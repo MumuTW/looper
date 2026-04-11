@@ -107,19 +107,15 @@ worker 不再接受 `taskId`。
 
 这是实现前必须先定死的点。
 
-推荐：
-
-> worker 保留，但不要在“尚未创建 PR”时伪装成 `pull_request` target。
-
-建议最终形态：
+定稿方案：
 
 - reviewer / fixer：`targetType = "pull_request"`
 - worker：`targetType = "project"`
 
 worker 的真实输入（`prompt/specPath/repo/baseBranch/title`）放入：
 
-- `loop.config`
-- 或 `queue.payloadJson`
+- `loops.metadataJson`
+- 必要时镜像到 `queue.payloadJson`
 
 不再引入新的 `task` / `work_request` 持久化实体。
 
@@ -154,10 +150,10 @@ worker 的业务目标改为：
 
 删除 `/api/v1/tasks*` 后，必须补新的 worker 启动入口。
 
-建议：
+定稿方案：
 
-- 服务端：`POST /api/v1/work`
-- CLI：`looper work start`
+- 服务端：`POST /api/v1/workers`
+- CLI：`looper work`
 
 建议输入：
 
@@ -170,13 +166,13 @@ worker 的业务目标改为：
 行为：
 
 - 创建 `worker` loop
-- 写入 `loop.config` / `queue.payloadJson`
+- 写入 `loops.metadataJson` / `queue.payloadJson`
 - enqueue
 - 后续由 worker 创建 branch、改代码、开 PR
 
 ### 4.5 Worker Queue Item Shape
 
-建议 queue item 形态：
+定稿 queue item 形态：
 
 - `type = "worker"`
 - `targetType = "project"`
@@ -190,17 +186,42 @@ worker 的业务目标改为：
 
 #### lockKey
 
-建议：
+定稿：
 
-- `project:<projectId>:worker`
+- `worker:<loopId>`
 
-避免同一项目并发启动多个主动开发 worker。
+第一阶段以 loop 维度幂等为准；如果后续需要项目级串行化，再单独收紧。
 
 #### dedupeKey
 
-建议：
+定稿：
 
 - `worker:<loopId>`
+
+### 4.5.1 Worker 与 PR 的关联记录
+
+worker 的输入 target 是 `project`，但仍需要记录它最终创建/拥有的 PR。
+
+定稿方案：
+
+- durable association 放在 `loops` 表：
+  - `loops.repo`
+  - `loops.prNumber`
+- 运行态/恢复态信息放在 checkpoint：
+  - `checkpoint.pullRequest`
+
+状态演进：
+
+- worker 创建时：
+  - `targetType = "project"`
+  - `targetId = projectId`
+  - `repo = null`
+  - `prNumber = null`
+- `open-pr` 成功后：
+  - 回写 `loops.repo`
+  - 回写 `loops.prNumber`
+
+这让 worker 既保留 project-scoped 输入语义，也拥有 durable PR ownership 记录。
 
 ### 4.6 Worker 是否 requeue
 
@@ -224,6 +245,26 @@ worker 的业务目标改为：
   - 自动开 PR
   - 或手动开 PR
 - 删除 `all_done` / `first_commit` 这类依赖 checklist 的策略
+
+### 4.8 CLI UX
+
+定稿 CLI 形态：
+
+```bash
+looper work --project <projectId> --title "..." --spec <path>
+```
+
+可选扩展：
+
+- `--item <text>` 多次传入
+- `--repo <owner/name>`
+- `--base-branch <branch>`
+
+不再保留：
+
+- `task create`
+- `task start`
+- `loop start --task`
 
 ---
 
@@ -270,6 +311,7 @@ worker 的业务目标改为：
 - `QueueItemRecord.taskId`
 - `AgentExecutionRecord.taskId`
 - `WorktreeRecord.taskId`
+- worker 旧的 task/checklist requeue 逻辑
 
 ### 6.2 Domain
 
@@ -308,6 +350,7 @@ worker 的业务目标改为：
 - `worker` loop type
 - `worker` runner 文件
 - runtime 对 worker 的 wiring
+- `loops.repo + loops.prNumber` 作为 worker PR 关联记录
 
 ### 7.2 改造
 
@@ -316,6 +359,7 @@ worker 的业务目标改为：
 - worker step sequence
 - worker open PR 逻辑
 - worker 的 worktree / commit / validation 流程
+- worker API / CLI 入口
 
 ### 7.3 对齐 fixer
 
@@ -337,6 +381,11 @@ worker 应尽量复用 fixer 已经比较成熟的模式：
 - `apps/looperd/src/server/index.ts`
 - `apps/looperd/src/server/index.test.ts`
 - `README.md`
+
+补充：
+
+- 需要新增 `/api/v1/workers`
+- 需要新增 `looper work`
 
 ## 8.2 删除 task schema / types
 
@@ -382,9 +431,9 @@ worker 应尽量复用 fixer 已经比较成熟的模式：
 
 在第 5 步开始前，必须先定清：
 
-- worker 的 `targetType`
-- worker 的 API / CLI 入口
-- worker queue item / lockKey / dedupeKey 形态
+- worker 的 `targetType`（已定：`project`）
+- worker 的 API / CLI 入口（已定：`POST /api/v1/workers` + `looper work`）
+- worker queue item / lockKey / dedupeKey 形态（已定）
 
 ---
 
@@ -399,6 +448,8 @@ worker 应尽量复用 fixer 已经比较成熟的模式：
 - `LOOP_TARGET_TYPES` 不再包含 `task`
 - `AUDIT_EVENT_TYPES` / `AUDIT_ENTITY_TYPES` 不再包含 task 残余
 - `worker` 仍存在，但不依赖 task
+- worker 的输入通过 `loops.metadataJson` / `queue.payloadJson` 进入系统
+- worker 创建出的 PR 关联持久化在 `loops.repo + loops.prNumber`
 - worker 能从输入生成 PR
 - reviewer / fixer 主流程继续可运行
 - `bun run lint && bun run typecheck && bun run test && bun run build` 全部通过

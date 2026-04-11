@@ -6,8 +6,8 @@
 - [ ] 确认保留 `worker`
 - [ ] 确认 worker 改为 PR-oriented worker
 - [ ] 确认不再引入新的 task-like 中间持久化实体
-- [ ] 定义 worker 的最终 `loop.target_type`
-- [ ] 定义新的 worker API / CLI 入口
+- [x] 定义 worker 的最终 `loop.target_type` 为 `project`
+- [x] 定义新的 worker API / CLI 入口为 `POST /api/v1/workers` + `looper work`
 
 ## 单 PR 交付范围
 
@@ -28,12 +28,13 @@
 - [ ] worker 不再读取 `tasks`
 - [ ] worker 不再读取 `task_items`
 - [ ] worker 输入改为 `projectId + repo + baseBranch + prompt/specPath`
-- [ ] 定义 worker queue item 结构
-- [ ] 定义 worker 的 `lockKey` / `dedupeKey`
+- [x] 定义 worker queue item 结构
+- [x] 定义 worker 的 `lockKey` / `dedupeKey`
 - [ ] 计划/分解状态改存 checkpoint / payload
 - [ ] step sequence 重构为 PR-oriented 流程
 - [ ] 明确 worker 是否 requeue（默认不再沿用 task slice requeue）
 - [ ] 评估并简化 `openPrStrategy`
+- [x] 明确 worker 创建出的 PR 关联持久化在 `loops.repo + loops.prNumber`
 - [ ] worktree / reconcile-commits / validate / open-pr 路径可运行
 
 ## Schema 设计

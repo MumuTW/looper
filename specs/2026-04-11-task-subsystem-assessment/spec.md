@@ -487,9 +487,11 @@ PR list/status 中对 task 的引用主要是：
 目标方向：
 
 - `worker` 保留
+- `worker.targetType = project`
 - `worker` 不再读取 `tasks` / `task_items`
 - `worker` 的计划/分解状态存到 checkpoint 或 payload
 - `worker` 的产物是 PR，并与 reviewer/fixer 共用 PR 主线
+- worker 创建出的 PR 关联应持久化到 `loops.repo + loops.prNumber`
 
 ### Phase 5：清理 schema
 
@@ -508,13 +510,20 @@ PR list/status 中对 task 的引用主要是：
 
 ## 12. 单一最高风险未知项
 
-最高风险不是代码，而是**worker 的最终产品定义是否已定清楚**。
+最高风险已经不再是方向本身，而是**实现时是否会重新引入一个新的 task-like 中间实体**。
 
 即：
 
-> worker 最终是要围绕 PR 工作，还是要引入另一个新的中间实体（例如 work_request）？
+> 在删除 `task` 之后，是否会因为实现便利又引入新的 `work_request` / `job` / `spec record` 持久化表，把复杂度重新带回来？
 
-如果这个问题不先定清，删 task 之后容易重新引入另一个“task-like”实体，造成二次返工。
+当前更合理的约束应该是：
+
+- `worker.targetType = project`
+- worker 输入进入 `loops.metadataJson` / `queue.payloadJson`
+- worker 创建后的 PR 关联写入 `loops.repo + loops.prNumber`
+- worker 运行态状态进入 checkpoint
+
+如果偏离这条约束，就有很大概率重新长出新的 task-like 模型。
 
 ---
 
@@ -539,4 +548,4 @@ PR list/status 中对 task 的引用主要是：
 
 1. 先确认产品方向
 2. 若确认不再需要 task 这个中间实体，则直接在**一个收敛 PR** 中完成 task/task_items 删除，并同步把 worker 重构为 PR-oriented worker
-3. 若 worker 的目标模型还没定清，则先冻结 task 扩展，再先写清 worker 新模型
+3. worker 新模型应明确采用：`project` 作为 target、`/api/v1/workers` 作为入口、`looper work` 作为 CLI、`loops.repo/prNumber` 作为 PR 关联主记录
