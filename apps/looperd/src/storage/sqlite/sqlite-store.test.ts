@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { Database } from "bun:sqlite";
 
 import { SqliteStore } from "./sqlite-store";
 
@@ -291,11 +293,199 @@ describe("SqliteStore", () => {
 
     const health = store.schema.healthcheck();
     expect(health.ok).toBe(true);
-    expect(health.migration.latestAppliedId).toBe("0003_scheduler_queue");
+    expect(health.migration.latestAppliedId).toBe("0004_worker_project_target");
     expect(health.lastUpdatedAt).toBeString();
 
     const backupPath = store.schema.backup();
     await access(backupPath);
+
+    store.close();
+  });
+
+  test("migrates legacy task-target worker schemas to project-target worker schemas", async () => {
+    const fixture = await createStoreFixture();
+    await mkdir(join(fixture.rootDir, "state"), { recursive: true });
+    const db = new Database(fixture.dbPath, { create: true });
+    db.exec(`
+      CREATE TABLE schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations (id, applied_at) VALUES
+        ('0001_init', '2026-04-11T00:00:00.000Z'),
+        ('0002_integrations', '2026-04-11T00:00:00.000Z'),
+        ('0003_scheduler_queue', '2026-04-11T00:00:00.000Z');
+
+      CREATE TABLE projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        repo_path TEXT NOT NULL,
+        base_branch TEXT,
+        archived INTEGER NOT NULL DEFAULT 0,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE loops (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT,
+        repo TEXT,
+        pr_number INTEGER,
+        status TEXT NOT NULL,
+        config_json TEXT,
+        metadata_json TEXT,
+        last_run_at TEXT,
+        next_run_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (target_type IN ('task', 'pull_request', 'repository', 'manual'))
+      );
+
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        loop_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_step TEXT,
+        last_completed_step TEXT,
+        checkpoint_json TEXT,
+        summary TEXT,
+        error_message TEXT,
+        started_at TEXT NOT NULL,
+        last_heartbeat_at TEXT,
+        ended_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE queue_items (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        loop_id TEXT,
+        task_id TEXT,
+        type TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        repo TEXT,
+        pr_number INTEGER,
+        dedupe_key TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        available_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 3,
+        claimed_by TEXT,
+        claimed_at TEXT,
+        started_at TEXT,
+        finished_at TEXT,
+        lock_key TEXT,
+        payload_json TEXT,
+        last_error TEXT,
+        last_error_kind TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE agent_executions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        loop_id TEXT,
+        run_id TEXT,
+        task_id TEXT,
+        vendor TEXT NOT NULL,
+        status TEXT NOT NULL,
+        pid INTEGER,
+        command_json TEXT,
+        cwd TEXT,
+        summary TEXT,
+        parse_status TEXT,
+        completion_signal TEXT,
+        heartbeat_count INTEGER NOT NULL DEFAULT 0,
+        last_heartbeat_at TEXT,
+        output_json TEXT,
+        error_message TEXT,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE worktrees (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT,
+        repo_path TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        base_branch TEXT,
+        status TEXT NOT NULL,
+        head_sha TEXT,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        cleaned_at TEXT
+      );
+
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE task_items (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL,
+        position INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      INSERT INTO projects (id, name, repo_path, base_branch, archived, metadata_json, created_at, updated_at)
+      VALUES ('project_1', 'Looper', '/tmp/looper', 'main', 0, NULL, '2026-04-11T00:00:00.000Z', '2026-04-11T00:00:00.000Z');
+
+      INSERT INTO loops (id, project_id, type, target_type, target_id, repo, pr_number, status, config_json, metadata_json, last_run_at, next_run_at, created_at, updated_at)
+      VALUES ('loop_worker_1', 'project_1', 'worker', 'task', 'task_1', 'acme/looper', NULL, 'queued', NULL, NULL, NULL, '2026-04-11T00:00:00.000Z', '2026-04-11T00:00:00.000Z', '2026-04-11T00:00:00.000Z');
+
+      INSERT INTO queue_items (id, project_id, loop_id, task_id, type, target_type, target_id, repo, pr_number, dedupe_key, priority, status, available_at, attempts, max_attempts, claimed_by, claimed_at, started_at, finished_at, lock_key, payload_json, last_error, last_error_kind, created_at, updated_at)
+      VALUES ('queue_worker_1', 'project_1', 'loop_worker_1', 'task_1', 'worker', 'task', 'task:task_1', 'acme/looper', NULL, 'worker:task_1', 1, 'queued', '2026-04-11T00:00:00.000Z', 0, 3, NULL, NULL, NULL, NULL, 'task:task_1', NULL, NULL, NULL, '2026-04-11T00:00:00.000Z', '2026-04-11T00:00:00.000Z');
+    `);
+    db.close(false);
+
+    const store = new SqliteStore({ dbPath: fixture.dbPath });
+    store.initialize({ autoMigrate: true });
+
+    expect(store.schema.healthcheck().migration.latestAppliedId).toBe(
+      "0004_worker_project_target",
+    );
+    expect(store.loops.getById("loop_worker_1")).toMatchObject({
+      targetType: "project",
+      targetId: "project_1",
+      status: "paused",
+    });
+    expect(store.queue.getById("queue_worker_1")).toMatchObject({
+      targetType: "project",
+      targetId: "project_1",
+      dedupeKey: "worker:loop_worker_1",
+      status: "cancelled",
+      lockKey: "worker:loop_worker_1",
+    });
+    expect(
+      store.withTransaction(() => {
+        try {
+          store.schema.healthcheck();
+          return true;
+        } catch {
+          return false;
+        }
+      }),
+    ).toBe(true);
 
     store.close();
   });

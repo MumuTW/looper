@@ -565,8 +565,15 @@ export class WorkerLoopRunner {
     project: ProjectRecord;
     loop: LoopRecord;
   }): Promise<WorkerCheckpoint> {
-    if (input.checkpoint.pullRequest) {
-      return input.checkpoint;
+    if (input.checkpoint.pullRequest || input.loop.prNumber) {
+      const metadata = parseJsonObject(input.loop.metadataJson);
+      return {
+        ...input.checkpoint,
+        pullRequest: input.checkpoint.pullRequest ?? {
+          number: input.loop.prNumber ?? undefined,
+          url: readString(metadata.prUrl) ?? "",
+        },
+      };
     }
 
     const work = requireWork(input.checkpoint);

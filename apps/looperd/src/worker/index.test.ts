@@ -478,6 +478,69 @@ describe("WorkerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("skips PR creation when loop already tracks a pull request", async () => {
+    const fixture = await createFixture();
+    fixture.store.loops.upsert({
+      ...(fixture.store.loops.getById("loop_worker_1") ?? {
+        id: "loop_worker_1",
+        projectId: "project_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: "acme/looper",
+        prNumber: 101,
+        status: "queued",
+        configJson: null,
+        metadataJson: null,
+        lastRunAt: null,
+        nextRunAt: fixture.now.toISOString(),
+        createdAt: fixture.now.toISOString(),
+        updatedAt: fixture.now.toISOString(),
+      }),
+      prNumber: 101,
+      metadataJson: JSON.stringify({
+        prUrl: "https://example.test/acme/looper/pull/101",
+      }),
+      updatedAt: fixture.now.toISOString(),
+    });
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and committed changes", [
+        "abc123",
+      ]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(result.pullRequestNumber).toBe(101);
+    expect(git.pushCalls).toBe(0);
+    expect(github.createPullRequestCalls).toHaveLength(0);
+
+    fixture.store.close();
+  });
+
   test("pauses for manual PR opening when auto push is disabled", async () => {
     const fixture = await createFixture();
     const git = new FakeGitGateway(fixture.worktreeRoot);

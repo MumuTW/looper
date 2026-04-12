@@ -107,10 +107,10 @@
 
 本次实施方式：
 
-- 直接 reset schema baseline，不做兼容旧库的增量 migration。
-- 现有本地数据库由使用者删除后重建。
-- 在此约束下，允许直接改写现有 `0001_init.sql` / `0002_integrations.sql` / `0003_scheduler_queue.sql`，使其反映新的无-task 基线结构。
-- 不新增“删除 tasks 表”的补丁 migration，也不保留仅为兼容旧库存在的过渡字段。
+- 保持 `0001_init.sql` / `0002_integrations.sql` / `0003_scheduler_queue.sql` 反映新的无-task 基线结构。
+- 额外提供前向迁移，把已存在数据库从 task-target / task-backed worker 模型迁到新的 project-target worker 模型。
+- 迁移期间允许清理旧的 `tasks` / `task_items` 表，并移除 `queue_items.task_id` / `agent_executions.task_id` / `worktrees.task_id` 等过渡字段。
+- 对无法自动继续执行的旧 worker loop / queue item，迁移后应落到安全状态（如 paused / cancelled），避免运行时继续按旧模型执行。
 
 ### 4.2 Store / Storage Types
 

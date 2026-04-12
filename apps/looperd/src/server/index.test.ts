@@ -168,7 +168,9 @@ describe("createLooperdApi", () => {
 
     expect(statusResponse.status).toBe(200);
     expect(statusBody.ok).toBe(true);
-    expect(statusBody.data.storage.schemaVersion).toBe("0003_scheduler_queue");
+    expect(statusBody.data.storage.schemaVersion).toBe(
+      "0004_worker_project_target",
+    );
     expect(statusBody.data.scheduler.queuedItems).toBe(1);
     expect(statusBody.data.scheduler.totalRuns).toBe(1);
     expect(statusBody.data.safety.allowAutoCommit).toBe(true);
