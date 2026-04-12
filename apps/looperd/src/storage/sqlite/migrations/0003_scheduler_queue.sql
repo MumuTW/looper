@@ -2,7 +2,6 @@ CREATE TABLE IF NOT EXISTS queue_items (
   id TEXT PRIMARY KEY,
   project_id TEXT,
   loop_id TEXT,
-  task_id TEXT,
   type TEXT NOT NULL,
   target_type TEXT NOT NULL,
   target_id TEXT NOT NULL,
@@ -26,7 +25,6 @@ CREATE TABLE IF NOT EXISTS queue_items (
   updated_at TEXT NOT NULL,
   FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
   FOREIGN KEY (loop_id) REFERENCES loops (id) ON DELETE CASCADE,
-  FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE,
   CHECK (pr_number IS NULL OR pr_number > 0),
   CHECK (priority > 0),
   CHECK (attempts >= 0),
@@ -39,8 +37,6 @@ CREATE INDEX IF NOT EXISTS idx_queue_items_status_available_priority
   ON queue_items (status, available_at, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_queue_items_loop_status
   ON queue_items (loop_id, status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_queue_items_task_status
-  ON queue_items (task_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_queue_items_type_repo_pr_status
   ON queue_items (type, repo, pr_number, status, available_at);
 CREATE INDEX IF NOT EXISTS idx_queue_items_dedupe_status

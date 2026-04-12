@@ -95,32 +95,6 @@ export interface RunRecord {
   updatedAt: string;
 }
 
-export interface TaskRecord {
-  id: string;
-  projectId: string;
-  title: string;
-  description?: string | null;
-  status: string;
-  loopId?: string | null;
-  repo?: string | null;
-  prNumber?: number | null;
-  metadataJson?: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface TaskItemRecord {
-  id: string;
-  taskId: string;
-  content: string;
-  status: string;
-  position: number;
-  source: string;
-  metadataJson?: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export interface PullRequestSnapshotRecord {
   id: string;
   projectId: string;
@@ -184,7 +158,6 @@ export interface QueueItemRecord {
   id: string;
   projectId?: string | null;
   loopId?: string | null;
-  taskId?: string | null;
   type: string;
   targetType: string;
   targetId: string;
@@ -213,7 +186,6 @@ export interface AgentExecutionRecord {
   projectId?: string | null;
   loopId?: string | null;
   runId?: string | null;
-  taskId?: string | null;
   vendor: string;
   status: string;
   pid?: number | null;
@@ -257,7 +229,6 @@ export interface NotificationRecord {
 export interface WorktreeRecord {
   id: string;
   projectId: string;
-  taskId?: string | null;
   repoPath: string;
   worktreePath: string;
   branch: string;

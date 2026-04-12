@@ -3,12 +3,10 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "../bootstrap/logger";
 import type { LooperConfig } from "../config/index";
 import {
-  assertTaskStatusTransition,
   assertUniqueActiveLoop,
   createLoop,
-  createTaskItem,
+  defineProjectLoopTarget,
   definePullRequestLoopTarget,
-  defineTaskLoopTarget,
 } from "../domain/index";
 import type { ProjectManager } from "../projects/index";
 import { SchedulerQueue } from "../scheduler/index";
@@ -19,7 +17,6 @@ import type {
   LoopRecord,
   PullRequestSnapshotRecord,
   RunRecord,
-  TaskRecord,
 } from "../storage/types";
 
 export interface ApiResponse<T> {
@@ -121,17 +118,14 @@ export function createLooperdApi(context: LooperdApiContext): LooperdApi {
                 ? buildLoopsResponse(context)
                 : await buildLoopsCreateResponse(context, request);
             break;
+          case pathname === "/api/v1/workers":
+            data = await buildWorkersCreateResponse(context, request);
+            break;
           case pathname === "/api/v1/projects":
             data = await buildProjectsRouteResponse(context, request);
             break;
           case pathname.startsWith("/api/v1/loops/"):
             data = await buildLoopRouteResponse(context, request, pathname);
-            break;
-          case pathname === "/api/v1/tasks":
-            data = await buildTasksRouteResponse(context, request);
-            break;
-          case pathname.startsWith("/api/v1/tasks/"):
-            data = await buildTaskRouteResponse(context, request, pathname);
             break;
           case pathname === "/api/v1/runs":
             assertMethod(request, ["GET"], pathname);
@@ -411,12 +405,7 @@ function buildPullRequestsResponse(context: LooperdApiContext) {
     context.store.pullRequestSnapshots.list(),
   );
   const loops = context.store.loops.list();
-  const tasks = context.store.tasks.list();
-  const identities = collectPullRequestIdentities(
-    latestSnapshots,
-    loops,
-    tasks,
-  );
+  const identities = collectPullRequestIdentities(latestSnapshots, loops);
   const snapshotByKey = new Map(
     latestSnapshots.map((snapshot) => [
       `${snapshot.repo}#${snapshot.prNumber}`,
@@ -512,193 +501,96 @@ function mutateLoopStatus(
   return updated;
 }
 
-async function buildTasksRouteResponse(
+async function buildWorkersCreateResponse(
   context: LooperdApiContext,
   request: Request,
 ) {
-  if (request.method === "GET") {
-    return {
-      items: context.store.tasks
-        .list()
-        .map((task) => serializeTask(context, task)),
-    };
-  }
+  assertMethod(request, ["POST"], "/api/v1/workers");
 
-  if (request.method === "POST") {
-    const body = await parseJsonBody(request);
-    const projectId = readRequiredString(body, "projectId");
-    const title = readRequiredString(body, "title");
-    const project = context.store.projects.getById(projectId);
-    if (!project) {
-      throw new ApiError(
-        "PROJECT_NOT_FOUND",
-        404,
-        `Project not found: ${projectId}`,
-      );
-    }
-
-    const now = new Date().toISOString();
-    const taskId = randomUUID();
-    const specPath = readOptionalString(body, "specPath");
-    const items = readTaskItems(body, taskId, now);
-
-    const task = {
-      id: taskId,
-      projectId,
-      title,
-      description: readOptionalString(body, "description"),
-      status: "pending",
-      loopId: readOptionalString(body, "loopId"),
-      repo: readOptionalString(body, "repo"),
-      prNumber: readOptionalPositiveInteger(body, "prNumber"),
-      metadataJson: specPath ? JSON.stringify({ specPath }) : null,
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    context.store.withTransaction((store) => {
-      store.tasks.upsert(task);
-      for (const item of items) {
-        store.taskItems.upsert(item);
-      }
-    });
-
-    return serializeTask(context, context.store.tasks.getById(task.id) ?? task);
-  }
-
-  throw new ApiError(
-    "METHOD_NOT_ALLOWED",
-    405,
-    "Unsupported method for /api/v1/tasks",
-  );
-}
-
-async function buildTaskRouteResponse(
-  context: LooperdApiContext,
-  request: Request,
-  pathname: string,
-) {
-  const parts = pathname.split("/").filter(Boolean);
-  const taskId = decodeURIComponent(parts[3] ?? "");
-  const subresource = parts[4];
-
-  if (!taskId) {
-    throw new ApiError("VALIDATION_FAILED", 400, "taskId is required");
-  }
-
-  if (!subresource) {
-    assertMethod(request, ["GET"], pathname);
-    const task = context.store.tasks.getById(taskId);
-    if (!task) {
-      throw new ApiError("TASK_NOT_FOUND", 404, `Task not found: ${taskId}`);
-    }
-
-    return serializeTask(context, task);
-  }
-
-  if (subresource === "start") {
-    assertMethod(request, ["POST"], pathname);
-    return startTask(context, taskId);
-  }
-
-  if (subresource === "pause") {
-    assertMethod(request, ["POST"], pathname);
-    return pauseTask(context, taskId);
-  }
-
-  throw new ApiError("ROUTE_NOT_FOUND", 404, `Unknown route: ${pathname}`);
-}
-
-function mutateTaskStatus(
-  context: LooperdApiContext,
-  taskId: string,
-  status: string,
-) {
-  const task = context.store.tasks.getById(taskId);
-  if (!task) {
-    throw new ApiError("TASK_NOT_FOUND", 404, `Task not found: ${taskId}`);
-  }
-
-  try {
-    assertTaskStatusTransition(task.status as never, status as never);
-  } catch (error) {
+  if (!isCodingAgentConfigured(context.config)) {
     throw new ApiError(
-      "INVALID_TASK_TRANSITION",
-      409,
-      error instanceof Error ? error.message : "Invalid task transition",
+      "AGENT_NOT_CONFIGURED",
+      400,
+      "Cannot create worker loop without config.agent.vendor",
     );
   }
 
-  const updated = {
-    ...task,
-    status,
-    updatedAt: new Date().toISOString(),
-  };
-  context.store.tasks.upsert(updated);
-
-  return updated;
-}
-
-function startTask(context: LooperdApiContext, taskId: string) {
-  const task = context.store.tasks.getById(taskId);
-  if (!task) {
-    throw new ApiError("TASK_NOT_FOUND", 404, `Task not found: ${taskId}`);
+  const body = await parseJsonBody(request);
+  const projectId = readRequiredString(body, "projectId");
+  const project = context.store.projects.getById(projectId);
+  if (!project) {
+    throw new ApiError(
+      "PROJECT_NOT_FOUND",
+      404,
+      `Project not found: ${projectId}`,
+    );
   }
 
+  const prompt = readOptionalString(body, "prompt");
+  const specPath = readOptionalString(body, "specPath");
+  if (!prompt && !specPath) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      "prompt or specPath is required",
+    );
+  }
+
+  const projectMetadata = parseMetadata(project.metadataJson);
+  const repo =
+    readOptionalString(body, "repo") ?? readString(projectMetadata.repo);
+  const baseBranch =
+    readOptionalString(body, "baseBranch") ?? project.baseBranch ?? null;
+  if (!repo) {
+    throw new ApiError("VALIDATION_FAILED", 400, "repo is required");
+  }
+  if (!baseBranch) {
+    throw new ApiError("VALIDATION_FAILED", 400, "baseBranch is required");
+  }
+
+  const title =
+    readOptionalString(body, "title") ??
+    deriveWorkerTitle({ prompt, specPath });
   const now = new Date().toISOString();
-  let loop = task.loopId ? context.store.loops.getById(task.loopId) : null;
-
-  if (!loop) {
-    loop = createLoopRecord({
-      context,
-      projectId: task.projectId,
-      type: "worker",
-      targetType: "task",
-      taskId,
-      status: "running",
-      now,
-    });
-  } else if (loop.status !== "running") {
-    loop = mutateLoopStatus(context, loop.id, "running");
-  }
-
-  const updatedTask = {
-    ...task,
-    loopId: loop.id,
-    status: "in_progress",
-    updatedAt: now,
+  const payload = {
+    title,
+    prompt,
+    specPath,
+    repo,
+    baseBranch,
   };
+  const loop = createLoopRecord({
+    context,
+    projectId,
+    type: "worker",
+    targetType: "project",
+    targetId: projectId,
+    status: "running",
+    now,
+    metadataJson: JSON.stringify({ worker: payload }),
+  });
 
-  context.store.tasks.upsert(updatedTask);
   new SchedulerQueue({
     store: context.store,
     retryMaxAttempts: context.config.scheduler.retryMaxAttempts,
     retryBaseDelayMs: context.config.scheduler.retryBaseDelayMs,
     now: () => new Date(now),
   }).enqueue({
-    projectId: updatedTask.projectId,
+    projectId,
     loopId: loop.id,
-    taskId: updatedTask.id,
     type: "worker",
-    targetType: "task",
-    targetId: `task:${updatedTask.id}`,
-    repo: updatedTask.repo,
-    dedupeKey: `worker:${updatedTask.id}`,
+    targetType: "project",
+    targetId: projectId,
+    repo,
+    dedupeKey: `worker:${loop.id}`,
+    lockKey: `worker:${loop.id}`,
+    payloadJson: JSON.stringify(payload),
   });
-  return serializeTask(context, updatedTask);
-}
 
-function pauseTask(context: LooperdApiContext, taskId: string) {
-  const task = mutateTaskStatus(context, taskId, "paused");
-
-  if (task.loopId) {
-    const loop = context.store.loops.getById(task.loopId);
-    if (loop && loop.status !== "paused") {
-      mutateLoopStatus(context, loop.id, "paused");
-    }
-  }
-
-  return serializeTask(context, context.store.tasks.getById(taskId) ?? task);
+  return {
+    ...loop,
+    ...payload,
+  };
 }
 
 function buildRunsResponse(
@@ -717,7 +609,6 @@ function buildRunsResponse(
 interface ActiveRunsQuery {
   type?: string;
   projectId?: string;
-  taskId?: string;
   repo?: string;
   prNumber?: number;
 }
@@ -744,8 +635,8 @@ interface ActiveRunView {
   startedAt: string;
   target:
     | {
-        type: "task";
-        taskId: string;
+        type: "project";
+        projectId: string;
         label: string;
       }
     | {
@@ -850,21 +741,21 @@ function tryBuildActiveRunTarget(
   context: LooperdApiContext,
   loop: LoopRecord,
 ): ActiveRunView["target"] | null {
-  if (loop.targetType === "task") {
-    const taskId =
-      loop.targetId?.startsWith("task:") === true
-        ? loop.targetId.slice("task:".length)
+  if (loop.targetType === "project") {
+    const projectId =
+      loop.targetId?.startsWith("project:") === true
+        ? loop.targetId.slice("project:".length)
         : loop.targetId;
-    if (!taskId) {
+    if (!projectId) {
       return null;
     }
 
-    const task = context.store.tasks.getById(taskId);
+    const project = context.store.projects.getById(projectId);
 
     return {
-      type: "task",
-      taskId,
-      label: task?.title?.trim() || taskId,
+      type: "project",
+      projectId,
+      label: project?.name?.trim() || projectId,
     };
   }
 
@@ -883,7 +774,6 @@ function tryBuildActiveRunTarget(
 function readActiveRunsQuery(searchParams: URLSearchParams): ActiveRunsQuery {
   const type = searchParams.get("type")?.trim() || undefined;
   const projectId = searchParams.get("projectId")?.trim() || undefined;
-  const taskId = searchParams.get("taskId")?.trim() || undefined;
   const repo = searchParams.get("repo")?.trim() || undefined;
   const prNumberValue = searchParams.get("prNumber")?.trim();
   const prNumber = prNumberValue
@@ -898,7 +788,7 @@ function readActiveRunsQuery(searchParams: URLSearchParams): ActiveRunsQuery {
     );
   }
 
-  return { type, projectId, taskId, repo, prNumber };
+  return { type, projectId, repo, prNumber };
 }
 
 function readSearchParamPositiveInteger(
@@ -927,12 +817,6 @@ function matchesActiveRunsQuery(
 
   if (query.projectId && item.projectId !== query.projectId) {
     return false;
-  }
-
-  if (query.taskId) {
-    if (item.target.type !== "task" || item.target.taskId !== query.taskId) {
-      return false;
-    }
   }
 
   if (query.repo || query.prNumber !== undefined) {
@@ -1058,7 +942,7 @@ async function buildLoopsCreateResponse(
     projectId,
     type,
     targetType,
-    taskId: readOptionalString(body, "taskId") ?? undefined,
+    targetId: readOptionalString(body, "targetId") ?? undefined,
     repo: readOptionalString(body, "repo") ?? undefined,
     prNumber: readOptionalPositiveInteger(body, "prNumber") ?? undefined,
     status,
@@ -1073,16 +957,17 @@ function createLoopRecord(input: {
   projectId: string;
   type: string;
   targetType: string;
-  taskId?: string;
+  targetId?: string;
   repo?: string;
   prNumber?: number;
   status: string;
   now: string;
+  metadataJson?: string | null;
 }) {
   const { context } = input;
   const target =
-    input.targetType === "task"
-      ? defineTaskLoopTarget(readRequiredValue(input.taskId, "taskId"))
+    input.targetType === "project"
+      ? defineProjectLoopTarget(readRequiredValue(input.targetId, "targetId"))
       : definePullRequestLoopTarget(
           readRequiredValue(input.repo, "repo"),
           readRequiredNumber(input.prNumber, "prNumber"),
@@ -1125,14 +1010,14 @@ function createLoopRecord(input: {
     type: loop.type,
     targetType: target.targetType,
     targetId:
-      target.targetType === "task"
-        ? `task:${target.taskId}`
+      target.targetType === "project"
+        ? `project:${target.projectId}`
         : `pr:${target.repo}:${target.prNumber}`,
     repo: target.targetType === "pull_request" ? target.repo : null,
     prNumber: target.targetType === "pull_request" ? target.prNumber : null,
     status: loop.status,
     configJson: null,
-    metadataJson: null,
+    metadataJson: input.metadataJson ?? null,
     lastRunAt: null,
     nextRunAt: loop.status === "running" ? input.now : null,
     createdAt: input.now,
@@ -1143,33 +1028,15 @@ function createLoopRecord(input: {
   return record;
 }
 
-function serializeTask(
-  context: LooperdApiContext,
-  task: ReturnType<Store["tasks"]["getById"]> extends infer T
-    ? Exclude<T, null>
-    : never,
-) {
-  const metadata = parsePayloadJson(task.metadataJson ?? "null") as Record<
-    string,
-    unknown
-  > | null;
-
-  return {
-    ...task,
-    specPath: typeof metadata?.specPath === "string" ? metadata.specPath : null,
-    items: context.store.taskItems.listByTask(task.id),
-  };
-}
-
 function toLoopTarget(loop: ReturnType<Store["loops"]["list"]>[number]) {
-  if (loop.targetType === "task") {
-    const taskId =
-      loop.targetId?.startsWith("task:") === true
-        ? loop.targetId.slice("task:".length)
+  if (loop.targetType === "project") {
+    const projectId =
+      loop.targetId?.startsWith("project:") === true
+        ? loop.targetId.slice("project:".length)
         : loop.targetId;
 
-    return defineTaskLoopTarget(
-      readRequiredValue(taskId ?? undefined, "taskId"),
+    return defineProjectLoopTarget(
+      readRequiredValue(projectId ?? undefined, "projectId"),
     );
   }
 
@@ -1177,42 +1044,6 @@ function toLoopTarget(loop: ReturnType<Store["loops"]["list"]>[number]) {
     readRequiredValue(loop.repo ?? undefined, "repo"),
     readRequiredNumber(loop.prNumber ?? undefined, "prNumber"),
   );
-}
-
-function readTaskItems(
-  body: Record<string, unknown>,
-  taskId: string,
-  now: string,
-) {
-  const raw = body.items;
-  if (raw == null) {
-    return [];
-  }
-
-  if (!Array.isArray(raw)) {
-    throw new ApiError("VALIDATION_FAILED", 400, "items must be an array");
-  }
-
-  return raw.map((value, index) => {
-    if (typeof value !== "string" || value.trim().length === 0) {
-      throw new ApiError(
-        "VALIDATION_FAILED",
-        400,
-        `items[${index}] must be a non-empty string`,
-      );
-    }
-
-    return createTaskItem({
-      id: randomUUID(),
-      taskId,
-      content: value.trim(),
-      status: "pending",
-      position: index,
-      source: "user",
-      createdAt: now,
-      updatedAt: now,
-    });
-  });
 }
 
 function readRequiredValue(
@@ -1378,13 +1209,6 @@ function buildPullRequestStatusResponse(
   const runMatches = loopMatches.flatMap((loop) =>
     context.store.runs.listByLoop(loop.id),
   );
-  const taskMatch = context.store.tasks
-    .list()
-    .find(
-      (task) =>
-        task.repo === snapshot.repo && task.prNumber === snapshot.prNumber,
-    );
-
   return {
     repo: snapshot.repo,
     prNumber: snapshot.prNumber,
@@ -1395,13 +1219,6 @@ function buildPullRequestStatusResponse(
     reviewer: findLatestLoopStatus(loopMatches, "reviewer"),
     fixer: findLatestLoopStatus(loopMatches, "fixer"),
     loopStatus: summarizeRunAndLoopState(loopMatches, runMatches),
-    task: taskMatch
-      ? {
-          id: taskMatch.id,
-          title: taskMatch.title,
-          status: taskMatch.status,
-        }
-      : null,
   };
 }
 
@@ -1425,7 +1242,6 @@ function findLatestLoopStatus(
 function collectPullRequestIdentities(
   snapshots: PullRequestSnapshotRecord[],
   loops: ReturnType<Store["loops"]["list"]>,
-  tasks: ReturnType<Store["tasks"]["list"]>,
 ) {
   const seen = new Set<string>();
   const identities: Array<{
@@ -1463,11 +1279,6 @@ function collectPullRequestIdentities(
   for (const loop of loops) {
     appendIdentity(loop);
   }
-
-  for (const task of tasks) {
-    appendIdentity(task);
-  }
-
   return identities;
 }
 
@@ -1520,16 +1331,11 @@ function serializePullRequestListItem(
   snapshot: PullRequestSnapshotRecord | undefined,
 ) {
   const loopMatches = findPullRequestLoops(context, repo, prNumber);
-  const task = context.store.tasks
-    .list()
-    .find(
-      (candidate) => candidate.repo === repo && candidate.prNumber === prNumber,
-    );
 
   return {
     repo,
     prNumber,
-    projectId: snapshot?.projectId ?? task?.projectId ?? null,
+    projectId: snapshot?.projectId ?? loopMatches[0]?.projectId ?? null,
     headSha: snapshot?.headSha ?? null,
     baseSha: snapshot?.baseSha ?? null,
     title: snapshot?.title ?? null,
@@ -1542,23 +1348,13 @@ function serializePullRequestListItem(
     capturedAt: snapshot?.capturedAt ?? null,
     reviewer: findLatestLoopStatus(loopMatches, "reviewer"),
     fixer: findLatestLoopStatus(loopMatches, "fixer"),
-    task: task
-      ? {
-          id: task.id,
-          title: task.title,
-          status: task.status,
-        }
-      : null,
   };
 }
 
 function serializeProject(
   project: ReturnType<Store["projects"]["list"]>[number],
 ) {
-  const metadata = parsePayloadJson(project.metadataJson ?? "null") as Record<
-    string,
-    unknown
-  > | null;
+  const metadata = parseMetadata(project.metadataJson);
 
   return {
     id: project.id,
@@ -1578,6 +1374,34 @@ function serializeProject(
     createdAt: project.createdAt,
     updatedAt: project.updatedAt,
   };
+}
+
+function parseMetadata(metadataJson?: string | null): Record<string, unknown> {
+  const parsed = parsePayloadJson(metadataJson ?? "null");
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : {};
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+function deriveWorkerTitle(input: {
+  prompt: string | null;
+  specPath: string | null;
+}): string {
+  if (input.prompt) {
+    return input.prompt.slice(0, 80);
+  }
+
+  if (input.specPath) {
+    return `Implement ${input.specPath}`;
+  }
+
+  return "Worker run";
 }
 
 function deriveProjectIdFromPath(repoPath: string): string {

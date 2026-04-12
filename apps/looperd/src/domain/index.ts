@@ -1,7 +1,7 @@
 export const LOOP_TYPES = ["reviewer", "worker", "fixer"] as const;
 export type LoopType = (typeof LOOP_TYPES)[number];
 
-export const LOOP_TARGET_TYPES = ["task", "pull_request"] as const;
+export const LOOP_TARGET_TYPES = ["project", "pull_request"] as const;
 export type LoopTargetType = (typeof LOOP_TARGET_TYPES)[number];
 
 export const LOOP_STATUSES = [
@@ -26,23 +26,6 @@ export const RUN_STATUSES = [
 ] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
-export const TASK_STATUSES = [
-  "pending",
-  "ready",
-  "in_progress",
-  "blocked",
-  "paused",
-  "completed",
-  "failed",
-] as const;
-export type TaskStatus = (typeof TASK_STATUSES)[number];
-
-export const TASK_ITEM_STATUSES = ["pending", "in_progress", "done"] as const;
-export type TaskItemStatus = (typeof TASK_ITEM_STATUSES)[number];
-
-export const TASK_ITEM_SOURCES = ["spec", "user", "agent", "system"] as const;
-export type TaskItemSource = (typeof TASK_ITEM_SOURCES)[number];
-
 export const REVIEWER_STEPS = [
   "discover",
   "filter",
@@ -54,12 +37,11 @@ export const REVIEWER_STEPS = [
 export type ReviewerStep = (typeof REVIEWER_STEPS)[number];
 
 export const WORKER_STEPS = [
-  "prepare-task",
+  "prepare-work",
   "prepare-worktree",
-  "plan-step",
-  "execute-step",
-  "validate-step",
-  "sync-checklist",
+  "plan",
+  "execute",
+  "validate",
   "open-pr",
 ] as const;
 export type WorkerStep = (typeof WORKER_STEPS)[number];
@@ -68,9 +50,12 @@ export const FIXER_STEPS = [
   "discover-pr",
   "claim-pr",
   "collect-fixes",
+  "prepare-worktree",
   "repair",
   "validate",
   "push",
+  "reconcile-commits",
+  "resolve-comments",
   "recheck",
 ] as const;
 export type FixerStep = (typeof FIXER_STEPS)[number];
@@ -137,7 +122,6 @@ export const AUDIT_EVENT_TYPES = [
   "agent.killed",
   "pr.review.posted",
   "pr.branch.pushed",
-  "task.checklist.updated",
   "notification.sent",
 ] as const;
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number];
@@ -146,8 +130,6 @@ export const AUDIT_ENTITY_TYPES = [
   "project",
   "loop",
   "run",
-  "task",
-  "task_item",
   "pull_request",
   "lock",
   "notification",
@@ -166,9 +148,9 @@ export interface Project {
   updatedAt: string;
 }
 
-export interface TaskLoopTarget {
-  targetType: "task";
-  taskId: string;
+export interface ProjectLoopTarget {
+  targetType: "project";
+  projectId: string;
 }
 
 export interface PullRequestLoopTarget {
@@ -177,7 +159,7 @@ export interface PullRequestLoopTarget {
   prNumber: number;
 }
 
-export type LoopTarget = TaskLoopTarget | PullRequestLoopTarget;
+export type LoopTarget = ProjectLoopTarget | PullRequestLoopTarget;
 
 export interface Loop {
   id: string;
@@ -205,33 +187,6 @@ export interface Run {
   startedAt: string;
   lastHeartbeatAt?: string;
   endedAt?: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface Task {
-  id: string;
-  projectId: string;
-  title: string;
-  description?: string;
-  status: TaskStatus;
-  loopId?: string;
-  specPath?: string;
-  repo?: string;
-  prNumber?: number;
-  metadata?: Record<string, unknown>;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface TaskItem {
-  id: string;
-  taskId: string;
-  content: string;
-  status: TaskItemStatus;
-  position: number;
-  source: TaskItemSource;
-  metadata?: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
 }
@@ -299,10 +254,6 @@ export type CreateLoopInput = Omit<Loop, "target"> & {
 
 export type CreateRunInput = Run & { loopType?: LoopType };
 
-export type CreateTaskInput = Task;
-
-export type CreateTaskItemInput = TaskItem;
-
 export type CreatePullRequestSnapshotInput = PullRequestSnapshot;
 
 export type CreateLockInput = Lock;
@@ -333,26 +284,6 @@ const RUN_STATUS_TRANSITIONS: Readonly<
   cancelled: [],
   interrupted: [],
   parse_failed: [],
-};
-
-const TASK_STATUS_TRANSITIONS: Readonly<
-  Record<TaskStatus, readonly TaskStatus[]>
-> = {
-  pending: ["ready", "blocked", "paused"],
-  ready: ["in_progress", "blocked", "paused"],
-  in_progress: ["completed", "failed", "blocked", "paused", "ready"],
-  blocked: ["ready", "in_progress", "paused"],
-  paused: ["ready", "in_progress"],
-  completed: [],
-  failed: [],
-};
-
-const TASK_ITEM_STATUS_TRANSITIONS: Readonly<
-  Record<TaskItemStatus, readonly TaskItemStatus[]>
-> = {
-  pending: ["in_progress", "done"],
-  in_progress: ["pending", "done"],
-  done: [],
 };
 
 function assertNonEmpty(value: string, fieldName: string): void {
@@ -395,12 +326,12 @@ export function isTerminalRunStatus(
   return TERMINAL_RUN_STATUSES.includes(status as TerminalRunStatus);
 }
 
-export function defineTaskLoopTarget(taskId: string): TaskLoopTarget {
-  assertNonEmpty(taskId, "target.taskId");
+export function defineProjectLoopTarget(projectId: string): ProjectLoopTarget {
+  assertNonEmpty(projectId, "target.projectId");
 
   return {
-    targetType: "task",
-    taskId,
+    targetType: "project",
+    projectId,
   };
 }
 
@@ -422,8 +353,8 @@ export function assertLoopTypeMatchesTarget(
   loopType: LoopType,
   target: LoopTarget,
 ): void {
-  if (loopType === "worker" && target.targetType !== "task") {
-    throw new Error("worker loops must target a task");
+  if (loopType === "worker" && target.targetType !== "project") {
+    throw new Error("worker loops must target a project");
   }
 
   if (
@@ -489,30 +420,6 @@ export function assertRunStatusTransition(
   }
 }
 
-export function assertTaskStatusTransition(
-  from: TaskStatus,
-  to: TaskStatus,
-): void {
-  assertKnownValue(from, TASK_STATUSES, "fromStatus");
-  assertKnownValue(to, TASK_STATUSES, "toStatus");
-
-  if (!TASK_STATUS_TRANSITIONS[from].includes(to)) {
-    throw new Error(`invalid task status transition: ${from} -> ${to}`);
-  }
-}
-
-export function assertTaskItemStatusTransition(
-  from: TaskItemStatus,
-  to: TaskItemStatus,
-): void {
-  assertKnownValue(from, TASK_ITEM_STATUSES, "fromStatus");
-  assertKnownValue(to, TASK_ITEM_STATUSES, "toStatus");
-
-  if (!TASK_ITEM_STATUS_TRANSITIONS[from].includes(to)) {
-    throw new Error(`invalid task item status transition: ${from} -> ${to}`);
-  }
-}
-
 export function assertStepBelongsToLoopType(
   loopType: LoopType,
   step: LoopStep,
@@ -525,46 +432,12 @@ export function assertStepBelongsToLoopType(
   }
 }
 
-export function assertSingleTaskPrBinding(inputs: {
-  taskId: string;
-  repo?: string;
-  prNumber?: number;
-}): void {
-  if ((inputs.repo && !inputs.prNumber) || (!inputs.repo && inputs.prNumber)) {
-    throw new Error("task PR binding requires both repo and prNumber");
-  }
-
-  if (inputs.prNumber !== undefined) {
-    assertPositiveInteger(inputs.prNumber, "task.prNumber");
-  }
-}
-
-export function assertTaskPrUniqueness(inputs: {
-  tasks: readonly Pick<Task, "id" | "repo" | "prNumber">[];
-  candidate: Pick<Task, "id" | "repo" | "prNumber">;
-}): void {
-  if (!inputs.candidate.repo || !inputs.candidate.prNumber) {
-    return;
-  }
-
-  const conflict = inputs.tasks.find(
-    (task) =>
-      task.id !== inputs.candidate.id &&
-      task.repo === inputs.candidate.repo &&
-      task.prNumber === inputs.candidate.prNumber,
-  );
-
-  if (conflict) {
-    throw new Error(
-      `pull request ${inputs.candidate.repo}#${inputs.candidate.prNumber} is already linked to task ${conflict.id}`,
-    );
-  }
-}
-
 export function getLoopTargetKey(target: LoopTarget): string {
-  return target.targetType === "task"
-    ? `task:${target.taskId}`
-    : `pull_request:${target.repo}:${target.prNumber}`;
+  if (target.targetType === "project") {
+    return `project:${target.projectId}`;
+  }
+
+  return `pull_request:${target.repo}:${target.prNumber}`;
 }
 
 export function createPrLockKey(repo: string, prNumber: number): string {
@@ -572,12 +445,6 @@ export function createPrLockKey(repo: string, prNumber: number): string {
   assertPositiveInteger(prNumber, "prNumber");
 
   return `pr:${repo}:${prNumber}`;
-}
-
-export function createTaskLockKey(taskId: string): string {
-  assertNonEmpty(taskId, "taskId");
-
-  return `task:${taskId}`;
 }
 
 export function createProject(input: CreateProjectInput): Project {
@@ -652,38 +519,6 @@ export function createRun(input: CreateRunInput): Run {
     if (!isTerminalRunStatus(input.status)) {
       throw new Error("only terminal runs may define endedAt");
     }
-  }
-
-  return { ...input };
-}
-
-export function createTask(input: CreateTaskInput): Task {
-  assertNonEmpty(input.id, "task.id");
-  assertNonEmpty(input.projectId, "task.projectId");
-  assertNonEmpty(input.title, "task.title");
-  assertKnownValue(input.status, TASK_STATUSES, "task.status");
-  assertTimestamp(input.createdAt, "task.createdAt");
-  assertTimestamp(input.updatedAt, "task.updatedAt");
-  assertSingleTaskPrBinding({
-    taskId: input.id,
-    repo: input.repo,
-    prNumber: input.prNumber,
-  });
-
-  return { ...input };
-}
-
-export function createTaskItem(input: CreateTaskItemInput): TaskItem {
-  assertNonEmpty(input.id, "taskItem.id");
-  assertNonEmpty(input.taskId, "taskItem.taskId");
-  assertNonEmpty(input.content, "taskItem.content");
-  assertKnownValue(input.status, TASK_ITEM_STATUSES, "taskItem.status");
-  assertKnownValue(input.source, TASK_ITEM_SOURCES, "taskItem.source");
-  assertTimestamp(input.createdAt, "taskItem.createdAt");
-  assertTimestamp(input.updatedAt, "taskItem.updatedAt");
-
-  if (!Number.isInteger(input.position) || input.position < 0) {
-    throw new Error("taskItem.position must be a non-negative integer");
   }
 
   return { ...input };

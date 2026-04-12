@@ -11,8 +11,6 @@ import type {
   QueueItemRecord,
   RunRecord,
   StorageHealth,
-  TaskItemRecord,
-  TaskRecord,
   WorktreeRecord,
 } from "./types";
 
@@ -37,18 +35,6 @@ export interface Store {
     list(): RunRecord[];
     listByStatus(status: RunRecord["status"]): RunRecord[];
     listByLoop(loopId: string): RunRecord[];
-  };
-
-  tasks: {
-    upsert(record: TaskRecord): void;
-    getById(id: string): TaskRecord | null;
-    list(): TaskRecord[];
-  };
-
-  taskItems: {
-    upsert(record: TaskItemRecord): void;
-    listByTask(taskId: string): TaskItemRecord[];
-    getById(id: string): TaskItemRecord | null;
   };
 
   pullRequestSnapshots: {
@@ -99,7 +85,6 @@ export interface Store {
       updatedAt: string;
     }): void;
     cancelByLoop(loopId: string, finishedAt: string, reason?: string): number;
-    cancelByTask(taskId: string, finishedAt: string, reason?: string): number;
   };
 
   agentExecutions: {

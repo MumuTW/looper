@@ -396,7 +396,6 @@ export class FixerLoopRunner {
       loopId: loop.id,
       runId: run.id,
       queueItemId: queueItem.id,
-      taskId: queueItem.taskId,
       currentStep: resumedRun.startStep,
       resumed: resumedRun.resumed,
     });
@@ -417,7 +416,6 @@ export class FixerLoopRunner {
       loopId: loop.id,
       runId: run.id,
       queueItemId: queueItem.id,
-      taskId: queueItem.taskId,
       currentStep: resumedRun.startStep,
     });
 
@@ -440,7 +438,6 @@ export class FixerLoopRunner {
           loopId: loop.id,
           runId: run.id,
           queueItemId: queueItem.id,
-          taskId: queueItem.taskId,
           currentStep: step,
         });
         checkpoint = await this.executeStep({
@@ -471,7 +468,6 @@ export class FixerLoopRunner {
           loopId: loop.id,
           runId: run.id,
           queueItemId: queueItem.id,
-          taskId: queueItem.taskId,
           currentStep: step,
         });
         if (checkpoint.skipReason) {
@@ -503,7 +499,6 @@ export class FixerLoopRunner {
           loopId: loop.id,
           runId: run.id,
           queueItemId: queueItem.id,
-          taskId: queueItem.taskId,
           currentStep: run.currentStep,
           summary,
         },
@@ -572,7 +567,6 @@ export class FixerLoopRunner {
         loopId: loop.id,
         runId: run.id,
         queueItemId: queueItem.id,
-        taskId: queueItem.taskId,
         currentStep: run.currentStep,
         failureKind: failure.kind,
         summary: failure.message,
@@ -1249,7 +1243,7 @@ export class FixerLoopRunner {
     }
 
     const repo = requireString(input.queueItem.repo, "queueItem.repo");
-    const worktreePath = requireString(
+    const _worktreePath = requireString(
       requireWorktree(input.checkpoint).path,
       "worktree.path",
     );

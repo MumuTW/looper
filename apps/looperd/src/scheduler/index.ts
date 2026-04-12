@@ -19,7 +19,6 @@ export interface EnqueueQueueItemInput {
   id?: string;
   projectId?: string | null;
   loopId?: string | null;
-  taskId?: string | null;
   type: QueueLoopType;
   targetType: string;
   targetId: string;
@@ -59,7 +58,6 @@ export class SchedulerQueue {
       id: input.id ?? randomUUID(),
       projectId: input.projectId ?? null,
       loopId: input.loopId ?? null,
-      taskId: input.taskId ?? null,
       type: input.type,
       targetType: input.targetType,
       targetId: input.targetId,
@@ -163,14 +161,6 @@ export class SchedulerQueue {
     );
   }
 
-  public cancelByTask(taskId: string, reason?: string): number {
-    return this.options.store.queue.cancelByTask(
-      taskId,
-      this.now().toISOString(),
-      reason,
-    );
-  }
-
   public acquireBusinessLock(
     input: Omit<LockRecord, "createdAt" | "updatedAt">,
   ): boolean {
@@ -213,16 +203,16 @@ export function isRetryableFailure(kind: QueueFailureKind): boolean {
 }
 
 export function deriveLockKey(input: {
-  taskId?: string | null;
+  loopId?: string | null;
   repo?: string | null;
   prNumber?: number | null;
 }): string | null {
-  if (input.taskId) {
-    return `task:${input.taskId}`;
-  }
-
   if (input.repo && input.prNumber) {
     return `pr:${input.repo}:${input.prNumber}`;
+  }
+
+  if (input.loopId) {
+    return `worker:${input.loopId}`;
   }
 
   return null;

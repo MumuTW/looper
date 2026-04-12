@@ -4,9 +4,6 @@ import {
   assertLoopStatusTransition,
   assertRunStatusTransition,
   assertStepBelongsToLoopType,
-  assertTaskItemStatusTransition,
-  assertTaskPrUniqueness,
-  assertTaskStatusTransition,
   assertUniqueActiveLoop,
   createAuditEvent,
   createLock,
@@ -14,29 +11,27 @@ import {
   createPrLockKey,
   createProject,
   createRun,
-  createTask,
-  createTaskLockKey,
+  defineProjectLoopTarget,
   definePullRequestLoopTarget,
-  defineTaskLoopTarget,
 } from "./index";
 
 const now = "2026-04-11T12:00:00.000Z";
 
 describe("domain invariants", () => {
-  test("creates a valid worker loop for a task target", () => {
+  test("creates a valid worker loop for a project target", () => {
     const loop = createLoop({
       id: "loop_worker_1",
       projectId: "project_1",
       type: "worker",
-      target: defineTaskLoopTarget("task_1"),
+      target: defineProjectLoopTarget("project_1"),
       status: "idle",
       createdAt: now,
       updatedAt: now,
     });
 
     expect(loop.target).toEqual({
-      targetType: "task",
-      taskId: "task_1",
+      targetType: "project",
+      projectId: "project_1",
     });
   });
 
@@ -46,7 +41,7 @@ describe("domain invariants", () => {
         id: "loop_reviewer_1",
         projectId: "project_1",
         type: "reviewer",
-        target: defineTaskLoopTarget("task_1"),
+        target: defineProjectLoopTarget("project_1"),
         status: "idle",
         createdAt: now,
         updatedAt: now,
@@ -112,22 +107,6 @@ describe("domain invariants", () => {
     );
   });
 
-  test("enforces task and task item transition rules", () => {
-    expect(() =>
-      assertTaskStatusTransition("ready", "in_progress"),
-    ).not.toThrow();
-    expect(() => assertTaskStatusTransition("completed", "ready")).toThrow(
-      "invalid task status transition",
-    );
-
-    expect(() =>
-      assertTaskItemStatusTransition("pending", "in_progress"),
-    ).not.toThrow();
-    expect(() => assertTaskItemStatusTransition("done", "pending")).toThrow(
-      "invalid task item status transition",
-    );
-  });
-
   test("enforces endedAt only on terminal run statuses", () => {
     expect(() =>
       createRun({
@@ -161,37 +140,6 @@ describe("domain invariants", () => {
     ).not.toThrow();
   });
 
-  test("enforces one PR per task and one task per PR in MVP helpers", () => {
-    expect(() =>
-      createTask({
-        id: "task_1",
-        projectId: "project_1",
-        title: "Implement domain layer",
-        status: "in_progress",
-        repo: "acme/looper",
-        createdAt: now,
-        updatedAt: now,
-      }),
-    ).toThrow("task PR binding requires both repo and prNumber");
-
-    expect(() =>
-      assertTaskPrUniqueness({
-        tasks: [
-          {
-            id: "task_existing",
-            repo: "acme/looper",
-            prNumber: 42,
-          },
-        ],
-        candidate: {
-          id: "task_new",
-          repo: "acme/looper",
-          prNumber: 42,
-        },
-      }),
-    ).toThrow("already linked to task");
-  });
-
   test("builds audit event envelopes and lock keys", () => {
     const event = createAuditEvent({
       id: "event_1",
@@ -212,7 +160,6 @@ describe("domain invariants", () => {
 
     expect(event.payload.step).toBe("review");
     expect(createPrLockKey("acme/looper", 42)).toBe("pr:acme/looper:42");
-    expect(createTaskLockKey("task_1")).toBe("task:task_1");
   });
 
   test("creates projects and validates lock expiry ordering", () => {

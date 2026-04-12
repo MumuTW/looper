@@ -259,6 +259,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
               }),
             allowAutoCommit: this.options.config.defaults.allowAutoCommit,
             allowAutoPush: this.options.config.defaults.allowAutoPush,
+            openPrStrategy: this.options.config.defaults.openPrStrategy,
           });
       }
 
@@ -794,7 +795,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
               runId: result.runId,
               level: "failure",
               title: "Looper Worker",
-              subtitle: claimed.taskId ?? claimed.targetId,
+              subtitle: claimed.targetId,
               body: `Run failed: ${result.summary}`,
               entityType: "run",
               entityId: result.runId,
@@ -807,7 +808,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
             loopId: claimed.loopId ?? undefined,
             level: "failure",
             title: "Looper Worker",
-            subtitle: claimed.taskId ?? claimed.targetId,
+            subtitle: claimed.targetId,
             body: `Scheduling failed: ${error instanceof Error ? error.message : String(error)}`,
             entityType: "queue_item",
             entityId: claimed.id,

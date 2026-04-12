@@ -38,22 +38,23 @@ describe("runCli", () => {
     expect(lines.join("\n")).toContain('"healthy": true');
   });
 
-  test("creates task with checklist items and spec path", async () => {
+  test("creates worker work item with spec path", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
     const exitCode = await runCli(
       [
-        "task",
-        "create",
+        "work",
         "--project",
         "project_1",
         "--title",
         "Ship CLI",
         "--spec",
         "spec.md",
-        "--item",
-        "first",
-        "--item",
-        "second",
+        "--prompt",
+        "Implement CLI flow",
+        "--repo",
+        "acme/looper",
+        "--base-branch",
+        "main",
       ],
       {
         stdout: () => {},
@@ -67,7 +68,7 @@ describe("runCli", () => {
             JSON.stringify({
               ok: true,
               requestId: "req_2",
-              data: { id: "task_1", title: "Ship CLI", status: "pending" },
+              data: { id: "loop_1", title: "Ship CLI", status: "running" },
             }),
           );
         },
@@ -76,8 +77,8 @@ describe("runCli", () => {
 
     expect(exitCode).toBe(0);
     expect(requests).toHaveLength(1);
-    expect(requests[0]?.url).toContain("/api/v1/tasks");
-    expect(requests[0]?.body).toContain('"items":["first","second"]');
+    expect(requests[0]?.url).toContain("/api/v1/workers");
+    expect(requests[0]?.body).toContain('"prompt":"Implement CLI flow"');
     expect(requests[0]?.body).toContain('"specPath":"spec.md"');
   });
 
@@ -232,7 +233,6 @@ describe("runCli", () => {
                   checksSummary: "green",
                   reviewer: "running",
                   fixer: "paused",
-                  task: { id: "task_1" },
                 },
                 {
                   repo: "acme/looper",
@@ -242,7 +242,6 @@ describe("runCli", () => {
                   checksSummary: null,
                   reviewer: "queued",
                   fixer: null,
-                  task: null,
                 },
               ],
             },
@@ -282,9 +281,9 @@ describe("runCli", () => {
                   currentStep: "execute",
                   startedAt: "2026-04-11T12:00:00.000Z",
                   target: {
-                    type: "task",
-                    taskId: "task_1",
-                    label: "Ship CLI",
+                    type: "project",
+                    projectId: "project_1",
+                    label: "project_1",
                   },
                   agent: {
                     active: true,
@@ -336,9 +335,9 @@ describe("runCli", () => {
                     currentStep: "execute",
                     startedAt: "2026-04-11T12:00:00.000Z",
                     target: {
-                      type: "task",
-                      taskId: "task_1",
-                      label: "Ship CLI",
+                      type: "project",
+                      projectId: "project_1",
+                      label: "project_1",
                     },
                     agent: {
                       active: true,
@@ -368,7 +367,7 @@ describe("runCli", () => {
       expect(lines[0]).toContain("status");
       expect(lines[0]).toContain("age");
       expect(lines[2]).toContain("worker");
-      expect(lines[2]).toContain("Ship CLI");
+      expect(lines[2]).toContain("project_1");
       expect(lines[2]).toContain("run_worker_1");
       expect(lines[2]).toContain("execute");
       expect(lines[2]).toContain("opencode");

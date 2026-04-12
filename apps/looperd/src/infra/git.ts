@@ -14,7 +14,6 @@ export interface GitWorktreeGatewayOptions {
 
 export interface CreateWorktreeInput {
   projectId: string;
-  taskId?: string;
   repoPath: string;
   worktreeRoot: string;
   branch: string;
@@ -127,7 +126,6 @@ export class GitWorktreeGateway {
     const record: WorktreeRecord = {
       id: existingRecord?.id ?? randomUUID(),
       projectId: input.projectId,
-      taskId: input.taskId ?? existingRecord?.taskId ?? null,
       repoPath: input.repoPath,
       worktreePath,
       branch: input.branch,
@@ -206,7 +204,6 @@ export class GitWorktreeGateway {
     ) ?? {
       id: randomUUID(),
       projectId: input.projectId,
-      taskId: null,
       repoPath: input.repoPath,
       worktreePath: match.path,
       branch: input.branch,

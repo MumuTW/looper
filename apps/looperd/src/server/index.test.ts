@@ -67,30 +67,16 @@ async function createFixture() {
     createdAt: now,
     updatedAt: now,
   });
-  store.tasks.upsert({
-    id: "task_1",
-    projectId: "project_1",
-    title: "Wire runtime",
-    description: null,
-    status: "in_progress",
-    loopId: null,
-    repo: "acme/looper",
-    prNumber: 42,
-    metadataJson: null,
-    createdAt: now,
-    updatedAt: now,
-  });
   store.queue.upsert({
     id: "queue_1",
     projectId: "project_1",
     loopId: "loop_1",
-    taskId: "task_1",
     type: "worker",
-    targetType: "task",
-    targetId: "task_1",
+    targetType: "project",
+    targetId: "project_1",
     repo: "acme/looper",
     prNumber: 42,
-    dedupeKey: "worker:task_1",
+    dedupeKey: "worker:loop_1",
     priority: 3,
     status: "queued",
     availableAt: now,
@@ -100,21 +86,15 @@ async function createFixture() {
     claimedAt: null,
     startedAt: null,
     finishedAt: null,
-    lockKey: "task:task_1",
-    payloadJson: null,
+    lockKey: "worker:loop_1",
+    payloadJson: JSON.stringify({
+      title: "Wire runtime",
+      repo: "acme/looper",
+      baseBranch: "main",
+      prompt: "Wire runtime",
+    }),
     lastError: null,
     lastErrorKind: null,
-    createdAt: now,
-    updatedAt: now,
-  });
-  store.taskItems.upsert({
-    id: "task_item_1",
-    taskId: "task_1",
-    content: "Ship API routes",
-    status: "in_progress",
-    position: 1,
-    source: "user",
-    metadataJson: null,
     createdAt: now,
     updatedAt: now,
   });
@@ -242,13 +222,12 @@ describe("createLooperdApi", () => {
       new Request("http://localhost/api/v1/pull-requests/acme%2Flooper/42"),
     );
     const prBody = (await prResponse.json()) as {
-      data: { repo: string; prNumber: number; task: { id: string } | null };
+      data: { repo: string; prNumber: number };
     };
     expect(prBody.data.repo).toBe("acme/looper");
     expect(prBody.data.prNumber).toBe(42);
     expect((prBody.data as { reviewer?: string }).reviewer).toBe("running");
     expect((prBody.data as { fixer?: string }).fixer).toBe("paused");
-    expect(prBody.data.task?.id).toBe("task_1");
 
     const prListResponse = await api.handle(
       new Request("http://localhost/api/v1/pull-requests"),
@@ -342,7 +321,7 @@ describe("createLooperdApi", () => {
     await rm(rootDir, { recursive: true, force: true });
   });
 
-  test("returns loop, task, and run read routes", async () => {
+  test("returns loop and run read routes", async () => {
     const { api, store, rootDir } = await createFixture();
 
     const loopsResponse = await api.handle(
@@ -362,24 +341,6 @@ describe("createLooperdApi", () => {
     };
     expect(loopBody.data.id).toBe("loop_1");
     expect(loopBody.data.status).toBe("running");
-
-    const tasksResponse = await api.handle(
-      new Request("http://localhost/api/v1/tasks"),
-    );
-    const tasksBody = (await tasksResponse.json()) as {
-      data: { items: Array<{ id: string }> };
-    };
-    expect(tasksResponse.status).toBe(200);
-    expect(tasksBody.data.items[0]?.id).toBe("task_1");
-
-    const taskResponse = await api.handle(
-      new Request("http://localhost/api/v1/tasks/task_1"),
-    );
-    const taskBody = (await taskResponse.json()) as {
-      data: { id: string; items: Array<{ id: string }> };
-    };
-    expect(taskBody.data.id).toBe("task_1");
-    expect(taskBody.data.items[0]?.id).toBe("task_item_1");
 
     const runsResponse = await api.handle(
       new Request("http://localhost/api/v1/runs"),
@@ -403,7 +364,7 @@ describe("createLooperdApi", () => {
     await rm(rootDir, { recursive: true, force: true });
   });
 
-  test("supports loop and task mutation routes", async () => {
+  test("supports loop and worker mutation routes", async () => {
     const { api, store, rootDir } = await createFixture();
 
     const pauseLoopResponse = await api.handle(
@@ -427,71 +388,42 @@ describe("createLooperdApi", () => {
     };
     expect(startLoopBody.data.status).toBe("running");
 
-    const createTaskResponse = await api.handle(
-      new Request("http://localhost/api/v1/tasks", {
+    const createWorkerResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           projectId: "project_1",
           title: "Implement CLI route",
-          description: "Create API endpoint",
+          prompt: "Create API endpoint",
           specPath: "specs/cli.md",
-          items: ["wire client", "add tests"],
+          repo: "acme/looper",
+          baseBranch: "main",
         }),
       }),
     );
-    const createTaskBody = (await createTaskResponse.json()) as {
+    const createWorkerBody = (await createWorkerResponse.json()) as {
       data: {
         id: string;
         status: string;
         title: string;
         specPath: string;
-        items: Array<{ id: string }>;
       };
     };
-    expect(createTaskResponse.status).toBe(200);
-    expect(createTaskBody.data.status).toBe("pending");
-    expect(createTaskBody.data.title).toBe("Implement CLI route");
-    expect(createTaskBody.data.specPath).toBe("specs/cli.md");
-    expect(createTaskBody.data.items).toHaveLength(2);
-
-    const startedTaskResponse = await api.handle(
-      new Request(
-        `http://localhost/api/v1/tasks/${createTaskBody.data.id}/start`,
-        {
-          method: "POST",
-        },
-      ),
-    );
-    const startedTaskBody = (await startedTaskResponse.json()) as {
-      data: { status: string; loopId: string | null };
-    };
-    expect(startedTaskBody.data.status).toBe("in_progress");
-    expect(startedTaskBody.data.loopId).toBeTruthy();
+    expect(createWorkerResponse.status).toBe(200);
+    expect(createWorkerBody.data.status).toBe("running");
+    expect(createWorkerBody.data.title).toBe("Implement CLI route");
+    expect(createWorkerBody.data.specPath).toBe("specs/cli.md");
     expect(
-      store.queue.findActiveByDedupe(`worker:${createTaskBody.data.id}`),
+      store.queue.findActiveByDedupe(`worker:${createWorkerBody.data.id}`),
     ).toMatchObject({
-      loopId: startedTaskBody.data.loopId,
-      taskId: createTaskBody.data.id,
+      loopId: createWorkerBody.data.id,
       type: "worker",
       status: "queued",
     });
 
-    const pausedTaskResponse = await api.handle(
-      new Request(
-        `http://localhost/api/v1/tasks/${createTaskBody.data.id}/pause`,
-        {
-          method: "POST",
-        },
-      ),
-    );
-    const pausedTaskBody = (await pausedTaskResponse.json()) as {
-      data: { status: string };
-    };
-    expect(pausedTaskBody.data.status).toBe("paused");
-
     const validationResponse = await api.handle(
-      new Request("http://localhost/api/v1/tasks", {
+      new Request("http://localhost/api/v1/workers", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ projectId: "project_1", title: "" }),
@@ -654,8 +586,8 @@ describe("createLooperdApi", () => {
         body: JSON.stringify({
           projectId: "project_1",
           type: "worker",
-          targetType: "task",
-          taskId: "task_1",
+          targetType: "project",
+          targetId: "project_1",
         }),
       }),
     );
@@ -700,8 +632,8 @@ describe("createLooperdApi", () => {
       id: "loop_worker_1",
       projectId: "project_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_2",
+      targetType: "project",
+      targetId: "project_1",
       repo: null,
       prNumber: null,
       status: "running",
@@ -709,19 +641,6 @@ describe("createLooperdApi", () => {
       metadataJson: null,
       lastRunAt: "2026-04-11T12:01:00.000Z",
       nextRunAt: "2026-04-11T12:01:00.000Z",
-      createdAt: "2026-04-11T12:01:00.000Z",
-      updatedAt: "2026-04-11T12:01:00.000Z",
-    });
-    store.tasks.upsert({
-      id: "task_2",
-      projectId: "project_1",
-      title: "Implement ps command",
-      description: null,
-      status: "in_progress",
-      loopId: "loop_worker_1",
-      repo: null,
-      prNumber: null,
-      metadataJson: null,
       createdAt: "2026-04-11T12:01:00.000Z",
       updatedAt: "2026-04-11T12:01:00.000Z",
     });
@@ -773,13 +692,13 @@ describe("createLooperdApi", () => {
       updatedAt: "2026-04-11T12:02:30.000Z",
     });
 
-    // fallback label should use task id when task title is unavailable
+    // fallback label should use project id when project metadata is unavailable
     store.loops.upsert({
       id: "loop_worker_fallback",
       projectId: "project_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_fallback",
+      targetType: "project",
+      targetId: "project_fallback",
       repo: null,
       prNumber: null,
       status: "running",
@@ -812,7 +731,6 @@ describe("createLooperdApi", () => {
       projectId: "project_1",
       loopId: "loop_worker_1",
       runId: null,
-      taskId: "task_2",
       vendor: "opencode",
       status: "running",
       pid: 99901,
@@ -838,7 +756,6 @@ describe("createLooperdApi", () => {
       projectId: "project_1",
       loopId: "loop_worker_1",
       runId: "run_worker_1",
-      taskId: "task_2",
       vendor: "opencode",
       status: "running",
       pid: 11111,
@@ -862,7 +779,6 @@ describe("createLooperdApi", () => {
       projectId: "project_1",
       loopId: "loop_worker_1",
       runId: "run_worker_1",
-      taskId: "task_2",
       vendor: "opencode",
       status: "running",
       pid: 22222,
@@ -886,7 +802,6 @@ describe("createLooperdApi", () => {
       projectId: "project_1",
       loopId: "loop_fixer_1",
       runId: "run_fixer_1",
-      taskId: null,
       vendor: "opencode",
       status: "running",
       pid: 33333,
@@ -915,7 +830,7 @@ describe("createLooperdApi", () => {
           runId: string;
           type: string;
           currentStep: string | null;
-          target: { type: string; label: string; taskId?: string };
+          target: { type: string; label: string; projectId?: string };
           agent: {
             executionId: string;
             activeCount: number;
@@ -951,9 +866,9 @@ describe("createLooperdApi", () => {
       type: "worker",
       currentStep: "execute",
       target: {
-        type: "task",
-        taskId: "task_2",
-        label: "Implement ps command",
+        type: "project",
+        projectId: "project_1",
+        label: "Looper",
       },
       agent: {
         executionId: "agent_exec_worker_new",
@@ -981,9 +896,9 @@ describe("createLooperdApi", () => {
       (item) => item.runId === "run_worker_fallback",
     );
     expect(fallbackTaskTarget?.target).toMatchObject({
-      type: "task",
-      taskId: "task_fallback",
-      label: "task_fallback",
+      type: "project",
+      projectId: "project_fallback",
+      label: "project_fallback",
     });
 
     const typeFiltered = await api.handle(
@@ -1004,16 +919,6 @@ describe("createLooperdApi", () => {
       data: { items: Array<{ runId: string }> };
     };
     expect(projectFilteredBody.data.items).toHaveLength(4);
-
-    const taskFiltered = await api.handle(
-      new Request("http://localhost/api/v1/runs/active?taskId=task_2"),
-    );
-    const taskFilteredBody = (await taskFiltered.json()) as {
-      data: { items: Array<{ runId: string }> };
-    };
-    expect(taskFilteredBody.data.items.map((item) => item.runId)).toEqual([
-      "run_worker_1",
-    ]);
 
     const prFiltered = await api.handle(
       new Request(

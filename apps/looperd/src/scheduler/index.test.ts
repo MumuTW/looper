@@ -117,8 +117,8 @@ describe("SchedulerQueue", () => {
         id: "loop_1",
         projectId: "project_1",
         type: "worker",
-        targetType: "task",
-        targetId: "task_1",
+        targetType: "project",
+        targetId: "project_1",
         repo: null,
         prNumber: null,
         status: "queued",
@@ -129,44 +129,29 @@ describe("SchedulerQueue", () => {
         createdAt: "2026-04-11T13:00:00.000Z",
         updatedAt: "2026-04-11T13:00:00.000Z",
       });
-      store.tasks.upsert({
-        id: "task_1",
-        projectId: "project_1",
-        title: "Task",
-        description: null,
-        status: "ready",
-        loopId: "loop_1",
-        repo: null,
-        prNumber: null,
-        metadataJson: null,
-        createdAt: "2026-04-11T13:00:00.000Z",
-        updatedAt: "2026-04-11T13:00:00.000Z",
-      });
-
       const item = queue.enqueue({
         loopId: "loop_1",
-        taskId: "task_1",
         type: "worker",
-        targetType: "task",
-        targetId: "task_1",
-        dedupeKey: "worker:task_1",
+        targetType: "project",
+        targetId: "project_1",
+        dedupeKey: "worker:loop_1",
       });
 
       expect(
         queue.acquireBusinessLock({
-          key: "task:task_1",
+          key: "worker:loop_1",
           owner: item.id,
           expiresAt: "2026-04-11T13:05:00.000Z",
           reason: "execute",
         }),
       ).toBe(true);
-      expect(store.locks.get("task:task_1")?.owner).toBe(item.id);
+      expect(store.locks.get("worker:loop_1")?.owner).toBe(item.id);
 
-      expect(queue.cancelByTask("task_1", "task paused")).toBe(1);
+      expect(queue.cancelByLoop("loop_1", "loop paused")).toBe(1);
       expect(store.queue.getById(item.id)?.status).toBe("cancelled");
 
-      queue.releaseBusinessLock("task:task_1");
-      expect(store.locks.get("task:task_1")).toBeNull();
+      queue.releaseBusinessLock("worker:loop_1");
+      expect(store.locks.get("worker:loop_1")).toBeNull();
     } finally {
       store.close();
       await rm(rootDir, { recursive: true, force: true });

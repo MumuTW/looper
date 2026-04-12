@@ -16,18 +16,15 @@ import type {
   QueueFailureKind,
   QueueItemRecord,
   RunRecord,
-  TaskItemRecord,
-  TaskRecord,
   WorktreeRecord,
 } from "../storage/types";
 
 const WORKER_STEP_SEQUENCE = [
-  "prepare-task",
+  "prepare-work",
   "prepare-worktree",
-  "plan-step",
-  "execute-step",
-  "validate-step",
-  "sync-checklist",
+  "plan",
+  "execute",
+  "validate",
   "open-pr",
 ] as const;
 
@@ -36,7 +33,6 @@ export type WorkerStep = (typeof WORKER_STEP_SEQUENCE)[number];
 export interface WorkerGitGateway {
   createWorktree(input: {
     projectId: string;
-    taskId?: string;
     repoPath: string;
     worktreeRoot: string;
     branch: string;
@@ -112,8 +108,15 @@ export interface WorkerProcessResult {
   status: "success" | "skipped" | "failed";
   summary: string;
   failureKind?: QueueFailureKind;
-  requeuedQueueItemId?: string;
   pullRequestNumber?: number;
+}
+
+interface WorkerInput {
+  title: string;
+  prompt?: string | null;
+  specPath?: string | null;
+  repo: string;
+  baseBranch: string;
 }
 
 interface WorkerCheckpoint {
@@ -121,14 +124,7 @@ interface WorkerCheckpoint {
     | "replay_step"
     | "advance_from_checkpoint"
     | "manual_intervention";
-  task?: {
-    id: string;
-    title: string;
-    description?: string | null;
-    repo: string;
-    baseBranch: string;
-    specPath?: string | null;
-  };
+  work?: WorkerInput;
   claimedLockKey?: string;
   worktree?: {
     id: string;
@@ -136,7 +132,10 @@ interface WorkerCheckpoint {
     branch: string;
     baseBranch: string;
   };
-  plannedItemIds?: string[];
+  plan?: {
+    summary: string;
+    items: string[];
+  };
   execution?: {
     status: AgentResult["status"];
     summary?: string;
@@ -145,9 +144,6 @@ interface WorkerCheckpoint {
     stdout: string;
   };
   validation?: WorkerValidationResult;
-  syncedItemIds?: string[];
-  remainingItemIds?: string[];
-  allItemsDone?: boolean;
   pullRequest?: {
     number?: number;
     url: string;
@@ -186,7 +182,7 @@ export class WorkerLoopRunner {
     this.agentTimeoutMs = options.agentTimeoutMs ?? 30 * 60_000;
     this.claimTtlMs = options.claimTtlMs ?? 10 * 60_000;
     this.validationCommands = options.validationCommands ?? [];
-    this.openPrStrategy = options.openPrStrategy ?? "all_done";
+    this.openPrStrategy = options.openPrStrategy ?? "manual";
     this.allowAutoCommit = options.allowAutoCommit ?? true;
     this.allowAutoPush = options.allowAutoPush ?? true;
   }
@@ -208,18 +204,17 @@ export class WorkerLoopRunner {
     if (queueItem.type !== "worker") {
       throw new Error(`Unsupported queue item type: ${queueItem.type}`);
     }
-    if (!queueItem.loopId || !queueItem.taskId) {
-      throw new Error("Worker queue item requires loopId and taskId");
+    if (!queueItem.loopId) {
+      throw new Error("Worker queue item requires loopId");
     }
 
     const loop = this.getLoop(queueItem.loopId);
     const project = this.getProject(loop.projectId);
-    const task = this.getTask(queueItem.taskId);
     const resumedRun = this.createRunContext(loop);
     let run = resumedRun.run;
     let checkpoint = resumedRun.checkpoint;
     let claimedLockKey =
-      resumedRun.startStep !== "prepare-task"
+      resumedRun.startStep !== "prepare-work"
         ? checkpoint.claimedLockKey
         : undefined;
 
@@ -234,7 +229,7 @@ export class WorkerLoopRunner {
       });
       if (!acquired) {
         throw new WorkerLoopError(
-          `Task lock is already held for ${claimedLockKey}`,
+          `Worker lock is already held for ${claimedLockKey}`,
           "retryable_transient",
         );
       }
@@ -254,39 +249,9 @@ export class WorkerLoopRunner {
       entityId: loop.id,
       payload: {
         queueItemId: queueItem.id,
-        taskId: task.id,
         resumed: resumedRun.resumed,
         startStep: resumedRun.startStep,
       },
-    });
-    this.options.logger.info("worker loop started", {
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      taskId: task.id,
-      queueItemId: queueItem.id,
-      currentStep: resumedRun.startStep,
-      resumed: resumedRun.resumed,
-    });
-    this.appendEvent({
-      eventType: "run.started",
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      entityType: "run",
-      entityId: run.id,
-      payload: {
-        queueItemId: queueItem.id,
-        currentStep: resumedRun.startStep,
-      },
-    });
-    this.options.logger.info("worker run started", {
-      projectId: project.id,
-      loopId: loop.id,
-      runId: run.id,
-      taskId: task.id,
-      queueItemId: queueItem.id,
-      currentStep: resumedRun.startStep,
     });
 
     try {
@@ -294,96 +259,36 @@ export class WorkerLoopRunner {
         WORKER_STEP_SEQUENCE.indexOf(resumedRun.startStep),
       )) {
         run = this.persistStepStarted(run, step, checkpoint);
-        this.appendEvent({
-          eventType: "loop.step.started",
-          projectId: project.id,
-          loopId: loop.id,
-          runId: run.id,
-          entityType: "run",
-          entityId: run.id,
-          payload: { step },
-        });
-        this.options.logger.info("worker step started", {
-          projectId: project.id,
-          loopId: loop.id,
-          runId: run.id,
-          taskId: task.id,
-          queueItemId: queueItem.id,
-          currentStep: step,
-        });
-
         checkpoint = await this.executeStep({
           step,
           checkpoint,
           project,
           loop,
           run,
-          task,
           queueItem,
         });
 
-        if (step === "prepare-task") {
+        if (step === "prepare-work") {
           claimedLockKey = checkpoint.claimedLockKey;
         }
 
         run = this.persistStepCompleted(run, step, checkpoint);
-        this.appendEvent({
-          eventType: "loop.step.completed",
-          projectId: project.id,
-          loopId: loop.id,
-          runId: run.id,
-          entityType: "run",
-          entityId: run.id,
-          payload: { step },
-        });
-        this.options.logger.info("worker step completed", {
-          projectId: project.id,
-          loopId: loop.id,
-          runId: run.id,
-          taskId: task.id,
-          queueItemId: queueItem.id,
-          currentStep: step,
-        });
-
         if (checkpoint.skipReason) {
           break;
         }
       }
 
-      const summary = this.buildSuccessSummary(task, checkpoint);
+      const summary = this.buildSuccessSummary(loop, checkpoint);
       this.finalizeRun(run, {
         status: "success",
         summary,
         checkpoint,
       });
-      this.appendEvent({
-        eventType: "run.completed",
-        projectId: project.id,
-        loopId: loop.id,
-        runId: run.id,
-        entityType: "run",
-        entityId: run.id,
-        payload: { summary },
-      });
-      this.options.logger.info(
-        checkpoint.skipReason ? "worker run skipped" : "worker run completed",
-        {
-          projectId: project.id,
-          loopId: loop.id,
-          runId: run.id,
-          taskId: task.id,
-          queueItemId: queueItem.id,
-          currentStep: run.currentStep,
-          summary,
-        },
-      );
       this.options.scheduler.complete(queueItem.id);
-
-      const requeuedItem = this.handlePostRunSuccess({
-        loop,
-        queueItem,
-        task,
-        checkpoint,
+      this.updateLoop(loop, {
+        status: "completed",
+        lastRunAt: this.nowIso(),
+        nextRunAt: null,
       });
 
       return {
@@ -392,24 +297,10 @@ export class WorkerLoopRunner {
         queueItemId: queueItem.id,
         status: checkpoint.skipReason ? "skipped" : "success",
         summary,
-        requeuedQueueItemId: requeuedItem?.id,
         pullRequestNumber: checkpoint.pullRequest?.number,
       };
     } catch (error) {
       const failure = this.classifyFailure(error);
-      this.appendEvent({
-        eventType: "loop.step.failed",
-        projectId: project.id,
-        loopId: loop.id,
-        runId: run.id,
-        entityType: "run",
-        entityId: run.id,
-        payload: {
-          message: failure.message,
-          failureKind: failure.kind,
-          currentStep: run.currentStep,
-        },
-      });
       this.finalizeRun(run, {
         status: "failed",
         summary: failure.message,
@@ -424,28 +315,6 @@ export class WorkerLoopRunner {
         },
         errorMessage: failure.message,
       });
-      this.appendEvent({
-        eventType: "run.failed",
-        projectId: project.id,
-        loopId: loop.id,
-        runId: run.id,
-        entityType: "run",
-        entityId: run.id,
-        payload: {
-          summary: failure.message,
-          failureKind: failure.kind,
-        },
-      });
-      this.options.logger.error("worker run failed", {
-        projectId: project.id,
-        loopId: loop.id,
-        runId: run.id,
-        taskId: task.id,
-        queueItemId: queueItem.id,
-        currentStep: run.currentStep,
-        failureKind: failure.kind,
-        summary: failure.message,
-      });
 
       const failedQueueItem = this.options.scheduler.fail(
         queueItem.id,
@@ -453,19 +322,19 @@ export class WorkerLoopRunner {
         failure.message,
       );
 
-      if (failedQueueItem?.status === "queued") {
-        this.updateLoop(loop, {
-          status: "queued",
-          lastRunAt: this.nowIso(),
-          nextRunAt: failedQueueItem.availableAt,
-        });
-      } else {
-        this.updateLoop(loop, {
-          status: failure.kind === "manual_intervention" ? "paused" : "failed",
-          lastRunAt: this.nowIso(),
-          nextRunAt: null,
-        });
-      }
+      this.updateLoop(loop, {
+        status:
+          failedQueueItem?.status === "queued"
+            ? "queued"
+            : failure.kind === "manual_intervention"
+              ? "paused"
+              : "failed",
+        lastRunAt: this.nowIso(),
+        nextRunAt:
+          failedQueueItem?.status === "queued"
+            ? failedQueueItem.availableAt
+            : null,
+      });
 
       return {
         loopId: loop.id,
@@ -488,55 +357,37 @@ export class WorkerLoopRunner {
     project: ProjectRecord;
     loop: LoopRecord;
     run: RunRecord;
-    task: TaskRecord;
     queueItem: QueueItemRecord;
   }): Promise<WorkerCheckpoint> {
     switch (input.step) {
-      case "prepare-task":
-        return this.runPrepareTaskStep(input);
+      case "prepare-work":
+        return this.runPrepareWorkStep(input);
       case "prepare-worktree":
         return this.runPrepareWorktreeStep(input);
-      case "plan-step":
+      case "plan":
         return this.runPlanStep(input);
-      case "execute-step":
+      case "execute":
         return this.runExecuteStep(input);
-      case "validate-step":
+      case "validate":
         return this.runValidateStep(input);
-      case "sync-checklist":
-        return this.runSyncChecklistStep(input);
       case "open-pr":
         return this.runOpenPrStep(input);
     }
   }
 
-  private async runPrepareTaskStep(input: {
+  private async runPrepareWorkStep(input: {
     checkpoint: WorkerCheckpoint;
-    project: ProjectRecord;
     queueItem: QueueItemRecord;
-    task: TaskRecord;
+    loop: LoopRecord;
+    project: ProjectRecord;
   }): Promise<WorkerCheckpoint> {
-    const repo = requireString(input.task.repo, "task.repo");
-    const baseBranch = requireString(
-      input.project.baseBranch,
-      "project.baseBranch",
-    );
-    if (this.listTaskItems(input.task.id).length === 0) {
-      throw new WorkerLoopError(
-        `Task ${input.task.id} has no checklist items`,
-        "non_retryable",
+    const work =
+      input.checkpoint.work ??
+      this.resolveWorkerInput(
+        input.queueItem.payloadJson,
+        input.loop.metadataJson,
       );
-    }
-
-    const metadata = parseJsonObject(input.task.metadataJson);
-    const specPath = readString(metadata.specPath);
-    if (!specPath) {
-      throw new WorkerLoopError(
-        `Task ${input.task.id} is missing a bound specPath`,
-        "non_retryable",
-      );
-    }
-
-    const lockKey = input.queueItem.lockKey ?? `task:${input.task.id}`;
+    const lockKey = input.queueItem.lockKey ?? `worker:${input.loop.id}`;
     const acquired = this.options.scheduler.acquireBusinessLock({
       key: lockKey,
       owner: input.queueItem.id,
@@ -545,21 +396,14 @@ export class WorkerLoopRunner {
     });
     if (!acquired) {
       throw new WorkerLoopError(
-        `Task lock is already held for ${lockKey}`,
+        `Worker lock is already held for ${lockKey}`,
         "retryable_transient",
       );
     }
 
     return {
       ...input.checkpoint,
-      task: {
-        id: input.task.id,
-        title: input.task.title,
-        description: input.task.description ?? null,
-        repo,
-        baseBranch,
-        specPath,
-      },
+      work,
       claimedLockKey: lockKey,
       resumePolicy: "advance_from_checkpoint",
     };
@@ -568,29 +412,28 @@ export class WorkerLoopRunner {
   private async runPrepareWorktreeStep(input: {
     checkpoint: WorkerCheckpoint;
     project: ProjectRecord;
-    task: TaskRecord;
+    loop: LoopRecord;
   }): Promise<WorkerCheckpoint> {
     if (input.checkpoint.worktree) {
       return input.checkpoint;
     }
 
-    const taskInfo = requireTaskInfo(input.checkpoint);
-    const branch = `looper/task/${input.task.id}`;
+    const work = requireWork(input.checkpoint);
     const projectMetadata = parseJsonObject(input.project.metadataJson);
     const configuredRoot = readString(projectMetadata.worktreeRoot);
     const worktreeRoot =
       configuredRoot ?? join(input.project.repoPath, ".looper-worktrees");
+    const branch = `looper/worker/${slugify(input.loop.id)}`;
     const worktree = await this.options.git.createWorktree({
       projectId: input.project.id,
-      taskId: input.task.id,
       repoPath: input.project.repoPath,
       worktreeRoot,
       branch,
-      baseBranch: taskInfo.baseBranch,
-      protectedBranches: [taskInfo.baseBranch],
+      baseBranch: work.baseBranch,
+      protectedBranches: [work.baseBranch],
     });
 
-    this.updateLoopMetadata(input.task.loopId, {
+    this.updateLoopMetadata(input.loop.id, {
       worktreeId: worktree.id,
       worktreePath: worktree.worktreePath,
       branch: worktree.branch,
@@ -611,42 +454,23 @@ export class WorkerLoopRunner {
 
   private async runPlanStep(input: {
     checkpoint: WorkerCheckpoint;
-    task: TaskRecord;
   }): Promise<WorkerCheckpoint> {
-    const taskItems = this.listTaskItems(input.task.id);
-    const planned = taskItems
-      .filter(
-        (item) => item.status === "in_progress" || item.status === "pending",
-      )
-      .slice(0, 2);
-
-    if (planned.length === 0) {
-      return {
-        ...input.checkpoint,
-        plannedItemIds: [],
-        remainingItemIds: [],
-        allItemsDone: true,
-        resumePolicy: "advance_from_checkpoint",
-      };
+    if (input.checkpoint.plan) {
+      return input.checkpoint;
     }
 
-    for (const item of planned) {
-      if (item.status !== "in_progress") {
-        this.options.store.taskItems.upsert({
-          ...item,
-          status: "in_progress",
-          updatedAt: this.nowIso(),
-        });
-      }
-    }
+    const work = requireWork(input.checkpoint);
+    const items = [
+      work.prompt ? `Implement: ${work.prompt}` : null,
+      work.specPath ? `Follow spec: ${work.specPath}` : null,
+    ].filter((value): value is string => Boolean(value));
 
     return {
       ...input.checkpoint,
-      plannedItemIds: planned.map((item) => item.id),
-      remainingItemIds: taskItems
-        .filter((item) => item.status !== "done")
-        .map((item) => item.id),
-      allItemsDone: false,
+      plan: {
+        summary: work.title,
+        items: items.length > 0 ? items : [work.title],
+      },
       resumePolicy: "advance_from_checkpoint",
     };
   }
@@ -656,39 +480,24 @@ export class WorkerLoopRunner {
     project: ProjectRecord;
     loop: LoopRecord;
     run: RunRecord;
-    task: TaskRecord;
   }): Promise<WorkerCheckpoint> {
-    const plannedItems = this.getPlannedItems(input.task.id, input.checkpoint);
-    if (plannedItems.length === 0) {
-      return {
-        ...input.checkpoint,
-        execution: {
-          status: "completed",
-          summary: "No checklist items selected for this run",
-          changedFiles: [],
-          commits: [],
-          stdout: "",
-        },
-      };
-    }
     if (input.checkpoint.execution?.status === "completed") {
       return input.checkpoint;
     }
-
     if (!this.allowAutoCommit) {
       return {
         ...input.checkpoint,
-        skipReason: `Auto commit disabled; manual execution required for task ${input.task.id}`,
+        skipReason: `Auto commit disabled; manual execution required for worker ${input.loop.id}`,
         resumePolicy: "manual_intervention",
       };
     }
 
-    const taskInfo = requireTaskInfo(input.checkpoint);
+    const work = requireWork(input.checkpoint);
     const worktree = requireWorktree(input.checkpoint);
     const prompt = await buildWorkerPrompt({
       projectRepoPath: input.project.repoPath,
-      task: taskInfo,
-      items: plannedItems,
+      work,
+      plan: input.checkpoint.plan?.items ?? [],
     });
     const executionId = randomUUID();
     const execution = await this.options.agentExecutor.start({
@@ -696,28 +505,27 @@ export class WorkerLoopRunner {
       projectId: input.project.id,
       loopId: input.loop.id,
       runId: input.run.id,
-      taskId: input.task.id,
       prompt,
       workingDirectory: worktree.path,
       timeoutMs: this.agentTimeoutMs,
       metadata: {
         loopType: "worker",
-        taskId: input.task.id,
-        plannedItemIds: plannedItems.map((item) => item.id),
+        title: work.title,
+        repo: work.repo,
+        baseBranch: work.baseBranch,
       },
-      idempotencyKey: `worker:${input.loop.id}:${plannedItems.map((item) => item.id).join(",")}`,
+      idempotencyKey: `worker:${input.loop.id}`,
     });
     await this.options.onAgentExecutionStarted?.({
       executionId,
       projectId: input.project.id,
       loopId: input.loop.id,
       runId: input.run.id,
-      subtitle: input.task.id,
-      body: "Task started",
+      subtitle: work.title,
+      body: "Worker started",
       dedupeKey: `runtime.agent.started:worker:${input.run.id}`,
     });
     const result = await execution.wait();
-
     if (result.status !== "completed") {
       throw new WorkerLoopError(
         result.summary ?? `Worker agent ${result.status}`,
@@ -741,17 +549,6 @@ export class WorkerLoopRunner {
   private async runValidateStep(input: {
     checkpoint: WorkerCheckpoint;
   }): Promise<WorkerCheckpoint> {
-    if ((input.checkpoint.plannedItemIds?.length ?? 0) === 0) {
-      return {
-        ...input.checkpoint,
-        validation: {
-          passed: true,
-          summary: "No validation required for empty checklist slice",
-          output: "",
-        },
-      };
-    }
-
     const worktree = requireWorktree(input.checkpoint);
     return {
       ...input.checkpoint,
@@ -763,84 +560,34 @@ export class WorkerLoopRunner {
     };
   }
 
-  private async runSyncChecklistStep(input: {
-    checkpoint: WorkerCheckpoint;
-    project: ProjectRecord;
-    loop: LoopRecord;
-    run: RunRecord;
-    task: TaskRecord;
-  }): Promise<WorkerCheckpoint> {
-    const plannedItems = this.getPlannedItems(input.task.id, input.checkpoint);
-    const passed = input.checkpoint.validation?.passed ?? false;
-    const syncedItemIds: string[] = [];
-
-    for (const item of plannedItems) {
-      const updated: TaskItemRecord = {
-        ...item,
-        status: passed ? "done" : "in_progress",
-        updatedAt: this.nowIso(),
-      };
-      this.options.store.taskItems.upsert(updated);
-      syncedItemIds.push(item.id);
-    }
-
-    const remainingItems = this.listTaskItems(input.task.id).filter(
-      (item) => item.status !== "done",
-    );
-    const allItemsDone = remainingItems.length === 0;
-    this.options.store.tasks.upsert({
-      ...input.task,
-      status: "in_progress",
-      updatedAt: this.nowIso(),
-    });
-    this.appendEvent({
-      eventType: "task.checklist.updated",
-      projectId: input.project.id,
-      loopId: input.loop.id,
-      runId: input.run.id,
-      entityType: "task",
-      entityId: input.task.id,
-      payload: {
-        syncedItemIds,
-        allItemsDone,
-        validationPassed: passed,
-      },
-    });
-
-    return {
-      ...input.checkpoint,
-      syncedItemIds,
-      remainingItemIds: remainingItems.map((item) => item.id),
-      allItemsDone,
-      resumePolicy: "advance_from_checkpoint",
-    };
-  }
-
   private async runOpenPrStep(input: {
     checkpoint: WorkerCheckpoint;
     project: ProjectRecord;
-    task: TaskRecord;
+    loop: LoopRecord;
   }): Promise<WorkerCheckpoint> {
-    if (input.task.prNumber || input.checkpoint.pullRequest) {
+    if (input.checkpoint.pullRequest) {
       return input.checkpoint;
     }
 
-    const taskInfo = requireTaskInfo(input.checkpoint);
+    const work = requireWork(input.checkpoint);
     const worktree = requireWorktree(input.checkpoint);
-    const shouldOpen =
-      this.openPrStrategy !== "manual" &&
-      (Boolean(input.checkpoint.allItemsDone) ||
-        (this.openPrStrategy === "first_commit" &&
-          (input.checkpoint.execution?.commits.length ?? 0) > 0));
-
-    if (!shouldOpen) {
-      return input.checkpoint;
+    if (input.checkpoint.validation?.passed === false) {
+      throw new WorkerLoopError(
+        input.checkpoint.validation.summary ?? "Validation failed",
+        "manual_intervention",
+      );
     }
-
+    if (this.openPrStrategy === "manual") {
+      return {
+        ...input.checkpoint,
+        skipReason: `Worker completed; PR opening is manual for ${input.loop.id}`,
+        resumePolicy: "manual_intervention",
+      };
+    }
     if (!this.allowAutoPush) {
       return {
         ...input.checkpoint,
-        skipReason: `Auto push disabled; manual PR opening required for task ${input.task.id}`,
+        skipReason: `Auto push disabled; manual PR opening required for worker ${input.loop.id}`,
         resumePolicy: "manual_intervention",
       };
     }
@@ -849,30 +596,26 @@ export class WorkerLoopRunner {
       await this.options.git.push({
         worktreePath: worktree.path,
         branch: worktree.branch,
-        protectedBranches: [taskInfo.baseBranch],
+        protectedBranches: [work.baseBranch],
       });
       const pullRequest = await this.options.github.createPullRequest({
-        repo: taskInfo.repo,
+        repo: work.repo,
         headBranch: worktree.branch,
-        baseBranch: taskInfo.baseBranch,
-        title: taskInfo.title.trim(),
+        baseBranch: work.baseBranch,
+        title: work.title,
         body: buildPullRequestBody({
-          task: taskInfo,
+          work,
+          plan: input.checkpoint.plan?.items ?? [],
           executionSummary: input.checkpoint.execution?.summary,
-          itemContents: this.getPlannedItems(
-            input.task.id,
-            input.checkpoint,
-          ).map((item) => item.content),
         }),
         cwd: input.project.repoPath,
       });
 
-      this.options.store.tasks.upsert({
-        ...input.task,
+      this.updateLoop(input.loop, {
+        repo: work.repo,
         prNumber: pullRequest.number ?? null,
-        updatedAt: this.nowIso(),
       });
-      this.updateLoopMetadata(input.task.loopId, {
+      this.updateLoopMetadata(input.loop.id, {
         prUrl: pullRequest.url,
         prNumber: pullRequest.number ?? null,
       });
@@ -890,6 +633,33 @@ export class WorkerLoopRunner {
     }
   }
 
+  private resolveWorkerInput(
+    payloadJson?: string | null,
+    metadataJson?: string | null,
+  ): WorkerInput {
+    const payload = parseJsonObject(payloadJson);
+    const metadata = parseJsonObject(metadataJson);
+    const worker = asObject(metadata.worker);
+    const source = { ...worker, ...payload };
+
+    const title = readString(source.title) ?? "Worker run";
+    const repo = readRequiredStringValue(source.repo, "worker.repo");
+    const baseBranch = readRequiredStringValue(
+      source.baseBranch,
+      "worker.baseBranch",
+    );
+    const prompt = readString(source.prompt);
+    const specPath = readString(source.specPath);
+    if (!prompt && !specPath) {
+      throw new WorkerLoopError(
+        "worker.prompt or worker.specPath is required",
+        "non_retryable",
+      );
+    }
+
+    return { title, repo, baseBranch, prompt, specPath };
+  }
+
   private createRunContext(loop: LoopRecord): ResumedRunContext {
     const latestRun = this.options.store.runs.listByLoop(loop.id)[0] ?? null;
     const nowIso = this.nowIso();
@@ -899,12 +669,12 @@ export class WorkerLoopRunner {
       latestRun &&
       (latestRun.status === "failed" || latestRun.status === "interrupted") &&
       lastCompletedStep
-        ? (nextWorkerStep(lastCompletedStep) ?? "prepare-task")
-        : "prepare-task";
+        ? (nextWorkerStep(lastCompletedStep) ?? "prepare-work")
+        : "prepare-work";
     const resumed =
       Boolean(latestRun) &&
       (latestRun?.status === "failed" || latestRun?.status === "interrupted") &&
-      startStep !== "prepare-task";
+      startStep !== "prepare-work";
 
     const run: RunRecord = {
       id: randomUUID(),
@@ -992,84 +762,18 @@ export class WorkerLoopRunner {
     return updated;
   }
 
-  private handlePostRunSuccess(input: {
-    loop: LoopRecord;
-    queueItem: QueueItemRecord;
-    task: TaskRecord;
-    checkpoint: WorkerCheckpoint;
-  }): QueueItemRecord | null {
-    const currentTask =
-      this.options.store.tasks.getById(input.task.id) ?? input.task;
-
-    if (input.checkpoint.skipReason) {
-      this.options.store.tasks.upsert({
-        ...currentTask,
-        status:
-          currentTask.prNumber || this.openPrStrategy === "manual"
-            ? "completed"
-            : currentTask.status,
-        updatedAt: this.nowIso(),
-      });
-      this.updateLoop(input.loop, {
-        status: "completed",
-        lastRunAt: this.nowIso(),
-        nextRunAt: null,
-      });
-      return null;
-    }
-
-    if ((input.checkpoint.remainingItemIds?.length ?? 0) > 0) {
-      const requeued = this.options.scheduler.enqueue({
-        projectId: input.queueItem.projectId,
-        loopId: input.loop.id,
-        taskId: currentTask.id,
-        type: "worker",
-        targetType: "task",
-        targetId: input.queueItem.targetId,
-        repo: currentTask.repo,
-        dedupeKey: `worker:${currentTask.id}`,
-      });
-      this.updateLoop(input.loop, {
-        status: "queued",
-        lastRunAt: this.nowIso(),
-        nextRunAt: requeued.availableAt,
-      });
-      return requeued;
-    }
-
-    this.options.store.tasks.upsert({
-      ...currentTask,
-      status:
-        input.checkpoint.pullRequest || this.openPrStrategy === "manual"
-          ? "completed"
-          : "in_progress",
-      updatedAt: this.nowIso(),
-    });
-    this.updateLoop(input.loop, {
-      status: "completed",
-      lastRunAt: this.nowIso(),
-      nextRunAt: null,
-    });
-    return null;
-  }
-
   private buildSuccessSummary(
-    task: TaskRecord,
+    loop: LoopRecord,
     checkpoint: WorkerCheckpoint,
   ): string {
     if (checkpoint.skipReason) {
       return checkpoint.skipReason;
     }
     if (checkpoint.pullRequest?.url) {
-      return `Opened pull request for task ${task.id}: ${checkpoint.pullRequest.url}`;
+      return `Opened pull request for worker ${loop.id}: ${checkpoint.pullRequest.url}`;
     }
-    if ((checkpoint.remainingItemIds?.length ?? 0) > 0) {
-      return `Completed checklist slice for task ${task.id}; requeued remaining work`;
-    }
-    if (this.openPrStrategy === "manual") {
-      return `Completed task ${task.id}; PR opening is manual`;
-    }
-    return `Completed task ${task.id}`;
+
+    return `Completed worker ${loop.id}`;
   }
 
   private getLoop(loopId: string): LoopRecord {
@@ -1088,32 +792,6 @@ export class WorkerLoopRunner {
     }
 
     return project;
-  }
-
-  private getTask(taskId: string): TaskRecord {
-    const task = this.options.store.tasks.getById(taskId);
-    if (!task) {
-      throw new Error(`Task not found: ${taskId}`);
-    }
-
-    return task;
-  }
-
-  private listTaskItems(taskId: string): TaskItemRecord[] {
-    return this.options.store.taskItems.listByTask(taskId);
-  }
-
-  private getPlannedItems(
-    taskId: string,
-    checkpoint: WorkerCheckpoint,
-  ): TaskItemRecord[] {
-    const ids = checkpoint.plannedItemIds ?? [];
-    const byId = new Map(
-      this.listTaskItems(taskId).map((item) => [item.id, item]),
-    );
-    return ids
-      .map((id) => byId.get(id))
-      .filter((item): item is TaskItemRecord => Boolean(item));
   }
 
   private updateLoop(
@@ -1282,32 +960,38 @@ function parseJsonObject(
   }
 }
 
-function readString(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+function asObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
-function requireString(
-  value: string | null | undefined,
-  fieldName: string,
-): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new Error(`${fieldName} is required`);
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+function readRequiredStringValue(value: unknown, fieldName: string): string {
+  const result = readString(value);
+  if (!result) {
+    throw new WorkerLoopError(`${fieldName} is required`, "non_retryable");
   }
 
-  return value;
+  return result;
 }
 
-function requireTaskInfo(
+function requireWork(
   checkpoint: WorkerCheckpoint,
-): NonNullable<WorkerCheckpoint["task"]> {
-  if (!checkpoint.task) {
+): NonNullable<WorkerCheckpoint["work"]> {
+  if (!checkpoint.work) {
     throw new WorkerLoopError(
-      "Missing task checkpoint for worker step",
+      "Missing work checkpoint for worker step",
       "retryable_transient",
     );
   }
 
-  return checkpoint.task;
+  return checkpoint.work;
 }
 
 function requireWorktree(
@@ -1323,27 +1007,35 @@ function requireWorktree(
   return checkpoint.worktree;
 }
 
+function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 async function buildWorkerPrompt(input: {
   projectRepoPath: string;
-  task: NonNullable<WorkerCheckpoint["task"]>;
-  items: TaskItemRecord[];
+  work: WorkerInput;
+  plan: string[];
 }): Promise<string> {
   const specBlock = await readSpecBlock(
     input.projectRepoPath,
-    input.task.specPath,
+    input.work.specPath,
   );
   return appendCompletionInstruction(
     [
-      `Implement task ${input.task.id}: ${input.task.title}`,
-      input.task.description
-        ? `Task description:\n${input.task.description}`
-        : null,
-      `Repository: ${input.task.repo}`,
-      `Base branch: ${input.task.baseBranch}`,
+      `Create a pull request for: ${input.work.title}`,
+      input.work.prompt ? `User prompt:\n${input.work.prompt}` : null,
+      `Repository: ${input.work.repo}`,
+      `Base branch: ${input.work.baseBranch}`,
       specBlock,
-      "Checklist slice:",
-      ...input.items.map((item, index) => `${index + 1}. ${item.content}`),
-      "Work only on this checklist slice. Make the necessary code changes and stop when the slice is ready for validation.",
+      input.plan.length > 0
+        ? ["Execution plan:", ...input.plan.map((item) => `- ${item}`)].join(
+            "\n",
+          )
+        : null,
+      "Make the necessary code changes, validate them, and leave the branch ready for PR creation.",
     ]
       .filter((value): value is string => Boolean(value))
       .join("\n\n"),
@@ -1370,17 +1062,18 @@ async function readSpecBlock(
 }
 
 function buildPullRequestBody(input: {
-  task: NonNullable<WorkerCheckpoint["task"]>;
+  work: WorkerInput;
+  plan: string[];
   executionSummary?: string;
-  itemContents: string[];
 }): string {
   return [
     "## Summary",
-    ...input.itemContents.map((item) => `- ${item}`),
+    ...input.plan.map((item) => `- ${item}`),
     input.executionSummary
       ? `\n## Agent Summary\n${input.executionSummary}`
       : null,
-    input.task.specPath ? `\nSpec: ${input.task.specPath}` : null,
+    input.work.specPath ? `\nSpec: ${input.work.specPath}` : null,
+    input.work.prompt ? `\nPrompt: ${input.work.prompt}` : null,
   ]
     .filter((value): value is string => Boolean(value))
     .join("\n");

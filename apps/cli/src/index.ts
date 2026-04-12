@@ -79,8 +79,8 @@ interface ActiveRunItem {
   startedAt: string;
   target:
     | {
-        type: "task";
-        taskId: string;
+        type: "project";
+        projectId: string;
         label: string;
       }
     | {
@@ -212,24 +212,14 @@ async function dispatch(context: CliContext): Promise<void> {
       }
       context.showHelp("loop");
       return;
+    case "work":
+      return runWorkCreate(context);
     case "task":
-      if (subcommand === "create") {
-        return runTaskCreate(context);
-      }
-      if (subcommand === "start") {
-        return runTaskStart(context);
-      }
-      if (subcommand === "pause") {
-        return runTaskPause(context);
-      }
-      if (subcommand === "status") {
-        return runTaskStatus(context);
-      }
-      if (subcommand === "show") {
-        return runTaskShow(context);
-      }
-      context.showHelp("task");
-      return;
+      throw new Error("task commands were removed; use looper work instead");
+    case "worker":
+      throw new Error("worker commands were removed; use looper work instead");
+    case "workers":
+      throw new Error("worker commands were removed; use looper work instead");
     case "pr":
       if (subcommand === "list") {
         return runPrList(context);
@@ -304,7 +294,6 @@ function createCli(runtime: CliRuntime) {
     .usage("loop <subcommand> [options]")
     .option("--id <id>", "Loop id")
     .option("--type <type>", "Loop type")
-    .option("--task <taskId>", "Task id")
     .option("--pr <repo#number>", "Pull request reference")
     .example((name) => `  $ ${name} loop list`)
     .example(
@@ -315,21 +304,19 @@ function createCli(runtime: CliRuntime) {
     });
 
   cli
-    .command("task [...args]", "Task commands")
-    .usage("task <subcommand> [options]")
+    .command("work", "Create a worker run")
     .option("--project <projectId>", "Project id")
     .option("--title <title>", "Task title")
-    .option("--description <description>", "Task description")
+    .option("--prompt <text>", "Implementation prompt")
     .option("--spec <path>", "Spec path")
-    .option("--pr <repo#number>", "Pull request reference")
-    .option("--item <item>", "Checklist item", { type: [String] })
+    .option("--repo <repo>", "Repository slug")
+    .option("--base-branch <branch>", "Base branch")
     .example(
       (name) =>
-        `  $ ${name} task create --project project_1 --title "Ship CLI"`,
+        `  $ ${name} work --project project_1 --title "Ship CLI" --spec specs/ship-cli.md`,
     )
-    .example((name) => `  $ ${name} task status task_1`)
-    .action(async (args, options) => {
-      await dispatch(createContext(runtime, ["task", ...args], options));
+    .action(async (options) => {
+      await dispatch(createContext(runtime, ["work"], options));
     });
 
   cli
@@ -653,7 +640,7 @@ async function runLoopList(context: CliContext) {
       type: loop.type as string,
       status: loop.status as string,
       target:
-        loop.targetType === "task"
+        loop.targetType === "project"
           ? String(loop.targetId ?? "-")
           : `${loop.repo}#${loop.prNumber}`,
       projectId: loop.projectId as string,
@@ -686,21 +673,7 @@ async function runLoopStart(context: CliContext) {
 
 async function buildLoopCreateBody(context: CliContext) {
   const type = requireFlag(context.args, "type");
-  const taskId = getFlag(context.args, "task");
   const pr = getFlag(context.args, "pr");
-
-  if (taskId) {
-    const task = await context.client.get<Record<string, unknown>>(
-      `/api/v1/tasks/${encodeURIComponent(taskId)}`,
-    );
-    return {
-      projectId: task.projectId,
-      type,
-      targetType: "task",
-      taskId,
-      status: "running",
-    };
-  }
 
   if (pr) {
     const ref = parsePullRequestRef(pr);
@@ -717,9 +690,7 @@ async function buildLoopCreateBody(context: CliContext) {
     };
   }
 
-  throw new Error(
-    "loop start requires --task <task-id> or --pr <repo>#<number>",
-  );
+  throw new Error("loop start requires --pr <repo>#<number>");
 }
 
 async function runLoopPause(context: CliContext) {
@@ -742,18 +713,16 @@ async function runLoopPause(context: CliContext) {
   ]);
 }
 
-async function runTaskCreate(context: CliContext) {
+async function runWorkCreate(context: CliContext) {
   const data = await context.client.post<Record<string, unknown>>(
-    "/api/v1/tasks",
+    "/api/v1/workers",
     {
       projectId: requireFlag(context.args, "project"),
       title: requireFlag(context.args, "title"),
-      description: getFlag(context.args, "description"),
+      prompt: getFlag(context.args, "prompt"),
       specPath: getFlag(context.args, "spec"),
-      repo: parseOptionalPullRequestRef(getFlag(context.args, "pr"))?.repo,
-      prNumber: parseOptionalPullRequestRef(getFlag(context.args, "pr"))
-        ?.prNumber,
-      items: getFlags(context.args, "item"),
+      repo: getFlag(context.args, "repo"),
+      baseBranch: getFlag(context.args, "base-branch"),
     },
   );
 
@@ -761,83 +730,11 @@ async function runTaskCreate(context: CliContext) {
     return printJson(context.write, data);
   }
 
-  printSection(context.write, "Task created", [
+  printSection(context.write, "Worker started", [
     ["id", data.id as string],
     ["title", data.title as string],
     ["status", data.status as string],
   ]);
-}
-
-async function runTaskStart(context: CliContext) {
-  const taskId = context.args.positionals[2];
-  if (!taskId) {
-    throw new Error("Usage: looper task start <task-id>");
-  }
-  const data = await context.client.post<Record<string, unknown>>(
-    `/api/v1/tasks/${encodeURIComponent(taskId)}/start`,
-  );
-  return emitTaskResult(context, data, "Task started");
-}
-
-async function runTaskPause(context: CliContext) {
-  const taskId = context.args.positionals[2];
-  if (!taskId) {
-    throw new Error("Usage: looper task pause <task-id>");
-  }
-  const data = await context.client.post<Record<string, unknown>>(
-    `/api/v1/tasks/${encodeURIComponent(taskId)}/pause`,
-  );
-  return emitTaskResult(context, data, "Task paused");
-}
-
-async function runTaskStatus(context: CliContext) {
-  const taskId = context.args.positionals[2];
-  if (!taskId) {
-    throw new Error("Usage: looper task status <task-id>");
-  }
-  const data = await context.client.get<Record<string, unknown>>(
-    `/api/v1/tasks/${encodeURIComponent(taskId)}`,
-  );
-
-  if (hasFlag(context.args, "json")) {
-    return printJson(context.write, data);
-  }
-
-  printSection(context.write, "Task status", [
-    ["id", data.id as string],
-    ["title", data.title as string],
-    ["status", data.status as string],
-    ["loopId", (data.loopId as string | null | undefined) ?? "-"],
-    ["specPath", (data.specPath as string | null | undefined) ?? "-"],
-  ]);
-}
-
-async function runTaskShow(context: CliContext) {
-  const taskId = context.args.positionals[2];
-  if (!taskId) {
-    throw new Error("Usage: looper task show <task-id>");
-  }
-  const data = await context.client.get<Record<string, unknown>>(
-    `/api/v1/tasks/${encodeURIComponent(taskId)}`,
-  );
-
-  if (hasFlag(context.args, "json")) {
-    return printJson(context.write, data);
-  }
-
-  await runTaskStatus(context);
-  context.write("");
-  printTable(
-    context.write,
-    ((data.items as Array<Record<string, unknown>> | undefined) ?? []).map(
-      (item) => ({
-        id: item.id as string,
-        status: item.status as string,
-        position: item.position as number,
-        content: item.content as string,
-      }),
-    ),
-  );
 }
 
 async function runPrList(context: CliContext) {
@@ -857,7 +754,6 @@ async function runPrList(context: CliContext) {
       checks: item.checksSummary as string,
       reviewer: (item.reviewer as string | null | undefined) ?? "-",
       fixer: (item.fixer as string | null | undefined) ?? "-",
-      task: (item.task as { id?: string } | null)?.id ?? "-",
     })),
   );
 }
@@ -1007,22 +903,6 @@ function formatRelativeAge(startedAt: string): string {
     : `${totalDays}d${remainingHours}h`;
 }
 
-function emitTaskResult(
-  context: CliContext,
-  data: Record<string, unknown>,
-  title: string,
-) {
-  if (hasFlag(context.args, "json")) {
-    return printJson(context.write, data);
-  }
-
-  printSection(context.write, title, [
-    ["id", data.id as string],
-    ["status", data.status as string],
-    ["loopId", (data.loopId as string | null | undefined) ?? "-"],
-  ]);
-}
-
 function extractConfigArgs(argv: string[]): string[] {
   const extracted: string[] = [];
 
@@ -1062,10 +942,6 @@ function getFlag(args: ParsedArgs, name: string): string | undefined {
   return args.flags.get(name)?.at(-1);
 }
 
-function getFlags(args: ParsedArgs, name: string): string[] {
-  return args.flags.get(name) ?? [];
-}
-
 function requireFlag(args: ParsedArgs, name: string): string {
   const value = getFlag(args, name);
   if (!value || value === "true") {
@@ -1090,10 +966,6 @@ function parsePullRequestRef(value: string): PullRequestRef {
     repo,
     prNumber: Number(prNumber),
   };
-}
-
-function parseOptionalPullRequestRef(value: string | undefined) {
-  return value ? parsePullRequestRef(value) : undefined;
 }
 
 function deriveProjectId(repoPath: string): string {

@@ -64,7 +64,7 @@ The CLI connects to `looperd` over HTTP and supports commands under:
 - `config show`
 - `daemon status|logs`
 - `loop list|start|pause`
-- `task create|start|pause|status|show`
+- `work`
 - `pr list|show|status`
 - `run list`
 

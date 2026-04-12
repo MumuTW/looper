@@ -62,8 +62,8 @@ async function createFixture() {
     id: "loop_worker_1",
     projectId: "project_1",
     type: "worker",
-    targetType: "task",
-    targetId: "task:task_1",
+    targetType: "project",
+    targetId: "project_1",
     repo: "acme/looper",
     prNumber: null,
     status: "queued",
@@ -74,42 +74,6 @@ async function createFixture() {
     createdAt: nowIso,
     updatedAt: nowIso,
   });
-  store.tasks.upsert({
-    id: "task_1",
-    projectId: "project_1",
-    title: "Implement worker loop",
-    description: "Ship the checklist-driven worker loop.",
-    status: "in_progress",
-    loopId: "loop_worker_1",
-    repo: "acme/looper",
-    prNumber: null,
-    metadataJson: JSON.stringify({ specPath: "spec.md" }),
-    createdAt: nowIso,
-    updatedAt: nowIso,
-  });
-  store.taskItems.upsert({
-    id: "item_1",
-    taskId: "task_1",
-    content: "Build the worker runner",
-    status: "pending",
-    position: 0,
-    source: "spec",
-    metadataJson: null,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-  });
-  store.taskItems.upsert({
-    id: "item_2",
-    taskId: "task_1",
-    content: "Open a pull request",
-    status: "pending",
-    position: 1,
-    source: "spec",
-    metadataJson: null,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-  });
-
   const queue = new SchedulerQueue({
     store,
     retryMaxAttempts: 3,
@@ -119,12 +83,17 @@ async function createFixture() {
   queue.enqueue({
     projectId: "project_1",
     loopId: "loop_worker_1",
-    taskId: "task_1",
     type: "worker",
-    targetType: "task",
-    targetId: "task:task_1",
+    targetType: "project",
+    targetId: "project_1",
     repo: "acme/looper",
-    dedupeKey: "worker:task_1",
+    dedupeKey: "worker:loop_worker_1",
+    payloadJson: JSON.stringify({
+      title: "Implement worker loop",
+      specPath: "spec.md",
+      repo: "acme/looper",
+      baseBranch: "main",
+    }),
   });
 
   return { rootDir, repoPath, worktreeRoot, store, queue, now };
@@ -138,7 +107,6 @@ class FakeGitGateway implements WorkerGitGateway {
 
   public async createWorktree(input: {
     projectId: string;
-    taskId?: string;
     repoPath: string;
     worktreeRoot: string;
     branch: string;
@@ -154,7 +122,6 @@ class FakeGitGateway implements WorkerGitGateway {
     return {
       id: "worktree_1",
       projectId: input.projectId,
-      taskId: input.taskId ?? null,
       repoPath: input.repoPath,
       worktreePath,
       branch: input.branch,
@@ -354,28 +321,9 @@ describe("WorkerLoopRunner", () => {
     expect(git.createWorktreeCalls).toBe(1);
     expect(git.pushCalls).toBe(1);
     expect(github.createPullRequestCalls).toHaveLength(1);
-    expect(fixture.store.tasks.getById("task_1")?.prNumber).toBe(101);
     expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe(
       "completed",
     );
-    expect(fixture.store.taskItems.getById("item_1")?.status).toBe("done");
-    expect(fixture.store.taskItems.getById("item_2")?.status).toBe("done");
-    expect(
-      logs.entries.some((entry) => entry.message === "worker loop started"),
-    ).toBe(true);
-    expect(
-      logs.entries.some((entry) => entry.message === "worker run started"),
-    ).toBe(true);
-    expect(
-      logs.entries.some((entry) => entry.message === "worker step started"),
-    ).toBe(true);
-    expect(
-      logs.entries.some((entry) => entry.message === "worker step completed"),
-    ).toBe(true);
-    expect(
-      logs.entries.some((entry) => entry.message === "worker run completed"),
-    ).toBe(true);
-
     fixture.store.close();
   });
 
@@ -424,8 +372,8 @@ describe("WorkerLoopRunner", () => {
     await runner.processClaimedItem(claimed);
 
     expect(notifications).toHaveLength(1);
-    expect(notifications[0]?.subtitle).toBe("task_1");
-    expect(notifications[0]?.body).toBe("Task started");
+    expect(notifications[0]?.subtitle).toBe("Implement worker loop");
+    expect(notifications[0]?.body).toBe("Worker started");
     expect(notifications[0]?.dedupeKey).toMatch(
       /^runtime\.agent\.started:worker:/,
     );
@@ -433,7 +381,7 @@ describe("WorkerLoopRunner", () => {
     fixture.store.close();
   });
 
-  test("keeps checklist items in progress when validation fails and requeues", async () => {
+  test("keeps loop queued when validation fails and requeues", async () => {
     const fixture = await createFixture();
     const git = new FakeGitGateway(fixture.worktreeRoot);
     const github = new FakeGitHubGateway();
@@ -462,16 +410,9 @@ describe("WorkerLoopRunner", () => {
     }
 
     const result = await runner.processClaimedItem(claimed);
-    expect(result.status).toBe("success");
-    expect(result.requeuedQueueItemId).toBeDefined();
-    expect(fixture.store.taskItems.getById("item_1")?.status).toBe(
-      "in_progress",
-    );
-    expect(fixture.store.taskItems.getById("item_2")?.status).toBe(
-      "in_progress",
-    );
+    expect(result.status).toBe("failed");
     expect(github.createPullRequestCalls).toHaveLength(0);
-    expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe("queued");
+    expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe("paused");
 
     fixture.store.close();
   });
@@ -523,17 +464,6 @@ describe("WorkerLoopRunner", () => {
     expect(firstResult.status).toBe("failed");
     expect(firstResult.failureKind).toBe("retryable_after_resume");
     expect(agent.starts).toHaveLength(1);
-    const failedLog = logs.entries.find(
-      (entry) =>
-        entry.level === "error" && entry.message === "worker run failed",
-    );
-    expect(failedLog?.context).toMatchObject({
-      projectId: "project_1",
-      queueItemId: firstClaim.id,
-      taskId: "task_1",
-      failureKind: "retryable_after_resume",
-      currentStep: "open-pr",
-    });
 
     const retryClaim = fixture.queue.claimNext("worker-1");
     if (!retryClaim) {

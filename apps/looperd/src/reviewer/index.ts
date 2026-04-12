@@ -289,7 +289,6 @@ export class ReviewerLoopRunner {
       loopId: loop.id,
       runId: run.id,
       queueItemId: queueItem.id,
-      taskId: queueItem.taskId,
       currentStep: resumedRun.startStep,
       resumed: resumedRun.resumed,
     });
@@ -310,7 +309,6 @@ export class ReviewerLoopRunner {
       loopId: loop.id,
       runId: run.id,
       queueItemId: queueItem.id,
-      taskId: queueItem.taskId,
       currentStep: resumedRun.startStep,
     });
 
@@ -333,7 +331,6 @@ export class ReviewerLoopRunner {
           loopId: loop.id,
           runId: run.id,
           queueItemId: queueItem.id,
-          taskId: queueItem.taskId,
           currentStep: step,
         });
 
@@ -365,7 +362,6 @@ export class ReviewerLoopRunner {
           loopId: loop.id,
           runId: run.id,
           queueItemId: queueItem.id,
-          taskId: queueItem.taskId,
           currentStep: step,
         });
 
@@ -401,7 +397,6 @@ export class ReviewerLoopRunner {
           loopId: loop.id,
           runId: run.id,
           queueItemId: queueItem.id,
-          taskId: queueItem.taskId,
           currentStep: run.currentStep,
           summary,
         },
@@ -466,7 +461,6 @@ export class ReviewerLoopRunner {
         loopId: loop.id,
         runId: run.id,
         queueItemId: queueItem.id,
-        taskId: queueItem.taskId,
         currentStep: run.currentStep,
         failureKind: failure.kind,
         summary: failure.message,

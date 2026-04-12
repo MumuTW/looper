@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS loops (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
-  CHECK (target_type IN ('task', 'pull_request', 'repository', 'manual')),
+  CHECK (target_type IN ('project', 'pull_request')),
   CHECK (pr_number IS NULL OR pr_number > 0)
 );
 
@@ -118,38 +118,3 @@ CREATE TABLE IF NOT EXISTS pull_request_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pull_request_snapshots_repo_pr ON pull_request_snapshots (repo, pr_number, captured_at DESC);
-
-CREATE TABLE IF NOT EXISTS tasks (
-  id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  title TEXT NOT NULL,
-  description TEXT,
-  status TEXT NOT NULL,
-  loop_id TEXT,
-  repo TEXT,
-  pr_number INTEGER,
-  metadata_json TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
-  FOREIGN KEY (loop_id) REFERENCES loops (id) ON DELETE SET NULL,
-  CHECK (pr_number IS NULL OR pr_number > 0)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status);
-CREATE INDEX IF NOT EXISTS idx_tasks_repo_pr ON tasks (repo, pr_number);
-
-CREATE TABLE IF NOT EXISTS task_items (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL,
-  content TEXT NOT NULL,
-  status TEXT NOT NULL,
-  position INTEGER NOT NULL DEFAULT 0,
-  source TEXT NOT NULL,
-  metadata_json TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_task_items_task_position ON task_items (task_id, position ASC);

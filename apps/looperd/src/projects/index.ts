@@ -162,7 +162,6 @@ export class ProjectManager {
         const record: WorktreeRecord = {
           id: existing?.id ?? randomUUID(),
           projectId: project.id,
-          taskId: existing?.taskId ?? null,
           repoPath: project.repoPath,
           worktreePath: worktree.path,
           branch: worktree.branch,

@@ -215,7 +215,6 @@ class FakeGitGateway {
 
   public async createWorktree(input: {
     projectId: string;
-    taskId?: string;
     repoPath: string;
     worktreeRoot: string;
     branch: string;
@@ -226,7 +225,6 @@ class FakeGitGateway {
     return {
       id: `worktree:${input.branch}`,
       projectId: input.projectId,
-      taskId: input.taskId ?? null,
       repoPath: input.repoPath,
       worktreePath: input.worktreeRoot,
       branch: input.branch,
@@ -322,7 +320,6 @@ describe("createLooperdRuntime", () => {
       projectId: "project_1",
       loopId: null,
       runId: null,
-      taskId: null,
       vendor: "opencode",
       status: "running",
       pid: 12345,
@@ -765,7 +762,6 @@ describe("createLooperdRuntime", () => {
       id: "queue_1",
       projectId: "project_1",
       loopId: "loop_1",
-      taskId: null,
       type: "fixer",
       targetType: "pull_request",
       targetId: "pr:powerformer/looper:1",
@@ -865,6 +861,7 @@ describe("createLooperdRuntime", () => {
   test("processes scheduled worker queue items", async () => {
     const fixture = await createFixture();
     fixture.config.agent.vendor = "opencode";
+    fixture.config.defaults.openPrStrategy = "all_done";
     const now = new Date(Date.now() - 1_000).toISOString();
     const seedStore = new SqliteStore({
       dbPath: fixture.config.storage.dbPath,
@@ -885,8 +882,8 @@ describe("createLooperdRuntime", () => {
       id: "loop_worker_1",
       projectId: "project_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: "powerformer/looper",
       prNumber: null,
       status: "queued",
@@ -894,30 +891,6 @@ describe("createLooperdRuntime", () => {
       metadataJson: null,
       lastRunAt: null,
       nextRunAt: now,
-      createdAt: now,
-      updatedAt: now,
-    });
-    seedStore.tasks.upsert({
-      id: "task_1",
-      projectId: "project_1",
-      title: "Implement worker loop",
-      description: "Ship worker loop behavior",
-      status: "in_progress",
-      loopId: "loop_worker_1",
-      repo: "powerformer/looper",
-      prNumber: null,
-      metadataJson: JSON.stringify({ specPath: "spec.md" }),
-      createdAt: now,
-      updatedAt: now,
-    });
-    seedStore.taskItems.upsert({
-      id: "item_1",
-      taskId: "task_1",
-      content: "Do the thing",
-      status: "pending",
-      position: 0,
-      source: "spec",
-      metadataJson: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -930,12 +903,17 @@ describe("createLooperdRuntime", () => {
       id: "queue_worker_1",
       projectId: "project_1",
       loopId: "loop_worker_1",
-      taskId: "task_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: "powerformer/looper",
-      dedupeKey: "worker:task_1",
+      dedupeKey: "worker:loop_worker_1",
+      payloadJson: JSON.stringify({
+        title: "Implement worker loop",
+        specPath: "spec.md",
+        repo: "powerformer/looper",
+        baseBranch: "main",
+      }),
       availableAt: now,
     });
     await writeFile(join(fixture.rootDir, "spec.md"), "# Worker spec\n");
@@ -960,6 +938,16 @@ describe("createLooperdRuntime", () => {
 
     expect(agentExecutor.starts).toHaveLength(1);
     expect(git.createWorktreeCalls).toBe(1);
+    expect(git.pushCalls).toBe(1);
+    expect(github.createPullRequestCalls).toBe(1);
+
+    const verifyStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+    });
+    verifyStore.initialize();
+    expect(verifyStore.loops.getById("loop_worker_1")?.prNumber).toBe(101);
+    verifyStore.close();
+
     await runtime.stop("test");
   });
 
@@ -986,8 +974,8 @@ describe("createLooperdRuntime", () => {
       id: "loop_worker_1",
       projectId: "project_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: "powerformer/looper",
       prNumber: null,
       status: "queued",
@@ -995,30 +983,6 @@ describe("createLooperdRuntime", () => {
       metadataJson: null,
       lastRunAt: null,
       nextRunAt: now,
-      createdAt: now,
-      updatedAt: now,
-    });
-    seedStore.tasks.upsert({
-      id: "task_1",
-      projectId: "project_1",
-      title: "Implement worker loop",
-      description: "Ship worker loop behavior",
-      status: "in_progress",
-      loopId: "loop_worker_1",
-      repo: "powerformer/looper",
-      prNumber: null,
-      metadataJson: JSON.stringify({ specPath: "spec.md" }),
-      createdAt: now,
-      updatedAt: now,
-    });
-    seedStore.taskItems.upsert({
-      id: "item_1",
-      taskId: "task_1",
-      content: "Do the thing",
-      status: "pending",
-      position: 0,
-      source: "spec",
-      metadataJson: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -1031,12 +995,17 @@ describe("createLooperdRuntime", () => {
       id: "queue_worker_1",
       projectId: "project_1",
       loopId: "loop_worker_1",
-      taskId: "task_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: "powerformer/looper",
-      dedupeKey: "worker:task_1",
+      dedupeKey: "worker:loop_worker_1",
+      payloadJson: JSON.stringify({
+        title: "Implement worker loop",
+        specPath: "spec.md",
+        repo: "powerformer/looper",
+        baseBranch: "main",
+      }),
       availableAt: now,
     });
     await writeFile(join(fixture.rootDir, "spec.md"), "# Worker spec\n");

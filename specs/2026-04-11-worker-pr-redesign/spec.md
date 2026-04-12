@@ -105,6 +105,13 @@
 
 这表明 task 不是零碎残留，而是原始设计的一部分。
 
+本次实施方式：
+
+- 直接 reset schema baseline，不做兼容旧库的增量 migration。
+- 现有本地数据库由使用者删除后重建。
+- 在此约束下，允许直接改写现有 `0001_init.sql` / `0002_integrations.sql` / `0003_scheduler_queue.sql`，使其反映新的无-task 基线结构。
+- 不新增“删除 tasks 表”的补丁 migration，也不保留仅为兼容旧库存在的过渡字段。
+
 ### 4.2 Store / Storage Types
 
 关键文件：

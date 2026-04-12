@@ -398,6 +398,7 @@ worker 应尽量复用 fixer 已经比较成熟的模式：
 补充：
 
 - `loops.target_type` 的最终约束需重新定义；当前 SQL 中还包含 `repository` / `manual`
+- migration 采用 reset 方案：直接改写现有 baseline migration，删除本地数据库后重建，不做旧库增量兼容
 
 ## 8.3 删除 taskId 残余
 

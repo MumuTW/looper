@@ -230,7 +230,6 @@ describe("GitWorktreeGateway", () => {
     store.worktrees.upsert({
       id: "existing-record",
       projectId: "project_1",
-      taskId: null,
       repoPath,
       worktreePath: repoPath,
       branch: "feature/fixer",

@@ -80,30 +80,6 @@ describe("SqliteStore", () => {
       createdAt: now,
       updatedAt: now,
     });
-    store.tasks.upsert({
-      id: "task_1",
-      projectId: "project_1",
-      title: "Implement persistence",
-      description: "Finish SQLite foundation",
-      status: "in_progress",
-      loopId: "loop_1",
-      repo: "acme/looper",
-      prNumber: 42,
-      metadataJson: '{"source":"spec"}',
-      createdAt: now,
-      updatedAt: now,
-    });
-    store.taskItems.upsert({
-      id: "item_1",
-      taskId: "task_1",
-      content: "Write migrations",
-      status: "done",
-      position: 1,
-      source: "spec",
-      metadataJson: null,
-      createdAt: now,
-      updatedAt: now,
-    });
     store.pullRequestSnapshots.upsert({
       id: "snapshot_1",
       projectId: "project_1",
@@ -142,7 +118,6 @@ describe("SqliteStore", () => {
       id: "queue_reviewer_1",
       projectId: "project_1",
       loopId: "loop_1",
-      taskId: null,
       type: "reviewer",
       targetType: "pull_request",
       targetId: "pr:acme/looper:42",
@@ -169,7 +144,6 @@ describe("SqliteStore", () => {
       id: "queue_fixer_1",
       projectId: "project_1",
       loopId: null,
-      taskId: null,
       type: "fixer",
       targetType: "pull_request",
       targetId: "pr:acme/looper:42",
@@ -208,7 +182,6 @@ describe("SqliteStore", () => {
       projectId: "project_1",
       loopId: "loop_1",
       runId: "run_1",
-      taskId: "task_1",
       vendor: "opencode",
       status: "running",
       pid: 12345,
@@ -232,17 +205,17 @@ describe("SqliteStore", () => {
       projectId: "project_1",
       loopId: "loop_1",
       runId: "run_1",
-      entityType: "task",
-      entityId: "task_1",
+      entityType: "loop",
+      entityId: "loop_1",
       channel: "in_app",
       level: "info",
-      title: "Task updated",
-      subtitle: "task_1",
-      body: "Checklist advanced",
+      title: "Loop updated",
+      subtitle: "loop_1",
+      body: "Worker progressed",
       status: "success",
-      dedupeKey: "task.updated:task:task_1",
+      dedupeKey: "loop.updated:loop:loop_1",
       errorMessage: null,
-      payloadJson: '{"title":"Task updated"}',
+      payloadJson: '{"title":"Loop updated"}',
       sentAt: now,
       createdAt: now,
       updatedAt: now,
@@ -250,10 +223,9 @@ describe("SqliteStore", () => {
     store.worktrees.upsert({
       id: "worktree_1",
       projectId: "project_1",
-      taskId: "task_1",
       repoPath: "/tmp/looper",
-      worktreePath: "/tmp/looper-worktrees/task-1",
-      branch: "task/task-1",
+      worktreePath: "/tmp/looper-worktrees/feature-loop-1",
+      branch: "feature/loop-1",
       baseBranch: "main",
       status: "active",
       headSha: "abc123",
@@ -276,11 +248,6 @@ describe("SqliteStore", () => {
     expect(store.loops.getById("loop_1")?.repo).toBe("acme/looper");
     expect(store.loops.getById("loop_1")?.projectId).toBe("project_1");
     expect(store.runs.listByLoop("loop_1")).toHaveLength(1);
-    expect(store.tasks.list()).toHaveLength(1);
-    expect(store.tasks.getById("task_1")?.projectId).toBe("project_1");
-    expect(store.taskItems.listByTask("task_1")[0]?.content).toBe(
-      "Write migrations",
-    );
     expect(
       store.pullRequestSnapshots.getLatest("acme/looper", 42)?.headSha,
     ).toBe("abc123");
@@ -315,11 +282,11 @@ describe("SqliteStore", () => {
     expect(
       store.notifications.getLatestByDedupe(
         "in_app",
-        "task.updated:task:task_1",
+        "loop.updated:loop:loop_1",
       )?.status,
     ).toBe("success");
     expect(
-      store.worktrees.getByBranch("project_1", "task/task-1")?.status,
+      store.worktrees.getByBranch("project_1", "feature/loop-1")?.status,
     ).toBe("active");
 
     const health = store.schema.healthcheck();
@@ -353,25 +320,28 @@ describe("SqliteStore", () => {
 
     expect(() =>
       store.withTransaction((tx) => {
-        tx.tasks.upsert({
-          id: "task_rollback",
+        tx.loops.upsert({
+          id: "loop_rollback",
           projectId: "project_1",
-          title: "Temporary",
-          description: null,
-          status: "pending",
-          loopId: null,
+          type: "worker",
+          targetType: "project",
+          targetId: "project_1",
           repo: null,
           prNumber: null,
+          status: "queued",
+          configJson: null,
           metadataJson: null,
+          lastRunAt: null,
+          nextRunAt: null,
           createdAt: now,
           updatedAt: now,
         });
         tx.events.append({
-          id: "event_rollback",
-          eventType: "task.created",
+          id: "event_loop_rollback",
+          eventType: "loop.created",
           projectId: "project_1",
-          entityType: "task",
-          entityId: "task_rollback",
+          entityType: "loop",
+          entityId: "loop_rollback",
           payloadJson: "{}",
           createdAt: now,
         });
@@ -380,8 +350,8 @@ describe("SqliteStore", () => {
       }),
     ).toThrow("abort transaction");
 
-    expect(store.tasks.getById("task_rollback")).toBeNull();
-    expect(store.events.listByEntity("task", "task_rollback")).toHaveLength(0);
+    expect(store.loops.getById("loop_rollback")).toBeNull();
+    expect(store.events.listByEntity("loop", "loop_rollback")).toHaveLength(0);
 
     store.close();
   });
@@ -440,8 +410,8 @@ describe("SqliteStore", () => {
       id: "loop_paused",
       projectId: "project_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: null,
       prNumber: null,
       status: "paused",
@@ -452,30 +422,16 @@ describe("SqliteStore", () => {
       createdAt: now,
       updatedAt: now,
     });
-    store.tasks.upsert({
-      id: "task_1",
-      projectId: "project_1",
-      title: "Queued task",
-      description: null,
-      status: "ready",
-      loopId: "loop_paused",
-      repo: null,
-      prNumber: null,
-      metadataJson: null,
-      createdAt: now,
-      updatedAt: now,
-    });
     store.queue.upsert({
       id: "queue_worker_1",
       projectId: "project_1",
       loopId: "loop_paused",
-      taskId: "task_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: null,
       prNumber: null,
-      dedupeKey: "worker:task_1",
+      dedupeKey: "worker:loop_paused",
       priority: 3,
       status: "queued",
       availableAt: now,
@@ -485,7 +441,7 @@ describe("SqliteStore", () => {
       claimedAt: null,
       startedAt: null,
       finishedAt: null,
-      lockKey: "task:task_1",
+      lockKey: "worker:loop_paused",
       payloadJson: null,
       lastError: null,
       lastErrorKind: null,
@@ -547,8 +503,8 @@ describe("SqliteStore", () => {
       id: "loop_1",
       projectId: "project_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: null,
       prNumber: null,
       status: "running",

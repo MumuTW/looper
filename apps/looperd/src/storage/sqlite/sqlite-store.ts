@@ -10,8 +10,6 @@ import type {
   QueueFailureKind,
   QueueItemRecord,
   RunRecord,
-  TaskItemRecord,
-  TaskRecord,
   WorktreeRecord,
 } from "../types";
 import { SqliteDbCoordinator } from "./db";
@@ -199,94 +197,6 @@ export class SqliteStore implements Store {
     },
   };
 
-  public readonly tasks = {
-    upsert: (record: TaskRecord): void => {
-      this.coordinator.db
-        .query(`
-          INSERT INTO tasks (id, project_id, title, description, status, loop_id, repo, pr_number, metadata_json, created_at, updated_at)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-          ON CONFLICT(id) DO UPDATE SET
-            project_id=excluded.project_id,
-            title=excluded.title,
-            description=excluded.description,
-            status=excluded.status,
-            loop_id=excluded.loop_id,
-            repo=excluded.repo,
-            pr_number=excluded.pr_number,
-            metadata_json=excluded.metadata_json,
-            updated_at=excluded.updated_at
-        `)
-        .run(
-          record.id,
-          record.projectId,
-          record.title,
-          record.description ?? null,
-          record.status,
-          record.loopId ?? null,
-          record.repo ?? null,
-          record.prNumber ?? null,
-          record.metadataJson ?? null,
-          record.createdAt,
-          record.updatedAt,
-        );
-    },
-    getById: (id: string): TaskRecord | null => {
-      const row = this.coordinator.db
-        .query("SELECT * FROM tasks WHERE id = ?1")
-        .get(id) as Record<string, unknown> | null;
-      return row ? mapTask(row) : null;
-    },
-    list: (): TaskRecord[] => {
-      const rows = this.coordinator.db
-        .query("SELECT * FROM tasks ORDER BY updated_at DESC")
-        .all() as Record<string, unknown>[];
-      return rows.map(mapTask);
-    },
-  };
-
-  public readonly taskItems = {
-    upsert: (record: TaskItemRecord): void => {
-      this.coordinator.db
-        .query(`
-          INSERT INTO task_items (id, task_id, content, status, position, source, metadata_json, created_at, updated_at)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-          ON CONFLICT(id) DO UPDATE SET
-            task_id=excluded.task_id,
-            content=excluded.content,
-            status=excluded.status,
-            position=excluded.position,
-            source=excluded.source,
-            metadata_json=excluded.metadata_json,
-            updated_at=excluded.updated_at
-        `)
-        .run(
-          record.id,
-          record.taskId,
-          record.content,
-          record.status,
-          record.position,
-          record.source,
-          record.metadataJson ?? null,
-          record.createdAt,
-          record.updatedAt,
-        );
-    },
-    listByTask: (taskId: string): TaskItemRecord[] => {
-      const rows = this.coordinator.db
-        .query(
-          "SELECT * FROM task_items WHERE task_id = ?1 ORDER BY position ASC",
-        )
-        .all(taskId) as Record<string, unknown>[];
-      return rows.map(mapTaskItem);
-    },
-    getById: (id: string): TaskItemRecord | null => {
-      const row = this.coordinator.db
-        .query("SELECT * FROM task_items WHERE id = ?1")
-        .get(id) as Record<string, unknown> | null;
-      return row ? mapTaskItem(row) : null;
-    },
-  };
-
   public readonly pullRequestSnapshots = {
     upsert: (record: PullRequestSnapshotRecord): void => {
       this.coordinator.db
@@ -334,7 +244,9 @@ export class SqliteStore implements Store {
           "SELECT * FROM pull_request_snapshots ORDER BY captured_at DESC, created_at DESC",
         )
         .all()
-        .map((row) => mapPullRequestSnapshot(row as Record<string, unknown>));
+        .map((row: unknown) =>
+          mapPullRequestSnapshot(row as Record<string, unknown>),
+        );
     },
     getLatest: (
       repo: string,
@@ -376,7 +288,7 @@ export class SqliteStore implements Store {
       return this.coordinator.db
         .query("SELECT * FROM event_logs ORDER BY created_at DESC LIMIT ?1")
         .all(limit)
-        .map((row) => mapEvent(row as Record<string, unknown>));
+        .map((row: unknown) => mapEvent(row as Record<string, unknown>));
     },
     listByEntity: (entityType: string, entityId: string): EventLogRecord[] => {
       return this.coordinator.db
@@ -384,7 +296,7 @@ export class SqliteStore implements Store {
           "SELECT * FROM event_logs WHERE entity_type = ?1 AND entity_id = ?2 ORDER BY created_at ASC",
         )
         .all(entityType, entityId)
-        .map((row) => mapEvent(row as Record<string, unknown>));
+        .map((row: unknown) => mapEvent(row as Record<string, unknown>));
     },
   };
 
@@ -428,7 +340,7 @@ export class SqliteStore implements Store {
           "SELECT * FROM locks WHERE expires_at <= ?1 ORDER BY expires_at ASC",
         )
         .all(nowIso)
-        .map((row) => mapLock(row as Record<string, unknown>));
+        .map((row: unknown) => mapLock(row as Record<string, unknown>));
     },
   };
 
@@ -437,23 +349,21 @@ export class SqliteStore implements Store {
       this.coordinator.db
         .query(`
           INSERT INTO queue_items (
-            id, project_id, loop_id, task_id, type, target_type, target_id,
-            repo, pr_number, dedupe_key, priority, status, available_at,
-            attempts, max_attempts, claimed_by, claimed_at, started_at,
-            finished_at, lock_key, payload_json, last_error, last_error_kind,
-            created_at, updated_at
+            id, project_id, loop_id, type, target_type, target_id, repo,
+            pr_number, dedupe_key, priority, status, available_at, attempts,
+            max_attempts, claimed_by, claimed_at, started_at, finished_at,
+            lock_key, payload_json, last_error, last_error_kind, created_at,
+            updated_at
           )
           VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7,
             ?8, ?9, ?10, ?11, ?12, ?13,
-            ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22, ?23,
-            ?24, ?25
+            ?14, ?15, ?16, ?17, ?18, ?19,
+            ?20, ?21, ?22, ?23, ?24
           )
           ON CONFLICT(id) DO UPDATE SET
             project_id=excluded.project_id,
             loop_id=excluded.loop_id,
-            task_id=excluded.task_id,
             type=excluded.type,
             target_type=excluded.target_type,
             target_id=excluded.target_id,
@@ -479,7 +389,6 @@ export class SqliteStore implements Store {
           record.id,
           record.projectId ?? null,
           record.loopId ?? null,
-          record.taskId ?? null,
           record.type,
           record.targetType,
           record.targetId,
@@ -513,7 +422,7 @@ export class SqliteStore implements Store {
       return this.coordinator.db
         .query("SELECT * FROM queue_items ORDER BY created_at DESC")
         .all()
-        .map((row) => mapQueueItem(row as Record<string, unknown>));
+        .map((row: unknown) => mapQueueItem(row as Record<string, unknown>));
     },
     findActiveByDedupe: (dedupeKey: string): QueueItemRecord | null => {
       const row = this.coordinator.db
@@ -530,7 +439,7 @@ export class SqliteStore implements Store {
       return this.coordinator.db
         .query(`${SCHEDULED_QUEUE_QUERY} LIMIT ?2`)
         .all(nowIso, limit)
-        .map((row) => mapQueueItem(row as Record<string, unknown>));
+        .map((row: unknown) => mapQueueItem(row as Record<string, unknown>));
     },
     claimNext: (nowIso: string, claimedBy: string): QueueItemRecord | null => {
       return this.coordinator.withTransaction(() => {
@@ -690,36 +599,18 @@ export class SqliteStore implements Store {
         .run(loopId, finishedAt, reason ?? null);
       return result.changes;
     },
-    cancelByTask: (
-      taskId: string,
-      finishedAt: string,
-      reason?: string,
-    ): number => {
-      const result = this.coordinator.db
-        .query(
-          `UPDATE queue_items
-           SET status = 'cancelled',
-               finished_at = ?2,
-               last_error = COALESCE(?3, last_error),
-               updated_at = ?2
-           WHERE task_id = ?1 AND status IN ('queued', 'running')`,
-        )
-        .run(taskId, finishedAt, reason ?? null);
-      return result.changes;
-    },
   };
 
   public readonly agentExecutions = {
     upsert: (record: AgentExecutionRecord): void => {
       this.coordinator.db
         .query(`
-          INSERT INTO agent_executions (id, project_id, loop_id, run_id, task_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, started_at, ended_at, metadata_json, created_at, updated_at)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+          INSERT INTO agent_executions (id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, started_at, ended_at, metadata_json, created_at, updated_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
           ON CONFLICT(id) DO UPDATE SET
             project_id=excluded.project_id,
             loop_id=excluded.loop_id,
             run_id=excluded.run_id,
-            task_id=excluded.task_id,
             vendor=excluded.vendor,
             status=excluded.status,
             pid=excluded.pid,
@@ -742,7 +633,6 @@ export class SqliteStore implements Store {
           record.projectId ?? null,
           record.loopId ?? null,
           record.runId ?? null,
-          record.taskId ?? null,
           record.vendor,
           record.status,
           record.pid ?? null,
@@ -772,7 +662,9 @@ export class SqliteStore implements Store {
       return this.coordinator.db
         .query("SELECT * FROM agent_executions ORDER BY started_at DESC")
         .all()
-        .map((row) => mapAgentExecution(row as Record<string, unknown>));
+        .map((row: unknown) =>
+          mapAgentExecution(row as Record<string, unknown>),
+        );
     },
     listActive: (): AgentExecutionRecord[] => {
       return this.coordinator.db
@@ -780,7 +672,9 @@ export class SqliteStore implements Store {
           "SELECT * FROM agent_executions WHERE status IN ('running', 'cancelling') ORDER BY started_at DESC",
         )
         .all()
-        .map((row) => mapAgentExecution(row as Record<string, unknown>));
+        .map((row: unknown) =>
+          mapAgentExecution(row as Record<string, unknown>),
+        );
     },
   };
 
@@ -839,7 +733,7 @@ export class SqliteStore implements Store {
       return this.coordinator.db
         .query("SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?1")
         .all(limit)
-        .map((row) => mapNotification(row as Record<string, unknown>));
+        .map((row: unknown) => mapNotification(row as Record<string, unknown>));
     },
     getLatestByDedupe: (
       channel: string,
@@ -858,11 +752,10 @@ export class SqliteStore implements Store {
     upsert: (record: WorktreeRecord): void => {
       this.coordinator.db
         .query(`
-          INSERT INTO worktrees (id, project_id, task_id, repo_path, worktree_path, branch, base_branch, status, head_sha, metadata_json, created_at, updated_at, cleaned_at)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+          INSERT INTO worktrees (id, project_id, repo_path, worktree_path, branch, base_branch, status, head_sha, metadata_json, created_at, updated_at, cleaned_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
           ON CONFLICT(id) DO UPDATE SET
             project_id=excluded.project_id,
-            task_id=excluded.task_id,
             repo_path=excluded.repo_path,
             worktree_path=excluded.worktree_path,
             branch=excluded.branch,
@@ -876,7 +769,6 @@ export class SqliteStore implements Store {
         .run(
           record.id,
           record.projectId,
-          record.taskId ?? null,
           record.repoPath,
           record.worktreePath,
           record.branch,
@@ -909,7 +801,7 @@ export class SqliteStore implements Store {
           "SELECT * FROM worktrees WHERE project_id = ?1 ORDER BY updated_at DESC",
         )
         .all(projectId)
-        .map((row) => mapWorktree(row as Record<string, unknown>));
+        .map((row: unknown) => mapWorktree(row as Record<string, unknown>));
     },
   };
 
@@ -965,36 +857,6 @@ function mapRun(row: Record<string, unknown>): RunRecord {
     startedAt: String(row.started_at),
     lastHeartbeatAt: asNullableString(row.last_heartbeat_at),
     endedAt: asNullableString(row.ended_at),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function mapTask(row: Record<string, unknown>): TaskRecord {
-  return {
-    id: String(row.id),
-    projectId: String(row.project_id),
-    title: String(row.title),
-    description: asNullableString(row.description),
-    status: String(row.status),
-    loopId: asNullableString(row.loop_id),
-    repo: asNullableString(row.repo),
-    prNumber: asNullableNumber(row.pr_number),
-    metadataJson: asNullableString(row.metadata_json),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function mapTaskItem(row: Record<string, unknown>): TaskItemRecord {
-  return {
-    id: String(row.id),
-    taskId: String(row.task_id),
-    content: String(row.content),
-    status: String(row.status),
-    position: Number(row.position),
-    source: String(row.source),
-    metadataJson: asNullableString(row.metadata_json),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -1058,7 +920,6 @@ function mapQueueItem(row: Record<string, unknown>): QueueItemRecord {
     id: String(row.id),
     projectId: asNullableString(row.project_id),
     loopId: asNullableString(row.loop_id),
-    taskId: asNullableString(row.task_id),
     type: String(row.type),
     targetType: String(row.target_type),
     targetId: String(row.target_id),
@@ -1091,7 +952,6 @@ function mapAgentExecution(row: Record<string, unknown>): AgentExecutionRecord {
     projectId: asNullableString(row.project_id),
     loopId: asNullableString(row.loop_id),
     runId: asNullableString(row.run_id),
-    taskId: asNullableString(row.task_id),
     vendor: String(row.vendor),
     status: String(row.status),
     pid: asNullableNumber(row.pid),
@@ -1139,7 +999,6 @@ function mapWorktree(row: Record<string, unknown>): WorktreeRecord {
   return {
     id: String(row.id),
     projectId: String(row.project_id),
-    taskId: asNullableString(row.task_id),
     repoPath: String(row.repo_path),
     worktreePath: String(row.worktree_path),
     branch: String(row.branch),
@@ -1177,11 +1036,9 @@ const SCHEDULED_QUEUE_BASE_QUERY = `
   SELECT qi.*
   FROM queue_items qi
   LEFT JOIN loops l ON l.id = qi.loop_id
-  LEFT JOIN tasks t ON t.id = qi.task_id
   WHERE qi.status = 'queued'
     AND qi.available_at <= ?1
     AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted')
-    AND COALESCE(t.status, 'ready') NOT IN ('paused', 'completed', 'failed')
     AND (
       qi.type != 'fixer'
       OR qi.repo IS NULL

@@ -244,8 +244,8 @@ describe("ReviewerLoopRunner", () => {
       id: "loop_worker_1",
       projectId: "project_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_1",
+      targetType: "project",
+      targetId: "project:project_1",
       repo: "acme/looper",
       prNumber: null,
       status: "queued",
@@ -260,10 +260,10 @@ describe("ReviewerLoopRunner", () => {
       projectId: "project_1",
       loopId: "loop_worker_1",
       type: "worker",
-      targetType: "task",
-      targetId: "task:task_1",
+      targetType: "project",
+      targetId: "project_1",
       repo: "acme/looper",
-      dedupeKey: "worker:task_1",
+      dedupeKey: "worker:loop_worker_1",
     });
 
     const runner = new ReviewerLoopRunner({
@@ -279,7 +279,7 @@ describe("ReviewerLoopRunner", () => {
 
     expect(result).toBeNull();
     expect(
-      fixture.store.queue.findActiveByDedupe("worker:task_1")?.status,
+      fixture.store.queue.findActiveByDedupe("worker:loop_worker_1")?.status,
     ).toBe("queued");
 
     fixture.store.close();

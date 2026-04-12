@@ -3,7 +3,6 @@ CREATE TABLE IF NOT EXISTS agent_executions (
   project_id TEXT,
   loop_id TEXT,
   run_id TEXT,
-  task_id TEXT,
   vendor TEXT NOT NULL,
   status TEXT NOT NULL,
   pid INTEGER,
@@ -23,8 +22,7 @@ CREATE TABLE IF NOT EXISTS agent_executions (
   updated_at TEXT NOT NULL,
   FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE SET NULL,
   FOREIGN KEY (loop_id) REFERENCES loops (id) ON DELETE SET NULL,
-  FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE SET NULL,
-  FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE SET NULL
+  FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_executions_status ON agent_executions (status);
@@ -60,7 +58,6 @@ CREATE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications (channel, d
 CREATE TABLE IF NOT EXISTS worktrees (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
-  task_id TEXT,
   repo_path TEXT NOT NULL,
   worktree_path TEXT NOT NULL,
   branch TEXT NOT NULL,
@@ -71,8 +68,7 @@ CREATE TABLE IF NOT EXISTS worktrees (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   cleaned_at TEXT,
-  FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
-  FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE SET NULL
+  FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worktrees_project_branch ON worktrees (project_id, branch);

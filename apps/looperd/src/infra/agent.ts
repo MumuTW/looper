@@ -10,7 +10,6 @@ export interface AgentRunInput {
   projectId?: string;
   loopId?: string;
   runId?: string;
-  taskId?: string;
   prompt: string;
   workingDirectory: string;
   timeoutMs: number;
@@ -109,7 +108,6 @@ export class ConfiguredAgentExecutor {
       projectId: input.projectId,
       loopId: input.loopId,
       runId: input.runId,
-      taskId: input.taskId,
       vendor: this.options.config.vendor,
       status,
       pid: subprocess.pid,
@@ -277,7 +275,6 @@ export class ConfiguredAgentExecutor {
         projectId: input.projectId ?? null,
         loopId: input.loopId ?? null,
         runId: input.runId ?? null,
-        taskId: input.taskId ?? null,
         status: finalStatus,
         pid: subprocess.pid,
         summary: result.summary ?? null,
