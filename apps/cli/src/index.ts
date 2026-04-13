@@ -844,8 +844,8 @@ async function runWorkCreate(context: CliContext) {
       projectId: requireFlag(context.args, "project"),
       ...(issueNumber == null
         ? { title: requireFlag(context.args, "title") }
-        : getFlag(context.args, "title") != null
-          ? { title: getFlag(context.args, "title") }
+        : hasFlag(context.args, "title")
+          ? { title: requireFlag(context.args, "title") }
           : {}),
       ...(getFlag(context.args, "prompt") != null
         ? { prompt: getFlag(context.args, "prompt") }

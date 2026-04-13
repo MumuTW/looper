@@ -167,6 +167,22 @@ describe("runCli", () => {
     );
   });
 
+  test("rejects valueless title in worker issue mode", async () => {
+    const errors: string[] = [];
+    const exitCode = await runCli(
+      ["work", "--project", "project_1", "--issue", "123", "--title"],
+      {
+        stderr: (line) => errors.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(errors.at(-1)).toContain(
+      "option `--title <title>` value is missing",
+    );
+  });
+
   test("creates reviewer loop from PR reference", async () => {
     const requests: string[] = [];
     const exitCode = await runCli(
