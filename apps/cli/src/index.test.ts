@@ -82,6 +82,91 @@ describe("runCli", () => {
     expect(requests[0]?.body).toContain('"specPath":"spec.md"');
   });
 
+  test("creates worker work item from issue number", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(
+      [
+        "work",
+        "--project",
+        "project_1",
+        "--issue",
+        "123",
+        "--repo",
+        "acme/looper",
+        "--base-branch",
+        "main",
+      ],
+      {
+        stdout: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input, init) => {
+          requests.push({
+            url: String(input),
+            body: init?.body as string | null,
+          });
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_2_issue",
+              data: {
+                id: "loop_2",
+                title: "Implement acme/looper#123",
+                status: "running",
+              },
+            }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toContain("/api/v1/workers");
+    expect(requests[0]?.body).toContain('"projectId":"project_1"');
+    expect(requests[0]?.body).toContain('"issueNumber":123');
+    expect(requests[0]?.body).toContain('"repo":"acme/looper"');
+    expect(requests[0]?.body).toContain('"baseBranch":"main"');
+    expect(requests[0]?.body).not.toContain('"title":');
+  });
+
+  test("rejects invalid worker issue number", async () => {
+    const errors: string[] = [];
+    const exitCode = await runCli(
+      ["work", "--project", "project_1", "--issue", "123abc"],
+      {
+        stderr: (line) => errors.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(errors.at(-1)).toContain("--issue must be a positive integer");
+  });
+
+  test("rejects combining worker issue with prompt or spec", async () => {
+    const errors: string[] = [];
+    const exitCode = await runCli(
+      [
+        "work",
+        "--project",
+        "project_1",
+        "--issue",
+        "123",
+        "--prompt",
+        "Implement CLI flow",
+      ],
+      {
+        stderr: (line) => errors.push(line),
+        loadConfigImpl: async () => createConfig() as never,
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(errors.at(-1)).toContain(
+      "--issue cannot be combined with --prompt or --spec",
+    );
+  });
+
   test("creates reviewer loop from PR reference", async () => {
     const requests: string[] = [];
     const exitCode = await runCli(

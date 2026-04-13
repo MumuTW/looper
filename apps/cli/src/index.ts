@@ -373,6 +373,7 @@ function createCli(runtime: CliRuntime) {
     .option("--project <projectId>", "Project id")
     .option("--title <title>", "Task title")
     .option("--prompt <text>", "Implementation prompt")
+    .option("--issue <number>", "Issue number")
     .option("--spec <path>", "Spec path")
     .option("--repo <repo>", "Repository slug")
     .option("--base-branch <branch>", "Base branch")
@@ -380,6 +381,7 @@ function createCli(runtime: CliRuntime) {
       (name) =>
         `  $ ${name} work --project project_1 --title "Ship CLI" --spec specs/ship-cli.md`,
     )
+    .example((name) => `  $ ${name} work --project project_1 --issue 123`)
     .action(async (options) => {
       await dispatch(createContext(runtime, ["work"], options));
     });
@@ -819,13 +821,39 @@ async function runLoopPause(context: CliContext) {
 }
 
 async function runWorkCreate(context: CliContext) {
+  const issueNumberValue = getFlag(context.args, "issue");
+  let issueNumber: number | undefined;
+  if (issueNumberValue != null) {
+    if (
+      getFlag(context.args, "prompt") != null ||
+      getFlag(context.args, "spec") != null
+    ) {
+      throw new Error("--issue cannot be combined with --prompt or --spec");
+    }
+
+    const parsedIssueNumber = Number(issueNumberValue);
+    if (!Number.isInteger(parsedIssueNumber) || parsedIssueNumber <= 0) {
+      throw new Error("--issue must be a positive integer");
+    }
+    issueNumber = parsedIssueNumber;
+  }
+
   const data = await context.client.post<Record<string, unknown>>(
     "/api/v1/workers",
     {
       projectId: requireFlag(context.args, "project"),
-      title: requireFlag(context.args, "title"),
-      prompt: getFlag(context.args, "prompt"),
-      specPath: getFlag(context.args, "spec"),
+      ...(issueNumber == null
+        ? { title: requireFlag(context.args, "title") }
+        : getFlag(context.args, "title") != null
+          ? { title: getFlag(context.args, "title") }
+          : {}),
+      ...(getFlag(context.args, "prompt") != null
+        ? { prompt: getFlag(context.args, "prompt") }
+        : {}),
+      ...(issueNumber == null ? {} : { issueNumber }),
+      ...(getFlag(context.args, "spec") != null
+        ? { specPath: getFlag(context.args, "spec") }
+        : {}),
       repo: getFlag(context.args, "repo"),
       baseBranch: getFlag(context.args, "base-branch"),
     },
