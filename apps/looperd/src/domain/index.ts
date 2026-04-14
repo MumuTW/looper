@@ -423,6 +423,16 @@ export function assertUniqueActiveLoop(inputs: {
       return false;
     }
 
+    const allowConcurrentProjectWorkers =
+      loop.projectId === inputs.candidate.projectId &&
+      loop.type === "worker" &&
+      inputs.candidate.type === "worker" &&
+      loop.target.targetType === "project" &&
+      inputs.candidate.target.targetType === "project";
+    if (allowConcurrentProjectWorkers) {
+      return false;
+    }
+
     return (
       loop.projectId === inputs.candidate.projectId &&
       loop.type === inputs.candidate.type &&

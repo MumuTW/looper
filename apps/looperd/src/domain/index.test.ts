@@ -105,6 +105,52 @@ describe("domain invariants", () => {
     ).toThrow("active loop already exists");
   });
 
+  test("allows multiple active project-targeted worker loops", () => {
+    expect(() =>
+      assertUniqueActiveLoop({
+        loops: [
+          {
+            id: "loop_worker_existing",
+            projectId: "project_1",
+            type: "worker",
+            target: defineProjectLoopTarget("project_1"),
+            status: "running",
+          },
+        ],
+        candidate: {
+          id: "loop_worker_candidate",
+          projectId: "project_1",
+          type: "worker",
+          target: defineProjectLoopTarget("project_1"),
+          status: "queued",
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  test("still rejects duplicate active pull-request-targeted worker loops", () => {
+    expect(() =>
+      assertUniqueActiveLoop({
+        loops: [
+          {
+            id: "loop_worker_pr_existing",
+            projectId: "project_1",
+            type: "worker",
+            target: definePullRequestLoopTarget("acme/looper", 42),
+            status: "running",
+          },
+        ],
+        candidate: {
+          id: "loop_worker_pr_candidate",
+          projectId: "project_1",
+          type: "worker",
+          target: definePullRequestLoopTarget("acme/looper", 42),
+          status: "queued",
+        },
+      }),
+    ).toThrow("active loop already exists");
+  });
+
   test("allows terminal loops to coexist with a new active loop", () => {
     expect(() =>
       assertUniqueActiveLoop({

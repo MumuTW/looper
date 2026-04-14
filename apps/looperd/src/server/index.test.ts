@@ -448,6 +448,47 @@ describe("createLooperdApi", () => {
       status: "queued",
     });
 
+    const createSecondProjectWorkerResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          title: "Add CLI list command",
+          prompt: "Add a list subcommand",
+          repo: "acme/looper",
+          baseBranch: "main",
+        }),
+      }),
+    );
+    const createSecondProjectWorkerBody =
+      (await createSecondProjectWorkerResponse.json()) as {
+        data: {
+          id: string;
+          status: string;
+          title: string;
+        };
+      };
+    expect(createSecondProjectWorkerResponse.status).toBe(200);
+    expect(createSecondProjectWorkerBody.data.status).toBe("running");
+    expect(createSecondProjectWorkerBody.data.title).toBe(
+      "Add CLI list command",
+    );
+    expect(createSecondProjectWorkerBody.data.id).not.toBe(
+      createWorkerBody.data.id,
+    );
+    expect(
+      store.queue.findActiveByDedupe(
+        `worker:${createSecondProjectWorkerBody.data.id}`,
+      ),
+    ).toMatchObject({
+      loopId: createSecondProjectWorkerBody.data.id,
+      type: "worker",
+      targetType: "project",
+      targetId: "project_1",
+      status: "queued",
+    });
+
     const createWorkerFromPrResponse = await api.handle(
       new Request("http://localhost/api/v1/workers", {
         method: "POST",
@@ -483,6 +524,23 @@ describe("createLooperdApi", () => {
       lockKey: "pr:acme/looper:42",
       status: "queued",
     });
+
+    const duplicatePrWorkerResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          repo: "acme/looper",
+          prNumber: 42,
+        }),
+      }),
+    );
+    const duplicatePrWorkerBody = (await duplicatePrWorkerResponse.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(duplicatePrWorkerResponse.status).toBe(409);
+    expect(duplicatePrWorkerBody.error.code).toBe("LOOP_CONFLICT");
 
     store.projects.upsert({
       id: "project_2",
