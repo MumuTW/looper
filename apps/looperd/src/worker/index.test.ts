@@ -1458,6 +1458,44 @@ describe("WorkerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("defaults to manual PR opening when no strategy is configured", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and committed changes", [
+        "abc123",
+      ]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("skipped");
+    expect(result.summary).toContain("PR opening is manual");
+    expect(github.listOpenPullRequestCalls).toHaveLength(0);
+    expect(github.createPullRequestCalls).toHaveLength(0);
+
+    fixture.store.close();
+  });
+
   test("skips agent execution when auto commit is disabled", async () => {
     const fixture = await createFixture();
     const git = new FakeGitGateway(fixture.worktreeRoot);

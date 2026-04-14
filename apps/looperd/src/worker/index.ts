@@ -240,7 +240,7 @@ export class WorkerLoopRunner {
     this.agentTimeoutMs = options.agentTimeoutMs ?? 30 * 60_000;
     this.claimTtlMs = options.claimTtlMs ?? 10 * 60_000;
     this.validationCommands = options.validationCommands ?? [];
-    this.openPrStrategy = options.openPrStrategy ?? "all_done";
+    this.openPrStrategy = options.openPrStrategy ?? "manual";
     this.allowAutoCommit = options.allowAutoCommit ?? true;
     this.allowAutoPush = options.allowAutoPush ?? true;
   }

@@ -182,6 +182,7 @@ describe("createLooperdApi", () => {
           allowAutoPush: boolean;
           allowAutoApprove: boolean;
           allowRiskyFixes: boolean;
+          openPrStrategy: string;
         };
         notifications: { inAppEnabled: boolean };
       };
@@ -199,6 +200,7 @@ describe("createLooperdApi", () => {
     expect(statusBody.data.safety.allowAutoPush).toBe(true);
     expect(statusBody.data.safety.allowAutoApprove).toBe(false);
     expect(statusBody.data.safety.allowRiskyFixes).toBe(false);
+    expect(statusBody.data.safety.openPrStrategy).toBe("manual");
     expect(statusBody.data.notifications.inAppEnabled).toBe(true);
 
     const configResponse = await api.handle(

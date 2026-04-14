@@ -59,7 +59,7 @@ export function createDefaultLooperConfig(cwd = process.cwd()): LooperConfig {
       allowAutoApprove: false,
       allowAutoMerge: false,
       allowRiskyFixes: false,
-      openPrStrategy: "all_done",
+      openPrStrategy: "manual",
     },
     projects: [],
   };
