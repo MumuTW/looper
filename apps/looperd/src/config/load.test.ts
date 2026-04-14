@@ -104,6 +104,7 @@ describe("loadLooperConfig", () => {
     expect(loaded.config.defaults.allowAutoCommit).toBe(false);
     expect(loaded.config.defaults.allowAutoPush).toBe(false);
     expect(loaded.config.defaults.allowAutoApprove).toBe(true);
+    expect(loaded.config.defaults.openPrStrategy).toBe("all_done");
     expect(loaded.config.notifications.inApp).toBe(false);
     expect(loaded.config.notifications.osascript.enabled).toBe(false);
     expect(loaded.metadata.configFilePresent).toBe(true);

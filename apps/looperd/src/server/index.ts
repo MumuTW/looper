@@ -325,7 +325,7 @@ function buildStatusResponse(context: LooperdApiContext) {
       allowAutoPush: context.config.defaults.allowAutoPush,
       allowAutoApprove: context.config.defaults.allowAutoApprove,
       allowRiskyFixes: context.config.defaults.allowRiskyFixes,
-      openPrStrategy: context.config.defaults.openPrStrategy ?? "manual",
+      openPrStrategy: context.config.defaults.openPrStrategy ?? "all_done",
     },
     notifications: {
       inAppEnabled: context.config.notifications.inApp,
