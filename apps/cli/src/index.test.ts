@@ -713,6 +713,21 @@ describe("runCli", () => {
                       status: "running",
                     },
                   },
+                  {
+                    runId: null,
+                    loopId: "loop_worker_queued",
+                    projectId: "project_1",
+                    type: "worker",
+                    status: "queued",
+                    currentStep: null,
+                    startedAt: "2026-04-11T12:04:00.000Z",
+                    target: {
+                      type: "project",
+                      projectId: "project_1",
+                      label: "project_1",
+                    },
+                    agent: null,
+                  },
                 ],
               },
             }),
@@ -735,6 +750,10 @@ describe("runCli", () => {
       expect(lines[2]).toContain("2222");
       expect(lines[2]).toContain("running");
       expect(lines[2]).toContain("5m");
+      expect(lines[3]).toContain("worker");
+      expect(lines[3]).toContain("project_1");
+      expect(lines[3]).toContain("queued");
+      expect(lines[3]).toContain("1m");
     } finally {
       Date.now = originalNow;
     }
@@ -756,7 +775,7 @@ describe("runCli", () => {
     });
 
     expect(exitCode).toBe(0);
-    expect(lines).toEqual(["No running loops."]);
+    expect(lines).toEqual(["No running or queued loops."]);
   });
 
   test("composes ps query params from --type and --project", async () => {

@@ -686,7 +686,7 @@ async function buildWorkersCreateResponse(
     targetId: effectivePrNumber ? `pr:${repo}:${effectivePrNumber}` : projectId,
     repo,
     prNumber: effectivePrNumber ?? undefined,
-    status: "running",
+    status: "queued",
     now,
     metadataJson: JSON.stringify({ worker: payload }),
   });
@@ -832,13 +832,13 @@ interface ActiveRunAgentSummary {
 
 interface ActiveRunView {
   seq: number;
-  runId: string;
+  runId: string | null;
   loopId: string;
   projectId: string;
   type: string;
   status: string;
   currentStep: string | null;
-  startedAt: string;
+  startedAt: string | null;
   target:
     | {
         type: "project";
@@ -879,11 +879,14 @@ function buildActiveRunsResponse(
 
 function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
   const activeRuns = context.store.runs.listByStatus("running");
+  const queuedLoops = context.store.loops
+    .list()
+    .filter((loop) => loop.status === "queued");
   const activeAgentByRunId = buildActiveAgentByRunId(
     context.store.agentExecutions.listActive(),
   );
 
-  return activeRuns
+  const runningViews = activeRuns
     .map((run) => {
       const loop = context.store.loops.getById(run.loopId);
       if (!loop) {
@@ -909,8 +912,32 @@ function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
         worktree: buildWorktreeSummary(loop, run),
       } satisfies ActiveRunView;
     })
-    .filter((item): item is ActiveRunView => item !== null)
-    .sort(compareActiveRunViews);
+    .filter((item): item is ActiveRunView => item !== null);
+
+  const queuedViews = queuedLoops
+    .map((loop) => {
+      const target = tryBuildActiveRunTarget(context, loop);
+      if (!target) {
+        return null;
+      }
+
+      return {
+        seq: loop.seq,
+        runId: null,
+        loopId: loop.id,
+        projectId: loop.projectId,
+        type: loop.type,
+        status: loop.status,
+        currentStep: null,
+        startedAt: loop.nextRunAt ?? loop.updatedAt ?? loop.createdAt,
+        target,
+        agent: null,
+        worktree: null,
+      } satisfies ActiveRunView;
+    })
+    .filter((item): item is ActiveRunView => item !== null);
+
+  return [...runningViews, ...queuedViews].sort(compareActiveRunViews);
 }
 
 function buildActiveAgentByRunId(
@@ -1069,18 +1096,27 @@ function compareActiveRunViews(
   left: ActiveRunView,
   right: ActiveRunView,
 ): number {
+  const leftIsRunning = left.status === "running" ? 1 : 0;
+  const rightIsRunning = right.status === "running" ? 1 : 0;
+  if (leftIsRunning !== rightIsRunning) {
+    return rightIsRunning - leftIsRunning;
+  }
+
   const leftHasActiveAgent = left.agent ? 1 : 0;
   const rightHasActiveAgent = right.agent ? 1 : 0;
   if (leftHasActiveAgent !== rightHasActiveAgent) {
     return rightHasActiveAgent - leftHasActiveAgent;
   }
 
-  const startedAtComparison = compareIsoAsc(left.startedAt, right.startedAt);
+  const startedAtComparison = compareIsoAsc(
+    left.startedAt ?? "",
+    right.startedAt ?? "",
+  );
   if (startedAtComparison !== 0) {
     return startedAtComparison;
   }
 
-  return left.runId.localeCompare(right.runId);
+  return (left.runId ?? left.loopId).localeCompare(right.runId ?? right.loopId);
 }
 
 function compareIsoAsc(left: string, right: string): number {
