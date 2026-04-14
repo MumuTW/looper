@@ -19,7 +19,7 @@ export function createDefaultLooperConfig(cwd = process.cwd()): LooperConfig {
     },
     scheduler: {
       pollIntervalSeconds: 30,
-      maxConcurrentRuns: 1,
+      maxConcurrentRuns: 3,
       retryMaxAttempts: 5,
       retryBaseDelayMs: 5_000,
     },

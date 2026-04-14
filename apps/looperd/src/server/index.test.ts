@@ -11,6 +11,7 @@ import { createLooperdApi } from "./index";
 async function createFixture(options?: {
   runtimeControl?: {
     stopLoop(input: { loopId: string; reason: string }): Promise<unknown>;
+    triggerSchedulerTick(): void;
   };
 }) {
   const rootDir = await mkdtemp(join(tmpdir(), "looperd-api-"));
@@ -157,6 +158,7 @@ async function createFixture(options?: {
             vendor?: string;
             pid?: number | null;
           }>;
+          triggerSchedulerTick(): void;
         }
       | undefined,
   });
@@ -393,7 +395,15 @@ describe("createLooperdApi", () => {
   });
 
   test("supports loop and worker mutation routes", async () => {
-    const { api, store, rootDir } = await createFixture();
+    let schedulerTriggerCalls = 0;
+    const { api, store, rootDir } = await createFixture({
+      runtimeControl: {
+        stopLoop: async () => ({ stopped: false }),
+        triggerSchedulerTick: () => {
+          schedulerTriggerCalls += 1;
+        },
+      },
+    });
 
     const pauseLoopResponse = await api.handle(
       new Request("http://localhost/api/v1/loops/loop_1/pause", {
@@ -449,6 +459,7 @@ describe("createLooperdApi", () => {
       type: "worker",
       status: "queued",
     });
+    expect(schedulerTriggerCalls).toBe(1);
 
     const createSecondProjectWorkerResponse = await api.handle(
       new Request("http://localhost/api/v1/workers", {
@@ -1531,6 +1542,7 @@ describe("createLooperdApi", () => {
             stopped: true,
           };
         },
+        triggerSchedulerTick: () => {},
       },
     });
 

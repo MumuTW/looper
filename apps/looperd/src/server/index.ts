@@ -46,6 +46,7 @@ export interface LooperdApiContext {
       vendor?: string;
       pid?: number | null;
     }>;
+    triggerSchedulerTick(): void;
   };
   getStartedAt(): Date | undefined;
   getRecoverySummary(): Record<string, unknown>;
@@ -714,6 +715,8 @@ async function buildWorkersCreateResponse(
     payloadJson: JSON.stringify(payload),
   });
 
+  context.runtimeControl?.triggerSchedulerTick();
+
   return {
     ...loop,
     ...payload,
@@ -887,7 +890,7 @@ function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
   );
 
   const runningViews = activeRuns
-    .map((run) => {
+    .map<ActiveRunView | null>((run) => {
       const loop = context.store.loops.getById(run.loopId);
       if (!loop) {
         return null;
@@ -912,10 +915,10 @@ function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
         worktree: buildWorktreeSummary(loop, run),
       } satisfies ActiveRunView;
     })
-    .filter((item): item is ActiveRunView => item !== null);
+    .filter(isActiveRunView);
 
   const queuedViews = queuedLoops
-    .map((loop) => {
+    .map<ActiveRunView | null>((loop) => {
       const target = tryBuildActiveRunTarget(context, loop);
       if (!target) {
         return null;
@@ -935,7 +938,7 @@ function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
         worktree: null,
       } satisfies ActiveRunView;
     })
-    .filter((item): item is ActiveRunView => item !== null);
+    .filter(isActiveRunView);
 
   return [...runningViews, ...queuedViews].sort(compareActiveRunViews);
 }
@@ -981,6 +984,10 @@ function buildActiveAgentByRunId(
       ];
     }),
   );
+}
+
+function isActiveRunView(item: ActiveRunView | null): item is ActiveRunView {
+  return item !== null;
 }
 
 function tryBuildActiveRunTarget(

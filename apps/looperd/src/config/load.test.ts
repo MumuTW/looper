@@ -3,7 +3,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ConfigValidationError, loadLooperConfig } from "./index";
+import {
+  ConfigValidationError,
+  createDefaultLooperConfig,
+  loadLooperConfig,
+} from "./index";
 
 async function createFixture(): Promise<{
   rootDir: string;
@@ -40,6 +44,11 @@ afterEach(async () => {
 });
 
 describe("loadLooperConfig", () => {
+  test("defaults scheduler maxConcurrentRuns to 3", () => {
+    const config = createDefaultLooperConfig();
+    expect(config.scheduler.maxConcurrentRuns).toBe(3);
+  });
+
   test("merges config file, env, and CLI overrides in priority order", async () => {
     const fixture = await createFixture();
     cleanupPaths.push(fixture.rootDir);
