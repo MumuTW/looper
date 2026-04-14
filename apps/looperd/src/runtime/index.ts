@@ -73,8 +73,11 @@ export interface CreateLooperdRuntimeOptions {
     | "resolveReviewThread"
     | "capturePullRequestSnapshot"
     | "submitReview"
+    | "addPullRequestComment"
+    | "addPullRequestReaction"
     | "createPullRequest"
     | "addPullRequestLabels"
+    | "removePullRequestReaction"
     | "removePullRequestLabels"
     | "addPullRequestReviewers"
   >;

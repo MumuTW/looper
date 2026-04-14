@@ -180,6 +180,12 @@ class FakeGitHubGateway {
     this.submitCalls.push(input);
   }
 
+  public async addPullRequestComment(): Promise<void> {}
+
+  public async addPullRequestReaction(): Promise<void> {}
+
+  public async removePullRequestReaction(): Promise<void> {}
+
   public async createPullRequest(): Promise<{ number?: number; url: string }> {
     this.createPullRequestCalls += 1;
     return {

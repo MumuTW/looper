@@ -47,6 +47,21 @@ describe("GhCliGitHubGateway", () => {
   "api repos/acme/looper/pulls/42/requested_reviewers --method POST -f reviewers[]=reviewer")
     printf '{}'
     ;;
+  "api repos/acme/looper/pulls/42/reviews --method POST --input -")
+    printf '{}'
+    ;;
+  "pr comment 42 --repo acme/looper --body High-level follow-up")
+    printf '{}'
+    ;;
+  "api repos/acme/looper/issues/42/reactions --method POST -H Accept: application/vnd.github+json -f content=eyes")
+    printf '{}'
+    ;;
+  "api repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json")
+    printf '[{"id":7,"content":"eyes","user":{"login":"reviewer"}}]'
+    ;;
+  "api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json")
+    printf '{}'
+    ;;
   "pr view"*)
     printf '{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"DIRTY","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}},{"requestedReviewer":{"__typename":"Team","slug":"platform"}}],"comments":[{"state":"UNRESOLVED"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}'
     ;;
@@ -97,6 +112,36 @@ esac\n`,
       event: "COMMENT",
       body: "Looks good",
     });
+    await gateway.submitReview({
+      repo: "acme/looper",
+      prNumber: 42,
+      event: "COMMENT",
+      body: "Needs work",
+      commitId: "abc123",
+      comments: [
+        {
+          body: "Please handle the null case.",
+          path: "src/a.ts",
+          line: 12,
+          side: "RIGHT",
+        },
+      ],
+    });
+    await gateway.addPullRequestComment({
+      repo: "acme/looper",
+      prNumber: 42,
+      body: "High-level follow-up",
+    });
+    await gateway.addPullRequestReaction({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
+    await gateway.removePullRequestReaction({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
     await gateway.resolveReviewThread({
       repo: "acme/looper",
       threadId: "thread-1",
@@ -144,6 +189,18 @@ esac\n`,
     const log = await readFile(logPath, "utf8");
     expect(log).toContain(
       "pr review 42 --repo acme/looper --comment --body Looks good",
+    );
+    expect(log).toContain(
+      "api repos/acme/looper/pulls/42/reviews --method POST --input -",
+    );
+    expect(log).toContain(
+      "pr comment 42 --repo acme/looper --body High-level follow-up",
+    );
+    expect(log).toContain(
+      "api repos/acme/looper/issues/42/reactions --method POST -H Accept: application/vnd.github+json -f content=eyes",
+    );
+    expect(log).toContain(
+      "api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json",
     );
     expect(log).toContain(
       "pr list --repo acme/looper --state open --limit 30 --label phase-1",

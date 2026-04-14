@@ -15,8 +15,11 @@ export {
   GhCliGitHubGateway,
   type CreatePullRequestInput,
   type CreatePullRequestResult,
+  type GitHubReviewComment,
   type GitHubPullRequestDetail,
   type GitHubPullRequestSummary,
+  type PullRequestCommentInput,
+  type PullRequestReactionInput,
   type SubmitReviewInput,
 } from "./github";
 export {

@@ -7,6 +7,7 @@ import { CommandExecutionError } from "../infra/command";
 import type {
   GitHubPullRequestDetail,
   GitHubPullRequestSummary,
+  GitHubReviewComment,
   SubmitReviewInput,
 } from "../infra/github";
 import {
@@ -60,6 +61,24 @@ export interface ReviewerGitHubGateway {
     capturedAt?: string;
   }): Promise<PullRequestSnapshotRecord>;
   submitReview(input: SubmitReviewInput): Promise<void>;
+  addPullRequestComment(input: {
+    repo: string;
+    prNumber: number;
+    body: string;
+    cwd?: string;
+  }): Promise<void>;
+  addPullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd?: string;
+  }): Promise<void>;
+  removePullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd?: string;
+  }): Promise<void>;
   addPullRequestLabels(input: {
     repo: string;
     prNumber: number;
@@ -148,10 +167,27 @@ interface ReviewerCheckpoint {
   pendingReview?: {
     headSha: string;
     event: ReviewEvent;
-    body: string;
+    body?: string;
     summary?: string;
+    comments: ReviewFeedbackComment[];
+    clean: boolean;
   };
   skipReason?: string;
+}
+
+interface ReviewFeedbackComment {
+  body: string;
+  path?: string;
+  line?: number;
+  side?: "LEFT" | "RIGHT";
+  startLine?: number;
+  startSide?: "LEFT" | "RIGHT";
+}
+
+interface ParsedReviewFeedback {
+  body?: string;
+  comments: ReviewFeedbackComment[];
+  clean: boolean;
 }
 
 interface ResumedRunContext {
@@ -821,6 +857,12 @@ export class ReviewerLoopRunner {
     });
 
     const executionId = randomUUID();
+    await this.options.github.addPullRequestReaction({
+      repo,
+      prNumber,
+      content: "eyes",
+      cwd: input.project.repoPath,
+    });
     const execution = await this.options.agentExecutor.start({
       executionId,
       projectId: input.project.id,
@@ -854,10 +896,10 @@ export class ReviewerLoopRunner {
       );
     }
 
-    const reviewBody = toReviewBody(result);
-    if (!reviewBody) {
+    const reviewFeedback = parseReviewFeedback(result);
+    if (!reviewFeedback.clean && reviewFeedback.comments.length === 0) {
       throw new ReviewerLoopError(
-        "Reviewer agent produced an empty review body",
+        "Reviewer agent produced no actionable review comments",
         result.parseStatus === "invalid_json"
           ? "non_retryable"
           : "retryable_transient",
@@ -869,8 +911,10 @@ export class ReviewerLoopRunner {
       pendingReview: {
         headSha: snapshot.headSha,
         event: "COMMENT",
-        body: reviewBody,
+        body: reviewFeedback.body,
         summary: result.summary,
+        comments: reviewFeedback.comments,
+        clean: reviewFeedback.clean,
       },
       resumePolicy: "advance_from_checkpoint",
     };
@@ -908,6 +952,10 @@ export class ReviewerLoopRunner {
       pendingReview.event === "APPROVE" && !this.allowAutoApprove
         ? "COMMENT"
         : pendingReview.event;
+    const inlineComments = pendingReview.comments.filter(isInlineReviewComment);
+    const topLevelComments = pendingReview.comments.filter(
+      (comment) => !isInlineReviewComment(comment),
+    );
 
     const repo = requireString(input.queueItem.repo, "queueItem.repo");
     const prNumber = requireNumber(
@@ -931,13 +979,55 @@ export class ReviewerLoopRunner {
     }
 
     try {
-      await this.options.github.submitReview({
-        repo,
-        prNumber,
-        event: reviewEvent,
-        body: pendingReview.body,
-        cwd: input.project.repoPath,
-      });
+      if (pendingReview.clean) {
+        if (reviewEvent === "APPROVE") {
+          await this.options.github.submitReview({
+            repo,
+            prNumber,
+            event: reviewEvent,
+            body: pendingReview.body,
+            cwd: input.project.repoPath,
+          });
+        }
+        await this.options.github.addPullRequestReaction({
+          repo,
+          prNumber,
+          content: "+1",
+          cwd: input.project.repoPath,
+        });
+        await this.options.github.removePullRequestReaction({
+          repo,
+          prNumber,
+          content: "eyes",
+          cwd: input.project.repoPath,
+        });
+      } else {
+        if (inlineComments.length > 0 || pendingReview.body) {
+          await this.options.github.submitReview({
+            repo,
+            prNumber,
+            event: reviewEvent,
+            body: pendingReview.body,
+            commitId: pendingReview.headSha,
+            comments: inlineComments.map(toGitHubReviewComment),
+            cwd: input.project.repoPath,
+          });
+        }
+        for (const comment of topLevelComments) {
+          await this.options.github.addPullRequestComment({
+            repo,
+            prNumber,
+            body: comment.body,
+            cwd: input.project.repoPath,
+          });
+        }
+        await this.options.github.removePullRequestReaction({
+          repo,
+          prNumber,
+          content: "eyes",
+          cwd: input.project.repoPath,
+        });
+      }
 
       let postSubmitDetail = detail;
       if (
@@ -1446,6 +1536,136 @@ function toReviewBody(result: AgentResult): string | null {
   return candidate.length > 0 ? candidate : null;
 }
 
+function parseReviewFeedback(result: AgentResult): ParsedReviewFeedback {
+  const rawOutput = extractReviewOutput(result.rawLogs.stdout);
+  const parsed = parseStructuredReviewOutput(rawOutput);
+  if (parsed) {
+    return parsed;
+  }
+
+  const fallbackBody = toReviewBody(result);
+  return {
+    body: fallbackBody ?? undefined,
+    comments: fallbackBody ? [{ body: fallbackBody }] : [],
+    clean: false,
+  };
+}
+
+function extractReviewOutput(stdout: string): string {
+  return stdout
+    .split(/\r?\n/)
+    .filter((line) => !line.startsWith("__LOOPER_RESULT__="))
+    .join("\n")
+    .trim();
+}
+
+function parseStructuredReviewOutput(
+  output: string,
+): ParsedReviewFeedback | null {
+  if (!output) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(output) as Record<string, unknown>;
+    const verdict = readString(parsed.verdict)?.toLowerCase();
+    const body = normalizeOptionalBody(parsed.body);
+    const comments = Array.isArray(parsed.comments)
+      ? parsed.comments
+          .map((comment) => normalizeReviewFeedbackComment(comment))
+          .filter((comment): comment is ReviewFeedbackComment =>
+            Boolean(comment),
+          )
+      : [];
+    const clean = verdict === "clean";
+    if (!clean && comments.length === 0) {
+      return null;
+    }
+
+    return { body, comments, clean };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeReviewFeedbackComment(
+  value: unknown,
+): ReviewFeedbackComment | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const comment = value as Record<string, unknown>;
+  const body = readString(comment.body)?.trim();
+  if (!body) {
+    return null;
+  }
+
+  const path = readString(comment.path)?.trim();
+  const line = readPositiveInteger(comment.line);
+  const side = normalizeReviewSide(comment.side);
+  const startLine = readPositiveInteger(comment.startLine);
+  const startSide = normalizeReviewSide(comment.startSide);
+  if (
+    (path && (!line || !side)) ||
+    (!path && (line || side || startLine || startSide))
+  ) {
+    return null;
+  }
+
+  return {
+    body,
+    path,
+    line,
+    side,
+    startLine,
+    startSide,
+  };
+}
+
+function normalizeOptionalBody(value: unknown): string | undefined {
+  const body = readString(value)?.trim();
+  return body && body.length > 0 ? body : undefined;
+}
+
+function readPositiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function normalizeReviewSide(value: unknown): "LEFT" | "RIGHT" | undefined {
+  const side = readString(value)?.trim().toUpperCase();
+  return side === "LEFT" || side === "RIGHT" ? side : undefined;
+}
+
+function isInlineReviewComment(
+  comment: ReviewFeedbackComment,
+): comment is ReviewFeedbackComment & {
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+} {
+  return Boolean(comment.path && comment.line && comment.side);
+}
+
+function toGitHubReviewComment(
+  comment: ReviewFeedbackComment & {
+    path: string;
+    line: number;
+    side: "LEFT" | "RIGHT";
+  },
+): GitHubReviewComment {
+  return {
+    body: comment.body,
+    path: comment.path,
+    line: comment.line,
+    side: comment.side,
+    startLine: comment.startLine,
+    startSide: comment.startSide,
+  };
+}
+
 function summarizeLogs(stdout: string): string {
   return stdout
     .split("\n")
@@ -1484,7 +1704,15 @@ function buildReviewPrompt(input: {
         ? `Unresolved threads: ${input.snapshot.unresolvedThreadCount}`
         : null,
       diff ? `Diff:\n${diff}` : null,
-      "Return concise GitHub review feedback. Do not approve; provide comment-ready feedback text.",
+      [
+        "Return detailed GitHub review feedback as raw JSON with this exact shape:",
+        '{"verdict":"clean"|"actionable","body":"optional overall summary","comments":[{"body":"required comment text","path":"src/file.ts optional for inline comments","line":123,"side":"RIGHT","startLine":120,"startSide":"RIGHT"}]}',
+        "Use verdict=actionable whenever there is any actionable advice.",
+        "Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and diff line numbers.",
+        "Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback.",
+        "Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
+        "Do not approve. If the review is clean, return verdict=clean with comments=[].",
+      ].join("\n"),
     ]
       .filter((value): value is string => Boolean(value))
       .join("\n\n"),

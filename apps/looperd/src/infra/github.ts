@@ -52,6 +52,31 @@ export interface SubmitReviewInput {
   prNumber: number;
   event: "APPROVE" | "COMMENT" | "REQUEST_CHANGES";
   body?: string;
+  commitId?: string;
+  comments?: GitHubReviewComment[];
+  cwd?: string;
+}
+
+export interface GitHubReviewComment {
+  body: string;
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+  startLine?: number;
+  startSide?: "LEFT" | "RIGHT";
+}
+
+export interface PullRequestReactionInput {
+  repo: string;
+  prNumber: number;
+  content: "+1" | "eyes";
+  cwd?: string;
+}
+
+export interface PullRequestCommentInput {
+  repo: string;
+  prNumber: number;
+  body: string;
   cwd?: string;
 }
 
@@ -353,6 +378,35 @@ export class GhCliGitHubGateway {
   }
 
   public async submitReview(input: SubmitReviewInput): Promise<void> {
+    if ((input.comments?.length ?? 0) > 0) {
+      const payload = {
+        event: input.event,
+        body: input.body,
+        commit_id: input.commitId,
+        comments: input.comments?.map((comment) => ({
+          body: comment.body,
+          path: comment.path,
+          line: comment.line,
+          side: comment.side,
+          start_line: comment.startLine,
+          start_side: comment.startSide,
+        })),
+      };
+      await this.runGh(
+        [
+          "api",
+          `repos/${input.repo}/pulls/${input.prNumber}/reviews`,
+          "--method",
+          "POST",
+          "--input",
+          "-",
+        ],
+        input.cwd,
+        JSON.stringify(payload),
+      );
+      return;
+    }
+
     const args = [
       "pr",
       "review",
@@ -367,6 +421,84 @@ export class GhCliGitHubGateway {
     }
 
     await this.runGh(args, input.cwd);
+  }
+
+  public async addPullRequestComment(
+    input: PullRequestCommentInput,
+  ): Promise<void> {
+    await this.runGh(
+      [
+        "pr",
+        "comment",
+        String(input.prNumber),
+        "--repo",
+        input.repo,
+        "--body",
+        input.body,
+      ],
+      input.cwd,
+    );
+  }
+
+  public async addPullRequestReaction(
+    input: PullRequestReactionInput,
+  ): Promise<void> {
+    await this.runGh(
+      [
+        "api",
+        `repos/${input.repo}/issues/${input.prNumber}/reactions`,
+        "--method",
+        "POST",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-f",
+        `content=${input.content}`,
+      ],
+      input.cwd,
+    );
+  }
+
+  public async removePullRequestReaction(
+    input: PullRequestReactionInput,
+  ): Promise<void> {
+    const currentLogin = await this.getCurrentUserLogin({ cwd: input.cwd });
+    if (!currentLogin) {
+      return;
+    }
+
+    const reactionsResult = await this.runGh(
+      [
+        "api",
+        `repos/${input.repo}/issues/${input.prNumber}/reactions`,
+        "-H",
+        "Accept: application/vnd.github+json",
+      ],
+      input.cwd,
+    );
+    const reactions = asObjectArray(reactionsResult.stdout)
+      .map((value) => normalizeReaction(value))
+      .filter((value): value is GitHubReaction => Boolean(value));
+
+    for (const reaction of reactions) {
+      if (
+        reaction.content !== input.content ||
+        reaction.userLogin.toLowerCase() !== currentLogin.toLowerCase()
+      ) {
+        continue;
+      }
+
+      await this.runGh(
+        [
+          "api",
+          `repos/${input.repo}/issues/${input.prNumber}/reactions/${reaction.id}`,
+          "--method",
+          "DELETE",
+          "-H",
+          "Accept: application/vnd.github+json",
+        ],
+        input.cwd,
+      );
+    }
   }
 
   public async addPullRequestLabels(input: {
@@ -616,11 +748,12 @@ export class GhCliGitHubGateway {
     };
   }
 
-  private async runGh(args: string[], cwd?: string) {
+  private async runGh(args: string[], cwd?: string, stdin?: string) {
     return runCommand({
       command: this.options.ghPath,
       args,
       cwd: cwd ?? this.options.cwd,
+      stdin,
     });
   }
 
@@ -664,6 +797,12 @@ interface ReviewThreadComment {
   state: "RESOLVED" | "UNRESOLVED";
   isResolved: boolean;
   body?: string;
+}
+
+interface GitHubReaction {
+  id: number;
+  content: string;
+  userLogin: string;
 }
 
 function summarizeChecks(checks: unknown[]): string | null {
@@ -717,6 +856,22 @@ function normalizeReviewThread(value: unknown): ReviewThreadComment | null {
     isResolved,
     body: asOptionalString(commentNode?.body),
   };
+}
+
+function normalizeReaction(value: unknown): GitHubReaction | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const reaction = value as Record<string, unknown>;
+  const id = Number(reaction.id);
+  const content = asOptionalString(reaction.content);
+  const userLogin = extractAuthor(reaction.user);
+  if (!Number.isInteger(id) || id <= 0 || !content || !userLogin) {
+    return null;
+  }
+
+  return { id, content, userLogin };
 }
 
 function parseRepo(repo: string): { owner: string; name: string } {
