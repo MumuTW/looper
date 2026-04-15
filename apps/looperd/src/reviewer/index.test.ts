@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
+import { CommandExecutionError } from "../infra/command";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import type { PullRequestSnapshotRecord } from "../storage/types";
@@ -105,7 +106,9 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
   public removeReactionFailuresRemaining = 0;
   public nextReviewDecisionAfterSubmit: string | undefined;
   public failingViewPullRequestNumbers = new Set<number>();
+  public failInlineReviewAnchorCallNumbers = new Set<number>();
   public failPullRequestCommentCallNumbers = new Set<number>();
+  private submitCallCount = 0;
   private addPullRequestCommentCallCount = 0;
   private readonly currentLabels: string[];
 
@@ -237,7 +240,20 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
       startSide?: "LEFT" | "RIGHT";
     }>;
   }): Promise<void> {
+    this.submitCallCount += 1;
     this.submitCalls.push(input);
+    if (
+      (input.comments?.length ?? 0) > 0 &&
+      this.failInlineReviewAnchorCallNumbers.has(this.submitCallCount)
+    ) {
+      throw new CommandExecutionError("Command exited with code 1", {
+        exitCode: 1,
+        stdout: "",
+        stderr:
+          'gh: Validation Failed (HTTP 422)\n{"message":"Validation Failed","errors":["Pull request review thread line must be part of the diff"]}',
+        durationMs: 1,
+      });
+    }
     if (this.submitFailuresRemaining > 0) {
       this.submitFailuresRemaining -= 1;
       throw new Error("temporary GitHub failure");
@@ -1582,6 +1598,111 @@ describe("ReviewerLoopRunner", () => {
         repo: "acme/looper",
         prNumber: 42,
         body: "Second comment",
+      },
+    ]);
+
+    fixture.store.close();
+  });
+
+  test("falls back to top-level comments when GitHub rejects inline anchors", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    github.failInlineReviewAnchorCallNumbers.add(1);
+    github.failPullRequestCommentCallNumbers.add(2);
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("Detailed review"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "actionable",
+            body: "Overall review summary",
+            comments: [
+              {
+                body: "Please handle the null case.",
+                path: "src/a.ts",
+                line: 12,
+                side: "RIGHT",
+              },
+              { body: "Add a regression test." },
+            ],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!firstClaim) {
+      throw new Error("Expected first reviewer claim");
+    }
+
+    const firstResult = await runner.processClaimedItem(firstClaim);
+
+    expect(firstResult.status).toBe("failed");
+    expect(firstResult.failureKind).toBe("retryable_after_resume");
+    expect(github.submitCalls).toHaveLength(2);
+    expect(github.submitCalls[0]).toMatchObject({
+      repo: "acme/looper",
+      prNumber: 42,
+      event: "COMMENT",
+      body: "Overall review summary",
+      commitId: "abc123",
+      comments: [
+        {
+          body: "Please handle the null case.",
+          path: "src/a.ts",
+          line: 12,
+          side: "RIGHT",
+        },
+      ],
+    });
+    expect(github.submitCalls[1]).toMatchObject({
+      repo: "acme/looper",
+      prNumber: 42,
+      event: "COMMENT",
+      body: "Overall review summary",
+    });
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Inline comment fallback (src/a.ts:12):\n\nPlease handle the null case.",
+      },
+    ]);
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    github.failPullRequestCommentCallNumbers.clear();
+    const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!retryClaim) {
+      throw new Error("Expected retry reviewer claim");
+    }
+
+    const retryResult = await runner.processClaimedItem(retryClaim);
+
+    expect(retryResult.status).toBe("success");
+    expect(github.submitCalls).toHaveLength(2);
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Inline comment fallback (src/a.ts:12):\n\nPlease handle the null case.",
+      },
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Add a regression test.",
       },
     ]);
 

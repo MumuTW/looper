@@ -993,13 +993,6 @@ export class ReviewerLoopRunner {
           normalizedPendingReview.summary?.trim() ||
           undefined
         : normalizedPendingReview.body;
-    const inlineComments = normalizedPendingReview.comments.filter(
-      isInlineReviewComment,
-    );
-    const topLevelComments = normalizedPendingReview.comments.filter(
-      (comment) => !isInlineReviewComment(comment),
-    );
-
     const repo = requireString(input.queueItem.repo, "queueItem.repo");
     const prNumber = requireNumber(
       input.queueItem.prNumber,
@@ -1044,17 +1037,68 @@ export class ReviewerLoopRunner {
       } else {
         if (
           !normalizedPendingReview.publishState.reviewSubmitted &&
-          (inlineComments.length > 0 || normalizedPendingReview.body)
+          (normalizedPendingReview.comments.some(isInlineReviewComment) ||
+            normalizedPendingReview.body)
         ) {
-          await this.options.github.submitReview({
-            repo,
-            prNumber,
-            event: reviewEvent,
-            body: normalizedPendingReview.body,
-            commitId: normalizedPendingReview.headSha,
-            comments: inlineComments.map(toGitHubReviewComment),
-            cwd: input.project.repoPath,
-          });
+          const inlineComments = normalizedPendingReview.comments.filter(
+            isInlineReviewComment,
+          );
+          try {
+            await this.options.github.submitReview({
+              repo,
+              prNumber,
+              event: reviewEvent,
+              body: normalizedPendingReview.body,
+              commitId: normalizedPendingReview.headSha,
+              comments: inlineComments.map(toGitHubReviewComment),
+              cwd: input.project.repoPath,
+            });
+          } catch (error) {
+            if (
+              inlineComments.length === 0 ||
+              !isInlineReviewAnchorFailure(error)
+            ) {
+              throw error;
+            }
+
+            this.options.logger.warn(
+              "reviewer inline anchors rejected; falling back to top-level comments",
+              {
+                projectId: input.project.id,
+                loopId: input.loop.id,
+                runId: input.run.id,
+                repo,
+                prNumber,
+                inlineCommentCount: inlineComments.length,
+              },
+            );
+
+            normalizedPendingReview.comments =
+              normalizedPendingReview.comments.map((comment) =>
+                isInlineReviewComment(comment)
+                  ? downgradeInlineCommentToTopLevel(comment)
+                  : comment,
+              );
+            this.persistPendingReviewCheckpoint(
+              input.run,
+              input.checkpoint,
+              normalizedPendingReview,
+            );
+
+            const fallbackBody =
+              normalizedPendingReview.body?.trim() ||
+              normalizedPendingReview.summary?.trim() ||
+              undefined;
+            if (fallbackBody) {
+              await this.options.github.submitReview({
+                repo,
+                prNumber,
+                event: reviewEvent,
+                body: fallbackBody,
+                cwd: input.project.repoPath,
+              });
+            }
+          }
           normalizedPendingReview.publishState.reviewSubmitted = true;
           this.persistPendingReviewCheckpoint(
             input.run,
@@ -1062,10 +1106,16 @@ export class ReviewerLoopRunner {
             normalizedPendingReview,
           );
         }
-        while (
-          normalizedPendingReview.publishState.topLevelCommentsPosted <
-          topLevelComments.length
-        ) {
+        while (true) {
+          const topLevelComments = normalizedPendingReview.comments.filter(
+            (comment) => !isInlineReviewComment(comment),
+          );
+          if (
+            normalizedPendingReview.publishState.topLevelCommentsPosted >=
+            topLevelComments.length
+          ) {
+            break;
+          }
           const comment =
             topLevelComments[
               normalizedPendingReview.publishState.topLevelCommentsPosted
@@ -1822,6 +1872,55 @@ function toGitHubReviewComment(
     startLine: comment.startLine,
     startSide: comment.startSide,
   };
+}
+
+function downgradeInlineCommentToTopLevel(
+  comment: ReviewFeedbackComment,
+): ReviewFeedbackComment {
+  const location = formatInlineCommentLocation(comment);
+  return {
+    body: location
+      ? `Inline comment fallback (${location}):\n\n${comment.body}`
+      : comment.body,
+  };
+}
+
+function formatInlineCommentLocation(
+  comment: ReviewFeedbackComment,
+): string | null {
+  if (!comment.path) {
+    return null;
+  }
+
+  if (
+    typeof comment.startLine === "number" &&
+    Number.isFinite(comment.startLine) &&
+    comment.startLine !== comment.line
+  ) {
+    return `${comment.path}:${comment.startLine}-${comment.line}`;
+  }
+
+  if (typeof comment.line === "number" && Number.isFinite(comment.line)) {
+    return `${comment.path}:${comment.line}`;
+  }
+
+  return comment.path;
+}
+
+function isInlineReviewAnchorFailure(error: unknown): boolean {
+  if (!(error instanceof CommandExecutionError)) {
+    return false;
+  }
+
+  const output = `${error.result.stdout}\n${error.result.stderr}`.toLowerCase();
+  return (
+    output.includes("validation failed") &&
+    output.includes("pull request review thread") &&
+    (output.includes("line") ||
+      output.includes("path") ||
+      output.includes("diff") ||
+      output.includes("side"))
+  );
 }
 
 function normalizePendingReviewCheckpoint(
