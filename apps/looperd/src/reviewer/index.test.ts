@@ -1275,7 +1275,71 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
-  test("ignores malformed multiline inline comment ranges", async () => {
+  test("treats malformed clean inline comments as actionable feedback", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("Detailed review"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "clean",
+            body: "Overall review summary",
+            comments: [
+              {
+                body: "Fix null guard",
+                path: "src/config.ts",
+                line: 12,
+              },
+            ],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls[0]).toMatchObject({
+      event: "COMMENT",
+      body: "Overall review summary",
+      comments: [],
+    });
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Fix null guard",
+      },
+    ]);
+    expect(github.addedReactions).not.toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "+1",
+    });
+
+    fixture.store.close();
+  });
+
+  test("downgrades malformed multiline inline comment ranges to top-level comments", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway();
     const agent = new FakeAgentExecutor([
@@ -1329,6 +1393,11 @@ describe("ReviewerLoopRunner", () => {
       comments: [],
     });
     expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Broken multiline range",
+      },
       {
         repo: "acme/looper",
         prNumber: 42,

@@ -1745,7 +1745,7 @@ function normalizeReviewFeedbackComment(
       startSide === side) ||
     (startLine && line && startLine > line)
   ) {
-    return null;
+    return { body };
   }
 
   return {
