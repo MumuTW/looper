@@ -171,6 +171,10 @@ interface ReviewerCheckpoint {
     summary?: string;
     comments: ReviewFeedbackComment[];
     clean: boolean;
+    publishState?: {
+      reviewSubmitted?: boolean;
+      topLevelCommentsPosted?: number;
+    };
   };
   skipReason?: string;
 }
@@ -188,6 +192,19 @@ interface ParsedReviewFeedback {
   body?: string;
   comments: ReviewFeedbackComment[];
   clean: boolean;
+}
+
+interface NormalizedPendingReviewCheckpoint {
+  headSha: string;
+  event: ReviewEvent;
+  body?: string;
+  summary?: string;
+  comments: ReviewFeedbackComment[];
+  clean: boolean;
+  publishState: {
+    reviewSubmitted: boolean;
+    topLevelCommentsPosted: number;
+  };
 }
 
 interface ResumedRunContext {
@@ -857,11 +874,14 @@ export class ReviewerLoopRunner {
     });
 
     const executionId = randomUUID();
-    await this.options.github.addPullRequestReaction({
+    await this.tryAddPullRequestReaction({
       repo,
       prNumber,
       content: "eyes",
       cwd: input.project.repoPath,
+      projectId: input.project.id,
+      loopId: input.loop.id,
+      runId: input.run.id,
     });
     const execution = await this.options.agentExecutor.start({
       executionId,
@@ -939,21 +959,25 @@ export class ReviewerLoopRunner {
       );
     }
 
+    const normalizedPendingReview =
+      normalizePendingReviewCheckpoint(pendingReview);
     const loopMetadata = parseJsonObject(input.loop.metadataJson);
     const lastPublishedHeadSha = readString(loopMetadata.lastPublishedHeadSha);
-    if (lastPublishedHeadSha === pendingReview.headSha) {
+    if (lastPublishedHeadSha === normalizedPendingReview.headSha) {
       return {
         ...input.checkpoint,
-        skipReason: `Skipped already-published review for head ${pendingReview.headSha}`,
+        skipReason: `Skipped already-published review for head ${normalizedPendingReview.headSha}`,
       };
     }
 
     const reviewEvent =
-      pendingReview.event === "APPROVE" && !this.allowAutoApprove
+      normalizedPendingReview.event === "APPROVE" && !this.allowAutoApprove
         ? "COMMENT"
-        : pendingReview.event;
-    const inlineComments = pendingReview.comments.filter(isInlineReviewComment);
-    const topLevelComments = pendingReview.comments.filter(
+        : normalizedPendingReview.event;
+    const inlineComments = normalizedPendingReview.comments.filter(
+      isInlineReviewComment,
+    );
+    const topLevelComments = normalizedPendingReview.comments.filter(
       (comment) => !isInlineReviewComment(comment),
     );
 
@@ -979,55 +1003,92 @@ export class ReviewerLoopRunner {
     }
 
     try {
-      if (pendingReview.clean) {
-        if (reviewEvent === "APPROVE") {
+      if (normalizedPendingReview.clean) {
+        if (
+          !normalizedPendingReview.publishState.reviewSubmitted &&
+          (reviewEvent === "APPROVE" || Boolean(normalizedPendingReview.body))
+        ) {
           await this.options.github.submitReview({
             repo,
             prNumber,
             event: reviewEvent,
-            body: pendingReview.body,
+            body: normalizedPendingReview.body,
             cwd: input.project.repoPath,
           });
+          normalizedPendingReview.publishState.reviewSubmitted = true;
+          this.persistPendingReviewCheckpoint(
+            input.run,
+            input.checkpoint,
+            normalizedPendingReview,
+          );
         }
-        await this.options.github.addPullRequestReaction({
-          repo,
-          prNumber,
-          content: "+1",
-          cwd: input.project.repoPath,
-        });
-        await this.options.github.removePullRequestReaction({
-          repo,
-          prNumber,
-          content: "eyes",
-          cwd: input.project.repoPath,
-        });
       } else {
-        if (inlineComments.length > 0 || pendingReview.body) {
+        if (
+          !normalizedPendingReview.publishState.reviewSubmitted &&
+          (inlineComments.length > 0 || normalizedPendingReview.body)
+        ) {
           await this.options.github.submitReview({
             repo,
             prNumber,
             event: reviewEvent,
-            body: pendingReview.body,
-            commitId: pendingReview.headSha,
+            body: normalizedPendingReview.body,
+            commitId: normalizedPendingReview.headSha,
             comments: inlineComments.map(toGitHubReviewComment),
             cwd: input.project.repoPath,
           });
+          normalizedPendingReview.publishState.reviewSubmitted = true;
+          this.persistPendingReviewCheckpoint(
+            input.run,
+            input.checkpoint,
+            normalizedPendingReview,
+          );
         }
-        for (const comment of topLevelComments) {
+        while (
+          normalizedPendingReview.publishState.topLevelCommentsPosted <
+          topLevelComments.length
+        ) {
+          const comment =
+            topLevelComments[
+              normalizedPendingReview.publishState.topLevelCommentsPosted
+            ];
+          if (!comment) {
+            break;
+          }
           await this.options.github.addPullRequestComment({
             repo,
             prNumber,
             body: comment.body,
             cwd: input.project.repoPath,
           });
+          normalizedPendingReview.publishState.topLevelCommentsPosted += 1;
+          this.persistPendingReviewCheckpoint(
+            input.run,
+            input.checkpoint,
+            normalizedPendingReview,
+          );
         }
-        await this.options.github.removePullRequestReaction({
+      }
+
+      if (normalizedPendingReview.clean) {
+        await this.tryAddPullRequestReaction({
           repo,
           prNumber,
-          content: "eyes",
+          content: "+1",
           cwd: input.project.repoPath,
+          projectId: input.project.id,
+          loopId: input.loop.id,
+          runId: input.run.id,
         });
       }
+      await this.tryRemovePullRequestReaction({
+        repo,
+        prNumber,
+        content: "eyes",
+        cwd: input.project.repoPath,
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        runId: input.run.id,
+      });
 
       let postSubmitDetail = detail;
       if (
@@ -1077,9 +1138,9 @@ export class ReviewerLoopRunner {
     this.updateLoop(input.loop, {
       metadataJson: JSON.stringify({
         ...loopMetadata,
-        lastPublishedHeadSha: pendingReview.headSha,
+        lastPublishedHeadSha: normalizedPendingReview.headSha,
         lastReviewEvent: reviewEvent,
-        lastReviewSummary: pendingReview.summary ?? null,
+        lastReviewSummary: normalizedPendingReview.summary ?? null,
         lastPublishedAt: this.nowIso(),
       }),
     });
@@ -1097,7 +1158,7 @@ export class ReviewerLoopRunner {
         repo: input.queueItem.repo,
         prNumber: input.queueItem.prNumber,
         event: reviewEvent,
-        headSha: pendingReview.headSha,
+        headSha: normalizedPendingReview.headSha,
       },
     });
 
@@ -1245,6 +1306,66 @@ export class ReviewerLoopRunner {
       parseCheckpoint(persistedRun?.checkpointJson ?? run.checkpointJson) ??
       fallback
     );
+  }
+
+  private persistPendingReviewCheckpoint(
+    run: RunRecord,
+    checkpoint: ReviewerCheckpoint,
+    pendingReview: NonNullable<ReviewerCheckpoint["pendingReview"]>,
+  ): void {
+    this.persistStepStarted(run, "publish", {
+      ...checkpoint,
+      pendingReview,
+      resumePolicy: "advance_from_checkpoint",
+    });
+  }
+
+  private async tryAddPullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd: string;
+    projectId: string;
+    loopId: string;
+    runId: string;
+  }): Promise<void> {
+    try {
+      await this.options.github.addPullRequestReaction(input);
+    } catch (error) {
+      this.options.logger.warn("reviewer reaction add failed", {
+        projectId: input.projectId,
+        loopId: input.loopId,
+        runId: input.runId,
+        repo: input.repo,
+        prNumber: input.prNumber,
+        content: input.content,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async tryRemovePullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd: string;
+    projectId: string;
+    loopId: string;
+    runId: string;
+  }): Promise<void> {
+    try {
+      await this.options.github.removePullRequestReaction(input);
+    } catch (error) {
+      this.options.logger.warn("reviewer reaction removal failed", {
+        projectId: input.projectId,
+        loopId: input.loopId,
+        runId: input.runId,
+        repo: input.repo,
+        prNumber: input.prNumber,
+        content: input.content,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private ensureLoopForPullRequest(input: {
@@ -1577,7 +1698,7 @@ function parseStructuredReviewOutput(
             Boolean(comment),
           )
       : [];
-    const clean = verdict === "clean";
+    const clean = verdict === "clean" && comments.length === 0;
     if (!clean && comments.length === 0) {
       return null;
     }
@@ -1606,9 +1727,17 @@ function normalizeReviewFeedbackComment(
   const side = normalizeReviewSide(comment.side);
   const startLine = readPositiveInteger(comment.startLine);
   const startSide = normalizeReviewSide(comment.startSide);
+  const hasRangeStart = startLine !== undefined || startSide !== undefined;
   if (
     (path && (!line || !side)) ||
-    (!path && (line || side || startLine || startSide))
+    (!path && (line || side || startLine || startSide)) ||
+    (hasRangeStart && (!startLine || !startSide)) ||
+    (startLine &&
+      startSide &&
+      line &&
+      startLine === line &&
+      startSide === side) ||
+    (startLine && line && startLine > line)
   ) {
     return null;
   }
@@ -1666,6 +1795,30 @@ function toGitHubReviewComment(
   };
 }
 
+function normalizePendingReviewCheckpoint(
+  pendingReview: ReviewerCheckpoint["pendingReview"],
+): NormalizedPendingReviewCheckpoint {
+  if (!pendingReview) {
+    throw new Error("pendingReview is required");
+  }
+
+  return {
+    ...pendingReview,
+    comments: Array.isArray(pendingReview.comments)
+      ? pendingReview.comments
+      : [],
+    clean: pendingReview.clean === true,
+    publishState: {
+      reviewSubmitted: pendingReview.publishState?.reviewSubmitted === true,
+      topLevelCommentsPosted:
+        typeof pendingReview.publishState?.topLevelCommentsPosted ===
+          "number" && pendingReview.publishState.topLevelCommentsPosted >= 0
+          ? pendingReview.publishState.topLevelCommentsPosted
+          : 0,
+    },
+  };
+}
+
 function summarizeLogs(stdout: string): string {
   return stdout
     .split("\n")
@@ -1708,8 +1861,9 @@ function buildReviewPrompt(input: {
         "Return detailed GitHub review feedback as raw JSON with this exact shape:",
         '{"verdict":"clean"|"actionable","body":"optional overall summary","comments":[{"body":"required comment text","path":"src/file.ts optional for inline comments","line":123,"side":"RIGHT","startLine":120,"startSide":"RIGHT"}]}',
         "Use verdict=actionable whenever there is any actionable advice.",
-        "Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and diff line numbers.",
+        "Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and the file line numbers shown in the PR diff (not deprecated diff positions).",
         "Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback.",
+        "For multiline inline comments, `startLine`/`startSide` must identify the first line of the range and `line`/`side` the last line; omit `startLine`/`startSide` for single-line comments.",
         "Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
         "Do not approve. If the review is clean, return verdict=clean with comments=[].",
       ].join("\n"),
