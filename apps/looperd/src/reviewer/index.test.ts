@@ -1463,6 +1463,45 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("removes eyes reaction when review step exits before publish", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: new FakeAgentExecutor([]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("failed");
+    expect(github.addedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
+    expect(github.removedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
+    expect(github.submitCalls).toHaveLength(0);
+
+    fixture.store.close();
+  });
+
   test("resumes publish safely after top-level comment posting partially succeeds", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway();

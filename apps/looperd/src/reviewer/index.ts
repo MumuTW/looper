@@ -883,61 +883,74 @@ export class ReviewerLoopRunner {
       loopId: input.loop.id,
       runId: input.run.id,
     });
-    const execution = await this.options.agentExecutor.start({
-      executionId,
-      projectId: input.project.id,
-      loopId: input.loop.id,
-      runId: input.run.id,
-      prompt,
-      workingDirectory: input.project.repoPath,
-      timeoutMs: this.agentTimeoutMs,
-      metadata: {
-        loopType: "reviewer",
-        repo: input.queueItem.repo,
-        prNumber: input.queueItem.prNumber,
-      },
-      idempotencyKey: `reviewer:${input.loop.id}:${snapshot.headSha}`,
-    });
-    await this.options.onAgentExecutionStarted?.({
-      executionId,
-      projectId: input.project.id,
-      loopId: input.loop.id,
-      runId: input.run.id,
-      subtitle: `${repo}#${prNumber}`,
-      body: "Review started",
-      dedupeKey: `runtime.agent.started:reviewer:${input.run.id}`,
-    });
-    const result = await execution.wait();
+    try {
+      const execution = await this.options.agentExecutor.start({
+        executionId,
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        runId: input.run.id,
+        prompt,
+        workingDirectory: input.project.repoPath,
+        timeoutMs: this.agentTimeoutMs,
+        metadata: {
+          loopType: "reviewer",
+          repo: input.queueItem.repo,
+          prNumber: input.queueItem.prNumber,
+        },
+        idempotencyKey: `reviewer:${input.loop.id}:${snapshot.headSha}`,
+      });
+      await this.options.onAgentExecutionStarted?.({
+        executionId,
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        runId: input.run.id,
+        subtitle: `${repo}#${prNumber}`,
+        body: "Review started",
+        dedupeKey: `runtime.agent.started:reviewer:${input.run.id}`,
+      });
+      const result = await execution.wait();
 
-    if (result.status !== "completed") {
-      throw new ReviewerLoopError(
-        result.summary ?? `Reviewer agent ${result.status}`,
-        "retryable_transient",
-      );
+      if (result.status !== "completed") {
+        throw new ReviewerLoopError(
+          result.summary ?? `Reviewer agent ${result.status}`,
+          "retryable_transient",
+        );
+      }
+
+      const reviewFeedback = parseReviewFeedback(result);
+      if (!reviewFeedback.clean && reviewFeedback.comments.length === 0) {
+        throw new ReviewerLoopError(
+          "Reviewer agent produced no actionable review comments",
+          result.parseStatus === "invalid_json"
+            ? "non_retryable"
+            : "retryable_transient",
+        );
+      }
+
+      return {
+        ...input.checkpoint,
+        pendingReview: {
+          headSha: snapshot.headSha,
+          event: reviewFeedback.clean ? "APPROVE" : "COMMENT",
+          body: reviewFeedback.body,
+          summary: result.summary,
+          comments: reviewFeedback.comments,
+          clean: reviewFeedback.clean,
+        },
+        resumePolicy: "advance_from_checkpoint",
+      };
+    } catch (error) {
+      await this.tryRemovePullRequestReaction({
+        repo,
+        prNumber,
+        content: "eyes",
+        cwd: input.project.repoPath,
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        runId: input.run.id,
+      });
+      throw error;
     }
-
-    const reviewFeedback = parseReviewFeedback(result);
-    if (!reviewFeedback.clean && reviewFeedback.comments.length === 0) {
-      throw new ReviewerLoopError(
-        "Reviewer agent produced no actionable review comments",
-        result.parseStatus === "invalid_json"
-          ? "non_retryable"
-          : "retryable_transient",
-      );
-    }
-
-    return {
-      ...input.checkpoint,
-      pendingReview: {
-        headSha: snapshot.headSha,
-        event: reviewFeedback.clean ? "APPROVE" : "COMMENT",
-        body: reviewFeedback.body,
-        summary: result.summary,
-        comments: reviewFeedback.comments,
-        clean: reviewFeedback.clean,
-      },
-      resumePolicy: "advance_from_checkpoint",
-    };
   }
 
   private async runPublishStep(input: {
