@@ -1165,6 +1165,59 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("posts clean review summary as comment when auto-approve is disabled and body is omitted", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("No actionable issues found"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "clean",
+            comments: [],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls).toEqual([
+      expect.objectContaining({
+        repo: "acme/looper",
+        prNumber: 42,
+        event: "COMMENT",
+        body: "No actionable issues found",
+      }),
+    ]);
+    expect(github.addedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "+1",
+    });
+
+    fixture.store.close();
+  });
+
   test("treats clean verdict with comments as actionable feedback", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway();

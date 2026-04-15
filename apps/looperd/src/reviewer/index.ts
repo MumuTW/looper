@@ -974,6 +974,12 @@ export class ReviewerLoopRunner {
       normalizedPendingReview.event === "APPROVE" && !this.allowAutoApprove
         ? "COMMENT"
         : normalizedPendingReview.event;
+    const reviewBody =
+      normalizedPendingReview.clean && reviewEvent === "COMMENT"
+        ? normalizedPendingReview.body?.trim() ||
+          normalizedPendingReview.summary?.trim() ||
+          undefined
+        : normalizedPendingReview.body;
     const inlineComments = normalizedPendingReview.comments.filter(
       isInlineReviewComment,
     );
@@ -1006,13 +1012,13 @@ export class ReviewerLoopRunner {
       if (normalizedPendingReview.clean) {
         if (
           !normalizedPendingReview.publishState.reviewSubmitted &&
-          (reviewEvent === "APPROVE" || Boolean(normalizedPendingReview.body))
+          (reviewEvent === "APPROVE" || Boolean(reviewBody))
         ) {
           await this.options.github.submitReview({
             repo,
             prNumber,
             event: reviewEvent,
-            body: normalizedPendingReview.body,
+            body: reviewBody,
             cwd: input.project.repoPath,
           });
           normalizedPendingReview.publishState.reviewSubmitted = true;
