@@ -1271,6 +1271,11 @@ describe("ReviewerLoopRunner", () => {
       prNumber: 42,
       content: "+1",
     });
+    expect(github.removedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "+1",
+    });
 
     fixture.store.close();
   });
@@ -1458,7 +1463,13 @@ describe("ReviewerLoopRunner", () => {
       ]),
     );
     expect(github.addedReactions).toEqual([]);
-    expect(github.removedReactions).toEqual([]);
+    expect(github.removedReactions).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        content: "eyes",
+      },
+    ]);
 
     fixture.store.close();
   });

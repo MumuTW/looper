@@ -1098,6 +1098,16 @@ export class ReviewerLoopRunner {
           loopId: input.loop.id,
           runId: input.run.id,
         });
+      } else {
+        await this.tryRemovePullRequestReaction({
+          repo,
+          prNumber,
+          content: "+1",
+          cwd: input.project.repoPath,
+          projectId: input.project.id,
+          loopId: input.loop.id,
+          runId: input.run.id,
+        });
       }
       await this.tryRemovePullRequestReaction({
         repo,
