@@ -623,7 +623,17 @@ describe("ReviewerLoopRunner", () => {
     github.submitFailuresRemaining = 1;
     github.nextReviewDecisionAfterSubmit = "APPROVED";
     const agent = new FakeAgentExecutor([
-      completedAgentResult("Spec looks ready to implement"),
+      {
+        ...completedAgentResult("Spec looks ready to implement"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "clean",
+            body: "Spec looks ready to implement",
+            comments: [],
+          })}\n`,
+          stderr: "",
+        },
+      },
     ]);
     const runner = new ReviewerLoopRunner({
       store: fixture.store,
@@ -652,7 +662,7 @@ describe("ReviewerLoopRunner", () => {
       throw new Error("Expected failed reviewer run");
     }
     const failedCheckpoint = JSON.parse(failedRun.checkpointJson ?? "{}");
-    failedCheckpoint.pendingReview.event = "APPROVE";
+    expect(failedCheckpoint.pendingReview.event).toBe("APPROVE");
     fixture.store.runs.upsert({
       ...failedRun,
       checkpointJson: JSON.stringify(failedCheckpoint),

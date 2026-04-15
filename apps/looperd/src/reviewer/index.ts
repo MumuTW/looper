@@ -910,7 +910,7 @@ export class ReviewerLoopRunner {
       ...input.checkpoint,
       pendingReview: {
         headSha: snapshot.headSha,
-        event: "COMMENT",
+        event: reviewFeedback.clean ? "APPROVE" : "COMMENT",
         body: reviewFeedback.body,
         summary: result.summary,
         comments: reviewFeedback.comments,
