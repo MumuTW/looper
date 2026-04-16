@@ -104,7 +104,6 @@ jobs:
 
       - name: Compile looperd for ${{ matrix.target }}
         env:
-          LOOPER_FORCE_COMPILE: "1"
           LOOPER_BUILD_GIT_SHA: ${{ github.sha }}
         run: |
           export LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
