@@ -1036,6 +1036,8 @@ func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *worker
 	if committed.CommitSHA != "" {
 		checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, committed.CommitSHA)
 	}
+	checkpoint.Lifecycle.Pushed = false
+	checkpoint.Lifecycle.Actions.Push = lifecycle.ActionSourceNone
 	checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceFallback
 	checkpoint.Lifecycle.ReconciledAt = r.nowISO()
 	checkpoint.Lifecycle.ReconciledBy = "worker"

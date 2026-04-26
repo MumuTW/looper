@@ -1630,6 +1630,76 @@ func TestProcessClaimedItemPushExistingReconcilesDirtyWorktreeBeforePush(t *test
 	}
 }
 
+func TestRunOpenPRStepPushesWhenFallbackCommitCreatedAndLifecycleAlreadyPushed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+
+	prNumber := int64(555)
+	now := fixture.nowISO()
+	loopID := "loop_worker_pr_fallback"
+	loopTarget := "pr:acme/looper:555"
+	loopMeta := `{"worker":{"repo":"acme/looper","baseBranch":"main","baseSha":"abc123"},"prUrl":"https://example.com/pulls/555"}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, NextRunAt: &now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Existing PR fallback regression", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-555", IssueNumber: 0},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle: &lifecycle.State{
+			Policy:        lifecycle.PolicyAgentManagedWithFallback,
+			PolicyVersion: lifecycle.PolicyVersion,
+			Branch:        "feature/pr-555",
+			BaseBranch:    "main",
+			Pushed:        true,
+			Actions:       lifecycle.Actions{Push: lifecycle.ActionSourceAgent},
+		},
+	}
+	runID := "run_openpr_regression"
+	checkpointJSON := mustMarshalJSON(checkpoint)
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "failed", CurrentStep: stringPtr(string(stepOpenPR)), LastCompletedStep: stringPtr(string(stepOpenPR)), CheckpointJSON: &checkpointJSON, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	git := &fakeGitGateway{
+		inspectResults: []InspectHeadResult{
+			{HeadSHA: "abc123", HasUncommittedChanges: true, ChangedFiles: []string{"internal/worker/runner.go", "internal/lifecycle/lifecycle.go"}},
+			{HeadSHA: "fallback123", NewCommitSHAs: []string{"fallback123"}},
+		},
+		commitResult: CommitResult{CommitSHA: "fallback123"},
+	}
+
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	run, err := fixture.repos.Runs.GetByID(context.Background(), runID)
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want run", run, err)
+	}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), stepInput{Project: *project, Loop: *loop, Run: *run, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	if len(git.commitCalls) != 1 {
+		t.Fatalf("len(git.commitCalls) = %d, want 1", len(git.commitCalls))
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want 1", len(git.pushCalls))
+	}
+	if checkpointAfter.Lifecycle == nil || !checkpointAfter.Lifecycle.Pushed || checkpointAfter.Lifecycle.Actions.Commit != lifecycle.ActionSourceFallback || checkpointAfter.Lifecycle.Actions.Push != lifecycle.ActionSourceFallback {
+		t.Fatalf("updated lifecycle = %#v, want fallback actions and pushed", checkpointAfter.Lifecycle)
+	}
+}
+
 type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories
