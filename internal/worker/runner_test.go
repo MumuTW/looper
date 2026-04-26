@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -1571,6 +1572,64 @@ func TestProcessClaimedItemExecuteResumeDoesNotRerunAgentAfterTransientInspectFa
 	}
 }
 
+func TestProcessClaimedItemPushExistingReconcilesDirtyWorktreeBeforePush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	loopMeta := `{"worker":{"repo":"acme/looper","baseBranch":"main","specPath":"docs/spec.md"},"prUrl":"https://example/pr/42"}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_pr", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_worker_pr"
+	payload := `{"repo":"acme/looper","baseBranch":"main","specPath":"docs/spec.md"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_pr", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "worker:acme/looper:42", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-42", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "abc123", Clean: true},
+		inspectResults: []InspectHeadResult{
+			{HeadSHA: "abc123"},
+			{HeadSHA: "abc123", HasUncommittedChanges: true, ChangedFiles: []string{"internal/worker/runner.go", "internal/lifecycle/lifecycle.go"}},
+			{HeadSHA: "fallback123", NewCommitSHAs: []string{"fallback123"}},
+		},
+		commitResult: CommitResult{CommitSHA: "fallback123"},
+	}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, Title: "Existing PR", BaseRefName: "main", HeadRefName: "feature/pr-42", HeadSHA: "abc123", URL: "https://example/pr/42"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	claim, _ = fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-2", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 42 {
+		t.Fatalf("result = %#v, want success with existing PR", result)
+	}
+	if len(git.commitCalls) != 1 {
+		t.Fatalf("len(git.commitCalls) = %d, want fallback commit before push", len(git.commitCalls))
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want push after fallback commit", len(git.pushCalls))
+	}
+	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want run", run, err)
+	}
+	checkpoint, err := parseCheckpoint(run.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if checkpoint.Lifecycle == nil || checkpoint.Lifecycle.Actions.Commit != lifecycle.ActionSourceFallback || !checkpoint.Lifecycle.Pushed || checkpoint.Lifecycle.Actions.Push != lifecycle.ActionSourceFallback {
+		t.Fatalf("lifecycle = %#v, want fallback commit and push recorded", checkpoint.Lifecycle)
+	}
+}
+
 type runnerFixture struct {
 	coordinator *storage.SQLiteCoordinator
 	repos       *storage.Repositories
@@ -1714,19 +1773,20 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 }
 
 type fakeGitGateway struct {
-	createResult  CreateWorktreeResult
-	prepareResult PrepareWorktreeResult
-	inspectResult InspectHeadResult
-	inspectErrors []error
-	inspectIndex  int
-	commitResult  CommitResult
-	createCalls   []CreateWorktreeInput
-	pushCalls     []PushInput
-	prepareCalls  []PrepareWorktreeInput
-	inspectCalls  []InspectHeadInput
-	commitCalls   []CommitInput
-	pushErrors    []error
-	pushIndex     int
+	createResult   CreateWorktreeResult
+	prepareResult  PrepareWorktreeResult
+	inspectResult  InspectHeadResult
+	inspectResults []InspectHeadResult
+	inspectErrors  []error
+	inspectIndex   int
+	commitResult   CommitResult
+	createCalls    []CreateWorktreeInput
+	pushCalls      []PushInput
+	prepareCalls   []PrepareWorktreeInput
+	inspectCalls   []InspectHeadInput
+	commitCalls    []CommitInput
+	pushErrors     []error
+	pushIndex      int
 }
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
@@ -1748,6 +1808,11 @@ func (f *fakeGitGateway) InspectHead(_ context.Context, input InspectHeadInput) 
 		err := f.inspectErrors[f.inspectIndex]
 		f.inspectIndex++
 		return InspectHeadResult{}, err
+	}
+	if f.inspectIndex < len(f.inspectResults) {
+		result := f.inspectResults[f.inspectIndex]
+		f.inspectIndex++
+		return result, nil
 	}
 	f.inspectIndex++
 	return f.inspectResult, nil

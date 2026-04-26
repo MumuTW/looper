@@ -981,30 +981,67 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	if r.git != nil {
-		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)})
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-		}
-		if inspect.HasUncommittedChanges {
-			committed, err := r.git.Commit(ctx, CommitInput{WorktreePath: worktree.Path, Message: buildWorkerFallbackCommitMessage(work)})
-			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-			}
-			if committed.CommitSHA != "" {
-				checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, committed.CommitSHA)
-			}
-			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceFallback
-		} else if len(inspect.NewCommitSHAs) > 0 {
-			checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
-			if checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
-				checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
-			}
-		}
+	if err := r.reconcileWorkerGitState(ctx, &checkpoint, work, worktree); err != nil {
+		return checkpoint, err
 	}
 	checkpoint.Execution.GitReconciled = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, work workerInput, worktree checkpointWorktree) error {
+	checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
+	if r.git == nil {
+		return nil
+	}
+	baseRef := firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.Path, BaseRef: baseRef})
+	if err != nil {
+		checkpoint.Lifecycle.LastError = err.Error()
+		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if !inspect.HasUncommittedChanges {
+		checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
+		if len(inspect.NewCommitSHAs) > 0 && checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
+			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+		}
+		checkpoint.Lifecycle.ReconciledAt = r.nowISO()
+		checkpoint.Lifecycle.ReconciledBy = "worker"
+		checkpoint.Lifecycle.LastError = ""
+		checkpoint.Lifecycle.Normalize()
+		return nil
+	}
+	if !r.allowAutoCommit {
+		message := fmt.Sprintf("Worker worktree has uncommitted changes before PR push for branch %s", firstNonEmpty(work.Branch, worktree.Branch))
+		checkpoint.Lifecycle.LastError = message
+		return &loopError{message: message, kind: FailureManualIntervention}
+	}
+	committed, err := r.git.Commit(ctx, CommitInput{WorktreePath: worktree.Path, Message: buildWorkerFallbackCommitMessage(work)})
+	if err != nil {
+		checkpoint.Lifecycle.LastError = err.Error()
+		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	finalInspect, err := r.git.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.Path, BaseRef: baseRef})
+	if err != nil {
+		checkpoint.Lifecycle.LastError = err.Error()
+		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if finalInspect.HasUncommittedChanges {
+		message := fmt.Sprintf("Worker fallback commit left uncommitted changes in branch %s", firstNonEmpty(work.Branch, worktree.Branch))
+		checkpoint.Lifecycle.LastError = message
+		return &loopError{message: message, kind: FailureManualIntervention}
+	}
+	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
+	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, finalInspect.NewCommitSHAs...)
+	if committed.CommitSHA != "" {
+		checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, committed.CommitSHA)
+	}
+	checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceFallback
+	checkpoint.Lifecycle.ReconciledAt = r.nowISO()
+	checkpoint.Lifecycle.ReconciledBy = "worker"
+	checkpoint.Lifecycle.LastError = ""
+	checkpoint.Lifecycle.Normalize()
+	return nil
 }
 
 func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
@@ -1028,19 +1065,39 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if err != nil {
 		return checkpoint, err
 	}
-	if work.ExecutionMode == "create-pr" && (checkpoint.PullRequest != nil || input.Loop.PRNumber != nil) {
-		if checkpoint.PullRequest == nil {
-			checkpoint.PullRequest = &checkpointPullPR{Number: derefInt64(input.Loop.PRNumber), URL: stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])}
-		}
-		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
-		return checkpoint, nil
-	}
 	if checkpoint.Validation != nil && !checkpoint.Validation.Passed {
 		return checkpoint, &loopError{message: firstNonEmpty(checkpoint.Validation.Summary, "Validation failed"), kind: FailureManualIntervention}
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
 		return checkpoint, err
+	}
+	if err := r.reconcileWorkerGitState(ctx, &checkpoint, work, worktree); err != nil {
+		return checkpoint, err
+	}
+	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if work.ExecutionMode == "create-pr" && (checkpoint.PullRequest != nil || input.Loop.PRNumber != nil) {
+		if checkpoint.PullRequest == nil {
+			checkpoint.PullRequest = &checkpointPullPR{Number: derefInt64(input.Loop.PRNumber), URL: stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])}
+		}
+		pushedByFallback := false
+		if !checkpoint.Lifecycle.Pushed {
+			if !r.allowAutoPush {
+				checkpoint.SkipReason = fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
+				checkpoint.ResumePolicy = "manual_intervention"
+				return checkpoint, nil
+			}
+			if err := r.git.Push(ctx, PushInput{WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			pushedByFallback = true
+		}
+		checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, checkpoint.PullRequest.Number, checkpoint.PullRequest.URL, pushedByFallback, input.Loop.PRNumber != nil)
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
+		return checkpoint, nil
 	}
 	if work.ExecutionMode == "push-existing" {
 		if !r.allowAutoPush {
@@ -1868,7 +1925,7 @@ func (c *workerCheckpoint) markLifecyclePushAndPR(branch, baseBranch string, prN
 	if adopted {
 		c.Lifecycle.PRAdopted = true
 	}
-	if prNumber > 0 || prURL != "" {
+	if (prNumber > 0 || prURL != "") && c.Lifecycle.Actions.PR == lifecycle.ActionSourceNone {
 		c.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback
 	}
 	c.Lifecycle.Normalize()
