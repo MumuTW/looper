@@ -173,10 +173,11 @@ type UpdatePullRequestTitleInput struct {
 }
 
 type ListOpenPullRequestsInput struct {
-	Repo  string
-	CWD   string
-	Limit int
-	Label string
+	Repo   string
+	CWD    string
+	Limit  int
+	Label  string
+	Author string
 }
 
 type ListOpenIssuesInput struct {
@@ -248,6 +249,9 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	if strings.TrimSpace(input.Label) != "" {
 		args = append(args, "--label", input.Label)
 	}
+	if strings.TrimSpace(input.Author) != "" {
+		args = append(args, "--author", strings.TrimSpace(input.Author))
+	}
 	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "author", "reviewRequests"}, ","))
 
 	result, err := g.runGh(ctx, input.CWD, "", args...)
@@ -276,6 +280,18 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 		})
 	}
 	return out, nil
+}
+
+func (g *Gateway) GetPullRequestAuthor(ctx context.Context, input ViewPullRequestInput) (string, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "author")
+	if err != nil {
+		return "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	return extractAuthor(row["author"]), nil
 }
 
 func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {

@@ -580,11 +580,12 @@ type statusLoops struct {
 }
 
 type statusSafety struct {
-	AllowAutoCommit  bool                  `json:"allowAutoCommit"`
-	AllowAutoPush    bool                  `json:"allowAutoPush"`
-	AllowAutoApprove bool                  `json:"allowAutoApprove"`
-	AllowRiskyFixes  bool                  `json:"allowRiskyFixes"`
-	OpenPRStrategy   config.OpenPRStrategy `json:"openPrStrategy"`
+	AllowAutoCommit    bool                  `json:"allowAutoCommit"`
+	AllowAutoPush      bool                  `json:"allowAutoPush"`
+	AllowAutoApprove   bool                  `json:"allowAutoApprove"`
+	AllowRiskyFixes    bool                  `json:"allowRiskyFixes"`
+	FixAllPullRequests bool                  `json:"fixAllPullRequests"`
+	OpenPRStrategy     config.OpenPRStrategy `json:"openPrStrategy"`
 }
 
 type statusNotifications struct {
@@ -723,11 +724,12 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 		},
 		Loops: loopCounts,
 		Safety: statusSafety{
-			AllowAutoCommit:  h.context.Config.Defaults.AllowAutoCommit,
-			AllowAutoPush:    h.context.Config.Defaults.AllowAutoPush,
-			AllowAutoApprove: h.context.Config.Defaults.AllowAutoApprove,
-			AllowRiskyFixes:  h.context.Config.Defaults.AllowRiskyFixes,
-			OpenPRStrategy:   h.context.Config.Defaults.OpenPRStrategy,
+			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
+			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,
+			AllowAutoApprove:   h.context.Config.Defaults.AllowAutoApprove,
+			AllowRiskyFixes:    h.context.Config.Defaults.AllowRiskyFixes,
+			FixAllPullRequests: h.context.Config.Defaults.FixAllPullRequests,
+			OpenPRStrategy:     h.context.Config.Defaults.OpenPRStrategy,
 		},
 		Notifications: statusNotifications{
 			InAppEnabled:     h.context.Config.Notifications.InApp,

@@ -139,6 +139,7 @@
         "allowAutoApprove": true,
         "allowAutoMerge": false,
         "allowRiskyFixes": false,
+        "fixAllPullRequests": false,
         "openPrStrategy": "all_done"
       },
       "projects": [

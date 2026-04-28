@@ -264,6 +264,17 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureDefaultsConfig(&parsed.overrides).AllowAutoApprove = parsedValue
 			index = nextIndex
+		case matchesFlag(arg, "--fix-all-pull-requests"):
+			value, nextIndex, err := takeValue(index, "--fix-all-pull-requests")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --fix-all-pull-requests: %q is not a boolean", value)
+			}
+			ensureDefaultsConfig(&parsed.overrides).FixAllPullRequests = parsedValue
+			index = nextIndex
 		case matchesFlag(arg, "--osascript-path"):
 			value, nextIndex, err := takeValue(index, "--osascript-path")
 			if err != nil {
@@ -369,6 +380,13 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ALLOW_AUTO_APPROVE: %q is not a boolean", value)
 		}
 		ensureDefaultsConfig(&overrides).AllowAutoApprove = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_FIX_ALL_PULL_REQUESTS"); ok {
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_FIX_ALL_PULL_REQUESTS: %q is not a boolean", value)
+		}
+		ensureDefaultsConfig(&overrides).FixAllPullRequests = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_GIT_PATH"); ok {
 		ensureToolPathsConfig(&overrides).GitPath = stringPtr(value)

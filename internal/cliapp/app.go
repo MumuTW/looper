@@ -504,6 +504,7 @@ func globalFlags() []flagSpec {
 		stringFlag("git-path", "path", "Git binary path"),
 		stringFlag("gh-path", "path", "GitHub CLI path"),
 		stringFlag("osascript-path", "path", "osascript binary path"),
+		stringFlag("fix-all-pull-requests", "bool", "Allow fixer to inspect and fix PRs created by any author"),
 	}
 }
 
@@ -550,15 +551,16 @@ func (a *App) stderr() io.Writer {
 }
 
 var configFlagNames = map[string]struct{}{
-	"config":         {},
-	"host":           {},
-	"port":           {},
-	"db-path":        {},
-	"log-dir":        {},
-	"daemon-mode":    {},
-	"git-path":       {},
-	"gh-path":        {},
-	"osascript-path": {},
+	"config":                {},
+	"host":                  {},
+	"port":                  {},
+	"db-path":               {},
+	"log-dir":               {},
+	"daemon-mode":           {},
+	"git-path":              {},
+	"gh-path":               {},
+	"osascript-path":        {},
+	"fix-all-pull-requests": {},
 }
 
 func ExtractConfigArgs(argv []string) []string {

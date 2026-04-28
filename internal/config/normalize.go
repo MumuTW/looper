@@ -249,6 +249,10 @@ func mergeDefaultsConfig(config *DefaultsConfig, partial PartialDefaultsConfig) 
 		config.AllowRiskyFixes = *partial.AllowRiskyFixes
 	}
 
+	if partial.FixAllPullRequests != nil {
+		config.FixAllPullRequests = *partial.FixAllPullRequests
+	}
+
 	if partial.OpenPRStrategy != nil {
 		config.OpenPRStrategy = *partial.OpenPRStrategy
 	}

@@ -155,6 +155,7 @@
         "allowAutoApprove": true,
         "allowAutoMerge": true,
         "allowRiskyFixes": true,
+        "fixAllPullRequests": false,
         "openPrStrategy": "first_commit"
       },
       "projects": [

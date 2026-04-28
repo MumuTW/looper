@@ -56,6 +56,57 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentUser: "looper-bot",
+		listOpen: []PullRequestSummary{
+			{Number: 42, State: "OPEN", HeadSHA: "head-42", Author: "human"},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43", Author: "looper-bot"},
+		},
+		viewResponses: []PullRequestDetail{
+			{Number: 43, State: "OPEN", HeadSHA: "head-43", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}},
+		},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 43 {
+		t.Fatalf("QueueItems = %#v, want only owned PR #43", result.QueueItems)
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].Author != "looper-bot" {
+		t.Fatalf("list calls = %#v, want author-filtered discovery", github.listCalls)
+	}
+	if github.viewIndex != 1 {
+		t.Fatalf("view calls = %d, want 1", github.viewIndex)
+	}
+}
+
+func TestDiscoverPullRequestsFixAllPullRequestsOptIn(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentUser: "looper-bot",
+		listOpen:    []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-42", Author: "human"}},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}},
+		},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, FixAllPullRequests: true})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want opted-in foreign PR #42", result.QueueItems)
+	}
+}
+
 func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -238,6 +289,35 @@ func TestRunPrepareWorktreeStepPreservesExistingLifecycle(t *testing.T) {
 	}
 	if prepared.Lifecycle == nil || len(prepared.Lifecycle.CommitSHAs) != 1 || prepared.Lifecycle.CommitSHAs[0] != "commit-1" || !prepared.Lifecycle.Pushed || prepared.Lifecycle.PRNumber != 42 || prepared.Lifecycle.PRURL == "" || prepared.Lifecycle.Actions.PR != lifecycle.ActionSourceFallback {
 		t.Fatalf("Lifecycle = %#v, want existing lifecycle metadata preserved", prepared.Lifecycle)
+	}
+}
+
+func TestProcessClaimedItemSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentUser:   "looper-bot",
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_foreign", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_foreign", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:foreign", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !contains(result.Summary, "does not match fixer owner") {
+		t.Fatalf("result = %#v, want skipped foreign PR", result)
 	}
 }
 
@@ -933,7 +1013,9 @@ func (f *runnerFixture) nowISO() string {
 }
 
 type fakeGitHubGateway struct {
+	currentUser      string
 	listOpen         []PullRequestSummary
+	listCalls        []ListOpenPullRequestsInput
 	viewResponses    []PullRequestDetail
 	viewIndex        int
 	resolveCalls     []ResolveReviewThreadInput
@@ -941,8 +1023,28 @@ type fakeGitHubGateway struct {
 	removeLabelCalls []PullRequestLabelsInput
 }
 
-func (f *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
-	return append([]PullRequestSummary(nil), f.listOpen...), nil
+func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	f.listCalls = append(f.listCalls, input)
+	result := append([]PullRequestSummary(nil), f.listOpen...)
+	for index := range result {
+		if result[index].Author == "" {
+			result[index].Author = firstNonEmpty(f.currentUser, "looper")
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+	return firstNonEmpty(f.currentUser, "looper"), nil
+}
+
+func (f *fakeGitHubGateway) GetPullRequestAuthor(_ context.Context, input ViewPullRequestInput) (string, error) {
+	for _, detail := range f.viewResponses {
+		if detail.Number == input.PRNumber && detail.Author != "" {
+			return detail.Author, nil
+		}
+	}
+	return firstNonEmpty(f.currentUser, "looper"), nil
 }
 
 func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
@@ -957,6 +1059,9 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 	f.viewIndex++
 	if result.Number == 0 {
 		result.Number = input.PRNumber
+	}
+	if result.Author == "" {
+		result.Author = firstNonEmpty(f.currentUser, "looper")
 	}
 	return result, nil
 }

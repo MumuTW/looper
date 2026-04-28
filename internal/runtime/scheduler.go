@@ -312,15 +312,23 @@ func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.Agent
 type fixerGitHubAdapter struct{ gateway *githubinfra.Gateway }
 
 func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixer.ListOpenPullRequestsInput) ([]fixer.PullRequestSummary, error) {
-	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit})
+	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Author: input.Author})
 	if err != nil {
 		return nil, err
 	}
 	result := make([]fixer.PullRequestSummary, 0, len(pullRequests))
 	for _, pr := range pullRequests {
-		result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, HeadSHA: pr.HeadSHA})
+		result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, HeadSHA: pr.HeadSHA, Author: pr.Author})
 	}
 	return result, nil
+}
+
+func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+}
+
+func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {
+	return a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
@@ -328,7 +336,7 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
-	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, Checks: detail.Checks, HasConflicts: detail.HasConflicts}, nil
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
@@ -646,18 +654,19 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		},
 	})
 	fixerRunner = fixer.New(fixer.Options{
-		DB:               coordinator.DB(),
-		Repos:            repos,
-		GitHub:           fixerGitHubAdapter{gateway: githubGateway},
-		Git:              fixerGitAdapter{gateway: gitGateway},
-		AgentExecutor:    fixerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:           logger,
-		Now:              now,
-		AllowAutoCommit:  cfg.Defaults.AllowAutoCommit,
-		AllowAutoPush:    cfg.Defaults.AllowAutoPush,
-		AllowRiskyFixes:  cfg.Defaults.AllowRiskyFixes,
-		RetryBaseDelay:   retryBaseDelay,
-		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
+		DB:                 coordinator.DB(),
+		Repos:              repos,
+		GitHub:             fixerGitHubAdapter{gateway: githubGateway},
+		Git:                fixerGitAdapter{gateway: gitGateway},
+		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:             logger,
+		Now:                now,
+		AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
+		AllowAutoPush:      cfg.Defaults.AllowAutoPush,
+		AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
+		FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
+		RetryBaseDelay:     retryBaseDelay,
+		RetryMaxAttempts:   int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},

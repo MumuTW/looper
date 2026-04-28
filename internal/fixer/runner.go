@@ -78,6 +78,7 @@ type PullRequestSummary struct {
 	State   string
 	IsDraft bool
 	HeadSHA string
+	Author  string
 }
 
 type PullRequestDetail struct {
@@ -93,12 +94,14 @@ type PullRequestDetail struct {
 	Comments       []map[string]any
 	Checks         []map[string]any
 	HasConflicts   bool
+	Author         string
 }
 
 type ListOpenPullRequestsInput struct {
-	Repo  string
-	CWD   string
-	Limit int
+	Repo   string
+	CWD    string
+	Limit  int
+	Author string
 }
 
 type ViewPullRequestInput struct {
@@ -122,6 +125,8 @@ type PullRequestLabelsInput struct {
 
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
+	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetPullRequestAuthor(context.Context, ViewPullRequestInput) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ResolveReviewThread(context.Context, ResolveReviewThreadInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -270,6 +275,7 @@ type Options struct {
 	AllowAutoCommit         bool
 	AllowAutoPush           bool
 	AllowRiskyFixes         bool
+	FixAllPullRequests      bool
 	Sleep                   func(time.Duration)
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
@@ -291,6 +297,7 @@ type Runner struct {
 	allowAutoCommit         bool
 	allowAutoPush           bool
 	allowRiskyFixes         bool
+	fixAllPullRequests      bool
 	sleep                   func(time.Duration)
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -480,6 +487,7 @@ func New(options Options) *Runner {
 		allowAutoCommit:         options.AllowAutoCommit,
 		allowAutoPush:           options.AllowAutoPush,
 		allowRiskyFixes:         options.AllowRiskyFixes,
+		fixAllPullRequests:      options.FixAllPullRequests,
 		sleep:                   sleep,
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
@@ -498,13 +506,25 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if project == nil {
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
-	openPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit})
+	currentUser := ""
+	if !r.fixAllPullRequests {
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		currentUser = strings.TrimSpace(currentUser)
+	}
+	openPRs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Author: currentUser})
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, pr := range openPRs {
 		if pr.IsDraft || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
+			result.Skipped++
+			continue
+		}
+		if !r.fixAllPullRequests && !sameGitHubLogin(pr.Author, currentUser) {
 			result.Skipped++
 			continue
 		}
@@ -708,6 +728,27 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
+	if reason, err := r.pullRequestOwnershipSkipReason(ctx, project.RepoPath, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+		return ProcessResult{}, err
+	} else if reason != "" {
+		checkpoint.SkipReason = reason
+		if _, err := r.completeRun(ctx, run, "success", reason, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+		r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": reason}})
+		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+			return ProcessResult{}, err
+		}
+		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			updated.Status = "completed"
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
+	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("fixer loop started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
@@ -842,6 +883,24 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 	checkpoint.Detail = &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
+}
+
+func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, cwd, repo string, prNumber int64) (string, error) {
+	if r.fixAllPullRequests {
+		return "", nil
+	}
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", err
+	}
+	author, err := r.github.GetPullRequestAuthor(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return "", err
+	}
+	if sameGitHubLogin(author, currentUser) {
+		return "", nil
+	}
+	return fmt.Sprintf("Skipped fixer run for %s#%d because PR author %q does not match fixer owner %q", repo, prNumber, strings.TrimSpace(author), strings.TrimSpace(currentUser)), nil
 }
 
 func (r *Runner) runClaimPRStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -1980,6 +2039,12 @@ func normalizePRState(value string) string {
 		return "open"
 	}
 	return "other"
+}
+
+func sameGitHubLogin(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	return left != "" && right != "" && strings.EqualFold(left, right)
 }
 
 func isSpecReviewClean(detail PullRequestDetail) bool {
