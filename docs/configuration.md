@@ -139,7 +139,7 @@ Example minimal `~/.looper/config.json`:
     "allowAutoMerge": false,
     "allowRiskyFixes": false,
     "openPrStrategy": "all_done",
-    "addSnapshotMode": "full"
+    "addSnapshotMode": "async"
   },
   "projects": [
     {
@@ -266,7 +266,7 @@ Defaults:
 - `allowAutoMerge`
 - `allowRiskyFixes`
 - `openPrStrategy`: `all_done`, `first_commit`, or `manual`
-- `addSnapshotMode`: project-add PR snapshot behavior: `async`, `full`, or `off`; `looper project add --snapshot-mode` overrides this per request
+- `addSnapshotMode`: project-add PR snapshot behavior: `async`, `full`, or `off`; `looper project add --snapshot-mode` overrides this per request. The default is `async`, which queues PR snapshots for background capture so project registration can complete quickly. Use `full` to restore the previous synchronous capture behavior.
 
 Default values:
 
@@ -277,7 +277,23 @@ Default values:
 - `allowAutoMerge`: `false`
 - `allowRiskyFixes`: `false`
 - `openPrStrategy`: `all_done`
-- `addSnapshotMode`: `full`
+- `addSnapshotMode`: `async`
+
+To restore the previous synchronous `project add` behavior for one command:
+
+```bash
+looper project add --snapshot-mode full /absolute/path/to/repo
+```
+
+To restore it by default for all project additions:
+
+```json
+{
+  "defaults": {
+    "addSnapshotMode": "full"
+  }
+}
+```
 
 ### `projects`
 

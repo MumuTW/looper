@@ -226,7 +226,7 @@ func writeHumanProjectAdd(w io.Writer, payload json.RawMessage) error {
 		return fmt.Errorf("decode project response: %w", err)
 	}
 
-	printSection(w, "Project added", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}, {"baseBranch", data.BaseBranch}, {"repo", data.Repo}, {"discoveredPullRequests", data.DiscoveredPullRequests}, {"discoveredWorktrees", data.DiscoveredWorktrees}, {"scheduledSnapshots", data.PendingSnapshots}, {"capturedSnapshots", data.CapturedSnapshots}})
+	printSection(w, "Project added", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}, {"baseBranch", data.BaseBranch}, {"repo", data.Repo}, {"discoveredPullRequests", data.DiscoveredPullRequests}, {"discoveredWorktrees", data.DiscoveredWorktrees}, {"queuedSnapshots", data.PendingSnapshots}, {"capturedSnapshots", data.CapturedSnapshots}})
 	if len(data.Warnings) > 0 {
 		fmt.Fprintln(w)
 		entries := make([][2]any, 0, len(data.Warnings))
