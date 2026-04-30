@@ -505,6 +505,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			LoopID:      loopResult.record.ID,
 			Repo:        input.Repo,
 			PRNumber:    pr.Number,
+			HeadSHA:     pr.HeadSHA,
 			AvailableAt: availableAt,
 		})
 		if queueErr != nil {
@@ -926,12 +927,14 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipReason = fmt.Sprintf("Skipped already-reviewed head %s for %s#%d", checkpoint.Detail.HeadSHA, input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
-	if reason := r.loopBudgetTerminationReason(input.Loop, checkpoint.Detail.HeadSHA); reason != "" {
-		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for %s#%d: %s", input.Repo, input.PRNumber, reason)
-		if err := r.terminateLoop(ctx, input.Loop, reason); err != nil {
-			return checkpoint, err
+	if r.loopEnabled(meta) {
+		if reason := r.loopBudgetTerminationReason(input.Loop, checkpoint.Detail.HeadSHA); reason != "" {
+			checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for %s#%d: %s", input.Repo, input.PRNumber, reason)
+			if err := r.terminateLoop(ctx, input.Loop, reason); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
 		}
-		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
@@ -1556,6 +1559,7 @@ type enqueueInput struct {
 	LoopID      string
 	Repo        string
 	PRNumber    int64
+	HeadSHA     string
 	AvailableAt time.Time
 }
 
@@ -1569,7 +1573,29 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if !input.AvailableAt.IsZero() {
 		availableAt = eventlog.FormatJavaScriptISOString(input.AvailableAt.UTC())
 	}
+	payloadJSON := ""
+	if strings.TrimSpace(input.HeadSHA) != "" {
+		payload, err := json.Marshal(map[string]any{"headSha": input.HeadSHA})
+		if err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		payloadJSON = string(payload)
+	}
 	if existing != nil {
+		if existing.Status == "queued" && strings.TrimSpace(input.HeadSHA) != "" {
+			existingPayload := parseJSONObject(existing.PayloadJSON)
+			existingHeadSHA, _ := stringFromAny(existingPayload["headSha"])
+			if existingHeadSHA != input.HeadSHA && isoTimeAfter(availableAt, existing.AvailableAt) {
+				updated := *existing
+				updated.AvailableAt = availableAt
+				updated.UpdatedAt = r.nowISO()
+				updated.PayloadJSON = &payloadJSON
+				if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
+					return storage.QueueItemRecord{}, err
+				}
+				return updated, nil
+			}
+		}
 		return *existing, nil
 	}
 	nowISO := r.nowISO()
@@ -1578,10 +1604,22 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	projectID := input.ProjectID
 	loopID := input.LoopID
 	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: availableAt, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if payloadJSON != "" {
+		queueItem.PayloadJSON = &payloadJSON
+	}
 	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
 		return storage.QueueItemRecord{}, err
 	}
 	return queueItem, nil
+}
+
+func isoTimeAfter(candidate, current string) bool {
+	candidateTime, candidateErr := time.Parse(time.RFC3339Nano, candidate)
+	currentTime, currentErr := time.Parse(time.RFC3339Nano, current)
+	if candidateErr == nil && currentErr == nil {
+		return candidateTime.After(currentTime)
+	}
+	return candidate > current
 }
 
 func buildReviewerDedupeKey(projectID, loopID, repo string, prNumber int64) string {

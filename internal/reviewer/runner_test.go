@@ -276,6 +276,61 @@ func TestDiscoverPullRequestsDebouncesContinuousFollowUp(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsExtendsDebounceWhenQueuedFollowUpSeesNewHead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, listHeadSHA: "head-one"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	loop := storage.LoopRecord{ID: "loop_debounce_new_head", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "waiting", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("len(QueueItems) = %d, want 1", len(result.QueueItems))
+	}
+	firstAvailableAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(120 * time.Second))
+	if result.QueueItems[0].AvailableAt != firstAvailableAt {
+		t.Fatalf("AvailableAt = %q, want %q", result.QueueItems[0].AvailableAt, firstAvailableAt)
+	}
+
+	fixture.advance(30 * time.Second)
+	github.listHeadSHA = "head-two"
+	result, err = runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() second error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("second len(QueueItems) = %d, want one deduped queued item", len(result.QueueItems))
+	}
+	extendedAvailableAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(120 * time.Second))
+	if result.QueueItems[0].AvailableAt != extendedAvailableAt {
+		t.Fatalf("second AvailableAt = %q, want extended %q", result.QueueItems[0].AvailableAt, extendedAvailableAt)
+	}
+	items, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 || items[0].AvailableAt != extendedAvailableAt {
+		t.Fatalf("queue items = %#v, want single item rescheduled to %q", items, extendedAvailableAt)
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persistedLoop == nil || persistedLoop.NextRunAt == nil || *persistedLoop.NextRunAt != extendedAvailableAt {
+		t.Fatalf("loop after reschedule = %#v, want next run %q", persistedLoop, extendedAvailableAt)
+	}
+}
+
 func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 	t.Parallel()
 	runner := New(Options{LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
@@ -400,6 +455,35 @@ func TestRunFilterStepSkipsAlreadyReviewedHeadBeforeBudgetTermination(t *testing
 	}
 	if persisted == nil || persisted.Status != "waiting" {
 		t.Fatalf("loop after filter = %#v, want waiting loop not terminated", persisted)
+	}
+}
+
+func TestRunFilterStepDoesNotTerminateManualNoLoopReviewOnStaleBudget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 60, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"manual":true,"followUpdates":false,"loop":{"enabled":false,"iterationCount":99,"agentExecutionCount":99,"consecutiveFailures":99,"iterationsByHead":{"abc123":99},"startTime":"2026-04-11T10:00:00.000Z"}}`
+	loop := storage.LoopRecord{ID: "loop_manual_no_loop_stale", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want no skip so the one-shot review can run", checkpoint.SkipReason)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "queued" {
+		t.Fatalf("loop after filter = %#v, want queued loop not terminated", persisted)
 	}
 }
 
@@ -2681,6 +2765,7 @@ func (f *runnerFixture) nowISO() string {
 
 type fakeGitHubGateway struct {
 	changeHeadOnSecondView          bool
+	listHeadSHA                     string
 	removeReviewRequestOnSecondView bool
 	viewCalls                       int
 	labels                          []string
@@ -2713,7 +2798,11 @@ type fakeGitHubGateway struct {
 
 func (g *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	reviewRequests := g.effectiveReviewRequests()
-	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: "abc123", ReviewRequests: reviewRequests}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: reviewRequests}}, nil
+	headSHA := g.listHeadSHA
+	if headSHA == "" {
+		headSHA = "abc123"
+	}
+	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, ReviewRequests: reviewRequests}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: reviewRequests}}, nil
 }
 
 func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
