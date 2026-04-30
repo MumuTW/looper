@@ -182,6 +182,36 @@ func TestDiscoverPullRequestsAllowsAutomaticFollowUpWhenCurrentUserIsRequested(t
 	}
 }
 
+func TestDiscoverPullRequestsSkipsDraftFollowUpWithoutTerminatingLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "octocat", viewDraft: true}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true}`
+	loop := storage.LoopRecord{ID: "loop_draft_follow", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("len(QueueItems) = %d, want 0", len(result.QueueItems))
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "completed" {
+		t.Fatalf("loop = %#v, want completed follow-up loop preserved", persisted)
+	}
+}
+
 func TestDiscoverPullRequestsDebouncesContinuousFollowUp(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -206,6 +236,13 @@ func TestDiscoverPullRequestsDebouncesContinuousFollowUp(t *testing.T) {
 	wantAvailableAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(120 * time.Second))
 	if result.QueueItems[0].AvailableAt != wantAvailableAt {
 		t.Fatalf("AvailableAt = %q, want %q", result.QueueItems[0].AvailableAt, wantAvailableAt)
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persistedLoop == nil || persistedLoop.Status != "queued" || persistedLoop.NextRunAt == nil || *persistedLoop.NextRunAt != wantAvailableAt {
+		t.Fatalf("loop after debounce = %#v, want queued with delayed next run", persistedLoop)
 	}
 
 	result, err = runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
@@ -236,6 +273,37 @@ func TestDiscoverPullRequestsDebouncesContinuousFollowUp(t *testing.T) {
 	}
 	if result.QueueItems[0].AvailableAt != wantAvailableAt {
 		t.Fatalf("third AvailableAt = %q, want original %q", result.QueueItems[0].AvailableAt, wantAvailableAt)
+	}
+}
+
+func TestDiscoverPullRequestsDoesNotMarkSkippedExistingLoopQueued(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nextRunAt := "2026-04-11T13:00:00.000Z"
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"abc123"}`
+	loop := storage.LoopRecord{ID: "loop_same_head", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", NextRunAt: &nextRunAt, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("len(QueueItems) = %d, want 0", len(result.QueueItems))
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "completed" || persisted.NextRunAt == nil || *persisted.NextRunAt != nextRunAt {
+		t.Fatalf("loop after skipped discovery = %#v, want unchanged completed loop", persisted)
 	}
 }
 
@@ -2046,7 +2114,7 @@ func TestProcessClaimedItemPreservesPausedLoopOnRetryableFailureAfterPause(t *te
 func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", true, false, config.DefaultDisclosureConfig(), "opencode", "")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", true, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "")
 	for _, want := range []string{
 		"Every comment MUST include",
 		"Bad comment example",
@@ -2100,7 +2168,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 func TestBuildReviewPromptRestrictsExistingMarkerSkipWhenApprovalsDisallowed(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.DefaultDisclosureConfig(), "opencode", "")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "")
 	for _, want := range []string{
 		"Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED PR review",
 		"Ignore matching markers on APPROVED reviews and post a new COMMENT review instead",
@@ -2108,6 +2176,28 @@ func TestBuildReviewPromptRestrictsExistingMarkerSkipWhenApprovalsDisallowed(t *
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestBuildReviewPromptIncludesReviewerScopeInstruction(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		scope config.ReviewerScope
+		want  string
+	}{
+		{name: "full", scope: config.ReviewerScopeFullPR, want: "Review scope: full_pr"},
+		{name: "files", scope: config.ReviewerScopeChangedFiles, want: "Review scope: changed_files"},
+		{name: "ranges", scope: config.ReviewerScopeChangedRanges, want: "Review scope: changed_ranges"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, tc.scope, config.DefaultDisclosureConfig(), "opencode", "")
+			if !strings.Contains(prompt, tc.want) {
+				t.Fatalf("prompt missing %q:\n%s", tc.want, prompt)
+			}
+		})
 	}
 }
 
@@ -2202,7 +2292,7 @@ func TestBuildReviewPromptUsesConfiguredDisclosure(t *testing.T) {
 
 	cfg := config.DefaultDisclosureConfig()
 	model := "openai/gpt-5.5"
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, cfg, "claude-code", model)
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.ReviewerScopeChangedRanges, cfg, "claude-code", model)
 	if !strings.Contains(prompt, "agent=claude-code · model=openai/gpt-5.5") {
 		t.Fatalf("prompt missing configured agent/model disclosure:\n%s", prompt)
 	}
@@ -2211,7 +2301,7 @@ func TestBuildReviewPromptUsesConfiguredDisclosure(t *testing.T) {
 	}
 
 	cfg.Enabled = false
-	disabledPrompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, cfg, "claude-code", model)
+	disabledPrompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.ReviewerScopeChangedRanges, cfg, "claude-code", model)
 	if !strings.Contains(disabledPrompt, "disclosure stamping is disabled") {
 		t.Fatalf("prompt missing disabled disclosure instruction:\n%s", disabledPrompt)
 	}
@@ -2223,7 +2313,7 @@ func TestBuildReviewPromptUsesConfiguredDisclosure(t *testing.T) {
 func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.DefaultDisclosureConfig(), "opencode", "")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", false, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "")
 	if !strings.Contains(prompt, "Do not transition spec-review labels") {
 		t.Fatalf("prompt missing no-transition instruction:\n%s", prompt)
 	}
@@ -2287,6 +2377,8 @@ type fakeGitHubGateway struct {
 	reviewMarkerOutcome             string
 	reviewMarkerBody                string
 	reviewMarkerCalls               int
+	viewDraft                       bool
+	viewState                       string
 	addReactionErr                  error
 	removeReactionErr               error
 	addLabelErr                     error
@@ -2328,7 +2420,11 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 		reviewDecision = g.reviewDecisionAfterFirstView
 		comments = g.commentsAfterFirstView
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: "OPEN", ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: reviewRequests, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts", Comments: cloneCommentMaps(comments)}, nil
+	state := g.viewState
+	if state == "" {
+		state = "OPEN"
+	}
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: "PR body", State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "octocat", ReviewRequests: reviewRequests, ChecksSummary: "SUCCESS", Diff: "diff --git a/a.ts b/a.ts", Comments: cloneCommentMaps(comments)}, nil
 }
 
 func cloneCommentMaps(comments []map[string]any) []map[string]any {

@@ -444,6 +444,12 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"/opt/gh",
 		"--osascript-path",
 		"/opt/osascript",
+		"--reviewer-loop-enabled=false",
+		"--reviewer-quiet-period-seconds",
+		"60",
+		"--reviewer-max-iterations-per-pr",
+		"7",
+		"--reviewer-max-iterations-per-head=2",
 		"--force",
 	})
 
@@ -465,6 +471,12 @@ func TestExtractConfigArgsForwardsOnlyConfigFlags(t *testing.T) {
 		"/opt/gh",
 		"--osascript-path",
 		"/opt/osascript",
+		"--reviewer-loop-enabled=false",
+		"--reviewer-quiet-period-seconds",
+		"60",
+		"--reviewer-max-iterations-per-pr",
+		"7",
+		"--reviewer-max-iterations-per-head=2",
 	}
 
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {

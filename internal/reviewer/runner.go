@@ -509,6 +509,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if queueErr != nil {
 			return queueErr
 		}
+		if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
+			return err
+		}
 		result.QueueItems = append(result.QueueItems, queueItem)
 		return nil
 	}
@@ -555,7 +558,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if detail.IsDraft || normalizePRState(detail.State) != "open" {
+		if detail.IsDraft {
+			result.Skipped++
+			continue
+		}
+		if normalizePRState(detail.State) != "open" {
 			if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
 				return DiscoveryResult{}, err
 			}
@@ -1036,7 +1043,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.allowAutoApprove, isManualReviewerLoop(input.Loop), r.disclosure, r.agentRuntime, r.agentModel), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.allowAutoApprove, isManualReviewerLoop(input.Loop), r.scope, r.disclosure, r.agentRuntime, r.agentModel), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -1424,12 +1431,6 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			return loopUpsertResult{}, err
 		}
 		updated.MetadataJSON = &metadataJSON
-		if active, err := r.hasActiveRunningRun(ctx, updated.ID); err == nil && active {
-			updated.Status = "running"
-		} else {
-			updated.Status = "queued"
-		}
-		updated.NextRunAt = &nowISO
 		updated.UpdatedAt = nowISO
 		if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 			return loopUpsertResult{}, err
@@ -1451,6 +1452,22 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.created", projectID: project.ID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"type": "reviewer", "repo": repo, "prNumber": prNumber}})
 	return loopUpsertResult{record: loop, created: true}, nil
+}
+
+func (r *Runner) markLoopQueuedForReview(ctx context.Context, loop storage.LoopRecord, availableAt string) error {
+	if isTerminalReviewerLoopStatus(loop.Status) {
+		return nil
+	}
+	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		if active, activeErr := r.hasActiveRunningRun(ctx, updated.ID); activeErr == nil && active {
+			updated.Status = "running"
+			updated.NextRunAt = nil
+			return
+		}
+		updated.Status = "queued"
+		updated.NextRunAt = stringPtr(availableAt)
+	})
+	return err
 }
 
 func (r *Runner) hasActiveRunningRun(ctx context.Context, loopID string) (bool, error) {
@@ -2010,13 +2027,13 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
 }
 
-func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, allowApprove bool, manual bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
+func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, allowApprove bool, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
 	phaseInstruction := "This is an implementation review. Focus on code correctness, safety, tests, and maintainability."
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, "You must publish the GitHub review yourself by calling the `gh` CLI from the shell. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you.", fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|actionable -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean for clean LGTM reviews and outcome=actionable for reviews requesting changes or giving actionable feedback.", "Run ID for logging only, not for idempotency: " + runID}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), "You must publish the GitHub review yourself by calling the `gh` CLI from the shell. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you.", fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|actionable -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean for clean LGTM reviews and outcome=actionable for reviews requesting changes or giving actionable feedback.", "Run ID for logging only, not for idempotency: " + runID}
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
@@ -2089,6 +2106,19 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 		"If the review is clean, write a warm, specific LGTM review body that briefly praises what is good about this PR. Keep it concise, genuine, and varied; do not use a generic template if you can reference the actual PR content.",
 	)
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
+}
+
+func reviewerScopeInstruction(scope config.ReviewerScope) string {
+	switch scope {
+	case config.ReviewerScopeFullPR:
+		return "Review scope: full_pr. Use the full PR context, including title, body, checks, discussion metadata, and the complete diff payload below. You may report actionable issues anywhere in the PR diff when they are supported by the included context."
+	case config.ReviewerScopeChangedFiles:
+		return "Review scope: changed_files. Limit actionable findings to files changed by this PR. Use unchanged hunks only as context for changed files, and do not request changes in unrelated files unless the changed-file behavior cannot be fixed locally."
+	case config.ReviewerScopeChangedRanges:
+		return "Review scope: changed_ranges. Limit actionable findings to changed diff ranges. Use surrounding unchanged lines only to understand the change, and prefer resolvable inline comments anchored to RIGHT/LEFT lines in the diff."
+	default:
+		return reviewerScopeInstruction(config.ReviewerScopeChangedRanges)
+	}
 }
 
 func reviewDisclosureInstruction(disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {

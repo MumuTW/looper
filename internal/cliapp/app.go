@@ -589,16 +589,20 @@ func (a *App) stderr() io.Writer {
 }
 
 var configFlagNames = map[string]struct{}{
-	"config":                {},
-	"host":                  {},
-	"port":                  {},
-	"db-path":               {},
-	"log-dir":               {},
-	"daemon-mode":           {},
-	"git-path":              {},
-	"gh-path":               {},
-	"osascript-path":        {},
-	"fix-all-pull-requests": {},
+	"config":                           {},
+	"host":                             {},
+	"port":                             {},
+	"db-path":                          {},
+	"log-dir":                          {},
+	"daemon-mode":                      {},
+	"git-path":                         {},
+	"gh-path":                          {},
+	"osascript-path":                   {},
+	"fix-all-pull-requests":            {},
+	"reviewer-loop-enabled":            {},
+	"reviewer-quiet-period-seconds":    {},
+	"reviewer-max-iterations-per-pr":   {},
+	"reviewer-max-iterations-per-head": {},
 }
 
 func ExtractConfigArgs(argv []string) []string {
