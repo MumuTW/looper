@@ -1648,8 +1648,8 @@ func TestReviewCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 			if got, want := metadata["manual"], true; got != want {
 				t.Fatalf("body.metadata.manual = %#v, want %#v", got, want)
 			}
-			if _, ok := metadata["followUpdates"]; ok {
-				t.Fatalf("body.metadata.followUpdates = %#v, want omitted so daemon default applies", metadata["followUpdates"])
+			if got, want := metadata["followUpdates"], false; got != want {
+				t.Fatalf("body.metadata.followUpdates = %#v, want %#v", got, want)
 			}
 			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "running"}))
 		default:

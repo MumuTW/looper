@@ -1183,8 +1183,10 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
 	}
 	checkpoint.PendingReview = pending.clone()
-	if markerResult.Body != "" && checkpoint.PendingReview.ContentFingerprint == "" {
-		checkpoint.PendingReview.ContentFingerprint = reviewMarkerFingerprint(markerResult)
+	if checkpoint.PendingReview.ContentFingerprint == "" {
+		if fp := reviewMarkerFingerprint(markerResult); fp != "" {
+			checkpoint.PendingReview.ContentFingerprint = fp
+		}
 	}
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err

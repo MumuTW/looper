@@ -1528,7 +1528,7 @@ func TestProcessClaimedItemRecoversFailedAgentRunWhenReviewMarkerExists(t *testi
 func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true, reviewMarkerBodyExplicit: true, reviewMarkerInlineCommentBodies: []string{"inline-only retry finding"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}, {Status: "completed", Summary: "posted again", Stdout: `__LOOPER_RESULT__={"summary":"posted review again"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
@@ -1567,6 +1567,14 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	}
 	if github.reviewMarkerCalls != 2 {
 		t.Fatalf("review marker calls = %d, want initial lookup plus retry", github.reviewMarkerCalls)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
+	}
+	want := normalizedFindingFingerprint(strings.Join(github.reviewMarkerInlineCommentBodies, "\n"))
+	if !contains(*updatedLoop.MetadataJSON, fmt.Sprintf(`"lastOutputFingerprint":"%s"`, want)) {
+		t.Fatalf("loop metadata = %s, want inline-only retry fingerprint %s", *updatedLoop.MetadataJSON, want)
 	}
 }
 
@@ -2782,6 +2790,7 @@ type fakeGitHubGateway struct {
 	reviewMarkerEvent               ReviewEvent
 	reviewMarkerOutcome             string
 	reviewMarkerBody                string
+	reviewMarkerBodyExplicit        bool
 	reviewMarkerInlineCommentBodies []string
 	reviewMarkerCalls               int
 	viewDraft                       bool
@@ -2884,7 +2893,7 @@ func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyRevi
 		outcome = "actionable"
 	}
 	body := g.reviewMarkerBody
-	if body == "" {
+	if body == "" && !g.reviewMarkerBodyExplicit {
 		body = "review body <!-- looper:review outcome=" + outcome + " -->"
 	}
 	return ReviewMarkerResult{Found: true, Outcome: outcome, Event: g.reviewMarkerEvent, Body: body, InlineCommentBodies: append([]string(nil), g.reviewMarkerInlineCommentBodies...)}, nil

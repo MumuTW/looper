@@ -210,8 +210,8 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 	if loopFlagChanged && noLoop {
 		return fmt.Errorf("--loop and --no-loop are mutually exclusive")
 	}
-	loopEnabled := true
-	loopSetting := "default"
+	loopEnabled := false
+	loopSetting := "false"
 	if noLoop {
 		loopEnabled = false
 		loopSetting = "false"
@@ -226,10 +226,8 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 		}
 
 		metadata := map[string]any{
-			"manual": true,
-		}
-		if noLoop || loopFlagChanged {
-			metadata["followUpdates"] = loopEnabled
+			"manual":        true,
+			"followUpdates": loopEnabled,
 		}
 
 		body := map[string]any{
