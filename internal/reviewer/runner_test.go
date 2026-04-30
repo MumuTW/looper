@@ -753,6 +753,54 @@ func TestProcessClaimedItemFingerprintsPublishedReviewBodyForIdenticalOutput(t *
 	}
 }
 
+func TestProcessClaimedItemDetectsDuplicatePublishedFindings(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	body := "duplicate actionable finding <!-- looper:review loop=loop_duplicate_finding outcome=actionable -->"
+	fingerprint := normalizedFindingFingerprint(body)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerBody: body}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Duplicate findings", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}, DetectDuplicateFindings: true})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := fmt.Sprintf(`{"followUpdates":true,"loop":{"enabled":true,"publishedFindingFingerprints":[%q]}}`, fingerprint)
+	loop := storage.LoopRecord{ID: "loop_duplicate_finding", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
+	}
+	if !contains(*updatedLoop.MetadataJSON, `"duplicateFindingsDetected":1`) {
+		t.Fatalf("loop metadata = %#v, want duplicateFindingsDetected counter", updatedLoop.MetadataJSON)
+	}
+	if contains(*updatedLoop.MetadataJSON, "duplicateFindingsSuppressed") {
+		t.Fatalf("loop metadata = %#v, want no suppressed counter for detection-only accounting", updatedLoop.MetadataJSON)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts = %d, want review still executed for detection-only duplicate tracking", len(agent.starts))
+	}
+}
+
 func TestProcessClaimedItemStopsOnIdenticalReviewBodyWithDifferentMarkerHead(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

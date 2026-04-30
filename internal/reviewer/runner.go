@@ -271,7 +271,7 @@ type Options struct {
 	AllowAutoApprove        bool
 	LoopConfig              config.ReviewerLoopConfig
 	Scope                   config.ReviewerScope
-	DedupeFindings          bool
+	DetectDuplicateFindings bool
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
 	AgentModel              *string
@@ -293,7 +293,7 @@ type Runner struct {
 	allowAutoApprove        bool
 	loopConfig              config.ReviewerLoopConfig
 	scope                   config.ReviewerScope
-	dedupeFindings          bool
+	detectDuplicateFindings bool
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
 	agentModel              string
@@ -437,7 +437,7 @@ func New(options Options) *Runner {
 		allowAutoApprove:        options.AllowAutoApprove,
 		loopConfig:              loopConfig,
 		scope:                   scope,
-		dedupeFindings:          options.DedupeFindings,
+		detectDuplicateFindings: options.DetectDuplicateFindings,
 		disclosure:              disclosureCfg,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		agentModel:              derefString(options.AgentModel),
@@ -1951,8 +1951,8 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 		fingerprints, _ := loopMeta["publishedFindingFingerprints"].([]any)
 		if !containsAnyString(fingerprints, fp) {
 			loopMeta["publishedFindingFingerprints"] = append(fingerprints, fp)
-		} else if r.dedupeFindings {
-			loopMeta["duplicateFindingsSuppressed"] = intFromAny(loopMeta["duplicateFindingsSuppressed"]) + 1
+		} else if r.detectDuplicateFindings {
+			loopMeta["duplicateFindingsDetected"] = intFromAny(loopMeta["duplicateFindingsDetected"]) + 1
 		}
 	}
 	if loopMeta["terminationReason"] == nil {

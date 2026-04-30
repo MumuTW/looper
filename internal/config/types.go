@@ -184,10 +184,10 @@ type ReviewerLoopConfig struct {
 }
 
 type ReviewerConfig struct {
-	Loop           ReviewerLoopConfig  `json:"loop"`
-	Scope          ReviewerScope       `json:"scope"`
-	PublishMode    ReviewerPublishMode `json:"publishMode"`
-	DedupeFindings bool                `json:"dedupeFindings"`
+	Loop                    ReviewerLoopConfig  `json:"loop"`
+	Scope                   ReviewerScope       `json:"scope"`
+	PublishMode             ReviewerPublishMode `json:"publishMode"`
+	DetectDuplicateFindings bool                `json:"detectDuplicateFindings"`
 }
 
 type ProjectRefConfig struct {
@@ -321,10 +321,11 @@ type PartialReviewerLoopConfig struct {
 }
 
 type PartialReviewerConfig struct {
-	Loop           *PartialReviewerLoopConfig `json:"loop,omitempty"`
-	Scope          *ReviewerScope             `json:"scope,omitempty"`
-	PublishMode    *ReviewerPublishMode       `json:"publishMode,omitempty"`
-	DedupeFindings *bool                      `json:"dedupeFindings,omitempty"`
+	Loop                    *PartialReviewerLoopConfig `json:"loop,omitempty"`
+	Scope                   *ReviewerScope             `json:"scope,omitempty"`
+	PublishMode             *ReviewerPublishMode       `json:"publishMode,omitempty"`
+	DetectDuplicateFindings *bool                      `json:"detectDuplicateFindings,omitempty"`
+	DedupeFindings          *bool                      `json:"dedupeFindings,omitempty"`
 }
 
 type PartialConfig struct {

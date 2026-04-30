@@ -3731,12 +3731,12 @@ func loopTargetKeyCompat(target domain.LoopTarget) string {
 }
 
 func assertUniqueActiveLoopCompat(existing []storage.LoopRecord, candidateID, projectID string, loopType domain.LoopType, target domain.LoopTarget, status domain.LoopStatus) error {
-	if !domain.IsActiveLoopStatus(status) {
+	if !domain.IsConflictingActiveLoopStatus(status) {
 		return nil
 	}
 
 	for _, loop := range existing {
-		if loop.ID == candidateID || !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+		if loop.ID == candidateID || !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(loop.Status)) {
 			continue
 		}
 

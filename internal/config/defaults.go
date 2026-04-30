@@ -128,9 +128,9 @@ func DefaultConfig(cwd string) (Config, error) {
 				StopOnReadyLabel:        true,
 				StopOnIdenticalOutput:   true,
 			},
-			Scope:          ReviewerScopeChangedRanges,
-			PublishMode:    ReviewerPublishModeSingleReview,
-			DedupeFindings: true,
+			Scope:                   ReviewerScopeChangedRanges,
+			PublishMode:             ReviewerPublishModeSingleReview,
+			DetectDuplicateFindings: true,
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil

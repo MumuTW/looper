@@ -170,7 +170,7 @@
         },
         "scope": "changed_ranges",
         "publishMode": "single_review",
-        "dedupeFindings": true
+        "detectDuplicateFindings": true
       },
       "projects": [
         {

@@ -710,18 +710,18 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		},
 	})
 	reviewerRunner = reviewer.New(reviewer.Options{
-		DB:               coordinator.DB(),
-		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper},
-		Git:              reviewerGitAdapter{gateway: gitGateway},
-		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:           logger,
-		Now:              now,
-		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
-		LoopConfig:       cfg.Reviewer.Loop,
-		Scope:            cfg.Reviewer.Scope,
-		DedupeFindings:   cfg.Reviewer.DedupeFindings,
-		Disclosure:       &cfg.Disclosure,
+		DB:                      coordinator.DB(),
+		Repos:                   repos,
+		GitHub:                  reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper},
+		Git:                     reviewerGitAdapter{gateway: gitGateway},
+		AgentExecutor:           reviewerAgentExecutorAdapter{executor: agentExecutor},
+		Logger:                  logger,
+		Now:                     now,
+		AllowAutoApprove:        cfg.Defaults.AllowAutoApprove,
+		LoopConfig:              cfg.Reviewer.Loop,
+		Scope:                   cfg.Reviewer.Scope,
+		DetectDuplicateFindings: cfg.Reviewer.DetectDuplicateFindings,
+		Disclosure:              &cfg.Disclosure,
 		AgentRuntime: func() string {
 			if cfg.Agent.Vendor == nil {
 				return ""

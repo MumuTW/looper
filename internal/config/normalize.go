@@ -316,8 +316,10 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	if partial.PublishMode != nil {
 		config.PublishMode = *partial.PublishMode
 	}
-	if partial.DedupeFindings != nil {
-		config.DedupeFindings = *partial.DedupeFindings
+	if partial.DetectDuplicateFindings != nil {
+		config.DetectDuplicateFindings = *partial.DetectDuplicateFindings
+	} else if partial.DedupeFindings != nil {
+		config.DetectDuplicateFindings = *partial.DedupeFindings
 	}
 }
 

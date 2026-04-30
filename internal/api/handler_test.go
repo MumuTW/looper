@@ -20,6 +20,7 @@ import (
 
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/domain"
 	"github.com/powerformer/looper/internal/projects"
 	looperdruntime "github.com/powerformer/looper/internal/runtime"
 	"github.com/powerformer/looper/internal/storage"
@@ -145,7 +146,7 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, daemon["workingDirectory"], cfg.Daemon.WorkingDirectory)
 	assertEqual(t, reviewer["scope"], string(cfg.Reviewer.Scope))
 	assertEqual(t, reviewer["publishMode"], string(cfg.Reviewer.PublishMode))
-	assertEqual(t, reviewer["dedupeFindings"], cfg.Reviewer.DedupeFindings)
+	assertEqual(t, reviewer["detectDuplicateFindings"], cfg.Reviewer.DetectDuplicateFindings)
 	assertEqual(t, reviewerLoop["enabledByDefault"], cfg.Reviewer.Loop.EnabledByDefault)
 	assertEqual(t, reviewerLoop["maxConsecutiveFailures"], float64(cfg.Reviewer.Loop.MaxConsecutiveFailures))
 	if _, ok := daemon["shutdownTimeoutMs"]; ok {
@@ -1686,6 +1687,22 @@ func TestHandlerWorkerAndPlannerCreateRejectActiveLoopConflicts(t *testing.T) {
 	plannerBody := parseJSONMap(t, plannerRecorder.Body.Bytes())
 	plannerError := plannerBody["error"].(map[string]any)
 	assertEqual(t, plannerError["code"], "LOOP_CONFLICT")
+}
+
+func TestAssertUniqueActiveLoopCompatAllowsWaitingReviewerRerun(t *testing.T) {
+	existing := []storage.LoopRecord{{
+		ID:         "loop_waiting",
+		ProjectID:  "project_1",
+		Type:       string(domain.LoopTypeReviewer),
+		TargetType: string(domain.LoopTargetTypePullRequest),
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   int64Ptr(42),
+		Status:     string(domain.LoopStatusWaiting),
+	}}
+	target := domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42}
+	if err := assertUniqueActiveLoopCompat(existing, "loop_new", "project_1", domain.LoopTypeReviewer, target, domain.LoopStatusQueued); err != nil {
+		t.Fatalf("assertUniqueActiveLoopCompat() error = %v, want waiting loop ignored for conflict checks", err)
+	}
 }
 
 func TestHandlerWorkerCreateUsesProjectScopedPullRequestSnapshot(t *testing.T) {
