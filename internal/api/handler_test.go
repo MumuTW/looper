@@ -72,6 +72,7 @@ func TestIsTerminalReviewerLoopRecordTreatsFailedAsTerminal(t *testing.T) {
 func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	seedStatusData(t, rt)
+	seedStatusLoopCounts(t, rt)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
 	req.Header.Set("x-request-id", "fixture-request-id")
@@ -112,7 +113,11 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, scheduler["activeRuns"], float64(1))
 
 	reviewer := loops["reviewer"].(map[string]any)
+	assertEqual(t, reviewer["queued"], float64(1))
 	assertEqual(t, reviewer["running"], float64(1))
+	assertEqual(t, reviewer["waiting"], float64(1))
+	assertEqual(t, reviewer["terminated"], float64(1))
+	assertEqual(t, reviewer["stopped"], float64(1))
 }
 
 func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
@@ -4211,6 +4216,24 @@ func seedStatusData(t *testing.T, rt *looperdruntime.Runtime) {
 		UpdatedAt:   nowISO,
 	}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+}
+
+func seedStatusLoopCounts(t *testing.T, rt *looperdruntime.Runtime) {
+	t.Helper()
+
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_1"
+	for _, seededLoop := range []storage.LoopRecord{
+		{ID: "loop_queued", Seq: 2, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:43"), Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(43), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "loop_waiting", Seq: 3, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:44"), Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(44), Status: "waiting", CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "loop_terminated", Seq: 4, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:45"), Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(45), Status: "terminated", CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "loop_stopped", Seq: 5, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:46"), Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(46), Status: "stopped", CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := services.Repositories.Loops.Upsert(context.Background(), seededLoop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", seededLoop.ID, err)
+		}
 	}
 }
 

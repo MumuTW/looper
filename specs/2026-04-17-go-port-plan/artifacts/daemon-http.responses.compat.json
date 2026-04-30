@@ -92,24 +92,40 @@
           },
           "loops": {
             "planner": {
+              "queued": 0,
               "running": 0,
+              "waiting": 0,
               "paused": 0,
-              "failed": 0
+              "failed": 0,
+              "terminated": 0,
+              "stopped": 0
             },
             "reviewer": {
+              "queued": 0,
               "running": 1,
+              "waiting": 0,
               "paused": 0,
-              "failed": 0
+              "failed": 0,
+              "terminated": 0,
+              "stopped": 0
             },
             "worker": {
+              "queued": 0,
               "running": 0,
+              "waiting": 0,
               "paused": 0,
-              "failed": 0
+              "failed": 0,
+              "terminated": 0,
+              "stopped": 0
             },
             "fixer": {
+              "queued": 0,
               "running": 0,
+              "waiting": 0,
               "paused": 0,
-              "failed": 0
+              "failed": 0,
+              "terminated": 0,
+              "stopped": 0
             }
           },
           "safety": {

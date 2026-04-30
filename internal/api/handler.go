@@ -568,9 +568,13 @@ type statusScheduler struct {
 }
 
 type statusLoopType struct {
-	Running int `json:"running"`
-	Paused  int `json:"paused"`
-	Failed  int `json:"failed"`
+	Queued     int `json:"queued"`
+	Running    int `json:"running"`
+	Waiting    int `json:"waiting"`
+	Paused     int `json:"paused"`
+	Failed     int `json:"failed"`
+	Terminated int `json:"terminated"`
+	Stopped    int `json:"stopped"`
 }
 
 type statusLoops struct {
@@ -812,12 +816,20 @@ func countLoops(loops []storage.LoopRecord) statusLoops {
 		}
 
 		switch loop.Status {
+		case "queued":
+			target.Queued++
 		case "running":
 			target.Running++
+		case "waiting":
+			target.Waiting++
 		case "paused":
 			target.Paused++
 		case "failed":
 			target.Failed++
+		case "terminated":
+			target.Terminated++
+		case "stopped":
+			target.Stopped++
 		}
 	}
 
