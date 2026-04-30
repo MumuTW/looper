@@ -611,6 +611,7 @@ type configResponse struct {
 	Daemon        configDaemonResponse      `json:"daemon"`
 	Package       config.PackageConfig      `json:"package"`
 	Defaults      config.DefaultsConfig     `json:"defaults"`
+	Reviewer      config.ReviewerConfig     `json:"reviewer"`
 	Projects      []config.ProjectRefConfig `json:"projects"`
 }
 
@@ -656,6 +657,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 		},
 		Package:  cfg.Package,
 		Defaults: cfg.Defaults,
+		Reviewer: cfg.Reviewer,
 		Projects: append([]config.ProjectRefConfig{}, cfg.Projects...),
 	}
 }

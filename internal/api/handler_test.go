@@ -121,6 +121,8 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	server := data["server"].(map[string]any)
 	storageInfo := data["storage"].(map[string]any)
 	daemon := data["daemon"].(map[string]any)
+	reviewer := data["reviewer"].(map[string]any)
+	reviewerLoop := reviewer["loop"].(map[string]any)
 
 	assertEqual(t, server["host"], cfg.Server.Host)
 	assertEqual(t, server["port"], float64(cfg.Server.Port))
@@ -129,6 +131,11 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, storageInfo["mode"], cfg.Storage.Mode)
 	assertEqual(t, daemon["mode"], string(cfg.Daemon.Mode))
 	assertEqual(t, daemon["workingDirectory"], cfg.Daemon.WorkingDirectory)
+	assertEqual(t, reviewer["scope"], string(cfg.Reviewer.Scope))
+	assertEqual(t, reviewer["publishMode"], string(cfg.Reviewer.PublishMode))
+	assertEqual(t, reviewer["dedupeFindings"], cfg.Reviewer.DedupeFindings)
+	assertEqual(t, reviewerLoop["enabledByDefault"], cfg.Reviewer.Loop.EnabledByDefault)
+	assertEqual(t, reviewerLoop["maxConsecutiveFailures"], float64(cfg.Reviewer.Loop.MaxConsecutiveFailures))
 	if _, ok := daemon["shutdownTimeoutMs"]; ok {
 		t.Fatalf("daemon.shutdownTimeoutMs should be omitted from config response: %#v", daemon)
 	}

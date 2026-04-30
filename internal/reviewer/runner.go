@@ -760,13 +760,18 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if queueErr != nil {
 				return ProcessResult{}, queueErr
 			}
+			terminalFailure := false
 			_, loopErr := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
 				metadataJSON, metaErr := r.recordLoopFailureMetadata(updated.MetadataJSON, failure.message)
 				if metaErr == nil {
 					updated.MetadataJSON = &metadataJSON
 				}
-				if updated.Status == "paused" {
+				if terminalReviewerLoopReason(*updated) == "failed" {
+					terminalFailure = true
+					updated.Status = "failed"
+					updated.NextRunAt = nil
+				} else if updated.Status == "paused" {
 					updated.NextRunAt = nil
 				} else if failedQueue != nil && failedQueue.Status == "queued" {
 					updated.Status = "queued"
@@ -782,6 +787,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			})
 			if loopErr != nil {
 				return ProcessResult{}, loopErr
+			}
+			if terminalFailure && failedQueue != nil && failedQueue.Status == "queued" {
+				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
+					return ProcessResult{}, err
+				}
+				failedQueue.Status = "failed"
 			}
 			if failedQueue == nil || failedQueue.Status != "queued" {
 				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
