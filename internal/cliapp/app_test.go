@@ -1608,6 +1608,16 @@ func TestReviewCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 			if got, want := body["prNumber"], float64(123); got != want {
 				t.Fatalf("body.prNumber = %#v, want %#v", got, want)
 			}
+			metadata, ok := body["metadata"].(map[string]any)
+			if !ok {
+				t.Fatalf("body.metadata = %#v, want object", body["metadata"])
+			}
+			if got, want := metadata["manual"], true; got != want {
+				t.Fatalf("body.metadata.manual = %#v, want %#v", got, want)
+			}
+			if _, ok := metadata["followUpdates"]; ok {
+				t.Fatalf("body.metadata.followUpdates = %#v, want omitted so daemon default applies", metadata["followUpdates"])
+			}
 			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "running"}))
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.Path)

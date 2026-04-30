@@ -145,6 +145,7 @@ type ReviewMarkerResult struct {
 	Outcome     string
 	Event       string
 	AuthorLogin string
+	Body        string
 }
 
 type PullRequestReactionInput struct {
@@ -588,7 +589,7 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 		var pages [][]map[string]any
 		if err := json.Unmarshal([]byte(raw), &pages); err != nil {
 			if expectedAuthorLogin == "" && len(allowedReviewEvents) == 0 && strings.Contains(raw, marker) {
-				return ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(raw, marker)}
+				return ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(raw, marker), Body: raw}
 			}
 			return ReviewMarkerResult{}
 		}
@@ -608,7 +609,7 @@ func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []st
 		}
 		event := reviewEventFromStateString(row["state"])
 		if len(allowedReviewEvents) == 0 || reviewEventAllowed(event, allowedReviewEvents) {
-			newest = ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(body, marker), Event: event, AuthorLogin: author}
+			newest = ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(body, marker), Event: event, AuthorLogin: author, Body: body}
 		}
 	}
 	return newest

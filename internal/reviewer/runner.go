@@ -180,6 +180,7 @@ type ReviewMarkerResult struct {
 	Outcome     string
 	Event       ReviewEvent
 	AuthorLogin string
+	Body        string
 }
 
 type PullRequestReactionInput struct {
@@ -369,6 +370,7 @@ type pendingReviewCheckpoint struct {
 	IdempotencyKey           string      `json:"idempotencyKey,omitempty"`
 	Event                    ReviewEvent `json:"event,omitempty"`
 	Summary                  string      `json:"summary,omitempty"`
+	ContentFingerprint       string      `json:"contentFingerprint,omitempty"`
 	MarkerVerificationMisses int         `json:"markerVerificationMisses,omitempty"`
 }
 
@@ -473,7 +475,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if loopErr != nil {
 			return loopErr
 		}
-		if loopResult.record.Status == "paused" {
+		if isTerminalReviewerLoopStatus(loopResult.record.Status) {
 			result.Skipped++
 			return nil
 		}
@@ -1045,7 +1047,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: normalizedFindingFingerprint(found.Body)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -1064,7 +1066,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: normalizedFindingFingerprint(found.Body)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -1132,6 +1134,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
 	}
 	checkpoint.PendingReview = pending.clone()
+	if markerResult.Body != "" && checkpoint.PendingReview.ContentFingerprint == "" {
+		checkpoint.PendingReview.ContentFingerprint = normalizedFindingFingerprint(markerResult.Body)
+	}
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
@@ -1397,7 +1402,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 	}
 	if existing != nil {
-		if existing.Status == "paused" {
+		if isTerminalReviewerLoopStatus(existing.Status) {
 			return loopUpsertResult{record: *existing, created: false}, nil
 		}
 		updated := *existing
@@ -1832,7 +1837,7 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 		byHead[head] = intFromAny(byHead[head]) + 1
 		loopMeta["iterationsByHead"] = byHead
 	}
-	fp := normalizedFindingFingerprint(summary)
+	fp := loopSuccessOutputFingerprint(checkpoint, summary)
 	if fp != "" {
 		previous, _ := loopMeta["lastOutputFingerprint"].(string)
 		if previous == fp && r.loopConfig.StopOnIdenticalOutput {
@@ -1856,6 +1861,18 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
+}
+
+func loopSuccessOutputFingerprint(checkpoint reviewerCheckpoint, summary string) string {
+	if checkpoint.PendingReview != nil {
+		if fp := strings.TrimSpace(checkpoint.PendingReview.ContentFingerprint); fp != "" {
+			return fp
+		}
+		if fp := normalizedFindingFingerprint(checkpoint.PendingReview.Summary); fp != "" {
+			return fp
+		}
+	}
+	return normalizedFindingFingerprint(summary)
 }
 
 func (r *Runner) loopBudgetTerminationReason(loop storage.LoopRecord, headSHA string) string {

@@ -433,18 +433,17 @@ func TestProcessClaimedItemAllowsManualQueuedLoopWithoutReviewRequest(t *testing
 	}
 }
 
-func TestProcessClaimedItemPreservesTerminatedLoopStatusAfterSuccess(t *testing.T) {
+func TestProcessClaimedItemFingerprintsPublishedReviewBodyForIdenticalOutput(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerBody: "new actionable finding <!-- looper:review loop=loop_identical_output outcome=actionable -->"}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Same findings", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnIdenticalOutput: true}})
 	ctx := context.Background()
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
 	prNumber := int64(42)
-	summary := fmt.Sprintf("Published review for %s#%d", repo, prNumber)
-	metadata := fmt.Sprintf(`{"followUpdates":true,"loop":{"enabled":true,"lastOutputFingerprint":%q}}`, normalizedFindingFingerprint(summary))
+	metadata := fmt.Sprintf(`{"followUpdates":true,"loop":{"enabled":true,"lastOutputFingerprint":%q}}`, normalizedFindingFingerprint("previous actionable finding"))
 	loop := storage.LoopRecord{ID: "loop_identical_output", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -469,11 +468,44 @@ func TestProcessClaimedItemPreservesTerminatedLoopStatusAfterSuccess(t *testing.
 	if err != nil || updatedLoop == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updatedLoop, err)
 	}
+	if updatedLoop.Status != "waiting" {
+		t.Fatalf("loop status = %q, want waiting", updatedLoop.Status)
+	}
+	if updatedLoop.MetadataJSON == nil || contains(*updatedLoop.MetadataJSON, `"terminationReason":"identical_output"`) {
+		t.Fatalf("loop metadata = %#v, want no identical_output termination", updatedLoop.MetadataJSON)
+	}
+	if want := normalizedFindingFingerprint(github.reviewMarkerBody); !contains(*updatedLoop.MetadataJSON, fmt.Sprintf(`"lastOutputFingerprint":"%s"`, want)) {
+		t.Fatalf("loop metadata = %#v, want published review body fingerprint %s", updatedLoop.MetadataJSON, want)
+	}
+}
+
+func TestDiscoverPullRequestsDoesNotReactivateTerminalLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true,"status":"terminated","terminationReason":"identical_output"}}`
+	loop := storage.LoopRecord{ID: "loop_terminal", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "terminated", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: repo, Limit: 10})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none", result.QueueItems)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updatedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updatedLoop, err)
+	}
 	if updatedLoop.Status != "terminated" {
 		t.Fatalf("loop status = %q, want terminated", updatedLoop.Status)
-	}
-	if updatedLoop.MetadataJSON == nil || !contains(*updatedLoop.MetadataJSON, `"terminationReason":"identical_output"`) {
-		t.Fatalf("loop metadata = %#v, want identical_output termination", updatedLoop.MetadataJSON)
 	}
 }
 
@@ -2070,6 +2102,7 @@ type fakeGitHubGateway struct {
 	reviewMarkerErr                 error
 	reviewMarkerEvent               ReviewEvent
 	reviewMarkerOutcome             string
+	reviewMarkerBody                string
 	reviewMarkerCalls               int
 	addReactionErr                  error
 	removeReactionErr               error
@@ -2160,7 +2193,11 @@ func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyRevi
 	if outcome == "" {
 		outcome = "actionable"
 	}
-	return ReviewMarkerResult{Found: true, Outcome: outcome, Event: g.reviewMarkerEvent}, nil
+	body := g.reviewMarkerBody
+	if body == "" {
+		body = "review body <!-- looper:review outcome=" + outcome + " -->"
+	}
+	return ReviewMarkerResult{Found: true, Outcome: outcome, Event: g.reviewMarkerEvent, Body: body}, nil
 }
 
 func (g *fakeGitHubGateway) AddPullRequestReaction(_ context.Context, input PullRequestReactionInput) error {

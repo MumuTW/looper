@@ -308,12 +308,12 @@ func writeHumanPullRequestStatus(w io.Writer, payload json.RawMessage) error {
 	return nil
 }
 
-func writeHumanReviewCreate(w io.Writer, payload json.RawMessage, loopEnabled bool) error {
+func writeHumanReviewCreate(w io.Writer, payload json.RawMessage, loopSetting string) error {
 	var data loopOutput
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode reviewer response: %w", err)
 	}
-	printSection(w, "Reviewer started", [][2]any{{"id", data.ID}, {"projectId", data.ProjectID}, {"pr", formatPullRequestRef(data.Repo, data.PRNumber)}, {"status", data.Status}, {"loop", fmt.Sprintf("%t", loopEnabled)}})
+	printSection(w, "Reviewer started", [][2]any{{"id", data.ID}, {"projectId", data.ProjectID}, {"pr", formatPullRequestRef(data.Repo, data.PRNumber)}, {"status", data.Status}, {"loop", loopSetting}})
 	return nil
 }
 
