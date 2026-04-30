@@ -795,11 +795,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
 		}
-		if r.loopEnabled(parseJSONObject(updated.MetadataJSON)) && checkpoint.SkipReason == "" {
-			updated.Status = "waiting"
-		} else {
-			updated.Status = "completed"
-		}
+		updated.Status = r.loopSuccessStatus(updated.Status, updated.MetadataJSON, checkpoint.SkipReason)
 		updated.LastRunAt = stringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	}); err != nil {
@@ -1029,6 +1025,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if err != nil {
 		return checkpoint, err
 	}
+	if err := r.recordAgentExecutionStarted(ctx, input.Loop.ID); err != nil {
+		return checkpoint, err
+	}
 	if r.onAgentExecutionStarted != nil {
 		if err := r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), Body: "Review started", DedupeKey: "runtime.agent.started:reviewer:" + input.Run.ID}); err != nil && r.logger != nil {
 			r.logger.Warn("reviewer agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
@@ -1215,11 +1214,12 @@ func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
 }
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
-	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
-	if err != nil {
-		return err
-	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
+		if err == nil {
+			updated.MetadataJSON = stringPtr(metadataJSON)
+		}
+	}); err != nil {
 		return err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
@@ -1498,15 +1498,6 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 		availableAt = eventlog.FormatJavaScriptISOString(input.AvailableAt.UTC())
 	}
 	if existing != nil {
-		if existing.Status == "queued" && existing.AvailableAt != availableAt {
-			updated := *existing
-			updated.AvailableAt = availableAt
-			updated.UpdatedAt = r.nowISO()
-			if err := r.repos.Queue.Upsert(ctx, updated); err != nil {
-				return storage.QueueItemRecord{}, err
-			}
-			return updated, nil
-		}
 		return *existing, nil
 	}
 	nowISO := r.nowISO()
@@ -1756,10 +1747,51 @@ func (r *Runner) recordLoopRunStartMetadata(current *string) (string, error) {
 	loopMeta := reviewerLoopMetadata(meta)
 	loopMeta["status"] = "active"
 	loopMeta["lastStatus"] = "running"
-	loopMeta["agentExecutionCount"] = intFromAny(loopMeta["agentExecutionCount"]) + 1
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
+}
+
+func (r *Runner) recordAgentExecutionStarted(ctx context.Context, loopID string) error {
+	current, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || current == nil {
+		return err
+	}
+	_, err = r.updateLoop(ctx, storage.LoopRecord{ID: loopID}, func(updated *storage.LoopRecord) {
+		meta := parseJSONObject(updated.MetadataJSON)
+		loopMeta := reviewerLoopMetadata(meta)
+		loopMeta["agentExecutionCount"] = intFromAny(loopMeta["agentExecutionCount"]) + 1
+		meta["loop"] = loopMeta
+		if encoded, marshalErr := json.Marshal(meta); marshalErr == nil {
+			text := string(encoded)
+			updated.MetadataJSON = &text
+		}
+	})
+	return err
+}
+
+func (r *Runner) loopSuccessStatus(currentStatus string, metadataJSON *string, skipReason string) string {
+	meta := parseJSONObject(metadataJSON)
+	loopMeta := reviewerLoopMetadata(meta)
+	if status, ok := loopMeta["status"].(string); ok && isTerminalReviewerLoopStatus(status) {
+		return status
+	}
+	if isTerminalReviewerLoopStatus(currentStatus) {
+		return currentStatus
+	}
+	if r.loopEnabled(meta) && skipReason == "" {
+		return "waiting"
+	}
+	return "completed"
+}
+
+func isTerminalReviewerLoopStatus(status string) bool {
+	switch status {
+	case "terminated", "failed", "paused", "stopped":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Runner) recordLoopFailureMetadata(current *string, message string) (string, error) {
