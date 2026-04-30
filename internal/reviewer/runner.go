@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -41,6 +42,8 @@ var reviewerStepSequence = []ReviewerStep{
 	stepReview,
 	stepPublish,
 }
+
+var reviewMarkerCommentPattern = regexp.MustCompile(`(?is)<!--\s*looper:review\b.*?-->`)
 
 type ReviewerStep string
 
@@ -553,7 +556,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			continue
 		}
 		if detail.IsDraft || normalizePRState(detail.State) != "open" {
-			_ = r.terminateLoop(ctx, loop, "pr_closed_or_merged")
+			if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+				return DiscoveryResult{}, err
+			}
 			result.Skipped++
 			continue
 		}
@@ -864,22 +869,30 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if normalizePRState(checkpoint.Detail.State) != "open" {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped non-open pull request %s#%d", input.Repo, input.PRNumber)
-		_ = r.terminateLoop(ctx, input.Loop, "pr_closed_or_merged")
+		if err := r.terminateLoop(ctx, input.Loop, "pr_closed_or_merged"); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
-		_ = r.terminateLoop(ctx, input.Loop, "approved")
+		if err := r.terminateLoop(ctx, input.Loop, "approved"); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
-	if r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
+	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
-		_ = r.terminateLoop(ctx, input.Loop, "ready_label")
+		if err := r.terminateLoop(ctx, input.Loop, "ready_label"); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
 	if reason := r.loopBudgetTerminationReason(input.Loop, checkpoint.Detail.HeadSHA); reason != "" {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for %s#%d: %s", input.Repo, input.PRNumber, reason)
-		_ = r.terminateLoop(ctx, input.Loop, reason)
+		if err := r.terminateLoop(ctx, input.Loop, reason); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) {
@@ -1944,6 +1957,7 @@ func intFromAny(value any) int {
 }
 
 func normalizedFindingFingerprint(text string) string {
+	text = reviewMarkerCommentPattern.ReplaceAllString(text, "")
 	normalized := strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
 	if normalized == "" {
 		return ""

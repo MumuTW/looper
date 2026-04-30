@@ -475,6 +475,57 @@ func TestProcessClaimedItemAllowsManualQueuedLoopWhenApproved(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemAllowsManualQueuedLoopWhenReadyLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{specpr.ReadyLabel}, reviewRequests: []string{"alice"}, currentLogin: "bob"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Manual review", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"manual":true}`
+	loop := storage.LoopRecord{ID: "loop_manual_ready", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts=%d, want manual review to bypass ready-label termination", len(agent.starts))
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil || updatedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updatedLoop, err)
+	}
+	if updatedLoop.Status == "terminated" {
+		t.Fatalf("loop status = %q, want manual run not terminated", updatedLoop.Status)
+	}
+}
+
+func TestNormalizedFindingFingerprintIgnoresReviewMarkerMetadata(t *testing.T) {
+	t.Parallel()
+	oldHead := normalizedFindingFingerprint("same actionable finding <!-- looper:review loop=loop_1 head=old outcome=actionable -->")
+	newHead := normalizedFindingFingerprint("same actionable finding <!-- looper:review loop=loop_1 head=new outcome=actionable -->")
+	if oldHead == "" || oldHead != newHead {
+		t.Fatalf("fingerprints = %q and %q, want equal non-empty values", oldHead, newHead)
+	}
+}
+
 func TestProcessClaimedItemFingerprintsPublishedReviewBodyForIdenticalOutput(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -518,6 +569,51 @@ func TestProcessClaimedItemFingerprintsPublishedReviewBodyForIdenticalOutput(t *
 	}
 	if want := normalizedFindingFingerprint(github.reviewMarkerBody); !contains(*updatedLoop.MetadataJSON, fmt.Sprintf(`"lastOutputFingerprint":"%s"`, want)) {
 		t.Fatalf("loop metadata = %#v, want published review body fingerprint %s", updatedLoop.MetadataJSON, want)
+	}
+}
+
+func TestProcessClaimedItemStopsOnIdenticalReviewBodyWithDifferentMarkerHead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	body := "same actionable finding <!-- looper:review loop=loop_identical_marker_head head=new-head outcome=actionable -->"
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerBody: body}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Same findings", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnIdenticalOutput: true}})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	previous := normalizedFindingFingerprint("same actionable finding <!-- looper:review loop=loop_identical_marker_head head=old-head outcome=actionable -->")
+	metadata := fmt.Sprintf(`{"followUpdates":true,"loop":{"enabled":true,"lastOutputFingerprint":%q}}`, previous)
+	loop := storage.LoopRecord{ID: "loop_identical_marker_head", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updatedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updatedLoop, err)
+	}
+	if updatedLoop.Status != "terminated" {
+		t.Fatalf("loop status = %q, want terminated", updatedLoop.Status)
+	}
+	if updatedLoop.MetadataJSON == nil || !contains(*updatedLoop.MetadataJSON, `"terminationReason":"identical_output"`) {
+		t.Fatalf("loop metadata = %#v, want identical_output termination", updatedLoop.MetadataJSON)
 	}
 }
 
