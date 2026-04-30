@@ -507,6 +507,27 @@ func TestStatusJSONPrintsDaemonPayload(t *testing.T) {
 	assertJSONContains(t, stdout, "version", "1.2.3")
 }
 
+func TestStatusAcceptsReviewerLoopConfigOverrideFlag(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{"healthy": true}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "status", "--reviewer-loop-enabled=false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([status --reviewer-loop-enabled=false]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([status --reviewer-loop-enabled=false]) stderr = %q, want empty string", stderr)
+	}
+}
+
 func TestConfigShowJSONSendsLocalToken(t *testing.T) {
 	t.Parallel()
 

@@ -1099,6 +1099,43 @@ func TestHandlerLoopStatusMutationsReconcileQueueItems(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopStartRejectsTerminalReviewerLoop(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	metadataTerminated := `{"loop":{"status":"terminated"}}`
+	loops := []storage.LoopRecord{
+		{ID: "loop_reviewer_terminated", Seq: 10, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "terminated", CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "loop_reviewer_metadata_terminated", Seq: 11, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadataTerminated, CreatedAt: nowISO, UpdatedAt: nowISO},
+	}
+	for _, loop := range loops {
+		if err := services.Repositories.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	for _, loop := range loops {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loop.ID+"/start", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("start %s status = %d, want 400", loop.ID, recorder.Code)
+		}
+		updated, err := services.Repositories.Loops.GetByID(context.Background(), loop.ID)
+		if err != nil || updated == nil {
+			t.Fatalf("Loops.GetByID(%s) = (%#v, %v), want loop", loop.ID, updated, err)
+		}
+		if updated.Status != loop.Status {
+			t.Fatalf("loop %s status = %q, want unchanged %q", loop.ID, updated.Status, loop.Status)
+		}
+	}
+}
+
 func TestHandlerLoopStartIsIdempotentWhenQueueItemAlreadyActive(t *testing.T) {
 	fixture := newTestFixture(t)
 	services := fixture.runtime.Services()
@@ -1955,6 +1992,9 @@ func TestHandlerCreateLoopReviewerEnqueuesSchedulableManualLoop(t *testing.T) {
 	metadata := parseJSONObject(loop.MetadataJSON)
 	assertEqual(t, metadata["manual"], true)
 	assertEqual(t, metadata["followUpdates"], false)
+	loopMeta := metadata["loop"].(map[string]any)
+	assertEqual(t, loopMeta["enabled"], false)
+	assertEqual(t, loopMeta["startTime"], fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString))
 
 	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
 	if err != nil {
@@ -1975,6 +2015,32 @@ func TestHandlerCreateLoopReviewerEnqueuesSchedulableManualLoop(t *testing.T) {
 	assertEqual(t, queue.TargetType, "pull_request")
 	assertEqual(t, queue.TargetID, "pr:acme/looper:99")
 	assertEqual(t, queue.DedupeKey, "reviewer:project_1:"+loopID+":acme/looper:99")
+}
+
+func TestHandlerCreateLoopReviewerBackfillsFollowUpdatesFromLoopEnabled(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":99,"metadata":{"loop":{"enabled":false}}}`)))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	loopID := data["id"].(string)
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	assertEqual(t, metadata["followUpdates"], false)
+	loopMeta := metadata["loop"].(map[string]any)
+	assertEqual(t, loopMeta["enabled"], false)
+	assertEqual(t, loopMeta["startTime"], fixture.now.UTC().Format(javaScriptISOString))
 }
 
 func TestHandlerCreateLoopReviewerEnqueuesAcrossProjectsForSamePullRequest(t *testing.T) {

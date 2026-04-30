@@ -543,6 +543,10 @@ func globalFlags() []flagSpec {
 		stringFlag("gh-path", "path", "GitHub CLI path"),
 		stringFlag("osascript-path", "path", "osascript binary path"),
 		stringFlag("fix-all-pull-requests", "bool", "Allow fixer to inspect and fix PRs created by any author"),
+		stringFlag("reviewer-loop-enabled", "bool", "Enable reviewer follow-up loops by default"),
+		stringFlag("reviewer-quiet-period-seconds", "seconds", "Reviewer loop quiet period"),
+		stringFlag("reviewer-max-iterations-per-pr", "count", "Reviewer loop max iterations per PR"),
+		stringFlag("reviewer-max-iterations-per-head", "count", "Reviewer loop max iterations per head"),
 	}
 }
 

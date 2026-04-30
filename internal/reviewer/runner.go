@@ -478,7 +478,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if loopErr != nil {
 			return loopErr
 		}
-		if isTerminalReviewerLoopStatus(loopResult.record.Status) {
+		if terminalReviewerLoopReason(loopResult.record) != "" {
 			result.Skipped++
 			return nil
 		}
@@ -487,7 +487,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 		meta := parseJSONObject(loopResult.record.MetadataJSON)
 		_, hasPublishedHead := stringFromAny(meta["lastPublishedHeadSha"])
-		if !r.loopEnabled(meta) && hasPublishedHead {
+		if !r.loopEnabled(meta) && (!loopResult.created || hasPublishedHead) {
 			result.Skipped++
 			return nil
 		}
@@ -655,6 +655,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
+	if reason := terminalReviewerLoopReason(*loop); reason != "" {
+		cancelReason := "loop_" + reason
+		if _, err := r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &cancelReason); err != nil {
+			return ProcessResult{}, err
+		}
+		summary := fmt.Sprintf("Skipped terminal reviewer loop %s: %s", loop.ID, reason)
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
+	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
 		return ProcessResult{}, err
@@ -804,7 +812,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		return ProcessResult{}, err
 	}
-	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		metadataJSON, metaErr := r.recordLoopSuccessMetadata(updated.MetadataJSON, checkpoint, summary)
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
@@ -812,8 +820,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		updated.Status = r.loopSuccessStatus(updated.Status, updated.MetadataJSON, checkpoint.SkipReason)
 		updated.LastRunAt = stringPtr(r.nowISO())
 		updated.NextRunAt = nil
-	}); err != nil {
+	})
+	if err != nil {
 		return ProcessResult{}, err
+	}
+	if reason := terminalReviewerLoopReason(updatedLoop); reason != "" {
+		if _, err := r.repos.Queue.CancelByLoop(ctx, updatedLoop.ID, r.nowISO(), &reason); err != nil {
+			return ProcessResult{}, err
+		}
 	}
 	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 	status := "success"
@@ -1422,7 +1436,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 	}
 	if existing != nil {
-		if isTerminalReviewerLoopStatus(existing.Status) {
+		if terminalReviewerLoopReason(*existing) != "" {
 			return loopUpsertResult{record: *existing, created: false}, nil
 		}
 		updated := *existing
@@ -1455,7 +1469,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 }
 
 func (r *Runner) markLoopQueuedForReview(ctx context.Context, loop storage.LoopRecord, availableAt string) error {
-	if isTerminalReviewerLoopStatus(loop.Status) {
+	if terminalReviewerLoopReason(loop) != "" {
 		return nil
 	}
 	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
@@ -1490,7 +1504,7 @@ func (r *Runner) listFollowUpLoops(ctx context.Context, projectID, repo string) 
 	}
 	result := make([]storage.LoopRecord, 0)
 	for _, loop := range loops {
-		if loop.Type != "reviewer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || loop.PRNumber == nil || loop.Status == "paused" || loop.Status == "stopped" || loop.Status == "terminated" || loop.Status == "failed" {
+		if loop.Type != "reviewer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || loop.PRNumber == nil || loop.Status == "paused" || loop.Status == "failed" || terminalReviewerLoopReason(loop) != "" {
 			continue
 		}
 		meta := parseJSONObject(loop.MetadataJSON)
@@ -1747,12 +1761,16 @@ func (r *Runner) loopEnabled(meta map[string]any) bool {
 
 func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber int64) (string, error) {
 	meta := parseJSONObject(current)
-	if _, ok := meta["followUpdates"].(bool); !ok {
-		meta["followUpdates"] = r.loopConfig.EnabledByDefault
-	}
 	loopMeta, _ := meta["loop"].(map[string]any)
 	if loopMeta == nil {
 		loopMeta = map[string]any{}
+	}
+	if _, ok := meta["followUpdates"].(bool); !ok {
+		if enabled, ok := loopMeta["enabled"].(bool); ok {
+			meta["followUpdates"] = enabled
+		} else {
+			meta["followUpdates"] = r.loopConfig.EnabledByDefault
+		}
 	}
 	if _, ok := loopMeta["enabled"].(bool); !ok {
 		loopMeta["enabled"] = r.loopEnabled(meta)
@@ -1829,6 +1847,18 @@ func isTerminalReviewerLoopStatus(status string) bool {
 	}
 }
 
+func terminalReviewerLoopReason(loop storage.LoopRecord) string {
+	if isTerminalReviewerLoopStatus(loop.Status) {
+		return loop.Status
+	}
+	meta := parseJSONObject(loop.MetadataJSON)
+	loopMeta := reviewerLoopMetadata(meta)
+	if status, ok := loopMeta["status"].(string); ok && isTerminalReviewerLoopStatus(status) {
+		return status
+	}
+	return ""
+}
+
 func (r *Runner) recordLoopFailureMetadata(current *string, message string) (string, error) {
 	meta := parseJSONObject(current)
 	loopMeta := reviewerLoopMetadata(meta)
@@ -1855,10 +1885,13 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 		head = checkpoint.Snapshot.HeadSHA
 	}
 	iterations := intFromAny(loopMeta["iterationCount"])
-	loopMeta["iterationCount"] = iterations + 1
 	loopMeta["lastStatus"] = "success"
 	loopMeta["consecutiveFailures"] = 0
-	if head != "" {
+	reviewCompleted := checkpoint.SkipReason == "" && checkpoint.PendingReview != nil
+	if reviewCompleted {
+		loopMeta["iterationCount"] = iterations + 1
+	}
+	if reviewCompleted && head != "" {
 		loopMeta["lastReviewedHeadSha"] = head
 		byHead, _ := loopMeta["iterationsByHead"].(map[string]any)
 		if byHead == nil {
@@ -1867,7 +1900,10 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 		byHead[head] = intFromAny(byHead[head]) + 1
 		loopMeta["iterationsByHead"] = byHead
 	}
-	fp := loopSuccessOutputFingerprint(checkpoint, summary)
+	fp := ""
+	if reviewCompleted {
+		fp = loopSuccessOutputFingerprint(checkpoint, summary)
+	}
 	if fp != "" {
 		previous, _ := loopMeta["lastOutputFingerprint"].(string)
 		if previous == fp && r.loopConfig.StopOnIdenticalOutput {
@@ -1946,6 +1982,10 @@ func (r *Runner) terminateLoop(ctx context.Context, loop storage.LoopRecord, rea
 			updated.MetadataJSON = &text
 		}
 	})
+	if err != nil {
+		return err
+	}
+	_, err = r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &reason)
 	return err
 }
 

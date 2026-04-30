@@ -2518,14 +2518,15 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return loopResponse{}, err
 		}
 	}
+	now := h.now().UTC()
+	nowISO := eventlog.FormatJavaScriptISOString(now)
 	if domain.LoopType(loopType) == domain.LoopTypeReviewer {
-		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Reviewer, target)
+		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Reviewer, target, nowISO)
 		if err != nil {
 			return loopResponse{}, err
 		}
 	}
 
-	now := h.now().UTC()
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		transactionRepos := storage.NewRepositories(tx)
 		project, err := transactionRepos.Projects.GetByID(r.Context(), projectID)
@@ -2553,7 +2554,6 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return storage.LoopRecord{}, err
 		}
 
-		nowISO := eventlog.FormatJavaScriptISOString(now)
 		record := storage.LoopRecord{
 			ID:           generateRequestID(),
 			Seq:          seq,
@@ -3224,6 +3224,9 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start %s loop without config.agent.vendor", loop.Type)}
 		}
+		if status == domain.LoopStatusRunning && loop.Type == string(domain.LoopTypeReviewer) && isTerminalReviewerLoopRecord(*loop) {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start terminal reviewer loop: %s", loop.ID)}
+		}
 
 		if status == domain.LoopStatusRunning {
 			target, targetErr := loopTargetFromRecordCompat(*loop)
@@ -3502,20 +3505,27 @@ func manualPlannerMetadataJSON(existing *string, issueNumber int64) (*string, er
 	return &text, nil
 }
 
-func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerConfig, target domain.LoopTarget) (*string, error) {
+func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerConfig, target domain.LoopTarget, nowISO string) (*string, error) {
 	metadata := parseJSONObject(existing)
-	if _, ok := metadata["followUpdates"].(bool); !ok {
-		metadata["followUpdates"] = reviewerConfig.Loop.EnabledByDefault
-	}
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	if loopMeta == nil {
 		loopMeta = map[string]any{}
+	}
+	if _, ok := metadata["followUpdates"].(bool); !ok {
+		if enabled, ok := loopMeta["enabled"].(bool); ok {
+			metadata["followUpdates"] = enabled
+		} else {
+			metadata["followUpdates"] = reviewerConfig.Loop.EnabledByDefault
+		}
 	}
 	if _, ok := loopMeta["enabled"].(bool); !ok {
 		loopMeta["enabled"] = metadata["followUpdates"]
 	}
 	if _, ok := loopMeta["status"].(string); !ok {
 		loopMeta["status"] = "active"
+	}
+	if _, ok := loopMeta["startTime"].(string); !ok {
+		loopMeta["startTime"] = nowISO
 	}
 	loopMeta["scope"] = string(reviewerConfig.Scope)
 	loopMeta["quietPeriodSeconds"] = reviewerConfig.Loop.QuietPeriodSeconds
@@ -3537,6 +3547,16 @@ func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerCo
 	}
 	text := string(encoded)
 	return &text, nil
+}
+
+func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
+	if loop.Status == "terminated" || loop.Status == "stopped" {
+		return true
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	loopMeta, _ := metadata["loop"].(map[string]any)
+	status, _ := loopMeta["status"].(string)
+	return status == "terminated" || status == "stopped"
 }
 
 func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.LoopTarget, nowISO string, metadataJSON *string, maxAttempts int64) (storage.QueueItemRecord, bool, error) {

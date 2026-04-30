@@ -347,6 +347,36 @@ func TestDiscoverPullRequestsAllowsManualFollowUpWithoutReviewRequest(t *testing
 	}
 }
 
+func TestDiscoverPullRequestsPreservesDisabledLoopEnabledWhenFollowUpdatesAbsent(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"loop":{"enabled":false}}`
+	loop := storage.LoopRecord{ID: "loop_disabled_legacy", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none for disabled follow-up loop", result.QueueItems)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updated, err)
+	}
+	updatedMeta := parseJSONObject(updated.MetadataJSON)
+	if got, _ := updatedMeta["followUpdates"].(bool); got {
+		t.Fatalf("followUpdates = true, want preserved false from loop.enabled")
+	}
+}
+
 func TestDiscoverPullRequestsAllowsManualFollowUpAfterSkippedAutomaticLoopForSamePR(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -418,6 +448,41 @@ func TestProcessClaimedItemSkipsQueuedAutomaticLoopWhenCurrentUserIsNotRequested
 	loopMeta := reviewerLoopMetadata(parseJSONObject(updatedLoop.MetadataJSON))
 	if got := intFromAny(loopMeta["agentExecutionCount"]); got != 0 {
 		t.Fatalf("agentExecutionCount = %d, want 0 for filter-only skip", got)
+	}
+	if got := intFromAny(loopMeta["iterationCount"]); got != 0 {
+		t.Fatalf("iterationCount = %d, want 0 for filter-only skip", got)
+	}
+}
+
+func TestProcessClaimedItemSkipsTerminalLoopWithoutStartingRun(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_terminated_queued", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "terminated", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_terminal", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loop.ID), Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Priority: 2, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "terminated") {
+		t.Fatalf("result = %#v, want skipped terminal loop", result)
+	}
+	runs, err := fixture.repos.Runs.ListByLoop(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Runs.ListByLoop() error = %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("runs = %#v, want none", runs)
 	}
 }
 
@@ -617,7 +682,6 @@ func TestProcessClaimedItemFingerprintsPublishedReviewBodyForIdenticalOutput(t *
 	if err != nil || claimed == nil || claimed.ID != queue.ID {
 		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
 	}
-
 	result, err := runner.ProcessClaimedItem(ctx, *claimed)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
@@ -665,6 +729,10 @@ func TestProcessClaimedItemStopsOnIdenticalReviewBodyWithDifferentMarkerHead(t *
 	if err != nil || claimed == nil || claimed.ID != queue.ID {
 		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
 	}
+	extraQueue := storage.QueueItemRecord{ID: "queue_identical_marker_head_extra", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loop.ID), Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:extra", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(ctx, extraQueue); err != nil {
+		t.Fatalf("Queue.Upsert(extra) error = %v", err)
+	}
 
 	result, err := runner.ProcessClaimedItem(ctx, *claimed)
 	if err != nil {
@@ -682,6 +750,13 @@ func TestProcessClaimedItemStopsOnIdenticalReviewBodyWithDifferentMarkerHead(t *
 	}
 	if updatedLoop.MetadataJSON == nil || !contains(*updatedLoop.MetadataJSON, `"terminationReason":"identical_output"`) {
 		t.Fatalf("loop metadata = %#v, want identical_output termination", updatedLoop.MetadataJSON)
+	}
+	cancelledQueue, err := fixture.repos.Queue.GetByID(ctx, extraQueue.ID)
+	if err != nil || cancelledQueue == nil {
+		t.Fatalf("Queue.GetByID(extra) = (%#v, %v), want queue", cancelledQueue, err)
+	}
+	if cancelledQueue.Status != "cancelled" {
+		t.Fatalf("extra queue status = %q, want cancelled", cancelledQueue.Status)
 	}
 }
 
@@ -712,6 +787,36 @@ func TestDiscoverPullRequestsDoesNotReactivateTerminalLoop(t *testing.T) {
 	}
 	if updatedLoop.Status != "terminated" {
 		t.Fatalf("loop status = %q, want terminated", updatedLoop.Status)
+	}
+}
+
+func TestDiscoverPullRequestsDoesNotReactivateMetadataTerminalLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true,"status":"terminated","terminationReason":"identical_output"}}`
+	loop := storage.LoopRecord{ID: "loop_metadata_terminal", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: repo, Limit: 10})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none", result.QueueItems)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updatedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updatedLoop, err)
+	}
+	if updatedLoop.Status != "completed" {
+		t.Fatalf("loop status = %q, want unchanged completed", updatedLoop.Status)
 	}
 }
 
