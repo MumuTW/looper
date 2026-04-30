@@ -56,6 +56,18 @@ func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
 	}
 }
 
+func TestIsTerminalReviewerLoopRecordTreatsFailedAsTerminal(t *testing.T) {
+	t.Parallel()
+	metadata := `{"loop":{"status":"failed"}}`
+
+	if !isTerminalReviewerLoopRecord(storage.LoopRecord{Type: "reviewer", Status: "failed"}) {
+		t.Fatalf("failed record status was not terminal")
+	}
+	if !isTerminalReviewerLoopRecord(storage.LoopRecord{Type: "reviewer", Status: "running", MetadataJSON: &metadata}) {
+		t.Fatalf("failed metadata status was not terminal")
+	}
+}
+
 func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	seedStatusData(t, rt)

@@ -1073,7 +1073,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, err
 	}
 	if err := r.recordAgentExecutionStarted(ctx, input.Loop.ID); err != nil {
-		return checkpoint, err
+		r.logWarn("reviewer agent execution start metadata update failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
 	}
 	if r.onAgentExecutionStarted != nil {
 		if err := r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), Body: "Review started", DedupeKey: "runtime.agent.started:reviewer:" + input.Run.ID}); err != nil && r.logger != nil {
@@ -1451,7 +1451,18 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			return loopUpsertResult{record: *existing, created: false}, nil
 		}
 		updated := *existing
-		metadataJSON, err := r.ensureLoopMetadataJSON(updated.MetadataJSON, repo, prNumber)
+		metadataJSONSource := updated.MetadataJSON
+		meta := parseJSONObject(updated.MetadataJSON)
+		if loopEnabledMetadataMissing(meta) {
+			meta["followUpdates"] = false
+			encoded, err := json.Marshal(meta)
+			if err != nil {
+				return loopUpsertResult{}, err
+			}
+			text := string(encoded)
+			metadataJSONSource = &text
+		}
+		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, repo, prNumber)
 		if err != nil {
 			return loopUpsertResult{}, err
 		}
@@ -1767,7 +1778,19 @@ func (r *Runner) loopEnabled(meta map[string]any) bool {
 			return enabled
 		}
 	}
-	return r.loopConfig.EnabledByDefault
+	return false
+}
+
+func loopEnabledMetadataMissing(meta map[string]any) bool {
+	if _, ok := meta["followUpdates"].(bool); ok {
+		return false
+	}
+	if loopMeta, ok := meta["loop"].(map[string]any); ok {
+		if _, ok := loopMeta["enabled"].(bool); ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber int64) (string, error) {

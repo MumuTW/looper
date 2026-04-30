@@ -276,6 +276,55 @@ func TestDiscoverPullRequestsDebouncesContinuousFollowUp(t *testing.T) {
 	}
 }
 
+func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
+	t.Parallel()
+	runner := New(Options{LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+
+	if runner.loopEnabled(map[string]any{}) {
+		t.Fatalf("loopEnabled(empty metadata) = true, want false for legacy persisted loop")
+	}
+
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "acme/looper", 42)
+	if err != nil {
+		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
+	}
+	meta := parseJSONObject(&metadataJSON)
+	if !runner.loopEnabled(meta) {
+		t.Fatalf("loopEnabled(ensured metadata) = false, want creation-time default true")
+	}
+	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
+		t.Fatalf("followUpdates = %#v, want true", meta["followUpdates"])
+	}
+}
+
+func TestEnsureLoopForPullRequestBackfillsLegacyFollowUpdatesDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_legacy", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ensureLoopForPullRequest(context.Background(), *project, repo, prNumber, &loop)
+	if err != nil {
+		t.Fatalf("ensureLoopForPullRequest() error = %v", err)
+	}
+	meta := parseJSONObject(result.record.MetadataJSON)
+	if runner.loopEnabled(meta) {
+		t.Fatalf("loopEnabled(backfilled legacy metadata) = true, want false")
+	}
+	if enabled, ok := meta["followUpdates"].(bool); !ok || enabled {
+		t.Fatalf("followUpdates = %#v, want false", meta["followUpdates"])
+	}
+}
+
 func TestDiscoverPullRequestsDoesNotMarkSkippedExistingLoopQueued(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -3552,13 +3552,13 @@ func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerCo
 }
 
 func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
-	if loop.Status == "terminated" || loop.Status == "stopped" {
+	if loop.Status == "terminated" || loop.Status == "stopped" || loop.Status == "failed" {
 		return true
 	}
 	metadata := parseJSONObject(loop.MetadataJSON)
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	status, _ := loopMeta["status"].(string)
-	return status == "terminated" || status == "stopped"
+	return status == "terminated" || status == "stopped" || status == "failed"
 }
 
 func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.LoopTarget, nowISO string, metadataJSON *string, maxAttempts int64) (storage.QueueItemRecord, bool, error) {
