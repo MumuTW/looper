@@ -179,11 +179,12 @@ type VerifyReviewMarkerInput struct {
 }
 
 type ReviewMarkerResult struct {
-	Found       bool
-	Outcome     string
-	Event       ReviewEvent
-	AuthorLogin string
-	Body        string
+	Found               bool
+	Outcome             string
+	Event               ReviewEvent
+	AuthorLogin         string
+	Body                string
+	InlineCommentBodies []string
 }
 
 type PullRequestReactionInput struct {
@@ -1092,7 +1093,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: normalizedFindingFingerprint(found.Body)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -1111,7 +1112,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: normalizedFindingFingerprint(found.Body)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -1180,7 +1181,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	}
 	checkpoint.PendingReview = pending.clone()
 	if markerResult.Body != "" && checkpoint.PendingReview.ContentFingerprint == "" {
-		checkpoint.PendingReview.ContentFingerprint = normalizedFindingFingerprint(markerResult.Body)
+		checkpoint.PendingReview.ContentFingerprint = reviewMarkerFingerprint(markerResult)
 	}
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
@@ -1973,6 +1974,19 @@ func loopSuccessOutputFingerprint(checkpoint reviewerCheckpoint, summary string)
 		}
 	}
 	return normalizedFindingFingerprint(summary)
+}
+
+func reviewMarkerFingerprint(found ReviewMarkerResult) string {
+	parts := make([]string, 0, 1+len(found.InlineCommentBodies))
+	if strings.TrimSpace(found.Body) != "" {
+		parts = append(parts, found.Body)
+	}
+	for _, body := range found.InlineCommentBodies {
+		if strings.TrimSpace(body) != "" {
+			parts = append(parts, body)
+		}
+	}
+	return normalizedFindingFingerprint(strings.Join(parts, "\n"))
 }
 
 func (r *Runner) loopBudgetTerminationReason(loop storage.LoopRecord, headSHA string) string {

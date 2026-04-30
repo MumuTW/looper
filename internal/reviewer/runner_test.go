@@ -783,6 +783,49 @@ func TestProcessClaimedItemFingerprintsPublishedReviewBodyForIdenticalOutput(t *
 	}
 }
 
+func TestProcessClaimedItemFingerprintsPublishedReviewInlineComments(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerBody: "review overview <!-- looper:review loop=loop_inline_fingerprint outcome=actionable -->", reviewMarkerInlineCommentBodies: []string{"different actionable inline finding"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Same overview", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnIdenticalOutput: true}})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := fmt.Sprintf(`{"followUpdates":true,"loop":{"enabled":true,"lastOutputFingerprint":%q}}`, normalizedFindingFingerprint(github.reviewMarkerBody+"\nprevious inline finding"))
+	loop := storage.LoopRecord{ID: "loop_inline_fingerprint", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
+	}
+	if contains(*updatedLoop.MetadataJSON, `"terminationReason":"identical_output"`) {
+		t.Fatalf("loop metadata = %#v, want distinct inline comments to avoid identical_output", updatedLoop.MetadataJSON)
+	}
+	want := normalizedFindingFingerprint(github.reviewMarkerBody + "\n" + strings.Join(github.reviewMarkerInlineCommentBodies, "\n"))
+	if !contains(*updatedLoop.MetadataJSON, fmt.Sprintf(`"lastOutputFingerprint":"%s"`, want)) {
+		t.Fatalf("loop metadata = %s, want inline comment fingerprint %s", *updatedLoop.MetadataJSON, want)
+	}
+}
+
 func TestProcessClaimedItemDetectsDuplicatePublishedFindings(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2654,6 +2697,7 @@ type fakeGitHubGateway struct {
 	reviewMarkerEvent               ReviewEvent
 	reviewMarkerOutcome             string
 	reviewMarkerBody                string
+	reviewMarkerInlineCommentBodies []string
 	reviewMarkerCalls               int
 	viewDraft                       bool
 	viewState                       string
@@ -2754,7 +2798,7 @@ func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyRevi
 	if body == "" {
 		body = "review body <!-- looper:review outcome=" + outcome + " -->"
 	}
-	return ReviewMarkerResult{Found: true, Outcome: outcome, Event: g.reviewMarkerEvent, Body: body}, nil
+	return ReviewMarkerResult{Found: true, Outcome: outcome, Event: g.reviewMarkerEvent, Body: body, InlineCommentBodies: append([]string(nil), g.reviewMarkerInlineCommentBodies...)}, nil
 }
 
 func (g *fakeGitHubGateway) AddPullRequestReaction(_ context.Context, input PullRequestReactionInput) error {
