@@ -718,6 +718,9 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Logger:           logger,
 		Now:              now,
 		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
+		LoopConfig:       cfg.Reviewer.Loop,
+		Scope:            cfg.Reviewer.Scope,
+		DedupeFindings:   cfg.Reviewer.DedupeFindings,
 		Disclosure:       &cfg.Disclosure,
 		AgentRuntime: func() string {
 			if cfg.Agent.Vendor == nil {

@@ -2518,6 +2518,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return loopResponse{}, err
 		}
 	}
+	if domain.LoopType(loopType) == domain.LoopTypeReviewer {
+		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Reviewer, target)
+		if err != nil {
+			return loopResponse{}, err
+		}
+	}
 
 	now := h.now().UTC()
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
@@ -3491,6 +3497,43 @@ func manualPlannerMetadataJSON(existing *string, issueNumber int64) (*string, er
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	text := string(encoded)
+	return &text, nil
+}
+
+func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerConfig, target domain.LoopTarget) (*string, error) {
+	metadata := parseJSONObject(existing)
+	if _, ok := metadata["followUpdates"].(bool); !ok {
+		metadata["followUpdates"] = reviewerConfig.Loop.EnabledByDefault
+	}
+	loopMeta, _ := metadata["loop"].(map[string]any)
+	if loopMeta == nil {
+		loopMeta = map[string]any{}
+	}
+	if _, ok := loopMeta["enabled"].(bool); !ok {
+		loopMeta["enabled"] = metadata["followUpdates"]
+	}
+	if _, ok := loopMeta["status"].(string); !ok {
+		loopMeta["status"] = "active"
+	}
+	loopMeta["scope"] = string(reviewerConfig.Scope)
+	loopMeta["quietPeriodSeconds"] = reviewerConfig.Loop.QuietPeriodSeconds
+	loopMeta["maxIterationsPerPR"] = reviewerConfig.Loop.MaxIterationsPerPR
+	loopMeta["maxIterationsPerHead"] = reviewerConfig.Loop.MaxIterationsPerHead
+	loopMeta["maxWallClockSeconds"] = reviewerConfig.Loop.MaxWallClockSeconds
+	loopMeta["maxConsecutiveFailures"] = reviewerConfig.Loop.MaxConsecutiveFailures
+	loopMeta["maxAgentExecutionsPerPR"] = reviewerConfig.Loop.MaxAgentExecutionsPerPR
+	if target.Repo != "" {
+		loopMeta["repo"] = target.Repo
+	}
+	if target.PRNumber > 0 {
+		loopMeta["prNumber"] = target.PRNumber
+	}
+	metadata["loop"] = loopMeta
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
 	}
 	text := string(encoded)
 	return &text, nil

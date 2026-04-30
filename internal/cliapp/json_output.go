@@ -205,6 +205,17 @@ func (r *commandRuntime) pullRequestStatus(cmd *cobra.Command, args []string) er
 }
 
 func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
+	loopFlagChanged := cmd.Flags().Changed("loop")
+	noLoop := getBoolFlag(cmd, "no-loop")
+	if loopFlagChanged && noLoop {
+		return fmt.Errorf("--loop and --no-loop are mutually exclusive")
+	}
+	loopEnabled := true
+	if noLoop {
+		loopEnabled = false
+	} else if loopFlagChanged {
+		loopEnabled = getBoolFlag(cmd, "loop")
+	}
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		projectID, repo, prNumber, err := r.resolveReviewTarget(ctx, strings.TrimSpace(args[0]), strings.TrimSpace(getStringFlag(cmd, "project")))
 		if err != nil {
@@ -219,14 +230,14 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 			"prNumber":   prNumber,
 			"status":     "running",
 			"metadata": map[string]any{
-				"followUpdates": getBoolFlag(cmd, "loop"),
+				"followUpdates": loopEnabled,
 				"manual":        true,
 			},
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops", body)
 	}, func(w io.Writer, payload json.RawMessage) error {
-		return writeHumanReviewCreate(w, payload, getBoolFlag(cmd, "loop"))
+		return writeHumanReviewCreate(w, payload, loopEnabled)
 	})
 }
 

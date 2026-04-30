@@ -33,6 +33,9 @@ const (
 	LoopStatusQueued      LoopStatus = "queued"
 	LoopStatusRunning     LoopStatus = "running"
 	LoopStatusPaused      LoopStatus = "paused"
+	LoopStatusWaiting     LoopStatus = "waiting"
+	LoopStatusStopped     LoopStatus = "stopped"
+	LoopStatusTerminated  LoopStatus = "terminated"
 	LoopStatusCompleted   LoopStatus = "completed"
 	LoopStatusFailed      LoopStatus = "failed"
 	LoopStatusInterrupted LoopStatus = "interrupted"
@@ -73,7 +76,7 @@ type LoopSummary struct {
 }
 
 var activeLoopStatuses = map[LoopStatus]struct{}{
-	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {},
+	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {}, LoopStatusWaiting: {},
 }
 
 var terminalRunStatuses = map[RunStatus]struct{}{
@@ -83,8 +86,11 @@ var terminalRunStatuses = map[RunStatus]struct{}{
 var loopStatusTransitions = map[LoopStatus][]LoopStatus{
 	LoopStatusIdle:        {LoopStatusQueued},
 	LoopStatusQueued:      {LoopStatusRunning},
-	LoopStatusRunning:     {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted},
-	LoopStatusPaused:      {LoopStatusQueued, LoopStatusCompleted},
+	LoopStatusRunning:     {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted, LoopStatusWaiting, LoopStatusTerminated},
+	LoopStatusPaused:      {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped},
+	LoopStatusWaiting:     {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusTerminated},
+	LoopStatusStopped:     {},
+	LoopStatusTerminated:  {},
 	LoopStatusCompleted:   {},
 	LoopStatusFailed:      {},
 	LoopStatusInterrupted: {LoopStatusQueued, LoopStatusFailed},
@@ -122,7 +128,7 @@ func AssertKnownLoopStatus(status LoopStatus) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("loop.status must be one of: %s, %s, %s, %s, %s, %s, %s", LoopStatusIdle, LoopStatusQueued, LoopStatusRunning, LoopStatusPaused, LoopStatusCompleted, LoopStatusFailed, LoopStatusInterrupted)
+	return fmt.Errorf("loop.status must be one of: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s", LoopStatusIdle, LoopStatusQueued, LoopStatusRunning, LoopStatusPaused, LoopStatusWaiting, LoopStatusStopped, LoopStatusTerminated, LoopStatusCompleted, LoopStatusFailed, LoopStatusInterrupted)
 }
 
 func IsActiveLoopStatus(status LoopStatus) bool {

@@ -295,6 +295,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep reviewing when new commits are pushed"),
+					boolFlag("no-loop", "Run only one review pass"),
 				},
 				exampleLines: []string{
 					"$ looper review 123",

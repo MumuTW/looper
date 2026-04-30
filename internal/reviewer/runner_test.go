@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 )
@@ -178,6 +179,65 @@ func TestDiscoverPullRequestsAllowsAutomaticFollowUpWhenCurrentUserIsRequested(t
 	}
 	if len(result.QueueItems) != 1 {
 		t.Fatalf("len(QueueItems) = %d, want 1", len(result.QueueItems))
+	}
+}
+
+func TestDiscoverPullRequestsDebouncesContinuousFollowUp(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	loop := storage.LoopRecord{ID: "loop_debounce", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "waiting", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("len(QueueItems) = %d, want 1", len(result.QueueItems))
+	}
+	wantAvailableAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(120 * time.Second))
+	if result.QueueItems[0].AvailableAt != wantAvailableAt {
+		t.Fatalf("AvailableAt = %q, want %q", result.QueueItems[0].AvailableAt, wantAvailableAt)
+	}
+
+	result, err = runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() second error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].ID == "" {
+		t.Fatalf("second result = %#v, want one deduped queued item", result)
+	}
+	items, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("len(Queue.List()) = %d, want deduped single item", len(items))
+	}
+}
+
+func TestReviewerLoopBudgetTerminationReasons(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 2, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	metadata := `{"loop":{"iterationCount":1,"agentExecutionCount":1,"consecutiveFailures":0,"iterationsByHead":{"abc123":1},"startTime":"2026-04-11T12:00:00.000Z"}}`
+	loop := storage.LoopRecord{ID: "loop_budget", MetadataJSON: &metadata}
+	if got := runner.loopBudgetTerminationReason(loop, "abc123"); got != "max_iterations_per_head" {
+		t.Fatalf("loopBudgetTerminationReason() = %q, want max_iterations_per_head", got)
+	}
+
+	metadata = `{"loop":{"iterationCount":2,"agentExecutionCount":1,"consecutiveFailures":0,"iterationsByHead":{"old":1},"startTime":"2026-04-11T12:00:00.000Z"}}`
+	loop.MetadataJSON = &metadata
+	if got := runner.loopBudgetTerminationReason(loop, "abc123"); got != "max_iterations_per_pr" {
+		t.Fatalf("loopBudgetTerminationReason() = %q, want max_iterations_per_pr", got)
 	}
 }
 
