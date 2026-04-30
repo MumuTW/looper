@@ -433,6 +433,48 @@ func TestProcessClaimedItemAllowsManualQueuedLoopWithoutReviewRequest(t *testing
 	}
 }
 
+func TestProcessClaimedItemAllowsManualQueuedLoopWhenApproved(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewDecision: "APPROVED", reviewRequests: []string{"alice"}, currentLogin: "bob"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Manual review", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"manual":true}`
+	loop := storage.LoopRecord{ID: "loop_manual_approved", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts=%d, want manual review to bypass approved termination", len(agent.starts))
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil || updatedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updatedLoop, err)
+	}
+	if updatedLoop.Status == "terminated" {
+		t.Fatalf("loop status = %q, want manual run not terminated", updatedLoop.Status)
+	}
+}
+
 func TestProcessClaimedItemFingerprintsPublishedReviewBodyForIdenticalOutput(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1542,6 +1584,51 @@ func TestRunReviewStepRepreparesMissingReviewerWorktree(t *testing.T) {
 	}
 	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.worktreePath {
 		t.Fatalf("checkpoint worktree = %#v, want recreated worktree path", checkpoint.Worktree)
+	}
+}
+
+func TestRunReviewStepUsesStableIdempotencyKeyAcrossRuns(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	agent := &fakeAgentExecutor{results: []AgentResult{
+		{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`},
+		{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`},
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	worktree := &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42-head", PreparedAt: fixture.nowISO()}
+	input := stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_stable_review"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: worktree,
+		},
+	}
+
+	input.Run = storage.RunRecord{ID: "run_1"}
+	if _, err := runner.runReviewStep(context.Background(), input); err != nil {
+		t.Fatalf("runReviewStep(run_1) error = %v", err)
+	}
+	input.Run = storage.RunRecord{ID: "run_2"}
+	if _, err := runner.runReviewStep(context.Background(), input); err != nil {
+		t.Fatalf("runReviewStep(run_2) error = %v", err)
+	}
+	if len(agent.starts) != 2 {
+		t.Fatalf("len(agent.starts) = %d, want 2", len(agent.starts))
+	}
+	want := "reviewer:loop_stable_review:abc123"
+	for i, start := range agent.starts {
+		if start.IdempotencyKey != want {
+			t.Fatalf("start %d idempotency key = %q, want %q", i, start.IdempotencyKey, want)
+		}
 	}
 }
 

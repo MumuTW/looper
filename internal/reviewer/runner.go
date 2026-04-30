@@ -867,7 +867,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		_ = r.terminateLoop(ctx, input.Loop, "pr_closed_or_merged")
 		return checkpoint, nil
 	}
-	if r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
+	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
 		_ = r.terminateLoop(ctx, input.Loop, "approved")
 		return checkpoint, nil
@@ -1022,7 +1022,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA, input.Run.ID)
+	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.allowAutoApprove, isManualReviewerLoop(input.Loop), r.disclosure, r.agentRuntime, r.agentModel), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
@@ -2099,8 +2099,8 @@ func snapshotHeadSHA(checkpoint reviewerCheckpoint) string {
 	return ""
 }
 
-func agentNativeReviewID(loopID string, headSHA string, runID string) string {
-	return fmt.Sprintf("reviewer:%s:%s:%s", loopID, headSHA, runID)
+func agentNativeReviewID(loopID string, headSHA string) string {
+	return fmt.Sprintf("reviewer:%s:%s", loopID, headSHA)
 }
 
 func agentNativeReviewMarker(loopID string, headSHA string, idempotencyKey string) string {
