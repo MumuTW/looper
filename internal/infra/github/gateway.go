@@ -33,17 +33,19 @@ var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
 var ErrDiffTooLarge = errors.New("github pull request diff is too large")
 
 type Options struct {
-	GHPath string
-	CWD    string
-	Now    func() time.Time
-	GHRun  func(context.Context, shell.Options) (shell.Result, error)
+	GHPath                 string
+	CWD                    string
+	Now                    func() time.Time
+	GHRun                  func(context.Context, shell.Options) (shell.Result, error)
+	ReviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
 type Gateway struct {
-	ghPath string
-	cwd    string
-	now    func() time.Time
-	ghRun  func(context.Context, shell.Options) (shell.Result, error)
+	ghPath                 string
+	cwd                    string
+	now                    func() time.Time
+	ghRun                  func(context.Context, shell.Options) (shell.Result, error)
+	reviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
 type PullRequestSummary struct {
@@ -144,12 +146,13 @@ type SubmitReviewInput struct {
 }
 
 type ReviewComment struct {
-	Body      string
-	Path      string
-	Line      int64
-	Side      string
-	StartLine int64
-	StartSide string
+	Body            string
+	Path            string
+	Line            int64
+	Side            string
+	StartLine       int64
+	StartSide       string
+	DiagnosticIndex int
 }
 
 type VerifyReviewMarkerInput struct {
@@ -363,7 +366,7 @@ func New(options Options) *Gateway {
 	if ghRun == nil {
 		ghRun = shell.Run
 	}
-	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, ghRun: ghRun}
+	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -749,28 +752,57 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 }
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
+	request := g.reviewSubmitRequest(input)
 	if marker, ok := findReviewIdempotencyMarker(input.Body, ""); ok && marker.Outcome == "clean" && len(input.Comments) > 0 {
-		return fmt.Errorf("clean review marker cannot be submitted with review comments")
+		err := fmt.Errorf("clean review marker cannot be submitted with review comments")
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		return err
 	}
 	var flags []reviewQualityFlag
-	input.Body, input.Comments, flags = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
+	var processing reviewCommentProcessing
+	input.Body, input.Comments, flags, processing = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
+	request = g.reviewSubmitRequest(input)
+	request["comment_processing"] = map[string]any{
+		"original_count":   processing.OriginalCount,
+		"submitted_count":  processing.SubmittedCount,
+		"normalized_count": processing.NormalizedCount,
+		"downgraded_count": processing.DowngradedCount,
+		"dropped_count":    processing.DroppedCount,
+		"comments":         processing.Comments,
+	}
 	gateApplies, err := reviewQualityGateApplies(input.Event, input.Body)
 	if err != nil {
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
 		return err
 	}
 	if gateApplies && len(flags) > 0 {
-		return fmt.Errorf("review quality gate failed: %s", formatReviewQualityFlags(flags))
+		err := fmt.Errorf("review quality gate failed: %s", formatReviewQualityFlags(flags))
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error(), "quality_flags": reviewQualityFlagsSummary(flags)})
+		return err
 	}
 	comments := input.Comments[:0]
 	for _, comment := range input.Comments {
 		comment.Body = normalizeInlineReviewDisclosure(comment.Body, input.Disclosure)
 		if strings.TrimSpace(comment.Body) == "" {
+			processing.DroppedCount++
+			markReviewCommentDropped(processing.Comments, comment.DiagnosticIndex)
 			continue
 		}
 		comments = append(comments, comment)
 	}
 	input.Comments = comments
+	processing.SubmittedCount = len(input.Comments)
+	request = g.reviewSubmitRequest(input)
+	request["comment_processing"] = map[string]any{
+		"original_count":   processing.OriginalCount,
+		"submitted_count":  processing.SubmittedCount,
+		"normalized_count": processing.NormalizedCount,
+		"downgraded_count": processing.DowngradedCount,
+		"dropped_count":    processing.DroppedCount,
+		"comments":         processing.Comments,
+	}
 	if len(input.Comments) > 0 || strings.TrimSpace(input.CommitID) != "" {
+		endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber)
 		payload := map[string]any{
 			"event":     input.Event,
 			"body":      emptyToNil(input.Body),
@@ -803,7 +835,26 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 		if err != nil {
 			return fmt.Errorf("marshal gh review payload: %w", err)
 		}
-		_, err = g.runGh(ctx, input.CWD, string(body), "api", fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber), "--method", "POST", "--input", "-")
+		request["method"] = "POST"
+		request["endpoint"] = endpoint
+		g.emitReviewSubmitDiagnostic("github_review_submit_prepared", map[string]any{"request": request})
+		result, err := g.runGh(ctx, input.CWD, string(body), "api", endpoint, "--method", "POST", "--input", "-", "--include")
+		if err != nil {
+			fields := map[string]any{"request": request, "gh_stdout": reviewSubmitRawStdout(result.Stdout), "gh_stderr": result.Stderr, "gh_error": sanitizeReviewSubmitCommandError(err.Error())}
+			if response, ok := parseReviewSubmitHTTPResponse(result.Stdout); ok {
+				if response.StatusCode > 0 {
+					fields["http_status"] = response.StatusCode
+				}
+				if response.Body != "" {
+					fields["response_body"] = response.Body
+				}
+				if len(response.Headers) > 0 {
+					fields["response_headers"] = response.Headers
+				}
+			}
+			g.emitReviewSubmitDiagnostic("github_review_submit_failed", fields)
+			return err
+		}
 		return err
 	}
 	args := []string{"pr", "review", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--" + strings.ToLower(strings.ReplaceAll(input.Event, "_", "-"))}
@@ -812,6 +863,115 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	}
 	_, err = g.runGh(ctx, input.CWD, "", args...)
 	return err
+}
+
+func (g *Gateway) emitReviewSubmitDiagnostic(event string, fields map[string]any) {
+	if g.reviewSubmitDiagnostic != nil {
+		g.reviewSubmitDiagnostic(event, fields)
+	}
+}
+
+func (g *Gateway) reviewSubmitRequest(input SubmitReviewInput) map[string]any {
+	endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber)
+	request := map[string]any{
+		"repo":      input.Repo,
+		"pr_number": input.PRNumber,
+		"event":     input.Event,
+		"commit_id": strings.TrimSpace(input.CommitID),
+		"method":    "POST",
+		"endpoint":  endpoint,
+		"payload": map[string]any{
+			"body_marker": reviewSubmitBodyMarkerSummary(input.Body),
+			"comments":    reviewSubmitCommentsSummary(input.Comments),
+		},
+	}
+	return request
+}
+
+func reviewSubmitBodyMarkerSummary(body string) map[string]any {
+	if marker, ok := findReviewIdempotencyMarker(body, ""); ok {
+		return map[string]any{"id": marker.ID, "head": marker.Head, "outcome": marker.Outcome}
+	}
+	return map[string]any{}
+}
+
+func reviewSubmitCommentsSummary(comments []ReviewComment) []map[string]any {
+	summary := make([]map[string]any, 0, len(comments))
+	for idx, comment := range comments {
+		entry := map[string]any{"index": reviewCommentDiagnosticIndex(comment, idx)}
+		for key, value := range reviewCommentAnchorMap(comment) {
+			entry[key] = value
+		}
+		summary = append(summary, entry)
+	}
+	return summary
+}
+
+func reviewCommentDiagnosticIndex(comment ReviewComment, fallback int) int {
+	if comment.DiagnosticIndex != 0 || fallback == 0 {
+		return comment.DiagnosticIndex
+	}
+	return fallback
+}
+
+func reviewQualityFlagsSummary(flags []reviewQualityFlag) []map[string]any {
+	summary := make([]map[string]any, 0, len(flags))
+	for _, flag := range flags {
+		summary = append(summary, map[string]any{"kind": flag.Kind, "detail": flag.Detail})
+	}
+	return summary
+}
+
+func reviewSubmitRawStdout(raw string) string {
+	if response, ok := parseReviewSubmitHTTPResponse(raw); ok && response.Body != "" {
+		return response.Body
+	}
+	return raw
+}
+
+func sanitizeReviewSubmitCommandError(message string) string {
+	message = strings.TrimSpace(message)
+	if head, _, ok := strings.Cut(message, "\nstdout:"); ok {
+		return strings.TrimSpace(head)
+	}
+	return message
+}
+
+type reviewSubmitHTTPResponse struct {
+	StatusCode int
+	Headers    map[string]any
+	Body       string
+}
+
+func parseReviewSubmitHTTPResponse(raw string) (reviewSubmitHTTPResponse, bool) {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	parts := strings.SplitN(raw, "\n\n", 2)
+	if len(parts) != 2 {
+		return reviewSubmitHTTPResponse{}, false
+	}
+	headLines := strings.Split(parts[0], "\n")
+	if len(headLines) == 0 || !strings.HasPrefix(headLines[0], "HTTP/") {
+		return reviewSubmitHTTPResponse{}, false
+	}
+	response := reviewSubmitHTTPResponse{Headers: map[string]any{}, Body: strings.TrimSpace(parts[1])}
+	fields := strings.Fields(headLines[0])
+	if len(fields) >= 2 {
+		if status, err := strconv.Atoi(fields[1]); err == nil {
+			response.StatusCode = status
+		}
+	}
+	for _, line := range headLines[1:] {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		normalizedKey := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "-", "_"))
+		switch normalizedKey {
+		case "x_github_request_id", "x_ratelimit_limit", "x_ratelimit_remaining", "x_ratelimit_reset", "retry_after", "content_type":
+			response.Headers[normalizedKey] = strings.TrimSpace(value)
+		}
+	}
+	return response, true
 }
 
 func normalizeInlineReviewDisclosure(body string, disclosureCfg config.DisclosureConfig) string {

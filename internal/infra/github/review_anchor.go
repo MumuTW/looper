@@ -14,35 +14,65 @@ type reviewQualityFlag struct {
 	Detail string
 }
 
-func normalizeReviewAnchors(body string, comments []ReviewComment, anchors *diffanchor.Index) (string, []ReviewComment, []reviewQualityFlag) {
+type reviewCommentProcessing struct {
+	OriginalCount   int
+	SubmittedCount  int
+	NormalizedCount int
+	DowngradedCount int
+	DroppedCount    int
+	Comments        []map[string]any
+}
+
+func normalizeReviewAnchors(body string, comments []ReviewComment, anchors *diffanchor.Index) (string, []ReviewComment, []reviewQualityFlag, reviewCommentProcessing) {
 	flags := []reviewQualityFlag{}
+	processing := reviewCommentProcessing{OriginalCount: len(comments), Comments: make([]map[string]any, 0, len(comments))}
 	if anchors == nil {
 		if len(comments) == 0 && strings.TrimSpace(body) != "" {
 			if result := diffanchor.ValidateTopLevelLocation(body); result.QualityFlagged {
 				flags = append(flags, reviewQualityFlag{Kind: "top-level-location-missing", Detail: result.Reason})
 			}
 		}
-		return body, comments, flags
+		processing.SubmittedCount = len(comments)
+		for idx := range comments {
+			comments[idx].DiagnosticIndex = idx
+			processing.Comments = append(processing.Comments, reviewCommentProcessingEntry(idx, "kept", comments[idx], comments[idx], ""))
+		}
+		return body, comments, flags, processing
 	}
 	kept := make([]ReviewComment, 0, len(comments))
 	downgraded := []string{}
-	for _, comment := range comments {
+	for idx, comment := range comments {
+		original := comment
 		anchor := diffanchor.Anchor{Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide}
 		result := anchors.Validate(anchor)
 		if result.Valid {
-			kept = append(kept, normalizeReviewCommentAnchor(comment))
+			comment.DiagnosticIndex = idx
+			normalized := normalizeReviewCommentAnchor(comment)
+			kept = append(kept, normalized)
+			action := "kept"
+			if reviewCommentAnchorChanged(original, normalized) {
+				processing.NormalizedCount++
+				action = "normalized"
+			}
+			processing.Comments = append(processing.Comments, reviewCommentProcessingEntry(idx, action, original, normalized, ""))
 			continue
 		}
 		if nearest, ok := nearestSafeReviewAnchor(*anchors, anchor); ok {
+			comment.DiagnosticIndex = idx
 			comment.Line = nearest.Line
 			comment.Side = nearest.Side
 			comment.StartLine = nearest.StartLine
 			comment.StartSide = nearest.StartSide
 			comment.Body = addOriginalReviewLocation(comment.Body, anchor)
-			kept = append(kept, normalizeReviewCommentAnchor(comment))
+			normalized := normalizeReviewCommentAnchor(comment)
+			kept = append(kept, normalized)
+			processing.NormalizedCount++
+			processing.Comments = append(processing.Comments, reviewCommentProcessingEntry(idx, "retargeted", original, normalized, result.Reason))
 			continue
 		}
 		downgraded = append(downgraded, diffanchor.FallbackBody(comment.Body, anchor, result.Reason))
+		processing.DowngradedCount++
+		processing.Comments = append(processing.Comments, reviewCommentProcessingEntry(idx, "downgraded", original, ReviewComment{}, result.Reason))
 		if result.QualityFlagged {
 			flags = append(flags, reviewQualityFlag{Kind: "top-level-location-missing", Detail: result.Reason})
 		}
@@ -60,7 +90,55 @@ func normalizeReviewAnchors(body string, comments []ReviewComment, anchors *diff
 			flags = append(flags, reviewQualityFlag{Kind: "top-level-location-missing", Detail: result.Reason})
 		}
 	}
-	return body, kept, flags
+	processing.SubmittedCount = len(kept)
+	return body, kept, flags, processing
+}
+
+func reviewCommentProcessingEntry(index int, action string, original ReviewComment, final ReviewComment, reason string) map[string]any {
+	entry := map[string]any{"index": index, "action": action}
+	if originalAnchor := reviewCommentAnchorMap(original); len(originalAnchor) > 0 {
+		entry["original_anchor"] = originalAnchor
+	}
+	if finalAnchor := reviewCommentAnchorMap(final); len(finalAnchor) > 0 {
+		entry["final_anchor"] = finalAnchor
+	}
+	if strings.TrimSpace(reason) != "" {
+		entry["reason"] = strings.TrimSpace(reason)
+	}
+	return entry
+}
+
+func reviewCommentAnchorChanged(before ReviewComment, after ReviewComment) bool {
+	return before.Path != after.Path || before.Line != after.Line || normalizeReviewCommentSide(before.Side) != after.Side || before.StartLine != after.StartLine || normalizeReviewCommentSide(before.StartSide) != after.StartSide
+}
+
+func reviewCommentAnchorMap(comment ReviewComment) map[string]any {
+	anchor := map[string]any{}
+	if strings.TrimSpace(comment.Path) != "" {
+		anchor["path"] = comment.Path
+	}
+	if comment.Line > 0 {
+		anchor["line"] = comment.Line
+	}
+	if side := normalizeReviewCommentSide(comment.Side); side != "" {
+		anchor["side"] = side
+	}
+	if comment.StartLine > 0 {
+		anchor["start_line"] = comment.StartLine
+	}
+	if startSide := normalizeReviewCommentSide(comment.StartSide); startSide != "" {
+		anchor["start_side"] = startSide
+	}
+	return anchor
+}
+
+func markReviewCommentDropped(entries []map[string]any, index int) {
+	for _, entry := range entries {
+		if entryIndex, ok := entry["index"].(int); ok && entryIndex == index {
+			entry["action"] = "dropped"
+			return
+		}
+	}
 }
 
 func nearestSafeReviewAnchor(idx diffanchor.Index, anchor diffanchor.Anchor) (diffanchor.Anchor, bool) {

@@ -1,6 +1,7 @@
 package cliapp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,16 @@ type reviewSubmitComment struct {
 	Side      string `json:"side"`
 	StartLine int64  `json:"start_line"`
 	StartSide string `json:"start_side"`
+}
+
+type reviewSubmitDiagnosticFields struct {
+	Repo     string
+	PRNumber int64
+	Event    string
+	CommitID string
+	Payload  reviewSubmitPayload
+	Error    string
+	Extra    map[string]any
 }
 
 func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
@@ -76,7 +87,10 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("determine current working directory: %w", err)
 	}
 
-	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: shell.Run})
+	diagnosticWriter := func(event string, fields map[string]any) {
+		writeReviewSubmitDiagnosticEntry(cmd.ErrOrStderr(), event, fields)
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: shell.Run, ReviewSubmitDiagnostic: diagnosticWriter})
 	metadata, err := gh.GetPullRequestHeadAndAuthor(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return fmt.Errorf("validate expected PR head commit: %w", err)
@@ -85,6 +99,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, metadata.Author); err != nil {
+		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error()})
 		return err
 	}
 	submissionEvent, err := r.effectiveReviewSubmitEvent(cmd, gh, repo, prNumber, event, metadata.Author, cwd)
@@ -305,4 +320,75 @@ func submitReviewWithoutAnchorValidation(cmd *cobra.Command, gh *githubinfra.Gat
 		return fmt.Errorf("submit PR review without anchor validation: %w", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+}
+
+func writeReviewSubmitDiagnostic(w io.Writer, event string, fields reviewSubmitDiagnosticFields) {
+	entry := map[string]any{
+		"repo":         fields.Repo,
+		"pr_number":    fields.PRNumber,
+		"event":        event,
+		"review_event": fields.Event,
+		"commit_id":    strings.TrimSpace(fields.CommitID),
+		"method":       "POST",
+		"endpoint":     fmt.Sprintf("repos/%s/pulls/%d/reviews", fields.Repo, fields.PRNumber),
+		"payload": map[string]any{
+			"body_marker": reviewSubmitPayloadBodyMarker(fields.Payload.Body),
+			"comments":    reviewSubmitPayloadComments(fields.Payload.Comments),
+		},
+	}
+	if strings.TrimSpace(fields.Error) != "" {
+		entry["error"] = strings.TrimSpace(fields.Error)
+	}
+	for key, value := range fields.Extra {
+		entry[key] = value
+	}
+	writeReviewSubmitDiagnosticEntry(w, event, entry)
+}
+
+func writeReviewSubmitDiagnosticEntry(w io.Writer, event string, fields map[string]any) {
+	if w == nil {
+		return
+	}
+	entry := map[string]any{"event": event}
+	for key, value := range fields {
+		entry[key] = value
+	}
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(w, bytes.NewReader(append(encoded, '\n')))
+}
+
+func reviewSubmitPayloadBodyMarker(body string) map[string]any {
+	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
+	if len(matches) == 0 {
+		return map[string]any{}
+	}
+	fields := parseReviewSubmitMarkerFields(matches[0][1])
+	return map[string]any{"id": fields["id"], "head": fields["head"], "outcome": fields["outcome"]}
+}
+
+func reviewSubmitPayloadComments(comments []reviewSubmitComment) []map[string]any {
+	summary := make([]map[string]any, 0, len(comments))
+	for idx, comment := range comments {
+		entry := map[string]any{"index": idx}
+		if comment.Path != "" {
+			entry["path"] = comment.Path
+		}
+		if comment.Line > 0 {
+			entry["line"] = comment.Line
+		}
+		if comment.Side != "" {
+			entry["side"] = strings.ToUpper(strings.TrimSpace(comment.Side))
+		}
+		if comment.StartLine > 0 {
+			entry["start_line"] = comment.StartLine
+		}
+		if comment.StartSide != "" {
+			entry["start_side"] = strings.ToUpper(strings.TrimSpace(comment.StartSide))
+		}
+		summary = append(summary, entry)
+	}
+	return summary
 }

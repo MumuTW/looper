@@ -19,7 +19,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
-		case args == "api repos/acme/looper/pulls/42/reviews --method POST --input -":
+		case args == "api repos/acme/looper/pulls/42/reviews --method POST --input - --include":
 			runner.stdin = options.Stdin
 			return shell.Result{Stdout: "{}"}, nil
 		case strings.HasPrefix(args, "pr list"):
@@ -196,7 +196,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	log := strings.Join(runner.calls, "\n")
 	for _, needle := range []string{
 		"pr review 42 --repo acme/looper --comment --body app.go: Looks good",
-		"api repos/acme/looper/pulls/42/reviews --method POST --input -",
+		"api repos/acme/looper/pulls/42/reviews --method POST --input - --include",
 		"pr comment 42 --repo acme/looper --body High-level follow-up",
 		"api repos/acme/looper/issues/42/reactions --method POST -H Accept: application/vnd.github+json -f content=eyes",
 		"api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json",
@@ -345,7 +345,7 @@ func TestSubmitReviewUsesAPIForTopLevelReviewWithCommitID(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		runner.stdin = options.Stdin
@@ -365,7 +365,7 @@ func TestSubmitReviewNormalizesAnchorsBeforePublishing(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		runner.stdin = options.Stdin
@@ -389,7 +389,7 @@ func TestSubmitReviewStripsDisclosureFromInlineCommentsWhenReviewDisclosureDisab
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		runner.stdin = options.Stdin
@@ -411,7 +411,7 @@ func TestSubmitReviewDropsInlineCommentsEmptyAfterDisabledDisclosureStrip(t *tes
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		runner.stdin = options.Stdin
@@ -433,7 +433,7 @@ func TestSubmitReviewPreservesInlineDisclosureWhenReviewDisclosureEnabled(t *tes
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		runner.stdin = options.Stdin
@@ -456,7 +456,7 @@ func TestSubmitReviewNormalizesVisibleInlineDisclosureWhenInlineVisibleDisabled(
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		runner.stdin = options.Stdin
@@ -480,7 +480,7 @@ func TestSubmitReviewNormalizesLegacyVisibleInlineDisclosureWhenInlineVisibleDis
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		runner.stdin = options.Stdin
@@ -504,7 +504,7 @@ func TestSubmitReviewNormalizesLegacyVisibleInlineDisclosureWithoutMarkerWhenInl
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input -" {
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		runner.stdin = options.Stdin
@@ -1342,4 +1342,118 @@ func TestSubmitReviewRejectsCleanMarkerWithComments(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "clean review marker cannot be submitted with review comments") {
 		t.Fatalf("SubmitReview() error = %v, want clean-with-comments rejection", err)
 	}
+}
+
+func TestSubmitReviewLogsValidationFailureDiagnostics(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	var events []reviewSubmitDiagnosticEvent
+	gateway := New(Options{
+		GHPath: "gh",
+		CWD:    t.TempDir(),
+		GHRun:  runner.run,
+		ReviewSubmitDiagnostic: func(event string, fields map[string]any) {
+			events = append(events, reviewSubmitDiagnosticEvent{Name: event, Fields: fields})
+		},
+	})
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "LGTM\n<!-- looper:review id=abc head=def outcome=clean -->", CommitID: "def", Comments: []ReviewComment{{Body: "But fix this", Path: "app.go", Line: 1, Side: "RIGHT"}}})
+	if err == nil || !strings.Contains(err.Error(), "clean review marker cannot be submitted with review comments") {
+		t.Fatalf("SubmitReview() error = %v, want clean-with-comments rejection", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("diagnostic events = %#v, want one validation failure event", events)
+	}
+	if events[0].Name != "github_review_submit_validation_failed" {
+		t.Fatalf("event name = %q, want github_review_submit_validation_failed", events[0].Name)
+	}
+	if got := events[0].Fields["error"]; got != "clean review marker cannot be submitted with review comments" {
+		t.Fatalf("error = %#v, want clean marker rejection", got)
+	}
+	request, _ := events[0].Fields["request"].(map[string]any)
+	if request["repo"] != "acme/looper" || request["pr_number"] != int64(42) || request["commit_id"] != "def" {
+		t.Fatalf("request summary = %#v, want repo/pr/commit", request)
+	}
+	payload, _ := request["payload"].(map[string]any)
+	marker, _ := payload["body_marker"].(map[string]any)
+	if marker["id"] != "abc" || marker["head"] != "def" || marker["outcome"] != "clean" {
+		t.Fatalf("body marker = %#v, want marker fields", marker)
+	}
+	comments, _ := payload["comments"].([]map[string]any)
+	if len(comments) != 1 || comments[0]["path"] != "app.go" || comments[0]["line"] != int64(1) || comments[0]["side"] != "RIGHT" {
+		t.Fatalf("payload comments = %#v, want inline anchor summary", comments)
+	}
+}
+
+func TestSubmitReviewLogsGhFailureDiagnostics(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		result := shell.Result{
+			ExitCode: 1,
+			Stdout: strings.Join([]string{
+				"HTTP/2.0 422 Unprocessable Entity",
+				"X-GitHub-Request-Id: req-123",
+				"X-RateLimit-Remaining: 4999",
+				"",
+				`{"message":"Unprocessable Entity","errors":["An internal error occurred, please try again."]}`,
+			}, "\n"),
+			Stderr: "gh: Unprocessable Entity (HTTP 422)",
+		}
+		return result, &shell.CommandExecutionError{Message: "Command exited with code 1: gh: Unprocessable Entity (HTTP 422)", Result: result}
+	}
+	anchors := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1 +1 @@\n+new\n")
+	var events []reviewSubmitDiagnosticEvent
+	gateway := New(Options{
+		GHPath: "gh",
+		CWD:    t.TempDir(),
+		GHRun:  runner.run,
+		ReviewSubmitDiagnostic: func(event string, fields map[string]any) {
+			events = append(events, reviewSubmitDiagnosticEvent{Name: event, Fields: fields})
+		},
+	})
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "REQUEST_CHANGES", Body: "Please fix this.\n<!-- looper:review id=abc head=def outcome=blocking -->", CommitID: "def", Comments: []ReviewComment{{Body: "Fix this anchor", Path: "app.go", Line: 1, Side: "RIGHT"}}, Anchors: &anchors})
+	if err == nil || !strings.Contains(err.Error(), "HTTP 422") {
+		t.Fatalf("SubmitReview() error = %v, want HTTP 422 failure", err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("diagnostic events = %#v, want prepare and failure events", events)
+	}
+	failure := events[len(events)-1]
+	if failure.Name != "github_review_submit_failed" {
+		t.Fatalf("failure event name = %q, want github_review_submit_failed", failure.Name)
+	}
+	if failure.Fields["http_status"] != 422 {
+		t.Fatalf("http_status = %#v, want 422", failure.Fields["http_status"])
+	}
+	if failure.Fields["response_body"] != `{"message":"Unprocessable Entity","errors":["An internal error occurred, please try again."]}` {
+		t.Fatalf("response_body = %#v, want raw response body", failure.Fields["response_body"])
+	}
+	if failure.Fields["gh_stderr"] != "gh: Unprocessable Entity (HTTP 422)" {
+		t.Fatalf("gh_stderr = %#v, want gh stderr", failure.Fields["gh_stderr"])
+	}
+	headers, _ := failure.Fields["response_headers"].(map[string]any)
+	if headers["x_github_request_id"] != "req-123" || headers["x_ratelimit_remaining"] != "4999" {
+		t.Fatalf("response_headers = %#v, want selected headers", headers)
+	}
+	request, _ := failure.Fields["request"].(map[string]any)
+	if request["event"] != "REQUEST_CHANGES" {
+		t.Fatalf("request = %#v, want request event", request)
+	}
+	normalization, _ := request["comment_processing"].(map[string]any)
+	if normalization["original_count"] != 1 || normalization["submitted_count"] != 1 {
+		t.Fatalf("comment_processing = %#v, want counts", normalization)
+	}
+}
+
+type reviewSubmitDiagnosticEvent struct {
+	Name   string
+	Fields map[string]any
 }

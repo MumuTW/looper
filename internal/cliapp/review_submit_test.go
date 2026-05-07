@@ -3,6 +3,7 @@ package cliapp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -286,6 +287,49 @@ func TestEffectiveReviewSubmitEventDoesNotFetchUserForComment(t *testing.T) {
 	}
 	if got != "COMMENT" {
 		t.Fatalf("effectiveReviewSubmitEvent() = %q, want COMMENT", got)
+	}
+}
+
+func TestWriteReviewSubmitDiagnosticWritesStructuredJSON(t *testing.T) {
+	t.Parallel()
+	stderr := &bytes.Buffer{}
+	payload := reviewSubmitPayload{
+		Body:     "Please revisit this.\n<!-- looper:review id=abc head=def outcome=blocking -->",
+		Comments: []reviewSubmitComment{{Body: "anchor", Path: "app.go", Line: 7, Side: "RIGHT", StartLine: 5, StartSide: "RIGHT"}},
+	}
+	writeReviewSubmitDiagnostic(stderr, "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Event:    "REQUEST_CHANGES",
+		CommitID: "def",
+		Payload:  payload,
+		Error:    "review marker outcome=clean does not match REQUEST_CHANGES event",
+	})
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(stderr.Bytes()), &entry); err != nil {
+		t.Fatalf("decode stderr JSON: %v\n%s", err, stderr.String())
+	}
+	if entry["event"] != "github_review_submit_validation_failed" {
+		t.Fatalf("event = %#v, want validation_failed", entry["event"])
+	}
+	if entry["repo"] != "acme/looper" || entry["pr_number"] != float64(42) || entry["commit_id"] != "def" {
+		t.Fatalf("entry = %#v, want repo/pr/commit", entry)
+	}
+	payloadEntry, _ := entry["payload"].(map[string]any)
+	marker, _ := payloadEntry["body_marker"].(map[string]any)
+	if marker["id"] != "abc" || marker["head"] != "def" || marker["outcome"] != "blocking" {
+		t.Fatalf("body marker = %#v, want marker fields", marker)
+	}
+	comments, _ := payloadEntry["comments"].([]any)
+	if len(comments) != 1 {
+		t.Fatalf("comments = %#v, want one comment", comments)
+	}
+	comment, _ := comments[0].(map[string]any)
+	if comment["path"] != "app.go" || comment["line"] != float64(7) || comment["side"] != "RIGHT" || comment["start_line"] != float64(5) || comment["start_side"] != "RIGHT" {
+		t.Fatalf("comment = %#v, want anchor summary", comment)
+	}
+	if entry["error"] == "" {
+		t.Fatalf("entry = %#v, want error field", entry)
 	}
 }
 

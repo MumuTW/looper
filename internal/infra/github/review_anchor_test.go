@@ -10,7 +10,7 @@ import (
 func TestNormalizeReviewAnchorsPreservesValidAndDowngradesInvalid(t *testing.T) {
 	t.Parallel()
 	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
-	body, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+	body, comments, flags, _ := normalizeReviewAnchors("Needs changes", []ReviewComment{
 		{Body: "Valid inline", Path: "app.go", Line: 1, Side: "RIGHT"},
 		{Body: "Invalid inline", Path: "app.go", Line: 99, Side: "RIGHT"},
 	}, &idx)
@@ -32,7 +32,7 @@ func TestNormalizeReviewAnchorsPreservesValidAndDowngradesInvalid(t *testing.T) 
 func TestNormalizeReviewAnchorsMovesNearbyOutOfRangeAnchorToNearestHunk(t *testing.T) {
 	t.Parallel()
 	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -10,2 +10,2 @@\n old\n+new\n")
-	body, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+	body, comments, flags, _ := normalizeReviewAnchors("Needs changes", []ReviewComment{
 		{Body: "Nearby issue", Path: "app.go", Line: 13, Side: "RIGHT"},
 	}, &idx)
 
@@ -56,7 +56,7 @@ func TestNormalizeReviewAnchorsMovesNearbyOutOfRangeAnchorToNearestHunk(t *testi
 func TestNormalizeReviewAnchorsFallsBackForFarOutOfRangeAnchor(t *testing.T) {
 	t.Parallel()
 	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -10,2 +10,2 @@\n old\n+new\n")
-	body, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+	body, comments, flags, _ := normalizeReviewAnchors("Needs changes", []ReviewComment{
 		{Body: "Far issue", Path: "app.go", Line: 99, Side: "RIGHT"},
 	}, &idx)
 
@@ -77,7 +77,7 @@ func TestNormalizeReviewAnchorsFallsBackForFarOutOfRangeAnchor(t *testing.T) {
 func TestNormalizeReviewAnchorsDoesNotMoveWrongSideContextAnchor(t *testing.T) {
 	t.Parallel()
 	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -10,3 +10,3 @@\n context\n-old\n+new\n tail\n")
-	body, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+	body, comments, flags, _ := normalizeReviewAnchors("Needs changes", []ReviewComment{
 		{Body: "Context issue", Path: "app.go", Line: 10, Side: "LEFT"},
 	}, &idx)
 
@@ -95,7 +95,7 @@ func TestNormalizeReviewAnchorsDoesNotMoveWrongSideContextAnchor(t *testing.T) {
 func TestNormalizeReviewAnchorsDoesNotMoveAmbiguousNearestAnchor(t *testing.T) {
 	t.Parallel()
 	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -10,1 +10,1 @@\n-a\n+b\n@@ -14,1 +14,1 @@\n-c\n+d\n")
-	body, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+	body, comments, flags, _ := normalizeReviewAnchors("Needs changes", []ReviewComment{
 		{Body: "Between hunks", Path: "app.go", Line: 12, Side: "RIGHT"},
 	}, &idx)
 
@@ -113,7 +113,7 @@ func TestNormalizeReviewAnchorsDoesNotMoveAmbiguousNearestAnchor(t *testing.T) {
 func TestNormalizeReviewAnchorsCanonicalizesValidSides(t *testing.T) {
 	t.Parallel()
 	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
-	_, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+	_, comments, flags, _ := normalizeReviewAnchors("Needs changes", []ReviewComment{
 		{Body: "Valid inline", Path: "app.go", StartLine: 1, StartSide: "right", Line: 2, Side: "right"},
 	}, &idx)
 
@@ -131,7 +131,7 @@ func TestNormalizeReviewAnchorsCanonicalizesValidSides(t *testing.T) {
 func TestNormalizeReviewAnchorsPreservesValidPathSpaces(t *testing.T) {
 	t.Parallel()
 	idx := diffanchor.Parse("diff --git a/ leading.go b/ leading.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
-	_, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+	_, comments, flags, _ := normalizeReviewAnchors("Needs changes", []ReviewComment{
 		{Body: "Valid inline", Path: " leading.go", Line: 1, Side: "RIGHT"},
 	}, &idx)
 
@@ -148,7 +148,7 @@ func TestNormalizeReviewAnchorsPreservesValidPathSpaces(t *testing.T) {
 
 func TestNormalizeReviewAnchorsFlagsUnlocatedTopLevelComment(t *testing.T) {
 	t.Parallel()
-	_, _, flags := normalizeReviewAnchors("This is vague and needs work.", nil, nil)
+	_, _, flags, _ := normalizeReviewAnchors("This is vague and needs work.", nil, nil)
 	if len(flags) != 1 || flags[0].Kind != "top-level-location-missing" {
 		t.Fatalf("flags = %#v, want top-level-location-missing", flags)
 	}
@@ -156,7 +156,7 @@ func TestNormalizeReviewAnchorsFlagsUnlocatedTopLevelComment(t *testing.T) {
 
 func TestNormalizeReviewAnchorsDoesNotFlagEmptyTopLevelBody(t *testing.T) {
 	t.Parallel()
-	_, _, flags := normalizeReviewAnchors("", nil, nil)
+	_, _, flags, _ := normalizeReviewAnchors("", nil, nil)
 	if len(flags) != 0 {
 		t.Fatalf("flags = %#v, want none for empty top-level body", flags)
 	}
@@ -220,7 +220,7 @@ func TestReviewQualityGateRejectsExtraMalformedMarker(t *testing.T) {
 func TestNormalizeReviewAnchorsClearsSingleLineStartRange(t *testing.T) {
 	t.Parallel()
 	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
-	_, comments, flags := normalizeReviewAnchors("Needs changes", []ReviewComment{
+	_, comments, flags, _ := normalizeReviewAnchors("Needs changes", []ReviewComment{
 		{Body: "Valid inline", Path: "app.go", StartLine: 1, StartSide: "RIGHT", Line: 1, Side: "RIGHT"},
 	}, &idx)
 	if len(flags) != 0 {
