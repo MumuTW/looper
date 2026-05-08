@@ -22,6 +22,7 @@ import (
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
+	"github.com/powerformer/looper/internal/workflowpolicy"
 )
 
 const (
@@ -2115,6 +2116,9 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 		"Fix items:\n"+strings.Join(encodedItems, "\n"),
 		"Only perform repair changes for the listed fix items.",
 	)
+	if policyBlock, err := workflowpolicy.ResolveBlock(instructionConfig, projectID, "fixer"); err == nil && policyBlock.Instructions != "" {
+		parts = append(parts, policyBlock.Instructions)
+	}
 	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "fixer")
 	if instructionBlock.Text != "" {
 		parts = append(parts, instructionBlock.Text)

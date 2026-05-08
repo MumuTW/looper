@@ -20,6 +20,7 @@ import (
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
+	"github.com/powerformer/looper/internal/workflowpolicy"
 )
 
 const (
@@ -1565,6 +1566,9 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 	}
 	if agentsBlock := readAgentsBlock(project.RepoPath); agentsBlock != "" {
 		parts = append(parts, agentsBlock)
+	}
+	if policyBlock, err := workflowpolicy.ResolveBlock(instructionConfig, project.ID, "planner"); err == nil && policyBlock.Instructions != "" {
+		parts = append(parts, policyBlock.Instructions)
 	}
 	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, project.ID, "planner")
 	if instructionBlock.Text != "" {

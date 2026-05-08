@@ -44,6 +44,30 @@ func TestBuildFixerPromptOmitsMissingAgentRuntime(t *testing.T) {
 	}
 }
 
+func TestBuildFixerPromptPlacesWorkflowPolicyBeforeCustomInstructions(t *testing.T) {
+	t.Parallel()
+
+	packID := "matt-series"
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: &config.PartialRoleConfigs{Fixer: &config.PartialFixerRoleConfig{PolicyPack: &packID, Instructions: stringPtr("Custom fixer instructions.")}}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature"}
+	prompt, _ := buildFixerPrompt("project_1", cfg, "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+
+	assertPromptOrder(t, prompt, "Verify or reproduce each listed fix item", "Custom fixer instructions.", "Agent-managed git/PR lifecycle policy")
+}
+
+func assertPromptOrder(t *testing.T, prompt string, first string, second string, third string) {
+	t.Helper()
+	firstIndex := strings.Index(prompt, first)
+	secondIndex := strings.Index(prompt, second)
+	thirdIndex := strings.Index(prompt, third)
+	if firstIndex < 0 || secondIndex < 0 || thirdIndex < 0 || !(firstIndex < secondIndex && secondIndex < thirdIndex) {
+		t.Fatalf("unexpected prompt order %q=%d %q=%d %q=%d\n%s", first, firstIndex, second, secondIndex, third, thirdIndex, prompt)
+	}
+}
+
 func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 	t.Parallel()
 

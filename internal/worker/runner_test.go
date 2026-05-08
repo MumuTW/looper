@@ -322,9 +322,10 @@ func TestBuildWorkerPromptOmitsMissingAgentRuntime(t *testing.T) {
 	}
 }
 
-func TestBuildWorkerPromptPlacesCustomInstructionsBeforeLifecycle(t *testing.T) {
+func TestBuildWorkerPromptPlacesWorkflowPolicyAndCustomInstructionsBeforeLifecycle(t *testing.T) {
 	t.Parallel()
-	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: &config.PartialRoleConfigs{Worker: &config.PartialWorkerRoleConfig{Instructions: stringPtr("Prefer small commits.")}}})
+	packID := "matt-series"
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: &config.PartialRoleConfigs{Worker: &config.PartialWorkerRoleConfig{PolicyPack: &packID, Instructions: stringPtr("Prefer small commits.")}}})
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
 	}
@@ -335,11 +336,12 @@ func TestBuildWorkerPromptPlacesCustomInstructionsBeforeLifecycle(t *testing.T) 
 	if len(block.Sources) != 1 {
 		t.Fatalf("instruction sources = %#v", block.Sources)
 	}
+	policyIndex := strings.Index(prompt, "Work in vertical slices")
 	customIndex := strings.Index(prompt, "Prefer small commits.")
 	lifecycleIndex := strings.Index(prompt, "Agent-managed git/PR lifecycle policy")
 	completionIndex := strings.Index(prompt, "__LOOPER_RESULT__=")
-	if customIndex < 0 || lifecycleIndex < 0 || completionIndex < 0 || !(customIndex < lifecycleIndex && lifecycleIndex < completionIndex) {
-		t.Fatalf("unexpected prompt order custom=%d lifecycle=%d completion=%d\n%s", customIndex, lifecycleIndex, completionIndex, prompt)
+	if policyIndex < 0 || customIndex < 0 || lifecycleIndex < 0 || completionIndex < 0 || !(policyIndex < customIndex && customIndex < lifecycleIndex && lifecycleIndex < completionIndex) {
+		t.Fatalf("unexpected prompt order policy=%d custom=%d lifecycle=%d completion=%d\n%s", policyIndex, customIndex, lifecycleIndex, completionIndex, prompt)
 	}
 }
 

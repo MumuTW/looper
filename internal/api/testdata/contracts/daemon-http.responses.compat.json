@@ -138,6 +138,15 @@
             "fixAllPullRequests": false,
             "openPrStrategy": "all_done"
           },
+          "workflowPolicies": {
+            "enabled": true,
+            "bindings": {
+              "planner": null,
+              "reviewer": null,
+              "worker": null,
+              "fixer": null
+            }
+          },
           "notifications": {
             "inAppEnabled": true,
             "osascriptEnabled": true
@@ -272,6 +281,16 @@
               "requireNewHeadSinceThread": true,
               "scope": "looper_authored_only"
             }
+          },
+          "workflowPolicyPacks": {
+            "enabled": true,
+            "packs": [
+              {
+                "id": "matt-series",
+                "name": "Matt Series Engineering Workflow",
+                "source": "builtin"
+              }
+            ]
           },
           "roles": {
             "planner": {

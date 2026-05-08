@@ -86,6 +86,10 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeInstructionsConfig(&config.Instructions, *partial.Instructions)
 	}
 
+	if partial.WorkflowPolicyPacks != nil {
+		mergeWorkflowPolicyPacksConfig(&config.WorkflowPolicyPacks, *partial.WorkflowPolicyPacks)
+	}
+
 	if partial.Roles != nil {
 		mergeRoleConfigs(&config.Roles, *partial.Roles)
 	}
@@ -505,6 +509,15 @@ func mergeInstructionsConfig(config *InstructionsConfig, partial PartialInstruct
 	}
 }
 
+func mergeWorkflowPolicyPacksConfig(config *WorkflowPolicyPacksConfig, partial PartialWorkflowPolicyPacksConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.Packs != nil {
+		config.Packs = append([]WorkflowPolicyPackRef{}, (*partial.Packs)...)
+	}
+}
+
 func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Planner != nil {
 		mergePlannerRoleConfig(&config.Planner, *partial.Planner)
@@ -530,6 +543,9 @@ func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRol
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
+	if partial.PolicyPack != nil {
+		config.PolicyPack = *partial.PolicyPack
+	}
 }
 
 func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleConfig) {
@@ -541,6 +557,9 @@ func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleCo
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
+	}
+	if partial.PolicyPack != nil {
+		config.PolicyPack = *partial.PolicyPack
 	}
 }
 
@@ -557,6 +576,9 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
+	if partial.PolicyPack != nil {
+		config.PolicyPack = *partial.PolicyPack
+	}
 }
 
 func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfig) {
@@ -568,6 +590,9 @@ func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfi
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
+	}
+	if partial.PolicyPack != nil {
+		config.PolicyPack = *partial.PolicyPack
 	}
 }
 

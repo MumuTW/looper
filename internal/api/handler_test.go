@@ -71,6 +71,7 @@ func TestIsTerminalReviewerLoopRecordTreatsFailedAsTerminal(t *testing.T) {
 
 func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
+	cfg.Roles.Worker.PolicyPack = "matt-series"
 	seedStatusData(t, rt)
 	seedStatusLoopCounts(t, rt)
 
@@ -92,6 +93,7 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	binaryInfo := service["binary"].(map[string]any)
 	storageInfo := data["storage"].(map[string]any)
 	scheduler := data["scheduler"].(map[string]any)
+	workflowPolicies := data["workflowPolicies"].(map[string]any)
 	loops := data["loops"].(map[string]any)
 
 	assertEqual(t, service["healthy"], true)
@@ -111,6 +113,10 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	}
 	assertEqual(t, scheduler["totalRuns"], float64(1))
 	assertEqual(t, scheduler["activeRuns"], float64(1))
+	workflowBindings := workflowPolicies["bindings"].(map[string]any)
+	workerBinding := workflowBindings["worker"].(map[string]any)
+	assertEqual(t, workflowPolicies["enabled"], true)
+	assertEqual(t, workerBinding["display"], "matt-series (Matt Series Engineering Workflow)")
 
 	reviewer := loops["reviewer"].(map[string]any)
 	assertEqual(t, reviewer["queued"], float64(1))
@@ -141,6 +147,7 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	daemon := data["daemon"].(map[string]any)
 	reviewer := data["reviewer"].(map[string]any)
 	reviewerLoop := reviewer["loop"].(map[string]any)
+	workflowPacks := data["workflowPolicyPacks"].(map[string]any)
 
 	assertEqual(t, server["host"], cfg.Server.Host)
 	assertEqual(t, server["port"], float64(cfg.Server.Port))
@@ -157,6 +164,7 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, threadResolution["mode"], string(cfg.Reviewer.ThreadResolution.Mode))
 	assertEqual(t, reviewerLoop["enabledByDefault"], cfg.Reviewer.Loop.EnabledByDefault)
 	assertEqual(t, reviewerLoop["maxConsecutiveFailures"], float64(cfg.Reviewer.Loop.MaxConsecutiveFailures))
+	assertEqual(t, workflowPacks["enabled"], cfg.WorkflowPolicyPacks.Enabled)
 	if _, ok := daemon["shutdownTimeoutMs"]; ok {
 		t.Fatalf("daemon.shutdownTimeoutMs should be omitted from config response: %#v", daemon)
 	}

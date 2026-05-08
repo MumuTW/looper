@@ -798,6 +798,12 @@ func TestStatusWithoutJSONPrintsHumanReadableSections(t *testing.T) {
 				"worker":   map[string]any{"running": 2, "paused": 0, "failed": 1},
 				"fixer":    map[string]any{"running": 0, "paused": 0, "failed": 0},
 			},
+			"workflowPolicies": map[string]any{
+				"enabled": true,
+				"bindings": map[string]any{
+					"worker": map[string]any{"id": "matt-series", "name": "Matt Series Engineering Workflow", "display": "matt-series (Matt Series Engineering Workflow)"},
+				},
+			},
 			"tools":         map[string]any{"git": true, "gh": false, "osascript": true},
 			"notifications": map[string]any{"inAppEnabled": true, "osascriptEnabled": false},
 		}))
@@ -812,7 +818,7 @@ func TestStatusWithoutJSONPrintsHumanReadableSections(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([status]) stderr = %q, want empty string", stderr)
 	}
-	for _, want := range []string{"Service", "healthy    : yes", "version    : 1.2.3", "Storage", "Scheduler", "type", "reviewer", "Tools", "gh        : no", "Notifications"} {
+	for _, want := range []string{"Service", "healthy    : yes", "version    : 1.2.3", "Storage", "Scheduler", "Workflow policies", "worker   : matt-series (Matt Series Engineering Workflow)", "type", "reviewer", "Tools", "gh        : no", "Notifications"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([status]) stdout = %q, want to contain %q", stdout, want)
 		}

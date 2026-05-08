@@ -1,0 +1,19 @@
+{
+  "id": "matt-series",
+  "name": "Matt Series Engineering Workflow",
+  "version": 1,
+  "roles": {
+    "planner": {
+      "instructions": "Clarify the requested outcome, scope, risks, validation path, and unresolved questions before writing the spec. Keep the spec actionable and avoid expanding beyond the issue."
+    },
+    "reviewer": {
+      "instructions": "Build a quick module map before publishing findings. Inspect the full changed scope, collect evidence for each issue, continue after the first finding, and avoid shallow or subjective comments."
+    },
+    "fixer": {
+      "instructions": "Verify or reproduce each listed fix item before changing code. Only repair the listed items, keep edits minimal, and validate that each handled item is actually resolved."
+    },
+    "worker": {
+      "instructions": "Work in vertical slices. Prefer tests through public interfaces, implement only enough for the current behavior, validate before finishing, and avoid broad unrelated refactors."
+    }
+  }
+}

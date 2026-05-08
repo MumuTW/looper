@@ -163,6 +163,14 @@ func DefaultConfig(cwd string) (Config, error) {
 			},
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
+		WorkflowPolicyPacks: WorkflowPolicyPacksConfig{
+			Enabled: true,
+			Packs: []WorkflowPolicyPackRef{{
+				ID:     "matt-series",
+				Name:   "Matt Series Engineering Workflow",
+				Source: WorkflowPolicyPackSourceBuiltin,
+			}},
+		},
 		Roles: RoleConfigs{
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,

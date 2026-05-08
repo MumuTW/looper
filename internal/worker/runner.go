@@ -24,6 +24,7 @@ import (
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/lifecycle"
 	"github.com/powerformer/looper/internal/storage"
+	"github.com/powerformer/looper/internal/workflowpolicy"
 )
 
 const (
@@ -2422,6 +2423,9 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 			lines = append(lines, "- "+item)
 		}
 		parts = append(parts, strings.Join(lines, "\n"))
+	}
+	if policyBlock, err := workflowpolicy.ResolveBlock(instructionConfig, projectID, "worker"); err == nil && policyBlock.Instructions != "" {
+		parts = append(parts, policyBlock.Instructions)
 	}
 	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "worker")
 	if instructionBlock.Text != "" {

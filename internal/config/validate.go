@@ -181,6 +181,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	validateInstructions(config, &issues)
+	validateWorkflowPolicyPackRefs(config.WorkflowPolicyPacks, &issues)
+	validateRolePolicyPackBindings(config, &issues)
 	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Triggers, "roles.reviewer.triggers", &issues)
@@ -220,6 +222,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
 		effectiveProjectRoles := ProjectRoleConfigs(config, project.ID)
+		validateProjectPolicyPackBindings(config, project.Roles, prefix+".roles", &issues)
 		for role, text := range project.Instructions {
 			path := fmt.Sprintf("%s.instructions.%s", prefix, role)
 			validateInstructionText(path, role, text, config.Instructions.MaxBytes, &issues)
@@ -325,6 +328,114 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 			validateFixerRoleTriggers(partialFixerRoleTriggers(*roles.Fixer.Triggers), prefix+".fixer.triggers", issues)
 		}
 	}
+}
+
+func validateWorkflowPolicyPackRefs(policyConfig WorkflowPolicyPacksConfig, issues *[]ValidationIssue) {
+	ids := map[string]struct{}{}
+	for index, pack := range policyConfig.Packs {
+		prefix := fmt.Sprintf("workflowPolicyPacks.packs[%d]", index)
+		if strings.TrimSpace(pack.ID) == "" {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".id", Message: "must be a non-empty string"})
+		} else if pack.ID != strings.TrimSpace(pack.ID) || !isSlugID(pack.ID) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".id", Message: "must use lowercase letters, numbers, dots, underscores, or hyphens"})
+		} else if _, exists := ids[pack.ID]; exists {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".id", Message: fmt.Sprintf("duplicate workflow policy pack id: %s", pack.ID)})
+		} else {
+			ids[pack.ID] = struct{}{}
+		}
+		if strings.TrimSpace(pack.Name) == "" {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".name", Message: "must be a non-empty string"})
+		}
+		switch pack.Source {
+		case WorkflowPolicyPackSourceBuiltin:
+			if strings.TrimSpace(pack.Path) != "" {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".path", Message: "must be empty for builtin workflow policy packs"})
+			}
+		case WorkflowPolicyPackSourceFile:
+			if strings.TrimSpace(pack.Path) == "" {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".path", Message: "is required for file workflow policy packs"})
+			}
+		default:
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".source", Message: fmt.Sprintf("must be one of: %s, %s", WorkflowPolicyPackSourceBuiltin, WorkflowPolicyPackSourceFile)})
+		}
+	}
+}
+
+func validateRolePolicyPackBindings(config Config, issues *[]ValidationIssue) {
+	ids := workflowPolicyPackIDs(config.WorkflowPolicyPacks)
+	for _, binding := range rolePolicyPackBindings(config.Roles) {
+		validatePolicyPackBinding(binding.path, binding.value, ids, issues)
+	}
+}
+
+func validateProjectPolicyPackBindings(config Config, roles *PartialRoleConfigs, prefix string, issues *[]ValidationIssue) {
+	if roles == nil {
+		return
+	}
+	ids := workflowPolicyPackIDs(config.WorkflowPolicyPacks)
+	if roles.Planner != nil && roles.Planner.PolicyPack != nil {
+		validatePolicyPackBinding(prefix+".planner.policyPack", *roles.Planner.PolicyPack, ids, issues)
+	}
+	if roles.Worker != nil && roles.Worker.PolicyPack != nil {
+		validatePolicyPackBinding(prefix+".worker.policyPack", *roles.Worker.PolicyPack, ids, issues)
+	}
+	if roles.Reviewer != nil && roles.Reviewer.PolicyPack != nil {
+		validatePolicyPackBinding(prefix+".reviewer.policyPack", *roles.Reviewer.PolicyPack, ids, issues)
+	}
+	if roles.Fixer != nil && roles.Fixer.PolicyPack != nil {
+		validatePolicyPackBinding(prefix+".fixer.policyPack", *roles.Fixer.PolicyPack, ids, issues)
+	}
+}
+
+type rolePolicyPackBinding struct {
+	path  string
+	value string
+}
+
+func rolePolicyPackBindings(roles RoleConfigs) []rolePolicyPackBinding {
+	return []rolePolicyPackBinding{
+		{path: "roles.planner.policyPack", value: roles.Planner.PolicyPack},
+		{path: "roles.worker.policyPack", value: roles.Worker.PolicyPack},
+		{path: "roles.reviewer.policyPack", value: roles.Reviewer.PolicyPack},
+		{path: "roles.fixer.policyPack", value: roles.Fixer.PolicyPack},
+	}
+}
+
+func workflowPolicyPackIDs(config WorkflowPolicyPacksConfig) map[string]struct{} {
+	ids := map[string]struct{}{}
+	for _, pack := range config.Packs {
+		if strings.TrimSpace(pack.ID) != "" {
+			ids[pack.ID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+func validatePolicyPackBinding(path string, value string, ids map[string]struct{}, issues *[]ValidationIssue) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	if !isSlugID(value) {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must use lowercase letters, numbers, dots, underscores, or hyphens"})
+		return
+	}
+	if _, ok := ids[value]; !ok {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("references unknown workflow policy pack: %s", value)})
+	}
+}
+
+func isSlugID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validateProjectRoleInstruction(path, role string, text *string, maxBytes int, issues *[]ValidationIssue) {

@@ -5231,6 +5231,24 @@ func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) 
 	}
 }
 
+func TestBuildReviewPromptPlacesWorkflowPolicyBeforeCustomInstructions(t *testing.T) {
+	t.Parallel()
+
+	packID := "matt-series"
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{PolicyPack: &packID, Instructions: stringPtr("Custom reviewer instructions.")}}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	prompt, _ := buildReviewPromptWithInstructions("project_1", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+
+	firstIndex := strings.Index(prompt, "Build a quick module map")
+	secondIndex := strings.Index(prompt, "Custom reviewer instructions.")
+	thirdIndex := strings.Index(prompt, "Idempotency requirement")
+	if firstIndex < 0 || secondIndex < 0 || thirdIndex < 0 || !(firstIndex < secondIndex && secondIndex < thirdIndex) {
+		t.Fatalf("unexpected prompt order policy=%d custom=%d submit=%d\n%s", firstIndex, secondIndex, thirdIndex, prompt)
+	}
+}
+
 func TestRunThreadResolutionStepCommentsAndResolvesObjectiveLooperThread(t *testing.T) {
 	t.Parallel()
 	policy := defaultThreadResolutionPolicy(t)

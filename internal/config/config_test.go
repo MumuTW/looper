@@ -80,6 +80,79 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	}
 }
 
+func TestWorkflowPolicyPackDefaultsAreAvailableButNotBound(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Normalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if !cfg.WorkflowPolicyPacks.Enabled {
+		t.Fatal("workflowPolicyPacks.enabled = false, want true")
+	}
+	if len(cfg.WorkflowPolicyPacks.Packs) != 1 || cfg.WorkflowPolicyPacks.Packs[0].ID != "matt-series" || cfg.WorkflowPolicyPacks.Packs[0].Name == "" {
+		t.Fatalf("workflowPolicyPacks.packs = %#v", cfg.WorkflowPolicyPacks.Packs)
+	}
+	if cfg.Roles.Planner.PolicyPack != "" || cfg.Roles.Worker.PolicyPack != "" || cfg.Roles.Reviewer.PolicyPack != "" || cfg.Roles.Fixer.PolicyPack != "" {
+		t.Fatalf("role policy packs should require explicit bindings: %#v", cfg.Roles)
+	}
+}
+
+func TestWorkflowPolicyPackConfigParsesGlobalAndProjectBindings(t *testing.T) {
+	t.Parallel()
+
+	filePackPath := filepath.Join(t.TempDir(), "team-pack.json")
+	packs := []WorkflowPolicyPackRef{
+		{ID: "matt-series", Name: "Matt Series Engineering Workflow", Source: WorkflowPolicyPackSourceBuiltin},
+		{ID: "team-pack", Name: "Team Pack", Source: WorkflowPolicyPackSourceFile, Path: filePackPath},
+	}
+	projectID := "demo"
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		WorkflowPolicyPacks: &PartialWorkflowPolicyPacksConfig{Packs: &packs},
+		Roles:               &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{PolicyPack: stringPtr("matt-series")}},
+		Projects: &[]ProjectRefConfig{{
+			ID:       projectID,
+			Name:     "Demo",
+			RepoPath: t.TempDir(),
+			Roles:    &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{PolicyPack: stringPtr("team-pack")}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if got := cfg.Roles.Worker.PolicyPack; got != "matt-series" {
+		t.Fatalf("global worker policyPack = %q", got)
+	}
+	if got := ProjectRoleConfigs(cfg, projectID).Worker.PolicyPack; got != "team-pack" {
+		t.Fatalf("project worker policyPack = %q", got)
+	}
+}
+
+func TestValidateRejectsInvalidWorkflowPolicyPackConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		WorkflowPolicyPacks: &PartialWorkflowPolicyPacksConfig{Packs: &[]WorkflowPolicyPackRef{
+			{ID: "dup", Name: "Dup", Source: WorkflowPolicyPackSourceBuiltin},
+			{ID: "dup", Name: "Dup Again", Source: WorkflowPolicyPackSourceBuiltin},
+			{ID: "file-pack", Name: "File Pack", Source: WorkflowPolicyPackSourceFile},
+		}},
+		Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{PolicyPack: stringPtr("unknown-pack")}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %v, want ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "workflowPolicyPacks.packs[1].id", "duplicate workflow policy pack id: dup")
+	assertValidationIssue(t, validationErr, "workflowPolicyPacks.packs[2].path", "is required for file workflow policy packs")
+	assertValidationIssue(t, validationErr, "roles.worker.policyPack", "references unknown workflow policy pack: unknown-pack")
+}
+
 func TestAgentTimeoutConfigOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")

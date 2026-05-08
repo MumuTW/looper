@@ -499,13 +499,14 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 }
 
 type statusResponse struct {
-	Service       statusService       `json:"service"`
-	Storage       statusStorage       `json:"storage"`
-	Scheduler     statusScheduler     `json:"scheduler"`
-	Loops         statusLoops         `json:"loops"`
-	Safety        statusSafety        `json:"safety"`
-	Notifications statusNotifications `json:"notifications"`
-	Tools         statusTools         `json:"tools"`
+	Service          statusService          `json:"service"`
+	Storage          statusStorage          `json:"storage"`
+	Scheduler        statusScheduler        `json:"scheduler"`
+	Loops            statusLoops            `json:"loops"`
+	Safety           statusSafety           `json:"safety"`
+	WorkflowPolicies statusWorkflowPolicies `json:"workflowPolicies"`
+	Notifications    statusNotifications    `json:"notifications"`
+	Tools            statusTools            `json:"tools"`
 }
 
 type statusService struct {
@@ -594,6 +595,17 @@ type statusSafety struct {
 	OpenPRStrategy     config.OpenPRStrategy `json:"openPrStrategy"`
 }
 
+type statusWorkflowPolicies struct {
+	Enabled  bool                                    `json:"enabled"`
+	Bindings map[string]*statusWorkflowPolicyBinding `json:"bindings"`
+}
+
+type statusWorkflowPolicyBinding struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Display string `json:"display"`
+}
+
 type statusNotifications struct {
 	InAppEnabled     bool `json:"inAppEnabled"`
 	OsascriptEnabled bool `json:"osascriptEnabled"`
@@ -606,19 +618,20 @@ type statusTools struct {
 }
 
 type configResponse struct {
-	Server        configServerResponse      `json:"server"`
-	Storage       config.StorageConfig      `json:"storage"`
-	Scheduler     config.SchedulerConfig    `json:"scheduler"`
-	Agent         config.AgentConfig        `json:"agent"`
-	Logging       config.LoggingConfig      `json:"logging"`
-	Notifications config.NotificationConfig `json:"notifications"`
-	Tools         config.ToolPathsConfig    `json:"tools"`
-	Daemon        configDaemonResponse      `json:"daemon"`
-	Package       config.PackageConfig      `json:"package"`
-	Defaults      config.DefaultsConfig     `json:"defaults"`
-	Reviewer      config.ReviewerConfig     `json:"reviewer"`
-	Roles         config.RoleConfigs        `json:"roles"`
-	Projects      []config.ProjectRefConfig `json:"projects"`
+	Server        configServerResponse             `json:"server"`
+	Storage       config.StorageConfig             `json:"storage"`
+	Scheduler     config.SchedulerConfig           `json:"scheduler"`
+	Agent         config.AgentConfig               `json:"agent"`
+	Logging       config.LoggingConfig             `json:"logging"`
+	Notifications config.NotificationConfig        `json:"notifications"`
+	Tools         config.ToolPathsConfig           `json:"tools"`
+	Daemon        configDaemonResponse             `json:"daemon"`
+	Package       config.PackageConfig             `json:"package"`
+	Defaults      config.DefaultsConfig            `json:"defaults"`
+	Reviewer      config.ReviewerConfig            `json:"reviewer"`
+	WorkflowPacks config.WorkflowPolicyPacksConfig `json:"workflowPolicyPacks"`
+	Roles         config.RoleConfigs               `json:"roles"`
+	Projects      []config.ProjectRefConfig        `json:"projects"`
 }
 
 type configServerResponse struct {
@@ -665,11 +678,12 @@ func (h *Handler) buildConfigResponse() configResponse {
 			WorkingDirectory:       cfg.Daemon.WorkingDirectory,
 			Environment:            cfg.Daemon.Environment,
 		},
-		Package:  cfg.Package,
-		Defaults: cfg.Defaults,
-		Reviewer: cfg.Reviewer,
-		Roles:    cfg.Roles,
-		Projects: append([]config.ProjectRefConfig{}, cfg.Projects...),
+		Package:       cfg.Package,
+		Defaults:      cfg.Defaults,
+		Reviewer:      cfg.Reviewer,
+		WorkflowPacks: cfg.WorkflowPolicyPacks,
+		Roles:         cfg.Roles,
+		Projects:      append([]config.ProjectRefConfig{}, cfg.Projects...),
 	}
 }
 
@@ -745,6 +759,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			FixAllPullRequests: h.context.Config.Defaults.FixAllPullRequests,
 			OpenPRStrategy:     h.context.Config.Defaults.OpenPRStrategy,
 		},
+		WorkflowPolicies: buildWorkflowPolicyStatus(h.context.Config),
 		Notifications: statusNotifications{
 			InAppEnabled:     h.context.Config.Notifications.InApp,
 			OsascriptEnabled: h.context.Config.Notifications.Osascript.Enabled,
@@ -755,6 +770,31 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Osascript: hasValue(h.context.Config.Tools.OsascriptPath),
 		},
 	}, nil
+}
+
+func buildWorkflowPolicyStatus(cfg config.Config) statusWorkflowPolicies {
+	bindings := map[string]*statusWorkflowPolicyBinding{
+		"planner":  workflowPolicyStatusBinding(cfg, cfg.Roles.Planner.PolicyPack),
+		"reviewer": workflowPolicyStatusBinding(cfg, cfg.Roles.Reviewer.PolicyPack),
+		"worker":   workflowPolicyStatusBinding(cfg, cfg.Roles.Worker.PolicyPack),
+		"fixer":    workflowPolicyStatusBinding(cfg, cfg.Roles.Fixer.PolicyPack),
+	}
+	return statusWorkflowPolicies{Enabled: cfg.WorkflowPolicyPacks.Enabled, Bindings: bindings}
+}
+
+func workflowPolicyStatusBinding(cfg config.Config, packID string) *statusWorkflowPolicyBinding {
+	packID = strings.TrimSpace(packID)
+	if packID == "" {
+		return nil
+	}
+	name := packID
+	for _, ref := range cfg.WorkflowPolicyPacks.Packs {
+		if ref.ID == packID && strings.TrimSpace(ref.Name) != "" {
+			name = ref.Name
+			break
+		}
+	}
+	return &statusWorkflowPolicyBinding{ID: packID, Name: name, Display: fmt.Sprintf("%s (%s)", packID, name)}
 }
 
 type storageState struct {

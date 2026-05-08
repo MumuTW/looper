@@ -119,6 +119,48 @@ func TestPromptPreviewWorkerHonorsManualOpenPRStrategy(t *testing.T) {
 	}
 }
 
+func TestPromptPreviewInjectsWorkflowPolicyPackThroughPublicWorkerPath(t *testing.T) {
+	t.Parallel()
+
+	payload := promptPreviewConfigPayload(t.TempDir(), true)
+	payload["workflowPolicyPacks"] = map[string]any{
+		"enabled": true,
+		"packs": []map[string]any{{
+			"id":     "matt-series",
+			"name":   "Matt Series Engineering Workflow",
+			"source": "builtin",
+		}},
+	}
+	payload["roles"] = map[string]any{
+		"worker": map[string]any{
+			"policyPack":   "matt-series",
+			"instructions": "Custom worker instructions after policy.",
+		},
+	}
+	configPath := writeEditableCLIConfigWithPayload(t, payload)
+
+	exitCode, stdout, stderr := runApp(t, "prompt", "preview", "--project", "project_1", "--role", "worker", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run(prompt preview worker policy pack) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	for _, want := range []string{
+		"Workflow policy pack: matt-series (Matt Series Engineering Workflow)",
+		"Work in vertical slices",
+		"Custom worker instructions after policy.",
+		"__LOOPER_RESULT__=",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
+		}
+	}
+	policyIndex := strings.Index(stdout, "Work in vertical slices")
+	customIndex := strings.Index(stdout, "Custom worker instructions after policy.")
+	completionIndex := strings.LastIndex(stdout, "__LOOPER_RESULT__=")
+	if policyIndex < 0 || customIndex < 0 || completionIndex < 0 || !(policyIndex < customIndex && customIndex < completionIndex) {
+		t.Fatalf("unexpected prompt order policy=%d custom=%d completion=%d\n%s", policyIndex, customIndex, completionIndex, stdout)
+	}
+}
+
 func TestPromptPreviewReviewerUsesReviewSubmitContract(t *testing.T) {
 	t.Parallel()
 

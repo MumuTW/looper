@@ -28,7 +28,8 @@ type statusOutput struct {
 		QueuedItems  int  `json:"queuedItems"`
 		RunningItems int  `json:"runningItems"`
 	} `json:"scheduler"`
-	Loops struct {
+	WorkflowPolicies *statusWorkflowPoliciesOutput `json:"workflowPolicies,omitempty"`
+	Loops            struct {
 		Planner  statusLoopSummary `json:"planner"`
 		Reviewer statusLoopSummary `json:"reviewer"`
 		Worker   statusLoopSummary `json:"worker"`
@@ -43,6 +44,17 @@ type statusOutput struct {
 		GH        bool `json:"gh"`
 		Osascript bool `json:"osascript"`
 	} `json:"tools"`
+}
+
+type statusWorkflowPoliciesOutput struct {
+	Enabled  bool                                          `json:"enabled"`
+	Bindings map[string]*statusWorkflowPolicyBindingOutput `json:"bindings"`
+}
+
+type statusWorkflowPolicyBindingOutput struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Display string `json:"display"`
 }
 
 type statusLoopSummary struct {
@@ -205,6 +217,10 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	printSection(w, "Storage", [][2]any{{"dbPath", data.Storage.DBPath}, {"schemaVersion", data.Storage.SchemaVersion}, {"healthy", data.Storage.Healthy}, {"pendingMigrations", joinOrNone(data.Storage.PendingMigrations)}})
 	fmt.Fprintln(w)
 	printSection(w, "Scheduler", [][2]any{{"healthy", data.Scheduler.Healthy}, {"queuedItems", data.Scheduler.QueuedItems}, {"runningItems", data.Scheduler.RunningItems}})
+	if data.WorkflowPolicies != nil {
+		fmt.Fprintln(w)
+		printSection(w, "Workflow policies", [][2]any{{"enabled", data.WorkflowPolicies.Enabled}, {"planner", workflowPolicyDisplay(data.WorkflowPolicies.Bindings["planner"])}, {"reviewer", workflowPolicyDisplay(data.WorkflowPolicies.Bindings["reviewer"])}, {"worker", workflowPolicyDisplay(data.WorkflowPolicies.Bindings["worker"])}, {"fixer", workflowPolicyDisplay(data.WorkflowPolicies.Bindings["fixer"])}})
+	}
 	fmt.Fprintln(w)
 	printTable(w, []string{"type", "queued", "running", "waiting", "paused", "failed", "terminated", "stopped"}, []tableRow{{"type": "planner", "queued": data.Loops.Planner.Queued, "running": data.Loops.Planner.Running, "waiting": data.Loops.Planner.Waiting, "paused": data.Loops.Planner.Paused, "failed": data.Loops.Planner.Failed, "terminated": data.Loops.Planner.Terminated, "stopped": data.Loops.Planner.Stopped}, {"type": "reviewer", "queued": data.Loops.Reviewer.Queued, "running": data.Loops.Reviewer.Running, "waiting": data.Loops.Reviewer.Waiting, "paused": data.Loops.Reviewer.Paused, "failed": data.Loops.Reviewer.Failed, "terminated": data.Loops.Reviewer.Terminated, "stopped": data.Loops.Reviewer.Stopped}, {"type": "worker", "queued": data.Loops.Worker.Queued, "running": data.Loops.Worker.Running, "waiting": data.Loops.Worker.Waiting, "paused": data.Loops.Worker.Paused, "failed": data.Loops.Worker.Failed, "terminated": data.Loops.Worker.Terminated, "stopped": data.Loops.Worker.Stopped}, {"type": "fixer", "queued": data.Loops.Fixer.Queued, "running": data.Loops.Fixer.Running, "waiting": data.Loops.Fixer.Waiting, "paused": data.Loops.Fixer.Paused, "failed": data.Loops.Fixer.Failed, "terminated": data.Loops.Fixer.Terminated, "stopped": data.Loops.Fixer.Stopped}})
 	fmt.Fprintln(w)
@@ -212,6 +228,19 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	fmt.Fprintln(w)
 	printSection(w, "Notifications", [][2]any{{"inAppEnabled", data.Notifications.InAppEnabled}, {"osascriptEnabled", data.Notifications.OsascriptEnabled}})
 	return nil
+}
+
+func workflowPolicyDisplay(binding *statusWorkflowPolicyBindingOutput) string {
+	if binding == nil {
+		return "none"
+	}
+	if strings.TrimSpace(binding.Display) != "" {
+		return binding.Display
+	}
+	if strings.TrimSpace(binding.Name) == "" {
+		return binding.ID
+	}
+	return fmt.Sprintf("%s (%s)", binding.ID, binding.Name)
 }
 
 func writeHumanProjectList(w io.Writer, payload json.RawMessage) error {

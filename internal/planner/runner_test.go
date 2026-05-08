@@ -44,6 +44,30 @@ func TestBuildPlannerPromptOmitsMissingAgentRuntime(t *testing.T) {
 	}
 }
 
+func TestBuildPlannerPromptPlacesWorkflowPolicyBeforeCustomInstructions(t *testing.T) {
+	t.Parallel()
+
+	packID := "matt-series"
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: &config.PartialRoleConfigs{Planner: &config.PartialPlannerRoleConfig{PolicyPack: &packID, Instructions: stringPtr("Custom planner instructions.")}}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	repoPath := t.TempDir()
+	prompt, _ := buildPlannerPrompt(storage.ProjectRecord{ID: "project_1", RepoPath: repoPath}, cfg, &checkpointIssue{Repo: "acme/looper", IssueNumber: 156, Title: "plan policy", SpecPath: "docs/spec.md"}, &checkpointWorktree{Branch: "looper/fix", BaseBranch: "main"}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+
+	assertPromptOrder(t, prompt, "Clarify the requested outcome", "Custom planner instructions.", "Agent-managed git/PR lifecycle policy")
+}
+
+func assertPromptOrder(t *testing.T, prompt string, first string, second string, third string) {
+	t.Helper()
+	firstIndex := strings.Index(prompt, first)
+	secondIndex := strings.Index(prompt, second)
+	thirdIndex := strings.Index(prompt, third)
+	if firstIndex < 0 || secondIndex < 0 || thirdIndex < 0 || !(firstIndex < secondIndex && secondIndex < thirdIndex) {
+		t.Fatalf("unexpected prompt order %q=%d %q=%d %q=%d\n%s", first, firstIndex, second, secondIndex, third, thirdIndex, prompt)
+	}
+}
+
 func TestDiscoverIssuesEnqueuesEligibleWorkAndCreatesLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

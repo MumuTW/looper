@@ -9,6 +9,7 @@ import (
 	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/lifecycle"
+	"github.com/powerformer/looper/internal/workflowpolicy"
 	"github.com/spf13/cobra"
 )
 
@@ -41,6 +42,14 @@ func (r *commandRuntime) promptPreview(cmd *cobra.Command, args []string) error 
 		sections = append(sections, "Repository context / AGENTS.md\n"+repoContext)
 		order = append(order, "repository context / AGENTS.md")
 	}
+	policyBlock, err := workflowpolicy.ResolveBlock(loaded.Config, projectID, role)
+	if err != nil {
+		return err
+	}
+	if policyBlock.Instructions != "" {
+		sections = append(sections, policyBlock.Instructions)
+		order = append(order, "workflow policy pack")
+	}
 	if block.Text != "" {
 		sections = append(sections, previewInstructionSources(block)+"\n\n"+block.Text)
 	} else {
@@ -53,7 +62,7 @@ func (r *commandRuntime) promptPreview(cmd *cobra.Command, args []string) error 
 	)
 	prompt := strings.Join(sections, "\n\n---\n\n")
 	if getBoolFlag(cmd, "json") {
-		return writeJSON(cmd.OutOrStdout(), map[string]any{"project": projectID, "role": role, "order": order, "customInstructions": block, "prompt": prompt})
+		return writeJSON(cmd.OutOrStdout(), map[string]any{"project": projectID, "role": role, "order": order, "workflowPolicy": policyBlock, "customInstructions": block, "prompt": prompt})
 	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), prompt)
 	return err

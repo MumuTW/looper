@@ -173,6 +173,16 @@
         "looperPath": "/detected/looper",
         "osascriptPath": "/cfg/osascript"
       },
+      "workflowPolicyPacks": {
+        "enabled": true,
+        "packs": [
+          {
+            "id": "matt-series",
+            "name": "Matt Series Engineering Workflow",
+            "source": "builtin"
+          }
+        ]
+      },
       "daemon": {
         "mode": "launchd",
         "restartPolicy": "on-failure",

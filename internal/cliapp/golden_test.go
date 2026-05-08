@@ -64,6 +64,12 @@ func TestCLIGoldenOutputs(t *testing.T) {
 							"worker":   map[string]any{"queued": 0, "running": 2, "waiting": 0, "paused": 0, "failed": 1, "terminated": 1, "stopped": 0},
 							"fixer":    map[string]any{"queued": 0, "running": 0, "waiting": 0, "paused": 0, "failed": 0, "terminated": 0, "stopped": 1},
 						},
+						"workflowPolicies": map[string]any{
+							"enabled": true,
+							"bindings": map[string]any{
+								"planner": map[string]any{"id": "matt-series", "name": "Matt Series Engineering Workflow", "display": "matt-series (Matt Series Engineering Workflow)"},
+							},
+						},
 						"tools":         map[string]any{"git": true, "gh": false, "osascript": true},
 						"notifications": map[string]any{"inAppEnabled": true, "osascriptEnabled": false},
 					}))

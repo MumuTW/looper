@@ -36,6 +36,7 @@ var configFieldRegistry = map[string]configField{
 	"defaults.openPrStrategy":     openPRStrategyField(),
 	"instructions.enabled":        boolField("instructions.enabled", "", "no-custom-instructions", func(c config.Config) any { return c.Instructions.Enabled }, func(p *config.PartialConfig) **bool { return &ensurePartialInstructions(p).Enabled }),
 	"instructions.maxBytes":       positiveIntField("instructions.maxBytes", "", "", func(c config.Config) any { return c.Instructions.MaxBytes }, func(p *config.PartialConfig) **int { return &ensurePartialInstructions(p).MaxBytes }),
+	"workflowPolicyPacks.enabled": boolField("workflowPolicyPacks.enabled", "", "", func(c config.Config) any { return c.WorkflowPolicyPacks.Enabled }, func(p *config.PartialConfig) **bool { return &ensurePartialWorkflowPolicyPacks(p).Enabled }),
 	"reviewer.reviewEvents.clean": reviewerReviewEventField("reviewer.reviewEvents.clean", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "reviewer-clean-review-event", func(c config.Config) any { return c.Reviewer.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Clean
 	}),
@@ -44,6 +45,7 @@ var configFieldRegistry = map[string]configField{
 	}),
 	"roles.planner.autoDiscovery":      boolField("roles.planner.autoDiscovery", "LOOPER_ROLES_PLANNER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Planner.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialPlannerRole(p).AutoDiscovery }),
 	"roles.planner.instructions":       stringField("roles.planner.instructions", "", "", func(c config.Config) any { return c.Roles.Planner.Instructions }, func(p *config.PartialConfig) **string { return &ensurePartialPlannerRole(p).Instructions }),
+	"roles.planner.policyPack":         stringField("roles.planner.policyPack", "", "", func(c config.Config) any { return c.Roles.Planner.PolicyPack }, func(p *config.PartialConfig) **string { return &ensurePartialPlannerRole(p).PolicyPack }),
 	"roles.planner.triggers.labels":    stringListField("roles.planner.triggers.labels", "LOOPER_ROLES_PLANNER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Planner.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialPlannerTriggers(p).Labels }),
 	"roles.planner.triggers.labelMode": labelModeField("roles.planner.triggers.labelMode", "LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Planner.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode { return &ensurePartialPlannerTriggers(p).LabelMode }),
 	"roles.planner.triggers.requireAssigneeCurrentUser": boolField("roles.planner.triggers.requireAssigneeCurrentUser", "LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER", "", func(c config.Config) any { return c.Roles.Planner.Triggers.RequireAssigneeCurrentUser }, func(p *config.PartialConfig) **bool {
@@ -51,6 +53,7 @@ var configFieldRegistry = map[string]configField{
 	}),
 	"roles.worker.autoDiscovery":      boolField("roles.worker.autoDiscovery", "LOOPER_ROLES_WORKER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Worker.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialWorkerRole(p).AutoDiscovery }),
 	"roles.worker.instructions":       stringField("roles.worker.instructions", "", "", func(c config.Config) any { return c.Roles.Worker.Instructions }, func(p *config.PartialConfig) **string { return &ensurePartialWorkerRole(p).Instructions }),
+	"roles.worker.policyPack":         stringField("roles.worker.policyPack", "", "", func(c config.Config) any { return c.Roles.Worker.PolicyPack }, func(p *config.PartialConfig) **string { return &ensurePartialWorkerRole(p).PolicyPack }),
 	"roles.worker.triggers.labels":    stringListField("roles.worker.triggers.labels", "LOOPER_ROLES_WORKER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Worker.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialWorkerTriggers(p).Labels }),
 	"roles.worker.triggers.labelMode": labelModeField("roles.worker.triggers.labelMode", "LOOPER_ROLES_WORKER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Worker.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode { return &ensurePartialWorkerTriggers(p).LabelMode }),
 	"roles.worker.triggers.requireAssigneeCurrentUser": boolField("roles.worker.triggers.requireAssigneeCurrentUser", "LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER", "", func(c config.Config) any { return c.Roles.Worker.Triggers.RequireAssigneeCurrentUser }, func(p *config.PartialConfig) **bool {
@@ -58,6 +61,7 @@ var configFieldRegistry = map[string]configField{
 	}),
 	"roles.reviewer.autoDiscovery":          boolField("roles.reviewer.autoDiscovery", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Reviewer.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialReviewerRole(p).AutoDiscovery }),
 	"roles.reviewer.instructions":           stringField("roles.reviewer.instructions", "", "", func(c config.Config) any { return c.Roles.Reviewer.Instructions }, func(p *config.PartialConfig) **string { return &ensurePartialReviewerRole(p).Instructions }),
+	"roles.reviewer.policyPack":             stringField("roles.reviewer.policyPack", "", "", func(c config.Config) any { return c.Roles.Reviewer.PolicyPack }, func(p *config.PartialConfig) **string { return &ensurePartialReviewerRole(p).PolicyPack }),
 	"roles.reviewer.triggers.includeDrafts": boolField("roles.reviewer.triggers.includeDrafts", "LOOPER_ROLES_REVIEWER_TRIGGERS_INCLUDE_DRAFTS", "", func(c config.Config) any { return c.Roles.Reviewer.Triggers.IncludeDrafts }, func(p *config.PartialConfig) **bool { return &ensurePartialReviewerRoleTriggers(p).IncludeDrafts }),
 	"roles.reviewer.triggers.requireReviewRequest": boolField("roles.reviewer.triggers.requireReviewRequest", "LOOPER_ROLES_REVIEWER_TRIGGERS_REQUIRE_REVIEW_REQUEST", "", func(c config.Config) any { return c.Roles.Reviewer.Triggers.RequireReviewRequest }, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerRoleTriggers(p).RequireReviewRequest
@@ -70,6 +74,7 @@ var configFieldRegistry = map[string]configField{
 	"roles.reviewer.specReview.reviewingLabel":        stringField("roles.reviewer.specReview.reviewingLabel", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL", "", func(c config.Config) any { return c.Roles.Reviewer.SpecReview.ReviewingLabel }, func(p *config.PartialConfig) **string { return &ensurePartialReviewerSpecReview(p).ReviewingLabel }),
 	"roles.fixer.autoDiscovery":                       boolField("roles.fixer.autoDiscovery", "LOOPER_ROLES_FIXER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Fixer.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialFixerRole(p).AutoDiscovery }),
 	"roles.fixer.instructions":                        stringField("roles.fixer.instructions", "", "", func(c config.Config) any { return c.Roles.Fixer.Instructions }, func(p *config.PartialConfig) **string { return &ensurePartialFixerRole(p).Instructions }),
+	"roles.fixer.policyPack":                          stringField("roles.fixer.policyPack", "", "", func(c config.Config) any { return c.Roles.Fixer.PolicyPack }, func(p *config.PartialConfig) **string { return &ensurePartialFixerRole(p).PolicyPack }),
 	"roles.fixer.triggers.includeDrafts":              boolField("roles.fixer.triggers.includeDrafts", "LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS", "", func(c config.Config) any { return c.Roles.Fixer.Triggers.IncludeDrafts }, func(p *config.PartialConfig) **bool { return &ensurePartialFixerRoleTriggers(p).IncludeDrafts }),
 	"roles.fixer.triggers.labels":                     stringListField("roles.fixer.triggers.labels", "LOOPER_ROLES_FIXER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Fixer.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialFixerRoleTriggers(p).Labels }),
 	"roles.fixer.triggers.labelMode":                  labelModeField("roles.fixer.triggers.labelMode", "LOOPER_ROLES_FIXER_TRIGGERS_LABEL_MODE", func(c config.Config) any { return c.Roles.Fixer.Triggers.LabelMode }, func(p *config.PartialConfig) **config.LabelMode { return &ensurePartialFixerRoleTriggers(p).LabelMode }),
@@ -543,6 +548,13 @@ func ensurePartialInstructions(partial *config.PartialConfig) *config.PartialIns
 	return partial.Instructions
 }
 
+func ensurePartialWorkflowPolicyPacks(partial *config.PartialConfig) *config.PartialWorkflowPolicyPacksConfig {
+	if partial.WorkflowPolicyPacks == nil {
+		partial.WorkflowPolicyPacks = &config.PartialWorkflowPolicyPacksConfig{}
+	}
+	return partial.WorkflowPolicyPacks
+}
+
 func ensurePartialRoles(partial *config.PartialConfig) *config.PartialRoleConfigs {
 	if partial.Roles == nil {
 		partial.Roles = &config.PartialRoleConfigs{}
@@ -668,6 +680,8 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Instructions != nil && partial.Instructions.Enabled != nil
 	case "instructions.maxBytes":
 		return partial.Instructions != nil && partial.Instructions.MaxBytes != nil
+	case "workflowPolicyPacks.enabled":
+		return partial.WorkflowPolicyPacks != nil && partial.WorkflowPolicyPacks.Enabled != nil
 	case "reviewer.reviewEvents.clean":
 		return partial.Reviewer != nil && partial.Reviewer.ReviewEvents != nil && partial.Reviewer.ReviewEvents.Clean != nil
 	case "reviewer.reviewEvents.blocking":
@@ -676,6 +690,8 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.AutoDiscovery != nil
 	case "roles.planner.instructions":
 		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.Instructions != nil
+	case "roles.planner.policyPack":
+		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.PolicyPack != nil
 	case "roles.planner.triggers.labels":
 		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.Triggers != nil && partial.Roles.Planner.Triggers.Labels != nil
 	case "roles.planner.triggers.labelMode":
@@ -686,6 +702,8 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.AutoDiscovery != nil
 	case "roles.worker.instructions":
 		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.Instructions != nil
+	case "roles.worker.policyPack":
+		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.PolicyPack != nil
 	case "roles.worker.triggers.labels":
 		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.Triggers != nil && partial.Roles.Worker.Triggers.Labels != nil
 	case "roles.worker.triggers.labelMode":
@@ -696,6 +714,8 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.AutoDiscovery != nil
 	case "roles.reviewer.instructions":
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Instructions != nil
+	case "roles.reviewer.policyPack":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.PolicyPack != nil
 	case "roles.reviewer.triggers.includeDrafts":
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Triggers != nil && partial.Roles.Reviewer.Triggers.IncludeDrafts != nil
 	case "roles.reviewer.triggers.requireReviewRequest":
@@ -712,6 +732,8 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.AutoDiscovery != nil
 	case "roles.fixer.instructions":
 		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Instructions != nil
+	case "roles.fixer.policyPack":
+		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.PolicyPack != nil
 	case "roles.fixer.triggers.includeDrafts":
 		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Triggers != nil && partial.Roles.Fixer.Triggers.IncludeDrafts != nil
 	case "roles.fixer.triggers.labels":

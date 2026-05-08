@@ -25,6 +25,7 @@ import (
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
 	"github.com/powerformer/looper/internal/version"
+	"github.com/powerformer/looper/internal/workflowpolicy"
 )
 
 const (
@@ -4070,6 +4071,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		if checkpoint.Snapshot.UnresolvedThreadCount != nil {
 			parts = append(parts, fmt.Sprintf("Unresolved threads: %d", *checkpoint.Snapshot.UnresolvedThreadCount))
 		}
+	}
+	if policyBlock, err := workflowpolicy.ResolveBlock(instructionConfig, projectID, "reviewer"); err == nil && policyBlock.Instructions != "" {
+		parts = append(parts, policyBlock.Instructions)
 	}
 	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "reviewer")
 	if instructionBlock.Text != "" {

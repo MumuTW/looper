@@ -15,6 +15,13 @@ Scheduler
   queuedItems  : 2
   runningItems : 1
 
+Workflow policies
+  enabled  : yes
+  planner  : matt-series (Matt Series Engineering Workflow)
+  reviewer : none
+  worker   : none
+  fixer    : none
+
 type      queued  running  waiting  paused  failed  terminated  stopped
 --------  ------  -------  -------  ------  ------  ----------  -------
 planner   0       0        0        1       0       0           0      

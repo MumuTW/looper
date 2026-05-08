@@ -195,6 +195,25 @@ type InstructionsConfig struct {
 	MaxBytes int  `json:"maxBytes"`
 }
 
+type WorkflowPolicyPackSource string
+
+const (
+	WorkflowPolicyPackSourceBuiltin WorkflowPolicyPackSource = "builtin"
+	WorkflowPolicyPackSourceFile    WorkflowPolicyPackSource = "file"
+)
+
+type WorkflowPolicyPackRef struct {
+	ID     string                   `json:"id"`
+	Name   string                   `json:"name"`
+	Source WorkflowPolicyPackSource `json:"source"`
+	Path   string                   `json:"path,omitempty"`
+}
+
+type WorkflowPolicyPacksConfig struct {
+	Enabled bool                    `json:"enabled"`
+	Packs   []WorkflowPolicyPackRef `json:"packs"`
+}
+
 type RoleConfig struct {
 	Instructions string `json:"instructions,omitempty"`
 }
@@ -328,12 +347,14 @@ type PlannerRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
+	PolicyPack    string                  `json:"policyPack,omitempty"`
 }
 
 type WorkerRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
+	PolicyPack    string                  `json:"policyPack,omitempty"`
 }
 
 type ReviewerRoleConfig struct {
@@ -341,12 +362,14 @@ type ReviewerRoleConfig struct {
 	Triggers      ReviewerRoleTriggersConfig `json:"triggers"`
 	SpecReview    ReviewerSpecReviewConfig   `json:"specReview"`
 	Instructions  string                     `json:"instructions,omitempty"`
+	PolicyPack    string                     `json:"policyPack,omitempty"`
 }
 
 type FixerRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      FixerRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
+	PolicyPack    string                  `json:"policyPack,omitempty"`
 }
 
 type RoleConfigs struct {
@@ -368,21 +391,22 @@ type ProjectRefConfig struct {
 }
 
 type Config struct {
-	Server        ServerConfig       `json:"server"`
-	Storage       StorageConfig      `json:"storage"`
-	Scheduler     SchedulerConfig    `json:"scheduler"`
-	Agent         AgentConfig        `json:"agent"`
-	Logging       LoggingConfig      `json:"logging"`
-	Notifications NotificationConfig `json:"notifications"`
-	Disclosure    DisclosureConfig   `json:"disclosure"`
-	Tools         ToolPathsConfig    `json:"tools"`
-	Daemon        DaemonConfig       `json:"daemon"`
-	Package       PackageConfig      `json:"package"`
-	Defaults      DefaultsConfig     `json:"defaults"`
-	Reviewer      ReviewerConfig     `json:"reviewer"`
-	Instructions  InstructionsConfig `json:"instructions"`
-	Roles         RoleConfigs        `json:"roles"`
-	Projects      []ProjectRefConfig `json:"projects"`
+	Server              ServerConfig              `json:"server"`
+	Storage             StorageConfig             `json:"storage"`
+	Scheduler           SchedulerConfig           `json:"scheduler"`
+	Agent               AgentConfig               `json:"agent"`
+	Logging             LoggingConfig             `json:"logging"`
+	Notifications       NotificationConfig        `json:"notifications"`
+	Disclosure          DisclosureConfig          `json:"disclosure"`
+	Tools               ToolPathsConfig           `json:"tools"`
+	Daemon              DaemonConfig              `json:"daemon"`
+	Package             PackageConfig             `json:"package"`
+	Defaults            DefaultsConfig            `json:"defaults"`
+	Reviewer            ReviewerConfig            `json:"reviewer"`
+	Instructions        InstructionsConfig        `json:"instructions"`
+	WorkflowPolicyPacks WorkflowPolicyPacksConfig `json:"workflowPolicyPacks"`
+	Roles               RoleConfigs               `json:"roles"`
+	Projects            []ProjectRefConfig        `json:"projects"`
 }
 
 type PartialServerConfig struct {
@@ -548,6 +572,11 @@ type PartialInstructionsConfig struct {
 	MaxBytes *int  `json:"maxBytes,omitempty"`
 }
 
+type PartialWorkflowPolicyPacksConfig struct {
+	Enabled *bool                    `json:"enabled,omitempty"`
+	Packs   *[]WorkflowPolicyPackRef `json:"packs,omitempty"`
+}
+
 type PartialIssueRoleTriggersConfig struct {
 	Labels                     *[]string  `json:"labels,omitempty"`
 	LabelMode                  *LabelMode `json:"labelMode,omitempty"`
@@ -582,12 +611,14 @@ type PartialPlannerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
+	PolicyPack    *string                         `json:"policyPack,omitempty"`
 }
 
 type PartialWorkerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
+	PolicyPack    *string                         `json:"policyPack,omitempty"`
 }
 
 type PartialReviewerRoleConfig struct {
@@ -595,12 +626,14 @@ type PartialReviewerRoleConfig struct {
 	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
 	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
 	Instructions  *string                            `json:"instructions,omitempty"`
+	PolicyPack    *string                            `json:"policyPack,omitempty"`
 }
 
 type PartialFixerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
+	PolicyPack    *string                         `json:"policyPack,omitempty"`
 }
 
 type PartialRoleConfigs struct {
@@ -611,19 +644,20 @@ type PartialRoleConfigs struct {
 }
 
 type PartialConfig struct {
-	Server        *PartialServerConfig       `json:"server,omitempty"`
-	Storage       *PartialStorageConfig      `json:"storage,omitempty"`
-	Scheduler     *PartialSchedulerConfig    `json:"scheduler,omitempty"`
-	Agent         *PartialAgentConfig        `json:"agent,omitempty"`
-	Logging       *PartialLoggingConfig      `json:"logging,omitempty"`
-	Notifications *PartialNotificationConfig `json:"notifications,omitempty"`
-	Disclosure    *PartialDisclosureConfig   `json:"disclosure,omitempty"`
-	Tools         *PartialToolPathsConfig    `json:"tools,omitempty"`
-	Daemon        *PartialDaemonConfig       `json:"daemon,omitempty"`
-	Package       *PartialPackageConfig      `json:"package,omitempty"`
-	Defaults      *PartialDefaultsConfig     `json:"defaults,omitempty"`
-	Reviewer      *PartialReviewerConfig     `json:"reviewer,omitempty"`
-	Instructions  *PartialInstructionsConfig `json:"instructions,omitempty"`
-	Roles         *PartialRoleConfigs        `json:"roles,omitempty"`
-	Projects      *[]ProjectRefConfig        `json:"projects,omitempty"`
+	Server              *PartialServerConfig              `json:"server,omitempty"`
+	Storage             *PartialStorageConfig             `json:"storage,omitempty"`
+	Scheduler           *PartialSchedulerConfig           `json:"scheduler,omitempty"`
+	Agent               *PartialAgentConfig               `json:"agent,omitempty"`
+	Logging             *PartialLoggingConfig             `json:"logging,omitempty"`
+	Notifications       *PartialNotificationConfig        `json:"notifications,omitempty"`
+	Disclosure          *PartialDisclosureConfig          `json:"disclosure,omitempty"`
+	Tools               *PartialToolPathsConfig           `json:"tools,omitempty"`
+	Daemon              *PartialDaemonConfig              `json:"daemon,omitempty"`
+	Package             *PartialPackageConfig             `json:"package,omitempty"`
+	Defaults            *PartialDefaultsConfig            `json:"defaults,omitempty"`
+	Reviewer            *PartialReviewerConfig            `json:"reviewer,omitempty"`
+	Instructions        *PartialInstructionsConfig        `json:"instructions,omitempty"`
+	WorkflowPolicyPacks *PartialWorkflowPolicyPacksConfig `json:"workflowPolicyPacks,omitempty"`
+	Roles               *PartialRoleConfigs               `json:"roles,omitempty"`
+	Projects            *[]ProjectRefConfig               `json:"projects,omitempty"`
 }

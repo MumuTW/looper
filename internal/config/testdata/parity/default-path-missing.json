@@ -90,6 +90,16 @@
         "looperPath": "/detected/looper",
         "osascriptPath": "/envonly/osascript"
       },
+      "workflowPolicyPacks": {
+        "enabled": true,
+        "packs": [
+          {
+            "id": "matt-series",
+            "name": "Matt Series Engineering Workflow",
+            "source": "builtin"
+          }
+        ]
+      },
       "daemon": {
         "mode": "foreground",
         "restartPolicy": "on-failure",
