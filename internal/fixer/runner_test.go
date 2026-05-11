@@ -433,6 +433,16 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 	if run == nil || run.Status != "success" || run.LastCompletedStep == nil || *run.LastCompletedStep != string(stepRecheck) {
 		t.Fatalf("run = %#v, want success through recheck", run)
 	}
+	checkpoint := parseCheckpoint(run.CheckpointJSON)
+	if checkpoint.Detail == nil || checkpoint.Detail.HeadSHA != "new-head" {
+		t.Fatalf("checkpoint.Detail = %#v, want pushed head new-head", checkpoint.Detail)
+	}
+	if checkpoint.Push == nil || checkpoint.Push.HeadSHA != "new-head" {
+		t.Fatalf("checkpoint.Push = %#v, want recorded pushed head new-head", checkpoint.Push)
+	}
+	if checkpoint.ReconcileCommits == nil || checkpoint.ReconcileCommits.FinalHeadSHA != "new-head" {
+		t.Fatalf("checkpoint.ReconcileCommits = %#v, want refreshed final head new-head", checkpoint.ReconcileCommits)
+	}
 }
 
 func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *testing.T) {
@@ -656,6 +666,52 @@ func TestRunResolveCommentsStepChecksHeadDriftBeforeNoFixBlock(t *testing.T) {
 	}
 	if len(github.resolveCalls) != 0 {
 		t.Fatalf("resolve calls = %d, want none on stale head", len(github.resolveCalls))
+	}
+}
+
+func TestRunResolveCommentsStepUsesRefreshedPushHeadSHA(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+	}}}
+	runner := New(Options{GitHub: github})
+	checkpoint := fixerCheckpoint{
+		Detail:     &checkpointDetail{HeadSHA: "old-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+		FixItems:   []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Push:       &checkpointPush{Pushed: true, Branch: "feature/fix-42", Remote: "origin", HeadSHA: "new-head"},
+		Lifecycle:  &lifecycle.State{Pushed: true},
+		ReconcileCommits: &checkpointReconcileCommits{
+			BaseHeadSHA:      "base-head",
+			FinalHeadSHA:     "old-head",
+			NewCommitSHAs:    []string{"new-head"},
+			WorkingTreeClean: true,
+		},
+	}
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: checkpoint,
+	})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveCalls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1", len(github.resolveCalls))
+	}
+	if len(github.replyCalls) != 1 || !contains(github.replyCalls[0].Body, "new-hea") {
+		t.Fatalf("reply calls = %#v, want reply referencing pushed head", github.replyCalls)
+	}
+	if updated.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("updated.ResumePolicy = %q, want advance_from_checkpoint", updated.ResumePolicy)
 	}
 }
 

@@ -479,6 +479,7 @@ type checkpointPush struct {
 	Pushed        bool   `json:"pushed"`
 	Branch        string `json:"branch,omitempty"`
 	Remote        string `json:"remote,omitempty"`
+	HeadSHA       string `json:"headSha,omitempty"`
 	PushedAt      string `json:"pushedAt,omitempty"`
 	SkippedReason string `json:"skippedReason,omitempty"`
 }
@@ -1513,12 +1514,14 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if finalHeadSHA == "" {
 		return checkpoint, &loopError{message: "reconcileCommits.finalHeadSha is required", kind: FailureRetryableAfterResume}
 	}
-	if err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: finalHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
+	liveDetail, err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: finalHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
 		return fmt.Sprintf("PR head did not update after push: expected %s, got %s", finalHeadSHA, firstNonEmpty(actual, "unknown"))
-	}}); err != nil {
+	}})
+	if err != nil {
 		return checkpoint, err
 	}
-	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": detailHeadSHA(checkpoint.Detail), "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": r.nowISO()})
+	checkpoint = refreshCheckpointHeadAfterPush(checkpoint, liveDetail)
+	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastFixHeadSha": resolveCommentsExpectedHeadSHA(checkpoint), "lastFixItemsHash": checkpoint.FixItemsHash, "lastFixPushedAt": r.nowISO()})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -1526,8 +1529,9 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		return checkpoint, err
 	}
 	pushedAt := r.nowISO()
-	r.appendEvent(ctx, eventInput{eventType: "pr.branch.pushed", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "pushedAt": pushedAt, "headSha": nilIfEmpty(detailHeadSHA(checkpoint.Detail))}})
-	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", PushedAt: pushedAt}
+	pushedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
+	r.appendEvent(ctx, eventInput{eventType: "pr.branch.pushed", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "pushedAt": pushedAt, "headSha": nilIfEmpty(pushedHeadSHA)}})
+	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: pushedHeadSHA, PushedAt: pushedAt}
 	checkpoint.ensureLifecycle("fixer", branch, detailBaseRefName(checkpoint.Detail), false)
 	checkpoint.Lifecycle.Pushed = true
 	checkpoint.Lifecycle.Actions.Push = lifecycle.ActionSourceFallback
@@ -1558,9 +1562,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		fixItems = collectFixItems(detail)
 		checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, detail)
 	}
-	if checkpoint.ReconcileCommits != nil && checkpoint.ReconcileCommits.FinalHeadSHA != "" {
-		if err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: checkpoint.ReconcileCommits.FinalHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
-			return fmt.Sprintf("PR head changed before resolving comments: expected %s, got %s", checkpoint.ReconcileCommits.FinalHeadSHA, firstNonEmpty(actual, "unknown"))
+	expectedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
+	if expectedHeadSHA != "" {
+		if _, err := r.waitForPullRequestHeadSHA(ctx, waitForPullRequestHeadSHAInput{Repo: input.Repo, PRNumber: input.PRNumber, ExpectedHeadSHA: expectedHeadSHA, CWD: input.Project.RepoPath, Attempts: 5, Delay: time.Second, FailureMessage: func(actual string) string {
+			return fmt.Sprintf("PR head changed before resolving comments: expected %s, got %s", expectedHeadSHA, firstNonEmpty(actual, "unknown"))
 		}}); err != nil {
 			return checkpoint, err
 		}
@@ -2405,22 +2410,24 @@ type waitForPullRequestHeadSHAInput struct {
 	FailureMessage  func(string) string
 }
 
-func (r *Runner) waitForPullRequestHeadSHA(ctx context.Context, input waitForPullRequestHeadSHAInput) error {
+func (r *Runner) waitForPullRequestHeadSHA(ctx context.Context, input waitForPullRequestHeadSHAInput) (PullRequestDetail, error) {
 	actual := ""
+	var latest PullRequestDetail
 	for attempt := 0; attempt < input.Attempts; attempt++ {
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 		if err != nil {
-			return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return PullRequestDetail{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
+		latest = detail
 		actual = detail.HeadSHA
 		if actual == input.ExpectedHeadSHA {
-			return nil
+			return detail, nil
 		}
 		if attempt < input.Attempts-1 {
 			r.sleep(input.Delay)
 		}
 	}
-	return &loopError{message: input.FailureMessage(actual), kind: FailureRetryableAfterResume}
+	return latest, &loopError{message: input.FailureMessage(actual), kind: FailureRetryableAfterResume}
 }
 
 func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (ValidationResult, error) {
@@ -3051,6 +3058,32 @@ func mergeCheckpointDetailPreservingLabels(existing *checkpointDetail, live Pull
 		merged.Labels = cloneStrings(existing.Labels)
 	}
 	return merged
+}
+
+func refreshCheckpointHeadAfterPush(checkpoint fixerCheckpoint, live PullRequestDetail) fixerCheckpoint {
+	if live.HeadSHA == "" {
+		return checkpoint
+	}
+	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, live)
+	if checkpoint.Worktree != nil {
+		checkpoint.Worktree.HeadSHA = live.HeadSHA
+	}
+	if checkpoint.ReconcileCommits != nil {
+		checkpoint.ReconcileCommits.FinalHeadSHA = live.HeadSHA
+	}
+	return checkpoint
+}
+
+func resolveCommentsExpectedHeadSHA(checkpoint fixerCheckpoint) string {
+	if checkpoint.Push != nil && checkpoint.Push.Pushed {
+		if headSHA := checkpoint.Push.HeadSHA; headSHA != "" {
+			return headSHA
+		}
+	}
+	if checkpoint.ReconcileCommits != nil && checkpoint.ReconcileCommits.FinalHeadSHA != "" {
+		return checkpoint.ReconcileCommits.FinalHeadSHA
+	}
+	return detailHeadSHA(checkpoint.Detail)
 }
 
 func detailHeadSHA(detail *checkpointDetail) string {
