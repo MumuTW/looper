@@ -14,9 +14,17 @@ on:
           - patch
           - minor
           - major
+      release_channel:
+        description: "Release channel"
+        required: true
+        type: choice
+        default: stable
+        options:
+          - stable
+          - beta
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && format('{0}-{1}', github.ref_name, inputs.version_bump) || github.ref_name }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && format('{0}-{1}-{2}', github.ref_name, inputs.version_bump, inputs.release_channel) || github.ref_name }}
 
 permissions:
   contents: write
@@ -73,6 +81,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           VERSION_BUMP: ${{ inputs.version_bump }}
+          RELEASE_CHANNEL: ${{ inputs.release_channel }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             latest_tag=""
@@ -111,11 +120,36 @@ jobs:
                 ;;
             esac
 
-            tag_name="v${major}.${minor}.${patch}"
-            if git rev-parse -q --verify "refs/tags/${tag_name}" >/dev/null; then
-              echo "Calculated tag already exists: ${tag_name}" >&2
-              exit 1
-            fi
+            base_version="${major}.${minor}.${patch}"
+            case "$RELEASE_CHANNEL" in
+              stable)
+                tag_name="v${base_version}"
+                if git rev-parse -q --verify "refs/tags/${tag_name}" >/dev/null; then
+                  echo "Calculated tag already exists: ${tag_name}" >&2
+                  exit 1
+                fi
+                ;;
+              beta)
+                next_beta=1
+                while IFS= read -r candidate_tag; do
+                  if [[ "$candidate_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-beta\.([0-9]+)$ ]] && \
+                    [ "${BASH_REMATCH[1]}" = "$major" ] && \
+                    [ "${BASH_REMATCH[2]}" = "$minor" ] && \
+                    [ "${BASH_REMATCH[3]}" = "$patch" ]; then
+                    beta_number="${BASH_REMATCH[4]}"
+                    if [ "$beta_number" -ge "$next_beta" ]; then
+                      next_beta=$((beta_number + 1))
+                    fi
+                  fi
+                done < <(git tag --list "v${base_version}-beta.*")
+
+                tag_name="v${base_version}-beta.${next_beta}"
+                ;;
+              *)
+                echo "release_channel must be one of: stable, beta" >&2
+                exit 1
+                ;;
+            esac
           else
             tag_name="$REF_NAME"
           fi
