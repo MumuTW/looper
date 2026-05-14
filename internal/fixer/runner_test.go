@@ -25,12 +25,12 @@ func TestBuildFixerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature"}
 	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
-	for _, want := range []string{"agent=opencode", "model=openai/gpt-5.5"} {
+	for _, want := range []string{"agent=opencode"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
 	}
-	for _, unwanted := range []string{"agent=<agent-runtime>", "model=<agent-model>", "agent=gpt-5.5", "agent=openai/gpt-5.5"} {
+	for _, unwanted := range []string{"agent=<agent-runtime>", "model=<agent-model>", "model=openai/gpt-5.5", "agent=gpt-5.5", "agent=openai/gpt-5.5"} {
 		if strings.Contains(prompt, unwanted) {
 			t.Fatalf("prompt contains %q:\n%s", unwanted, prompt)
 		}
@@ -45,8 +45,8 @@ func TestBuildFixerPromptOmitsMissingAgentRuntime(t *testing.T) {
 	if strings.Contains(prompt, "agent=") {
 		t.Fatalf("prompt should omit missing agent runtime:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, "model=openai/gpt-5.5") {
-		t.Fatalf("prompt should include configured model:\n%s", prompt)
+	if strings.Contains(prompt, "model=") || strings.Contains(prompt, "openai/gpt-5.5") {
+		t.Fatalf("prompt should not expose configured model:\n%s", prompt)
 	}
 }
 
@@ -4874,7 +4874,8 @@ func TestProcessClaimedItemPostsRoundSummaryComment(t *testing.T) {
 	}
 	stdout := fmt.Sprintf(`__LOOPER_RESULT__={"summary":"done","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Capped loop bound and added regression test.","threadCommentsObserved":"%s"}]}`+"\n", hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}}))
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+	agentModel := "openai/gpt-5.5"
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now, AgentModel: &agentModel})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
@@ -4904,6 +4905,9 @@ func TestProcessClaimedItemPostsRoundSummaryComment(t *testing.T) {
 	}
 	if !strings.Contains(body, "@alice") {
 		t.Fatalf("summary body missing @author mention:\n%s", body)
+	}
+	if strings.Contains(body, "model=") {
+		t.Fatalf("summary body should not expose agent model:\n%s", body)
 	}
 }
 
