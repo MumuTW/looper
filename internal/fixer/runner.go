@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -76,6 +77,45 @@ const (
 	defaultRetryDelay               = 5 * time.Second
 	defaultRetryMax                 = 3
 )
+
+var fixerDiscoveryLocks = newFixerDiscoveryLockSet()
+
+type fixerDiscoveryLockSet struct {
+	mu    sync.Mutex
+	locks map[string]*fixerDiscoveryLockRef
+}
+
+type fixerDiscoveryLockRef struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newFixerDiscoveryLockSet() *fixerDiscoveryLockSet {
+	return &fixerDiscoveryLockSet{locks: map[string]*fixerDiscoveryLockRef{}}
+}
+
+func (s *fixerDiscoveryLockSet) With(key string, fn func() error) error {
+	s.mu.Lock()
+	ref := s.locks[key]
+	if ref == nil {
+		ref = &fixerDiscoveryLockRef{}
+		s.locks[key] = ref
+	}
+	ref.refs++
+	s.mu.Unlock()
+
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		ref.refs--
+		if ref.refs == 0 {
+			delete(s.locks, key)
+		}
+		s.mu.Unlock()
+	}()
+	return fn()
+}
 
 type FixItem struct {
 	Type              string   `json:"type"`
@@ -448,6 +488,12 @@ type DiscoveryInput struct {
 	Repo      string
 	Limit     int
 	Snapshot  *githubinfra.DiscoverySnapshot
+}
+
+type TargetedDiscoveryInput struct {
+	ProjectID string
+	Repo      string
+	PRNumber  int64
 }
 
 type DiscoveryResult struct {
@@ -1039,54 +1085,152 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		appendDiscoveryQueueItem(&result.QueueItems, item)
 	}
 	for _, pr := range openPRs {
-		if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
-			result.Skipped++
-			continue
+		if err := fixerDiscoveryLocks.With(fixerDiscoveryLockKey(project.ID, input.Repo, pr.Number), func() error {
+			if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" || r.hasActivePRLock(ctx, input.Repo, pr.Number) {
+				result.Skipped++
+				return nil
+			}
+			if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
+				result.Skipped++
+				return nil
+			}
+			if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
+				result.Skipped++
+				return nil
+			}
+			detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
+			if err != nil {
+				return err
+			}
+			allFixItems := collectFixItems(detail)
+			if len(allFixItems) == 0 {
+				if err := r.clearFixerFollowupStateForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
+					return err
+				}
+				result.Skipped++
+				return nil
+			}
+			allFixItemsStateHash := hashFixItemsState(allFixItems)
+			fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, input.Repo, pr.Number), detail.HeadSHA, allFixItems)
+			if len(fixItems) == 0 {
+				if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, input.Repo, pr.Number, detail.HeadSHA, allFixItemsStateHash); err != nil {
+					return err
+				}
+				result.Skipped++
+				return nil
+			}
+			fixItemsHash := hashFixItems(fixItems)
+			fixItemsStateHash := allFixItemsStateHash
+			unresolvedThreadIDs := unresolvedThreadIDs(fixItems)
+			if len(unresolvedThreadIDs) == 0 {
+				if err := r.clearFixerFollowupMetadataForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
+					return err
+				}
+			}
+			loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, detail.HeadSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs)
+			if err != nil {
+				return err
+			}
+			if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.skipped {
+				result.Skipped++
+				return nil
+			}
+			if loopResult.created {
+				result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+			}
+			headSHA := detail.HeadSHA
+			if headSHA == "" {
+				headSHA = "unknown"
+			}
+			queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, PRNumber: pr.Number, HeadSHA: headSHA, FixItemsHash: fixItemsStateHash, AvailableAt: loopResult.availableAt})
+			if err != nil {
+				return err
+			}
+			appendDiscoveryQueueItem(&result.QueueItems, queueItem)
+			return nil
+		}); err != nil {
+			return DiscoveryResult{}, err
 		}
-		if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
-			result.Skipped++
-			continue
-		}
-		if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
-			result.Skipped++
-			continue
-		}
-		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
+	}
+	return result, nil
+}
+
+func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscoveryInput) (DiscoveryResult, error) {
+	if input.PRNumber <= 0 {
+		return DiscoveryResult{}, fmt.Errorf("prNumber must be positive")
+	}
+	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || r.repos.Locks == nil {
+		return DiscoveryResult{}, fmt.Errorf("fixer repositories are not configured")
+	}
+	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if project == nil {
+		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
+	}
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !policy.AutoDiscovery {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	currentUser := ""
+	if policy.AuthorFilter != config.FixerAuthorFilterAny {
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
+		}
+		currentUser = strings.TrimSpace(currentUser)
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: project.RepoPath})
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if (!policy.IncludeDrafts && detail.IsDraft) || normalizePRState(detail.State) != "open" {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(detail.Author, currentUser) {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	if !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	result := DiscoveryResult{}
+	if err := fixerDiscoveryLocks.With(fixerDiscoveryLockKey(project.ID, input.Repo, input.PRNumber), func() error {
+		if r.hasActivePRLock(ctx, input.Repo, input.PRNumber) {
+			result.Skipped++
+			return nil
 		}
 		allFixItems := collectFixItems(detail)
 		if len(allFixItems) == 0 {
-			if err := r.clearFixerFollowupStateForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
-				return DiscoveryResult{}, err
+			if err := r.clearFixerFollowupStateForPR(ctx, project.ID, input.Repo, input.PRNumber); err != nil {
+				return err
 			}
 			result.Skipped++
-			continue
+			return nil
 		}
 		allFixItemsStateHash := hashFixItemsState(allFixItems)
-		fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, input.Repo, pr.Number), detail.HeadSHA, allFixItems)
+		fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, input.Repo, input.PRNumber), detail.HeadSHA, allFixItems)
 		if len(fixItems) == 0 {
-			if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, input.Repo, pr.Number, detail.HeadSHA, allFixItemsStateHash); err != nil {
-				return DiscoveryResult{}, err
+			if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, input.Repo, input.PRNumber, detail.HeadSHA, allFixItemsStateHash); err != nil {
+				return err
 			}
 			result.Skipped++
-			continue
+			return nil
 		}
-		fixItemsHash := hashFixItems(fixItems)
 		fixItemsStateHash := allFixItemsStateHash
 		unresolvedThreadIDs := unresolvedThreadIDs(fixItems)
 		if len(unresolvedThreadIDs) == 0 {
-			if err := r.clearFixerFollowupMetadataForPR(ctx, project.ID, input.Repo, pr.Number); err != nil {
-				return DiscoveryResult{}, err
+			if err := r.clearFixerFollowupMetadataForPR(ctx, project.ID, input.Repo, input.PRNumber); err != nil {
+				return err
 			}
 		}
-		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, detail.HeadSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs)
+		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, input.PRNumber, detail.HeadSHA, hashFixItems(fixItems), fixItemsStateHash, fixItems, unresolvedThreadIDs)
 		if err != nil {
-			return DiscoveryResult{}, err
+			return err
 		}
 		if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.skipped {
 			result.Skipped++
-			continue
+			return nil
 		}
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
@@ -1095,21 +1239,20 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if headSHA == "" {
 			headSHA = "unknown"
 		}
-		queueItem, err := r.enqueue(ctx, enqueueInput{
-			ProjectID:    project.ID,
-			LoopID:       loopResult.record.ID,
-			Repo:         input.Repo,
-			PRNumber:     pr.Number,
-			HeadSHA:      headSHA,
-			FixItemsHash: fixItemsStateHash,
-			AvailableAt:  loopResult.availableAt,
-		})
+		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: headSHA, FixItemsHash: fixItemsStateHash, AvailableAt: loopResult.availableAt})
 		if err != nil {
-			return DiscoveryResult{}, err
+			return err
 		}
 		appendDiscoveryQueueItem(&result.QueueItems, queueItem)
+		return nil
+	}); err != nil {
+		return DiscoveryResult{}, err
 	}
 	return result, nil
+}
+
+func fixerDiscoveryLockKey(projectID, repo string, prNumber int64) string {
+	return fmt.Sprintf("%s|%s|%d", projectID, repo, prNumber)
 }
 
 func appendDiscoveryQueueItem(items *[]storage.QueueItemRecord, item storage.QueueItemRecord) {
