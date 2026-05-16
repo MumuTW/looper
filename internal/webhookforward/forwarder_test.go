@@ -189,6 +189,42 @@ func TestForwardRetriesTransientTargetedFailuresWithoutEscalation(t *testing.T) 
 	}
 }
 
+func TestForwardPreservesCoalescedWorkWhenRequeueHitsCapacity(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(make(chan struct{}))
+	fixerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: reviewerRunner, Fixer: targetedFixerAdapter{runner: fixerRunner}, MaxConcurrent: 1, QueueCapacity: 1})
+	defer forwarder.Close()
+
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "running-pr1", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 1)}); err != nil {
+		t.Fatalf("Forward(running-pr1) error = %v", err)
+	}
+	reviewerRunner.waitForCall(t, 1)
+
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "queued-pr2", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 2)}); err != nil {
+		t.Fatalf("Forward(queued-pr2) error = %v", err)
+	}
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "coalesced-pr1", EventType: "issue_comment", Payload: []byte(`{"action":"created","repository":{"full_name":"acme/looper"},"issue":{"number":1,"pull_request":{"url":"https://api.github.com/repos/acme/looper/pulls/1"}}}`)}); err != nil {
+		t.Fatalf("Forward(coalesced-pr1) error = %v", err)
+	}
+
+	close(reviewerRunner.block)
+	reviewerRunner.waitForCalls(t, 2)
+	fixerRunner.waitForCalls(t, 1)
+
+	reviewerRunner.assertPRCount(t, 1, 1)
+	reviewerRunner.assertPRCount(t, 2, 1)
+	fixerRunner.assertPRCount(t, 1, 1)
+	stats := forwarder.Stats()
+	if stats.QueueRejected != 0 {
+		t.Fatalf("QueueRejected = %d, want 0", stats.QueueRejected)
+	}
+	if stats.QueueCoalesced == 0 {
+		t.Fatalf("QueueCoalesced = %d, want > 0", stats.QueueCoalesced)
+	}
+}
+
 func TestForwardKeepsFixedSizeRecentOutcomes(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")

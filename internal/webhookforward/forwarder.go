@@ -381,14 +381,17 @@ func (f *forwarder) worker() {
 func (f *forwarder) nextWork() (workKey, workItem, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.enqueuePendingLocked()
 	for len(f.queue) == 0 && !f.closed {
 		f.cond.Wait()
+		f.enqueuePendingLocked()
 	}
 	if f.closed && len(f.queue) == 0 {
 		return workKey{}, workItem{}, false
 	}
 	key := f.queue[0]
 	f.queue = f.queue[1:]
+	f.enqueuePendingLocked()
 	itemKey := workKeyString(key)
 	item := f.works[itemKey]
 	if item == nil {
@@ -422,8 +425,6 @@ func (f *forwarder) finishWork(key workKey, outcome Outcome) {
 				f.queue = append(f.queue, key)
 				f.stats.QueueEnqueued++
 				f.cond.Signal()
-			} else {
-				f.stats.QueueRejected++
 			}
 		}
 	}
@@ -507,6 +508,28 @@ func (f *forwarder) appendOutcomeLocked(outcome Outcome) {
 	f.recentOutcomes = append(f.recentOutcomes, outcome)
 	if len(f.recentOutcomes) > f.recentOutcomeLimit {
 		f.recentOutcomes = append([]Outcome(nil), f.recentOutcomes[len(f.recentOutcomes)-f.recentOutcomeLimit:]...)
+	}
+}
+
+func (f *forwarder) enqueuePendingLocked() {
+	if len(f.queue) >= f.queueCapacity {
+		return
+	}
+	added := 0
+	for _, item := range f.works {
+		if item == nil || item.running || item.enqueued || len(item.lanes) == 0 {
+			continue
+		}
+		item.enqueued = true
+		f.queue = append(f.queue, item.key)
+		f.stats.QueueEnqueued++
+		added++
+		if len(f.queue) >= f.queueCapacity {
+			break
+		}
+	}
+	if added > 0 {
+		f.cond.Signal()
 	}
 }
 
