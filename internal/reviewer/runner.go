@@ -747,9 +747,12 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		seen[key] = struct{}{}
+		queuedBefore := len(result.QueueItems)
 		if err := r.discoverExistingReviewerLoop(ctx, *project, input.Repo, policy, &currentLogin, loop, detail, &result); err != nil {
 			return DiscoveryResult{}, err
+		}
+		if len(result.QueueItems) > queuedBefore {
+			seen[key] = struct{}{}
 		}
 	}
 	return result, nil
@@ -785,13 +788,19 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	}
 	pr := summaryFromDetail(detail)
 	result := DiscoveryResult{}
-	existingLoop, err := r.findReviewerLoopByPR(ctx, project.ID, input.Repo, input.PRNumber)
+	existingLoops, err := r.findReviewerLoopsByPR(ctx, project.ID, input.Repo, input.PRNumber)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	if existingLoop != nil {
-		if err := r.discoverExistingReviewerLoop(ctx, *project, input.Repo, policy, &currentLogin, *existingLoop, detail, &result); err != nil {
-			return DiscoveryResult{}, err
+	if len(existingLoops) > 0 {
+		for _, loop := range existingLoops {
+			queuedBefore := len(result.QueueItems)
+			if err := r.discoverExistingReviewerLoop(ctx, *project, input.Repo, policy, &currentLogin, loop, detail, &result); err != nil {
+				return DiscoveryResult{}, err
+			}
+			if len(result.QueueItems) > queuedBefore {
+				return result, nil
+			}
 		}
 		return result, nil
 	}
@@ -898,18 +907,18 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 	return r.enqueueReviewerDiscoveryCandidate(ctx, project, repo, policy, currentLogin, summaryFromDetail(detail), &loop, result)
 }
 
-func (r *Runner) findReviewerLoopByPR(ctx context.Context, projectID, repo string, prNumber int64) (*storage.LoopRecord, error) {
+func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
 	loops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return nil, err
 	}
+	matched := []storage.LoopRecord{}
 	for _, loop := range loops {
 		if loop.Type == "reviewer" && loop.ProjectID == projectID && derefString(loop.Repo) == repo && derefInt64(loop.PRNumber) == prNumber {
-			loop := loop
-			return &loop, nil
+			matched = append(matched, loop)
 		}
 	}
-	return nil, nil
+	return matched, nil
 }
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {
