@@ -26,6 +26,11 @@ func TestExtract(t *testing.T) {
 			want:      []AcceptanceCriterion{"first criterion"},
 		},
 		{
+			name:      "acceptance criteria heading allows closing atx markers",
+			issueBody: "## Acceptance Criteria ##\n- [ ] first criterion\n\n## Notes\nignored",
+			want:      []AcceptanceCriterion{"first criterion"},
+		},
+		{
 			name:      "nested headings inside acceptance criteria do not end parsing",
 			issueBody: "## Acceptance Criteria\n- [ ] api returns ok\n\n### Backend\n- [ ] background worker retries\n\n## Notes\nignored",
 			want:      []AcceptanceCriterion{"api returns ok", "background worker retries"},

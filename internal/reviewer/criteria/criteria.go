@@ -180,6 +180,7 @@ func isAcceptanceCriteriaHeading(line string) bool {
 	if !ok {
 		return false
 	}
+	heading = strings.TrimSpace(strings.TrimRight(heading, "#"))
 	heading = strings.TrimSpace(strings.TrimRight(heading, ":;.!?"))
 	return strings.EqualFold(heading, "acceptance criteria")
 }
