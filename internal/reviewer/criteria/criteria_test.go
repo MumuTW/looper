@@ -26,6 +26,11 @@ func TestExtract(t *testing.T) {
 			want:      []AcceptanceCriterion{"first criterion"},
 		},
 		{
+			name:      "nested headings inside acceptance criteria do not end parsing",
+			issueBody: "## Acceptance Criteria\n- [ ] api returns ok\n\n### Backend\n- [ ] background worker retries\n\n## Notes\nignored",
+			want:      []AcceptanceCriterion{"api returns ok", "background worker retries"},
+		},
+		{
 			name:      "missing section returns empty list",
 			issueBody: "## Summary\n- [ ] not here",
 			want:      []AcceptanceCriterion{},

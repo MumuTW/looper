@@ -22,7 +22,7 @@ func (s *Service) validateReviewerAutoMergeForProject(ctx context.Context, proje
 	if autoMergeCfg.Scope != config.ReviewerAutoMergeScopeLooperOnly {
 		return reviewerAutoMergeValidationError(projectRepoLabel(repo, projectID), fmt.Sprintf("scope %q is unsupported in v1", autoMergeCfg.Scope))
 	}
-	if s.GetRepositorySettings == nil || s.GetBranchProtection == nil {
+	if s.GetRepositorySettings == nil || (autoMergeCfg.RequireBranchProtection && s.GetBranchProtection == nil) {
 		return reviewerAutoMergeValidationError(projectRepoLabel(repo, projectID), "GitHub auto-merge validation is not configured")
 	}
 	repoName := strings.TrimSpace(stringValue(repo))

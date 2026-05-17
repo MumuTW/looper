@@ -48,6 +48,9 @@ func TestValidateReviewerAutoMergeForProjectFailureModes(t *testing.T) {
 		{name: "missing branch protection", mutate: func(cfg *config.Config) {}, service: &Service{GetRepositorySettings: service.GetRepositorySettings, GetBranchProtection: func(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
 			return githubinfra.BranchProtection{}, nil
 		}}, want: "default branch protection is missing or has no required checks"},
+		{name: "missing branch protection gateway only matters when protection required", mutate: func(cfg *config.Config) {
+			cfg.Roles.Reviewer.AutoMerge.RequireBranchProtection = false
+		}, service: &Service{GetRepositorySettings: service.GetRepositorySettings}, want: ""},
 	}
 
 	for _, tt := range tests {
@@ -56,6 +59,12 @@ func TestValidateReviewerAutoMergeForProjectFailureModes(t *testing.T) {
 			cfg := baseConfig
 			tt.mutate(&cfg)
 			err := tt.service.validateReviewerAutoMergeForProject(context.Background(), "project_1", &repo, "main", cfg)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("validateReviewerAutoMergeForProject() error = %v, want nil", err)
+				}
+				return
+			}
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("validateReviewerAutoMergeForProject() error = %v, want substring %q", err, tt.want)
 			}

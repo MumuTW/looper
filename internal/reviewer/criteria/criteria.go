@@ -63,19 +63,22 @@ type Verifier interface {
 func Extract(issueBody string) []AcceptanceCriterion {
 	lines := strings.Split(issueBody, "\n")
 	inSection := false
+	sectionLevel := 0
 	criteria := make([]AcceptanceCriterion, 0)
 
 	for _, rawLine := range lines {
 		trimmed := strings.TrimSpace(rawLine)
 
-		if isAcceptanceCriteriaHeading(trimmed) {
+		if level, _, ok := markdownHeading(trimmed); ok && isAcceptanceCriteriaHeading(trimmed) {
 			inSection = true
+			sectionLevel = level
 			continue
 		}
-		if isMarkdownHeading(trimmed) {
-			if inSection {
+		if level, _, ok := markdownHeading(trimmed); ok {
+			if inSection && level <= sectionLevel {
 				break
 			}
+			continue
 		}
 		if !inSection || trimmed == "" {
 			continue
@@ -172,7 +175,7 @@ func parseCriterionLine(line string) (string, bool) {
 }
 
 func isAcceptanceCriteriaHeading(line string) bool {
-	heading, ok := markdownHeadingText(line)
+	_, heading, ok := markdownHeading(line)
 	if !ok {
 		return false
 	}
@@ -180,23 +183,18 @@ func isAcceptanceCriteriaHeading(line string) bool {
 	return strings.EqualFold(heading, "acceptance criteria")
 }
 
-func isMarkdownHeading(line string) bool {
-	_, ok := markdownHeadingText(line)
-	return ok
-}
-
-func markdownHeadingText(line string) (string, bool) {
+func markdownHeading(line string) (int, string, bool) {
 	if line == "" || line[0] != '#' {
-		return "", false
+		return 0, "", false
 	}
 	level := 0
 	for level < len(line) && line[level] == '#' {
 		level++
 	}
 	if level == 0 || level > 6 || level >= len(line) || line[level] != ' ' {
-		return "", false
+		return 0, "", false
 	}
-	return strings.TrimSpace(line[level+1:]), true
+	return level, strings.TrimSpace(line[level+1:]), true
 }
 
 func trimCheckboxPrefix(line string) string {
