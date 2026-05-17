@@ -448,9 +448,16 @@ func (r *Runtime) start(ctx context.Context) error {
 		DB:     coordinator.DB(),
 		Repos:  repositories,
 		Logger: r.logger,
+		Config: r.config,
 		Now:    r.now,
 		DetectRepo: func(ctx context.Context, repoPath string) (string, error) {
 			return gitGateway.DetectGitHubRepo(ctx, repoPath)
+		},
+		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+			return githubGateway.GetRepositorySettings(ctx, input)
+		},
+		GetBranchProtection: func(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+			return githubGateway.GetBranchProtection(ctx, input)
 		},
 		ListWorktrees: func(ctx context.Context, repoPath string) ([]projects.WorktreeListEntry, error) {
 			worktrees, err := gitGateway.ListWorktrees(ctx, repoPath)

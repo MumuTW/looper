@@ -185,6 +185,15 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.Behavior.ThreadResolution.Mode == ReviewerThreadResolutionModeResolveObjective && !config.Roles.Reviewer.Behavior.ThreadResolution.RequireAuditComment {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.requireAuditComment", Message: "must be true when mode is resolve_objective"})
 	}
+	if !isValidReviewerAutoMergeStrategy(config.Roles.Reviewer.AutoMerge.Strategy) {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.strategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerAutoMergeStrategySquash, ReviewerAutoMergeStrategyMerge, ReviewerAutoMergeStrategyRebase)})
+	}
+	if config.Roles.Reviewer.AutoMerge.TransientRetries < 1 {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.transientRetries", Message: "must be a positive integer"})
+	}
+	if config.Roles.Reviewer.AutoMerge.Scope != ReviewerAutoMergeScopeLooperOnly {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
+	}
 	if config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment && config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
 	}
@@ -343,6 +352,9 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 			if label != "" && label != strings.TrimSpace(label) {
 				*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
 			}
+		}
+		if roles.Reviewer.AutoMerge != nil {
+			validatePartialReviewerAutoMerge(*roles.Reviewer.AutoMerge, prefix+".reviewer.autoMerge", issues)
 		}
 	}
 	if roles.Fixer != nil {
@@ -633,6 +645,27 @@ func isValidFixerAuthorFilter(filter FixerAuthorFilter) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func isValidReviewerAutoMergeStrategy(strategy ReviewerAutoMergeStrategy) bool {
+	switch strategy {
+	case ReviewerAutoMergeStrategySquash, ReviewerAutoMergeStrategyMerge, ReviewerAutoMergeStrategyRebase:
+		return true
+	default:
+		return false
+	}
+}
+
+func validatePartialReviewerAutoMerge(partial PartialReviewerAutoMergeConfig, path string, issues *[]ValidationIssue) {
+	if partial.Strategy != nil && !isValidReviewerAutoMergeStrategy(*partial.Strategy) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".strategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerAutoMergeStrategySquash, ReviewerAutoMergeStrategyMerge, ReviewerAutoMergeStrategyRebase)})
+	}
+	if partial.TransientRetries != nil && *partial.TransientRetries < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".transientRetries", Message: "must be a positive integer"})
+	}
+	if partial.Scope != nil && *partial.Scope != ReviewerAutoMergeScopeLooperOnly {
+		*issues = append(*issues, ValidationIssue{Path: path + ".scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
 	}
 }
 

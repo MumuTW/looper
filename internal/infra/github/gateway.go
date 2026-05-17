@@ -175,6 +175,29 @@ type PullRequestHeadAndAuthor struct {
 	Author  string
 }
 
+type RepositorySettingsInput struct {
+	Repo string
+	CWD  string
+}
+
+type RepositorySettings struct {
+	AllowSquashMerge bool
+	AllowMergeCommit bool
+	AllowRebaseMerge bool
+	AllowAutoMerge   bool
+}
+
+type BranchProtectionInput struct {
+	Repo   string
+	Branch string
+	CWD    string
+}
+
+type BranchProtection struct {
+	Enabled           bool
+	HasRequiredChecks bool
+}
+
 type IssueSummary struct {
 	Number            int64
 	Title             string
@@ -1064,6 +1087,58 @@ func (g *Gateway) GetRepositoryPermission(ctx context.Context, input RepositoryP
 		return "", err
 	}
 	return strings.ToLower(strings.TrimSpace(asString(row["permission"]))), nil
+}
+
+func (g *Gateway) GetRepositorySettings(ctx context.Context, input RepositorySettingsInput) (RepositorySettings, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s", repo)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return RepositorySettings{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return RepositorySettings{}, err
+	}
+	return RepositorySettings{
+		AllowSquashMerge: asBool(row["allow_squash_merge"]),
+		AllowMergeCommit: asBool(row["allow_merge_commit"]),
+		AllowRebaseMerge: asBool(row["allow_rebase_merge"]),
+		AllowAutoMerge:   asBool(row["allow_auto_merge"]),
+	}, nil
+}
+
+func (g *Gateway) GetBranchProtection(ctx context.Context, input BranchProtectionInput) (BranchProtection, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/branches/%s/protection", repo, encodeURIComponent(input.Branch))}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		if shellErr, ok := err.(*shell.CommandExecutionError); ok && strings.Contains(strings.ToLower(shellErr.Result.Stderr), "404") {
+			return BranchProtection{}, nil
+		}
+		return BranchProtection{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return BranchProtection{}, err
+	}
+	requiredStatusChecks, _ := row["required_status_checks"].(map[string]any)
+	hasRequiredChecks := false
+	if requiredStatusChecks != nil {
+		if len(toObjectSlice(requiredStatusChecks["checks"])) > 0 {
+			hasRequiredChecks = true
+		}
+		if contexts, ok := requiredStatusChecks["contexts"].([]any); ok && len(contexts) > 0 {
+			hasRequiredChecks = true
+		}
+	}
+	return BranchProtection{Enabled: true, HasRequiredChecks: hasRequiredChecks}, nil
 }
 
 func compactIssueAssignees(values []string) []string {

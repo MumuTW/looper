@@ -113,6 +113,20 @@ const (
 	ReviewerReviewEventRequestChanges ReviewerReviewEvent = "REQUEST_CHANGES"
 )
 
+type ReviewerAutoMergeStrategy string
+
+const (
+	ReviewerAutoMergeStrategySquash ReviewerAutoMergeStrategy = "squash"
+	ReviewerAutoMergeStrategyMerge  ReviewerAutoMergeStrategy = "merge"
+	ReviewerAutoMergeStrategyRebase ReviewerAutoMergeStrategy = "rebase"
+)
+
+type ReviewerAutoMergeScope string
+
+const (
+	ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
+)
+
 type NotificationSoundLevel string
 
 const (
@@ -307,6 +321,14 @@ type ReviewerThreadResolutionConfig struct {
 	MaxThreadsPerRun            int                                 `json:"maxThreadsPerRun"`
 }
 
+type ReviewerAutoMergeConfig struct {
+	Enabled                 bool                      `json:"enabled"`
+	Strategy                ReviewerAutoMergeStrategy `json:"strategy"`
+	RequireBranchProtection bool                      `json:"requireBranchProtection"`
+	TransientRetries        int                       `json:"transientRetries"`
+	Scope                   ReviewerAutoMergeScope    `json:"scope"`
+}
+
 type IssueRoleTriggersConfig struct {
 	Labels                     []string  `json:"labels"`
 	LabelMode                  LabelMode `json:"labelMode"`
@@ -359,6 +381,7 @@ type WorkerRoleConfig struct {
 type ReviewerRoleConfig struct {
 	Discovery    ReviewerRoleDiscoveryConfig `json:"discovery"`
 	Behavior     ReviewerConfig              `json:"behavior"`
+	AutoMerge    ReviewerAutoMergeConfig     `json:"autoMerge"`
 	Instructions string                      `json:"instructions,omitempty"`
 }
 
@@ -720,6 +743,14 @@ type PartialReviewerThreadResolutionConfig struct {
 	MaxThreadsPerRun            *int                                 `json:"maxThreadsPerRun,omitempty"`
 }
 
+type PartialReviewerAutoMergeConfig struct {
+	Enabled                 *bool                      `json:"enabled,omitempty"`
+	Strategy                *ReviewerAutoMergeStrategy `json:"strategy,omitempty"`
+	RequireBranchProtection *bool                      `json:"requireBranchProtection,omitempty"`
+	TransientRetries        *int                       `json:"transientRetries,omitempty"`
+	Scope                   *ReviewerAutoMergeScope    `json:"scope,omitempty"`
+}
+
 type PartialInstructionsConfig struct {
 	Enabled  *bool `json:"enabled,omitempty"`
 	MaxBytes *int  `json:"maxBytes,omitempty"`
@@ -839,6 +870,7 @@ type PartialWorkerRoleConfig struct {
 type PartialReviewerRoleConfig struct {
 	Discovery    *PartialReviewerRoleDiscoveryConfig `json:"discovery,omitempty"`
 	Behavior     *PartialReviewerConfig              `json:"behavior,omitempty"`
+	AutoMerge    *PartialReviewerAutoMergeConfig     `json:"autoMerge,omitempty"`
 	Instructions *string                             `json:"instructions,omitempty"`
 
 	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`

@@ -871,8 +871,29 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	if partial.Behavior != nil {
 		mergeReviewerConfig(&config.Behavior, *partial.Behavior)
 	}
+	if partial.AutoMerge != nil {
+		mergeReviewerAutoMergeConfig(&config.AutoMerge, *partial.AutoMerge)
+	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
+	}
+}
+
+func mergeReviewerAutoMergeConfig(config *ReviewerAutoMergeConfig, partial PartialReviewerAutoMergeConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.Strategy != nil {
+		config.Strategy = *partial.Strategy
+	}
+	if partial.RequireBranchProtection != nil {
+		config.RequireBranchProtection = *partial.RequireBranchProtection
+	}
+	if partial.TransientRetries != nil {
+		config.TransientRetries = *partial.TransientRetries
+	}
+	if partial.Scope != nil {
+		config.Scope = *partial.Scope
 	}
 }
 

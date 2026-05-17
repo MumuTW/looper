@@ -74,8 +74,11 @@ type Service struct {
 	DB                         *sql.DB
 	Repos                      *storage.Repositories
 	Logger                     bootstrap.Logger
+	Config                     config.Config
 	Now                        func() time.Time
 	DetectRepo                 DetectRepoFunc
+	GetRepositorySettings      GetRepositorySettingsFunc
+	GetBranchProtection        GetBranchProtectionFunc
 	ListWorktrees              ListWorktreesFunc
 	ListOpenPullRequests       ListOpenPullRequestsFunc
 	CapturePullRequestSnapshot CapturePullRequestSnapshotFunc
@@ -170,6 +173,10 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		} else if detected != "" {
 			repo = &detected
 		}
+	}
+
+	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, s.Config); err != nil {
+		return AddResult{}, err
 	}
 
 	nowISO := currentISO(s.Now)
@@ -332,6 +339,9 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 		baseBranch := cfg.Defaults.BaseBranch
 		if project.BaseBranch != nil {
 			baseBranch = *project.BaseBranch
+		}
+		if err := s.validateReviewerAutoMergeForProject(ctx, project.ID, repo, baseBranch, cfg); err != nil {
+			return err
 		}
 
 		createdAt := nowISO

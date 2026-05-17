@@ -225,6 +225,13 @@ func DefaultConfig(cwd string) (Config, error) {
 						MaxThreadsPerRun:            10,
 					},
 				},
+				AutoMerge: ReviewerAutoMergeConfig{
+					Enabled:                 false,
+					Strategy:                ReviewerAutoMergeStrategySquash,
+					RequireBranchProtection: true,
+					TransientRetries:        3,
+					Scope:                   ReviewerAutoMergeScopeLooperOnly,
+				},
 			},
 			Fixer: FixerRoleConfig{
 				AutoDiscovery: true,

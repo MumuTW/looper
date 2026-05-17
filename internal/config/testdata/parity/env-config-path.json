@@ -253,6 +253,13 @@
           }
         },
         "reviewer": {
+          "autoMerge": {
+            "enabled": false,
+            "requireBranchProtection": true,
+            "scope": "looper-only",
+            "strategy": "squash",
+            "transientRetries": 3
+          },
           "behavior": {
             "loop": {
               "enabledByDefault": true,

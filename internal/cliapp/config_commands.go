@@ -71,6 +71,17 @@ var configFieldRegistry = map[string]configField{
 	}, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerRole(p).AutoDiscovery
 	}),
+	"roles.reviewer.autoMerge.enabled": boolFieldWithAlias("roles.reviewer.autoMerge.enabled", "", "", "roles-reviewer-auto-merge-enabled", "reviewer-auto-merge-enabled", func(c config.Config) any { return c.Roles.Reviewer.AutoMerge.Enabled }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerAutoMerge(p).Enabled
+	}),
+	"roles.reviewer.autoMerge.strategy": reviewerAutoMergeStrategyField(),
+	"roles.reviewer.autoMerge.requireBranchProtection": boolFieldWithAlias("roles.reviewer.autoMerge.requireBranchProtection", "", "", "roles-reviewer-auto-merge-require-branch-protection", "reviewer-auto-merge-require-branch-protection", func(c config.Config) any { return c.Roles.Reviewer.AutoMerge.RequireBranchProtection }, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerAutoMerge(p).RequireBranchProtection
+	}),
+	"roles.reviewer.autoMerge.transientRetries": positiveIntField("roles.reviewer.autoMerge.transientRetries", "", "roles-reviewer-auto-merge-transient-retries", func(c config.Config) any { return c.Roles.Reviewer.AutoMerge.TransientRetries }, func(p *config.PartialConfig) **int {
+		return &ensurePartialReviewerAutoMerge(p).TransientRetries
+	}),
+	"roles.reviewer.autoMerge.scope": reviewerAutoMergeScopeField(),
 	"roles.reviewer.autoDiscovery": reviewerDiscoveryBoolFieldWithAlias("roles.reviewer.autoDiscovery", "LOOPER_ROLES_REVIEWER_AUTO_DISCOVERY", "LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY", "", "", func(c config.Config) any { return c.Roles.Reviewer.Discovery.AutoDiscovery }, func(p *config.PartialConfig) **bool {
 		return &ensurePartialReviewerRoleDiscovery(p).AutoDiscovery
 	}, func(p *config.PartialConfig) **bool {
@@ -1252,6 +1263,30 @@ func openPRStrategyField() configField {
 	}}
 }
 
+func reviewerAutoMergeStrategyField() configField {
+	return configField{key: "roles.reviewer.autoMerge.strategy", valueType: "string", flag: "roles-reviewer-auto-merge-strategy", flagAlias: "reviewer-auto-merge-strategy", get: func(c config.Config) any { return c.Roles.Reviewer.AutoMerge.Strategy }, set: func(p *config.PartialConfig, raw string) error {
+		value := config.ReviewerAutoMergeStrategy(strings.TrimSpace(raw))
+		switch value {
+		case config.ReviewerAutoMergeStrategySquash, config.ReviewerAutoMergeStrategyMerge, config.ReviewerAutoMergeStrategyRebase:
+			ensurePartialReviewerAutoMerge(p).Strategy = &value
+			return nil
+		default:
+			return fmt.Errorf("invalid value for roles.reviewer.autoMerge.strategy: must be one of: %s, %s, %s", config.ReviewerAutoMergeStrategySquash, config.ReviewerAutoMergeStrategyMerge, config.ReviewerAutoMergeStrategyRebase)
+		}
+	}, unset: func(p *config.PartialConfig) { ensurePartialReviewerAutoMerge(p).Strategy = nil }}
+}
+
+func reviewerAutoMergeScopeField() configField {
+	return configField{key: "roles.reviewer.autoMerge.scope", valueType: "string", flag: "roles-reviewer-auto-merge-scope", flagAlias: "reviewer-auto-merge-scope", get: func(c config.Config) any { return c.Roles.Reviewer.AutoMerge.Scope }, set: func(p *config.PartialConfig, raw string) error {
+		value := config.ReviewerAutoMergeScope(strings.TrimSpace(raw))
+		if value != config.ReviewerAutoMergeScopeLooperOnly {
+			return fmt.Errorf("invalid value for roles.reviewer.autoMerge.scope: must be %s", config.ReviewerAutoMergeScopeLooperOnly)
+		}
+		ensurePartialReviewerAutoMerge(p).Scope = &value
+		return nil
+	}, unset: func(p *config.PartialConfig) { ensurePartialReviewerAutoMerge(p).Scope = nil }}
+}
+
 func reviewerReviewEventField(key, env, envAlias, flag, flagAlias string, get func(config.Config) any, target func(*config.PartialConfig) **config.ReviewerReviewEvent) configField {
 	return configField{key: key, valueType: "string", env: env, envAlias: envAlias, flag: flag, flagAlias: flagAlias, get: get, set: func(p *config.PartialConfig, raw string) error {
 		value := config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(raw)))
@@ -1409,6 +1444,14 @@ func ensurePartialReviewerRoleDiscovery(partial *config.PartialConfig) *config.P
 	return reviewer.Discovery
 }
 
+func ensurePartialReviewerAutoMerge(partial *config.PartialConfig) *config.PartialReviewerAutoMergeConfig {
+	reviewer := ensurePartialReviewerRole(partial)
+	if reviewer.AutoMerge == nil {
+		reviewer.AutoMerge = &config.PartialReviewerAutoMergeConfig{}
+	}
+	return reviewer.AutoMerge
+}
+
 func ensurePartialReviewerRoleTriggers(partial *config.PartialConfig) *config.PartialReviewerRoleTriggersConfig {
 	reviewer := ensurePartialReviewerRole(partial)
 	if reviewer.Triggers == nil {
@@ -1533,6 +1576,16 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 		return partial.Roles != nil && partial.Roles.Worker != nil && partial.Roles.Worker.Triggers != nil && partial.Roles.Worker.Triggers.RequireAssigneeCurrentUser != nil
 	case "roles.reviewer.discovery.autoDiscovery", "roles.reviewer.autoDiscovery":
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && ((partial.Roles.Reviewer.Discovery != nil && partial.Roles.Reviewer.Discovery.AutoDiscovery != nil) || partial.Roles.Reviewer.AutoDiscovery != nil)
+	case "roles.reviewer.autoMerge.enabled":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.AutoMerge != nil && partial.Roles.Reviewer.AutoMerge.Enabled != nil
+	case "roles.reviewer.autoMerge.strategy":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.AutoMerge != nil && partial.Roles.Reviewer.AutoMerge.Strategy != nil
+	case "roles.reviewer.autoMerge.requireBranchProtection":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.AutoMerge != nil && partial.Roles.Reviewer.AutoMerge.RequireBranchProtection != nil
+	case "roles.reviewer.autoMerge.transientRetries":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.AutoMerge != nil && partial.Roles.Reviewer.AutoMerge.TransientRetries != nil
+	case "roles.reviewer.autoMerge.scope":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.AutoMerge != nil && partial.Roles.Reviewer.AutoMerge.Scope != nil
 	case "roles.reviewer.instructions":
 		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Instructions != nil
 	case "roles.reviewer.discovery.triggers.includeDrafts", "roles.reviewer.triggers.includeDrafts":

@@ -320,6 +320,65 @@ func TestGetPullRequestHeadSHA(t *testing.T) {
 	}
 }
 
+func TestGetRepositorySettings(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"allow_squash_merge":true,"allow_merge_commit":false,"allow_rebase_merge":true,"allow_auto_merge":true}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	settings, err := gateway.GetRepositorySettings(context.Background(), RepositorySettingsInput{Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("GetRepositorySettings() error = %v", err)
+	}
+	if !settings.AllowSquashMerge || settings.AllowMergeCommit || !settings.AllowRebaseMerge || !settings.AllowAutoMerge {
+		t.Fatalf("GetRepositorySettings() = %#v, want decoded repo settings", settings)
+	}
+}
+
+func TestGetBranchProtection(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/branches/main/protection" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"required_status_checks":{"checks":[{"context":"ci"}]}}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	protection, err := gateway.GetBranchProtection(context.Background(), BranchProtectionInput{Repo: "acme/looper", Branch: "main"})
+	if err != nil {
+		t.Fatalf("GetBranchProtection() error = %v", err)
+	}
+	if !protection.Enabled || !protection.HasRequiredChecks {
+		t.Fatalf("GetBranchProtection() = %#v, want enabled protection with required checks", protection)
+	}
+}
+
+func TestGetBranchProtectionReturnsEmptyOnMissingProtection(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		return shell.Result{Stderr: "HTTP 404: Not Found"}, &shell.CommandExecutionError{Result: shell.Result{Stderr: "HTTP 404: Not Found"}}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	protection, err := gateway.GetBranchProtection(context.Background(), BranchProtectionInput{Repo: "acme/looper", Branch: "main"})
+	if err != nil {
+		t.Fatalf("GetBranchProtection() error = %v", err)
+	}
+	if protection.Enabled || protection.HasRequiredChecks {
+		t.Fatalf("GetBranchProtection() = %#v, want no protection", protection)
+	}
+}
+
 func TestGetPullRequestHeadAndAuthorUsesNarrowPRView(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
