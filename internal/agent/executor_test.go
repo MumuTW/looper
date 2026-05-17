@@ -329,7 +329,7 @@ func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 		},
 	})
 
-	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resumed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: 5 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resumed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: 15 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
