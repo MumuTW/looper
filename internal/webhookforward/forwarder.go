@@ -717,7 +717,7 @@ func repoFromProjectMetadata(metadataJSON *string) string {
 }
 
 func workKeyString(key workKey) string {
-	return fmt.Sprintf("%s|%s|%s|%d|%s", key.ProjectID, strings.ToLower(key.Repo), key.ObjectType, key.Number, strings.ToLower(key.Branch))
+	return fmt.Sprintf("%s|%s|%s|%d|%s", key.ProjectID, strings.ToLower(key.Repo), key.ObjectType, key.Number, key.Branch)
 }
 
 func copyLanes(lanes map[Lane]struct{}) map[Lane]struct{} {

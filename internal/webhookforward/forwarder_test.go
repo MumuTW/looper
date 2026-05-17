@@ -321,6 +321,31 @@ func TestForwardRoutesPushToBaseBranchFixerDiscovery(t *testing.T) {
 	fixerRunner.assertBaseBranchCount(t, "project_1", "acme/looper", "main", 1)
 }
 
+func TestForwardPreservesBranchCaseInBaseBranchWorkKeys(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	fixerRunner := newFakeTargetedRunner(make(chan struct{}))
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: newFakeTargetedRunner(nil), Fixer: targetedFixerAdapter{runner: fixerRunner}, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "push-case-1", EventType: "push", Payload: []byte(`{"ref":"refs/heads/Release","repository":{"full_name":"acme/looper"}}`)}); err != nil {
+		t.Fatalf("Forward(Release) error = %v", err)
+	}
+	fixerRunner.waitForCall(t, 1)
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "push-case-2", EventType: "push", Payload: []byte(`{"ref":"refs/heads/release","repository":{"full_name":"acme/looper"}}`)}); err != nil {
+		t.Fatalf("Forward(release) error = %v", err)
+	}
+
+	close(fixerRunner.block)
+	fixerRunner.waitForCalls(t, 2)
+	fixerRunner.assertBaseBranchCount(t, "project_1", "acme/looper", "Release", 1)
+	fixerRunner.assertBaseBranchCount(t, "project_1", "acme/looper", "release", 1)
+	stats := forwarder.Stats()
+	if stats.QueueCoalesced != 0 {
+		t.Fatalf("QueueCoalesced = %d, want 0", stats.QueueCoalesced)
+	}
+}
+
 type fakeTargetedRunner struct {
 	mu                   sync.Mutex
 	block                chan struct{}
@@ -387,7 +412,11 @@ func (f *fakeTargetedRunner) run(projectID, repo string, prNumber int64) (review
 func (f *fakeTargetedRunner) runBaseBranch(projectID, repo, baseBranch string) error {
 	f.mu.Lock()
 	f.calls = append(f.calls, targetedCall{ProjectID: projectID, Repo: repo, BaseBranch: baseBranch})
+	block := f.block
 	f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	return nil
 }
 
