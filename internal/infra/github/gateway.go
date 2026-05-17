@@ -1119,7 +1119,7 @@ func (g *Gateway) GetBranchProtection(ctx context.Context, input BranchProtectio
 	}
 	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
-		if shellErr, ok := err.(*shell.CommandExecutionError); ok && strings.Contains(strings.ToLower(shellErr.Result.Stderr), "404") {
+		if IsNotFoundError(err) {
 			return BranchProtection{}, nil
 		}
 		return BranchProtection{}, err

@@ -37,7 +37,7 @@ func TestExtract(t *testing.T) {
 		},
 		{
 			name:      "malformed lines are tolerated",
-			issueBody: "## Acceptance criteria\n- [] missing space\n* [x] valid\n- criterion without checkbox",
+			issueBody: "## Acceptance criteria\nPlease convert this list before merging.\n- [] missing space\n* [x] valid\n- criterion without checkbox",
 			want:      []AcceptanceCriterion{"missing space", "valid", "criterion without checkbox"},
 		},
 		{

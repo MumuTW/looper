@@ -164,9 +164,10 @@ func parseCriterionLine(line string) (string, bool) {
 	if trimmed == "" {
 		return "", false
 	}
-	if strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "*") {
-		trimmed = strings.TrimSpace(trimmed[1:])
+	if !strings.HasPrefix(trimmed, "-") && !strings.HasPrefix(trimmed, "*") {
+		return "", false
 	}
+	trimmed = strings.TrimSpace(trimmed[1:])
 	trimmed = trimCheckboxPrefix(trimmed)
 	if trimmed == "" {
 		return "", false

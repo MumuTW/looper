@@ -379,6 +379,24 @@ func TestGetBranchProtectionReturnsEmptyOnMissingProtection(t *testing.T) {
 	}
 }
 
+func TestGetBranchProtectionReturnsEmptyOnMissingProtectionFromStdout(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		result := shell.Result{Stdout: `{"message":"Branch not protected","documentation_url":"https://docs.github.com/rest/branches/branch-protection#get-branch-protection","status":"404"}`}
+		return result, &shell.CommandExecutionError{Message: "Command exited with code 1: stdout: HTTP 404: Not Found", Result: result}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	protection, err := gateway.GetBranchProtection(context.Background(), BranchProtectionInput{Repo: "acme/looper", Branch: "main"})
+	if err != nil {
+		t.Fatalf("GetBranchProtection() error = %v", err)
+	}
+	if protection.Enabled || protection.HasRequiredChecks {
+		t.Fatalf("GetBranchProtection() = %#v, want no protection", protection)
+	}
+}
+
 func TestGetPullRequestHeadAndAuthorUsesNarrowPRView(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
