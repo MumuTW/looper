@@ -225,7 +225,7 @@ func filterPullRequests(prs []PullRequestSummary, input ListOpenPullRequestsInpu
 		if author != "" && !strings.EqualFold(strings.TrimSpace(pr.Author), author) {
 			continue
 		}
-		if baseRefName != "" && !strings.EqualFold(strings.TrimSpace(pr.BaseRefName), baseRefName) {
+		if baseRefName != "" && strings.TrimSpace(pr.BaseRefName) != baseRefName {
 			continue
 		}
 		if len(labels) > 0 && !hasAllLabels(pr.Labels, labels) {
