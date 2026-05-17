@@ -68,11 +68,11 @@ func Extract(issueBody string) []AcceptanceCriterion {
 	for _, rawLine := range lines {
 		trimmed := strings.TrimSpace(rawLine)
 
-		if strings.HasPrefix(trimmed, "## ") {
-			if isAcceptanceCriteriaHeading(trimmed) {
-				inSection = true
-				continue
-			}
+		if isAcceptanceCriteriaHeading(trimmed) {
+			inSection = true
+			continue
+		}
+		if isMarkdownHeading(trimmed) {
 			if inSection {
 				break
 			}
@@ -164,15 +164,7 @@ func parseCriterionLine(line string) (string, bool) {
 	if strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "*") {
 		trimmed = strings.TrimSpace(trimmed[1:])
 	}
-	trimmed = strings.TrimPrefix(trimmed, "[ ]")
-	trimmed = strings.TrimPrefix(trimmed, "[x]")
-	trimmed = strings.TrimPrefix(trimmed, "[X]")
-	trimmed = strings.TrimSpace(trimmed)
-	if strings.HasPrefix(trimmed, "[") {
-		if idx := strings.Index(trimmed, "]"); idx >= 0 && idx+1 < len(trimmed) {
-			trimmed = strings.TrimSpace(trimmed[idx+1:])
-		}
-	}
+	trimmed = trimCheckboxPrefix(trimmed)
 	if trimmed == "" {
 		return "", false
 	}
@@ -180,7 +172,38 @@ func parseCriterionLine(line string) (string, bool) {
 }
 
 func isAcceptanceCriteriaHeading(line string) bool {
-	heading := strings.TrimSpace(strings.TrimPrefix(line, "## "))
+	heading, ok := markdownHeadingText(line)
+	if !ok {
+		return false
+	}
 	heading = strings.TrimSpace(strings.TrimRight(heading, ":;.!?"))
 	return strings.EqualFold(heading, "acceptance criteria")
+}
+
+func isMarkdownHeading(line string) bool {
+	_, ok := markdownHeadingText(line)
+	return ok
+}
+
+func markdownHeadingText(line string) (string, bool) {
+	if line == "" || line[0] != '#' {
+		return "", false
+	}
+	level := 0
+	for level < len(line) && line[level] == '#' {
+		level++
+	}
+	if level == 0 || level > 6 || level >= len(line) || line[level] != ' ' {
+		return "", false
+	}
+	return strings.TrimSpace(line[level+1:]), true
+}
+
+func trimCheckboxPrefix(line string) string {
+	for _, prefix := range []string{"[ ]", "[x]", "[X]", "[]"} {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(line[len(prefix):])
+		}
+	}
+	return strings.TrimSpace(line)
 }

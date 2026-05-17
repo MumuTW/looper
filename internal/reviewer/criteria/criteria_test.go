@@ -21,6 +21,11 @@ func TestExtract(t *testing.T) {
 			want:      []AcceptanceCriterion{"first criterion"},
 		},
 		{
+			name:      "acceptance criteria heading allows nested heading levels",
+			issueBody: "### Acceptance Criteria\n- [ ] first criterion\n\n### Notes\nignored",
+			want:      []AcceptanceCriterion{"first criterion"},
+		},
+		{
 			name:      "missing section returns empty list",
 			issueBody: "## Summary\n- [ ] not here",
 			want:      []AcceptanceCriterion{},
@@ -29,6 +34,11 @@ func TestExtract(t *testing.T) {
 			name:      "malformed lines are tolerated",
 			issueBody: "## Acceptance criteria\n- [] missing space\n* [x] valid\n- criterion without checkbox",
 			want:      []AcceptanceCriterion{"missing space", "valid", "criterion without checkbox"},
+		},
+		{
+			name:      "preserves leading markdown links in criteria",
+			issueBody: "## Acceptance criteria\n- [ ] [Spec](https://example.com) is updated",
+			want:      []AcceptanceCriterion{"[Spec](https://example.com) is updated"},
 		},
 	}
 
