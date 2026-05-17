@@ -29,6 +29,7 @@ func TestDecide(t *testing.T) {
 		wantDecision AutoMergeDecision
 	}{
 		{name: "full pass", pr: basePR, cfg: baseConfig, protection: baseProtection, settings: baseSettings, wantDecision: OptInWithStrategy(config.ReviewerAutoMergeStrategySquash)},
+		{name: "mixed case looper label", pr: PRSnapshot{Labels: []string{"Looper:worker-ready"}, HasTrackedIssueLink: true}, cfg: baseConfig, protection: baseProtection, settings: baseSettings, wantDecision: OptInWithStrategy(config.ReviewerAutoMergeStrategySquash)},
 		{name: "label only", pr: PRSnapshot{Labels: []string{"looper:worker-ready"}}, cfg: baseConfig, protection: baseProtection, settings: baseSettings, wantDecision: RefuseWithReason(RefusalReasonScope)},
 		{name: "tracked issue only", pr: PRSnapshot{HasTrackedIssueLink: true}, cfg: baseConfig, protection: baseProtection, settings: baseSettings, wantDecision: RefuseWithReason(RefusalReasonScope)},
 		{name: "no branch protection", pr: basePR, cfg: baseConfig, protection: BranchProtectionSnapshot{}, settings: baseSettings, wantDecision: RefuseWithReason(RefusalReasonNoBranchProtection)},

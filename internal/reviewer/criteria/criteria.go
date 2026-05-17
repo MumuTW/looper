@@ -67,10 +67,9 @@ func Extract(issueBody string) []AcceptanceCriterion {
 
 	for _, rawLine := range lines {
 		trimmed := strings.TrimSpace(rawLine)
-		lower := strings.ToLower(trimmed)
 
 		if strings.HasPrefix(trimmed, "## ") {
-			if lower == "## acceptance criteria" {
+			if isAcceptanceCriteriaHeading(trimmed) {
 				inSection = true
 				continue
 			}
@@ -178,4 +177,10 @@ func parseCriterionLine(line string) (string, bool) {
 		return "", false
 	}
 	return trimmed, true
+}
+
+func isAcceptanceCriteriaHeading(line string) bool {
+	heading := strings.TrimSpace(strings.TrimPrefix(line, "## "))
+	heading = strings.TrimSpace(strings.TrimRight(heading, ":;.!?"))
+	return strings.EqualFold(heading, "acceptance criteria")
 }

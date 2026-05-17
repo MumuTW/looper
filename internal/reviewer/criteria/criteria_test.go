@@ -16,6 +16,11 @@ func TestExtract(t *testing.T) {
 			want:      []AcceptanceCriterion{"first criterion", "second criterion"},
 		},
 		{
+			name:      "acceptance criteria heading allows trailing punctuation",
+			issueBody: "## Acceptance Criteria:\n- [ ] first criterion\n\n## Notes\nignored",
+			want:      []AcceptanceCriterion{"first criterion"},
+		},
+		{
 			name:      "missing section returns empty list",
 			issueBody: "## Summary\n- [ ] not here",
 			want:      []AcceptanceCriterion{},

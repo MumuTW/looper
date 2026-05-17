@@ -67,7 +67,7 @@ func Decide(pr PRSnapshot, autoMergeConfig config.ReviewerAutoMergeConfig, prote
 
 func hasLooperLabel(labels []string) bool {
 	for _, label := range labels {
-		if strings.HasPrefix(strings.TrimSpace(label), "looper:") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(label)), "looper:") {
 			return true
 		}
 	}
