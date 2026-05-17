@@ -91,6 +91,7 @@ type TargetedReviewer interface {
 
 type TargetedFixer interface {
 	DiscoverPullRequest(context.Context, fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error)
+	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
 }
 
 type Options struct {
@@ -116,6 +117,7 @@ type workKey struct {
 	Repo       string
 	ObjectType string
 	Number     int64
+	Branch     string
 }
 
 type workMetadata struct {
@@ -136,8 +138,17 @@ type routedDelivery struct {
 	repo       string
 	objectType string
 	number     int64
+	branch     string
 	action     string
 	lanes      map[Lane]struct{}
+}
+
+type pushEnvelope struct {
+	Ref        string `json:"ref"`
+	Deleted    bool   `json:"deleted"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
 }
 
 type pullRequestEnvelope struct {
@@ -333,6 +344,7 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 		}
 		matched++
 		key := workKey{ProjectID: project.ID, Repo: repo, ObjectType: routed.objectType, Number: routed.number}
+		key.Branch = routed.branch
 		candidates = append(candidates, candidate{key: key, lanes: lanes})
 		itemKey := workKeyString(key)
 		item, exists := f.works[itemKey]
@@ -491,6 +503,10 @@ func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem)
 		if f.fixer == nil {
 			return fmt.Errorf("fixer targeted discovery is not configured")
 		}
+		if key.ObjectType == "base_branch" {
+			_, err := f.fixer.DiscoverPullRequestsForBaseBranchUpdate(ctx, fixer.BaseBranchDiscoveryInput{ProjectID: key.ProjectID, Repo: key.Repo, BaseRefName: key.Branch})
+			return err
+		}
 		if _, err := f.fixer.DiscoverPullRequest(ctx, fixer.TargetedDiscoveryInput{ProjectID: key.ProjectID, Repo: key.Repo, PRNumber: key.Number}); err != nil {
 			return err
 		}
@@ -577,6 +593,22 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
 		}
 		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", number: envelope.PullRequest.Number, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+	case "push":
+		var envelope pushEnvelope
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return routedDelivery{}, false, fmt.Errorf("decode push webhook: %w", err)
+		}
+		if envelope.Deleted {
+			return routedDelivery{}, false, nil
+		}
+		if strings.TrimSpace(envelope.Repository.FullName) == "" {
+			return routedDelivery{}, false, errors.New("push webhook missing repository")
+		}
+		branch := strings.TrimPrefix(strings.TrimSpace(envelope.Ref), "refs/heads/")
+		if branch == "" || branch == strings.TrimSpace(envelope.Ref) {
+			return routedDelivery{}, false, nil
+		}
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "base_branch", branch: branch, action: "push", lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
 	default:
 		return routedDelivery{}, false, nil
 	}
@@ -607,7 +639,7 @@ func repoFromProjectMetadata(metadataJSON *string) string {
 }
 
 func workKeyString(key workKey) string {
-	return fmt.Sprintf("%s|%s|%s|%d", key.ProjectID, strings.ToLower(key.Repo), key.ObjectType, key.Number)
+	return fmt.Sprintf("%s|%s|%s|%d|%s", key.ProjectID, strings.ToLower(key.Repo), key.ObjectType, key.Number, strings.ToLower(key.Branch))
 }
 
 func copyLanes(lanes map[Lane]struct{}) map[Lane]struct{} {

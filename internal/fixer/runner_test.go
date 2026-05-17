@@ -256,6 +256,68 @@ func TestDiscoverPullRequestSkipsIneligiblePullRequest(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsForBaseBranchUpdateTargetsMatchingBaseBranch(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		listOpen: []PullRequestSummary{
+			{Number: 42, State: "OPEN", BaseRefName: "main", HeadSHA: "head-42"},
+			{Number: 43, State: "OPEN", BaseRefName: "release", HeadSHA: "head-43"},
+		},
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-42", BaseRefName: "main", HasConflicts: true}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequestsForBaseBranchUpdate(context.Background(), BaseBranchDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", BaseRefName: "main"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequestsForBaseBranchUpdate() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want only PR #42", result.QueueItems)
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].BaseRefName != "main" {
+		t.Fatalf("list calls = %#v, want base branch filtered discovery", github.listCalls)
+	}
+}
+
+func TestDiscoverPullRequestsForBaseBranchUpdateAppliesLabelFilters(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		listOpenByLabel: map[string][]PullRequestSummary{
+			"bug":    {{Number: 42, State: "OPEN", BaseRefName: "main", HeadSHA: "head-42", Labels: []string{"bug"}}},
+			"urgent": {{Number: 43, State: "OPEN", BaseRefName: "main", HeadSHA: "head-43", Labels: []string{"urgent"}}},
+		},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "head-42", BaseRefName: "main", HasConflicts: true, Labels: []string{"bug"}},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43", BaseRefName: "main", HasConflicts: true, Labels: []string{"urgent"}},
+		},
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	labels := []string{"bug", "urgent"}
+	labelMode := config.LabelModeAny
+	autoDiscovery := true
+	authorFilter := config.FixerAuthorFilterAny
+	cfg.Projects = append(cfg.Projects, config.ProjectRefConfig{ID: "project_1", RepoPath: t.TempDir(), Roles: &config.PartialRoleConfigs{Fixer: &config.PartialFixerRoleConfig{AutoDiscovery: &autoDiscovery, Triggers: &config.PartialFixerRoleTriggersConfig{AuthorFilter: &authorFilter, Labels: &labels, LabelMode: &labelMode}}}})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, FixAllPullRequests: true})
+
+	result, err := runner.DiscoverPullRequestsForBaseBranchUpdate(context.Background(), BaseBranchDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", BaseRefName: "main"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequestsForBaseBranchUpdate() error = %v", err)
+	}
+	if len(result.QueueItems) != 2 {
+		t.Fatalf("len(QueueItems) = %d, want 2", len(result.QueueItems))
+	}
+	for _, call := range github.listCalls {
+		if call.BaseRefName != "main" {
+			t.Fatalf("list call = %#v, want base branch filter on every query", call)
+		}
+	}
+}
+
 func TestDiscoverPullRequestReusesExistingActiveQueueItem(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -4546,6 +4608,15 @@ func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 		return append([]PullRequestSummary(nil), f.listOpenByLabel[input.Label]...), nil
 	}
 	result := append([]PullRequestSummary(nil), f.listOpen...)
+	if strings.TrimSpace(input.BaseRefName) != "" {
+		filtered := result[:0]
+		for _, pr := range result {
+			if strings.EqualFold(strings.TrimSpace(pr.BaseRefName), strings.TrimSpace(input.BaseRefName)) {
+				filtered = append(filtered, pr)
+			}
+		}
+		result = filtered
+	}
 	for index := range result {
 		if result[index].Author == "" {
 			result[index].Author = firstNonEmpty(f.currentUser, "looper")

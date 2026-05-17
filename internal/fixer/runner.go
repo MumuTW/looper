@@ -135,12 +135,13 @@ type FixItem struct {
 }
 
 type PullRequestSummary struct {
-	Number  int64
-	State   string
-	IsDraft bool
-	Labels  []string
-	HeadSHA string
-	Author  string
+	Number      int64
+	State       string
+	IsDraft     bool
+	Labels      []string
+	BaseRefName string
+	HeadSHA     string
+	Author      string
 }
 
 type PullRequestDetail struct {
@@ -161,12 +162,13 @@ type PullRequestDetail struct {
 }
 
 type ListOpenPullRequestsInput struct {
-	Repo   string
-	CWD    string
-	Limit  int
-	Author string
-	Label  string
-	Labels []string
+	Repo        string
+	CWD         string
+	Limit       int
+	Author      string
+	Label       string
+	Labels      []string
+	BaseRefName string
 }
 
 type ViewPullRequestInput struct {
@@ -498,6 +500,13 @@ type TargetedDiscoveryInput struct {
 	Repo      string
 	PRNumber  int64
 	Snapshot  *githubinfra.DiscoverySnapshot
+}
+
+type BaseBranchDiscoveryInput struct {
+	ProjectID   string
+	Repo        string
+	BaseRefName string
+	Snapshot    *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -1080,7 +1089,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, currentUser, policy)
+	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, currentUser, policy, "")
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -1148,6 +1157,55 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	return result, nil
 }
 
+func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, input BaseBranchDiscoveryInput) (DiscoveryResult, error) {
+	baseRefName := strings.TrimSpace(input.BaseRefName)
+	if baseRefName == "" {
+		return DiscoveryResult{}, fmt.Errorf("baseRefName is required")
+	}
+	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
+	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || r.repos.Locks == nil {
+		return DiscoveryResult{}, fmt.Errorf("fixer repositories are not configured")
+	}
+	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if project == nil {
+		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
+	}
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !policy.AutoDiscovery {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	currentUser := ""
+	if policy.AuthorFilter != config.FixerAuthorFilterAny {
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		currentUser = strings.TrimSpace(currentUser)
+	}
+	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, 0, currentUser, policy, baseRefName)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	result := DiscoveryResult{}
+	for _, pr := range openPRs {
+		if !r.pullRequestEligibleForDiscovery(ctx, pr, input.Repo, currentUser, policy) {
+			result.Skipped++
+			continue
+		}
+		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
+			return DiscoveryResult{}, err
+		}
+	}
+	return result, nil
+}
+
 func appendDiscoveryQueueItem(items *[]storage.QueueItemRecord, item storage.QueueItemRecord) {
 	for i, existing := range *items {
 		if existing.ID == item.ID {
@@ -1159,20 +1217,20 @@ func appendDiscoveryQueueItem(items *[]storage.QueueItemRecord, item storage.Que
 }
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int, author string) ([]PullRequestSummary, error) {
-	return r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, author, r.discoveryPolicy)
+	return r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, author, r.discoveryPolicy, "")
 }
 
-func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context, repo, cwd string, limit int, author string, policy DiscoveryPolicy) ([]PullRequestSummary, error) {
+func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context, repo, cwd string, limit int, author string, policy DiscoveryPolicy, baseRefName string) ([]PullRequestSummary, error) {
 	labels := prQueryLabels(policy.Labels)
 	effectiveLimit := defaultDiscoveryLimit(limit)
 	if len(labels) == 0 {
-		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author})
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, BaseRefName: baseRefName})
 	}
 	if len(labels) == 1 {
-		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Label: labels[0]})
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Label: labels[0], BaseRefName: baseRefName})
 	}
 	if policy.LabelMode == config.LabelModeAll {
-		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Labels: labels})
+		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Author: author, Labels: labels, BaseRefName: baseRefName})
 	}
 
 	result := []PullRequestSummary{}
@@ -1181,7 +1239,7 @@ func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context,
 		if len(result) >= effectiveLimit {
 			break
 		}
-		prs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: effectiveLimit, Author: author, Label: label})
+		prs, err := r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: effectiveLimit, Author: author, Label: label, BaseRefName: baseRefName})
 		if err != nil {
 			return nil, err
 		}

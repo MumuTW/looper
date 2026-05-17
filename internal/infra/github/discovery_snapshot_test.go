@@ -19,8 +19,8 @@ func TestDiscoverySnapshotCachesPerProjectDataAndTickLoginByCWD(t *testing.T) {
 		case strings.Contains(cmd, "pr list"):
 			counts["pr_list"]++
 			return shell.Result{Stdout: `[
-				{"number":1,"title":"PR 1","state":"OPEN","labels":[{"name":"bug"}],"headRefOid":"sha-1","author":{"login":"octo"}},
-				{"number":2,"title":"PR 2","state":"OPEN","labels":[{"name":"feature"}],"headRefOid":"sha-2","author":{"login":"other"}}
+				{"number":1,"title":"PR 1","state":"OPEN","labels":[{"name":"bug"}],"baseRefName":"main","headRefOid":"sha-1","author":{"login":"octo"}},
+				{"number":2,"title":"PR 2","state":"OPEN","labels":[{"name":"feature"}],"baseRefName":"release","headRefOid":"sha-2","author":{"login":"other"}}
 			]`}, nil
 		case strings.Contains(cmd, "issue list"):
 			counts["issue_list"]++
@@ -66,6 +66,13 @@ func TestDiscoverySnapshotCachesPerProjectDataAndTickLoginByCWD(t *testing.T) {
 	}
 	if len(prs) != 1 || prs[0].Number != 1 {
 		t.Fatalf("ListOpenPullRequests(author) = %#v, want only PR 1", prs)
+	}
+	prs, err = gateway.ListOpenPullRequests(projectOneCtx, ListOpenPullRequestsInput{Repo: "acme/looper", CWD: "/repo-one", Limit: 10, BaseRefName: "main"})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests(base) error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 1 {
+		t.Fatalf("ListOpenPullRequests(base) = %#v, want only PR 1", prs)
 	}
 	issues, err := gateway.ListOpenIssues(projectOneCtx, ListOpenIssuesInput{Repo: "acme/looper", CWD: "/repo-one", Limit: 10, Assignee: "octo", Label: "ready"})
 	if err != nil {
