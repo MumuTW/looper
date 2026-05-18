@@ -103,6 +103,39 @@ func TestServiceAddProjectValidatesReviewerAutoMerge(t *testing.T) {
 	}
 }
 
+func TestServiceAddProjectAllowsUnknownBaseBranchWithoutProtectionRequirement(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	repo := "acme/looper"
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.AutoMerge.Enabled = true
+	cfg.Roles.Reviewer.AutoMerge.RequireBranchProtection = false
+	cfg.Defaults.BaseBranch = ""
+
+	service := &Service{
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		Config: cfg,
+		Now:    func() time.Time { return time.Date(2026, time.May, 1, 0, 0, 0, 0, time.UTC) },
+		GetRepositorySettings: func(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+			return githubinfra.RepositorySettings{AllowSquashMerge: true, AllowMergeCommit: true, AllowRebaseMerge: true, AllowAutoMerge: true}, nil
+		},
+	}
+
+	result, err := service.AddProject(context.Background(), AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", Repo: &repo})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v, want nil", err)
+	}
+	if result.Project.BaseBranch != nil && *result.Project.BaseBranch != "" {
+		t.Fatalf("AddProject() base branch = %q, want empty", *result.Project.BaseBranch)
+	}
+}
+
 func TestServiceSyncConfiguredValidatesReviewerAutoMerge(t *testing.T) {
 	t.Parallel()
 
@@ -132,5 +165,45 @@ func TestServiceSyncConfiguredValidatesReviewerAutoMerge(t *testing.T) {
 	err = service.SyncConfigured(context.Background(), cfg, time.Date(2026, time.May, 1, 0, 0, 0, 0, time.UTC))
 	if err == nil || !strings.Contains(err.Error(), "default branch protection is missing or has no required checks") {
 		t.Fatalf("SyncConfigured() error = %v, want branch protection validation failure", err)
+	}
+}
+
+func TestServiceSyncConfiguredAllowsUnknownBaseBranchWithoutProtectionRequirement(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   func() time.Time { return time.Date(2026, time.May, 1, 0, 0, 0, 0, time.UTC) },
+		GetRepositorySettings: func(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+			return githubinfra.RepositorySettings{AllowSquashMerge: true, AllowMergeCommit: true, AllowRebaseMerge: true, AllowAutoMerge: true}, nil
+		},
+	}
+	repoName := "acme/looper"
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.AutoMerge.Enabled = true
+	cfg.Roles.Reviewer.AutoMerge.RequireBranchProtection = false
+	cfg.Defaults.BaseBranch = ""
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper"}}
+
+	service.DetectRepo = func(context.Context, string) (string, error) { return repoName, nil }
+	err = service.SyncConfigured(context.Background(), cfg, time.Date(2026, time.May, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("SyncConfigured() error = %v, want nil", err)
+	}
+	project, err := repos.Projects.GetByID(context.Background(), "looper")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if project == nil {
+		t.Fatalf("Projects.GetByID() = nil, want stored project")
+	}
+	if project.BaseBranch != nil && *project.BaseBranch != "" {
+		t.Fatalf("SyncConfigured() base branch = %q, want empty", *project.BaseBranch)
 	}
 }

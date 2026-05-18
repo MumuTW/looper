@@ -29,13 +29,6 @@ func (s *Service) validateReviewerAutoMergeForProject(ctx context.Context, proje
 	if repoName == "" {
 		return reviewerAutoMergeValidationError(projectID, "GitHub repo is unknown")
 	}
-	branch := strings.TrimSpace(baseBranch)
-	if branch == "" {
-		branch = strings.TrimSpace(cfg.Defaults.BaseBranch)
-	}
-	if branch == "" {
-		return reviewerAutoMergeValidationError(repoName, "default branch is unknown")
-	}
 	settings, err := s.GetRepositorySettings(ctx, githubinfra.RepositorySettingsInput{Repo: repoName})
 	if err != nil {
 		return fmt.Errorf("read repo settings for %s: %w", repoName, err)
@@ -52,6 +45,13 @@ func (s *Service) validateReviewerAutoMergeForProject(ctx context.Context, proje
 		return reviewerAutoMergeValidationError(repoName, "GitHub repo auto-merge is disabled")
 	}
 	if autoMergeCfg.RequireBranchProtection {
+		branch := strings.TrimSpace(baseBranch)
+		if branch == "" {
+			branch = strings.TrimSpace(cfg.Defaults.BaseBranch)
+		}
+		if branch == "" {
+			return reviewerAutoMergeValidationError(repoName, "default branch is unknown")
+		}
 		protection, err := s.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: repoName, Branch: branch})
 		if err != nil {
 			return fmt.Errorf("read branch protection for %s@%s: %w", repoName, branch, err)
