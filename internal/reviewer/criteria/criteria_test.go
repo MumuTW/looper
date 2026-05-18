@@ -71,8 +71,11 @@ func TestExtract(t *testing.T) {
 func TestVerify(t *testing.T) {
 	t.Parallel()
 
-	diff := PRDiff{Files: []DiffFile{{Path: "internal/reviewer/automerge/decision.go", Patch: "@@"}}}
-	passEvidence := []Evidence{{FilePath: "internal/reviewer/automerge/decision.go", StartLine: 10, EndLine: 20}}
+	diff := PRDiff{Files: []DiffFile{{
+		Path:  "internal/reviewer/automerge/decision.go",
+		Patch: "@@ -10,2 +10,3 @@\n context\n-old decision\n+new decision\n+follow up\n",
+	}}}
+	passEvidence := []Evidence{{FilePath: "internal/reviewer/automerge/decision.go", StartLine: 10, EndLine: 12}}
 
 	tests := []struct {
 		name         string
@@ -158,6 +161,16 @@ func TestVerifyRejectsInvalidVerifierOutput(t *testing.T) {
 	}})
 	if err == nil || err.Error() != `criterion "criterion 2" returned pass evidence outside the diff` {
 		t.Fatalf("Verify() error = %v, want evidence-outside-diff failure", err)
+	}
+
+	_, err = Verify([]AcceptanceCriterion{"criterion 3"}, PRDiff{Files: []DiffFile{{
+		Path:  "changed.go",
+		Patch: "@@ -10,2 +10,2 @@\n-old\n+new\n keep\n",
+	}}}, fixtureVerifier{responses: map[AcceptanceCriterion]CriterionAssessment{
+		"criterion 3": {Verdict: VerdictPass, Justification: "matched diff", Evidence: []Evidence{{FilePath: "changed.go", StartLine: 50, EndLine: 51}}},
+	}})
+	if err == nil || err.Error() != `criterion "criterion 3" returned pass evidence outside the diff` {
+		t.Fatalf("Verify() error = %v, want evidence-outside-hunks failure", err)
 	}
 }
 

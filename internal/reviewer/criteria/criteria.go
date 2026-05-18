@@ -3,6 +3,8 @@ package criteria
 import (
 	"fmt"
 	"strings"
+
+	"github.com/nexu-io/looper/internal/diffanchor"
 )
 
 type AcceptanceCriterion string
@@ -143,16 +145,32 @@ func validateAssessment(criterion AcceptanceCriterion, assessment CriterionAsses
 		if strings.TrimSpace(evidence.FilePath) == "" || evidence.StartLine < 1 || evidence.EndLine < evidence.StartLine {
 			return fmt.Errorf("criterion %q returned invalid evidence", criterion)
 		}
-		if !diffContainsFile(diff, evidence.FilePath) {
+		if !diffContainsEvidence(diff, evidence) {
 			return fmt.Errorf("criterion %q returned pass evidence outside the diff", criterion)
 		}
 	}
 	return nil
 }
 
-func diffContainsFile(diff PRDiff, filePath string) bool {
+func diffContainsEvidence(diff PRDiff, evidence Evidence) bool {
 	for _, file := range diff.Files {
-		if file.Path == filePath {
+		if file.Path != evidence.FilePath {
+			continue
+		}
+
+		parsed := diffanchor.Parse(strings.Join([]string{
+			fmt.Sprintf("diff --git a/%s b/%s", file.Path, file.Path),
+			fmt.Sprintf("--- a/%s", file.Path),
+			fmt.Sprintf("+++ b/%s", file.Path),
+			file.Patch,
+		}, "\n"))
+		if parsed.Validate(diffanchor.Anchor{
+			Path:      evidence.FilePath,
+			StartLine: int64(evidence.StartLine),
+			StartSide: diffanchor.SideRight,
+			Line:      int64(evidence.EndLine),
+			Side:      diffanchor.SideRight,
+		}).Valid {
 			return true
 		}
 	}
