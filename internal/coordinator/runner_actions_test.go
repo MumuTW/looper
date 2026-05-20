@@ -688,7 +688,7 @@ func newCoordinatorFixture(t *testing.T) coordinatorFixture {
 	}
 	cfg.Disclosure.Enabled = true
 	cfg.Disclosure.Channels.IssueComment = true
-	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, subIssueErr: map[int64]error{}}
+	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, branchProtection: map[string]githubinfra.BranchProtection{}}
 	runner := New(Options{Repos: repos, GitHub: github, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}})
 	return coordinatorFixture{runner: runner, github: github, cfg: &cfg, projectID: projectID, now: now, coord: coord}
 }
@@ -731,6 +731,10 @@ type stubCoordinatorGitHub struct {
 	addedLabels         []githubinfra.IssueLabelsInput
 	removedLabels       []githubinfra.IssueLabelsInput
 	assigned            []githubinfra.IssueAssigneesInput
+	prDetails           map[int64]githubinfra.PullRequestDetail
+	prCheckRuns         map[string]githubinfra.PullRequestCheckRuns
+	branchProtection    map[string]githubinfra.BranchProtection
+	addedPRLabels       []githubinfra.PullRequestLabelsInput
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -834,6 +838,33 @@ func (s *stubCoordinatorGitHub) UpdateIssueComment(_ context.Context, input gith
 	s.updatedBodies = append(s.updatedBodies, input.Body)
 	return nil
 }
+func (s *stubCoordinatorGitHub) DeleteIssueComment(_ context.Context, input githubinfra.DeleteIssueCommentInput) error {
+	s.ops = append(s.ops, "delete-comment")
+	return nil
+}
+func (s *stubCoordinatorGitHub) AddPullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
+	s.ops = append(s.ops, "add-pr:"+joinLabels(input.Labels))
+	s.addedPRLabels = append(s.addedPRLabels, input)
+	return nil
+}
+func (s *stubCoordinatorGitHub) ViewPullRequestMergeWatch(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	if s.prDetails == nil {
+		return githubinfra.PullRequestDetail{}, nil
+	}
+	return s.prDetails[input.PRNumber], nil
+}
+func (s *stubCoordinatorGitHub) ListPullRequestCheckRuns(_ context.Context, input githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error) {
+	if s.prCheckRuns == nil {
+		return githubinfra.PullRequestCheckRuns{}, nil
+	}
+	return s.prCheckRuns[input.Ref], nil
+}
+func (s *stubCoordinatorGitHub) GetBranchProtection(_ context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	if s.branchProtection == nil {
+		return githubinfra.BranchProtection{}, nil
+	}
+	return s.branchProtection[input.Branch], nil
+}
 
 func TestRunnerHumanDispatchBlockedByPostsFailureComment(t *testing.T) {
 	t.Parallel()
@@ -853,6 +884,95 @@ func TestRunnerHumanDispatchBlockedByPostsFailureComment(t *testing.T) {
 	assertOrderedOps(t, fixture.github.ops, []string{"create-comment", "react:confused:11"})
 	if len(fixture.github.createdBodies) != 1 || !containsAll(fixture.github.createdBodies[0], dispatchFailureCommentMarker, "#9", "open") {
 		t.Fatalf("createdBodies = %v, want blocked_by failure comment", fixture.github.createdBodies)
+	}
+}
+
+func TestRunnerMergeWatchConflictRoutesToFixerAndUpdatesMarker(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Fixer.Triggers.Labels = []string{"looper:fix"}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1,
+		Title:  "Bug",
+		Author: "octo",
+		Labels: []string{"triaged"},
+		Comments: []githubinfra.CommentInfo{{
+			ID:        44,
+			Author:    "looper",
+			Body:      mergeWatchCommentBody(fixture.cfg, 77, "abc123", 3, nil, nil, "old summary"),
+			CreatedAt: fixture.now.Format(time.RFC3339),
+		}},
+		CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339),
+	}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number:         77,
+		Body:           "Closes #1",
+		State:          "open",
+		HeadSHA:        "abc123",
+		BaseRefName:    "main",
+		Labels:         []string{"looper:plan"},
+		Mergeable:      boolPtr(false),
+		MergeableState: "dirty",
+		AutoMerge:      &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
+	}
+	fixture.github.timeline[1] = []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 77, "html_url": "https://github.com/acme/looper/pull/77"}}}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"add-pr:looper:fix", "update-comment"})
+	if len(fixture.github.addedPRLabels) != 1 || fixture.github.addedPRLabels[0].PRNumber != 77 {
+		t.Fatalf("addedPRLabels = %#v, want PR #77 label add", fixture.github.addedPRLabels)
+	}
+	if len(fixture.github.updatedBodies) != 1 || !containsAll(fixture.github.updatedBodies[0], "Coordinator merge-watch routed PR #77 to Fixer for conflict.", mergeWatchCommentMarkerPrefix, "pr=77", "head_sha=abc123") {
+		t.Fatalf("updatedBodies = %v, want conflict summary marker update", fixture.github.updatedBodies)
+	}
+	if len(fixture.github.createdBodies) != 0 {
+		t.Fatalf("createdBodies = %v, want no new comments", fixture.github.createdBodies)
+	}
+}
+
+func TestRunnerMergeWatchHumanDisabledRemovesMarkerOnly(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Fixer.Triggers.Labels = []string{"looper:fix"}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1,
+		Title:  "Bug",
+		Author: "octo",
+		Labels: []string{"triaged"},
+		Comments: []githubinfra.CommentInfo{{
+			ID:        45,
+			Author:    "looper",
+			Body:      mergeWatchCommentBody(fixture.cfg, 78, "def456", 3, nil, nil, "watching"),
+			CreatedAt: fixture.now.Format(time.RFC3339),
+		}},
+		CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339),
+	}
+	fixture.github.prDetails[78] = githubinfra.PullRequestDetail{
+		Number:         78,
+		Body:           "Closes #1",
+		State:          "open",
+		HeadSHA:        "def456",
+		BaseRefName:    "main",
+		Labels:         []string{"looper:plan"},
+		Mergeable:      boolPtr(true),
+		MergeableState: "clean",
+	}
+	fixture.github.timeline[1] = []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 78, "html_url": "https://github.com/acme/looper/pull/78"}}}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.ops) != 1 || fixture.github.ops[0] != "delete-comment" {
+		t.Fatalf("ops = %v, want only delete-comment", fixture.github.ops)
+	}
+	if len(fixture.github.addedPRLabels) != 0 || len(fixture.github.updatedBodies) != 0 || len(fixture.github.createdBodies) != 0 || len(fixture.github.addedLabels) != 0 || len(fixture.github.removedLabels) != 0 {
+		t.Fatalf("unexpected mutations: addedPRLabels=%v updatedBodies=%v createdBodies=%v addedLabels=%v removedLabels=%v", fixture.github.addedPRLabels, fixture.github.updatedBodies, fixture.github.createdBodies, fixture.github.addedLabels, fixture.github.removedLabels)
 	}
 }
 
@@ -991,6 +1111,21 @@ func containsAll(body string, parts ...string) bool {
 
 func intToString(value int64) string {
 	return strconv.FormatInt(value, 10)
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func mergeWatchCommentBody(cfg *config.Config, prNumber int64, headSHA string, retries int, firstUnknownAt, nextRetryAt *time.Time, summary string) string {
+	body := strings.TrimSpace(summary)
+	line := "<!-- looper:coordinator:merge-watch pr=" + strconv.FormatInt(prNumber, 10) + " head_sha=" + headSHA + " retries=" + strconv.Itoa(retries) + " first_unknown_at=" + mergeWatchTime(firstUnknownAt) + " next_retry_at=" + mergeWatchTime(nextRetryAt) + " -->"
+	if body != "" {
+		body += "\n\n" + line
+	} else {
+		body = line
+	}
+	return stampedCoordinatorBody(cfg, body)
 }
 
 func stampedCoordinatorBody(cfg *config.Config, body string) string {
