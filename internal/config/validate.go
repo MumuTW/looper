@@ -148,6 +148,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Daemon.WorkingDirectory == "" {
 		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
+	validateWorktreeCleanupConfig(config.Daemon.WorktreeCleanup, "daemon.worktreeCleanup", &issues)
 
 	if strings.TrimSpace(config.Package.Distribution) == "" {
 		issues = append(issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})
@@ -306,6 +307,19 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	return nil
+}
+
+func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, issues *[]ValidationIssue) {
+	interval, err := time.ParseDuration(config.Interval)
+	if err != nil || interval <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".interval", Message: "must be a positive duration"})
+	}
+	if config.RetentionDays < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".retentionDays", Message: "must be an integer >= 0"})
+	}
+	if config.MaxPerTick < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxPerTick", Message: "must be a positive integer"})
+	}
 }
 
 func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]ValidationIssue) {

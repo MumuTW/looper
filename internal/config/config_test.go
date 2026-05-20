@@ -54,6 +54,30 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestWorktreeCleanupConfigDefaultsAndPartialOverride(t *testing.T) {
+	enabled := true
+	maxPerTick := 3
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Daemon: &PartialDaemonConfig{
+			WorktreeCleanup: &PartialWorktreeCleanupConfig{
+				Enabled:    &enabled,
+				MaxPerTick: &maxPerTick,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	cleanup := cfg.Daemon.WorktreeCleanup
+	if !cleanup.Enabled {
+		t.Fatal("WorktreeCleanup.Enabled = false, want override true")
+	}
+	if cleanup.Interval != "24h" || cleanup.RetentionDays != 7 || cleanup.MaxPerTick != 3 || cleanup.IncludeOrphans || !cleanup.DryRun {
+		t.Fatalf("WorktreeCleanup = %#v, want defaults with maxPerTick override", cleanup)
+	}
+}
+
 func TestLoadFileUsesDefaultsWhenConfigFileIsTopLevelNull(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
@@ -2028,8 +2052,9 @@ func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 	}
 
 	loaded, err := LoadFile(LoadFileOptions{
-		CWD:      t.TempDir(),
-		LookPath: fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+		CWD:       t.TempDir(),
+		LookupEnv: emptyEnvLookup,
+		LookPath:  fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
 	})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
@@ -2904,6 +2929,30 @@ func TestValidateDaemonSupervisionConfig(t *testing.T) {
 			}
 			assertValidationIssue(t, validationErr, tt.wantPath, tt.wantError)
 		})
+	}
+}
+
+func TestValidateRejectsInvalidWorktreeCleanupConfig(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Daemon.WorktreeCleanup.Interval = "soon"
+	cfg.Daemon.WorktreeCleanup.RetentionDays = -1
+	cfg.Daemon.WorktreeCleanup.MaxPerTick = 0
+
+	err = Validate(cfg)
+	if err == nil {
+		t.Fatal("Validate() error = nil, want validation error")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+	}
+	for _, path := range []string{"daemon.worktreeCleanup.interval", "daemon.worktreeCleanup.retentionDays", "daemon.worktreeCleanup.maxPerTick"} {
+		if !hasValidationIssue(validationErr.Issues, path) {
+			t.Fatalf("validation issues = %#v, want %s", validationErr.Issues, path)
+		}
 	}
 }
 
