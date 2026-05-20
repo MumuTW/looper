@@ -149,6 +149,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
 
+	validateWorktreeCleanupConfig(config.Daemon.WorktreeCleanup, "daemon.worktreeCleanup", &issues)
+
 	if strings.TrimSpace(config.Package.Distribution) == "" {
 		issues = append(issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})
 	}
@@ -351,6 +353,23 @@ func validateAgentTimeoutSeconds(seconds int, path string, issues *[]ValidationI
 	maxSeconds := int64(maxDuration / time.Second)
 	if int64(seconds) > maxSeconds {
 		*issues = append(*issues, ValidationIssue{Path: path, Message: "must fit within time.Duration when converted from seconds"})
+	}
+}
+
+func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, issues *[]ValidationIssue) {
+	interval := strings.TrimSpace(config.Interval)
+	if interval == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".interval", Message: "must be a non-empty duration string"})
+	} else if duration, err := time.ParseDuration(interval); err != nil {
+		*issues = append(*issues, ValidationIssue{Path: path + ".interval", Message: "must be a valid time.Duration string"})
+	} else if duration <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".interval", Message: "must be greater than 0"})
+	}
+	if config.RetentionDays < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".retentionDays", Message: "must be greater than or equal to 0"})
+	}
+	if config.MaxPerTick <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxPerTick", Message: "must be a positive integer"})
 	}
 }
 

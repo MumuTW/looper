@@ -2028,8 +2028,9 @@ func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 	}
 
 	loaded, err := LoadFile(LoadFileOptions{
-		CWD:      t.TempDir(),
-		LookPath: fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+		CWD:       t.TempDir(),
+		LookupEnv: emptyEnvLookup,
+		LookPath:  fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
 	})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
@@ -2897,6 +2898,107 @@ func TestValidateDaemonSupervisionConfig(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatal("Validate() error = nil, want validation error")
+			}
+			var validationErr *ConfigValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+			}
+			assertValidationIssue(t, validationErr, tt.wantPath, tt.wantError)
+		})
+	}
+}
+
+func TestNormalizeDaemonWorktreeCleanupDefaultsAndPartialOverrides(t *testing.T) {
+	t.Parallel()
+
+	retentionDays := 14
+	config, err := Normalize(t.TempDir(), PartialConfig{
+		Daemon: &PartialDaemonConfig{
+			WorktreeCleanup: &PartialWorktreeCleanupConfig{
+				RetentionDays: &retentionDays,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	if config.Daemon.WorktreeCleanup.Enabled {
+		t.Fatal("WorktreeCleanup.Enabled = true, want default false")
+	}
+	if config.Daemon.WorktreeCleanup.Interval != "1h" {
+		t.Fatalf("WorktreeCleanup.Interval = %q, want default 1h", config.Daemon.WorktreeCleanup.Interval)
+	}
+	if config.Daemon.WorktreeCleanup.RetentionDays != 14 {
+		t.Fatalf("WorktreeCleanup.RetentionDays = %d, want 14", config.Daemon.WorktreeCleanup.RetentionDays)
+	}
+	if config.Daemon.WorktreeCleanup.MaxPerTick != 10 {
+		t.Fatalf("WorktreeCleanup.MaxPerTick = %d, want default 10", config.Daemon.WorktreeCleanup.MaxPerTick)
+	}
+	if config.Daemon.WorktreeCleanup.IncludeOrphans {
+		t.Fatal("WorktreeCleanup.IncludeOrphans = true, want default false")
+	}
+	if !config.Daemon.WorktreeCleanup.DryRun {
+		t.Fatal("WorktreeCleanup.DryRun = false, want default true")
+	}
+}
+
+func TestValidateDaemonWorktreeCleanupConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		mutate    func(*Config)
+		wantPath  string
+		wantError string
+	}{
+		{
+			name: "valid zero retention",
+			mutate: func(cfg *Config) {
+				cfg.Daemon.WorktreeCleanup.RetentionDays = 0
+			},
+		},
+		{
+			name: "invalid interval",
+			mutate: func(cfg *Config) {
+				cfg.Daemon.WorktreeCleanup.Interval = "soon"
+			},
+			wantPath:  "daemon.worktreeCleanup.interval",
+			wantError: "must be a valid time.Duration string",
+		},
+		{
+			name: "negative retention",
+			mutate: func(cfg *Config) {
+				cfg.Daemon.WorktreeCleanup.RetentionDays = -1
+			},
+			wantPath:  "daemon.worktreeCleanup.retentionDays",
+			wantError: "must be greater than or equal to 0",
+		},
+		{
+			name: "invalid max per tick",
+			mutate: func(cfg *Config) {
+				cfg.Daemon.WorktreeCleanup.MaxPerTick = 0
+			},
+			wantPath:  "daemon.worktreeCleanup.maxPerTick",
+			wantError: "must be a positive integer",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			tt.mutate(&cfg)
+			err = Validate(cfg)
+			if tt.wantPath == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
 			}
 			var validationErr *ConfigValidationError
 			if !errors.As(err, &validationErr) {
