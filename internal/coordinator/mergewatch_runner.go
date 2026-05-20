@@ -182,6 +182,9 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	mergeableState := strings.ToLower(strings.TrimSpace(detail.MergeableState))
 	protection, err := r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: repo, Branch: detail.BaseRefName, CWD: cwd})
 	if err != nil {
+		if isTransientMergeWatchError(err) {
+			return mergeWatchPartialSnapshot(repo, issueNumber, prNumber, detail, currentLogin), &mergewatch.TemporaryError{SuggestedDelay: time.Minute}, nil
+		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
 	requiredChecks := map[string]struct{}{}
@@ -232,6 +235,21 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		MergeableState:         mergeableState,
 		RequiredChecks:         checks,
 	}, nil, nil
+}
+
+func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail, currentLogin string) mergewatch.PRSnapshot {
+	return mergewatch.PRSnapshot{
+		Repo:                   repo,
+		PRNumber:               prNumber,
+		IssueNumber:            issueNumber,
+		HeadSHA:                detail.HeadSHA,
+		Open:                   strings.EqualFold(detail.State, "open"),
+		AutoMergeEnabled:       detail.AutoMerge != nil,
+		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),
+		HasLooperLabel:         hasLooperLabel(detail.Labels),
+		Mergeable:              detail.Mergeable,
+		MergeableState:         strings.ToLower(strings.TrimSpace(detail.MergeableState)),
+	}
 }
 
 func mergeWatchBaseMarker(marker *mergeWatchComment, snapshot mergewatch.PRSnapshot, fallbackRetries int) mergewatch.PriorWatchMarker {

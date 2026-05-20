@@ -190,15 +190,16 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	activeLoaded := filterLoadedIssues(loaded, mergeWatchRetriggers)
 
-	deps, err := r.buildDependencyState(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, roleCfg.Dependencies)
+	deps, err := r.buildDependencyState(ctx, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, roleCfg.Dependencies)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	if err := r.applyDependencyActions(ctx, input.Repo, project.RepoPath, triageCfg, deps); err != nil {
 		return DiscoveryResult{}, err
 	}
-	if err := r.applyDispatches(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, deps); err != nil {
+	if err := r.applyDispatches(ctx, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, deps); err != nil {
 		return DiscoveryResult{}, err
 	}
 
@@ -233,6 +234,20 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	}
 	return DiscoveryResult{Ticked: true}, nil
+}
+
+func filterLoadedIssues(loaded []loadedIssue, skipped map[int64]struct{}) []loadedIssue {
+	if len(skipped) == 0 {
+		return loaded
+	}
+	filtered := make([]loadedIssue, 0, len(loaded))
+	for _, item := range loaded {
+		if _, skip := skipped[item.issue.Number]; skip {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func (r *Runner) buildDispatchDependencyGraph(ctx context.Context, repo, cwd string, depsCfg config.CoordinatorDependenciesConfig, dispatchCfg dispatch.Config, loaded []loadedCoordinatorIssue, now time.Time) (*depgraph.DependencyGraph, error) {

@@ -712,31 +712,32 @@ func (stubCoordinatorInspector) Inspect(context.Context, string, triage.Issue) (
 }
 
 type stubCoordinatorGitHub struct {
-	issues              []githubinfra.IssueSummary
-	details             map[int64]githubinfra.IssueDetail
-	comments            map[int64][][]githubinfra.CommentInfo
-	timeline            map[int64][]map[string]any
-	blockedBy           map[int64][]githubinfra.DependencyIssue
-	subIssues           map[int64][]githubinfra.DependencyIssue
-	subIssueErr         map[int64]error
-	blockedByReads      int
-	blockedByIssueReads int
-	permissionErr       error
-	ops                 []string
-	createdBodies       []string
-	updatedBodies       []string
-	commentReads        map[int64]int
-	failAddLabels       map[string]error
-	failBlockedByIssues map[int64][]error
-	addedLabels         []githubinfra.IssueLabelsInput
-	removedLabels       []githubinfra.IssueLabelsInput
-	assigned            []githubinfra.IssueAssigneesInput
-	prDetails           map[int64]githubinfra.PullRequestDetail
-	failPRDetails       map[int64][]error
-	prCheckRuns         map[string]githubinfra.PullRequestCheckRuns
-	failPRCheckRuns     map[string]error
-	branchProtection    map[string]githubinfra.BranchProtection
-	addedPRLabels       []githubinfra.PullRequestLabelsInput
+	issues               []githubinfra.IssueSummary
+	details              map[int64]githubinfra.IssueDetail
+	comments             map[int64][][]githubinfra.CommentInfo
+	timeline             map[int64][]map[string]any
+	blockedBy            map[int64][]githubinfra.DependencyIssue
+	subIssues            map[int64][]githubinfra.DependencyIssue
+	subIssueErr          map[int64]error
+	blockedByReads       int
+	blockedByIssueReads  int
+	permissionErr        error
+	ops                  []string
+	createdBodies        []string
+	updatedBodies        []string
+	commentReads         map[int64]int
+	failAddLabels        map[string]error
+	failBlockedByIssues  map[int64][]error
+	addedLabels          []githubinfra.IssueLabelsInput
+	removedLabels        []githubinfra.IssueLabelsInput
+	assigned             []githubinfra.IssueAssigneesInput
+	prDetails            map[int64]githubinfra.PullRequestDetail
+	failPRDetails        map[int64][]error
+	prCheckRuns          map[string]githubinfra.PullRequestCheckRuns
+	failPRCheckRuns      map[string]error
+	branchProtection     map[string]githubinfra.BranchProtection
+	failBranchProtection map[string]error
+	addedPRLabels        []githubinfra.PullRequestLabelsInput
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -872,6 +873,9 @@ func (s *stubCoordinatorGitHub) ListPullRequestCheckRuns(_ context.Context, inpu
 	return s.prCheckRuns[input.Ref], nil
 }
 func (s *stubCoordinatorGitHub) GetBranchProtection(_ context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	if err := s.failBranchProtection[input.Branch]; err != nil {
+		return githubinfra.BranchProtection{}, err
+	}
 	if s.branchProtection == nil {
 		return githubinfra.BranchProtection{}, nil
 	}
@@ -1085,6 +1089,59 @@ func TestRunnerMergeWatchPRDetailTransientErrorConsumesRetryBudget(t *testing.T)
 	}
 }
 
+func TestRunnerMergeWatchBranchProtectionTransientErrorConsumesRetryBudget(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.MergeWatch.TransientRetries = 3
+	fixture.github.failBranchProtection = map[string]error{"main": errors.New("HTTP 429 rate limit")}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1,
+		Title:  "Bug",
+		Author: "octo",
+		Labels: []string{"triaged"},
+		Comments: []githubinfra.CommentInfo{{
+			ID:        49,
+			Author:    "looper",
+			Body:      mergeWatchCommentBody(fixture.cfg, 77, "abc123", 2, nil, nil, "watching"),
+			CreatedAt: fixture.now.Format(time.RFC3339),
+		}},
+		CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339),
+	}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number:         77,
+		Body:           "Closes #1",
+		State:          "open",
+		HeadSHA:        "abc123",
+		BaseRefName:    "main",
+		Labels:         []string{"looper:plan"},
+		Mergeable:      boolPtr(true),
+		MergeableState: "blocked",
+		AutoMerge:      &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
+	}
+	fixture.github.timeline[1] = []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 77, "html_url": "https://github.com/acme/looper/pull/77"}}}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.ops) != 1 || fixture.github.ops[0] != "update-comment" {
+		t.Fatalf("ops = %v, want retry marker update only", fixture.github.ops)
+	}
+	if len(fixture.github.updatedBodies) != 1 || !containsAll(fixture.github.updatedBodies[0], "head_sha=abc123", "retries=1") {
+		t.Fatalf("updatedBodies = %v, want preserved head SHA and decremented retry budget", fixture.github.updatedBodies)
+	}
+	if len(fixture.github.removedLabels) != 0 {
+		t.Fatalf("removedLabels = %v, want no retriage cleanup on transient error", fixture.github.removedLabels)
+	}
+	if len(fixture.github.createdBodies) != 0 {
+		t.Fatalf("createdBodies = %v, want no new comments", fixture.github.createdBodies)
+	}
+	if len(fixture.github.addedPRLabels) != 0 {
+		t.Fatalf("addedPRLabels = %v, want no fixer routing on transient error", fixture.github.addedPRLabels)
+	}
+}
+
 func TestRunnerMergeWatchStatusContextsPreventMissingRequiredCheck(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t)
@@ -1128,6 +1185,58 @@ func TestRunnerMergeWatchStatusContextsPreventMissingRequiredCheck(t *testing.T)
 	}
 	if len(fixture.github.removedLabels) != 0 || len(fixture.github.createdBodies) != 0 {
 		t.Fatalf("removedLabels=%v createdBodies=%v, want watch to stay pending without retriage", fixture.github.removedLabels, fixture.github.createdBodies)
+	}
+}
+
+func TestRunnerMergeWatchRetriggerSkipsSameTickDispatch(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Roles.Coordinator.MergeWatch.MaxIndeterminateDuration = "15m"
+	firstUnknownAt := fixture.now.Add(-16 * time.Minute)
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{
+		Number: 1,
+		Title:  "Bug",
+		Author: "octo",
+		Labels: []string{"triaged", "dispatch/plan"},
+		Comments: []githubinfra.CommentInfo{{
+			ID:        50,
+			Author:    "looper",
+			Body:      mergeWatchCommentBody(fixture.cfg, 77, "abc123", 3, &firstUnknownAt, nil, "watching"),
+			CreatedAt: fixture.now.Format(time.RFC3339),
+		}},
+		CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339),
+	}
+	fixture.github.prDetails[77] = githubinfra.PullRequestDetail{
+		Number:         77,
+		Body:           "Closes #1",
+		State:          "open",
+		HeadSHA:        "abc123",
+		BaseRefName:    "main",
+		Labels:         []string{"looper:plan"},
+		Mergeable:      boolPtr(false),
+		MergeableState: "unknown",
+		AutoMerge:      &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
+	}
+	fixture.github.timeline[1] = []map[string]any{{"source": map[string]any{"issue": map[string]any{"pull_request": map[string]any{"number": 77, "html_url": "https://github.com/acme/looper/pull/77"}}}}, {"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"remove:triaged,dispatch/plan", "delete-comment"})
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 1, "triaged", "dispatch/plan"); got != 1 {
+		t.Fatalf("issue 1 remove count = %d, want 1", got)
+	}
+	if hasAssignedIssue(fixture.github.assigned, 1) {
+		t.Fatalf("assigned = %#v, want no same-tick dispatch assignment after merge-watch cleanup", fixture.github.assigned)
+	}
+	if len(fixture.github.addedLabels) != 0 {
+		t.Fatalf("addedLabels = %#v, want no same-tick dispatch labels after merge-watch cleanup", fixture.github.addedLabels)
+	}
+	if len(fixture.github.createdBodies) != 0 || len(fixture.github.updatedBodies) != 0 {
+		t.Fatalf("createdBodies=%v updatedBodies=%v, want only cleanup mutations", fixture.github.createdBodies, fixture.github.updatedBodies)
 	}
 }
 
