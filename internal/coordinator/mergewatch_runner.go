@@ -71,14 +71,14 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, repo, cwd string, is
 	}
 	if tempErr != nil {
 		snapshot.TemporaryError = tempErr
-	}
-	if !snapshot.HasLooperLabel || (snapshot.AutoMergeEnabled && !snapshot.AutoMergeOwnedByLooper) {
-		return false, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
+		if snapshot.HeadSHA == "" && marker != nil && marker.Marker.PRNumber == snapshot.PRNumber {
+			snapshot.HeadSHA = marker.Marker.HeadSHA
+		}
 	}
 	action := mergewatch.Classify(snapshot, markerState(marker), mergewatch.RetryBudget{Now: r.now().UTC(), TransientRetries: roles.Coordinator.MergeWatch.TransientRetries, MaxIndeterminateDuration: maxIndeterminateDuration})
-	baseMarker := mergewatch.PriorWatchMarker{PRNumber: snapshot.PRNumber, HeadSHA: snapshot.HeadSHA, Retries: roles.Coordinator.MergeWatch.TransientRetries}
-	if marker != nil && marker.Marker.PRNumber == snapshot.PRNumber && marker.Marker.HeadSHA == snapshot.HeadSHA {
-		baseMarker = marker.Marker
+	baseMarker := mergeWatchBaseMarker(marker, snapshot, roles.Coordinator.MergeWatch.TransientRetries)
+	if action.Kind != mergewatch.ActionTransientError && (!snapshot.HasLooperLabel || (snapshot.AutoMergeEnabled && !snapshot.AutoMergeOwnedByLooper)) {
+		return false, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
 	}
 	switch action.Kind {
 	case mergewatch.ActionMerged, mergewatch.ActionHumanDisabledAutoMerge:
@@ -201,6 +201,17 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 			checks.Failed = append(checks.Failed, checkRun.Name)
 		}
 	}
+	for _, status := range checkRuns.Statuses {
+		contextKey := strings.ToLower(strings.TrimSpace(status.Context))
+		state := strings.ToLower(strings.TrimSpace(status.State))
+		seenChecks[contextKey] = struct{}{}
+		switch {
+		case requiredCheck(requiredChecks, contextKey) && state == "pending":
+			checks.Pending = append(checks.Pending, status.Context)
+		case mergeableState == "unstable" && requiredCheck(requiredChecks, contextKey) && (state == "failure" || state == "error"):
+			checks.Failed = append(checks.Failed, status.Context)
+		}
+	}
 	for requiredName := range requiredChecks {
 		if _, ok := seenChecks[requiredName]; !ok {
 			checks.Missing = append(checks.Missing, requiredName)
@@ -221,6 +232,13 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		MergeableState:         mergeableState,
 		RequiredChecks:         checks,
 	}, nil, nil
+}
+
+func mergeWatchBaseMarker(marker *mergeWatchComment, snapshot mergewatch.PRSnapshot, fallbackRetries int) mergewatch.PriorWatchMarker {
+	if marker != nil && marker.Marker.PRNumber == snapshot.PRNumber && (snapshot.HeadSHA == "" || marker.Marker.HeadSHA == snapshot.HeadSHA) {
+		return marker.Marker
+	}
+	return mergewatch.PriorWatchMarker{PRNumber: snapshot.PRNumber, HeadSHA: snapshot.HeadSHA, Retries: fallbackRetries}
 }
 
 func markerState(marker *mergeWatchComment) *mergewatch.PriorWatchMarker {

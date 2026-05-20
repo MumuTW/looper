@@ -107,12 +107,18 @@ type PullRequestAutoMerge struct {
 type PullRequestCheckRuns struct {
 	TotalCount int
 	CheckRuns  []PullRequestCheckRun
+	Statuses   []PullRequestStatus
 }
 
 type PullRequestCheckRun struct {
 	Name       string
 	Status     string
 	Conclusion string
+}
+
+type PullRequestStatus struct {
+	Context string
+	State   string
 }
 
 type CommentInfo struct {
@@ -1321,10 +1327,37 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 	if err != nil {
 		return PullRequestCheckRuns{}, err
 	}
+	statusArgs := []string{"api", fmt.Sprintf("repos/%s/commits/%s/status", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		statusArgs = append(statusArgs, "--hostname", hostname)
+	}
+	statusResult, err := g.runGh(ctx, input.CWD, "", statusArgs...)
+	if err != nil {
+		return PullRequestCheckRuns{}, err
+	}
+	statusRow, err := decodeJSONObject(statusResult.Stdout)
+	if err != nil {
+		return PullRequestCheckRuns{}, err
+	}
 	checkRuns := toObjectSlice(row["check_runs"])
 	out := PullRequestCheckRuns{TotalCount: int(asInt64(row["total_count"])), CheckRuns: make([]PullRequestCheckRun, 0, len(checkRuns))}
 	for _, checkRun := range checkRuns {
 		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"])})
+	}
+	statuses := toObjectSlice(statusRow["statuses"])
+	out.Statuses = make([]PullRequestStatus, 0, len(statuses))
+	seenContexts := map[string]struct{}{}
+	for _, status := range statuses {
+		contextName := asString(status["context"])
+		key := strings.ToLower(strings.TrimSpace(contextName))
+		if key == "" {
+			continue
+		}
+		if _, ok := seenContexts[key]; ok {
+			continue
+		}
+		seenContexts[key] = struct{}{}
+		out.Statuses = append(out.Statuses, PullRequestStatus{Context: contextName, State: asString(status["state"])})
 	}
 	return out, nil
 }
