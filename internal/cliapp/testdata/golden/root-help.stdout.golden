@@ -25,6 +25,7 @@ Subcommands:
   pr         Pull request commands
   review     Create a reviewer task for a pull request
   fix        Create a fixer task for a pull request
+  takeover   Continuously review and fix a pull request until it merges
   feedback   Submit feedback as a GitHub issue
   ps         Show running loops
   jump       Print shell command for a loop worktree

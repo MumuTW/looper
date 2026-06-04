@@ -495,12 +495,35 @@ looper loop start --type fixer --pr owner/repo#42
 
 This is useful when you already have a PR and only want Looper to handle the review/fix cycle.
 
+### Option C: take over one PR in a single command
+
+`looper review --loop` + `looper loop start --type fixer` (Option B) requires the repo to already be a registered project, and a plain `looper project add` turns on autonomous discovery for *every* PR in that repo. When you only want Looper on a single PR — for example a contributor adopting their own PR — use `takeover`, which does the whole setup in one step and scopes Looper to just that PR:
+
+```bash
+# from inside the repo checkout
+looper takeover                 # detect the current branch's PR
+looper takeover owner/repo#42   # or name it explicitly
+looper takeover owner/repo#42 --merge   # also auto-merge once approved + green
+```
+
+`takeover`:
+
+1. installs/starts the managed daemon if needed;
+2. writes (or reuses) `~/.looper/config.json`, registering the repo as a project whose `planner` / `worker` / `fixer` / `reviewer` discovery loops are all disabled — so the daemon never picks up any *other* PR or issue in the repo;
+3. starts a continuous reviewer loop and fixer loop on the target PR (skip the fixer with `--no-fix`);
+4. with `--merge`, sets `roles.reviewer.autoMerge.enabled` for the project so the reviewer enables GitHub auto-merge once the PR is approved and checks are green.
+
+Agent selection: `takeover` reuses the vendor already in your config; otherwise it auto-detects an installed `claude` / `codex` / `opencode` CLI, prompts when the choice is ambiguous, and accepts `--agent-vendor` plus `--yes` for non-interactive runs. Auto-merge still depends on the repository allowing it (and, by default, on branch protection with required checks); when GitHub refuses, the reviewer keeps reviewing and reports why instead.
+
+To stop, run `looper ps` and `looper stop <id>` for the reviewer and fixer loops.
+
 ## 14. Quick decision guide
 
 - You have an issue but no spec yet: use `planner`
 - You have a PR that needs review: use `reviewer`
 - A PR already has review comments to address: use `fixer`
 - The spec is ready and implementation should begin: use `worker`
+- You want Looper on just one PR until it merges (no repo-wide automation): use `takeover`
 
 As a rule of thumb:
 

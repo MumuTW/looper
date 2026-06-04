@@ -90,6 +90,44 @@ Inside a registered repo, `--project` is usually optional for `review` and `work
 
 The full workflow — label conventions, assignment rules, how planner / reviewer / fixer / worker hand off — is in **[docs/users-guide.md](docs/users-guide.md)**.
 
+## Take over a single PR
+
+Want Looper to babysit *one* pull request — review it, fix review threads, and keep going until it's mergeable — without registering the whole repo for autonomous work? Run `looper takeover` from inside the checkout:
+
+```bash
+# detect the current branch's PR automatically
+looper takeover
+
+# or target an explicit PR
+looper takeover acme/repo#42
+```
+
+`takeover` is the one-command path that, behind the scenes:
+
+- installs/starts the managed `looperd` daemon if it isn't already running;
+- registers the repository **scoped to that single PR** — every autonomous discovery loop is disabled, so Looper only touches the PR you named, never the rest of the repo;
+- starts a continuous **reviewer** loop and **fixer** loop on the PR, which ping-pong until the review comes back clean;
+- with `--merge`, lets the reviewer enable GitHub auto-merge so the PR merges itself once it's approved and green.
+
+It picks your coding agent automatically when exactly one of `claude` / `codex` / `opencode` is on `PATH`, prompts when it's ambiguous, and accepts `--agent-vendor` / `--yes` for non-interactive (agent-driven) runs:
+
+```bash
+looper takeover acme/repo#42 --merge --agent-vendor claude-code
+looper takeover --yes --agent-vendor codex          # fully non-interactive
+```
+
+Requirements: `git`, an authenticated `gh`, and one supported agent CLI installed locally (the agent runs on your machine with your own credentials).
+
+### One-liner for not-yet-installed users
+
+For someone who doesn't have Looper yet, a single piped command installs the CLI and hands off to `takeover`. This is what an automation/bot can drop into a PR comment so the author can adopt the PR in one step (run it from inside the repo checkout):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/takeover.sh | sh -s -- acme/repo#42
+```
+
+Everything after `--` is forwarded to `looper takeover`, so `--merge` and `--agent-vendor` work there too.
+
 ## Agent skill
 
 Looper includes an installable agent skill for setup, status, config, daemon lifecycle, and troubleshooting guidance:
@@ -165,6 +203,7 @@ looper project add /path/to/repo
 **Start loops manually**
 
 ```bash
+looper takeover [<owner>/<repo>#<pr>] [--merge]   # adopt one PR until it merges
 looper plan   --project <id> --issue <num>
 looper review <owner>/<repo>#<pr> [--loop]
 looper work   --project <id> --issue <num>
