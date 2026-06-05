@@ -283,6 +283,104 @@ func TestResolveTakeoverTarget(t *testing.T) {
 	})
 }
 
+func TestMatchTakeovers(t *testing.T) {
+	t.Parallel()
+
+	entries := []takeoverStateEntry{
+		{Repo: "acme/looper", PRNumber: 42},
+		{Repo: "acme/other", PRNumber: 7},
+		{Repo: "fork/other", PRNumber: 7},
+	}
+
+	t.Run("all", func(t *testing.T) {
+		t.Parallel()
+		got, err := matchTakeovers(entries, "", true)
+		if err != nil || len(got) != 3 {
+			t.Fatalf("matchTakeovers(all) = %v, %v", got, err)
+		}
+	})
+
+	t.Run("qualified ref", func(t *testing.T) {
+		t.Parallel()
+		got, err := matchTakeovers(entries, "acme/looper#42", false)
+		if err != nil || len(got) != 1 || got[0].Repo != "acme/looper" {
+			t.Fatalf("matchTakeovers(qualified) = %v, %v", got, err)
+		}
+	})
+
+	t.Run("bare number unique", func(t *testing.T) {
+		t.Parallel()
+		got, err := matchTakeovers(entries, "42", false)
+		if err != nil || len(got) != 1 || got[0].PRNumber != 42 {
+			t.Fatalf("matchTakeovers(42) = %v, %v", got, err)
+		}
+	})
+
+	t.Run("bare number ambiguous", func(t *testing.T) {
+		t.Parallel()
+		if _, err := matchTakeovers(entries, "7", false); err == nil {
+			t.Fatal("matchTakeovers(7) expected ambiguity error")
+		}
+	})
+
+	t.Run("empty with multiple", func(t *testing.T) {
+		t.Parallel()
+		if _, err := matchTakeovers(entries, "", false); err == nil {
+			t.Fatal("matchTakeovers(empty, multiple) expected error")
+		}
+	})
+
+	t.Run("empty with single", func(t *testing.T) {
+		t.Parallel()
+		got, err := matchTakeovers(entries[:1], "", false)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("matchTakeovers(empty, single) = %v, %v", got, err)
+		}
+	})
+
+	t.Run("no match", func(t *testing.T) {
+		t.Parallel()
+		if _, err := matchTakeovers(entries, "acme/looper#999", false); err == nil {
+			t.Fatal("matchTakeovers(missing) expected no-match error")
+		}
+	})
+}
+
+func TestTakeoverStateRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	r := newCommandRuntime(New(Deps{HomeDir: home}), nil)
+
+	// Empty state when the file is absent.
+	st, err := r.loadTakeoverState()
+	if err != nil {
+		t.Fatalf("loadTakeoverState() error = %v", err)
+	}
+	if len(st.Takeovers) != 0 {
+		t.Fatalf("expected empty state, got %+v", st)
+	}
+
+	if err := r.recordTakeover(takeoverStateEntry{Repo: "acme/looper", PRNumber: 42, ReviewerLoopID: "loop_r", FixerLoopID: "loop_f"}); err != nil {
+		t.Fatalf("recordTakeover() error = %v", err)
+	}
+	// Re-recording the same PR updates in place rather than duplicating.
+	if err := r.recordTakeover(takeoverStateEntry{Repo: "acme/looper", PRNumber: 42, ReviewerLoopID: "loop_r2"}); err != nil {
+		t.Fatalf("recordTakeover() second error = %v", err)
+	}
+
+	st, err = r.loadTakeoverState()
+	if err != nil {
+		t.Fatalf("loadTakeoverState() reload error = %v", err)
+	}
+	if len(st.Takeovers) != 1 {
+		t.Fatalf("expected one takeover after upsert, got %+v", st.Takeovers)
+	}
+	if st.Takeovers[0].ReviewerLoopID != "loop_r2" {
+		t.Fatalf("expected updated reviewer loop id, got %q", st.Takeovers[0].ReviewerLoopID)
+	}
+}
+
 func TestEnsureTakeoverConfigDoesNotClobberExistingProjects(t *testing.T) {
 	t.Parallel()
 

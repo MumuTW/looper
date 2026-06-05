@@ -515,7 +515,15 @@ looper takeover owner/repo#42 --merge   # also auto-merge once approved + green
 
 Agent selection: `takeover` reuses the vendor already in your config; otherwise it auto-detects an installed `claude` / `codex` / `opencode` CLI, prompts when the choice is ambiguous, and accepts `--agent-vendor` plus `--yes` for non-interactive runs. Auto-merge still depends on the repository allowing it (and, by default, on branch protection with required checks); when GitHub refuses, the reviewer keeps reviewing and reports why instead.
 
-To stop, run `looper ps` and `looper stop <id>` for the reviewer and fixer loops.
+Manage and stop takeovers:
+
+```bash
+looper takeover list                 # all active takeovers + live loop status
+looper takeover stop owner/repo#42   # stop this takeover's reviewer + fixer loops
+looper takeover stop --all           # stop every takeover
+```
+
+`takeover list` / `stop` are backed by a local index at `~/.looper/takeovers.json`; stopping closes the underlying loops by id (so it works even while they are idle/waiting between commits).
 
 ## 14. Quick decision guide
 

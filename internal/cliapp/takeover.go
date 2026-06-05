@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -169,6 +170,24 @@ func (r *commandRuntime) runTakeover(ctx context.Context, cmd *cobra.Command, op
 			return takeoverResult{}, err
 		}
 		result.Fixer = fixer
+	}
+
+	entry := takeoverStateEntry{
+		Repo:        repo,
+		PRNumber:    prNumber,
+		ProjectID:   project.ID,
+		AgentVendor: string(vendor),
+		AutoMerge:   opts.Merge,
+		StartedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if result.Reviewer != nil {
+		entry.ReviewerLoopID = result.Reviewer.ID
+	}
+	if result.Fixer != nil {
+		entry.FixerLoopID = result.Fixer.ID
+	}
+	if err := r.recordTakeover(entry); err != nil {
+		result.Notes = append(result.Notes, fmt.Sprintf("could not record takeover state (%v); `looper takeover list`/`stop` may not see this run", err))
 	}
 
 	result.NextSteps = takeoverNextSteps(repo, prNumber)
@@ -596,6 +615,296 @@ func takeoverNextSteps(repo string, prNumber int64) []string {
 		fmt.Sprintf("looper pr status %s#%d", repo, prNumber),
 		"looper stop <id>",
 	}
+}
+
+// takeoverStateFile is the local index, under ~/.looper, that ties each
+// takeover to the loops it started so `takeover list` / `takeover stop` can
+// manage them without the daemon having to model "a takeover" as a first-class
+// concept.
+const takeoverStateFile = "takeovers.json"
+
+type takeoverStateEntry struct {
+	Repo           string `json:"repo"`
+	PRNumber       int64  `json:"prNumber"`
+	ProjectID      string `json:"projectId"`
+	AgentVendor    string `json:"agentVendor"`
+	AutoMerge      bool   `json:"autoMerge"`
+	ReviewerLoopID string `json:"reviewerLoopId,omitempty"`
+	FixerLoopID    string `json:"fixerLoopId,omitempty"`
+	StartedAt      string `json:"startedAt"`
+}
+
+type takeoverState struct {
+	Version   int                  `json:"version"`
+	Takeovers []takeoverStateEntry `json:"takeovers"`
+}
+
+func (r *commandRuntime) takeoverStatePath() (string, error) {
+	home, err := r.homeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".looper", takeoverStateFile), nil
+}
+
+func (r *commandRuntime) loadTakeoverState() (takeoverState, error) {
+	path, err := r.takeoverStatePath()
+	if err != nil {
+		return takeoverState{}, err
+	}
+	data, err := r.readFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return takeoverState{Version: 1}, nil
+		}
+		return takeoverState{}, err
+	}
+	var st takeoverState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return takeoverState{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if st.Version == 0 {
+		st.Version = 1
+	}
+	return st, nil
+}
+
+func (r *commandRuntime) saveTakeoverState(st takeoverState) error {
+	path, err := r.takeoverStatePath()
+	if err != nil {
+		return err
+	}
+	if err := r.mkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	st.Version = 1
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	return r.writeFile(path, append(data, '\n'), 0o644)
+}
+
+func (r *commandRuntime) recordTakeover(entry takeoverStateEntry) error {
+	st, err := r.loadTakeoverState()
+	if err != nil {
+		return err
+	}
+	st.Takeovers = upsertTakeoverEntry(st.Takeovers, entry)
+	return r.saveTakeoverState(st)
+}
+
+func upsertTakeoverEntry(entries []takeoverStateEntry, entry takeoverStateEntry) []takeoverStateEntry {
+	for i := range entries {
+		if entries[i].Repo == entry.Repo && entries[i].PRNumber == entry.PRNumber {
+			entries[i] = entry
+			return entries
+		}
+	}
+	return append(entries, entry)
+}
+
+// matchTakeovers selects the takeover entries targeted by a stop request. With
+// all=true it returns everything; an explicit fully-qualified ref matches
+// repo+number; a bare number matches a unique PR number; an empty ref matches
+// the only takeover when exactly one is recorded.
+func matchTakeovers(entries []takeoverStateEntry, ref string, all bool) ([]takeoverStateEntry, error) {
+	if all {
+		if len(entries) == 0 {
+			return nil, fmt.Errorf("no active takeovers to stop")
+		}
+		return entries, nil
+	}
+
+	if strings.TrimSpace(ref) == "" {
+		switch len(entries) {
+		case 0:
+			return nil, fmt.Errorf("no active takeovers to stop")
+		case 1:
+			return entries, nil
+		default:
+			return nil, fmt.Errorf("multiple takeovers active; pass <owner/repo>#<number> or --all")
+		}
+	}
+
+	repo, prNumber, repoQualified, err := parseOptionalPullRequestRef(ref)
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]takeoverStateEntry, 0, 1)
+	for _, entry := range entries {
+		if entry.PRNumber != prNumber {
+			continue
+		}
+		if repoQualified && entry.Repo != repo {
+			continue
+		}
+		matches = append(matches, entry)
+	}
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("no active takeover matches %s", ref)
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("%s is ambiguous across multiple repos; pass <owner/repo>#<number>", ref)
+	}
+	return matches, nil
+}
+
+func (r *commandRuntime) takeoverList(cmd *cobra.Command, args []string) error {
+	_ = args
+	ctx := cmd.Context()
+	st, err := r.loadTakeoverState()
+	if err != nil {
+		return err
+	}
+
+	statusByID := map[string]string{}
+	if payload, err := r.getJSON(ctx, "/api/v1/loops"); err == nil {
+		var data loopsListOutput
+		if json.Unmarshal(payload, &data) == nil {
+			for _, loop := range data.Items {
+				statusByID[loop.ID] = loop.Status
+			}
+		}
+	}
+
+	if getBoolFlag(cmd, "json") {
+		return writeJSON(cmd.OutOrStdout(), takeoverListPayload(st, statusByID))
+	}
+	return writeHumanTakeoverList(cmd.OutOrStdout(), st, statusByID)
+}
+
+func loopLiveStatus(statusByID map[string]string, loopID string) string {
+	if loopID == "" {
+		return "-"
+	}
+	if status, ok := statusByID[loopID]; ok {
+		return status
+	}
+	return "waiting"
+}
+
+func takeoverListPayload(st takeoverState, statusByID map[string]string) map[string]any {
+	items := make([]map[string]any, 0, len(st.Takeovers))
+	for _, entry := range st.Takeovers {
+		items = append(items, map[string]any{
+			"repo":           entry.Repo,
+			"prNumber":       entry.PRNumber,
+			"projectId":      entry.ProjectID,
+			"agentVendor":    entry.AgentVendor,
+			"autoMerge":      entry.AutoMerge,
+			"startedAt":      entry.StartedAt,
+			"reviewerLoopId": entry.ReviewerLoopID,
+			"fixerLoopId":    entry.FixerLoopID,
+			"reviewerStatus": loopLiveStatus(statusByID, entry.ReviewerLoopID),
+			"fixerStatus":    loopLiveStatus(statusByID, entry.FixerLoopID),
+		})
+	}
+	return map[string]any{"items": items}
+}
+
+func writeHumanTakeoverList(w io.Writer, st takeoverState, statusByID map[string]string) error {
+	if len(st.Takeovers) == 0 {
+		_, err := fmt.Fprintln(w, "No active takeovers.")
+		return err
+	}
+	rows := make([]tableRow, 0, len(st.Takeovers))
+	for _, entry := range st.Takeovers {
+		fixer := loopLiveStatus(statusByID, entry.FixerLoopID)
+		if entry.FixerLoopID == "" {
+			fixer = "(none)"
+		}
+		rows = append(rows, tableRow{
+			"pr":        fmt.Sprintf("%s#%d", entry.Repo, entry.PRNumber),
+			"agent":     entry.AgentVendor,
+			"autoMerge": fmt.Sprintf("%t", entry.AutoMerge),
+			"reviewer":  loopLiveStatus(statusByID, entry.ReviewerLoopID),
+			"fixer":     fixer,
+			"startedAt": entry.StartedAt,
+		})
+	}
+	printTable(w, []string{"pr", "agent", "autoMerge", "reviewer", "fixer", "startedAt"}, rows)
+	return nil
+}
+
+type takeoverStopResult struct {
+	Stopped []takeoverStopEntry `json:"stopped"`
+}
+
+type takeoverStopEntry struct {
+	Repo        string   `json:"repo"`
+	PRNumber    int64    `json:"prNumber"`
+	ClosedLoops []string `json:"closedLoops"`
+	Warnings    []string `json:"warnings,omitempty"`
+}
+
+func (r *commandRuntime) takeoverStop(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	ref := ""
+	if len(args) > 0 {
+		ref = strings.TrimSpace(args[0])
+	}
+
+	st, err := r.loadTakeoverState()
+	if err != nil {
+		return err
+	}
+	targets, err := matchTakeovers(st.Takeovers, ref, getBoolFlag(cmd, "all"))
+	if err != nil {
+		return err
+	}
+
+	result := takeoverStopResult{}
+	stopped := map[string]struct{}{}
+	for _, target := range targets {
+		entry := takeoverStopEntry{Repo: target.Repo, PRNumber: target.PRNumber}
+		for _, loopID := range []string{target.ReviewerLoopID, target.FixerLoopID} {
+			if loopID == "" {
+				continue
+			}
+			if _, err := r.postJSON(ctx, "/api/v1/runs/active/"+url.PathEscape(loopID)+"/close", nil); err != nil {
+				entry.Warnings = append(entry.Warnings, fmt.Sprintf("close %s: %v", loopID, err))
+				continue
+			}
+			entry.ClosedLoops = append(entry.ClosedLoops, loopID)
+		}
+		result.Stopped = append(result.Stopped, entry)
+		stopped[takeoverKey(target.Repo, target.PRNumber)] = struct{}{}
+	}
+
+	remaining := make([]takeoverStateEntry, 0, len(st.Takeovers))
+	for _, entry := range st.Takeovers {
+		if _, ok := stopped[takeoverKey(entry.Repo, entry.PRNumber)]; ok {
+			continue
+		}
+		remaining = append(remaining, entry)
+	}
+	st.Takeovers = remaining
+	if err := r.saveTakeoverState(st); err != nil {
+		return err
+	}
+
+	if getBoolFlag(cmd, "json") {
+		return writeJSON(cmd.OutOrStdout(), result)
+	}
+	return writeHumanTakeoverStop(cmd.OutOrStdout(), result)
+}
+
+func takeoverKey(repo string, prNumber int64) string {
+	return fmt.Sprintf("%s#%d", repo, prNumber)
+}
+
+func writeHumanTakeoverStop(w io.Writer, result takeoverStopResult) error {
+	for _, entry := range result.Stopped {
+		printSection(w, "Takeover stopped", [][2]any{
+			{"pr", takeoverKey(entry.Repo, entry.PRNumber)},
+			{"closedLoops", strings.Join(entry.ClosedLoops, ", ")},
+		})
+		for _, warning := range entry.Warnings {
+			_, _ = fmt.Fprintf(w, "- note: %s\n", warning)
+		}
+	}
+	return nil
 }
 
 func writeHumanTakeoverResult(w io.Writer, result takeoverResult) error {

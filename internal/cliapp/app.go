@@ -424,21 +424,28 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				},
 			}),
 			newCommand(commandSpec{
-				use:   "takeover [<pr>]",
-				short: "Continuously review and fix a pull request until it merges",
-				args:  cobra.MaximumNArgs(1),
-				runE:  runtime.takeover,
+				use:             "takeover [<pr>]",
+				short:           "Continuously review and fix a pull request until it merges",
+				args:            cobra.MaximumNArgs(1),
+				runE:            runtime.takeover,
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List active takeovers"}, {name: "stop", description: "Stop a takeover's reviewer and fixer loops"}},
 				localFlags: []flagSpec{
 					stringFlag("agent-vendor", "vendor", "Agent vendor to run loops (claude-code, codex, opencode, cursor-cli)"),
 					boolFlag("merge", "Let the reviewer enable auto-merge once the PR is approved and green"),
 					boolFlag("no-fix", "Only run the reviewer loop; skip the fixer loop"),
 					boolFlag("yes", "Run non-interactively; fail instead of prompting for the agent vendor"),
 				},
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "list", short: "List active takeovers", args: cobra.NoArgs, runE: runtime.takeoverList, exampleLines: []string{"$ looper takeover list", "$ looper takeover list --json"}}),
+					newCommand(commandSpec{use: "stop [<pr>]", short: "Stop a takeover's reviewer and fixer loops", args: cobra.MaximumNArgs(1), runE: runtime.takeoverStop, localFlags: []flagSpec{boolFlag("all", "Stop every active takeover")}, exampleLines: []string{"$ looper takeover stop", "$ looper takeover stop acme/looper#42", "$ looper takeover stop --all"}}),
+				},
 				exampleLines: []string{
 					"$ looper takeover",
 					"$ looper takeover acme/looper#42",
 					"$ looper takeover acme/looper#42 --merge --agent-vendor claude-code",
 					"$ looper takeover --yes --agent-vendor codex",
+					"$ looper takeover list",
+					"$ looper takeover stop acme/looper#42",
 				},
 			}),
 			newCommand(commandSpec{

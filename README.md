@@ -116,6 +116,14 @@ looper takeover acme/repo#42 --merge --agent-vendor claude-code
 looper takeover --yes --agent-vendor codex          # fully non-interactive
 ```
 
+List and stop takeovers:
+
+```bash
+looper takeover list                 # active takeovers + live loop status
+looper takeover stop acme/repo#42    # stop this takeover's reviewer + fixer loops
+looper takeover stop --all
+```
+
 Requirements: `git`, an authenticated `gh`, and one supported agent CLI installed locally (the agent runs on your machine with your own credentials).
 
 ### One-liner for not-yet-installed users
