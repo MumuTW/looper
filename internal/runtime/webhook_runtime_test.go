@@ -655,7 +655,27 @@ func TestWebhookRuntimeTerminalForwarderExitLatchesWithoutRespawn(t *testing.T) 
 		starts++
 		mu.Unlock()
 		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
-		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "LOOPER_HELPER_STDERR_EXIT=authentication required; run gh auth login")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", `LOOPER_HELPER_STDERR_EXIT=Error: error creating webhook: HTTP 422: Validation Failed
+Hook already exists on this repository
+Usage:
+  forward --events=<types> [--url=<url>] [flags]
+
+Examples:
+# create a dev webhook for the 'issue_open' event in the monalisa/smile repo in GitHub running locally, and
+# forward payloads for the triggered event to http://localhost:9999/webhooks
+
+$ gh webhook forward --events=issues --repo=monalisa/smile --url="http://localhost:9999/webhooks"
+$ gh webhook forward --events=issues --org=github --url="http://localhost:9999/webhooks"
+
+
+Flags:
+  -E, --events types         Names of the event types to forward. Use * to forward all events.
+  -H, --github-host string   GitHub host name (default "github.com")
+  -h, --help                 help for forward
+  -O, --org string           Name of the org where the webhook is installed
+  -R, --repo string          Name of the repo where the webhook is installed
+  -S, --secret string        Webhook secret for incoming events
+  -U, --url string           Address of the local server to receive events. If omitted, events will be printed to stdout.`)
 		cmd.Args[0] = name
 		return cmd
 	}
@@ -679,7 +699,7 @@ func TestWebhookRuntimeTerminalForwarderExitLatchesWithoutRespawn(t *testing.T) 
 	if !status.Degraded || len(status.DegradedReasons) == 0 || !strings.Contains(status.DegradedReasons[0], "polling fallback") {
 		t.Fatalf("Status().DegradedReasons = %v, want latched polling fallback reason", status.DegradedReasons)
 	}
-	if status.Forwarders[0].RestartCount != 1 || status.Forwarders[0].LatchReason == nil || !strings.Contains(*status.Forwarders[0].LatchReason, "authentication required") {
+	if status.Forwarders[0].RestartCount != 1 || status.Forwarders[0].LatchReason == nil || !strings.Contains(*status.Forwarders[0].LatchReason, "Hook already exists") {
 		t.Fatalf("forwarder status = %#v, want terminal latch with one observed exit", status.Forwarders[0])
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -687,71 +707,6 @@ func TestWebhookRuntimeTerminalForwarderExitLatchesWithoutRespawn(t *testing.T) 
 	defer mu.Unlock()
 	if starts != 1 {
 		t.Fatalf("starts = %d, want no respawn after terminal latch", starts)
-	}
-}
-
-func TestWebhookRuntimeHookAlreadyExistsCleansStaleForwardHookAndRetries(t *testing.T) {
-	testBin, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable() error = %v", err)
-	}
-	var mu sync.Mutex
-	commands := []string{}
-	originalCommand := execCommand
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		mu.Lock()
-		commands = append(commands, strings.Join(append([]string{name}, args...), " "))
-		call := len(commands)
-		mu.Unlock()
-
-		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
-		cmd.Args[0] = name
-		env := append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
-		switch call {
-		case 1:
-			env = append(env, `LOOPER_HELPER_STDERR_EXIT=Error: error creating webhook: HTTP 422: Validation Failed
-Hook already exists on this repository`)
-		case 2:
-			env = append(env, `LOOPER_HELPER_STDOUT_EXIT=[[{"id":101,"name":"cli","type":"Repository","active":true,"events":["pull_request"],"config":{"url":"https://webhook-forwarder.github.com/hook"}},{"id":202,"name":"web","type":"Repository","active":true,"events":["pull_request"],"config":{"url":"https://example.com/hook"}}]]`)
-		case 3:
-			env = append(env, "LOOPER_HELPER_STDOUT_EXIT=")
-		}
-		cmd.Env = env
-		return cmd
-	}
-	t.Cleanup(func() { execCommand = originalCommand })
-
-	rt := &webhookRuntime{
-		ghPath:          "/usr/bin/gh",
-		status:          WebhookStatus{Enabled: true, EndpointURL: "http://127.0.0.1:7777/webhook/forward", FallbackPollIntervalSeconds: 300},
-		stopCh:          make(chan struct{}),
-		forwarderStopCh: map[string]chan struct{}{},
-		now:             time.Now,
-	}
-	t.Cleanup(rt.Stop)
-	rt.Reconcile(openWebhookRuntimeTestRepositoriesWithProject(t, "nexu-io/looper"))
-
-	waitForWebhookCondition(t, 5*time.Second, func() bool {
-		status := rt.Status()
-		return len(status.Forwarders) == 1 && status.Forwarders[0].Running && !status.Forwarders[0].Latched
-	})
-	status := rt.Status()
-	if status.Degraded {
-		t.Fatalf("Status().Degraded = true, want recovered forwarder; reasons=%v", status.DegradedReasons)
-	}
-	if status.Forwarders[0].RestartCount != 1 || status.Forwarders[0].LastError != "" {
-		t.Fatalf("forwarder status = %#v, want one failed start followed by clean retry", status.Forwarders[0])
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(commands) != 4 {
-		t.Fatalf("commands = %q, want forward, list hooks, delete stale cli hook, forward retry", commands)
-	}
-	if !strings.Contains(commands[1], "api --paginate --slurp repos/nexu-io/looper/hooks") {
-		t.Fatalf("list command = %q, want gh api hooks list", commands[1])
-	}
-	if !strings.Contains(commands[2], "api -X DELETE repos/nexu-io/looper/hooks/101") {
-		t.Fatalf("delete command = %q, want delete of stale cli hook only", commands[2])
 	}
 }
 
@@ -1255,10 +1210,6 @@ func (q *flakyProjectListQuerier) QueryRowContext(ctx context.Context, query str
 func TestWebhookRuntimeForwarderHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
-	}
-	if message, ok := os.LookupEnv("LOOPER_HELPER_STDOUT_EXIT"); ok {
-		_, _ = os.Stdout.WriteString(message)
-		os.Exit(0)
 	}
 	if message := os.Getenv("LOOPER_HELPER_STDERR_EXIT"); message != "" {
 		_, _ = os.Stderr.WriteString(message + "\n")

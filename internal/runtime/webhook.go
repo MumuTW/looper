@@ -2,9 +2,7 @@ package runtime
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -28,8 +26,6 @@ const noConfiguredWebhookReposReason = "no configured GitHub repos are available
 var webhookReconcileRetryDelay = 5 * time.Second
 
 var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment", "push", "check_run"}
-
-const ghWebhookForwarderHookURL = "https://webhook-forwarder.github.com/hook"
 
 const (
 	webhookForwarderStdoutTailLines = 20
@@ -787,7 +783,6 @@ func (w *webhookRuntime) isStopped() bool {
 
 func (w *webhookRuntime) runForwarder(repo string) {
 	backoff := time.Second
-	conflictCleanupAttempted := false
 	for {
 		state, stopCh, ok := w.forwarderSnapshot(repo)
 		if !ok {
@@ -934,29 +929,6 @@ func (w *webhookRuntime) runForwarder(repo string) {
 		if w.logger != nil {
 			w.logger.Info("webhook.forwarder.exited", map[string]any{"repo": repo, "pid": pid, "exit_class": string(classification.Class), "matched_pattern": classification.MatchedPattern, "wait_err": message})
 		}
-		if classification.MatchedPattern == "Hook already exists on this repository" && !conflictCleanupAttempted && !w.isStopped() && w.hasForwarder(repo, stopCh) {
-			conflictCleanupAttempted = true
-			deleted, cleanupErr := w.cleanupStaleGHForwardHooks(context.Background(), repo)
-			if cleanupErr == nil && deleted > 0 {
-				if w.logger != nil {
-					w.logger.Info("webhook.forwarder.cleaned_stale_hooks", map[string]any{"repo": repo, "deleted": deleted})
-				}
-				w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
-					state.LastError = ""
-					state.Latched = false
-					state.LatchReason = nil
-				})
-				backoff = time.Second
-				continue
-			}
-			if w.logger != nil {
-				fields := map[string]any{"repo": repo, "deleted": deleted}
-				if cleanupErr != nil {
-					fields["error"] = cleanupErr.Error()
-				}
-				w.logger.Warn("webhook.forwarder.stale_hook_cleanup_failed", fields)
-			}
-		}
 		if classification.Class == forwarderExitTerminal && !w.isStopped() && w.hasForwarder(repo, stopCh) {
 			reason := forwarderLatchReason(classification.MatchedPattern)
 			w.updateForwarder(repo, stopCh, func(state *WebhookForwarderState) {
@@ -980,115 +952,6 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			backoff *= 2
 		}
 	}
-}
-
-type ghForwardWebhookHook struct {
-	ID     int64    `json:"id"`
-	Name   string   `json:"name"`
-	Events []string `json:"events"`
-	Config struct {
-		URL string `json:"url"`
-	} `json:"config"`
-}
-
-func (w *webhookRuntime) cleanupStaleGHForwardHooks(ctx context.Context, repo string) (int, error) {
-	if w == nil {
-		return 0, nil
-	}
-	ghPath := strings.TrimSpace(w.ghPath)
-	if ghPath == "" {
-		return 0, fmt.Errorf("gh path is unavailable")
-	}
-	hooks, err := w.listGHForwardHooks(ctx, ghPath, repo)
-	if err != nil {
-		return 0, err
-	}
-	deleted := 0
-	for _, hook := range hooks {
-		if !isStaleGHForwardHook(hook) {
-			continue
-		}
-		if err := w.deleteGHHook(ctx, ghPath, repo, hook.ID); err != nil {
-			return deleted, err
-		}
-		deleted++
-	}
-	return deleted, nil
-}
-
-func (w *webhookRuntime) listGHForwardHooks(ctx context.Context, ghPath, repo string) ([]ghForwardWebhookHook, error) {
-	repoPath, hostname := splitWebhookRepoHost(repo)
-	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/hooks", repoPath)}
-	if hostname != "" {
-		args = append(args, "--hostname", hostname)
-	}
-	output, err := runGHOutput(ctx, ghPath, args)
-	if err != nil {
-		return nil, fmt.Errorf("list GitHub webhook hooks for %s: %w", repo, err)
-	}
-	hooks, err := decodeGHForwardHooks(output)
-	if err != nil {
-		return nil, fmt.Errorf("decode GitHub webhook hooks for %s: %w", repo, err)
-	}
-	return hooks, nil
-}
-
-func (w *webhookRuntime) deleteGHHook(ctx context.Context, ghPath, repo string, id int64) error {
-	repoPath, hostname := splitWebhookRepoHost(repo)
-	args := []string{"api", "-X", "DELETE", fmt.Sprintf("repos/%s/hooks/%d", repoPath, id)}
-	if hostname != "" {
-		args = append(args, "--hostname", hostname)
-	}
-	if _, err := runGHOutput(ctx, ghPath, args); err != nil {
-		if strings.Contains(err.Error(), "HTTP 404") {
-			return nil
-		}
-		return fmt.Errorf("delete GitHub webhook hook %d for %s: %w", id, repo, err)
-	}
-	return nil
-}
-
-func runGHOutput(ctx context.Context, ghPath string, args []string) ([]byte, error) {
-	cmd := execCommand(ghPath, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		message := strings.TrimSpace(strings.Join([]string{stderr.String(), string(output)}, "\n"))
-		if message == "" {
-			message = err.Error()
-		}
-		return nil, fmt.Errorf("%s", message)
-	}
-	return output, nil
-}
-
-func decodeGHForwardHooks(output []byte) ([]ghForwardWebhookHook, error) {
-	var pages [][]ghForwardWebhookHook
-	if err := json.Unmarshal(output, &pages); err == nil {
-		hooks := make([]ghForwardWebhookHook, 0)
-		for _, page := range pages {
-			hooks = append(hooks, page...)
-		}
-		return hooks, nil
-	}
-	var hooks []ghForwardWebhookHook
-	if err := json.Unmarshal(output, &hooks); err != nil {
-		return nil, err
-	}
-	return hooks, nil
-}
-
-func isStaleGHForwardHook(hook ghForwardWebhookHook) bool {
-	return strings.EqualFold(strings.TrimSpace(hook.Name), "cli") && strings.TrimSpace(hook.Config.URL) == ghWebhookForwarderHookURL
-}
-
-func splitWebhookRepoHost(repo string) (string, string) {
-	parts := strings.Split(strings.TrimSpace(repo), "/")
-	if len(parts) == 3 {
-		return strings.Join(parts[1:], "/"), parts[0]
-	}
-	return strings.TrimSpace(repo), ""
 }
 
 func (w *webhookRuntime) captureTail(repo string, stopCh chan struct{}, pipe io.ReadCloser, stdout bool, onLine ...func(string)) {

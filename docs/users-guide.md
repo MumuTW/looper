@@ -530,7 +530,7 @@ When webhook mode is enabled, `looper webhook status --json` reports the active 
 In `gh-forward` mode it reports each local `gh webhook forward` subprocess.
 
 - `adopted=true` means this daemon boot safely reattached to a forwarder spawned by a previous boot. Adopted processes do not have stdout/stderr tails because the new daemon did not create their pipes.
-- `latched=true` means `gh webhook forward` exited with a terminal error and Looper will not respawn-loop it. `latchReason` contains the matched error and remediation. For `Hook already exists`, Looper first deletes stale GitHub CLI forward hooks that clearly match `https://webhook-forwarder.github.com/hook` and retries once. If it still latches, run `looper webhook cleanup <owner/repo>` and fix `gh` authentication before restarting `looperd`.
+- `latched=true` means `gh webhook forward` exited with a terminal error and Looper will not respawn-loop it. `latchReason` contains the matched error and remediation. For `Hook already exists`, delete the conflicting GitHub webhook or fix `gh` authentication, then restart `looperd`.
 - polling remains the correctness fallback while a forwarder is latched or degraded.
 
 In `tunnel` mode Looper creates a GitHub repository webhook and listens on `127.0.0.1:<webhook.listenPort>`. You run your own tunnel to that listener:
