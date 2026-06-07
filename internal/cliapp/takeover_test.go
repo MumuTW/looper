@@ -71,8 +71,8 @@ func TestTakeoverScopingRoles(t *testing.T) {
 			t.Fatalf("%s autoDiscovery = %v, want false", name, got)
 		}
 	}
-	if withoutMerge.Reviewer.AutoMerge != nil {
-		t.Fatalf("auto-merge should be unset when merge=false")
+	if withoutMerge.Reviewer.AutoMerge == nil || withoutMerge.Reviewer.AutoMerge.Enabled == nil || *withoutMerge.Reviewer.AutoMerge.Enabled {
+		t.Fatalf("auto-merge should be explicitly disabled when merge=false (to override any global setting), got %+v", withoutMerge.Reviewer.AutoMerge)
 	}
 
 	withMerge := takeoverScopingRoles(true)
@@ -381,6 +381,96 @@ func TestTakeoverStateRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEnsureTakeoverConfigHonorsExplicitVendorOverride(t *testing.T) {
+	t.Parallel()
+
+	cwd := t.TempDir()
+	repoRoot := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+
+	existingVendor := config.AgentVendorCodex
+	raw, err := config.MarshalConfigFile(configPath, config.PartialConfig{
+		Agent: &config.PartialAgentConfig{Vendor: &existingVendor},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	r := newTakeoverRuntime(t, configPath, Deps{})
+	changed, err := r.ensureTakeoverConfig(configPath, cwd, repoRoot, config.AgentVendorClaudeCode, false)
+	if err != nil {
+		t.Fatalf("ensureTakeoverConfig() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true after vendor override")
+	}
+
+	partial, _, err := config.ReadPartialConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if partial.Agent == nil || partial.Agent.Vendor == nil || *partial.Agent.Vendor != config.AgentVendorClaudeCode {
+		t.Fatalf("explicit --agent-vendor should override config, got %+v", partial.Agent)
+	}
+}
+
+func TestEnsureTakeoverConfigPreservesExistingRoleSubConfig(t *testing.T) {
+	t.Parallel()
+
+	cwd := t.TempDir()
+	repoRoot := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+
+	// An existing project for repoRoot with custom reviewer instructions and
+	// auto-discovery left on — takeover must scope it without dropping the
+	// instructions.
+	reviewerInstructions := "Be extra strict about error handling."
+	enabled := true
+	raw, err := config.MarshalConfigFile(configPath, config.PartialConfig{
+		Agent: &config.PartialAgentConfig{Vendor: ptrVendor(config.AgentVendorClaudeCode)},
+		Projects: &[]config.PartialProjectRefConfig{{
+			ID: "repo", Name: "Repo", RepoPath: repoRoot,
+			Roles: &config.PartialRoleConfigs{
+				Reviewer: &config.PartialReviewerRoleConfig{
+					Instructions: &reviewerInstructions,
+					Discovery:    &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &enabled},
+				},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	r := newTakeoverRuntime(t, configPath, Deps{})
+	if _, err := r.ensureTakeoverConfig(configPath, cwd, repoRoot, config.AgentVendorClaudeCode, false); err != nil {
+		t.Fatalf("ensureTakeoverConfig() error = %v", err)
+	}
+
+	partial, _, err := config.ReadPartialConfigFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	project := (*partial.Projects)[0]
+	if project.Roles == nil || project.Roles.Reviewer == nil {
+		t.Fatalf("reviewer roles missing: %+v", project.Roles)
+	}
+	if project.Roles.Reviewer.Instructions == nil || *project.Roles.Reviewer.Instructions != reviewerInstructions {
+		t.Fatalf("custom reviewer instructions should be preserved, got %+v", project.Roles.Reviewer.Instructions)
+	}
+	if project.Roles.Reviewer.Discovery == nil || project.Roles.Reviewer.Discovery.AutoDiscovery == nil || *project.Roles.Reviewer.Discovery.AutoDiscovery {
+		t.Fatalf("reviewer auto-discovery should be scoped off, got %+v", project.Roles.Reviewer.Discovery)
+	}
+}
+
+func ptrVendor(v config.AgentVendor) *config.AgentVendor { return &v }
+
 func TestEnsureTakeoverConfigDoesNotClobberExistingProjects(t *testing.T) {
 	t.Parallel()
 
@@ -401,8 +491,10 @@ func TestEnsureTakeoverConfigDoesNotClobberExistingProjects(t *testing.T) {
 		t.Fatalf("write config: %v", err)
 	}
 
+	// Reuse the configured vendor (as resolveTakeoverVendor would), so this test
+	// isolates project preservation from the explicit-vendor-override behavior.
 	r := newTakeoverRuntime(t, configPath, Deps{})
-	if _, err := r.ensureTakeoverConfig(configPath, cwd, repoRoot, config.AgentVendorClaudeCode, false); err != nil {
+	if _, err := r.ensureTakeoverConfig(configPath, cwd, repoRoot, config.AgentVendorCodex, false); err != nil {
 		t.Fatalf("ensureTakeoverConfig() error = %v", err)
 	}
 
@@ -411,7 +503,7 @@ func TestEnsureTakeoverConfigDoesNotClobberExistingProjects(t *testing.T) {
 		t.Fatalf("read config: %v", err)
 	}
 	if partial.Agent == nil || partial.Agent.Vendor == nil || *partial.Agent.Vendor != config.AgentVendorCodex {
-		t.Fatalf("existing agent vendor should be preserved, got %+v", partial.Agent)
+		t.Fatalf("configured agent vendor should be preserved when reused, got %+v", partial.Agent)
 	}
 	if partial.Projects == nil || len(*partial.Projects) != 2 {
 		t.Fatalf("want existing + new project, got %+v", partial.Projects)

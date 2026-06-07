@@ -382,23 +382,69 @@ func joinVendors(vendors []config.AgentVendor) string {
 	return strings.Join(parts, ", ")
 }
 
-// takeoverScopingRoles builds the per-project role overrides that keep the
-// daemon focused on the single targeted PR: every autonomous discovery loop is
-// disabled so only the manually started reviewer/fixer loops run. When merge is
-// requested, the reviewer is allowed to enable GitHub auto-merge.
+// takeoverScopingRoles builds a fresh set of per-project role overrides that
+// scope the daemon to the single targeted PR.
 func takeoverScopingRoles(merge bool) *config.PartialRoleConfigs {
+	return applyTakeoverScoping(nil, merge)
+}
+
+// applyTakeoverScoping enforces the single-PR scoping on top of an existing role
+// tree (or a fresh one when roles is nil): every autonomous discovery loop is
+// disabled so only the manually started reviewer/fixer loops run, and the
+// reviewer auto-merge flag is set explicitly to match --merge. Setting
+// auto-merge explicitly (instead of only when merge is true) is required so a
+// takeover without --merge overrides any global roles.reviewer.autoMerge.enabled
+// rather than silently inheriting it. Existing role sub-fields (instructions,
+// reviewer behavior, triggers, …) are preserved — only the scoping leaves are
+// overwritten.
+func applyTakeoverScoping(roles *config.PartialRoleConfigs, merge bool) *config.PartialRoleConfigs {
 	disabled := false
-	roles := &config.PartialRoleConfigs{
-		Planner:  &config.PartialPlannerRoleConfig{AutoDiscovery: &disabled},
-		Worker:   &config.PartialWorkerRoleConfig{AutoDiscovery: &disabled},
-		Fixer:    &config.PartialFixerRoleConfig{AutoDiscovery: &disabled},
-		Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &disabled}},
+	autoMerge := merge
+	if roles == nil {
+		roles = &config.PartialRoleConfigs{}
 	}
-	if merge {
-		enabled := true
-		roles.Reviewer.AutoMerge = &config.PartialReviewerAutoMergeConfig{Enabled: &enabled}
+	if roles.Planner == nil {
+		roles.Planner = &config.PartialPlannerRoleConfig{}
 	}
+	roles.Planner.AutoDiscovery = &disabled
+	if roles.Worker == nil {
+		roles.Worker = &config.PartialWorkerRoleConfig{}
+	}
+	roles.Worker.AutoDiscovery = &disabled
+	if roles.Fixer == nil {
+		roles.Fixer = &config.PartialFixerRoleConfig{}
+	}
+	roles.Fixer.AutoDiscovery = &disabled
+	if roles.Reviewer == nil {
+		roles.Reviewer = &config.PartialReviewerRoleConfig{}
+	}
+	if roles.Reviewer.Discovery == nil {
+		roles.Reviewer.Discovery = &config.PartialReviewerRoleDiscoveryConfig{}
+	}
+	roles.Reviewer.Discovery.AutoDiscovery = &disabled
+	if roles.Reviewer.AutoMerge == nil {
+		roles.Reviewer.AutoMerge = &config.PartialReviewerAutoMergeConfig{}
+	}
+	roles.Reviewer.AutoMerge.Enabled = &autoMerge
 	return roles
+}
+
+// clonePartialRoleConfigs deep-copies a role tree via JSON so scoping can be
+// applied to a copy without mutating the config read from disk (which would
+// break change detection).
+func clonePartialRoleConfigs(in *config.PartialRoleConfigs) *config.PartialRoleConfigs {
+	if in == nil {
+		return nil
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		return nil
+	}
+	var out config.PartialRoleConfigs
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil
+	}
+	return &out
 }
 
 // ensureTakeoverConfig creates or patches the config file so it carries the
@@ -436,10 +482,14 @@ func (r *commandRuntime) ensureTakeoverConfig(configPath string, cwd string, rep
 	}
 
 	changed := false
-	if partial.Agent == nil || partial.Agent.Vendor == nil {
-		if partial.Agent == nil {
-			partial.Agent = &config.PartialAgentConfig{}
-		}
+	// Always honor the resolved vendor. resolveTakeoverVendor already reuses the
+	// configured vendor when no explicit --agent-vendor was given, so this is a
+	// no-op in the reuse case but applies an explicit override that would
+	// otherwise be silently ignored (leaving the daemon on the old vendor).
+	if partial.Agent == nil {
+		partial.Agent = &config.PartialAgentConfig{}
+	}
+	if partial.Agent.Vendor == nil || *partial.Agent.Vendor != vendor {
 		v := vendor
 		partial.Agent.Vendor = &v
 		changed = true
@@ -458,11 +508,12 @@ func (r *commandRuntime) ensureTakeoverConfig(configPath string, cwd string, rep
 	if partial.Projects != nil {
 		for _, existing := range *partial.Projects {
 			if samePath(existing.RepoPath, repoRoot) {
-				// Preserve the user's existing project fields and only enforce
-				// the single-PR scoping roles, so re-running takeover does not
-				// drop custom instructions, worktree roots, or names.
+				// Preserve the user's existing project fields AND existing role
+				// sub-config (instructions, reviewer behavior, …); only overwrite
+				// the single-PR scoping leaves. Apply scoping to a deep copy so
+				// the original is untouched for change detection.
 				merged := existing
-				merged.Roles = roles
+				merged.Roles = applyTakeoverScoping(clonePartialRoleConfigs(existing.Roles), merge)
 				if !sameTakeoverProject(existing, merged) {
 					changed = true
 				}
