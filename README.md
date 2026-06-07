@@ -92,7 +92,12 @@ The full workflow — label conventions, assignment rules, how planner / reviewe
 
 ## Take over a single PR
 
-Want Looper to babysit *one* pull request — review it, fix review threads, and keep going until it's mergeable — without registering the whole repo for autonomous work? Run `looper takeover` from inside the checkout:
+Want to babysit *one* pull request — review it, fix review threads, dismiss unreasonable change requests, and keep going until it merges? There are two ways, depending on whether you want it **attended** or **unattended**:
+
+- **Agent-driven (zero install, attended)** — paste a prompt into the coding agent you're already running (Claude Code, Cursor, Codex…) and it drives the PR using `gh` + `git`. No daemon, and it uses your already-authenticated agent. Install the [`pr-takeover` skill](skills/pr-takeover/SKILL.md) (`npx skills add ./skills/pr-takeover`) or just paste its copy-paste prompt. Best when you're actively working; it only runs while your agent session is alive.
+- **Daemon-driven (unattended)** — `looper takeover` registers the PR with the background `looperd` daemon, which runs the reviewer + fixer loops on their own. Survives closing your terminal and can grind for days. Best for "set it and forget it".
+
+The rest of this section covers the daemon-driven `looper takeover` command. Run it from inside the checkout:
 
 ```bash
 # detect the current branch's PR automatically
@@ -136,21 +141,26 @@ curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/takeove
 
 Everything after `--` is forwarded to `looper takeover`, so `--merge` and `--agent-vendor` work there too.
 
-## Agent skill
+## Agent skills
 
-Looper includes an installable agent skill for setup, status, config, daemon lifecycle, and troubleshooting guidance:
+Looper ships installable agent skills:
+
+- **`looper`** — setup, status, config, daemon lifecycle, and troubleshooting guidance.
+- **`pr-takeover`** — drive a single PR to merge from inside your own coding-agent session (read review feedback → fix → resolve threads → dismiss unreasonable change requests → merge when approved and green). Zero install beyond `gh` + `git`; no daemon. This is the agent-driven counterpart to the `looper takeover` command.
 
 ```bash
 npx skills add ./skills/looper
+npx skills add ./skills/pr-takeover
 ```
 
-Or install it directly from GitHub:
+Or install directly from GitHub:
 
 ```bash
 npx skills add https://github.com/nexu-io/looper/tree/main/skills/looper
+npx skills add https://github.com/nexu-io/looper/tree/main/skills/pr-takeover
 ```
 
-See [`skills/looper/SKILL.md`](skills/looper/SKILL.md) for install and verification details.
+See [`skills/looper/SKILL.md`](skills/looper/SKILL.md) and [`skills/pr-takeover/SKILL.md`](skills/pr-takeover/SKILL.md) for details.
 
 ## How it works
 
