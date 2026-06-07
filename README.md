@@ -92,12 +92,18 @@ The full workflow — label conventions, assignment rules, how planner / reviewe
 
 ## Take over a single PR
 
-Want to babysit *one* pull request — review it, fix review threads, dismiss unreasonable change requests, and keep going until it merges? There are two ways, depending on whether you want it **attended** or **unattended**:
+Want to babysit *one* pull request — review it, fix review threads, dismiss unreasonable change requests, and keep going until it merges?
 
-- **Agent-driven (zero install, attended)** — paste a prompt into the coding agent you're already running (Claude Code, Cursor, Codex…) and it drives the PR using `gh` + `git`. No daemon, and it uses your already-authenticated agent. Install the [`pr-takeover` skill](skills/pr-takeover/SKILL.md) (`npx skills add ./skills/pr-takeover`) or just paste its copy-paste prompt. Best when you're actively working; it only runs while your agent session is alive.
-- **Daemon-driven (unattended)** — `looper takeover` registers the PR with the background `looperd` daemon, which runs the reviewer + fixer loops on their own. Survives closing your terminal and can grind for days. Best for "set it and forget it".
+**The simplest path is one prompt.** Paste this into whatever coding agent you already run (Claude Code, Codex, opencode, Gemini, …):
 
-The rest of this section covers the daemon-driven `looper takeover` command. Run it from inside the checkout:
+> Take over this PR until it merges — read https://raw.githubusercontent.com/nexu-io/looper/main/skills/pr-takeover/SKILL.md and follow it.
+
+That points the agent at the [`pr-takeover` skill](skills/pr-takeover/SKILL.md), which decides — confirming with you when unclear — between two modes:
+
+- **Live (default, zero install)** — your own session drives the PR with `gh` + `git`. Uses your already-authenticated agent; runs while your session is alive.
+- **Background (unattended)** — hands the PR to the `looper takeover` command below, so the `looperd` daemon runs the reviewer + fixer loops on their own and it survives you closing your terminal.
+
+The rest of this section covers the `looper takeover` command that powers the background mode. Run it from inside the checkout:
 
 ```bash
 # detect the current branch's PR automatically
@@ -146,7 +152,7 @@ Everything after `--` is forwarded to `looper takeover`, so `--merge` and `--age
 Looper ships installable agent skills:
 
 - **`looper`** — setup, status, config, daemon lifecycle, and troubleshooting guidance.
-- **`pr-takeover`** — drive a single PR to merge from inside your own coding-agent session (read review feedback → fix → resolve threads → dismiss unreasonable change requests → merge when approved and green). Zero install beyond `gh` + `git`; no daemon. This is the agent-driven counterpart to the `looper takeover` command.
+- **`pr-takeover`** — drive a single PR to merge (read review feedback → fix → resolve threads → dismiss unreasonable change requests → merge when approved and green). One skill, two modes: it runs **live** in your own agent session (`gh` + `git`, zero install) or hands off to the **background** `looper takeover` daemon, confirming with you when unclear. Works in any agent via one universal prompt — see [`skills/pr-takeover/SKILL.md`](skills/pr-takeover/SKILL.md).
 
 ```bash
 npx skills add ./skills/looper

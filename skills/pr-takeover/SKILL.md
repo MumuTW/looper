@@ -1,122 +1,158 @@
 ---
 name: pr-takeover
-description: Use when asked to take over, adopt, or babysit a GitHub pull request until it merges — continuously read review feedback, fix it, push, reply to and resolve review threads, dismiss unreasonable change requests with a written reason, and merge once the PR is approved and all required checks pass. Triggers on "take over this PR", "接管这个 PR", "持续修复 review comment 直到合并", or a Looper takeover bot comment. Runs in your own coding agent session (Claude Code, Cursor, Codex, opencode) using gh + git — no daemon, no install.
+description: Use when asked to take over, adopt, or babysit a GitHub pull request until it merges — read review feedback, fix it, resolve threads, dismiss unreasonable change requests, and merge once approved and green. Picks between driving the PR live in this session or handing it to the Looper daemon for unattended background runs, confirming with the user when unclear. Triggers on "take over this PR", "接管这个 PR", "持续修复 review 直到合并", or a Looper takeover bot comment. Works in any coding agent (Claude Code, Codex, opencode, Gemini, …) using gh + git.
 ---
 
 # PR Takeover
 
-Drive a single pull request to merge **autonomously**, from inside your own coding-agent session. You read the live review state, fix what reviewers ask for, resolve the threads, dismiss change requests you can justify as incorrect, and merge once the PR is approved and green — looping until it lands.
+Drive one pull request to merge: continuously read the live review state, fix what reviewers ask for, reply to and resolve threads, dismiss change requests you can justify as wrong, and merge once the PR is approved and all required checks pass — looping until it lands.
 
-This is the **attended / zero-install** path: it uses the agent the user is already running (so GitHub and model credentials are already valid) and needs only `gh` and `git`. For **unattended / background** takeover that survives the user closing their terminal, point them at `looper takeover` instead (see [References](references/github-commands.md#unattended-alternative)).
+There are **two ways to run this**. Pick one in Step 0, then execute it.
 
-## When to use
+| Mode | Who runs the agent | Lifetime | Needs |
+| --- | --- | --- | --- |
+| **A · Live** (default) | *you*, in this session | until your session ends | `gh` + `git` only |
+| **B · Background** | the Looper daemon | survives you leaving; runs for days | Looper installed |
 
-- A PR author wants their agent to shepherd a PR through review → fixes → merge.
-- A Looper bot left a comment recommending takeover.
-- The user says "take over / 接管 / babysit this PR until it merges".
+## Step 0 — Choose the mode (confirm with the user only if unclear)
 
-**Do not** silently start an endless loop on a repo you were not asked to act on. Confirm the target PR first.
+1. If the user already signalled a preference, honor it:
+   - "in the background", "while I'm away", "even after I close this", "set and forget" → **Mode B**.
+   - "watch it", "do it now", "in here" → **Mode A**.
+2. Otherwise default to **Mode A** (zero install, uses your already-authenticated session). Mention in one line that Mode B exists for unattended runs, and switch only if they ask.
+3. Choose **Mode B** only if `command -v looper` succeeds *and* the user wants it unattended. If they want unattended but Looper isn't installed, tell them to install it (`https://github.com/nexu-io/looper`) or fall back to Mode A.
 
-## Prerequisites (check, then proceed)
+Keep this lightweight — ask at most one short question, and only when the user gave no signal.
 
-```bash
-gh auth status                       # must be authenticated
-git rev-parse --show-toplevel        # must run inside the repo checkout
-```
-
-- `gh` authenticated as an account with **push access to the PR branch** (the PR author, or a collaborator).
-- Merge requires permission to merge into the base repo; dismissing reviews requires write access.
-- Run from inside the repository checkout, or pass an explicit `<owner>/<repo>#<number>`.
-
-## Identify the PR
+## Prerequisites
 
 ```bash
-# explicit ref wins; otherwise resolve the current branch's PR
-gh pr view --json number,headRefName,baseRefName,url --jq '{number,head:.headRefName,base:.baseRefName,url}'
+gh auth status                  # authenticated, with push access to the PR branch
+git rev-parse --show-toplevel   # run from inside the repo checkout
 ```
 
-If no PR exists for the branch, stop and tell the user to open one (or push the branch first).
+Identify the PR (explicit `<owner>/<repo>#<num>` wins; else the current branch's):
 
-## The takeover loop
+```bash
+gh pr view --json number,headRefName,baseRefName,url
+```
 
-Repeat until the PR is **merged** or a **hard blocker** needs a human. One iteration:
+If no PR exists for the branch, stop and ask the user to open one.
 
-### 1. Snapshot the live state — never act on stale data
+---
+
+## Mode B — Background (Looper daemon)
+
+Hand the PR to Looper and you're done; it runs the reviewer + fixer loops itself.
+
+```bash
+looper takeover <owner>/<repo>#<num> --merge   # --merge enables auto-merge once approved + green
+looper takeover list                           # check status later
+looper takeover stop <owner>/<repo>#<num>      # stop it
+```
+
+Scopes Looper to just this PR (it won't touch other PRs). Note: Looper runs **its own** agent headlessly, so its configured agent vendor must be authenticated for non-interactive use. Report the loop ids it prints, then stop — the rest happens in the background.
+
+---
+
+## Mode A — Live (this session)
+
+Loop until the PR is **merged** or a **hard blocker** needs a human. Each iteration:
+
+### 1. Snapshot the live state (never act on stale data)
 
 ```bash
 gh pr view <num> --json state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid
 ```
 
-Also fetch **unresolved review threads** (GraphQL — see [references](references/github-commands.md#list-review-threads)). Work only from what GitHub returns *now*; if a fetch fails (network), retry — do not proceed on assumptions.
+List **unresolved review threads**:
 
-Decide the iteration's mode from `state` / `reviewDecision` / checks:
-- `state == MERGED` → **done**, report and stop.
-- `state == CLOSED` → stop, tell the user.
-- unresolved actionable threads exist → go to **2 (fix)**.
-- no actionable threads, `reviewDecision == APPROVED`, all required checks green, `mergeable == MERGEABLE` → go to **4 (merge)**.
-- otherwise (waiting on CI, waiting on a re-review) → go to **5 (wait)**.
+```bash
+gh api graphql -f query='
+query($owner:String!,$repo:String!,$num:Int!){
+  repository(owner:$owner,name:$repo){ pullRequest(number:$num){
+    reviewThreads(first:100){ nodes{ id isResolved
+      comments(first:20){ nodes{ author{login} body path line } } } } } }
+}' -F owner=<owner> -F repo=<repo> -F num=<num> \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false)
+        | {id, file:.comments.nodes[0].path, line:.comments.nodes[0].line, body:.comments.nodes[-1].body, author:.comments.nodes[0].author.login}'
+```
 
-### 2. Address every actionable unresolved thread
+Pick the iteration's action:
+- `state==MERGED` → **done**. `state==CLOSED` → stop, tell the user.
+- actionable unresolved threads → **2**.
+- none, `reviewDecision==APPROVED`, all required checks `SUCCESS`, `mergeable==MERGEABLE` → **4**.
+- else (CI pending / awaiting re-review) → **5**.
 
-For each unresolved thread that asks for a real change:
-- Make the change in the worktree. Keep edits **scoped to what the thread asks for** — do not opportunistically rewrite unrelated code.
-- Run the repo's tests/linters if they're quick and obvious.
-- Commit with a clear subject (`fix: <what>`), then push to the PR branch.
+### 2. Fix each actionable thread
+
+Make the change (scoped to what the thread asks — don't rewrite unrelated code), run quick tests/linters, then:
 
 ```bash
 git add -A && git commit -m "fix: <addresses review comment>"
-git push
+git push        # if rejected non-fast-forward: git pull --rebase && git push. Never --force.
 ```
 
-Batch related fixes into sensible commits; one commit per thread is fine but not required.
+### 3. Reply, then resolve — or dismiss
 
-### 3. Reply, then resolve or dismiss
+Reply with how you fixed it, then resolve:
 
-For each thread you addressed: **reply** with a one-line note on how you fixed it, then **resolve** the thread (GraphQL `resolveReviewThread` — see [references](references/github-commands.md#resolve-a-thread)).
+```bash
+# reply
+gh api graphql -f query='mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$t,body:$b}){comment{id}}}' -F t=<threadId> -F b="Fixed in <sha>: <summary>."
+# resolve
+gh api graphql -f query='mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}' -F t=<threadId>
+```
 
-For a change request you judge **incorrect or unreasonable** (factually wrong, out of scope, or contradicting the agreed design): **reply with your reasoning first**, then **dismiss** that review (GraphQL `dismissPullRequestReview` — see [references](references/github-commands.md#dismiss-a-review)). The dismissal `message` is mandatory and must state *why*. Never dismiss silently, and never dismiss a comment that raises a legitimate blocking concern just to get to green.
+For a change request you can justify as **incorrect or out of scope**: reply with your reasoning first, then dismiss it (message is mandatory — state *why*):
+
+```bash
+# get the CHANGES_REQUESTED review's node id (PRR_…)
+gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviews(first:50){nodes{id state author{login}}}}}}' -F o=<owner> -F r=<repo> -F n=<num> --jq '.data.repository.pullRequest.reviews.nodes[]|select(.state=="CHANGES_REQUESTED")'
+# dismiss with a reason
+gh api graphql -f query='mutation($id:ID!,$m:String!){dismissPullRequestReview(input:{pullRequestReviewId:$id,message:$m}){pullRequestReview{state}}}' -F id=<reviewNodeId> -F m="Dismissing: <why this change request is wrong/out of scope>."
+```
 
 ### 4. Merge when approved and green
 
-Only when **all** hold: `reviewDecision == APPROVED`, every required check is `SUCCESS` (none `PENDING`/`FAILURE`), `mergeable == MERGEABLE`, and the PR is not a draft:
+Only when `reviewDecision==APPROVED`, every required check is `SUCCESS` (none pending/failing), `mergeable==MERGEABLE`, and not a draft:
 
 ```bash
-gh pr merge <num> --squash --delete-branch
-# or, to let GitHub merge automatically as soon as requirements are met:
-gh pr merge <num> --squash --auto
+gh pr merge <num> --squash --delete-branch     # use --merge/--rebase to match repo convention
+# or: gh pr merge <num> --squash --auto         # let GitHub merge as soon as requirements are met
 ```
 
-Use the repo's conventional merge method if it differs (`--merge` / `--rebase`). Then report and stop.
+Then report and stop.
 
 ### 5. Wait, then re-loop
 
-If you're waiting on CI or a fresh review, poll on an interval rather than spinning:
-- **Claude Code**: use the `/loop` skill (`/loop 5m <this instruction>`) or schedule a wake-up; between ticks, stop consuming tokens.
-- **Cursor / Codex / others**: re-run this instruction on a timer, or iterate in-session with a sleep between checks.
+Poll on an interval instead of spinning. Use your agent's own loop/scheduler if it has one:
+- **Claude Code**: `/loop 5m <this instruction>`, or schedule a wake-up; idle between ticks.
+- **Codex / opencode / Gemini / others**: re-run this instruction on a timer, or iterate with a `sleep 180` between checks.
 
-Re-request review after pushing fixes if the reviewer was dismissed or the PR fell out of `REVIEW_REQUIRED`:
+Re-request review after pushing fixes if needed: `gh pr edit <num> --add-reviewer <login>`.
 
-```bash
-gh pr edit <num> --add-reviewer <login>   # if a specific reviewer should re-review
-```
+---
 
 ## Safety rails (apply even in full-auto)
 
-These keep autonomous runs from doing damage — they are not optional:
+- **Never merge with a failing or pending required check.** Green-and-approved is the only gate. Never `--admin`-bypass.
+- **Never force-push**, rewrite others' commits, or delete the base branch.
+- **Dismiss only with a written reason.** If you can't articulate why a change request is wrong, treat it as valid and fix it.
+- **Stop and ask a human** when: someone says "hold" / "do not merge" / adds a hold label; a fix needs a product or design decision; the same thread reopens after 2 fix attempts; or a merge conflict needs real judgement.
+- **Cap no-progress loops**: after N iterations with no new commit and no state change, stop and summarize the blocker.
 
-- **Never merge with a failing or pending required check**, ever. Green-and-approved is the only merge gate.
-- **Never force-push**, never rewrite or drop other people's commits, never delete the base branch.
-- **Dismiss only with a written justification**; if you can't articulate why a change request is wrong, treat it as valid and address it.
-- **Stop and ask a human** when: a reviewer explicitly says "do not merge" / "hold" / applies a hold label; the fix needs a product/design decision you can't infer; the same thread reopens after 2 fix attempts (you're not converging); or a merge conflict needs non-trivial judgement.
-- **Cap no-progress iterations**: if N consecutive loops produce no new commit and no state change, stop and summarize what's blocking.
-- Keep a short running log of what you changed and why, so the human can audit the session.
+## More detail
 
-## Exact commands
+Extended `gh` / GraphQL recipes: `references/github-commands.md` (when installed as a skill), or fetch
+`https://raw.githubusercontent.com/nexu-io/looper/main/skills/pr-takeover/references/github-commands.md`.
 
-All `gh` / GraphQL recipes (list threads, resolve, dismiss, check status, merge, re-request) are in **[references/github-commands.md](references/github-commands.md)**.
+## One universal prompt (for a bot to post under a PR)
 
-## Copy-paste prompt (for a bot to post under a PR)
+Works in any agent, with or without this skill installed — it just points the agent at this file:
 
-> Take over this PR until it merges. Continuously: read all review comments, fix what they ask for and push, reply to and resolve each thread, dismiss any change request you can justify as incorrect (with a written reason), and merge once the PR is approved and all required checks pass. Don't merge on red checks, don't force-push, and stop to ask me if a human says hold or a fix needs a product decision.
+> Take over this PR until it merges — read https://raw.githubusercontent.com/nexu-io/looper/main/skills/pr-takeover/SKILL.md and follow it.
 
-For Claude Code, prefix with `/loop 5m` to make it poll until merged.
+If your agent can't fetch URLs, paste this instead:
+
+> Take over this PR until it merges. Loop: read the open review threads (`gh`), fix what they ask and push, reply + resolve each thread, dismiss any change request you can justify as wrong (with a written reason), and merge once it's approved and all required checks are green. Never merge on red/pending checks, never force-push, and stop to ask me if someone says hold or a fix needs a product decision.
