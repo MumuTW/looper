@@ -7829,6 +7829,54 @@ func TestRunPublishStepMarksStaleWhenMarkerMissingRecoveryFetchSeesHeadChangeBef
 	}
 }
 
+func TestRunPublishStepMarksStaleWhenMarkerMissingRecoveryFetchSeesClosedPRBeforeAlreadyReviewedSkip(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentLogin:            "octocat",
+		reviewMarkerMissing:     true,
+		viewStateAfterFirstView: "CLOSED",
+		reviews: []map[string]any{{
+			"author": map[string]any{"login": "octocat"},
+			"state":  "COMMENTED",
+			"commit": map[string]any{"oid": "abc123"},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_publish_marker_missing_recovery_closed", ProjectID: project.ID, Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_publish_marker_missing_recovery_closed", LoopID: "loop_publish_marker_missing_recovery_closed"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:        &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", ReviewRequests: []string{}, CurrentLogin: "octocat"},
+			Snapshot:      &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: &pendingReviewCheckpoint{HeadSHA: "abc123", IdempotencyKey: "reviewer:loop_publish_marker_missing_recovery_closed:abc123", Event: reviewEventAgentNative, Summary: "posted review"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v, want stale checkpoint", err)
+	}
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
+	}
+	if !contains(checkpoint.SkipReason, "expected PR state OPEN, observed CLOSED") {
+		t.Fatalf("SkipReason = %q, want closed PR stale reason", checkpoint.SkipReason)
+	}
+	if checkpoint.PendingReview != nil {
+		t.Fatalf("PendingReview = %#v, want nil after stale publish", checkpoint.PendingReview)
+	}
+	if checkpoint.SkipReviewerLogin != "" {
+		t.Fatalf("SkipReviewerLogin = %q, want empty when stale wins over already-reviewed skip", checkpoint.SkipReviewerLogin)
+	}
+}
+
 func TestProcessClaimedItemMarksStaleOnUnparsedHeadChangeGuardrail(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

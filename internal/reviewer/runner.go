@@ -2813,7 +2813,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
 	if requireReviewRequest && !markerResult.Found {
-		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
+		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, checkpoint, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
 		if staleReason != "" {
 			return markReviewerRunStale(checkpoint, staleReason), nil
 		}
@@ -2835,7 +2835,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		}
 	}
 	if !markerResult.Found {
-		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
+		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, checkpoint, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
 		if staleReason != "" {
 			return markReviewerRunStale(checkpoint, staleReason), nil
 		}
@@ -4811,7 +4811,7 @@ func (r *Runner) detectHeadChangeForExpectedHead(ctx context.Context, input step
 	return "", false
 }
 
-func (r *Runner) detectMarkerMissingRecovery(ctx context.Context, input stepInput, expectedHeadSHA string, allowAlreadyReviewed bool) (string, string, string) {
+func (r *Runner) detectMarkerMissingRecovery(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, expectedHeadSHA string, allowAlreadyReviewed bool) (string, string, string) {
 	expectedHeadSHA = strings.TrimSpace(expectedHeadSHA)
 	if expectedHeadSHA == "" {
 		return "", "", ""
@@ -4822,6 +4822,9 @@ func (r *Runner) detectMarkerMissingRecovery(ctx context.Context, input stepInpu
 	}
 	if detail.HeadSHA != "" && detail.HeadSHA != expectedHeadSHA {
 		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", expectedHeadSHA, detail.HeadSHA), "", ""
+	}
+	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
+		return reason, "", ""
 	}
 	if !allowAlreadyReviewed {
 		return "", "", ""
