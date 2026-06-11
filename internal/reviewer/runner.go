@@ -2813,6 +2813,18 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
 	if requireReviewRequest && !markerResult.Found {
+		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
+		if staleReason != "" {
+			return markReviewerRunStale(checkpoint, staleReason), nil
+		}
+		if reviewedReason != "" {
+			checkpoint.SkipReason = reviewedReason
+			checkpoint.SkipKind = "already_reviewed_by_current_user"
+			checkpoint.SkipReviewerLogin = login
+			checkpoint.PendingReview = nil
+			checkpoint.ResumePolicy = ""
+			return checkpoint, nil
+		}
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2823,8 +2835,17 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		}
 	}
 	if !markerResult.Found {
-		if reason, ok := r.detectHeadChangeForExpectedHead(ctx, input, pending.HeadSHA); ok {
-			return markReviewerRunStale(checkpoint, reason), nil
+		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
+		if staleReason != "" {
+			return markReviewerRunStale(checkpoint, staleReason), nil
+		}
+		if reviewedReason != "" {
+			checkpoint.SkipReason = reviewedReason
+			checkpoint.SkipKind = "already_reviewed_by_current_user"
+			checkpoint.SkipReviewerLogin = login
+			checkpoint.PendingReview = nil
+			checkpoint.ResumePolicy = ""
+			return checkpoint, nil
 		}
 		message := missingReviewMarkerMessage(input, pending)
 		if pending.MarkerVerificationMisses == 0 {
@@ -4788,6 +4809,32 @@ func (r *Runner) detectHeadChangeForExpectedHead(ctx context.Context, input step
 		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", expectedHeadSHA, detail.HeadSHA), true
 	}
 	return "", false
+}
+
+func (r *Runner) detectMarkerMissingRecovery(ctx context.Context, input stepInput, expectedHeadSHA string, allowAlreadyReviewed bool) (string, string, string) {
+	expectedHeadSHA = strings.TrimSpace(expectedHeadSHA)
+	if expectedHeadSHA == "" {
+		return "", "", ""
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return "", "", ""
+	}
+	if detail.HeadSHA != "" && detail.HeadSHA != expectedHeadSHA {
+		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", expectedHeadSHA, detail.HeadSHA), "", ""
+	}
+	if !allowAlreadyReviewed {
+		return "", "", ""
+	}
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return "", "", ""
+	}
+	currentLogin = normalizeLogin(currentLogin)
+	if !hasReviewByAuthorForHead(detail.Reviews, currentLogin, expectedHeadSHA) {
+		return "", "", ""
+	}
+	return "", fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s but no Looper review marker was found", input.Repo, input.PRNumber, expectedHeadSHA), currentLogin
 }
 
 func hasReviewByAuthorForHead(reviews []map[string]any, login string, headSHA string) bool {
