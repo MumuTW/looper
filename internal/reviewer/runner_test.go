@@ -7609,6 +7609,87 @@ func TestRunPublishStepKeepsPendingReviewForExistingLoopFollowUpOnNewHeadWithout
 	}
 }
 
+func TestRunPublishStepMarksStaleWhenAgentNativeMarkerMissingAndHeadChanged(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true, viewHeadSHA: "new-head"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_publish_head_changed", ProjectID: project.ID, Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_publish_head_changed", LoopID: "loop_publish_head_changed"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:        &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", ReviewRequests: []string{"octocat"}},
+			Snapshot:      &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: &pendingReviewCheckpoint{HeadSHA: "abc123", IdempotencyKey: "reviewer:loop_publish_head_changed:abc123", Event: reviewEventAgentNative, Summary: "posted review"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v, want stale checkpoint", err)
+	}
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
+	}
+	if !contains(checkpoint.SkipReason, "PR head changed before publish") {
+		t.Fatalf("SkipReason = %q, want head-change stale reason", checkpoint.SkipReason)
+	}
+	if checkpoint.PendingReview != nil {
+		t.Fatalf("PendingReview = %#v, want nil after stale publish", checkpoint.PendingReview)
+	}
+	if github.reviewMarkerCalls != 0 {
+		t.Fatalf("reviewMarkerCalls = %d, want 0 when head drift wins before marker retry", github.reviewMarkerCalls)
+	}
+}
+
+func TestRunPublishStepMarksStaleWhenAgentNativeMarkerMissingAfterHeadChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true, changeHeadOnSecondView: true}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_publish_marker_missing_then_head_changed", ProjectID: project.ID, Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_publish_marker_missing_then_head_changed", LoopID: "loop_publish_marker_missing_then_head_changed"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:        &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", ReviewRequests: []string{"octocat"}},
+			Snapshot:      &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: &pendingReviewCheckpoint{HeadSHA: "abc123", IdempotencyKey: "reviewer:loop_publish_marker_missing_then_head_changed:abc123", Event: reviewEventAgentNative, Summary: "posted review"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v, want stale checkpoint", err)
+	}
+	if checkpoint.SkipKind != "stale" {
+		t.Fatalf("SkipKind = %q, want stale", checkpoint.SkipKind)
+	}
+	if !contains(checkpoint.SkipReason, "PR head changed before publish") {
+		t.Fatalf("SkipReason = %q, want head-change stale reason", checkpoint.SkipReason)
+	}
+	if checkpoint.PendingReview != nil {
+		t.Fatalf("PendingReview = %#v, want nil after stale publish", checkpoint.PendingReview)
+	}
+	if github.reviewMarkerCalls == 0 {
+		t.Fatalf("reviewMarkerCalls = %d, want marker lookup before stale recheck", github.reviewMarkerCalls)
+	}
+	if github.viewCalls < 2 {
+		t.Fatalf("viewCalls = %d, want publish drift check plus stale recheck", github.viewCalls)
+	}
+}
+
 func TestProcessClaimedItemMarksStaleOnUnparsedHeadChangeGuardrail(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

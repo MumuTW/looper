@@ -2823,15 +2823,19 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		}
 	}
 	if !markerResult.Found {
+		if reason, ok := r.detectHeadChangeForExpectedHead(ctx, input, pending.HeadSHA); ok {
+			return markReviewerRunStale(checkpoint, reason), nil
+		}
+		message := missingReviewMarkerMessage(input, pending)
 		if pending.MarkerVerificationMisses == 0 {
 			pending.MarkerVerificationMisses = 1
 			checkpoint.PendingReview = pending.clone()
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
-			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
+			return checkpoint, &loopError{message: message + "; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = nil
 		checkpoint.ResumePolicy = "rerun_review"
-		return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
 	reviewPolicy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
 	if cleanReviewNoopSummary(pending.Summary) && reviewPolicy.Clean == config.ReviewerReviewEventApprove && !cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail)) {
@@ -2881,6 +2885,22 @@ func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input s
 	checkpoint.SkipKind = "not_requested"
 	checkpoint.PendingReview = nil
 	return true, checkpoint, nil
+}
+
+func missingReviewMarkerMessage(input stepInput, pending pendingReviewCheckpoint) string {
+	parts := []string{"Reviewer agent completed but no matching GitHub review marker was found"}
+	parts = append(parts, fmt.Sprintf("repo=%s", input.Repo))
+	parts = append(parts, fmt.Sprintf("pr=%d", input.PRNumber))
+	if strings.TrimSpace(pending.HeadSHA) != "" {
+		parts = append(parts, "head="+strings.TrimSpace(pending.HeadSHA))
+	}
+	if strings.TrimSpace(pending.IdempotencyKey) != "" {
+		parts = append(parts, "idempotencyKey="+strings.TrimSpace(pending.IdempotencyKey))
+	}
+	if pending.MarkerVerificationMisses > 0 {
+		parts = append(parts, fmt.Sprintf("previousMarkerMisses=%d", pending.MarkerVerificationMisses))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepInput, headSHA string, idempotencyKey string, prAuthorLogin string) (ReviewMarkerResult, error) {
@@ -4755,12 +4775,17 @@ func (r *Runner) detectHeadChangeRequired(ctx context.Context, input stepInput, 
 	if checkpoint.Snapshot == nil {
 		return "", false
 	}
+	return r.detectHeadChangeForExpectedHead(ctx, input, checkpoint.Snapshot.HeadSHA)
+}
+
+func (r *Runner) detectHeadChangeForExpectedHead(ctx context.Context, input stepInput, expectedHeadSHA string) (string, bool) {
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return "", false
 	}
-	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
-		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
+	expectedHeadSHA = strings.TrimSpace(expectedHeadSHA)
+	if detail.HeadSHA != "" && expectedHeadSHA != "" && detail.HeadSHA != expectedHeadSHA {
+		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", expectedHeadSHA, detail.HeadSHA), true
 	}
 	return "", false
 }
