@@ -264,7 +264,7 @@ Forgejo profile (MVP):
 
 - planner: enabled (unchanged).
 - worker: enabled; claim via assignee.
-- reviewer discovery: `RequireReviewRequest: false`. **A non-empty reviewer discovery label is required for Forgejo.** Because the current reviewer treats empty labels + `RequireReviewRequest:false` as match-all (`internal/reviewer/runner.go:1079`), the profile sets a default reviewer discovery label and validation rejects a Forgejo reviewer with `AutoDiscovery:true` and no label. PRs are made discoverable by applying that label: planner already labels its spec PR (`looper:spec-reviewing`), and worker must apply the configured reviewer discovery label to PRs it creates (see "Worker"). Worker PRs that are not labeled are not reviewer-discovered. The reviewer never discovers by review request on Forgejo.
+- reviewer discovery: `RequireReviewRequest: false`. **Non-empty reviewer discovery labels are required for Forgejo, and spec-review and implementation-review discovery labels are distinct.** Because the current reviewer treats empty labels + `RequireReviewRequest:false` as match-all (`internal/reviewer/runner.go:1079`), the profile sets default labels and validation rejects a Forgejo reviewer with `AutoDiscovery:true` and no label for the PR phase being discovered. Planner/spec PRs keep the existing spec-review label (`looper:spec-reviewing`) so `specpr.ResolvePullRequestPhase` continues to route them to spec-review instructions. Worker implementation PRs must apply a separate implementation-review discovery label (for example `looper:impl-reviewing`) and must not use `looper:spec-reviewing`, or they would be reviewed as specs. Worker PRs that are not labeled are not reviewer-discovered. The reviewer never discovers by review request on Forgejo.
 - reviewer publish: forced to comment-only. `ReviewPublishStrategy: comment_only` overrides `PublishMode: SingleReview`; `ReviewEvents.Clean`/`ReviewEvents.Blocking` are not used to drive native review events. The reviewer emits a single PR/issue comment instead of a native `APPROVE`/`REQUEST_CHANGES` review.
 - reviewer thread resolution: forced disabled (already default-disabled; profile asserts it).
 - reviewer auto-merge: forced disabled (already default-disabled; profile asserts it).
@@ -419,7 +419,7 @@ Required provider methods:
 - Create PR.
 - Compare branches or provide enough PR state for dedupe.
 - Update PR title/body.
-- Add/remove PR labels, including removing handoff labels and applying the reviewer discovery label to PRs it creates (so the comment-only reviewer can discover them; see "Forgejo provider profile").
+- Add/remove PR labels, including removing handoff labels and applying the implementation-review discovery label to PRs it creates (so the comment-only reviewer can discover them without making worker PRs look like spec PRs; see "Forgejo provider profile").
 
 Worker claims via provider assignee only. **Label-only claim is out of MVP scope.** A claim label is not an exclusive, race-free authority: two workers can both add the same label and both believe they own the issue. Supporting it correctly would require defining concurrent-claim semantics and regression tests for the race, which is not justified for the MVP. If Forgejo's assignee semantics turn out to be unsuitable as a claim, the worker is disabled for that project with a clear message rather than falling back to a racy label claim. Adding a label-claim authority later is a separate design that must name the authority, its non-atomicity cost, and ship concurrent-claim tests.
 
@@ -513,6 +513,7 @@ Inventory must cover the whole composition, not just role imports:
 - The composition root and shared gateway construction (`internal/runtime/runtime.go`).
 - Scheduler tick input and adapter construction (`internal/runtime/scheduler.go`).
 - Discovery snapshot construction and consumption (`internal/infra/github/discovery_snapshot.go`, `internal/planner/runner.go`, `internal/worker/runner.go`).
+- Agent-facing prompt and fetch contracts that currently name GitHub or `gh` directly, including reviewer fetch instructions (`reviewerAgentSideGitHubFetchContract` in `internal/reviewer/runner.go`) and planner/worker prompts that describe GitHub issues, pull requests, labels, or review requests.
 - Project add/detect/validate (`internal/projects/service.go`, `internal/projects/reviewer_automerge_validation.go`).
 - Webhook and bootstrap `gh` assumptions (`internal/runtime/webhook.go`, `internal/runtime/webhook_forwarder.go`, `internal/config/validate.go`, `internal/cliapp/bootstrap.go`).
 - Network routed identity (`internal/config/types.go`, `internal/networkpolicy/policy.go`).
@@ -521,6 +522,7 @@ Then:
 
 - Create provider-neutral type names for issue, PR, review, label, and identity concepts.
 - Rename role interfaces only where the provider-neutral replacement exists.
+- Inventory each role prompt's mutable forge reads and side effects, then split provider-specific prompt/fetch-contract text so Forgejo agents are never instructed to run `gh pr view`, `gh pr diff`, `gh api`, or fail solely because `gh` is unavailable.
 
 ### Phase 1 - Provider config, registry, profile, and GitHub wrapper
 
@@ -542,11 +544,14 @@ Then:
 - Enable planner and worker for Forgejo projects with no discovery snapshot.
 - Resolve provider per project in the scheduler.
 - Add validation that unsupported provider features are rejected at config time.
+- Migrate planner and worker prompts to provider-neutral wording for issues, PRs, labels, assignees, and review discovery. GitHub-specific prompt text remains only on the GitHub provider path.
 - Document polling-only operation.
 
 ### Phase 4 - Reduced reviewer
 
 - Add comment-only reviewer publishing for Forgejo.
+- Replace the reviewer agent-side GitHub fetch contract with provider-specific fetch contracts: GitHub keeps the existing `gh`-based validation/diff/API instructions, while Forgejo uses provider-backed PR metadata and diff inputs supplied by Looper and never requires `gh`.
+- Add prompt-contract regression tests that render Forgejo reviewer prompts and assert they do not contain GitHub-only `gh pr view`, `gh pr diff`, `gh api`, review-request, or native-review instructions.
 - Keep fixer and coordinator disabled for Forgejo.
 
 ### Phase 5 - Optional advanced features
@@ -575,6 +580,7 @@ Each advanced feature must name the provider-native authority it relies on.
 - Planner can discover an issue and publish a spec PR on a Forgejo project in fake-provider integration tests, with no discovery snapshot.
 - Worker can claim an issue via assignee, push code with `git`, and create/update a PR on a Forgejo project in fake-provider integration tests.
 - Reviewer publishes a comment-only review on Forgejo and does not publish again for the same PR head SHA once a successful publish is recorded (a crash-window duplicate is accepted and documented), or fails validation with a clear unsupported-capability message if a disabled behavior is enabled.
+- Forgejo planner, worker, and reviewer prompts are rendered from provider-specific contracts: reviewer prompts do not instruct agents to call `gh pr view`, `gh pr diff`, or `gh api`, and planner/worker prompts do not describe GitHub-only review-request or native-review flows.
 - A Forgejo-only install boots through the recovery path (not just a scheduler tick) with no global GitHub gateway and no `ghPath`.
 - A mixed config (GitHub project using `gh-forward`/`tunnel` webhooks + Forgejo project polling) validates and runs; existing GitHub tunnel/forward configs are not regressed.
 - The new provider-neutral role interfaces do not reference the GitHub `DiscoverySnapshot` type.
