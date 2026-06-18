@@ -118,7 +118,7 @@ Depends on: Step 6
 
 - [x] Step 1: Provider Config And Contracts
 - [x] Step 2: Provider-Aware Runtime And Scheduler
-- [ ] Step 3: Forgejo REST Client MVP
+- [x] Step 3: Forgejo REST Client MVP
 - [ ] Step 4: Forgejo Planner And Worker Enablement
 - [ ] Step 5: Forgejo Comment-Only Reviewer
 - [ ] Step 6: EAG Validation
