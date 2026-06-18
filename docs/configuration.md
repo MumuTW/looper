@@ -162,6 +162,7 @@ Looper's frozen canonical top-level config roots are:
 | `defaults` | user-facing default policy that does not belong to a narrower domain |
 | `instructions` | global instruction-system settings that are not role-specific instruction content |
 | `roles` | role-specific config grouped by role name, for example `roles.<role>` |
+| `providers` | forge provider definitions such as GitHub or Forgejo hosts and credentials |
 | `projects` | per-project metadata and supported project-scoped overrides |
 
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
@@ -187,6 +188,46 @@ id = "looper"
 name = "Looper"
 repoPath = "/absolute/path/to/repo"
 ```
+
+## Provider support
+
+Looper supports two provider kinds:
+
+- `github` — existing default behavior, backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
+- `forgejo` — REST-backed MVP for planner, worker, and comment-only reviewer flows. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
+
+Forgejo provider example:
+
+```toml
+[agent]
+vendor = "opencode"
+
+[[providers]]
+id = "forgejo-main"
+kind = "forgejo"
+baseUrl = "https://code.example.com"
+tokenEnv = "LOOPER_FORGEJO_TOKEN"
+
+[[projects]]
+id = "example"
+name = "Example"
+repoPath = "/absolute/path/to/example"
+provider = "forgejo-main"
+repo = "acme/example"
+```
+
+Forgejo rules:
+
+- `providers[].id` must be unique.
+- `providers[].kind` must be `github` or `forgejo`; `gitea` is not a supported provider kind yet.
+- Forgejo providers require an absolute `http(s)` `baseUrl` and a non-empty `tokenEnv`. The token value is read from the daemon environment and is never stored in project metadata.
+- Forgejo projects require explicit `provider` and `repo` (`owner/name`).
+- Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
+- Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
+- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses label discovery and comment-only publish, and fixer/coordinator/auto-merge/thread resolution stay disabled.
+- Explicitly re-enabling unsupported Forgejo behavior fails config validation instead of silently downgrading behavior.
+
+Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label.
 
 ## Role model guidance
 
@@ -461,6 +502,12 @@ gitPath = "/usr/bin/git"
 ghPath = "/opt/homebrew/bin/gh"
 osascriptPath = "/usr/bin/osascript"
 
+[[providers]]
+id = "forgejo-main"
+kind = "forgejo"
+baseUrl = "https://code.example.com"
+tokenEnv = "LOOPER_FORGEJO_TOKEN"
+
 [package]
 distribution = "github-release"
 autoMigrateOnStartup = true
@@ -577,6 +624,13 @@ name = "Looper"
 repoPath = "/absolute/path/to/looper"
 baseBranch = "main"
 worktreeRoot = "/Users/you/.looper/worktrees/looper"
+
+[[projects]]
+id = "forgejo-example"
+name = "Forgejo Example"
+repoPath = "/absolute/path/to/forgejo-example"
+provider = "forgejo-main"
+repo = "acme/forgejo-example"
 
 [projects.roles.worker.discovery]
 autoDiscovery = false
@@ -749,6 +803,13 @@ Defaults preserve Looper's historical behavior:
 - worker discovers open issues labeled `looper:worker-ready` assigned to the current GitHub user
 - reviewer discovers open non-draft PRs where the current user is requested for review, skips self-authored PRs by default, and includes the `looper:spec-reviewing` follow-up path
 - fixer discovers open non-draft PRs authored by the current user that have actionable review items
+
+Forgejo provider profile differences:
+
+- planner discovers labeled issues through the Forgejo REST provider
+- worker discovers only issues already assigned to the current Forgejo user and does not claim work by adding itself as assignee
+- reviewer discovers by configured labels and publishes a top-level comment-only review; it does not use review requests or native PR review events
+- fixer, coordinator, auto-merge, review-thread resolution, routed network mode, and webhook modes are unsupported for Forgejo in the MVP and fail fast if explicitly enabled
 
 Common fields:
 

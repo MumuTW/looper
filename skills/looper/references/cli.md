@@ -50,8 +50,9 @@ Before bootstrap:
 
 - Confirm the target repo path is absolute and points to a Git repository.
 - Confirm the intended `agent.vendor` (for example `opencode`).
-- Check `gh auth status` and ensure `git`/`gh` resolve in the environment that will run `looperd`.
-- If `git` or `gh` are missing, ask before installing them. On macOS with Homebrew, the usual repair is `brew install git gh`; otherwise use the user's OS/package manager.
+- For GitHub projects, check `gh auth status` and ensure `git`/`gh` resolve in the environment that will run `looperd`.
+- For Forgejo-only configs, ensure `git` resolves and the configured provider `tokenEnv` is exported in the daemon environment; `gh` is not required.
+- If a required `git` or `gh` binary is missing, ask before installing it. On macOS with Homebrew, the usual repair is `brew install git gh`; otherwise use the user's OS/package manager.
 - Ask before using `--yes`; bootstrap may create config, install or reuse the managed daemon, register a project, and start the daemon.
 - If `~/.looper/config.json` already exists, inspect targeted fields first and avoid overwriting user configuration.
 
@@ -187,7 +188,7 @@ looper daemon restart
 
 ## Add an existing project/repo
 
-If Looper is already installed and the user has an existing local repository, register it explicitly instead of re-running first-time bootstrap:
+If Looper is already installed and the user has an existing local GitHub repository, register it explicitly instead of re-running first-time bootstrap:
 
 ```bash
 looper project add /absolute/path/to/repo --id myproj --repo owner/repo
@@ -211,6 +212,8 @@ looper status
 ```
 
 After a project is registered, Looper can often infer it from commands run inside that repo. If no project matches the current directory, or multiple projects match, pass `--project <id>` explicitly.
+
+Forgejo projects are config-driven in the MVP. Do not use GitHub autodetection for them; add a `[[providers]]` entry with `kind = "forgejo"`, `baseUrl`, and `tokenEnv`, then add a project with `provider` and explicit `repo = "owner/name"`.
 
 Daemon lifecycle commands:
 

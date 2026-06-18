@@ -1,6 +1,6 @@
 # Looper daemon reference for agents
 
-`looperd` is the background daemon that polls GitHub and runs configured Looper roles. Starting or restarting it can trigger repository automation, so confirm user intent before changing lifecycle state.
+`looperd` is the background daemon that polls GitHub or Forgejo and runs configured Looper roles. Starting or restarting it can trigger repository automation, so confirm user intent before changing lifecycle state.
 
 ## Read-only checks
 
@@ -39,12 +39,13 @@ Launchd mode creates or uses a user LaunchAgent plist and stores logs under `~/.
 
 Check these before changing config:
 
-1. `git` and `gh` are installed and resolvable.
-2. `gh` is authenticated for the target repositories.
-3. `~/.looper/` and configured storage/log/backup/worktree paths are writable.
-4. `~/.looper/config.json` is valid JSON and passes Looper validation.
-5. If notifications enable osascript, `osascript` resolves.
-6. The managed daemon binary exists at `~/.looper/bin/looperd` or `looperd` resolves on `PATH`.
+1. `git` is installed and resolvable.
+2. For GitHub projects, `gh` is installed, resolvable, and authenticated for the target repositories.
+3. For Forgejo projects, the configured provider `tokenEnv` is present in the daemon environment.
+4. `~/.looper/` and configured storage/log/backup/worktree paths are writable.
+5. `~/.looper/config.toml` or the selected config file is valid and passes Looper validation.
+6. If notifications enable osascript, `osascript` resolves.
+7. The managed daemon binary exists at `~/.looper/bin/looperd` or `looperd` resolves on `PATH`.
 
 Useful checks:
 
@@ -58,7 +59,9 @@ test -w ~/.looper
 
 If a tool resolves in your shell but not for `looperd`, set explicit `tools.gitPath`, `tools.ghPath`, or `tools.osascriptPath` in config after confirming with the user.
 
-If `git` or `gh` are missing, ask before installing them. On macOS with Homebrew, the usual repair is:
+`tools.ghPath` is only required for configs with GitHub projects. Do not add `ghPath` to fix a Forgejo-only startup unless the config also contains GitHub projects.
+
+If a required `git` or `gh` binary is missing, ask before installing it. On macOS with Homebrew, the usual repair is:
 
 ```bash
 brew install git gh

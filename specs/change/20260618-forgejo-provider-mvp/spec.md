@@ -1,7 +1,7 @@
 ---
 id: 20260618-forgejo-provider-mvp
 name: Forgejo Provider Mvp
-status: planned
+status: implemented
 created: '2026-06-18'
 ---
 
@@ -122,7 +122,7 @@ Depends on: Step 6
 - [x] Step 4: Forgejo Planner And Worker Enablement
 - [x] Step 5: Forgejo Comment-Only Reviewer
 - [x] Step 6: EAG Validation
-- [ ] Step 7: Documentation Sync
+- [x] Step 7: Documentation Sync
 
 ## Implementation
 

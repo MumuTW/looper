@@ -71,6 +71,7 @@ Looper's frozen canonical top-level config roots are:
 - `defaults`
 - `instructions`
 - `roles`
+- `providers`
 - `projects`
 
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
@@ -90,6 +91,49 @@ id = "looper"
 name = "Looper"
 repoPath = "/absolute/path/to/repo"
 ```
+
+## Provider config
+
+Provider kinds:
+
+- `github` — legacy default, backed by `gh`. Projects without `provider` keep GitHub autodetection/metadata behavior.
+- `forgejo` — REST-backed MVP. Forgejo-only configs do not require `gh` when `git`, the provider config, and token environment are valid.
+
+Minimal Forgejo project:
+
+```toml
+[agent]
+vendor = "opencode"
+
+[[providers]]
+id = "forgejo-main"
+kind = "forgejo"
+baseUrl = "https://code.example.com"
+tokenEnv = "LOOPER_FORGEJO_TOKEN"
+
+[[projects]]
+id = "example"
+name = "Example"
+repoPath = "/absolute/path/to/example"
+provider = "forgejo-main"
+repo = "acme/example"
+```
+
+Forgejo validation notes:
+
+- `baseUrl` must be an absolute `http(s)` URL.
+- `tokenEnv` must name an environment variable available to `looperd`; do not write token values into config.
+- Forgejo projects require explicit `provider` and `repo`.
+- Duplicate `repo` values are rejected case-insensitively, even across providers.
+- Forgejo uses polling only; omit project `webhook.mode` and keep `network.mode` off.
+- The provider profile disables unsupported GitHub-shaped defaults. Explicit opt-ins to Forgejo-unsupported behavior fail fast.
+
+Forgejo MVP role limits:
+
+- planner and worker are supported
+- worker only processes issues already assigned to the current Forgejo user; it does not self-assign
+- reviewer discovers by labels and publishes comment-only PR comments; default normal-review label is `looper:review`, while spec PRs use `looper:spec-reviewing`
+- fixer, coordinator, auto-merge, native reviews, review requests, thread resolution, routed network mode, and webhooks are unsupported for Forgejo
 
 ## Role model guidance
 
@@ -238,6 +282,12 @@ gitPath = "/usr/bin/git"
 ghPath = "/opt/homebrew/bin/gh"
 osascriptPath = "/usr/bin/osascript"
 
+[[providers]]
+id = "forgejo-main"
+kind = "forgejo"
+baseUrl = "https://code.example.com"
+tokenEnv = "LOOPER_FORGEJO_TOKEN"
+
 [defaults]
 baseBranch = "main"
 openPrStrategy = "all_done"
@@ -288,6 +338,13 @@ requireAssigneeCurrentUser = true
 id = "looper"
 name = "Looper"
 repoPath = "/absolute/path/to/looper"
+
+[[projects]]
+id = "forgejo-example"
+name = "Forgejo Example"
+repoPath = "/absolute/path/to/forgejo-example"
+provider = "forgejo-main"
+repo = "acme/forgejo-example"
 
 [projects.roles.reviewer.discovery.triggers]
 labels = ["needs-review"]
@@ -405,6 +462,8 @@ looperd \
 - `projects[].id` must be valid and unique
 - storage, log, working-directory, and worktree paths must be writable
 - required tool paths must resolve
+- `gh` must resolve for GitHub projects; Forgejo-only configs do not require `gh`
+- Forgejo providers require `baseUrl` and `tokenEnv`; the named token environment variable must be present for runtime API calls
 - `notifications.osascript.enabled=true` requires `tools.osascriptPath` to resolve
 
 ## Safety notes

@@ -1,6 +1,6 @@
 # Looper Quick User Guide
 
-This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with GitHub issues and PRs.
+This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support is currently limited to planner, worker, and comment-only reviewer flows.
 
 ## 1. Prerequisites
 
@@ -9,7 +9,7 @@ Make sure these work first:
 ```bash
 looper status
 looper project list
-gh auth status
+gh auth status  # GitHub projects only
 ```
 
 If the project is not registered in Looper yet:
@@ -31,8 +31,11 @@ Also make sure:
 
 - `looperd` is running
 - your local repo can `git fetch` and `git push`
-- `gh` is authenticated with the target GitHub account
+- GitHub projects: `gh` is authenticated with the target GitHub account
+- Forgejo projects: the configured provider `tokenEnv` is exported in the daemon environment
 - `config.agent.vendor` is set (for example via `looper bootstrap --agent-vendor opencode`)
+
+Forgejo projects are added in config, not by `looper project add` autodetection. Add a `[[providers]]` entry with `kind = "forgejo"`, `baseUrl`, and `tokenEnv`, then set the project `provider` and explicit `repo` (`owner/name`). See [configuration](configuration.md#provider-support).
 
 ## 1a. Local-only vs Routed projects
 
@@ -89,6 +92,13 @@ If no project matches the current directory, or multiple projects match, pass `-
 | `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | `looper review <repo>#<pr> [--loop]` or `looper review <pr> [--loop]` from inside the repo |
 | `fixer` | Fixes PR issues based on review comments and tries to resolve threads | `looper fix <repo>#<pr>` |
 | `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | `looper work --issue <num>` or `looper work --project <id> --issue <num>` |
+
+Forgejo MVP role support:
+
+- Planner and Worker are supported over the Forgejo REST API.
+- Reviewer is supported as comment-only: Looper posts a top-level PR comment and uses a local head-SHA record for idempotency.
+- Fixer, Coordinator, auto-merge, native reviews, review requests, review-thread resolution, routed network mode, and webhook modes are GitHub-only for now.
+- A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
 ## 4. Recommended flow
 
@@ -255,6 +265,8 @@ For the default review-requested path, Looper asks GitHub for PRs requested from
 
 For spec PRs, `looper:spec-reviewing` marks the review phase, but it does not by itself authorize other users' Looper instances to run. Request review from the intended GitHub user to trigger that user's automatic reviewer.
 
+For Forgejo projects, reviewer auto-discovery uses labels instead of review requests. The provider profile defaults normal PR discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Forgejo reviewer publishes comment-only results and does not create native `APPROVE` or `REQUEST_CHANGES` reviews.
+
 ### What happens after reviewer finishes
 
 If reviewer considers the spec review clean, it will:
@@ -346,6 +358,8 @@ If that issue already has a related planner loop, worker will try to reuse plann
 That means issue → planner → worker can flow through without manually copying the spec path.
 
 When worker claims an issue, it adds the current GitHub user as an assignee and preserves any existing assignees. If GitHub assignment fails, the claim reports a retryable failure instead of silently continuing with ambiguous ownership.
+
+For Forgejo projects, Worker does not claim issues by mutating assignees. The issue must already be assigned to the current Forgejo provider user, and Worker re-checks that assignment before side effects.
 
 ### Start directly from a spec
 

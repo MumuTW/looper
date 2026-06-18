@@ -33,3 +33,9 @@
 - Updated reviewer prompt construction for Forgejo comment-only runs so the agent uses supplied metadata/diff context without GitHub CLI/native-review instructions, while the runner records `lastPublishedHeadSha` and publishes exactly one top-level comment per head.
 - Added focused coverage in `internal/reviewer/runner_test.go` and `internal/runtime/scheduler_forgejo_test.go` for Forgejo comment-only prompt contracts, label-based discovery without review requests, local head-SHA idempotency after publish, and reviewer adapter Forgejo endpoints.
 - Verified with `go test ./internal/forge ./internal/reviewer ./internal/runtime`.
+
+## Step 7
+
+- Updated `README.md`, `docs/configuration.md`, `docs/installation.md`, and `docs/users-guide.md` so public docs describe explicit `github`/`forgejo` provider support, conditional `gh` requirements, Forgejo-only boot behavior, and Forgejo MVP role limitations.
+- Updated `skills/looper/references/config.md`, `skills/looper/references/daemon.md`, and `skills/looper/references/cli.md` so the bundled agent guidance matches Forgejo provider configuration, provider-aware startup checks, and Forgejo comment-only reviewer behavior.
+- Verified with `git diff -- README.md docs/configuration.md docs/users-guide.md docs/installation.md skills/looper/references/config.md skills/looper/references/daemon.md skills/looper/references/cli.md` and a manual pass over the updated docs.

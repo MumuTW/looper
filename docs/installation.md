@@ -8,16 +8,16 @@ For the default supported install path:
 
 - macOS (`darwin-arm64`) or Linux (`linux-amd64`)
 - `git`
-- `gh`
+- `gh` for GitHub projects; Forgejo-only installs do not require `gh`
 
 For source development:
 
 - Go `1.22`
 - `git`
-- `gh`
+- `gh` for GitHub projects; Forgejo-only development does not require `gh`
 - `osascript` if macOS notifications stay enabled
 
-`looperd` auto-detects tool paths from `PATH`, but startup validation fails if required tools cannot be resolved.
+`looperd` auto-detects tool paths from `PATH`, but startup validation fails if required tools cannot be resolved. `git` is always required. `gh` is required when any configured project uses the GitHub provider, but a Forgejo-only config starts without `gh` when the Forgejo provider and token environment variable are valid.
 
 ## Install
 

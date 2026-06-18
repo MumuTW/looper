@@ -4,18 +4,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go)](go.mod)
 
-**An autonomous AI dev team for your GitHub repos — plan, review, fix, and ship PRs, on a loop.**
+**An autonomous AI dev team for your GitHub and Forgejo repos — plan, review, fix, and ship PRs, on a loop.**
 
 > *"LLMs are exceptionally good at looping until they meet specific goals... Don't tell it what to do, give it success criteria and watch it go."*
 > — Andrej Karpathy
 
-Looper turns that idea into a local AI dev team. Register the repos you want it to watch; Looper picks up assigned, labeled issues and runs specialized agents — **planner → reviewer ↔ fixer → worker** — each looping against its own success criteria until the PR is ready for human merge. GitHub stays the source of truth; Looper handles the spec, review cycle, and implementation in isolated worktrees.
+Looper turns that idea into a local AI dev team. Register the repos you want it to watch; Looper picks up assigned, labeled issues and runs specialized agents — **planner → reviewer ↔ fixer → worker** — each looping against its own success criteria until the PR is ready for human merge. Your forge stays the source of truth; Looper handles the spec, review cycle, and implementation in isolated worktrees.
 
 ![Looper technical architecture](assets/looper-technical-architecture.png)
 
 Looper ships two binaries:
 
-- `looperd` — the background daemon that polls GitHub, runs loops, and manages worktrees
+- `looperd` — the background daemon that polls GitHub or Forgejo, runs loops, and manages worktrees
 - `looper` — the CLI for setup, control, inspection, and manual loop starts
 
 ## Four loops, four success criteria
@@ -32,7 +32,7 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 ## Features
 
 - 🚢 **Start from an issue, not a prompt.** Label an issue `looper:plan`, assign it to yourself, and a spec PR shows up. Once it reaches `looper:spec-ready`, implementation begins.
-- 🐙 **GitHub is the only source of truth.** Issues, PRs, labels, reviews, and assignees *are* the workflow — no external task tracker, no YAML pipeline, no project-specific config. If you can use GitHub, you can drive Looper.
+- 🐙 **The forge is the source of truth.** Issues, PRs, labels, reviews, and assignees *are* the workflow — no external task tracker, no YAML pipeline. GitHub is fully supported; Forgejo is supported for planner, worker, and comment-only reviewer flows.
 - 🛰️ **Many repos, one daemon.** Register your projects once — Looper watches them together and runs loops across repos in parallel.
 - 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents work across issues and repos without stepping on each other.
 - 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`) so you're not locked into one model or CLI.
@@ -72,7 +72,7 @@ looper project add .
 
 Add each repo you want Looper to watch after bootstrap. Full install, upgrade, uninstall, and from-source instructions: **[docs/installation.md](docs/installation.md)**.
 
-Once `looper status` succeeds and `gh auth status` shows an authenticated account, drive loops manually:
+Once `looper status` succeeds and your forge credentials are configured (`gh auth status` for GitHub, or a configured Forgejo token environment variable), drive loops manually:
 
 ```bash
 # plan a spec from an issue
@@ -193,7 +193,7 @@ issue (looper:plan, assigned)
 
 Each role runs in its own worktree, coordinated by `looperd` and gated by labels. The planner opens the spec PR, the reviewer and fixer loop on it until it's clean, and `looper:spec-ready` is the signal that hands work to the worker — which implements on the same PR rather than opening a new one.
 
-Looper is poll-driven, not webhook-driven: keep `looperd` running and `gh` authenticated for the loop to fire. Everything runs locally — no hosted control plane required.
+Looper is poll-driven by default: keep `looperd` running and forge credentials available for the loop to fire. GitHub projects still use `gh`; Forgejo projects use the configured REST provider and do not require `gh` in Forgejo-only installs. Everything runs locally — no hosted control plane required.
 
 ## Networked operation
 
@@ -267,6 +267,7 @@ If `looper ps` shows stale `running` work with no live agent after sleep/wake, r
 - Canonical default path: `~/.looper/config.toml`
 - Supported formats: `.toml`, `.yaml`, `.yml`, `.json`
 - Config source selection precedence: `--config` → `LOOPER_CONFIG` → default-path discovery
+- Provider support: legacy GitHub projects keep working through `gh`; Forgejo projects require an explicit provider, `baseUrl`, `tokenEnv`, and `repo`
 - All role-specific config lives under `roles.<role>`; canonical reviewer behavior lives under `roles.reviewer.behavior.*`
 - Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path
 - `agent.vendor` is required to run loops (no default)
@@ -295,4 +296,4 @@ Build artifacts go to `dist/` and are gitignored — don't edit generated files.
 - Daemon-managed worktrees live under `~/.looper/worktrees/`, grouped by repo and project
 - `looper worktree cleanup` dry-runs Looper-managed worktree cleanup; `--confirm` removes eligible clean terminal worktrees without deleting branches
 - When `notifications.osascript.enabled=true`, `osascript` must resolve on startup
-- Automation is poll-driven, not webhook-driven — keep `looperd` running and `gh` installed and authenticated for the loop to fire
+- Automation is poll-driven by default — keep `looperd` running and provider credentials available; GitHub projects require `gh`, while Forgejo-only installs do not
