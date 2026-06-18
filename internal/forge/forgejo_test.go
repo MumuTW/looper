@@ -55,6 +55,11 @@ func TestForgejoClientContract(t *testing.T) {
 			writeJSON(t, w, http.StatusOK, []map[string]any{{"id": 11, "name": "planner"}, {"id": 12, "name": "ready"}})
 		case r.Method == http.MethodDelete && r.URL.Path == "/forge/api/v1/repos/acme/looper/issues/7/labels/planner":
 			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete && r.URL.Path == "/forge/api/v1/repos/acme/looper/issues/7/labels/team/review":
+			if got := r.URL.EscapedPath(); got != "/forge/api/v1/repos/acme/looper/issues/7/labels/team%2Freview" {
+				t.Fatalf("slash label escaped path = %q, want encoded slash preserved", got)
+			}
+			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && r.URL.Path == "/forge/api/v1/repos/acme/looper/issues/7/assignees":
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodDelete && r.URL.Path == "/forge/api/v1/repos/acme/looper/issues/7/assignees":
@@ -120,6 +125,9 @@ func TestForgejoClientContract(t *testing.T) {
 	}
 	if err := client.RemoveIssueLabel(ctx, 7, "planner"); err != nil {
 		t.Fatalf("RemoveIssueLabel() error = %v", err)
+	}
+	if err := client.RemoveIssueLabel(ctx, 7, "team/review"); err != nil {
+		t.Fatalf("RemoveIssueLabel() slash label error = %v", err)
 	}
 	if err := client.AddIssueAssignees(ctx, 7, []string{"ralph"}); err != nil {
 		t.Fatalf("AddIssueAssignees() error = %v", err)

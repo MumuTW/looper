@@ -320,7 +320,7 @@ func (forgejo *ForgejoClient) AddIssueLabels(ctx context.Context, issueNumber in
 }
 
 func (forgejo *ForgejoClient) RemoveIssueLabel(ctx context.Context, issueNumber int64, label string) error {
-	return forgejo.do(ctx, http.MethodDelete, forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "labels", label), nil, nil, nil)
+	return forgejo.do(ctx, http.MethodDelete, forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "labels", url.PathEscape(label)), nil, nil, nil)
 }
 
 func (forgejo *ForgejoClient) AddIssueAssignees(ctx context.Context, issueNumber int64, assignees []string) error {
@@ -437,7 +437,10 @@ func (forgejo *ForgejoClient) do(ctx context.Context, method string, path string
 }
 
 func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path string, query url.Values, payload any) (rawResponse, error) {
-	apiURL := forgejo.apiURL(path)
+	apiURL, err := forgejo.apiURL(path)
+	if err != nil {
+		return rawResponse{}, err
+	}
 	apiURL.RawQuery = query.Encode()
 	var body io.Reader
 	if payload != nil {
@@ -474,12 +477,16 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 	return rawResponse{body: responseBody, header: response.Header.Clone()}, nil
 }
 
-func (forgejo *ForgejoClient) apiURL(path string) *url.URL {
+func (forgejo *ForgejoClient) apiURL(path string) (*url.URL, error) {
 	cleanPath := strings.TrimLeft(path, "/")
+	decodedPath, err := url.PathUnescape(cleanPath)
+	if err != nil {
+		return nil, fmt.Errorf("forgejo API invalid path %q: %w", path, err)
+	}
 	apiURL := *forgejo.baseURL
-	apiURL.Path = strings.TrimRight(forgejo.baseURL.Path, "/") + "/api/v1/" + strings.ReplaceAll(cleanPath, "%2F", "/")
+	apiURL.Path = strings.TrimRight(forgejo.baseURL.Path, "/") + "/api/v1/" + decodedPath
 	apiURL.RawPath = strings.TrimRight(forgejo.baseURL.EscapedPath(), "/") + "/api/v1/" + cleanPath
-	return &apiURL
+	return &apiURL, nil
 }
 
 func cloneValues(input url.Values) url.Values {
