@@ -1097,7 +1097,7 @@ func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
 	if work.IssueRepo != "nexu-io/looper" {
 		t.Fatalf("IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement GitHub issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
 		t.Fatalf("Prompt = %q, want issue repo in prompt", work.Prompt)
 	}
 	if issueRepoFromURL("https://ghe.example.com/nexu-io/looper/issues/27") != "nexu-io/looper" {
@@ -1109,8 +1109,8 @@ func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
 	if issueRepoFromURL("https://github.com/nexu-io/looper/issues/not-a-number") != "" {
 		t.Fatal("issueRepoFromURL() should ignore invalid issue URLs")
 	}
-	if !strings.Contains(buildAgentPullRequestInstruction(work), "Closes nexu-io/looper#27") {
-		t.Fatalf("instruction = %q, want cross-repo closing reference", buildAgentPullRequestInstruction(work))
+	if !strings.Contains(buildAgentPullRequestInstruction(work, config.ProviderKindGitHub), "Closes nexu-io/looper#27") {
+		t.Fatalf("instruction = %q, want cross-repo closing reference", buildAgentPullRequestInstruction(work, config.ProviderKindGitHub))
 	}
 }
 
@@ -1120,7 +1120,7 @@ func TestHydrateWorkerInputFromIssueUsesSourceIssueURLWhenIssueURLMissing(t *tes
 	if work.IssueRepo != "nexu-io/looper" {
 		t.Fatalf("IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement GitHub issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
 		t.Fatalf("Prompt = %q, want issue repo inferred from source issue URL", work.Prompt)
 	}
 	if work.IssueURL != "https://github.com/nexu-io/looper/issues/27" {
@@ -1164,10 +1164,10 @@ func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 	if work.IssueRepo != "nexu-io/looper" {
 		t.Fatalf("work.IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement GitHub issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
 	}
-	if strings.Contains(work.Prompt, "Implement GitHub issue acme/looper#27") {
+	if strings.Contains(work.Prompt, "Implement issue acme/looper#27") {
 		t.Fatalf("Prompt = %q, want prompt to avoid worker repo issue reference", work.Prompt)
 	}
 }
@@ -1208,7 +1208,7 @@ func TestResolveWorkerInputFallsBackToWorkerRepoForIssueHydration(t *testing.T) 
 	if work.IssueRepo != "nexu-io/looper" {
 		t.Fatalf("work.IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement GitHub issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
 	}
 }
@@ -1249,10 +1249,10 @@ func TestResolveWorkerInputUsesIssueURLRepoForIssueHydrationLookup(t *testing.T)
 	if work.IssueRepo != "nexu-io/looper" {
 		t.Fatalf("work.IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement GitHub issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
 	}
-	if strings.Contains(work.Prompt, "Implement GitHub issue acme/looper#27") {
+	if strings.Contains(work.Prompt, "Implement issue acme/looper#27") {
 		t.Fatalf("Prompt = %q, want prompt to avoid worker repo issue reference", work.Prompt)
 	}
 }
@@ -2118,6 +2118,75 @@ func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyD
 	}
 	if len(github.addAssigneeCalls) != 0 {
 		t.Fatalf("addAssigneeCalls = %#v, want no self-assignment", github.addAssigneeCalls)
+	}
+}
+
+func TestProcessClaimedItemForgejoPromptAvoidsGitHubCLIText(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: filepath.Join(t.TempDir(), "repo")}}
+	work := workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: 27, Prompt: "Implement issue acme/looper#27: task"}
+	prompt, _, err := buildWorkerPromptWithInstructions(t.TempDir(), "project_1", *fixture.cfg, work, nil, false, config.DefaultDisclosureConfig(), "opencode", "model")
+	if err != nil {
+		t.Fatalf("buildWorkerPromptWithInstructions() error = %v", err)
+	}
+	if strings.Contains(prompt, "GitHub CLI") || strings.Contains(prompt, "`gh`") {
+		t.Fatalf("prompt = %q, want Forgejo-safe prompt text", prompt)
+	}
+}
+
+func TestProcessClaimedItemForgejoSkipsWhenIssueUnassignedWithoutSelfAssignment(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: filepath.Join(t.TempDir(), "repo")}}
+	github := &fakeGitHubGateway{currentLogin: "forge-user", issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open", AssigneeUsers: []networkpolicy.GitHubUser{{Login: "teammate"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped", result)
+	}
+	if len(github.addAssigneeCalls) != 0 {
+		t.Fatalf("addAssigneeCalls = %#v, want no self-assignment for Forgejo", github.addAssigneeCalls)
+	}
+	if len(github.viewIssueCalls) == 0 {
+		t.Fatal("viewIssueCalls = 0, want assignment recheck before side effects")
+	}
+}
+
+func TestProcessClaimedItemForgejoSkipsWhenIssueDeassignedBeforeSideEffects(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: filepath.Join(t.TempDir(), "repo")}}
+	github := &fakeGitHubGateway{currentLogin: "forge-user", issueDetailResponses: []IssueDetail{{Number: 27, Title: "Implement worker loop", State: "open", AssigneeUsers: []networkpolicy.GitHubUser{{Login: "forge-user"}}}, {Number: 27, Title: "Implement worker loop", State: "open", AssigneeUsers: []networkpolicy.GitHubUser{{Login: "teammate"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped", result)
+	}
+	if len(github.addAssigneeCalls) != 0 {
+		t.Fatalf("addAssigneeCalls = %#v, want no self-assignment for Forgejo", github.addAssigneeCalls)
+	}
+	if len(github.viewIssueCalls) < 2 {
+		t.Fatalf("viewIssueCalls = %#v, want open-check plus assignment recheck", github.viewIssueCalls)
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
+	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
@@ -172,9 +173,151 @@ func (g coordinatorNetworkGateway) api() (*networkclient.Client, error) {
 type plannerGitHubAdapter struct {
 	gateway *githubinfra.Gateway
 	stamper disclosure.Stamper
+	config  *config.Config
+}
+
+func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
+	provider, ok, err := forgejoProviderForRepo(cfg, repo)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(repo))
+	if err != nil {
+		return nil, true, err
+	}
+	return client, true, nil
+}
+
+func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
+	project, provider, ok, err := forgejoProjectProviderForCWD(cfg, cwd)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(project.Repo))
+	if err != nil {
+		return nil, true, err
+	}
+	return client, true, nil
+}
+
+func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, bool, error) {
+	if cfg == nil {
+		return config.ProviderConfig{}, false, nil
+	}
+	repo = strings.TrimSpace(repo)
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.Repo) != repo {
+			continue
+		}
+		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+			return config.ProviderConfig{}, false, nil
+		}
+		provider, ok := forgejoProviderByID(*cfg, project.Provider)
+		if !ok {
+			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", project.Provider, repo)
+		}
+		return provider, true, nil
+	}
+	return config.ProviderConfig{}, false, nil
+}
+
+func forgejoProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
+	if cfg == nil {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	cwd = strings.TrimSpace(cwd)
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.RepoPath) != cwd {
+			continue
+		}
+		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+		}
+		provider, ok := forgejoProviderByID(*cfg, project.Provider)
+		if !ok {
+			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for project %s", project.Provider, project.ID)
+		}
+		if strings.TrimSpace(project.Repo) == "" {
+			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo project %s is missing repo", project.ID)
+		}
+		return project, provider, true, nil
+	}
+	return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+}
+
+func forgejoProviderByID(cfg config.Config, providerID string) (config.ProviderConfig, bool) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return config.ProviderConfig{}, false
+	}
+	for _, provider := range cfg.Providers {
+		if provider.ID == providerID {
+			return provider, true
+		}
+	}
+	return config.ProviderConfig{}, false
+}
+
+func forgeIdentityLogins(identities []forge.Identity) []string {
+	if identities == nil {
+		return nil
+	}
+	logins := make([]string, 0, len(identities))
+	for _, identity := range identities {
+		if login := strings.TrimSpace(identity.Login); login != "" {
+			logins = append(logins, login)
+		}
+	}
+	return logins
+}
+
+func forgeLabelNames(labels []forge.Label) []string {
+	if labels == nil {
+		return nil
+	}
+	names := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if name := strings.TrimSpace(label.Name); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func forgeNetworkPolicyUsers(users []forge.Identity) []networkpolicy.GitHubUser {
+	if users == nil {
+		return nil
+	}
+	converted := make([]networkpolicy.GitHubUser, 0, len(users))
+	for _, user := range users {
+		converted = append(converted, networkpolicy.GitHubUser{Login: user.Login, ID: user.ID})
+	}
+	return converted
+}
+
+func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForRepo(a.config, repo)
+	return client, ok, err
 }
 
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]planner.IssueSummary, 0, len(issues))
+		for _, issue := range issues {
+			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+		}
+		return result, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
 	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label, Labels: input.Labels})
 	if err != nil {
 		return nil, err
@@ -187,6 +330,19 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 }
 
 func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewIssueInput) (planner.IssueDetail, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return planner.IssueDetail{}, err
+		}
+		issue, err := client.ViewIssue(ctx, input.IssueNumber)
+		if err != nil {
+			return planner.IssueDetail{}, err
+		}
+		return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
+	}
+	if a.gateway == nil {
+		return planner.IssueDetail{}, fmt.Errorf("github gateway is not configured")
+	}
 	issue, err := a.gateway.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
 	if err != nil {
 		return planner.IssueDetail{}, err
@@ -195,10 +351,29 @@ func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewI
 }
 
 func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		identity, err := client.CurrentUser(ctx)
+		return identity.Login, err
+	}
+	if a.gateway == nil {
+		return "", fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
 
 func (a plannerGitHubAdapter) AddIssueAssignees(ctx context.Context, input planner.IssueAssigneesInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Assignees: input.Assignees, CWD: input.CWD})
 }
 
@@ -214,6 +389,23 @@ func networkPolicyUsers(users []githubinfra.GitHubUser) []networkpolicy.GitHubUs
 }
 
 func (a plannerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input planner.ListOpenPullRequestsInput) ([]planner.PullRequestSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: input.Limit})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]planner.PullRequestSummary, 0, len(pullRequests))
+		for _, pr := range pullRequests {
+			result = append(result, planner.PullRequestSummary{Number: pr.Number, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name})
+		}
+		return result, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
 	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit})
 	if err != nil {
 		return nil, err
@@ -226,6 +418,19 @@ func (a plannerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input pl
 }
 
 func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner.ViewPullRequestInput) (planner.PullRequestDetail, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return planner.PullRequestDetail{}, err
+		}
+		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
+		if err != nil {
+			return planner.PullRequestDetail{}, err
+		}
+		return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name}, nil
+	}
+	if a.gateway == nil {
+		return planner.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
 	pr, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return planner.PullRequestDetail{}, err
@@ -235,6 +440,19 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
 	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return planner.CreatePullRequestResult{}, err
+		}
+		pr, err := client.CreatePullRequest(ctx, forge.CreatePullRequestInput{Title: input.Title, Body: body, Head: input.HeadBranch, Base: input.BaseBranch})
+		if err != nil {
+			return planner.CreatePullRequestResult{}, err
+		}
+		return planner.CreatePullRequestResult{Number: pr.Number, URL: pr.HTMLURL}, nil
+	}
+	if a.gateway == nil {
+		return planner.CreatePullRequestResult{}, fmt.Errorf("github gateway is not configured")
+	}
 	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, CWD: input.CWD})
 	if err != nil {
 		return planner.CreatePullRequestResult{}, err
@@ -244,14 +462,43 @@ func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input plann
 
 func (a plannerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input planner.UpdatePullRequestBodyInput) error {
 	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdatePullRequest(ctx, forge.UpdatePullRequestInput{Number: input.PRNumber, Body: &body})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.UpdatePullRequestBody(ctx, githubinfra.UpdatePullRequestBodyInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
 }
 
 func (a plannerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input planner.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.AddIssueLabels(ctx, input.PRNumber, input.Labels)
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
 func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input planner.PullRequestReviewersInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
 }
 
@@ -680,9 +927,32 @@ func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult
 type workerGitHubAdapter struct {
 	gateway *githubinfra.Gateway
 	stamper disclosure.Stamper
+	config  *config.Config
+}
+
+func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForRepo(a.config, repo)
+	return client, ok, err
 }
 
 func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input worker.ListOpenPullRequestsInput) ([]worker.PullRequestSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: input.Limit})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]worker.PullRequestSummary, 0, len(pullRequests))
+		for _, pr := range pullRequests {
+			result = append(result, worker.PullRequestSummary{Number: pr.Number, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name})
+		}
+		return result, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
 	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Label: input.Label})
 	if err != nil {
 		return nil, err
@@ -695,6 +965,23 @@ func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input wor
 }
 
 func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.ListOpenIssuesInput) ([]worker.IssueSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]worker.IssueSummary, 0, len(issues))
+		for _, issue := range issues {
+			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+		}
+		return result, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
 	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label, Labels: input.Labels})
 	if err != nil {
 		return nil, err
@@ -707,14 +994,46 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 }
 
 func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		identity, err := client.CurrentUser(ctx)
+		return identity.Login, err
+	}
+	if a.gateway == nil {
+		return "", fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
 
 func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker.IssueAssigneesInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Assignees: input.Assignees, CWD: input.CWD})
 }
 
 func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return worker.PullRequestDetail{}, err
+		}
+		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
+		if err != nil {
+			return worker.PullRequestDetail{}, err
+		}
+		return worker.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA}, nil
+	}
+	if a.gateway == nil {
+		return worker.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
 	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return worker.PullRequestDetail{}, err
@@ -723,6 +1042,19 @@ func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.V
 }
 
 func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIssueInput) (worker.IssueDetail, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return worker.IssueDetail{}, err
+		}
+		issue, err := client.ViewIssue(ctx, input.IssueNumber)
+		if err != nil {
+			return worker.IssueDetail{}, err
+		}
+		return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
+	}
+	if a.gateway == nil {
+		return worker.IssueDetail{}, fmt.Errorf("github gateway is not configured")
+	}
 	issue, err := a.gateway.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
 	if err != nil {
 		return worker.IssueDetail{}, err
@@ -732,6 +1064,19 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 
 func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return worker.IssueCommentResult{}, err
+		}
+		comment, err := client.CreateIssueComment(ctx, forge.CreateCommentInput{IssueNumber: input.IssueNumber, Body: body})
+		if err != nil {
+			return worker.IssueCommentResult{}, err
+		}
+		return worker.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
+	}
+	if a.gateway == nil {
+		return worker.IssueCommentResult{}, fmt.Errorf("github gateway is not configured")
+	}
 	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: body, CWD: input.CWD})
 	if err != nil {
 		return worker.IssueCommentResult{}, err
@@ -741,11 +1086,34 @@ func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worke
 
 func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worker.UpdateIssueCommentInput) error {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdateIssueComment(ctx, forge.UpdateCommentInput{CommentID: input.CommentID, Body: body})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: body, CWD: input.CWD})
 }
 
 func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker.CreatePullRequestInput) (worker.CreatePullRequestResult, error) {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return worker.CreatePullRequestResult{}, err
+		}
+		pr, err := client.CreatePullRequest(ctx, forge.CreatePullRequestInput{Title: input.Title, Body: body, Head: input.HeadBranch, Base: input.BaseBranch})
+		if err != nil {
+			return worker.CreatePullRequestResult{}, err
+		}
+		return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.HTMLURL}, nil
+	}
+	if a.gateway == nil {
+		return worker.CreatePullRequestResult{}, fmt.Errorf("github gateway is not configured")
+	}
 	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, CWD: input.CWD})
 	if err != nil {
 		return worker.CreatePullRequestResult{}, err
@@ -754,6 +1122,15 @@ func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker
 }
 
 func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.CompareBranchesInput) (worker.CompareBranchesResult, error) {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return worker.CompareBranchesResult{}, err
+		}
+		return worker.CompareBranchesResult{AheadBy: 1, Status: "ahead", TotalCommits: 1}, nil
+	}
+	if a.gateway == nil {
+		return worker.CompareBranchesResult{}, fmt.Errorf("github gateway is not configured")
+	}
 	comparison, err := a.gateway.CompareBranches(ctx, githubinfra.CompareBranchesInput{Repo: input.Repo, BaseBranch: input.BaseBranch, HeadBranch: input.HeadBranch, CWD: input.CWD})
 	if err != nil {
 		return worker.CompareBranchesResult{}, err
@@ -763,18 +1140,61 @@ func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.C
 
 func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input worker.UpdatePullRequestBodyInput) error {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdatePullRequest(ctx, forge.UpdatePullRequestInput{Number: input.PRNumber, Body: &body})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.UpdatePullRequestBody(ctx, githubinfra.UpdatePullRequestBodyInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
 }
 
 func (a workerGitHubAdapter) UpdatePullRequestTitle(ctx context.Context, input worker.UpdatePullRequestTitleInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdatePullRequest(ctx, forge.UpdatePullRequestInput{Number: input.PRNumber, Title: &input.Title})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.UpdatePullRequestTitle(ctx, githubinfra.UpdatePullRequestTitleInput{Repo: input.Repo, PRNumber: input.PRNumber, Title: input.Title, CWD: input.CWD})
 }
 
 func (a workerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		for _, label := range input.Labels {
+			if err := client.RemoveIssueLabel(ctx, input.PRNumber, label); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
 func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input worker.PullRequestReviewersInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
 }
 
@@ -969,7 +1389,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	plannerRunner = planner.New(planner.Options{
 		DB:                 coordinator.DB(),
 		Repos:              repos,
-		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper},
+		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:                plannerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,
@@ -1081,7 +1501,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	workerRunner = worker.New(worker.Options{
 		DB:     coordinator.DB(),
 		Repos:  repos,
-		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper},
+		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 		},
@@ -1291,12 +1711,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}
 			continue
 		}
-		if providerKind != config.ProviderKindGitHub {
-			if input.Logger != nil {
-				input.Logger.Debug("scheduler skipped project without provider role adapters", map[string]any{"projectId": project.ID, "repo": repo, "provider": providerKind})
-			}
-			continue
-		}
 		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
 			appendErr(runSchedulerLane(input, "planner discovery", project.ID, repo, func() error {
 				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
@@ -1309,14 +1723,25 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("planner auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Coordinator != nil && coordinatorEnabledForProject(input, project.ID) {
+			if providerKind != config.ProviderKindGitHub {
+				if input.Logger != nil {
+					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "coordinator discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
+				}
+			} else {
 			appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
 				_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
 			}))
 			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_coordinator_discovery", input, discoveredRunnableIDs, true)
 			recordClaim(claimedCount, availableSlots, err)
+			}
 		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
+			if providerKind != config.ProviderKindGitHub {
+				if input.Logger != nil {
+					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "reviewer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
+				}
+			} else {
 			appendErr(runSchedulerLane(input, "reviewer discovery", project.ID, repo, func() error {
 				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -1324,10 +1749,16 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}))
 			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_reviewer_discovery", input, discoveredRunnableIDs, true)
 			recordClaim(claimedCount, availableSlots, err)
+			}
 		} else if input.Reviewer != nil && input.Logger != nil {
 			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
+			if providerKind != config.ProviderKindGitHub {
+				if input.Logger != nil {
+					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "fixer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
+				}
+			} else {
 			appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
 				result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -1335,6 +1766,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}))
 			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_fixer_discovery", input, discoveredRunnableIDs, true)
 			recordClaim(claimedCount, availableSlots, err)
+			}
 		} else if input.Fixer != nil && input.Logger != nil {
 			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}

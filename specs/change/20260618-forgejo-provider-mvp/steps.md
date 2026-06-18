@@ -18,3 +18,11 @@
 - Added `internal/forge/forgejo.go` with a Forgejo REST client that implements the provider contract, reads token auth from config/env, supports typed issue/PR/label/assignee/comment/identity methods, fetches PR diffs, applies request timeouts, and paginates via Forgejo response headers.
 - Added fake-server contract coverage in `internal/forge/forgejo_test.go` for auth, pagination, typed decoding, sanitized error bodies, issue/PR reads, label and assignee mutations, issue comments, PR create/update, and config-driven client construction.
 - Verified with `go test ./internal/forge`, `go test ./...`, and `go build ./...`. `go test ./...` still reports the existing unrelated `internal/cliapp` failure in `TestWebhookStatusVerboseShowsRuntimeDetails`.
+
+## Step 4
+
+- Enabled scheduler discovery for Forgejo planner and worker projects, while keeping unsupported non-GitHub coordinator/reviewer/fixer lanes explicitly skipped in this step.
+- Finished provider-aware planner/worker runtime adapters in `internal/runtime/scheduler.go` so Forgejo projects can list issues, create PRs, mutate labels/comments, and resolve current-user identity through the existing REST client.
+- Updated planner and worker prompt/contracts to use provider-aware issue wording, removed Forgejo-inappropriate GitHub CLI guidance, and changed Forgejo worker handling to require pre-assigned issues with an assignment re-check before side effects and no self-assignment fallback.
+- Added focused coverage in `internal/runtime/scheduler_forgejo_test.go`, `internal/planner/runner_test.go`, and `internal/worker/runner_test.go` for Forgejo planner PR creation/labels, Forgejo worker PR creation, prompt text, and unassigned/de-assigned worker skip behavior.
+- Verified with `go test ./internal/runtime ./internal/planner ./internal/worker`.

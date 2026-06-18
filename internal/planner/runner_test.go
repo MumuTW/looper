@@ -45,6 +45,25 @@ func TestBuildPlannerPromptOmitsMissingAgentRuntime(t *testing.T) {
 	}
 }
 
+func TestBuildPlannerPromptUsesForgejoIssueTextForForgejoProjects(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	cfg, err := config.Normalize("")
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}}
+	prompt, _ := buildPlannerPrompt(storage.ProjectRecord{ID: "project_1", RepoPath: repoPath}, cfg, &checkpointIssue{Repo: "acme/looper", IssueNumber: 156, Title: "forgejo issue", SpecPath: "docs/spec.md"}, &checkpointWorktree{Branch: "looper/fix", BaseBranch: "main"}, true, config.DefaultDisclosureConfig(), "opencode", "model")
+	if !strings.Contains(prompt, "Write a planning spec for Forgejo issue acme/looper#156.") {
+		t.Fatalf("prompt = %q, want Forgejo issue text", prompt)
+	}
+	if strings.Contains(prompt, "GitHub issue") {
+		t.Fatalf("prompt = %q, want no GitHub-specific issue text", prompt)
+	}
+}
+
 func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	t.Parallel()
 

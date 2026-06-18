@@ -491,6 +491,18 @@ type Runner struct {
 	network                 NetworkStatusGateway
 }
 
+func (r *Runner) providerKindForProject(projectID string) config.ProviderKind {
+	if r == nil || r.projectRoleConfig == nil {
+		return config.ProviderKindGitHub
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if project.ID == projectID {
+			return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project)
+		}
+	}
+	return config.ProviderKindGitHub
+}
+
 type ProcessResult struct {
 	LoopID            string
 	RunID             string
@@ -1311,7 +1323,23 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
+	providerKind := r.providerKindForProject(input.Project.ID)
+	if providerKind == config.ProviderKindForgejo && work.IssueNumber > 0 && r.github != nil {
+		stillAssigned, err := r.workerIssueAssignedToCurrentUser(ctx, work, input.Project.RepoPath)
+		if err != nil {
+			_ = r.repos.Locks.Release(context.Background(), lockKey)
+			return checkpoint, err
+		}
+		if !stillAssigned {
+			checkpoint.Work = &work
+			checkpoint.ClaimedLockKey = lockKey
+			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+			checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is not currently assigned to the configured user", formatIssueReference(issueLookupRepo(work), work.IssueNumber))
+			_ = r.repos.Locks.Release(context.Background(), lockKey)
+			checkpoint.ClaimedLockKey = ""
+			return checkpoint, nil
+		}
+	} else if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
 		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
 			_ = r.repos.Locks.Release(context.Background(), lockKey)
 			return checkpoint, err
@@ -1348,6 +1376,34 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 		return &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, work.IssueNumber, login, err), kind: FailureRetryableAfterResume}
 	}
 	return nil
+}
+
+func (r *Runner) workerIssueAssignedToCurrentUser(ctx context.Context, work workerInput, cwd string) (bool, error) {
+	if r.github == nil || work.IssueNumber <= 0 {
+		return false, nil
+	}
+	repo := issueLookupRepo(work)
+	if repo == "" {
+		return false, nil
+	}
+	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return false, &loopError{message: fmt.Sprintf("Unable to resolve provider login for worker issue assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
+	}
+	login = normalizeLogin(login)
+	if login == "" {
+		return false, &loopError{message: fmt.Sprintf("Unable to resolve provider login for worker issue assignment on %s#%d", repo, work.IssueNumber), kind: FailureRetryableAfterResume}
+	}
+	issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: repo, IssueNumber: work.IssueNumber, CWD: cwd})
+	if err != nil {
+		return false, err
+	}
+	for _, assignee := range issue.AssigneeUsers {
+		if normalizeLogin(assignee.Login) == login {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
@@ -1817,7 +1873,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
-	if !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
+	if r.providerKindForProject(input.Project.ID) == config.ProviderKindGitHub && !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
 		message := fmt.Sprintf("GitHub CLI unavailable; PR opening is manual for worker %s", input.Loop.ID)
 		checkpoint.SkipReason = message
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
@@ -3089,7 +3145,17 @@ func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPl
 	return prompt, err
 }
 
+func providerKindForProject(cfg config.Config, projectID string) config.ProviderKind {
+	for _, project := range cfg.Projects {
+		if project.ID == projectID {
+			return config.ResolvedProjectProviderKind(cfg, project)
+		}
+	}
+	return config.ProviderKindGitHub
+}
+
 func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock, error) {
+	providerKind := providerKindForProject(instructionConfig, projectID)
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
 		parts = append(parts, fmt.Sprintf("Continue implementing on existing pull request %s#%d.", work.Repo, work.PRNumber))
@@ -3118,7 +3184,7 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		parts = append(parts, instructionBlock.Text)
 	}
 	if allowAgentPRCreation {
-		parts = append(parts, buildAgentPullRequestInstruction(work))
+		parts = append(parts, buildAgentPullRequestInstruction(work, providerKind))
 		parts = append(parts, "Make the necessary code changes, validate them, and ensure the branch and pull request are left in a consistent state.")
 		parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
 	} else {
@@ -3148,12 +3214,15 @@ func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, discl
 	}, "\n")
 }
 
-func buildAgentPullRequestInstruction(work workerInput) string {
+func buildAgentPullRequestInstruction(work workerInput, providerKind config.ProviderKind) string {
 	parts := []string{
-		"When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself.",
+		"When the implementation is ready and validation passes, create the pull request yourself using the configured provider tooling.",
 		"Before creating a PR, check whether one already exists for the current branch and avoid duplicates.",
 		"Write a concise, accurate PR title and a structured body that explains the actual changes and why they were made.",
 		fmt.Sprintf("Target base branch: %s.", work.BaseBranch),
+	}
+	if providerKind == config.ProviderKindGitHub {
+		parts[0] = "When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself."
 	}
 	if work.IssueNumber > 0 {
 		parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
@@ -3278,7 +3347,7 @@ func validateWorkerIssueTarget(repo string, issueNumber int64, issue IssueDetail
 }
 
 func buildIssuePrompt(repo string, issue IssueDetail) string {
-	parts := []string{fmt.Sprintf("Implement GitHub issue %s#%d: %s", repo, issue.Number, issue.Title)}
+	parts := []string{fmt.Sprintf("Implement issue %s#%d: %s", repo, issue.Number, issue.Title)}
 	if issue.Body != "" {
 		parts = append(parts, "Issue body:\n"+issue.Body)
 	}
