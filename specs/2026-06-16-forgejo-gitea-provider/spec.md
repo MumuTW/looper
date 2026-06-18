@@ -85,7 +85,7 @@ type RepositoryRef struct {
 }
 ```
 
-The provider registry is keyed by `ProviderConfig.ID` (or resolved `(kind, baseUrl)`); the repo lives on the project binding. Host-qualified repo strings may remain supported for legacy GitHub compatibility, but new Forgejo config must set explicit `baseUrl` and `repo`.
+The provider registry is keyed by `ProviderConfig.ID`; the repo lives on the project binding. Do **not** key provider instances only by resolved `(kind, baseUrl)`: two configured providers may intentionally point at the same Forgejo host with different `tokenEnv` values, and host-keying would let one project's identity lookup or REST mutation run with another provider's credentials. Host-qualified repo strings may remain supported for legacy GitHub compatibility, but new Forgejo config must set explicit `baseUrl` and `repo`.
 
 ### Repo identity and authority
 
@@ -96,7 +96,7 @@ Decisions for the MVP:
 - **For Forgejo projects, config is the authority** for provider and repo. A Forgejo project requires explicit `provider` and `repo` in config; they are resolved at startup and never read back from metadata. There is no config-vs-metadata reconciliation because there is no second source.
 - **Legacy GitHub projects keep their current authority (transitional).** Today `ProjectRefConfig` has no `provider`/`repo` field (`internal/config/types.go:598-608`), and repo is autodetected and preserved in project metadata during `SyncConfigured` (`internal/projects/service.go`). The MVP does **not** rewrite that path. GitHub repo authority remains autodetect/metadata until a separate migration moves all projects to explicit config `repo`. This exception is explicit and bounded: it applies only to the existing GitHub provider.
 - **Canonical project identity is the project `id`**, not the `repo` string. The project `id` is already unique in config and storage and is unaffected by host collisions.
-- **For the MVP, two projects may not resolve to the same `repo` regardless of provider/host.** Bare `repo` is rejected as a duplicate across all projects, because loop records, queue items, locks, PR snapshots, and recovery are keyed on bare `repo`; allowing two projects on the same `repo` (even same host) would let them share repo-scoped locks/snapshots and double-watch the same remote PR. This is stricter than necessary for cross-host safety but keeps the existing `repo`-keyed storage correct with no migration.
+- **For the MVP, two active projects may not resolve to the same `repo` regardless of provider/host.** Bare `repo` is rejected as a duplicate across configured projects and active stored projects, because loop records, queue items, locks, PR snapshots, and recovery are keyed on bare `repo`; allowing two projects on the same `repo` (even same host) would let them share repo-scoped locks/snapshots and double-watch the same remote PR. `SyncConfigured` must validate the incoming effective config against active projects already in storage, including GitHub projects that are no longer present in `cfg.Projects` but have not been archived. A collision is rejected at sync/startup; silently relying on config-only duplicate checks is not sufficient. This is stricter than necessary for cross-host safety but keeps the existing `repo`-keyed storage correct with no migration.
 - **`baseUrl` must be normalized before use in validation and registry keys:** strip trailing slash, lowercase scheme+host, apply default ports, and reject an empty path-only value. GitHub host-qualified compatibility strings normalize to the GitHub provider.
 - A host/provider-qualified repo key (for example `kind|baseUrl|owner/name`) is the eventual canonical form, but introducing it touches storage keys, lock keys, queue identity, and recovery. That migration is explicitly deferred and is not required by the MVP because of the duplicate-rejection rule above.
 
@@ -105,7 +105,7 @@ Authority-bearing behavior must name the authority per provider. Examples:
 - Forgejo project provider/repo selection authority: config.
 - Legacy GitHub project repo authority: autodetect/metadata (transitional, see above).
 - Planner and worker issue discovery authority: provider issue state, labels, and assignees.
-- Worker issue-claim authority: provider assignee (Forgejo). Label-only claim is not an MVP authority (see "Worker").
+- Worker issue-selection authority: provider assignee membership. Forgejo worker does not claim by adding itself as an assignee; it only processes issues already assigned to the current user (see "Worker").
 - Reviewer discovery authority: review request (GitHub) or a required non-empty label (Forgejo). Forgejo reviewer does not use review requests and never discovers match-all.
 - Reviewer comment idempotency authority: Looper loop/run state keyed by PR head SHA (see "Reviewer"). This is idempotency state, not provider authority.
 - Auto-merge authority: provider-native auto-merge/mergeability only when the provider exposes an equivalent signal (out of MVP scope).
@@ -147,8 +147,9 @@ type Capabilities struct {
 type IssueClaimStrategy string
 
 const (
-	IssueClaimByAssignee    IssueClaimStrategy = "assignee" // exclusive-enough native claim
-	IssueClaimUnsupported   IssueClaimStrategy = "unsupported"
+	IssueClaimByAssignee          IssueClaimStrategy = "assignee" // GitHub's existing claim behavior
+	IssueClaimPreassignedAssignee IssueClaimStrategy = "preassigned_assignee" // only process issues already assigned to current user
+	IssueClaimUnsupported         IssueClaimStrategy = "unsupported"
 )
 
 type ReviewerDiscoveryStrategy string
@@ -194,7 +195,7 @@ Exact MVP capability values (out-of-MVP Forgejo features are set to false/unsupp
 | AutoMerge | true | false |
 | Checks | true | false |
 | IssueDependencies | true | false |
-| IssueClaimStrategy | assignee | assignee |
+| IssueClaimStrategy | assignee | preassigned_assignee |
 | ReviewerDiscoveryStrategy | review_request | label_author |
 | ReviewPublishStrategy | native_review | comment_only |
 | ReviewThreadStrategy | native_resolve | unsupported |
@@ -240,7 +241,7 @@ Compatibility:
 - Existing `tools.ghPath` remains valid and feeds the default GitHub provider.
 - New Forgejo providers require `baseUrl` and either `tokenEnv`, `tokenPath`, or a future credential helper; Forgejo projects require explicit `name`, `provider`, and `repo`.
 - Tokens must never be stored in project metadata or printed in diagnostics.
-- Config validation rejects two projects resolving to the same `repo`, regardless of provider/host (see "Repo identity and authority").
+- Config validation rejects two active projects resolving to the same `repo`, regardless of provider/host, across both configured projects and active stored projects already known to Looper (see "Repo identity and authority").
 - A Forgejo project gets the Forgejo provider profile applied to its effective role config (see "Forgejo provider profile"), so a minimal Forgejo project validates without the user disabling each GitHub-shaped default by hand.
 - After the profile is applied, config validation rejects a Forgejo project that still enables any feature whose strategy is `unsupported` for Forgejo (native review, review-request discovery, reviewer match-all/empty-label discovery, thread resolution, fixer auto-discovery, coordinator, auto-merge, branch protection, dependency gates, routed network mode).
 
@@ -252,20 +253,31 @@ This resolves a concrete problem: the existing global defaults (`internal/config
 
 The MVP defines a **Forgejo provider profile**: a fixed compatibility profile — a set of effective-config overrides applied to a project once it resolves to a Forgejo provider. It is layered after hard defaults and before user global/project overrides, then validated with source information (which fields the user set explicitly). The capability table is not rich enough to express role policy (fixer, coordinator, reviewer label requirements), so the profile is a hand-maintained, fixed compatibility profile that must be *consistent with* (validated against) the capability table — not mechanically generated from it.
 
-Config layering is source-aware so the profile can distinguish "default" from "explicit user opt-in":
+Config layering is source-aware so the profile can distinguish "default" from "explicit user opt-in" across every supported override source:
 
 1. hard defaults (`internal/config/defaults.go`)
 2. Forgejo provider profile overrides (this section)
-3. user global `roles.*` and per-project `roles` overrides
-4. validation
+3. config file user global `roles.*` and per-project `roles` overrides
+4. environment overrides
+5. CLI flag overrides
+6. validation
 
-Validation runs against the merged result with knowledge of which fields the user set explicitly. A user explicitly enabling an unsupported capability on a Forgejo project (e.g. native review, fixer auto-discovery, review-request discovery, coordinator) is a validation error naming the unsupported capability. The profile does not silently override an explicit user opt-in into unsupported behavior; it only supplies safe Forgejo defaults where the user did not.
+Validation runs against the merged result with knowledge of which fields the user set explicitly in the config file, environment, or CLI flags. A user explicitly enabling an unsupported capability on a Forgejo project from any of those sources (e.g. native review, fixer auto-discovery, review-request discovery, coordinator) is a validation error naming the unsupported capability. The profile does not silently override an explicit user opt-in into unsupported behavior; it only supplies safe Forgejo defaults where the user did not.
 
 Forgejo profile (MVP):
 
 - planner: enabled (unchanged).
-- worker: enabled; claim via assignee.
-- reviewer discovery: `RequireReviewRequest: false`. **Non-empty reviewer discovery labels are required for Forgejo, and spec-review and implementation-review discovery labels are distinct.** Because the current reviewer treats empty labels + `RequireReviewRequest:false` as match-all (`internal/reviewer/runner.go:1079`), the profile sets default labels and validation rejects a Forgejo reviewer with `AutoDiscovery:true` and no label for the PR phase being discovered. Planner/spec PRs keep the existing spec-review label (`looper:spec-reviewing`) so `specpr.ResolvePullRequestPhase` continues to route them to spec-review instructions. Worker implementation PRs must apply a separate implementation-review discovery label (for example `looper:impl-reviewing`) and must not use `looper:spec-reviewing`, or they would be reviewed as specs. Worker PRs that are not labeled are not reviewer-discovered. The reviewer never discovers by review request on Forgejo.
+- worker: enabled only for issues already assigned to the current user; the worker does not claim by mutating assignees.
+- reviewer discovery: `RequireReviewRequest: false`. **Non-empty reviewer discovery labels are required for Forgejo, and spec-review and implementation-review discovery labels are distinct.** Because the current reviewer treats empty labels + `RequireReviewRequest:false` as match-all (`internal/reviewer/runner.go:1079`), the profile sets default labels and validation rejects a Forgejo reviewer with `AutoDiscovery:true` and no label for the PR phase being discovered. Planner/spec PRs keep the existing spec-review label (`looper:spec-reviewing`) so `specpr.ResolvePullRequestPhase` continues to route them to spec-review instructions. Worker implementation PRs must apply a separate implementation-review discovery label and must not use `looper:spec-reviewing`, or they would be reviewed as specs. Worker PRs that are not labeled are not reviewer-discovered. The reviewer never discovers by review request on Forgejo.
+
+Reviewer discovery label schema for Forgejo:
+
+| PR phase | Config field | Forgejo profile default | Validation rule |
+|---|---|---|---|
+| Spec review | `roles.reviewer.discovery.specReview.reviewingLabel` with `includeReviewingLabel:true` | `looper:spec-reviewing` | Must be non-empty when spec-review discovery is enabled; this label is reserved for spec PRs. |
+| Implementation review | `roles.reviewer.discovery.triggers.labels` with `labelMode:any` | `looper:impl-reviewing` | Must contain at least one non-empty label when Forgejo reviewer `autoDiscovery` is true; it must not equal the configured spec-review label. |
+
+The Forgejo profile owns those defaults only when the user did not explicitly set the fields. If the config file, env, or CLI sets either field, validation uses that source-tracked value and fails fast if the resulting Forgejo reviewer would discover with an empty label, spec/implementation label collision, or review-request requirement.
 - reviewer publish: forced to comment-only. `ReviewPublishStrategy: comment_only` overrides `PublishMode: SingleReview`; `ReviewEvents.Clean`/`ReviewEvents.Blocking` are not used to drive native review events. The reviewer emits a single PR/issue comment instead of a native `APPROVE`/`REQUEST_CHANGES` review.
 - reviewer thread resolution: forced disabled (already default-disabled; profile asserts it).
 - reviewer auto-merge: forced disabled (already default-disabled; profile asserts it).
@@ -371,7 +383,7 @@ The first milestone should not support:
 - Review thread auto-resolution.
 - Reviewer/fixer ping-pong based on provider-native thread resolution.
 - Fixer on Forgejo.
-- Label-only issue claim (worker claims via assignee only).
+- Mutable Forgejo issue claim by label or by adding the current user as an assignee.
 - Auto-merge.
 - Branch protection gates.
 - GitHub-style `blocked_by` dependency gates.
@@ -413,16 +425,17 @@ Worker is also in MVP scope.
 
 Required provider methods:
 
-- List open issues by label.
+- List open issues by label and current-user assignee.
 - View issue.
-- Claim issue through assignee.
 - Create/update issue comments.
 - Create PR.
 - Compare branches or provide enough PR state for dedupe.
 - Update PR title/body.
 - Add/remove PR labels, including removing handoff labels and applying the implementation-review discovery label to PRs it creates (so the comment-only reviewer can discover them without making worker PRs look like spec PRs; see "Forgejo provider profile").
 
-Worker claims via provider assignee only. **Label-only claim is out of MVP scope.** A claim label is not an exclusive, race-free authority: two workers can both add the same label and both believe they own the issue. Supporting it correctly would require defining concurrent-claim semantics and regression tests for the race, which is not justified for the MVP. If Forgejo's assignee semantics turn out to be unsuitable as a claim, the worker is disabled for that project with a clear message rather than falling back to a racy label claim. Adding a label-claim authority later is a separate design that must name the authority, its non-atomicity cost, and ship concurrent-claim tests.
+Forgejo worker does **not** claim work by adding the current user as an assignee. Forgejo/Gitea-compatible issues have a list of assignees, so adding the current user is not an exclusive worker claim: two daemon instances can both add themselves, both satisfy an assignee check, and both produce duplicate worker runs. The MVP therefore uses a pre-assigned invariant: a Forgejo worker only discovers and processes issues that already have the configured worker label and are already assigned to the current user before Looper starts work. If an issue is labeled but not pre-assigned to the current user, Forgejo worker skips it and may report it as not claimable.
+
+**Label-only claim is out of MVP scope.** A claim label is not an exclusive, race-free authority: two workers can both add the same label and both believe they own the issue. Supporting any mutable claim later, whether label-based or assignee-based, requires a separate design with a re-read/CAS-style invariant and concurrent-claim regression tests. If the pre-assigned invariant is too restrictive for a deployment, worker is disabled for that Forgejo project with a clear message rather than falling back to a racy mutation-based claim.
 
 ### Reviewer
 
@@ -487,15 +500,16 @@ Until that exists, Forgejo projects must use polling (`WebhookCapability{Polling
 **Mixed GitHub + Forgejo installs.** Webhook config is global with per-project mode overrides today. The MVP rules:
 
 - A GitHub project may use its existing webhook mode (`gh-forward`/`tunnel`).
-- For a Forgejo project, the project webhook mode is ignored: a Forgejo provider always polls in MVP because its `WebhookCapability.PollingOnly` is true. An empty/unset project webhook mode on a Forgejo project means provider-default polling; no new `polling`/`disabled` config mode is added.
-- Enabling global webhooks must **not** be rejected merely because a Forgejo project also exists. Validation fails only if a Forgejo project **explicitly sets** a webhook mode (`gh-forward`/`tunnel`), since the provider cannot honor it.
+- For a Forgejo project, an empty/unset project webhook mode means provider-default polling; no new `polling`/`disabled` config mode is added.
+- Any explicit per-project webhook mode on a Forgejo project (`gh-forward`/`tunnel`, or any future selectable webhook mode before Forgejo supports it) is a validation error. It is never silently ignored, because the provider cannot honor it.
+- Enabling global webhooks must **not** be rejected merely because a Forgejo project also exists.
 - The global `gh` bootstrap requirement applies when at least one GitHub project exists, because the MVP GitHub wrapper still uses `gh` for non-webhook issue, PR, review, label, and auth operations. Forgejo-only installs do not require `gh`.
 
 ## Testing strategy
 
 Add tests in layers:
 
-- Unit tests for provider config normalization and validation, including `baseUrl` normalization, duplicate-`repo` rejection (any provider/host), Forgejo-profile application, and unsupported-feature rejection.
+- Unit tests for provider config normalization and validation, including `baseUrl` normalization, duplicate-`repo` rejection across configured and active stored projects (any provider/host), provider registry keying by `ProviderConfig.ID`, Forgejo-profile application, source-aware file/env/CLI unsupported-feature rejection, and unsupported-feature rejection.
 - HTTP fake-server tests for Forgejo REST pagination, auth, errors, and field normalization.
 - Role adapter tests that prove planner and worker use provider contracts rather than GitHub structs, and that they work with no discovery snapshot.
 - Integration tests for config-driven project add, scheduler per-project provider resolution, planner publish, and worker PR creation with fake Forgejo responses.
@@ -530,7 +544,7 @@ Then:
 - Add provider config with backward-compatible defaults.
 - Build a GitHub provider wrapper over the current gateway.
 - Move the composition root to per-project provider resolution (registry) instead of one shared GitHub gateway, including recovery, deferred reviewer recovery, network manager, and webhook setup (see "Runtime lifecycle and recovery").
-- Add the Forgejo provider profile and the config-validation rules (duplicate `repo`, unsupported-feature rejection, `baseUrl` normalization).
+- Add the Forgejo provider profile and the config-validation rules (duplicate `repo` across configured and active stored projects, unsupported-feature rejection with file/env/CLI source tracking, `baseUrl` normalization, provider registry keying by config provider ID).
 - Make global `gh` detection conditional on at least one GitHub project existing; Forgejo-only installs do not require `gh`, but any GitHub project still does until GitHub has a non-`gh` provider.
 - Keep all behavior green with `go test ./...`.
 
@@ -575,11 +589,11 @@ Each advanced feature must name the provider-native authority it relies on.
 - Existing GitHub projects run unchanged, including their current autodetect/metadata repo behavior.
 - `gh` is not required for Forgejo-only installs; any install with a GitHub project still requires `gh` until GitHub has a non-`gh` provider.
 - A Forgejo project can be configured with explicit `name`, `provider`, `baseUrl`, token source, and `repo` (`owner/name`).
-- Config validation rejects two projects resolving to the same `repo` (any provider/host).
+- Config validation rejects two active projects resolving to the same `repo` (any provider/host), including collisions between configured projects and active stored projects omitted from the current config.
 - Config validation applies the Forgejo provider profile and then rejects Forgejo projects that still enable unsupported features (native review, review-request discovery, reviewer match-all/empty-label discovery, thread resolution, fixer auto-discovery, coordinator, auto-merge, branch protection, dependency gates, routed mode, label-only claim).
-- A minimal Forgejo project using the documented example config validates without manual per-field overrides, and the resolved reviewer discovery has a non-empty label.
+- A minimal Forgejo project using the documented example config validates without manual per-field overrides, and the resolved reviewer discovery has distinct non-empty labels for spec review and implementation review.
 - Planner can discover an issue and publish a spec PR on a Forgejo project in fake-provider integration tests, with no discovery snapshot.
-- Worker can claim an issue via assignee, push code with `git`, and create/update a PR on a Forgejo project in fake-provider integration tests.
+- Worker can process an issue that is pre-assigned to the current user, push code with `git`, and create/update a PR on a Forgejo project in fake-provider integration tests; tests prove a labeled but unassigned issue is skipped and no assignee mutation is treated as an exclusive claim.
 - Reviewer publishes a comment-only review on Forgejo and does not publish again for the same PR head SHA once a successful publish is recorded (a crash-window duplicate is accepted and documented), or fails validation with a clear unsupported-capability message if a disabled behavior is enabled.
 - Forgejo planner, worker, and reviewer prompts are rendered from provider-specific contracts: reviewer prompts do not instruct agents to call `gh pr view`, `gh pr diff`, or `gh api`, and planner/worker prompts do not describe GitHub-only review-request or native-review flows.
 - A Forgejo-only install boots through the recovery path (not just a scheduler tick) with no global GitHub gateway and no `ghPath`.
