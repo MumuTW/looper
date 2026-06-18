@@ -1,6 +1,10 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"net/url"
+	"strings"
+)
 
 func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	config, err := DefaultConfig(cwd)
@@ -13,6 +17,10 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 			return Config{}, &ConfigValidationError{Issues: issues}
 		}
 		mergeConfig(&config, normalizeLayerPartial(partial))
+	}
+
+	if err := applyProviderProfiles(&config, partials...); err != nil {
+		return Config{}, err
 	}
 
 	return config, nil
@@ -65,6 +73,14 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 	if normalized.Projects != nil {
 		projects := *normalized.Projects
 		for i := range projects {
+			if projects[i].Provider != nil {
+				provider := strings.TrimSpace(*projects[i].Provider)
+				projects[i].Provider = &provider
+			}
+			if projects[i].Repo != nil {
+				repo := strings.TrimSpace(*projects[i].Repo)
+				projects[i].Repo = &repo
+			}
 			if projects[i].RepoPath == "" {
 				projects[i].RepoPath = projects[i].Path
 			}
@@ -74,6 +90,14 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 			}
 		}
 		normalized.Projects = &projects
+	}
+	if normalized.Providers != nil {
+		providers := cloneProviderConfigs(*normalized.Providers)
+		partials := make([]PartialProviderConfig, len(providers))
+		for i, provider := range providers {
+			partials[i] = PartialProviderConfig{ID: provider.ID, Kind: &provider.Kind, BaseURL: &provider.BaseURL, GHPath: provider.GHPath, TokenEnv: provider.TokenEnv}
+		}
+		normalized.Providers = &partials
 	}
 
 	if normalized.Defaults != nil {
@@ -287,7 +311,155 @@ func mergeConfig(config *Config, partial PartialConfig) {
 	if partial.Projects != nil {
 		config.Projects = cloneProjects(*partial.Projects)
 	}
+
+	if partial.Providers != nil {
+		config.Providers = cloneProviderConfigs(*partial.Providers)
+	}
 }
+
+func applyProviderProfiles(config *Config, partials ...PartialConfig) error {
+	if config == nil || !hasForgejoProject(*config) {
+		return nil
+	}
+	if issues := validateExplicitForgejoUnsupportedGlobalOptIns(partials...); len(issues) > 0 {
+		return &ConfigValidationError{Issues: issues}
+	}
+	for index := range config.Projects {
+		project := &config.Projects[index]
+		if resolvedProjectProviderKind(*config, *project) != ProviderKindForgejo {
+			continue
+		}
+		applyForgejoProjectProfile(project)
+	}
+	return nil
+}
+
+func hasForgejoProject(config Config) bool {
+	for _, project := range config.Projects {
+		if resolvedProjectProviderKind(config, project) == ProviderKindForgejo {
+			return true
+		}
+	}
+	return false
+}
+
+func resolvedProjectProviderKind(config Config, project ProjectRefConfig) ProviderKind {
+	providerID := strings.TrimSpace(project.Provider)
+	if providerID == "" {
+		return ProviderKindGitHub
+	}
+	for _, provider := range config.Providers {
+		if provider.ID == providerID {
+			return provider.Kind
+		}
+	}
+	return ""
+}
+
+func applyForgejoProjectProfile(project *ProjectRefConfig) {
+	roles := project.Roles
+	if roles == nil {
+		roles = &PartialRoleConfigs{}
+		project.Roles = roles
+	}
+	if roles.Reviewer == nil {
+		roles.Reviewer = &PartialReviewerRoleConfig{}
+	}
+	if roles.Reviewer.Discovery == nil {
+		roles.Reviewer.Discovery = &PartialReviewerRoleDiscoveryConfig{}
+	}
+	if roles.Reviewer.Discovery.Triggers == nil {
+		roles.Reviewer.Discovery.Triggers = &PartialReviewerRoleTriggersConfig{}
+	}
+	if roles.Reviewer.Discovery.Triggers.RequireReviewRequest == nil {
+		roles.Reviewer.Discovery.Triggers.RequireReviewRequest = boolPtr(false)
+	}
+	if roles.Reviewer.Discovery.Triggers.Labels == nil {
+		labels := []string{"looper:review"}
+		roles.Reviewer.Discovery.Triggers.Labels = &labels
+	}
+	if roles.Reviewer.Behavior == nil {
+		roles.Reviewer.Behavior = &PartialReviewerConfig{}
+	}
+	if roles.Reviewer.Behavior.ReviewEvents == nil {
+		roles.Reviewer.Behavior.ReviewEvents = &PartialReviewerReviewEventsConfig{}
+	}
+	if roles.Reviewer.Behavior.ReviewEvents.Clean == nil {
+		roles.Reviewer.Behavior.ReviewEvents.Clean = reviewerReviewEventPtr(ReviewerReviewEventComment)
+	}
+	if roles.Reviewer.Behavior.ReviewEvents.Blocking == nil {
+		roles.Reviewer.Behavior.ReviewEvents.Blocking = reviewerReviewEventPtr(ReviewerReviewEventComment)
+	}
+	if roles.Reviewer.Behavior.ThreadResolution == nil {
+		roles.Reviewer.Behavior.ThreadResolution = &PartialReviewerThreadResolutionConfig{}
+	}
+	if roles.Reviewer.Behavior.ThreadResolution.Enabled == nil {
+		roles.Reviewer.Behavior.ThreadResolution.Enabled = boolPtr(false)
+	}
+	if roles.Reviewer.AutoMerge == nil {
+		roles.Reviewer.AutoMerge = &PartialReviewerAutoMergeConfig{}
+	}
+	if roles.Reviewer.AutoMerge.Enabled == nil {
+		roles.Reviewer.AutoMerge.Enabled = boolPtr(false)
+	}
+	if roles.Fixer == nil {
+		roles.Fixer = &PartialFixerRoleConfig{}
+	}
+	if roles.Fixer.AutoDiscovery == nil {
+		roles.Fixer.AutoDiscovery = boolPtr(false)
+	}
+}
+
+func validateExplicitForgejoUnsupportedGlobalOptIns(partials ...PartialConfig) []ValidationIssue {
+	issues := []ValidationIssue{}
+	for _, partial := range partials {
+		if partial.Roles == nil {
+			continue
+		}
+		if partial.Roles.Fixer != nil && partial.Roles.Fixer.AutoDiscovery != nil && *partial.Roles.Fixer.AutoDiscovery {
+			issues = append(issues, ValidationIssue{Path: "roles.fixer.autoDiscovery", Message: "must be false when any configured project uses provider kind forgejo"})
+		}
+		if partial.Roles.Reviewer == nil {
+			continue
+		}
+		reviewer := partial.Roles.Reviewer
+		if reviewer.Discovery != nil && reviewer.Discovery.Triggers != nil && reviewer.Discovery.Triggers.RequireReviewRequest != nil && *reviewer.Discovery.Triggers.RequireReviewRequest {
+			issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.triggers.requireReviewRequest", Message: "must be false when any configured project uses provider kind forgejo"})
+		}
+		if reviewer.AutoMerge != nil && reviewer.AutoMerge.Enabled != nil && *reviewer.AutoMerge.Enabled {
+			issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.enabled", Message: "must be false when any configured project uses provider kind forgejo"})
+		}
+		if reviewer.Behavior != nil && reviewer.Behavior.ThreadResolution != nil && reviewer.Behavior.ThreadResolution.Enabled != nil && *reviewer.Behavior.ThreadResolution.Enabled {
+			issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.enabled", Message: "must be false when any configured project uses provider kind forgejo"})
+		}
+	}
+	return issues
+}
+
+func normalizeProviderConfig(provider *ProviderConfig) {
+	provider.ID = strings.TrimSpace(provider.ID)
+	provider.BaseURL = normalizeBaseURL(provider.BaseURL)
+	if provider.GHPath != nil {
+		provider.GHPath = stringPtr(strings.TrimSpace(*provider.GHPath))
+	}
+	if provider.TokenEnv != nil {
+		provider.TokenEnv = stringPtr(strings.TrimSpace(*provider.TokenEnv))
+	}
+}
+
+func normalizeBaseURL(value string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(value), "/")
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return trimmed
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String()
+}
+
+func reviewerReviewEventPtr(value ReviewerReviewEvent) *ReviewerReviewEvent { return &value }
 
 func mergeServerConfig(config *ServerConfig, partial PartialServerConfig) {
 	if partial.Host != nil {
@@ -1177,6 +1349,17 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 		projects := clonePartialProjects(*partial.Projects)
 		cloned.Projects = &projects
 	}
+	if partial.Providers != nil {
+		providers := make([]PartialProviderConfig, len(*partial.Providers))
+		copy(providers, *partial.Providers)
+		for i := range providers {
+			providers[i].Kind = cloneProviderKindPtr(providers[i].Kind)
+			providers[i].BaseURL = cloneStringPtr(providers[i].BaseURL)
+			providers[i].GHPath = cloneStringPtr(providers[i].GHPath)
+			providers[i].TokenEnv = cloneStringPtr(providers[i].TokenEnv)
+		}
+		cloned.Providers = &providers
+	}
 	return cloned
 }
 
@@ -1189,6 +1372,8 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 		cloned[index] = PartialProjectRefConfig{
 			ID:           project.ID,
 			Name:         project.Name,
+			Provider:     cloneStringPtr(project.Provider),
+			Repo:         cloneStringPtr(project.Repo),
 			RepoPath:     project.RepoPath,
 			Path:         project.Path,
 			BaseBranch:   cloneStringPtr(project.BaseBranch),
@@ -1268,6 +1453,12 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 			Network:  ProjectNetworkConfig{Mode: NetworkModeOff},
 			Roles:    roles,
 		}
+		if project.Provider != nil {
+			cloned[index].Provider = strings.TrimSpace(*project.Provider)
+		}
+		if project.Repo != nil {
+			cloned[index].Repo = strings.TrimSpace(*project.Repo)
+		}
 		if project.Network != nil && project.Network.Mode != nil {
 			cloned[index].Network.Mode = *project.Network.Mode
 		}
@@ -1284,6 +1475,38 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		}
 	}
 
+	return cloned
+}
+
+func cloneProviderKindPtr(value *ProviderKind) *ProviderKind {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
+	if providers == nil {
+		return nil
+	}
+	cloned := make([]ProviderConfig, len(providers))
+	for index, provider := range providers {
+		kind := ProviderKindGitHub
+		if provider.Kind != nil {
+			kind = *provider.Kind
+		}
+		cloned[index] = ProviderConfig{
+			ID:       strings.TrimSpace(provider.ID),
+			Kind:     kind,
+			GHPath:   cloneStringPtr(provider.GHPath),
+			TokenEnv: cloneStringPtr(provider.TokenEnv),
+		}
+		if provider.BaseURL != nil {
+			cloned[index].BaseURL = normalizeBaseURL(*provider.BaseURL)
+		}
+		normalizeProviderConfig(&cloned[index])
+	}
 	return cloned
 }
 

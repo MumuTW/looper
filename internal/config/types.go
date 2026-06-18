@@ -172,6 +172,21 @@ const (
 	WebhookModeTunnel    WebhookMode = "tunnel"
 )
 
+type ProviderKind string
+
+const (
+	ProviderKindGitHub  ProviderKind = "github"
+	ProviderKindForgejo ProviderKind = "forgejo"
+)
+
+type ProviderConfig struct {
+	ID       string       `json:"id"`
+	Kind     ProviderKind `json:"kind"`
+	BaseURL  string       `json:"baseUrl,omitempty"`
+	GHPath   *string      `json:"ghPath,omitempty"`
+	TokenEnv *string      `json:"tokenEnv,omitempty"`
+}
+
 type AgentConfig struct {
 	Vendor       *AgentVendor            `json:"vendor,omitempty"`
 	Model        *string                 `json:"model,omitempty"`
@@ -508,6 +523,8 @@ type RoleConfigs struct {
 type ProjectRefConfig struct {
 	ID           string               `json:"id"`
 	Name         string               `json:"name"`
+	Provider     string               `json:"provider,omitempty"`
+	Repo         string               `json:"repo,omitempty"`
 	RepoPath     string               `json:"repoPath"`
 	Path         string               `json:"path,omitempty"`
 	BaseBranch   *string              `json:"baseBranch,omitempty"`
@@ -524,6 +541,8 @@ type ProjectWebhookConfig struct {
 type PartialProjectRefConfig struct {
 	ID           string                       `json:"id"`
 	Name         string                       `json:"name"`
+	Provider     *string                      `json:"provider,omitempty"`
+	Repo         *string                      `json:"repo,omitempty"`
 	RepoPath     string                       `json:"repoPath"`
 	Path         string                       `json:"path,omitempty"`
 	BaseBranch   *string                      `json:"baseBranch,omitempty"`
@@ -542,6 +561,14 @@ type PartialProjectWebhookConfig struct {
 	Mode *WebhookMode `json:"mode,omitempty"`
 }
 
+type PartialProviderConfig struct {
+	ID       string        `json:"id"`
+	Kind     *ProviderKind `json:"kind,omitempty"`
+	BaseURL  *string       `json:"baseUrl,omitempty"`
+	GHPath   *string       `json:"ghPath,omitempty"`
+	TokenEnv *string       `json:"tokenEnv,omitempty"`
+}
+
 type Config struct {
 	Server        ServerConfig       `json:"server"`
 	Storage       StorageConfig      `json:"storage"`
@@ -558,6 +585,7 @@ type Config struct {
 	Defaults      DefaultsConfig     `json:"defaults"`
 	Instructions  InstructionsConfig `json:"instructions"`
 	Roles         RoleConfigs        `json:"roles"`
+	Providers     []ProviderConfig   `json:"providers,omitempty"`
 	Projects      []ProjectRefConfig `json:"projects"`
 }
 
@@ -919,5 +947,6 @@ type PartialConfig struct {
 	LegacyReviewer *PartialReviewerConfig     `json:"reviewer,omitempty"`
 	Instructions   *PartialInstructionsConfig `json:"instructions,omitempty"`
 	Roles          *PartialRoleConfigs        `json:"roles,omitempty"`
+	Providers      *[]PartialProviderConfig   `json:"providers,omitempty"`
 	Projects       *[]PartialProjectRefConfig `json:"projects,omitempty"`
 }

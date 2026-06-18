@@ -307,6 +307,78 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	}
 }
 
+func TestMinimalForgejoProviderConfigAppliesSafeProjectProfile(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"notifications": {"osascript": {"enabled": false}},
+		"providers": [{"id":"fj","kind":"forgejo","baseUrl":"https://Forgejo.Example.test/","tokenEnv":"FORGEJO_TOKEN"}],
+		"projects": [{"id":"demo","name":"Demo","provider":"fj","repo":"OWNER/repo","repoPath":"/tmp/repo"}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if got := loaded.Config.Providers[0].BaseURL; got != "https://forgejo.example.test" {
+		t.Fatalf("provider baseUrl = %q, want normalized host without trailing slash", got)
+	}
+	roles := ProjectRoleConfigs(loaded.Config, "demo")
+	if roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
+		t.Fatalf("forgejo reviewer requireReviewRequest = true, want false")
+	}
+	if roles.Fixer.AutoDiscovery {
+		t.Fatalf("forgejo fixer autoDiscovery = true, want false")
+	}
+	if roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment || roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
+		t.Fatalf("forgejo review events = %#v, want comment-only", roles.Reviewer.Behavior.ReviewEvents)
+	}
+}
+
+func TestForgejoExplicitUnsupportedProjectOptInFails(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"notifications": {"osascript": {"enabled": false}},
+		"providers": [{"id":"fj","kind":"forgejo","baseUrl":"https://forgejo.example.test","tokenEnv":"FORGEJO_TOKEN"}],
+		"projects": [{"id":"demo","name":"Demo","provider":"fj","repo":"owner/repo","repoPath":"/tmp/repo","roles":{"reviewer":{"discovery":{"triggers":{"requireReviewRequest":true}}}}}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want forgejo unsupported feature validation error")
+	}
+	if !strings.Contains(err.Error(), "requireReviewRequest") {
+		t.Fatalf("LoadFile() error = %v, want requireReviewRequest validation", err)
+	}
+}
+
+func TestForgejoProviderConfigRequiresRepoAndRejectsDuplicateBareRepos(t *testing.T) {
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{ID: "fj", Kind: providerKindPtr(ProviderKindForgejo), BaseURL: stringPtr("https://forgejo.example.test"), TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects: &[]PartialProjectRefConfig{
+			{ID: "one", Name: "One", Provider: stringPtr("fj"), Repo: stringPtr("owner/repo"), RepoPath: "/tmp/one"},
+			{ID: "two", Name: "Two", Provider: stringPtr("fj"), Repo: stringPtr("Owner/Repo"), RepoPath: "/tmp/two"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want duplicate repo error")
+	}
+	if !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("ValidateWithOptions() error = %v, want duplicate repo validation", err)
+	}
+}
+
 func TestAgentTimeoutConfigOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
@@ -3666,6 +3738,10 @@ func emptyEnvLookup(string) (string, bool) {
 }
 
 func intPtr(value int) *int {
+	return &value
+}
+
+func providerKindPtr(value ProviderKind) *ProviderKind {
 	return &value
 }
 
