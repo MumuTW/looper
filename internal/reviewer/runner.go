@@ -597,6 +597,7 @@ type pendingReviewCheckpoint struct {
 	IdempotencyKey           string      `json:"idempotencyKey,omitempty"`
 	Event                    ReviewEvent `json:"event,omitempty"`
 	Summary                  string      `json:"summary,omitempty"`
+	Outcome                  string      `json:"outcome,omitempty"`
 	ContentFingerprint       string      `json:"contentFingerprint,omitempty"`
 	CleanNoop                bool        `json:"cleanNoop,omitempty"`
 	MarkerVerificationMisses int         `json:"markerVerificationMisses,omitempty"`
@@ -2659,7 +2660,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -2682,7 +2683,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found)}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -2696,14 +2697,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 			return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
 		}
-		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, MarkerVerificationMisses: 1}
+		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(reviewCompletionOutcome(result)), MarkerVerificationMisses: 1}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
 		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
 		if policy.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, CleanNoop: true}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -2714,17 +2715,17 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 				if err := validateCleanApprovedReviewMarkerBody(found, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 				}
-				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, ContentFingerprint: reviewMarkerFingerprint(found), CleanNoop: true}
+				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", ContentFingerprint: reviewMarkerFingerprint(found), CleanNoop: true}
 				checkpoint.ResumePolicy = "advance_from_checkpoint"
 				return checkpoint, nil
 			}
 			return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
 		}
-		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, CleanNoop: true}
+		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
-	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary}
+	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(reviewCompletionOutcome(result))}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -3463,10 +3464,7 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 	if body == "" {
 		return &loopError{message: "Reviewer agent completed without comment body for comment-only publish", kind: FailureRetryableAfterResume}
 	}
-	outcome := "non_blocking"
-	if pending.CleanNoop {
-		outcome = "clean"
-	}
+	outcome := pendingCommentOnlyOutcome(pending)
 	body = appendReviewMarker(body, marker, outcome)
 	body = stampIssueComment(r.disclosure, body, "reviewer")
 	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath}); err != nil {
@@ -3678,6 +3676,50 @@ func cleanReviewNoopSummary(summary string) bool {
 		return false
 	}
 	return strings.HasPrefix(normalized, "no actionable findings")
+}
+
+func pendingCommentOnlyOutcome(pending pendingReviewCheckpoint) string {
+	if pending.CleanNoop {
+		return "clean"
+	}
+	outcome := normalizeCommentOnlyOutcome(pending.Outcome)
+	if outcome == "" {
+		return "non_blocking"
+	}
+	return outcome
+}
+
+func normalizeCommentOnlyOutcome(outcome string) string {
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean", "blocking", "non_blocking":
+		return strings.ToLower(strings.TrimSpace(outcome))
+	case "actionable":
+		return "non_blocking"
+	default:
+		return ""
+	}
+}
+
+func reviewCompletionOutcome(result AgentResult) string {
+	raw := result.Stdout
+	if strings.TrimSpace(result.Stderr) != "" {
+		raw += "\n" + result.Stderr
+	}
+	lines := strings.Split(raw, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, agent.CompletionMarkerPrefix) {
+			continue
+		}
+		payload := strings.TrimPrefix(line, agent.CompletionMarkerPrefix)
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+			return ""
+		}
+		outcome, _ := parsed["outcome"].(string)
+		return outcome
+	}
+	return ""
 }
 
 func cleanApprovedReviewMarker(found ReviewMarkerResult) bool {
@@ -5731,7 +5773,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	fetchContract := reviewerAgentSideGitHubFetchContract()
 	if commentOnlyPublish {
 		publishInstruction = "This provider is comment-only. Looper supplied the PR metadata and diff in this prompt/context and will publish exactly one top-level PR comment from your final completion summary after re-checking local idempotency. Do not publish anything yourself or attempt native review features."
-		outcomeInstruction = "If there are actionable findings, finish successfully with a concise markdown comment body that names the findings and locations. If there are no actionable findings, finish successfully with a summary beginning `No actionable findings`. Do not include terminal logs, JSON payloads, or publishing commands."
+		outcomeInstruction = "If there are actionable findings, finish successfully with a concise markdown comment body that names the findings and locations, and set the final `__LOOPER_RESULT__` JSON field `outcome` to `non_blocking` or `blocking` to match the highest-severity finding. If there are no actionable findings, finish successfully with a summary beginning `No actionable findings` and set `outcome` to `clean`. Do not include terminal logs, JSON payloads other than the final completion line, or publishing commands."
 		cleanResultCompletionInstruction = "Prefer a concise, specific final summary over many shallow notes. If there is no concrete actionable feedback, start the final summary with `No actionable findings`. Do not invent feedback."
 		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata and diff before invoking you. Use the prepared local worktree plus the supplied metadata/diff as the review context; do not use GitHub CLI/API commands or native review/thread features."
 	}

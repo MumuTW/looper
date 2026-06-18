@@ -208,6 +208,60 @@ func TestNewForgejoClientFromConfigReadsTokenEnv(t *testing.T) {
 	}
 }
 
+func TestListOpenPullRequestsAppliesLimitAfterLabelFiltering(t *testing.T) {
+	t.Parallel()
+
+	var requests []recordedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests = append(requests, recordedRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Auth: r.Header.Get("Authorization"), Body: string(body)})
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls" {
+			t.Fatalf("unexpected request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		if got := r.URL.Query().Get("labels"); got != "" {
+			t.Fatalf("pull list labels query = %q, want empty client-side filtering", got)
+		}
+		switch r.URL.Query().Get("page") {
+		case "1":
+			w.Header().Set("Link", `</api/v1/repos/acme/looper/pulls?page=2>; rel="next"`)
+			writeJSON(t, w, http.StatusOK, []map[string]any{{
+				"number": 1, "title": "Skip me", "body": "body 1", "state": "open",
+				"head":   map[string]any{"ref": "skip", "sha": "sha-1"},
+				"base":   map[string]any{"ref": "main", "sha": "base"},
+				"user":   map[string]any{"id": 1, "login": "octo"},
+				"labels": []map[string]any{{"id": 11, "name": "other"}},
+			}})
+		case "2":
+			writeJSON(t, w, http.StatusOK, []map[string]any{{
+				"number": 2, "title": "Match me", "body": "body 2", "state": "open",
+				"head":   map[string]any{"ref": "match", "sha": "sha-2"},
+				"base":   map[string]any{"ref": "main", "sha": "base"},
+				"user":   map[string]any{"id": 2, "login": "marge"},
+				"labels": []map[string]any{{"id": 12, "name": "review"}},
+			}})
+		default:
+			t.Fatalf("unexpected page %q", r.URL.Query().Get("page"))
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewForgejoClient(RepositoryRef{ProviderID: "fj", Kind: ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "secret")
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+
+	pulls, err := client.ListOpenPullRequests(context.Background(), ListPullRequestsInput{Labels: []string{"review"}, Limit: 1})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(pulls) != 1 || pulls[0].Number != 2 {
+		t.Fatalf("pulls = %#v, want second-page labeled PR", pulls)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %#v, want two pages fetched before limit satisfied", requests)
+	}
+}
+
 func TestNewForgejoClientRejectsInvalidInputs(t *testing.T) {
 	_, err := NewForgejoClient(RepositoryRef{ProviderID: "", BaseURL: "https://forgejo.example.test", Repo: "acme/looper"}, "token")
 	if err == nil || !strings.Contains(err.Error(), "provider id") {

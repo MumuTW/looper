@@ -242,8 +242,12 @@ func (forgejo *ForgejoClient) ListOpenPullRequests(ctx context.Context, input Li
 		input.State = "open"
 	}
 	query := url.Values{"state": {input.State}}
+	limit := input.Limit
+	if len(input.Labels) > 0 {
+		limit = 0
+	}
 	var output []forgejoPullRequest
-	if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls"), query, input.Limit, &output); err != nil {
+	if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls"), query, limit, &output); err != nil {
 		return nil, err
 	}
 	pulls := make([]PullRequest, 0, len(output))
@@ -253,6 +257,9 @@ func (forgejo *ForgejoClient) ListOpenPullRequests(ctx context.Context, input Li
 			continue
 		}
 		pulls = append(pulls, converted)
+		if input.Limit > 0 && len(pulls) >= input.Limit {
+			break
+		}
 	}
 	return pulls, nil
 }
