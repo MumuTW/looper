@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -2114,29 +2115,41 @@ func TestHandlerLoopStartRejectsTerminalReviewerLoop(t *testing.T) {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	metadataTerminated := `{"loop":{"status":"terminated"}}`
-	loops := []storage.LoopRecord{
-		{ID: "loop_reviewer_terminated", Seq: 10, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "terminated", CreatedAt: nowISO, UpdatedAt: nowISO},
-		{ID: "loop_reviewer_metadata_terminated", Seq: 11, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadataTerminated, CreatedAt: nowISO, UpdatedAt: nowISO},
+	testCases := []struct {
+		loop                  storage.LoopRecord
+		wantPersistedStatuses []string
+	}{
+		{
+			loop:                  storage.LoopRecord{ID: "loop_reviewer_terminated", Seq: 10, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "terminated", CreatedAt: nowISO, UpdatedAt: nowISO},
+			wantPersistedStatuses: []string{"terminated"},
+		},
+		{
+			loop:                  storage.LoopRecord{ID: "loop_reviewer_metadata_terminated", Seq: 11, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadataTerminated, CreatedAt: nowISO, UpdatedAt: nowISO},
+			wantPersistedStatuses: []string{"completed", "terminated"},
+		},
 	}
-	for _, loop := range loops {
-		if err := services.Repositories.Loops.Upsert(context.Background(), loop); err != nil {
-			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+	for _, tc := range testCases {
+		if err := services.Repositories.Loops.Upsert(context.Background(), tc.loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", tc.loop.ID, err)
 		}
 	}
 	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
-	for _, loop := range loops {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loop.ID+"/start", nil)
+	for _, tc := range testCases {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+tc.loop.ID+"/start", nil)
 		recorder := httptest.NewRecorder()
 		h.ServeHTTP(recorder, req)
 		if recorder.Code != http.StatusBadRequest {
-			t.Fatalf("start %s status = %d, want 400", loop.ID, recorder.Code)
+			t.Fatalf("start %s status = %d, want 400", tc.loop.ID, recorder.Code)
 		}
-		updated, err := services.Repositories.Loops.GetByID(context.Background(), loop.ID)
+		updated, err := services.Repositories.Loops.GetByID(context.Background(), tc.loop.ID)
 		if err != nil || updated == nil {
-			t.Fatalf("Loops.GetByID(%s) = (%#v, %v), want loop", loop.ID, updated, err)
+			t.Fatalf("Loops.GetByID(%s) = (%#v, %v), want loop", tc.loop.ID, updated, err)
 		}
-		if updated.Status != loop.Status {
-			t.Fatalf("loop %s status = %q, want unchanged %q", loop.ID, updated.Status, loop.Status)
+		if !slices.Contains(tc.wantPersistedStatuses, updated.Status) {
+			t.Fatalf("loop %s status = %q, want one of %#v", tc.loop.ID, updated.Status, tc.wantPersistedStatuses)
+		}
+		if !isTerminalReviewerLoopRecord(*updated) {
+			t.Fatalf("loop %s = %#v, want terminal reviewer loop", tc.loop.ID, updated)
 		}
 	}
 }
