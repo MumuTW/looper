@@ -673,7 +673,11 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, Diff: diff}, nil
+		comments, err := client.ListIssueComments(ctx, input.PRNumber)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, Diff: diff, IssueComments: forgeCommentsToObjects(comments)}, nil
 	}
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -927,6 +931,20 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 		return fixer.PullRequestDetail{}, err
 	}
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+}
+
+func forgeCommentsToObjects(items []forge.Comment) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, map[string]any{
+			"id":        item.ID,
+			"author":    map[string]any{"login": item.User.Login},
+			"body":      item.Body,
+			"updatedAt": item.UpdatedAt,
+			"url":       item.HTMLURL,
+		})
+	}
+	return out
 }
 
 func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {

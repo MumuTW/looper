@@ -150,6 +150,7 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	var listLabels string
 	var commentBody map[string]any
+	existingMarker := "<!-- looper:review id=reviewer:loop_123:abc123:key head=abc123 outcome=non_blocking -->"
 	var removedPaths []string
 	var comparePath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -179,6 +180,14 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42.diff":
 			_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-old\n+new\n"))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/issues/42/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id":         77,
+				"body":       "Existing review\n\n" + existingMarker,
+				"html_url":   serverURL(r) + "/acme/looper/issues/42#issuecomment-77",
+				"updated_at": "2026-06-18T00:00:00Z",
+				"user":       map[string]any{"login": "reviewer-bot", "id": 7},
+			}})
 		case r.Method == http.MethodGet && r.URL.EscapedPath() == "/api/v1/repos/acme/looper/compare/main...feature%2Freview-me":
 			comparePath = r.URL.EscapedPath()
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "ahead_by": 1, "behind_by": 0, "total_commits": 1})
@@ -219,6 +228,12 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	}
 	if !detail.IsDraft {
 		t.Fatalf("detail = %#v, want draft preserved", detail)
+	}
+	if len(detail.IssueComments) != 1 {
+		t.Fatalf("detail.IssueComments = %#v, want existing Forgejo issue comment", detail.IssueComments)
+	}
+	if body, _ := detail.IssueComments[0]["body"].(string); !strings.Contains(body, existingMarker) {
+		t.Fatalf("detail.IssueComments = %#v, want marker-bearing comment body", detail.IssueComments)
 	}
 	snapshot, err := adapter.CapturePullRequestSnapshot(context.Background(), reviewer.CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, CWD: repoPath, CapturedAt: "2026-06-18T00:00:00Z"})
 	if err != nil {

@@ -66,6 +66,11 @@ func TestForgejoClientContract(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && r.URL.Path == "/forge/api/v1/repos/acme/looper/issues/7/comments":
 			writeJSON(t, w, http.StatusOK, map[string]any{"id": 301, "body": "comment body", "html_url": "https://example.test/comments/301", "updated_at": "2026-06-18T02:00:00Z", "user": map[string]any{"id": 42, "login": "ralph"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/forge/api/v1/repos/acme/looper/issues/7/comments":
+			writeJSON(t, w, http.StatusOK, []map[string]any{
+				{"id": 301, "body": "comment body", "html_url": "https://example.test/comments/301", "updated_at": "2026-06-18T02:00:00Z", "user": map[string]any{"id": 42, "login": "ralph"}},
+				{"id": 302, "body": "follow-up", "html_url": "https://example.test/comments/302", "updated_at": "2026-06-18T02:30:00Z", "user": map[string]any{"id": 7, "login": "marge"}},
+			})
 		case r.Method == http.MethodPatch && r.URL.Path == "/forge/api/v1/repos/acme/looper/issues/comments/301":
 			writeJSON(t, w, http.StatusOK, map[string]any{"id": 301, "body": "updated body", "html_url": "https://example.test/comments/301", "updated_at": "2026-06-18T03:00:00Z", "user": map[string]any{"id": 42, "login": "ralph"}})
 		case r.Method == http.MethodGet && r.URL.Path == "/forge/api/v1/repos/acme/looper/pulls":
@@ -138,6 +143,10 @@ func TestForgejoClientContract(t *testing.T) {
 	comment, err := client.CreateIssueComment(ctx, CreateCommentInput{IssueNumber: 7, Body: "comment body"})
 	if err != nil || comment.ID != 301 {
 		t.Fatalf("CreateIssueComment() = %#v, %v", comment, err)
+	}
+	comments, err := client.ListIssueComments(ctx, 7)
+	if err != nil || len(comments) != 2 || comments[1].User.Login != "marge" {
+		t.Fatalf("ListIssueComments() = %#v, %v", comments, err)
 	}
 	comment, err = client.UpdateIssueComment(ctx, UpdateCommentInput{CommentID: 301, Body: "updated body"})
 	if err != nil || comment.Body != "updated body" {

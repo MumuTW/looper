@@ -346,6 +346,18 @@ func (forgejo *ForgejoClient) CreateIssueComment(ctx context.Context, input Crea
 	return convertComment(output), nil
 }
 
+func (forgejo *ForgejoClient) ListIssueComments(ctx context.Context, issueNumber int64) ([]Comment, error) {
+	var output []forgejoComment
+	if err := forgejo.getPaged(ctx, forgejo.repoPath("issues", strconv.FormatInt(issueNumber, 10), "comments"), nil, 0, &output); err != nil {
+		return nil, err
+	}
+	comments := make([]Comment, 0, len(output))
+	for _, comment := range output {
+		comments = append(comments, convertComment(comment))
+	}
+	return comments, nil
+}
+
 func (forgejo *ForgejoClient) UpdateIssueComment(ctx context.Context, input UpdateCommentInput) (Comment, error) {
 	var output forgejoComment
 	if err := forgejo.do(ctx, http.MethodPatch, forgejo.repoPath("issues", "comments", strconv.FormatInt(input.CommentID, 10)), nil, map[string]string{"body": input.Body}, &output); err != nil {
