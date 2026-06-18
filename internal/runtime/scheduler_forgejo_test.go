@@ -71,22 +71,50 @@ func TestPlannerGitHubAdapterForgejoCreatePullRequestAndLabels(t *testing.T) {
 	}
 }
 
-func TestWorkerGitHubAdapterForgejoCreatePullRequest(t *testing.T) {
+func TestWorkerGitHubAdapterForgejoCreatePullRequestQueuesReviewerDiscoveryLabel(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	var createdBody map[string]any
+	var labelBody map[string][]string
+	currentLabels := []map[string]any{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/repos/acme/looper/pulls" {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
+			if err := json.NewDecoder(r.Body).Decode(&createdBody); err != nil {
+				t.Fatalf("decode create PR body: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 201, "html_url": serverURL(r) + "/acme/looper/pulls/201", "head": map[string]any{"ref": "worker-branch", "sha": "abc"}, "base": map[string]any{"ref": "main", "sha": "def"}, "labels": currentLabels})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/201/labels":
+			if err := json.NewDecoder(r.Body).Decode(&labelBody); err != nil {
+				t.Fatalf("decode labels body: %v", err)
+			}
+			currentLabels = currentLabels[:0]
+			for i, label := range labelBody["labels"] {
+				currentLabels = append(currentLabels, map[string]any{"id": i + 1, "name": label})
+			}
+			_ = json.NewEncoder(w).Encode(currentLabels)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"number": 201, "title": "Implement worker", "body": "Body", "state": "open",
+				"head":   map[string]any{"ref": "worker-branch", "sha": "abc"},
+				"base":   map[string]any{"ref": "main", "sha": "def"},
+				"user":   map[string]any{"login": "worker", "id": 1},
+				"labels": currentLabels,
+			}})
+		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
-		if err := json.NewDecoder(r.Body).Decode(&createdBody); err != nil {
-			t.Fatalf("decode create PR body: %v", err)
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"number": 201, "html_url": serverURL(r) + "/acme/looper/pulls/201", "head": map[string]any{"ref": "worker-branch", "sha": "abc"}, "base": map[string]any{"ref": "main", "sha": "def"}})
 	}))
 	defer server.Close()
 
 	repoPath := filepath.Join(t.TempDir(), "repo")
 	cfg := config.Config{
+		Roles: config.RoleConfigs{
+			Reviewer: config.ReviewerRoleConfig{
+				Discovery: config.ReviewerRoleDiscoveryConfig{
+					Triggers: config.ReviewerRoleTriggersConfig{Labels: []string{"team-review"}},
+				},
+			},
+		},
 		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
 		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}
@@ -99,8 +127,22 @@ func TestWorkerGitHubAdapterForgejoCreatePullRequest(t *testing.T) {
 	if created.Number != 201 {
 		t.Fatalf("created = %#v, want PR 201", created)
 	}
+	if err := adapter.AddPullRequestReviewers(context.Background(), worker.PullRequestReviewersInput{Repo: "acme/looper", PRNumber: 201, Reviewers: []string{"reviewer"}, CWD: repoPath}); err != nil {
+		t.Fatalf("AddPullRequestReviewers() error = %v", err)
+	}
 	if createdBody["head"] != "worker-branch" || createdBody["base"] != "main" {
 		t.Fatalf("create body = %#v, want worker-branch->main", createdBody)
+	}
+	if got := labelBody["labels"]; len(got) != 1 || got[0] != "team-review" {
+		t.Fatalf("label body = %#v, want configured reviewer discovery label", labelBody)
+	}
+	reviewerAdapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	prs, err := reviewerAdapter.ListOpenPullRequests(context.Background(), reviewer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath, Labels: []string{"team-review"}})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 201 {
+		t.Fatalf("prs = %#v, want worker-created PR rediscovered by reviewer label", prs)
 	}
 }
 

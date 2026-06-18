@@ -221,6 +221,32 @@ func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderCon
 	return config.ProviderConfig{}, false, nil
 }
 
+func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo string) []string {
+	if cfg == nil {
+		return nil
+	}
+	repo = strings.TrimSpace(repo)
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.Repo) != repo {
+			continue
+		}
+		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+			return nil
+		}
+		labels := config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Discovery.Triggers.Labels
+		result := make([]string, 0, len(labels))
+		for _, label := range labels {
+			label = strings.TrimSpace(label)
+			if label == "" {
+				continue
+			}
+			result = append(result, label)
+		}
+		return result
+	}
+	return nil
+}
+
 func forgejoProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
 	if cfg == nil {
 		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
@@ -1325,9 +1351,15 @@ func (a workerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input 
 }
 
 func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input worker.PullRequestReviewersInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
 		if err != nil {
 			return err
+		}
+		labels := forgejoReviewerDiscoveryLabelsForRepo(a.config, input.Repo)
+		if len(labels) > 0 {
+			if _, err := client.AddIssueLabels(ctx, input.PRNumber, labels); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
