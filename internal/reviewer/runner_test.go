@@ -8198,7 +8198,7 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail while disabled:\n%s", prompt)
@@ -8211,7 +8211,7 @@ func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) 
 func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail for follow-up bypass:\n%s", prompt)
@@ -8221,6 +8221,81 @@ func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "enabled reviewer follow-up loop") || !strings.Contains(prompt, "differs from the last published review head") {
 		t.Fatalf("prompt missing follow-up authority explanation:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPromptCommentOnlyOmitsGitHubPublishInstructions(t *testing.T) {
+	t.Parallel()
+
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true)
+
+	for _, forbidden := range []string{"gh pr view", "gh pr diff", "gh api", "GitHub operation contract", "review request removed before publish", "trusted Looper CLI at", "review-thread resolution"} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("prompt contains %q:\n%s", forbidden, prompt)
+		}
+	}
+	if !strings.Contains(prompt, "comment-only") || !strings.Contains(prompt, "Looper will post your final completion summary") {
+		t.Fatalf("prompt missing comment-only publish instructions:\n%s", prompt)
+	}
+}
+
+func TestProcessClaimedItemCommentOnlyPublishesOneCommentAndSkipsRediscoveryForSameHead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "internal/reviewer/runner.go: add a regression test for Forgejo comment-only publish", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: add a regression test for Forgejo comment-only publish"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+
+	discovery, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(github.listReviewRequestedCalls) != 0 {
+		t.Fatalf("review-request calls = %#v, want none for comment-only label discovery", github.listReviewRequestedCalls)
+	}
+	if len(github.listCalls) != 1 || github.listCalls[0].Label != "looper:review" {
+		t.Fatalf("list calls = %#v, want label-based discovery", github.listCalls)
+	}
+	if len(discovery.QueueItems) != 1 {
+		t.Fatalf("queue items = %#v, want one queued PR", discovery.QueueItems)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(github.submitReviewCalls) != 0 {
+		t.Fatalf("submitReviewCalls = %#v, want no native review submissions", github.submitReviewCalls)
+	}
+	if len(github.issueCommentCalls) != 1 {
+		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
+	}
+	if !strings.Contains(github.issueCommentCalls[0].Body, "Forgejo comment-only publish") || !strings.Contains(github.issueCommentCalls[0].Body, "<!-- looper:review") {
+		t.Fatalf("comment body = %q, want summary plus marker", github.issueCommentCalls[0].Body)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	meta := parseJSONObject(loop.MetadataJSON)
+	if got, _ := stringFromAny(meta["lastPublishedHeadSha"]); got != "abc123" {
+		t.Fatalf("lastPublishedHeadSha = %q, want abc123", got)
+	}
+	rediscovery, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if len(rediscovery.QueueItems) != 0 {
+		t.Fatalf("second discovery queue items = %#v, want none for already-published head", rediscovery.QueueItems)
+	}
+	if len(github.issueCommentCalls) != 1 {
+		t.Fatalf("issueCommentCalls after rediscovery = %#v, want still one comment", github.issueCommentCalls)
 	}
 }
 

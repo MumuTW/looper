@@ -558,9 +558,36 @@ func (a plannerAgentExecutionAdapter) Wait(ctx context.Context) (planner.AgentRe
 type reviewerGitHubAdapter struct {
 	gateway *githubinfra.Gateway
 	stamper disclosure.Stamper
+	config  *config.Config
+}
+
+func (a reviewerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForRepo(a.config, repo)
+	return client, ok, err
 }
 
 func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input reviewer.ListOpenPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		labels := append([]string(nil), input.Labels...)
+		if len(labels) == 0 && strings.TrimSpace(input.Label) != "" {
+			labels = []string{strings.TrimSpace(input.Label)}
+		}
+		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Labels: labels, Limit: input.Limit})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
+		for _, pr := range pullRequests {
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login})
+		}
+		return result, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
 	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Label: input.Label, Labels: input.Labels})
 	if err != nil {
 		return nil, err
@@ -573,6 +600,15 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 }
 
 func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Context, input reviewer.ListReviewRequestedPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("forgejo reviewer does not support review-request discovery")
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
 	pullRequests, err := a.gateway.ListReviewRequestedPullRequests(ctx, githubinfra.ListReviewRequestedPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Reviewer: input.Reviewer})
 	if err != nil {
 		return nil, err
@@ -585,10 +621,37 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 }
 
 func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		identity, err := client.CurrentUser(ctx)
+		return identity.Login, err
+	}
+	if a.gateway == nil {
+		return "", fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
 
 func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		diff, err := client.PullRequestDiff(ctx, input.PRNumber)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, Diff: diff}, nil
+	}
+	if a.gateway == nil {
+		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
+	}
 	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
@@ -609,10 +672,55 @@ func (a reviewerGitHubAdapter) GetBranchProtection(ctx context.Context, input gi
 }
 
 func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input reviewer.ViewPullRequestInput) (string, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
+		return pr.Head.SHA, err
+	}
+	if a.gateway == nil {
+		return "", fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.GetPullRequestHeadSHA(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, input reviewer.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return storage.PullRequestSnapshotRecord{}, err
+		}
+		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
+		if err != nil {
+			return storage.PullRequestSnapshotRecord{}, err
+		}
+		diff, err := client.PullRequestDiff(ctx, input.PRNumber)
+		if err != nil {
+			return storage.PullRequestSnapshotRecord{}, err
+		}
+		payloadJSON, err := json.Marshal(map[string]any{"diff": diff})
+		if err != nil {
+			return storage.PullRequestSnapshotRecord{}, err
+		}
+		baseSHA := strings.TrimSpace(pr.Base.SHA)
+		return storage.PullRequestSnapshotRecord{
+			ID:          fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt),
+			ProjectID:   input.ProjectID,
+			Repo:        input.Repo,
+			PRNumber:    input.PRNumber,
+			HeadSHA:     pr.Head.SHA,
+			BaseSHA:     stringPtr(baseSHA),
+			Title:       stringPtr(pr.Title),
+			Body:        stringPtr(pr.Body),
+			Author:      stringPtr(pr.User.Login),
+			PayloadJSON: stringPtr(string(payloadJSON)),
+			CapturedAt:  input.CapturedAt,
+			CreatedAt:   input.CapturedAt,
+		}, nil
+	}
+	if a.gateway == nil {
+		return storage.PullRequestSnapshotRecord{}, fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 }
 
@@ -630,6 +738,19 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 
 func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input reviewer.IssueCommentInput) (reviewer.IssueCommentResult, error) {
 	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return reviewer.IssueCommentResult{}, err
+		}
+		comment, err := client.CreateIssueComment(ctx, forge.CreateCommentInput{IssueNumber: input.IssueNumber, Body: body})
+		if err != nil {
+			return reviewer.IssueCommentResult{}, err
+		}
+		return reviewer.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
+	}
+	if a.gateway == nil {
+		return reviewer.IssueCommentResult{}, fmt.Errorf("github gateway is not configured")
+	}
 	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: body, CWD: input.CWD})
 	if err != nil {
 		return reviewer.IssueCommentResult{}, err
@@ -658,6 +779,20 @@ func (a reviewerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input r
 }
 
 func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input reviewer.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		for _, label := range input.Labels {
+			if err := client.RemoveIssueLabel(ctx, input.PRNumber, label); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
@@ -1429,7 +1564,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	reviewerRunner = reviewer.New(reviewer.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper},
+		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:              reviewerGitAdapter{gateway: gitGateway},
 		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:           logger,
@@ -1728,20 +1863,15 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "coordinator discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
 			} else {
-			appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
-				_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-				return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
-			}))
-			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_coordinator_discovery", input, discoveredRunnableIDs, true)
-			recordClaim(claimedCount, availableSlots, err)
+				appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
+					_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
+					return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
+				}))
+				claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_coordinator_discovery", input, discoveredRunnableIDs, true)
+				recordClaim(claimedCount, availableSlots, err)
 			}
 		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
-			if providerKind != config.ProviderKindGitHub {
-				if input.Logger != nil {
-					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "reviewer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
-				}
-			} else {
 			appendErr(runSchedulerLane(input, "reviewer discovery", project.ID, repo, func() error {
 				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -1749,7 +1879,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}))
 			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_reviewer_discovery", input, discoveredRunnableIDs, true)
 			recordClaim(claimedCount, availableSlots, err)
-			}
 		} else if input.Reviewer != nil && input.Logger != nil {
 			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
@@ -1759,13 +1888,13 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "fixer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
 			} else {
-			appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
-				result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-				trackRunnableDiscovery(result.QueueItems)
-				return wrapSchedulerError("fixer discovery", project.ID, repo, err)
-			}))
-			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_fixer_discovery", input, discoveredRunnableIDs, true)
-			recordClaim(claimedCount, availableSlots, err)
+				appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
+					result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
+					trackRunnableDiscovery(result.QueueItems)
+					return wrapSchedulerError("fixer discovery", project.ID, repo, err)
+				}))
+				claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_fixer_discovery", input, discoveredRunnableIDs, true)
+				recordClaim(claimedCount, availableSlots, err)
 			}
 		} else if input.Fixer != nil && input.Logger != nil {
 			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})

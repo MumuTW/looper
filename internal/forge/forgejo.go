@@ -121,8 +121,9 @@ type ListIssuesInput struct {
 }
 
 type ListPullRequestsInput struct {
-	State string
-	Limit int
+	State  string
+	Labels []string
+	Limit  int
 }
 
 type CreatePullRequestInput struct {
@@ -227,6 +228,9 @@ func (forgejo *ForgejoClient) ListOpenPullRequests(ctx context.Context, input Li
 		input.State = "open"
 	}
 	query := url.Values{"state": {input.State}}
+	if len(input.Labels) > 0 {
+		query.Set("labels", strings.Join(input.Labels, ","))
+	}
 	var output []forgejoPullRequest
 	if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls"), query, input.Limit, &output); err != nil {
 		return nil, err

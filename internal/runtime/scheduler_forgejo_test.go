@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/planner"
+	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/worker"
 )
 
@@ -27,7 +28,7 @@ func TestPlannerGitHubAdapterForgejoCreatePullRequestAndLabels(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&createdBody); err != nil {
 				t.Fatalf("decode create PR body: %v", err)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"number": 101, "html_url": serverURL(r)+"/acme/looper/pulls/101", "head": map[string]any{"ref": "feature", "sha": "abc"}, "base": map[string]any{"ref": "main", "sha": "def"}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 101, "html_url": serverURL(r) + "/acme/looper/pulls/101", "head": map[string]any{"ref": "feature", "sha": "abc"}, "base": map[string]any{"ref": "main", "sha": "def"}})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/101/labels":
 			if err := json.NewDecoder(r.Body).Decode(&labelBody); err != nil {
 				t.Fatalf("decode labels body: %v", err)
@@ -100,6 +101,95 @@ func TestWorkerGitHubAdapterForgejoCreatePullRequest(t *testing.T) {
 	}
 	if createdBody["head"] != "worker-branch" || createdBody["base"] != "main" {
 		t.Fatalf("create body = %#v, want worker-branch->main", createdBody)
+	}
+}
+
+func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	var listLabels string
+	var commentBody map[string]any
+	var removedPaths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
+			listLabels = r.URL.Query().Get("labels")
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"number": 42, "title": "Review me", "body": "PR body", "state": "open",
+				"head":   map[string]any{"ref": "feature/review-me", "sha": "abc123"},
+				"base":   map[string]any{"ref": "main", "sha": "base123"},
+				"user":   map[string]any{"login": "alice", "id": 1},
+				"labels": []map[string]any{{"id": 1, "name": "looper:review"}},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 42, "title": "Review me", "body": "PR body", "state": "open",
+				"head":   map[string]any{"ref": "feature/review-me", "sha": "abc123"},
+				"base":   map[string]any{"ref": "main", "sha": "base123"},
+				"user":   map[string]any{"login": "alice", "id": 1},
+				"labels": []map[string]any{{"id": 1, "name": "looper:review"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42.diff":
+			_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n@@ -1 +1 @@\n-old\n+new\n"))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/42/comments":
+			if err := json.NewDecoder(r.Body).Decode(&commentBody); err != nil {
+				t.Fatalf("decode comment body: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99, "html_url": serverURL(r) + "/acme/looper/issues/42#comment-99"})
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/issues/42/labels/"):
+			removedPaths = append(removedPaths, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+
+	prs, err := adapter.ListOpenPullRequests(context.Background(), reviewer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath, Labels: []string{"looper:review"}})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].HeadSHA != "abc123" {
+		t.Fatalf("prs = %#v, want Forgejo PR summary", prs)
+	}
+	detail, err := adapter.ViewPullRequest(context.Background(), reviewer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath})
+	if err != nil {
+		t.Fatalf("ViewPullRequest() error = %v", err)
+	}
+	if !strings.Contains(detail.Diff, "diff --git") {
+		t.Fatalf("detail.Diff = %q, want fetched Forgejo diff", detail.Diff)
+	}
+	snapshot, err := adapter.CapturePullRequestSnapshot(context.Background(), reviewer.CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, CWD: repoPath, CapturedAt: "2026-06-18T00:00:00Z"})
+	if err != nil {
+		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
+	}
+	if snapshot.HeadSHA != "abc123" || snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, "diff --git") {
+		t.Fatalf("snapshot = %#v, want captured Forgejo diff payload", snapshot)
+	}
+	comment, err := adapter.CreateIssueComment(context.Background(), reviewer.IssueCommentInput{Repo: "acme/looper", IssueNumber: 42, Body: "Needs a test", CWD: repoPath})
+	if err != nil {
+		t.Fatalf("CreateIssueComment() error = %v", err)
+	}
+	if comment.ID != 99 {
+		t.Fatalf("comment = %#v, want created comment id", comment)
+	}
+	if err := adapter.RemovePullRequestLabels(context.Background(), reviewer.PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{"looper:review"}, CWD: repoPath}); err != nil {
+		t.Fatalf("RemovePullRequestLabels() error = %v", err)
+	}
+	if listLabels != "looper:review" {
+		t.Fatalf("labels query = %q, want looper:review", listLabels)
+	}
+	if body, _ := commentBody["body"].(string); !strings.Contains(body, "Needs a test") {
+		t.Fatalf("comment body = %#v, want stamped comment content", commentBody)
+	}
+	if len(removedPaths) != 1 || !strings.Contains(removedPaths[0], "/issues/42/labels/looper:review") {
+		t.Fatalf("removedPaths = %#v, want Forgejo label delete", removedPaths)
 	}
 }
 

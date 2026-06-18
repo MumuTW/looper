@@ -26,3 +26,10 @@
 - Updated planner and worker prompt/contracts to use provider-aware issue wording, removed Forgejo-inappropriate GitHub CLI guidance, and changed Forgejo worker handling to require pre-assigned issues with an assignment re-check before side effects and no self-assignment fallback.
 - Added focused coverage in `internal/runtime/scheduler_forgejo_test.go`, `internal/planner/runner_test.go`, and `internal/worker/runner_test.go` for Forgejo planner PR creation/labels, Forgejo worker PR creation, prompt text, and unassigned/de-assigned worker skip behavior.
 - Verified with `go test ./internal/runtime ./internal/planner ./internal/worker`.
+
+## Step 5
+
+- Enabled Forgejo reviewer discovery in `internal/runtime/scheduler.go`, extended the reviewer adapter to use Forgejo label-filtered PR listing, PR metadata+diff fetches, snapshot capture, issue comments, and label removal through the REST client, and added comment-only publish mode routing into the reviewer runner.
+- Updated reviewer prompt construction for Forgejo comment-only runs so the agent uses supplied metadata/diff context without GitHub CLI/native-review instructions, while the runner records `lastPublishedHeadSha` and publishes exactly one top-level comment per head.
+- Added focused coverage in `internal/reviewer/runner_test.go` and `internal/runtime/scheduler_forgejo_test.go` for Forgejo comment-only prompt contracts, label-based discovery without review requests, local head-SHA idempotency after publish, and reviewer adapter Forgejo endpoints.
+- Verified with `go test ./internal/forge ./internal/reviewer ./internal/runtime`.
