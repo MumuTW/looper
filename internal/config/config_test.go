@@ -359,29 +359,54 @@ func TestForgejoExplicitUnsupportedProjectOptInFails(t *testing.T) {
 	}
 }
 
-func TestForgejoProjectRejectsGlobalReviewEventOverrides(t *testing.T) {
+func TestMixedGitHubAndForgejoProjectsKeepGlobalDefaultsAndApplyForgejoOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
 	contents := `{
 		"notifications": {"osascript": {"enabled": false}},
-		"roles": {"reviewer": {"behavior": {"reviewEvents": {"clean": "APPROVE", "blocking": "REQUEST_CHANGES"}}}},
+		"roles": {
+			"reviewer": {
+				"discovery": {"triggers": {"requireReviewRequest": true}},
+				"behavior": {"reviewEvents": {"clean": "APPROVE", "blocking": "REQUEST_CHANGES"}}
+			},
+			"fixer": {"autoDiscovery": true}
+		},
 		"providers": [{"id":"fj","kind":"forgejo","baseUrl":"https://forgejo.example.test","tokenEnv":"FORGEJO_TOKEN"}],
-		"projects": [{"id":"demo","name":"Demo","provider":"fj","repo":"owner/repo","repoPath":"/tmp/repo"}]
+		"projects": [
+			{"id":"github","name":"GitHub","repo":"owner/github","repoPath":"/tmp/github"},
+			{"id":"forgejo","name":"Forgejo","provider":"fj","repo":"owner/forgejo","repoPath":"/tmp/forgejo"}
+		]
 	}`
 	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
-	if err == nil {
-		t.Fatal("LoadFile() error = nil, want forgejo reviewEvents validation error")
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
 	}
-	var validationErr *ConfigValidationError
-	if !errors.As(err, &validationErr) {
-		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+
+	githubRoles := ProjectRoleConfigs(loaded.Config, "github")
+	if !githubRoles.Reviewer.Discovery.Triggers.RequireReviewRequest {
+		t.Fatalf("github reviewer requireReviewRequest = false, want true")
 	}
-	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.reviewEvents.clean", "must be COMMENT when any configured project uses provider kind forgejo")
-	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.reviewEvents.blocking", "must be COMMENT when any configured project uses provider kind forgejo")
+	if !githubRoles.Fixer.AutoDiscovery {
+		t.Fatalf("github fixer autoDiscovery = false, want true")
+	}
+	if githubRoles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove || githubRoles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventRequestChanges {
+		t.Fatalf("github review events = %#v, want global GitHub defaults", githubRoles.Reviewer.Behavior.ReviewEvents)
+	}
+
+	forgejoRoles := ProjectRoleConfigs(loaded.Config, "forgejo")
+	if forgejoRoles.Reviewer.Discovery.Triggers.RequireReviewRequest {
+		t.Fatalf("forgejo reviewer requireReviewRequest = true, want false")
+	}
+	if forgejoRoles.Fixer.AutoDiscovery {
+		t.Fatalf("forgejo fixer autoDiscovery = true, want false")
+	}
+	if forgejoRoles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment || forgejoRoles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
+		t.Fatalf("forgejo review events = %#v, want comment-only", forgejoRoles.Reviewer.Behavior.ReviewEvents)
+	}
 }
 
 func TestForgejoProjectRejectsProjectReviewEventOverrides(t *testing.T) {

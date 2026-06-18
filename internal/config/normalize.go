@@ -321,9 +321,6 @@ func applyProviderProfiles(config *Config, partials ...PartialConfig) error {
 	if config == nil || !hasForgejoProject(*config) {
 		return nil
 	}
-	if issues := validateExplicitForgejoUnsupportedGlobalOptIns(partials...); len(issues) > 0 {
-		return &ConfigValidationError{Issues: issues}
-	}
 	for index := range config.Projects {
 		project := &config.Projects[index]
 		if resolvedProjectProviderKind(*config, *project) != ProviderKindForgejo {
@@ -412,40 +409,6 @@ func applyForgejoProjectProfile(project *ProjectRefConfig) {
 	if roles.Fixer.AutoDiscovery == nil {
 		roles.Fixer.AutoDiscovery = boolPtr(false)
 	}
-}
-
-func validateExplicitForgejoUnsupportedGlobalOptIns(partials ...PartialConfig) []ValidationIssue {
-	issues := []ValidationIssue{}
-	for _, partial := range partials {
-		if partial.Roles == nil {
-			continue
-		}
-		if partial.Roles.Fixer != nil && partial.Roles.Fixer.AutoDiscovery != nil && *partial.Roles.Fixer.AutoDiscovery {
-			issues = append(issues, ValidationIssue{Path: "roles.fixer.autoDiscovery", Message: "must be false when any configured project uses provider kind forgejo"})
-		}
-		if partial.Roles.Reviewer == nil {
-			continue
-		}
-		reviewer := partial.Roles.Reviewer
-		if reviewer.Discovery != nil && reviewer.Discovery.Triggers != nil && reviewer.Discovery.Triggers.RequireReviewRequest != nil && *reviewer.Discovery.Triggers.RequireReviewRequest {
-			issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.triggers.requireReviewRequest", Message: "must be false when any configured project uses provider kind forgejo"})
-		}
-		if reviewer.AutoMerge != nil && reviewer.AutoMerge.Enabled != nil && *reviewer.AutoMerge.Enabled {
-			issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.enabled", Message: "must be false when any configured project uses provider kind forgejo"})
-		}
-		if reviewer.Behavior != nil && reviewer.Behavior.ReviewEvents != nil {
-			if reviewer.Behavior.ReviewEvents.Clean != nil && *reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
-				issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: "must be COMMENT when any configured project uses provider kind forgejo"})
-			}
-			if reviewer.Behavior.ReviewEvents.Blocking != nil && *reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
-				issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.blocking", Message: "must be COMMENT when any configured project uses provider kind forgejo"})
-			}
-		}
-		if reviewer.Behavior != nil && reviewer.Behavior.ThreadResolution != nil && reviewer.Behavior.ThreadResolution.Enabled != nil && *reviewer.Behavior.ThreadResolution.Enabled {
-			issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.enabled", Message: "must be false when any configured project uses provider kind forgejo"})
-		}
-	}
-	return issues
 }
 
 func normalizeProviderConfig(provider *ProviderConfig) {
