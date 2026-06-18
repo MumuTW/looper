@@ -17,6 +17,7 @@ import (
 )
 
 const defaultForgejoTimeout = 30 * time.Second
+const maxForgejoResponseBodyBytes = 1 << 20
 
 type ForgejoClient struct {
 	baseURL    *url.URL
@@ -460,9 +461,12 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s failed: %w", method, path, err)
 	}
 	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxForgejoResponseBodyBytes+1))
 	if err != nil {
 		return rawResponse{}, fmt.Errorf("forgejo API read response %s %s: %w", method, path, err)
+	}
+	if len(responseBody) > maxForgejoResponseBodyBytes {
+		return rawResponse{}, fmt.Errorf("forgejo API %s %s response exceeds %d bytes", method, path, maxForgejoResponseBodyBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s returned HTTP %d: %s", method, path, response.StatusCode, sanitizeForgejoErrorBody(responseBody, forgejo.token))

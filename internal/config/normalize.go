@@ -433,6 +433,14 @@ func validateExplicitForgejoUnsupportedGlobalOptIns(partials ...PartialConfig) [
 		if reviewer.AutoMerge != nil && reviewer.AutoMerge.Enabled != nil && *reviewer.AutoMerge.Enabled {
 			issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.enabled", Message: "must be false when any configured project uses provider kind forgejo"})
 		}
+		if reviewer.Behavior != nil && reviewer.Behavior.ReviewEvents != nil {
+			if reviewer.Behavior.ReviewEvents.Clean != nil && *reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
+				issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: "must be COMMENT when any configured project uses provider kind forgejo"})
+			}
+			if reviewer.Behavior.ReviewEvents.Blocking != nil && *reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
+				issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.blocking", Message: "must be COMMENT when any configured project uses provider kind forgejo"})
+			}
+		}
 		if reviewer.Behavior != nil && reviewer.Behavior.ThreadResolution != nil && reviewer.Behavior.ThreadResolution.Enabled != nil && *reviewer.Behavior.ThreadResolution.Enabled {
 			issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.enabled", Message: "must be false when any configured project uses provider kind forgejo"})
 		}

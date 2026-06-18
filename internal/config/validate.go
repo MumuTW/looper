@@ -424,6 +424,12 @@ func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[
 	if roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.triggers.requireReviewRequest", Message: "must be false for forgejo projects"})
 	}
+	if roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.reviewEvents.clean", Message: "must be COMMENT for forgejo projects"})
+	}
+	if roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.reviewEvents.blocking", Message: "must be COMMENT for forgejo projects"})
+	}
 	if roles.Reviewer.AutoMerge.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.autoMerge.enabled", Message: "must be false for forgejo projects"})
 	}
