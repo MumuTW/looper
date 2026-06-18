@@ -225,6 +225,7 @@ Add provider config without breaking existing configs:
   "projects": [
     {
       "id": "example",
+      "name": "Example",
       "repoPath": "/repos/example",
       "provider": "forgejo-main",
       "repo": "acme/example"
@@ -237,7 +238,7 @@ Compatibility:
 
 - Existing GitHub projects without `provider` continue to use the default GitHub provider with their current autodetect/metadata repo authority (transitional; see "Repo identity and authority").
 - Existing `tools.ghPath` remains valid and feeds the default GitHub provider.
-- New Forgejo providers require `baseUrl` and either `tokenEnv`, `tokenPath`, or a future credential helper; Forgejo projects require explicit `provider` and `repo`.
+- New Forgejo providers require `baseUrl` and either `tokenEnv`, `tokenPath`, or a future credential helper; Forgejo projects require explicit `name`, `provider`, and `repo`.
 - Tokens must never be stored in project metadata or printed in diagnostics.
 - Config validation rejects two projects resolving to the same `repo`, regardless of provider/host (see "Repo identity and authority").
 - A Forgejo project gets the Forgejo provider profile applied to its effective role config (see "Forgejo provider profile"), so a minimal Forgejo project validates without the user disabling each GitHub-shaped default by hand.
@@ -343,7 +344,7 @@ MVP rules for this layer:
 - **Provider is resolved per project, not globally.** The composition root builds a provider per project (or a provider registry keyed by config provider id) instead of one shared GitHub gateway. GitHub projects resolve to the transitional GitHub wrapper; Forgejo projects resolve to the REST provider.
 - **The scheduler resolves the provider per project at tick time** and selects provider-specific role adapters. The scheduler must not assume a GitHub gateway.
 - **Discovery snapshots are GitHub-only in the MVP.** The GitHub discovery snapshot is an optimization for the `gh`/GraphQL path. Forgejo projects run **without** a discovery snapshot in v1: planner/worker/reviewer make direct provider calls (list issues/PRs by label/assignee). Today role discovery inputs use the concrete `*githubinfra.DiscoverySnapshot` type. The MVP must keep that GitHub type **out of the new provider-neutral role interfaces**: either the snapshot stays a GitHub-only optional optimization behind the GitHub provider adapter (not in the shared contract), or Phase 1/3 removes it from role-facing signatures. Passing a `nil` GitHub snapshot through a still-GitHub-typed interface is not acceptable as the end state. A provider-neutral snapshot is explicitly deferred.
-- **Bootstrap must not require `gh` for a Forgejo-only install.** Global `gh` detection/validation in bootstrap and config validation must become conditional on at least one GitHub project existing. This is covered by an acceptance test (startup with no `ghPath` and only Forgejo projects).
+- **Bootstrap must not require `gh` for a Forgejo-only install.** Because the transitional GitHub provider wraps the current `gh`-backed gateway for core issue, PR, review, label, auth, and webhook operations, any install with a GitHub project still requires `gh` until GitHub has a non-`gh` provider. This is covered by an acceptance test (startup with no `ghPath` and only Forgejo projects).
 - **`go-git` is not introduced.** Local git stays as-is; only forge API calls change.
 
 ## MVP scope
@@ -488,7 +489,7 @@ Until that exists, Forgejo projects must use polling (`WebhookCapability{Polling
 - A GitHub project may use its existing webhook mode (`gh-forward`/`tunnel`).
 - For a Forgejo project, the project webhook mode is ignored: a Forgejo provider always polls in MVP because its `WebhookCapability.PollingOnly` is true. An empty/unset project webhook mode on a Forgejo project means provider-default polling; no new `polling`/`disabled` config mode is added.
 - Enabling global webhooks must **not** be rejected merely because a Forgejo project also exists. Validation fails only if a Forgejo project **explicitly sets** a webhook mode (`gh-forward`/`tunnel`), since the provider cannot honor it.
-- The global `gh` bootstrap requirement applies only when at least one GitHub project actually uses a `gh`-backed webhook mode.
+- The global `gh` bootstrap requirement applies when at least one GitHub project exists, because the MVP GitHub wrapper still uses `gh` for non-webhook issue, PR, review, label, and auth operations. Forgejo-only installs do not require `gh`.
 
 ## Testing strategy
 
@@ -530,7 +531,7 @@ Then:
 - Build a GitHub provider wrapper over the current gateway.
 - Move the composition root to per-project provider resolution (registry) instead of one shared GitHub gateway, including recovery, deferred reviewer recovery, network manager, and webhook setup (see "Runtime lifecycle and recovery").
 - Add the Forgejo provider profile and the config-validation rules (duplicate `repo`, unsupported-feature rejection, `baseUrl` normalization).
-- Make global `gh` detection conditional on at least one GitHub project actually using a `gh`-backed path.
+- Make global `gh` detection conditional on at least one GitHub project existing; Forgejo-only installs do not require `gh`, but any GitHub project still does until GitHub has a non-`gh` provider.
 - Keep all behavior green with `go test ./...`.
 
 ### Phase 2 - Forgejo client MVP
@@ -572,8 +573,8 @@ Each advanced feature must name the provider-native authority it relies on.
 ## Acceptance criteria
 
 - Existing GitHub projects run unchanged, including their current autodetect/metadata repo behavior.
-- `gh` is required only for GitHub projects that use a `gh`-backed path; a Forgejo-only install starts with no `ghPath`.
-- A Forgejo project can be configured with explicit `provider`, `baseUrl`, token source, and `repo` (`owner/name`).
+- `gh` is not required for Forgejo-only installs; any install with a GitHub project still requires `gh` until GitHub has a non-`gh` provider.
+- A Forgejo project can be configured with explicit `name`, `provider`, `baseUrl`, token source, and `repo` (`owner/name`).
 - Config validation rejects two projects resolving to the same `repo` (any provider/host).
 - Config validation applies the Forgejo provider profile and then rejects Forgejo projects that still enable unsupported features (native review, review-request discovery, reviewer match-all/empty-label discovery, thread resolution, fixer auto-discovery, coordinator, auto-merge, branch protection, dependency gates, routed mode, label-only claim).
 - A minimal Forgejo project using the documented example config validates without manual per-field overrides, and the resolved reviewer discovery has a non-empty label.
