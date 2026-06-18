@@ -413,6 +413,15 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 }
 
 func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *storage.ProjectRecord, project config.ProjectRefConfig) (*string, error) {
+	if repo := strings.TrimSpace(project.Repo); repo != "" {
+		return &repo, nil
+	}
+	if config.ResolvedProjectProviderKind(s.Config, project) != config.ProviderKindGitHub {
+		if existing != nil && existing.RepoPath == project.RepoPath {
+			return stringMetadataPtr(existing.MetadataJSON, "repo"), nil
+		}
+		return nil, nil
+	}
 	if s.DetectRepo != nil {
 		detected, err := s.DetectRepo(ctx, project.RepoPath)
 		if err != nil {

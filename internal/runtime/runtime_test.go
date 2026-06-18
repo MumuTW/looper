@@ -100,6 +100,47 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	}
 }
 
+func TestRuntimeStartForgejoOnlyDoesNotRequireGitHubGateway(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Tools.GHPath = nil
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+	cfg.Projects = []config.ProjectRefConfig{{
+		ID:       "forgejo_project",
+		Name:     "Forgejo Project",
+		Provider: "forgejo-main",
+		Repo:     "acme/forgejo-project",
+		RepoPath: filepath.Join(workingDir, "repo"),
+	}}
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	if rt.githubGateway != nil {
+		t.Fatal("runtime githubGateway = non-nil, want nil for Forgejo-only config")
+	}
+	project, err := rt.Services().Repositories.Projects.GetByID(context.Background(), "forgejo_project")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if project == nil || project.MetadataJSON == nil || !strings.Contains(*project.MetadataJSON, `"repo":"acme/forgejo-project"`) {
+		t.Fatalf("project.MetadataJSON = %#v, want configured Forgejo repo", project)
+	}
+	if recovery := rt.RecoverySummary(); recovery.StartedAt == "" {
+		t.Fatalf("RecoverySummary().StartedAt = empty, want startup recovery to run")
+	}
+}
+
 func TestRuntimeStartIsIdempotent(t *testing.T) {
 	t.Parallel()
 

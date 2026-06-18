@@ -356,6 +356,10 @@ func resolvedProjectProviderKind(config Config, project ProjectRefConfig) Provid
 	return ""
 }
 
+func ResolvedProjectProviderKind(config Config, project ProjectRefConfig) ProviderKind {
+	return resolvedProjectProviderKind(config, project)
+}
+
 func applyForgejoProjectProfile(project *ProjectRefConfig) {
 	roles := project.Roles
 	if roles == nil {

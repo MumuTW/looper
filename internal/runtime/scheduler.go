@@ -1276,11 +1276,24 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		if project.Archived {
 			continue
 		}
+		providerKind := config.ProviderKindGitHub
+		if input.Config != nil {
+			providerKind = runtimeProjectProviderKind(*input.Config, project.ID)
+		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
-		snapshot := projectSnapshot(project.ID)
+		var snapshot *githubinfra.DiscoverySnapshot
+		if providerKind == config.ProviderKindGitHub {
+			snapshot = projectSnapshot(project.ID)
+		}
 		if repo == "" {
 			if input.Logger != nil {
 				input.Logger.Warn("scheduler skipped project without repo metadata", map[string]any{"projectId": project.ID})
+			}
+			continue
+		}
+		if providerKind != config.ProviderKindGitHub {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler skipped project without provider role adapters", map[string]any{"projectId": project.ID, "repo": repo, "provider": providerKind})
 			}
 			continue
 		}

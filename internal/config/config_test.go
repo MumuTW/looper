@@ -379,6 +379,23 @@ func TestForgejoProviderConfigRequiresRepoAndRejectsDuplicateBareRepos(t *testin
 	}
 }
 
+func TestMixedGitHubWebhookAndForgejoPollingConfigValidates(t *testing.T) {
+	t.Parallel()
+
+	mode := WebhookModeGHForward
+	partial := PartialConfig{
+		Providers: &[]PartialProviderConfig{{ID: "forgejo-main", Kind: providerKindPtr(ProviderKindForgejo), BaseURL: stringPtr("https://forgejo.example.test"), TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects: &[]PartialProjectRefConfig{
+			{ID: "github-project", Name: "GitHub Project", RepoPath: "/repos/github-project", Webhook: &PartialProjectWebhookConfig{Mode: &mode}},
+			{ID: "forgejo-project", Name: "Forgejo Project", Provider: stringPtr("forgejo-main"), Repo: stringPtr("acme/forgejo-project"), RepoPath: "/repos/forgejo-project"},
+		},
+	}
+
+	if _, err := Normalize(t.TempDir(), partial); err != nil {
+		t.Fatalf("Normalize() error = %v, want mixed GitHub webhook plus Forgejo polling config valid", err)
+	}
+}
+
 func TestAgentTimeoutConfigOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")

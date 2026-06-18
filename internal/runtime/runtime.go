@@ -541,7 +541,10 @@ func (r *Runtime) start(ctx context.Context) error {
 
 	repositories := storage.NewRepositories(coordinator.DB())
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
-	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+	var githubGateway *githubinfra.Gateway
+	if runtimeConfigHasGitHubProjects(r.config) {
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+	}
 	projectService := &projects.Service{
 		DB:     coordinator.DB(),
 		Repos:  repositories,
@@ -552,9 +555,15 @@ func (r *Runtime) start(ctx context.Context) error {
 			return gitGateway.DetectGitHubRepo(ctx, repoPath)
 		},
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+			if githubGateway == nil {
+				return githubinfra.RepositorySettings{}, fmt.Errorf("github gateway is not configured")
+			}
 			return githubGateway.GetRepositorySettings(ctx, input)
 		},
 		GetBranchProtection: func(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+			if githubGateway == nil {
+				return githubinfra.BranchProtection{}, fmt.Errorf("github gateway is not configured")
+			}
 			return githubGateway.GetBranchProtection(ctx, input)
 		},
 		ListWorktrees: func(ctx context.Context, repoPath string) ([]projects.WorktreeListEntry, error) {
@@ -569,6 +578,9 @@ func (r *Runtime) start(ctx context.Context) error {
 			return items, nil
 		},
 		ListOpenPullRequests: func(ctx context.Context, input projects.ListOpenPullRequestsInput) ([]projects.PullRequestSummary, error) {
+			if githubGateway == nil {
+				return nil, fmt.Errorf("github gateway is not configured")
+			}
 			pullRequests, err := githubGateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Timeout: input.Timeout})
 			if err != nil {
 				return nil, err
@@ -580,6 +592,9 @@ func (r *Runtime) start(ctx context.Context) error {
 			return items, nil
 		},
 		CapturePullRequestSnapshot: func(ctx context.Context, input projects.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			if githubGateway == nil {
+				return storage.PullRequestSnapshotRecord{}, fmt.Errorf("github gateway is not configured")
+			}
 			return githubGateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 		},
 		AsyncSnapshotQueueEnabled: func() bool {
@@ -786,6 +801,24 @@ func runtimeProjectRepo(metadataJSON *string) string {
 	}
 	value, _ := metadata["repo"].(string)
 	return strings.TrimSpace(value)
+}
+
+func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
+	for _, project := range cfg.Projects {
+		if config.ResolvedProjectProviderKind(cfg, project) == config.ProviderKindGitHub {
+			return true
+		}
+	}
+	return len(cfg.Projects) == 0
+}
+
+func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
+	for _, project := range cfg.Projects {
+		if project.ID == projectID {
+			return config.ResolvedProjectProviderKind(cfg, project)
+		}
+	}
+	return config.ProviderKindGitHub
 }
 
 func runtimeDependencyTimeout(seconds int) time.Duration {
