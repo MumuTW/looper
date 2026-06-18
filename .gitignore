@@ -6,3 +6,4 @@ dist/
 *.test
 /looper
 /looperd
+specs/change/active
