@@ -64,17 +64,25 @@ func TestForgejoClientContract(t *testing.T) {
 		case r.Method == http.MethodPatch && r.URL.Path == "/forge/api/v1/repos/acme/looper/issues/comments/301":
 			writeJSON(t, w, http.StatusOK, map[string]any{"id": 301, "body": "updated body", "html_url": "https://example.test/comments/301", "updated_at": "2026-06-18T03:00:00Z", "user": map[string]any{"id": 42, "login": "ralph"}})
 		case r.Method == http.MethodGet && r.URL.Path == "/forge/api/v1/repos/acme/looper/pulls":
+			if got := r.URL.Query().Get("labels"); got != "" {
+				t.Fatalf("pull list labels query = %q, want empty client-side filtering", got)
+			}
 			if r.URL.Query().Get("page") == "2" {
 				writeJSON(t, w, http.StatusOK, []map[string]any{})
 				return
 			}
 			w.Header().Set("Link", `</forge/api/v1/repos/acme/looper/pulls?page=2>; rel="next"`)
-			writeJSON(t, w, http.StatusOK, []map[string]any{{"number": 9, "title": "PR 9", "body": "body 9", "state": "open", "html_url": "https://example.test/pulls/9", "updated_at": "2026-06-18T04:00:00Z", "user": map[string]any{"id": 3, "login": "lisa"}, "head": map[string]any{"ref": "feature", "sha": "headsha"}, "base": map[string]any{"ref": "main", "sha": "basesha"}, "labels": []map[string]any{{"id": 13, "name": "review"}}, "assignees": []map[string]any{{"id": 42, "login": "ralph"}}}})
+			writeJSON(t, w, http.StatusOK, []map[string]any{
+				{"number": 9, "title": "PR 9", "body": "body 9", "state": "open", "draft": true, "html_url": "https://example.test/pulls/9", "updated_at": "2026-06-18T04:00:00Z", "user": map[string]any{"id": 3, "login": "lisa"}, "head": map[string]any{"ref": "feature", "sha": "headsha"}, "base": map[string]any{"ref": "main", "sha": "basesha"}, "labels": []map[string]any{{"id": 13, "name": "review"}}, "assignees": []map[string]any{{"id": 42, "login": "ralph"}}},
+				{"number": 10, "title": "PR 10", "body": "body 10", "state": "open", "html_url": "https://example.test/pulls/10", "updated_at": "2026-06-18T04:30:00Z", "user": map[string]any{"id": 4, "login": "maggie"}, "head": map[string]any{"ref": "other", "sha": "othersha"}, "base": map[string]any{"ref": "main", "sha": "basesha"}, "labels": []map[string]any{{"id": 14, "name": "other"}}},
+			})
 		case r.Method == http.MethodGet && r.URL.Path == "/forge/api/v1/repos/acme/looper/pulls/9":
-			writeJSON(t, w, http.StatusOK, map[string]any{"number": 9, "title": "PR 9", "body": "body 9", "state": "open", "html_url": "https://example.test/pulls/9", "updated_at": "2026-06-18T04:00:00Z", "user": map[string]any{"id": 3, "login": "lisa"}, "head": map[string]any{"ref": "feature", "sha": "headsha"}, "base": map[string]any{"ref": "main", "sha": "basesha"}})
+			writeJSON(t, w, http.StatusOK, map[string]any{"number": 9, "title": "PR 9", "body": "body 9", "state": "open", "draft": true, "html_url": "https://example.test/pulls/9", "updated_at": "2026-06-18T04:00:00Z", "user": map[string]any{"id": 3, "login": "lisa"}, "head": map[string]any{"ref": "feature", "sha": "headsha"}, "base": map[string]any{"ref": "main", "sha": "basesha"}})
 		case r.Method == http.MethodGet && r.URL.Path == "/forge/api/v1/repos/acme/looper/pulls/9.diff":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("diff --git a/foo b/foo"))
+		case r.Method == http.MethodGet && r.URL.Path == "/forge/api/v1/repos/acme/looper/compare/main...feature":
+			writeJSON(t, w, http.StatusOK, map[string]any{"status": "ahead", "ahead_by": 2, "behind_by": 0, "total_commits": 2})
 		case r.Method == http.MethodPost && r.URL.Path == "/forge/api/v1/repos/acme/looper/pulls":
 			writeJSON(t, w, http.StatusCreated, map[string]any{"number": 10, "title": "New PR", "body": "new body", "state": "open", "html_url": "https://example.test/pulls/10", "updated_at": "2026-06-18T05:00:00Z", "user": map[string]any{"id": 42, "login": "ralph"}, "head": map[string]any{"ref": "feat", "sha": "newsha"}, "base": map[string]any{"ref": "main", "sha": "basesha"}})
 		case r.Method == http.MethodPatch && r.URL.Path == "/forge/api/v1/repos/acme/looper/pulls/10":
@@ -127,17 +135,27 @@ func TestForgejoClientContract(t *testing.T) {
 	if err != nil || comment.Body != "updated body" {
 		t.Fatalf("UpdateIssueComment() = %#v, %v", comment, err)
 	}
-	pulls, err := client.ListOpenPullRequests(ctx, ListPullRequestsInput{})
+	pulls, err := client.ListOpenPullRequests(ctx, ListPullRequestsInput{Labels: []string{"review"}})
 	if err != nil || len(pulls) != 1 || pulls[0].Head.Name != "feature" {
 		t.Fatalf("ListOpenPullRequests() = %#v, %v", pulls, err)
+	}
+	if !pulls[0].IsDraft {
+		t.Fatalf("ListOpenPullRequests() = %#v, want draft preserved", pulls)
 	}
 	pull, err := client.ViewPullRequest(ctx, 9)
 	if err != nil || pull.Base.Name != "main" {
 		t.Fatalf("ViewPullRequest() = %#v, %v", pull, err)
 	}
+	if !pull.IsDraft {
+		t.Fatalf("ViewPullRequest() = %#v, want draft preserved", pull)
+	}
 	diff, err := client.PullRequestDiff(ctx, 9)
 	if err != nil || !strings.Contains(diff, "diff --git") {
 		t.Fatalf("PullRequestDiff() = %q, %v", diff, err)
+	}
+	comparison, err := client.CompareBranches(ctx, CompareBranchesInput{Base: "main", Head: "feature"})
+	if err != nil || comparison.Status != "ahead" || comparison.AheadBy != 2 || comparison.TotalCommits != 2 {
+		t.Fatalf("CompareBranches() = %#v, %v", comparison, err)
 	}
 	pull, err = client.CreatePullRequest(ctx, CreatePullRequestInput{Title: "New PR", Body: "new body", Head: "feat", Base: "main"})
 	if err != nil || pull.Number != 10 {

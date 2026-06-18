@@ -2802,6 +2802,15 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 			return checkpoint, nil
 		}
+		if r.commentOnlyPublishForProject(input.Project.ID) {
+			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
+				return checkpoint, err
+			}
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
+		}
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
 		}
@@ -3454,16 +3463,14 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 	if body == "" {
 		return &loopError{message: "Reviewer agent completed without comment body for comment-only publish", kind: FailureRetryableAfterResume}
 	}
-	body = appendReviewMarker(body, marker, "non_blocking")
+	outcome := "non_blocking"
+	if pending.CleanNoop {
+		outcome = "clean"
+	}
+	body = appendReviewMarker(body, marker, outcome)
 	body = stampIssueComment(r.disclosure, body, "reviewer")
 	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath}); err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-	}
-	specReviewingLabel := r.specReviewingLabel(input.Project.ID)
-	if specReviewingLabel != "" && specpr.HasLabel(detail.Labels, specReviewingLabel) {
-		if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
-			return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking comment-only publish success: %v", err), kind: FailureRetryableAfterResume}
-		}
 	}
 	return nil
 }

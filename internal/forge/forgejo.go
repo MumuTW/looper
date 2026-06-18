@@ -126,6 +126,18 @@ type ListPullRequestsInput struct {
 	Limit  int
 }
 
+type CompareBranchesInput struct {
+	Base string
+	Head string
+}
+
+type CompareBranchesResult struct {
+	Status       string
+	AheadBy      int
+	BehindBy     int
+	TotalCommits int
+}
+
 type CreatePullRequestInput struct {
 	Title string
 	Body  string
@@ -166,6 +178,7 @@ type PullRequest struct {
 	Title     string
 	Body      string
 	State     string
+	IsDraft   bool
 	HTMLURL   string
 	UpdatedAt string
 	User      Identity
@@ -228,16 +241,17 @@ func (forgejo *ForgejoClient) ListOpenPullRequests(ctx context.Context, input Li
 		input.State = "open"
 	}
 	query := url.Values{"state": {input.State}}
-	if len(input.Labels) > 0 {
-		query.Set("labels", strings.Join(input.Labels, ","))
-	}
 	var output []forgejoPullRequest
 	if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls"), query, input.Limit, &output); err != nil {
 		return nil, err
 	}
 	pulls := make([]PullRequest, 0, len(output))
 	for _, pull := range output {
-		pulls = append(pulls, convertPullRequest(pull))
+		converted := convertPullRequest(pull)
+		if !hasAllLabelNames(converted.Labels, input.Labels) {
+			continue
+		}
+		pulls = append(pulls, converted)
 	}
 	return pulls, nil
 }
@@ -248,6 +262,20 @@ func (forgejo *ForgejoClient) ViewPullRequest(ctx context.Context, number int64)
 		return PullRequest{}, err
 	}
 	return convertPullRequest(output), nil
+}
+
+func (forgejo *ForgejoClient) CompareBranches(ctx context.Context, input CompareBranchesInput) (CompareBranchesResult, error) {
+	var output forgejoCompareBranches
+	path := forgejo.repoPath("compare", url.PathEscape(strings.TrimSpace(input.Base))+"..."+url.PathEscape(strings.TrimSpace(input.Head)))
+	if err := forgejo.do(ctx, http.MethodGet, path, nil, nil, &output); err != nil {
+		return CompareBranchesResult{}, err
+	}
+	return CompareBranchesResult{
+		Status:       output.Status,
+		AheadBy:      output.AheadBy,
+		BehindBy:     output.BehindBy,
+		TotalCommits: output.TotalCommits,
+	}, nil
 }
 
 func (forgejo *ForgejoClient) PullRequestDiff(ctx context.Context, number int64) (string, error) {
@@ -408,7 +436,7 @@ func (forgejo *ForgejoClient) do(ctx context.Context, method string, path string
 }
 
 func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path string, query url.Values, payload any) (rawResponse, error) {
-	apiURL := forgejo.baseURL.ResolveReference(&url.URL{Path: strings.TrimRight(forgejo.baseURL.Path, "/") + "/api/v1/" + strings.TrimLeft(path, "/")})
+	apiURL := forgejo.apiURL(path)
 	apiURL.RawQuery = query.Encode()
 	var body io.Reader
 	if payload != nil {
@@ -440,6 +468,14 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s returned HTTP %d: %s", method, path, response.StatusCode, sanitizeForgejoErrorBody(responseBody, forgejo.token))
 	}
 	return rawResponse{body: responseBody, header: response.Header.Clone()}, nil
+}
+
+func (forgejo *ForgejoClient) apiURL(path string) *url.URL {
+	cleanPath := strings.TrimLeft(path, "/")
+	apiURL := *forgejo.baseURL
+	apiURL.Path = strings.TrimRight(forgejo.baseURL.Path, "/") + "/api/v1/" + strings.ReplaceAll(cleanPath, "%2F", "/")
+	apiURL.RawPath = strings.TrimRight(forgejo.baseURL.EscapedPath(), "/") + "/api/v1/" + cleanPath
+	return &apiURL
 }
 
 func cloneValues(input url.Values) url.Values {
@@ -496,6 +532,7 @@ type forgejoPullRequest struct {
 	Title     string         `json:"title"`
 	Body      string         `json:"body"`
 	State     string         `json:"state"`
+	Draft     bool           `json:"draft"`
 	HTMLURL   string         `json:"html_url"`
 	UpdatedAt string         `json:"updated_at"`
 	User      forgejoUser    `json:"user"`
@@ -511,6 +548,13 @@ type forgejoBranch struct {
 	SHA  string `json:"sha"`
 }
 
+type forgejoCompareBranches struct {
+	Status       string `json:"status"`
+	AheadBy      int    `json:"ahead_by"`
+	BehindBy     int    `json:"behind_by"`
+	TotalCommits int    `json:"total_commits"`
+}
+
 type forgejoComment struct {
 	ID        int64       `json:"id"`
 	Body      string      `json:"body"`
@@ -524,7 +568,7 @@ func convertIssue(input forgejoIssue) Issue {
 }
 
 func convertPullRequest(input forgejoPullRequest) PullRequest {
-	return PullRequest{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Head: convertBranch(input.Head), Base: convertBranch(input.Base), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees)}
+	return PullRequest{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, IsDraft: input.Draft, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Head: convertBranch(input.Head), Base: convertBranch(input.Base), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees)}
 }
 
 func convertComment(input forgejoComment) Comment {
@@ -555,4 +599,28 @@ func convertBranch(input forgejoBranch) BranchRef {
 		name = input.Ref
 	}
 	return BranchRef{Name: name, SHA: input.SHA}
+}
+
+func hasAllLabelNames(labels []Label, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	names := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
+		name := strings.TrimSpace(label.Name)
+		if name == "" {
+			continue
+		}
+		names[strings.ToLower(name)] = struct{}{}
+	}
+	for _, label := range required {
+		name := strings.ToLower(strings.TrimSpace(label))
+		if name == "" {
+			continue
+		}
+		if _, ok := names[name]; !ok {
+			return false
+		}
+	}
+	return true
 }

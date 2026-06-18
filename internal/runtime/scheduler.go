@@ -581,7 +581,7 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 		}
 		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login})
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login})
 		}
 		return result, nil
 	}
@@ -647,7 +647,7 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, Diff: diff}, nil
+		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, Diff: diff}, nil
 	}
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -1257,11 +1257,15 @@ func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker
 }
 
 func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.CompareBranchesInput) (worker.CompareBranchesResult, error) {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
 		if err != nil {
 			return worker.CompareBranchesResult{}, err
 		}
-		return worker.CompareBranchesResult{AheadBy: 1, Status: "ahead", TotalCommits: 1}, nil
+		comparison, err := client.CompareBranches(ctx, forge.CompareBranchesInput{Base: input.BaseBranch, Head: input.HeadBranch})
+		if err != nil {
+			return worker.CompareBranchesResult{}, err
+		}
+		return worker.CompareBranchesResult{AheadBy: comparison.AheadBy, BehindBy: comparison.BehindBy, Status: comparison.Status, TotalCommits: comparison.TotalCommits}, nil
 	}
 	if a.gateway == nil {
 		return worker.CompareBranchesResult{}, fmt.Errorf("github gateway is not configured")

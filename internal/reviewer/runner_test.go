@@ -8299,6 +8299,41 @@ func TestProcessClaimedItemCommentOnlyPublishesOneCommentAndSkipsRediscoveryForS
 	}
 }
 
+func TestProcessClaimedItemCommentOnlyPublishesCleanNoopWithoutReactionOrLabelRemoval(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{}, currentLogin: "reviewer"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{specpr.ReviewingLabel}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(github.issueCommentCalls) != 1 {
+		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
+	}
+	if !strings.Contains(github.issueCommentCalls[0].Body, "outcome=clean") {
+		t.Fatalf("comment body = %q, want clean outcome marker", github.issueCommentCalls[0].Body)
+	}
+	if len(github.addReactionCalls) != 0 {
+		t.Fatalf("addReactionCalls = %#v, want no GitHub reaction for comment-only clean noop", github.addReactionCalls)
+	}
+	if len(github.removeLabelCalls) != 0 {
+		t.Fatalf("removeLabelCalls = %#v, want no spec-reviewing label removal", github.removeLabelCalls)
+	}
+}
+
 func TestRequireReviewRequestForLoopIgnoresExistingFollowUpNewHead(t *testing.T) {
 	t.Parallel()
 	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","loop":{"enabled":true}}`
