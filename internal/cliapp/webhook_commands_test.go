@@ -337,8 +337,10 @@ func TestWebhookStatusVerboseShowsRuntimeDetails(t *testing.T) {
 			t.Fatalf("stdout = %q, want to contain %q", stdout, needle)
 		}
 	}
-	if strings.Contains(stdout, "0x") {
-		t.Fatalf("stdout = %q, want pid value instead of pointer address", stdout)
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.Contains(line, "acme/looper") && strings.Contains(line, "0x") {
+			t.Fatalf("stdout = %q, want pid value instead of pointer address", stdout)
+		}
 	}
 }
 

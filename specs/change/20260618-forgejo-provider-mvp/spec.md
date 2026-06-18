@@ -121,7 +121,7 @@ Depends on: Step 6
 - [x] Step 3: Forgejo REST Client MVP
 - [x] Step 4: Forgejo Planner And Worker Enablement
 - [x] Step 5: Forgejo Comment-Only Reviewer
-- [ ] Step 6: EAG Validation
+- [x] Step 6: EAG Validation
 - [ ] Step 7: Documentation Sync
 
 ## Implementation
