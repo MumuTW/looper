@@ -39,3 +39,27 @@ Notes:
 
 - Build outputs are under `dist/`, which is generated output and not committed.
 - No live Forgejo operation or real agent invocation has run yet.
+
+## 2026-06-22: Step 8 worker config preparation
+
+Status: completed.
+
+Human operation completed:
+
+- Selected `codex` as the real local agent command for the Step 8 run.
+
+AI operations completed:
+
+- Confirmed local commands are present: `codex`, `opencode`, `claude`, `agent`, and `git`.
+- Confirmed `e2e/.env` has the required Forgejo env keys without printing the token value.
+- Created isolated runtime outside the repository at `/var/folders/1d/0byj0hb96vd30xbwb4b4b3800000gn/T/opencode/looper-forgejo-real-agent`.
+- Cloned the Forgejo sandbox repository into the isolated runtime and configured its local `origin` for token-backed HTTPS push without recording the token.
+- Wrote worker-only local config at `/var/folders/1d/0byj0hb96vd30xbwb4b4b3800000gn/T/opencode/looper-forgejo-real-agent/config-worker.toml`.
+- Configured only Forgejo MVP-supported behavior for the worker run: polling, worker discovery by `looper:worker-ready`, current-user assignment requirement, reviewer discovery disabled, fixer disabled, coordinator disabled, osascript disabled, and auto-merge disabled.
+- Ran config validation: `source e2e/.env && dist/looper --config <config-worker.toml> config validate` — passed.
+
+Notes:
+
+- A first config generation attempt failed before writing a usable config because of shell/Python quoting around TOML path expressions; it was corrected before validation.
+- The config references `tokenEnv = "LOOPER_E2E_FORGEJO_TOKEN"`; no token value is stored in tracked files or the journal.
+- No live Looper daemon run or real agent invocation has started yet.
