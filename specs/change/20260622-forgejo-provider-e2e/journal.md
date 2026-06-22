@@ -30,3 +30,14 @@ Next Human operation required:
 
 1. Create a Forgejo access token for the sandbox run.
 2. Provide `LOOPER_E2E_FORGEJO_TOKEN` for this shell/session only; do not commit it to any file.
+
+## 2026-06-22: Step 7 token storage guidance
+
+Status: blocked on Human operation to place the token in a local-only env file and confirm the path.
+
+AI guidance provided:
+
+- Do not store the token in a repo-root `.env` because `.env` is not currently ignored by this repository.
+- Preferred local-only path: `~/.looper/forgejo-e2e.env` with owner-only permissions.
+- The env file should export `LOOPER_E2E_FORGEJO`, `LOOPER_E2E_FORGEJO_BASE_URL`, `LOOPER_E2E_FORGEJO_SANDBOX_REPO`, and `LOOPER_E2E_FORGEJO_TOKEN`.
+- No token value was recorded in the journal.
