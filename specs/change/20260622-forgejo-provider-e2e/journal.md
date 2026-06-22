@@ -152,3 +152,23 @@ Notes:
 - The reviewer run will use a separate DB from the worker run because the worker DB intentionally preserves the recovery failure evidence.
 - The config references `tokenEnv = "LOOPER_E2E_FORGEJO_TOKEN"`; no token value is stored in tracked files or the journal.
 - No reviewer daemon run or reviewer agent invocation has started yet.
+
+## 2026-06-22: Step 8 reviewer PR ready
+
+Status: completed.
+
+Human operation completed:
+
+- Prepared Forgejo PR #11 for reviewer comment-only run.
+- Added trigger label `looper:review` to PR #11.
+
+AI operations completed:
+
+- Confirmed PR #11 is open.
+- Confirmed PR #11 title is `Looper real-agent worker smoke test`.
+- Confirmed PR #11 URL is `https://code.powerformer.net/core/looper-sandbox/pulls/11`.
+- Confirmed PR #11 issue labels include `looper:review`.
+
+Next AI operation:
+
+- Start local `looperd` with the reviewer-only real-agent config and observe a comment-only reviewer run.
