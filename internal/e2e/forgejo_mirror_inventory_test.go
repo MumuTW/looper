@@ -11,10 +11,10 @@ const (
 )
 
 type forgejoMirrorCase struct {
-	GitHubCase string
+	GitHubCase  string
 	ForgejoCase string
-	Intent     forgejoMirrorIntent
-	Reason     string
+	Intent      forgejoMirrorIntent
+	Reason      string
 }
 
 var forgejoSandboxMirrorCases = []forgejoMirrorCase{

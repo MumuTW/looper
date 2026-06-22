@@ -21,8 +21,8 @@ const forgejoContractToken = "forgejo-contract-secret"
 type forgejoRouteAuthority string
 
 const (
-	forgejoAuthorityOfficialDocs forgejoRouteAuthority = "official Forgejo API docs: /api/v1 REST, token auth, page/limit pagination"
-	forgejoAuthorityOpenAPI      forgejoRouteAuthority = "Forgejo instance OpenAPI: /swagger.v1.json, basePath /api/v1"
+	forgejoAuthorityOfficialDocs  forgejoRouteAuthority = "official Forgejo API docs: /api/v1 REST, token auth, page/limit pagination"
+	forgejoAuthorityOpenAPI       forgejoRouteAuthority = "Forgejo instance OpenAPI: /swagger.v1.json, basePath /api/v1"
 	forgejoAuthorityMVPCapability forgejoRouteAuthority = "Forgejo MVP capability surface: issues, pull requests, labels, assignees, comments, diffs, compare, create/update PR"
 	forgejoAuthorityLiveObserved  forgejoRouteAuthority = "live observation: code.powerformer.net exposes Forgejo API 14.0.2+gitea-1.22.0"
 )
