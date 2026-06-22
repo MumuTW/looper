@@ -287,6 +287,25 @@ go vet ./...
 go test ./...
 ```
 
+Provider e2e checks:
+
+```bash
+go test ./internal/e2e/forgejocontract -count=1
+go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1
+```
+
+Forgejo live sandbox e2e is local/manual only and skipped unless explicitly enabled. Use a dedicated existing sandbox repo; tests create and clean run-scoped issues, branches, PRs, labels, and comments:
+
+```bash
+LOOPER_E2E_FORGEJO=1 \
+LOOPER_E2E_FORGEJO_BASE_URL=https://code.example.com \
+LOOPER_E2E_FORGEJO_SANDBOX_REPO=owner/repo \
+LOOPER_E2E_FORGEJO_TOKEN=$TOKEN \
+go test ./internal/e2e -run '^TestForgejoSandbox' -count=1
+```
+
+GitHub live sandbox tests prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`; legacy `LOOPER_E2E_SANDBOX_REPO` remains accepted only as a compatibility alias, and conflicting values fail fast.
+
 Build artifacts go to `dist/` and are gitignored — don't edit generated files.
 
 ## Runtime notes

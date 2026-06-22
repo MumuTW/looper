@@ -79,8 +79,27 @@ Default runtime artifacts land in `~/.looper/` (`looper.sqlite`, `backups/`, `lo
 ## Tests
 
 - Add or update tests for any behavior change.
-- Keep tests hermetic: no network, no real GitHub calls, no writes outside `t.TempDir()`.
+- Keep default tests hermetic: no network, no real forge calls, no writes outside `t.TempDir()`.
 - Run `go test ./...` locally before opening a PR.
+
+Provider e2e coverage has two layers:
+
+```bash
+go test ./internal/e2e/forgejocontract -count=1
+go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1
+```
+
+Live sandbox e2e is opt-in only and should use dedicated sandbox repositories. Forgejo live sandbox tests are local/manual for now:
+
+```bash
+LOOPER_E2E_FORGEJO=1 \
+LOOPER_E2E_FORGEJO_BASE_URL=https://code.example.com \
+LOOPER_E2E_FORGEJO_SANDBOX_REPO=owner/repo \
+LOOPER_E2E_FORGEJO_TOKEN=$TOKEN \
+go test ./internal/e2e -run '^TestForgejoSandbox' -count=1
+```
+
+For GitHub live sandbox tests, prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`; `LOOPER_E2E_SANDBOX_REPO` is still accepted as a legacy alias. Setting both to different repos is a test configuration error.
 
 ## Documentation
 

@@ -55,3 +55,8 @@ Notes:
 ## Step 6: Documentation Sync
 
 Notes:
+
+- Updated `README.md` and `CONTRIBUTING.md` with the deterministic Forgejo contract/non-live e2e commands, the local/manual Forgejo live sandbox command, and the GitHub sandbox repo env compatibility note.
+- Updated `docs/configuration.md` with the Forgejo live sandbox e2e prerequisites and fail-fast behavior for enabled live runs.
+- Verified the documentation now names `LOOPER_E2E_FORGEJO`, `LOOPER_E2E_FORGEJO_BASE_URL`, `LOOPER_E2E_FORGEJO_SANDBOX_REPO`, `LOOPER_E2E_FORGEJO_TOKEN`, `LOOPER_E2E_GITHUB_SANDBOX_REPO`, and the legacy `LOOPER_E2E_SANDBOX_REPO` alias.
+- Re-ran `go test ./internal/e2e/forgejocontract -count=1` and `go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1` after the docs sync.

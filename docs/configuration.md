@@ -229,6 +229,28 @@ Forgejo rules:
 
 Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label.
 
+### Forgejo live sandbox e2e
+
+Forgejo live sandbox e2e is a local/manual developer check, not a normal CI job. It is skipped unless explicitly enabled:
+
+```bash
+LOOPER_E2E_FORGEJO=1 \
+LOOPER_E2E_FORGEJO_BASE_URL=https://code.example.com \
+LOOPER_E2E_FORGEJO_SANDBOX_REPO=owner/repo \
+LOOPER_E2E_FORGEJO_TOKEN=$TOKEN \
+go test ./internal/e2e -run '^TestForgejoSandbox' -count=1
+```
+
+Rules:
+
+- `LOOPER_E2E_FORGEJO_BASE_URL` must be an absolute `http(s)` Forgejo base URL.
+- `LOOPER_E2E_FORGEJO_SANDBOX_REPO` must be `owner/repo` for an existing dedicated sandbox repository.
+- `LOOPER_E2E_FORGEJO_TOKEN` must authenticate against `/api/v1/user` and have access to the sandbox repository.
+- Missing, invalid, or inaccessible live prerequisites fail the enabled test run rather than falling back to mocks.
+- The tests derive the HTTPS clone/push URL from the base URL, repo, and token; there is no clone URL override.
+
+GitHub live sandbox tests now prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`. The older `LOOPER_E2E_SANDBOX_REPO` name remains a compatibility alias, but setting both names to different repos fails fast.
+
 ## Role model guidance
 
 All role-specific config lives under `roles.<role>`.
