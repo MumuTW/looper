@@ -8,4 +8,5 @@ dist/
 /looperd
 specs/change/active
 task.md
-e2e/.env
+e2e/.env*
+!e2e/.env.example

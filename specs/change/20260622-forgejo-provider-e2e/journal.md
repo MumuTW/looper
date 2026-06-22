@@ -57,6 +57,10 @@ AI operations completed:
 - Added `e2e/.env.example` with the Forgejo sandbox base URL and repo plus a token placeholder.
 - No token value was recorded in the journal or committed files.
 
+Follow-up AI operation completed:
+
+- Strengthened `.gitignore` to ignore `e2e/.env*` while explicitly allowing `e2e/.env.example`, so local token variants remain untracked but the template stays committed.
+
 Next Human operation required:
 
 1. Copy `e2e/.env.example` to `e2e/.env`.
