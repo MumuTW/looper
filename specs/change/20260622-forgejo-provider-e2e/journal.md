@@ -41,3 +41,24 @@ AI guidance provided:
 - Preferred local-only path: `~/.looper/forgejo-e2e.env` with owner-only permissions.
 - The env file should export `LOOPER_E2E_FORGEJO`, `LOOPER_E2E_FORGEJO_BASE_URL`, `LOOPER_E2E_FORGEJO_SANDBOX_REPO`, and `LOOPER_E2E_FORGEJO_TOKEN`.
 - No token value was recorded in the journal.
+
+## 2026-06-22: Step 7 repo-local env layout selected
+
+Status: blocked on Human operation to copy the template and paste the token into the ignored local env file.
+
+Human direction:
+
+- Store the local live e2e env file inside the repository under an `e2e/` directory.
+- Add a committed `e2e/.env.example` template.
+
+AI operations completed:
+
+- Added `e2e/.env` to `.gitignore` so the real token file is not committed.
+- Added `e2e/.env.example` with the Forgejo sandbox base URL and repo plus a token placeholder.
+- No token value was recorded in the journal or committed files.
+
+Next Human operation required:
+
+1. Copy `e2e/.env.example` to `e2e/.env`.
+2. Replace `replace-with-forgejo-token` with the real token.
+3. Tell the AI when `e2e/.env` is ready.
