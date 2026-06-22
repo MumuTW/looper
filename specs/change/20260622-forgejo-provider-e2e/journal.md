@@ -87,3 +87,22 @@ Notes:
 
 - A first temporary Go preflight snippet failed due shell quoting before making a successful API request; it was replaced with read-only `curl` requests.
 - No daemon run, issue mutation, PR mutation, git push, or real agent invocation has started yet.
+
+## 2026-06-22: Step 8 worker issue ready
+
+Status: completed.
+
+Human operation completed:
+
+- Created Forgejo sandbox worker issue: `https://code.powerformer.net/core/looper-sandbox/issues/10`.
+
+AI operations completed:
+
+- Confirmed issue #10 is open.
+- Confirmed issue #10 title is `Looper real-agent worker smoke test`.
+- Confirmed issue #10 is assigned to current token user `nettee`.
+- Confirmed issue #10 has trigger label `looper:worker-ready`.
+
+Next AI operation:
+
+- Start local `looperd` with the worker-only real-agent config and observe the worker run.
