@@ -96,7 +96,7 @@ Depends on: Step 5
 - [x] Step 2: Forgejo Contract E2E
 - [x] Step 3: Forgejo Live Sandbox Mirror
 - [x] Step 4: Copy-Run-Classify Supported Cases
-- [ ] Step 5: EAG Validation
+- [x] Step 5: EAG Validation
 - [ ] Step 6: Documentation Sync
 
 ## Implementation

@@ -47,6 +47,11 @@ Verification:
 
 Notes:
 
+- Ran the deterministic Forgejo contract EAG command: `go test ./internal/e2e/forgejocontract -count=1`.
+- Ran the relevant non-live Forgejo e2e package tests: `go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1`.
+- Did not run the opt-in live Forgejo sandbox command because the required `LOOPER_E2E_FORGEJO=1`, `LOOPER_E2E_FORGEJO_BASE_URL`, `LOOPER_E2E_FORGEJO_SANDBOX_REPO`, and `LOOPER_E2E_FORGEJO_TOKEN` set was not fully present in this environment.
+- Ran full repository validation with `go test ./... && go vet ./... && go build ./...`.
+
 ## Step 6: Documentation Sync
 
 Notes:
