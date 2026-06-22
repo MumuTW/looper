@@ -63,3 +63,27 @@ Notes:
 - A first config generation attempt failed before writing a usable config because of shell/Python quoting around TOML path expressions; it was corrected before validation.
 - The config references `tokenEnv = "LOOPER_E2E_FORGEJO_TOKEN"`; no token value is stored in tracked files or the journal.
 - No live Looper daemon run or real agent invocation has started yet.
+
+## 2026-06-22: Step 8 worker preflight
+
+Status: completed.
+
+AI operations completed:
+
+- Re-ran config validation: `source e2e/.env && dist/looper --config <config-worker.toml> config validate` — passed.
+- Checked isolated sandbox clone status: `main...origin/main`, clean.
+- Checked read access to remote git HEAD with `git ls-remote --exit-code origin HEAD` — passed.
+- Checked isolated runtime/worktree directories are writable — passed.
+- Checked selected `codex` command and `git` are executable — passed.
+- Checked Forgejo API access with token-backed read-only `GET /api/v1/user` and `GET /api/v1/repos/core/looper-sandbox` — passed.
+
+Observed non-secret Forgejo API facts:
+
+- Current token user: `nettee`.
+- Sandbox repo: `core/looper-sandbox`.
+- Sandbox default branch: `main`.
+
+Notes:
+
+- A first temporary Go preflight snippet failed due shell quoting before making a successful API request; it was replaced with read-only `curl` requests.
+- No daemon run, issue mutation, PR mutation, git push, or real agent invocation has started yet.
