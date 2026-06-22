@@ -134,3 +134,21 @@ Notes:
 - The recovery failure appears to be a local Looper recovery/idempotency defect exposed by the test harness shutdown timing, not a Forgejo provider API failure and not a real agent failure.
 - Remote side currently has one open PR for this worker issue; no duplicate PR was observed.
 - Issue #10 still has `looper:worker-ready`, and the local isolated runtime should not be reused for the reviewer case without resetting or using a separate DB.
+
+## 2026-06-22: Step 8 reviewer config preparation
+
+Status: completed.
+
+AI operations completed:
+
+- Created a separate reviewer runtime under `/var/folders/1d/0byj0hb96vd30xbwb4b4b3800000gn/T/opencode/looper-forgejo-real-agent/reviewer-runtime`.
+- Wrote reviewer-only local config at `/var/folders/1d/0byj0hb96vd30xbwb4b4b3800000gn/T/opencode/looper-forgejo-real-agent/config-reviewer.toml`.
+- Configured only Forgejo MVP-supported reviewer behavior: polling, label-based discovery via `looper:review`, `requireReviewRequest = false`, self-review allowed for this sandbox PR, comment-only clean/blocking events, thread resolution disabled, fixer disabled, worker disabled, coordinator disabled, osascript disabled, and auto-merge disabled.
+- Configured `codex exec` with read-only sandbox for the reviewer run.
+- Ran config validation: `source e2e/.env && dist/looper --config <config-reviewer.toml> config validate` — passed.
+
+Notes:
+
+- The reviewer run will use a separate DB from the worker run because the worker DB intentionally preserves the recovery failure evidence.
+- The config references `tokenEnv = "LOOPER_E2E_FORGEJO_TOKEN"`; no token value is stored in tracked files or the journal.
+- No reviewer daemon run or reviewer agent invocation has started yet.
