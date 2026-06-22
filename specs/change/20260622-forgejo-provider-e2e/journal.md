@@ -203,3 +203,17 @@ Step 8 result summary:
 - Worker real-agent remote path: passed; PR #11 was created with the intended change.
 - Worker local completion bookkeeping: failed after an induced early shutdown, exposing a local recovery/idempotency defect (`upsert run: UNIQUE constraint failed: runs.loop_id`).
 - Reviewer comment-only real-agent path: passed; PR #11 received a normal Forgejo comment from the real reviewer run.
+
+## 2026-06-22: Step 8 conclusion and real-agent e2e write-up
+
+Status: completed.
+
+AI operations completed:
+
+- Appended Step 8 conclusions to `steps.md`, including worker/reviewer results, the recovery/idempotency finding, and Forgejo MVP scope limits.
+- Added `real-agent-e2e.md` with the HITL workflow, local build commands, isolated runtime/config guidance, worker/reviewer trigger steps, observation checklist, and lessons learned.
+
+Notes:
+
+- The write-up does not include token values.
+- The write-up keeps remote destructive cleanup as a Human operation unless explicitly authorized.

@@ -77,3 +77,36 @@ Verification:
 - `go test ./internal/forge -run 'TestCompareBranchesNormalizesForgejoTotalCommitsOnlyResponse|TestForgejoClient' -count=1`
 - `go test ./internal/e2e/forgejocontract -count=1`
 - `source e2e/.env && go test ./internal/e2e -run '^TestForgejoSandbox' -count=1`
+
+## Step 8: Pair-Mode Forgejo Real-Agent Local Run
+
+Notes:
+
+- Built local real-run binaries with `go build -o dist/looperd ./cmd/looperd` and `go build -o dist/looper ./cmd/looper`.
+- Used the ignored repo-local `e2e/.env` for Forgejo sandbox env values and token; no token value was recorded in tracked files.
+- Used `codex` as the real local agent command.
+- Created an isolated runtime outside the repository at `/var/folders/1d/0byj0hb96vd30xbwb4b4b3800000gn/T/opencode/looper-forgejo-real-agent` with a sandbox clone, separate SQLite DBs, logs, backups, and worktree roots.
+- Prepared a worker-only config with Forgejo MVP-supported behavior only: polling, worker label discovery by `looper:worker-ready`, current-user assignment requirement, reviewer discovery disabled, fixer disabled, coordinator disabled, osascript disabled, and auto-merge disabled.
+- Validated the worker config with `source e2e/.env && dist/looper --config <config-worker.toml> config validate`.
+- Human-created worker issue #10 was open, assigned to `nettee`, and labeled `looper:worker-ready`.
+- Started local `looperd` with the worker-only config and real `codex` execution. The real-agent remote path passed: Looper created PR #11, the PR changed `looper-real-agent-worker-smoke.txt`, and the PR head contained `worker real-agent smoke test 2026-06-22`.
+- The worker run also exposed a local recovery/idempotency defect after the monitor script stopped `looperd` immediately after PR creation but before local bookkeeping completed. Recovery requeued the interrupted run and then moved worker queue items to `manual_intervention` with `upsert run: UNIQUE constraint failed: runs.loop_id`. This is classified as a local Looper recovery defect induced by shutdown timing, not a Forgejo provider API failure and not a real agent failure.
+- Prepared a separate reviewer-only runtime and config so the reviewer run did not reuse the worker DB that preserved recovery-failure evidence.
+- Configured Forgejo MVP comment-only reviewer behavior only: polling, label-based discovery by `looper:review`, `requireReviewRequest = false`, self-review allowed for the sandbox PR, clean/blocking events set to `COMMENT`, thread resolution disabled, fixer disabled, worker disabled, coordinator disabled, osascript disabled, and auto-merge disabled.
+- Human-prepared PR #11 by adding `looper:review` while leaving the PR open.
+- Started local `looperd` with the reviewer-only config and real `codex` execution. The reviewer comment-only path passed: queue item `queue_d1e9b66f56b1394f18cbda973e0d45b9` completed, run `run_7b9e6da08e0dee442d28c9254dbf7b31` succeeded, and Forgejo PR comment ID `50` was created with outcome `clean`.
+
+Conclusion:
+
+- Forgejo MVP is sufficient for a real-agent local worker live run through issue discovery, real agent execution, branch push, and PR creation.
+- Forgejo MVP is sufficient for a real-agent local comment-only reviewer live run through label discovery, real agent review, and normal Forgejo PR comment publication.
+- Forgejo MVP is still not sufficient for fixer, coordinator/dependency gates, native review requests, inline review threads, thread resolution, auto-merge, or webhook/routed mode.
+- Real-agent e2e should wait for queue/run terminal state before stopping `looperd`; stopping immediately after observing a remote side effect can expose or create ambiguous local recovery state.
+
+Artifacts:
+
+- Worker issue: `https://code.powerformer.net/core/looper-sandbox/issues/10`
+- Worker PR: `https://code.powerformer.net/core/looper-sandbox/pulls/11`
+- Reviewer comment: Forgejo PR comment ID `50` on PR #11.
+- Detailed execution record: `journal.md`.
+- Operational write-up: `real-agent-e2e.md`.
