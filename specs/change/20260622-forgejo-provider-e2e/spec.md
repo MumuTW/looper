@@ -163,7 +163,7 @@ Human operations:
 - [x] Step 5: EAG Validation
 - [x] Step 6: Documentation Sync
 - [x] Step 7: Pair-Mode Forgejo Live Sandbox Run
-- [ ] Step 8: Pair-Mode Forgejo Real-Agent Local Run
+- [x] Step 8: Pair-Mode Forgejo Real-Agent Local Run
 
 ## Implementation
 

@@ -172,3 +172,34 @@ AI operations completed:
 Next AI operation:
 
 - Start local `looperd` with the reviewer-only real-agent config and observe a comment-only reviewer run.
+
+## 2026-06-22: Step 8 reviewer comment-only real-agent run
+
+Status: completed.
+
+AI operations completed:
+
+- Started local `looperd` with `/var/folders/1d/0byj0hb96vd30xbwb4b4b3800000gn/T/opencode/looper-forgejo-real-agent/config-reviewer.toml`.
+- Waited for reviewer queue terminal state instead of stopping immediately after observing a comment.
+- Observed reviewer queue item `queue_d1e9b66f56b1394f18cbda973e0d45b9` reach `completed`.
+- Observed reviewer run `run_7b9e6da08e0dee442d28c9254dbf7b31` reach `success` with summary `Published review for core/looper-sandbox#11`.
+- Observed real `codex` reviewer agent execution complete in the logs with `status = completed` and `parseStatus = parsed`.
+- Observed Forgejo PR comment creation on PR #11: comment ID `50`.
+- Verified the comment is a normal Forgejo issue/PR comment authored by `nettee`, not a native inline review thread.
+- Verified the comment marker reports reviewer outcome `clean` for head `cfd0a66db365b56a8f37955b41e40e224d20d0ff`.
+
+Observed reviewer comment excerpt:
+
+> No actionable findings. Reviewed the changed range in `looper-real-agent-worker-smoke.txt:1`; it adds a one-line smoke marker, and I found no concrete correctness, safety, test, or maintainability issue.
+
+Failure classification:
+
+- Reviewer comment-only real-agent path: passed.
+- No Forgejo provider failure, local reviewer runtime failure, or real agent execution failure was observed.
+- Shutdown after terminal queue completion emitted one expected context-canceled scheduler tick warning during daemon stop; this occurred after the queue item completed and did not affect the reviewer result.
+
+Step 8 result summary:
+
+- Worker real-agent remote path: passed; PR #11 was created with the intended change.
+- Worker local completion bookkeeping: failed after an induced early shutdown, exposing a local recovery/idempotency defect (`upsert run: UNIQUE constraint failed: runs.loop_id`).
+- Reviewer comment-only real-agent path: passed; PR #11 received a normal Forgejo comment from the real reviewer run.
