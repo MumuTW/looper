@@ -1,12 +1,16 @@
 # Looper
 
-Looper is a daemon (`looperd`) plus CLI (`looper`) that runs autonomous agent **Roles** against a GitHub repository's issues and pull requests.
+Looper is a daemon (`looperd`) plus CLI (`looper`) that runs autonomous agent **Roles** against a configured forge repository's issues and pull requests.
 
 ## Language
 
 ### Roles
 
 A **Role** is a configured agent that performs one specific job in the issue/PR lifecycle.
+
+**Provider**:
+A configured forge integration that owns remote Issues, Pull Requests, labels, comments, reviews, webhooks, and identity for a Project. Git remains separate and owns local repositories, refs, and worktrees.
+_Avoid_: forge, host, remote.
 
 **Planner**:
 A reactive Role that produces a Spec from an Issue.
@@ -108,6 +112,12 @@ _Avoid_: trigger label, routed label, worker-ready suffix.
 
 **Lease**:
 The durable Authority for Network Coordinator control-plane leadership. A row in the `loopernet` database with a fencing token, validated at every GitHub side-effect boundary.
+
+### Testing
+
+**Live sandbox**:
+A dedicated remote repository on a real Provider used for live end-to-end tests. It is isolated from product and developer repositories, but still performs real provider mutations.
+_Avoid_: local sandbox, mock sandbox.
 
 ## Relationships
 
