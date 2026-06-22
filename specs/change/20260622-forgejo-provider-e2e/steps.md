@@ -23,6 +23,12 @@ Notes:
 
 Notes:
 
+- Implemented real Forgejo live sandbox coverage in `internal/e2e/forgejo_sandbox_test.go` for `TestForgejoSandboxWorkerCreatesPullRequest` and `TestForgejoSandboxNoDiffPathsDoNotOpenOrResolve/worker-no-diff-no-pr`, still guarded by `LOOPER_E2E_FORGEJO=1` and still leaving unsupported fixer-review-thread and dependency-gate slices as explicit `t.Skip` cases with current MVP reasons.
+- Added fail-fast live prerequisite validation that goes beyond env-shape parsing: the Forgejo sandbox config now verifies token auth via `CurrentUser`, verifies repository accessibility via Forgejo REST `repos/{owner}/{repo}`, and verifies pull-request listing access before any live run starts.
+- Switched Forgejo sandbox setup to derive the authenticated HTTPS clone/push URL strictly from `baseURL`, `repo`, and token, wire the project to a Forgejo provider config, and use Forgejo REST helpers for label creation, issue creation, repository checks, PR discovery, and cleanup instead of `gh`-specific assumptions.
+- Added run-scoped titles/branch prefixes and live cleanup for created sandbox issues, pull requests, labels reuse, and pushed branches so Step 3 mirrors the GitHub sandbox posture without introducing clone URL overrides or silent fallbacks.
+- Added targeted non-live prerequisite tests in `internal/e2e/forgejo_sandbox_config_test.go` to cover successful live prereq validation and fail-fast repo-inaccessible behavior while keeping live sandbox tests compilable and skipped without credentials.
+
 ## Step 4: Copy-Run-Classify Supported Cases
 
 Case failure classifications:

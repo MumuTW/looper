@@ -1,6 +1,9 @@
 package e2e
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -33,9 +36,9 @@ func TestParseForgejoSandboxConfig(t *testing.T) {
 	})
 
 	for _, tc := range []struct {
-		name    string
+		name     string
 		override map[string]string
-		wantErr string
+		wantErr  string
 	}{
 		{name: "missing base URL", override: map[string]string{envForgejoBaseURL: ""}, wantErr: envForgejoBaseURL},
 		{name: "invalid base URL", override: map[string]string{envForgejoBaseURL: "://bad"}, wantErr: "absolute URL"},
@@ -55,4 +58,53 @@ func TestParseForgejoSandboxConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateForgejoSandboxPrerequisites(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/v1/user":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":42,"login":"ralph"}`))
+			case "/api/v1/repos/acme/looper":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"html_url":"https://forge.example.test/acme/looper"}`))
+			case "/api/v1/repos/acme/looper/pulls":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[]`))
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+
+		cfg, err := validateForgejoSandboxPrerequisites(context.Background(), forgejoSandboxConfig{BaseURL: server.URL, Repo: "acme/looper", Token: "secret"})
+		if err != nil {
+			t.Fatalf("validateForgejoSandboxPrerequisites() error = %v", err)
+		}
+		if cfg.CurrentUser.Login != "ralph" || cfg.RepoHTMLURL != "https://forge.example.test/acme/looper" || cfg.Client == nil || cfg.HTTPClient == nil {
+			t.Fatalf("validated cfg = %#v", cfg)
+		}
+	})
+
+	t.Run("repo inaccessible fails fast", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/v1/user":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":42,"login":"ralph"}`))
+			case "/api/v1/repos/acme/looper":
+				http.Error(w, "repo denied", http.StatusForbidden)
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+
+		_, err := validateForgejoSandboxPrerequisites(context.Background(), forgejoSandboxConfig{BaseURL: server.URL, Repo: "acme/looper", Token: "secret"})
+		if err == nil || !strings.Contains(err.Error(), "sandbox repo lookup failed") {
+			t.Fatalf("error = %v, want sandbox repo lookup failure", err)
+		}
+	})
 }
