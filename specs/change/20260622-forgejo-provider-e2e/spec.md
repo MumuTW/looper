@@ -121,6 +121,39 @@ Human operations:
 4. If Forgejo prompts, token scopes, branch protection, repository permissions, or network access block the test, perform the required Forgejo-side permission/configuration change manually and tell the AI what changed.
 5. Review any leftover sandbox artifacts if the live test aborts before cleanup; deleting remote branches, issues, PRs, labels, or comments manually is a Human operation unless you explicitly authorize the AI to perform that cleanup.
 
+### Step 8: Pair-Mode Forgejo Real-Agent Local Run
+
+Type: Pair
+Goal: Run Looper from a local build against the real Forgejo sandbox with real agent execution, first for the Forgejo MVP worker path and then for the Forgejo MVP comment-only reviewer path.
+Scope: Build local `looperd`/`looper` binaries, prepare an isolated runtime/config that points at the existing Forgejo sandbox and a real local agent command, run only Forgejo-supported MVP features, trigger one assigned worker issue and one comment-only reviewer case, record exact commands/results in `steps.md`, and stop on missing credentials, invalid config, unsupported Forgejo feature use, or agent execution failure.
+Depends on: Step 7
+Acceptance criteria: Local `looperd` starts from the isolated config, uses a real agent command instead of the e2e fake agent, successfully completes the worker live run or fails with a classified cause, and separately completes the reviewer comment-only live run or fails with a classified cause. No token values are committed or written to tracked files.
+
+#### Step 8 Pair Operations Plan
+
+AI operations:
+
+1. Build local binaries with `go build -o dist/looperd ./cmd/looperd` and `go build -o dist/looper ./cmd/looper`.
+2. Prepare an ignored/local runtime config for the real-agent Forgejo run using the existing sandbox base URL/repo and token source from `e2e/.env`, without copying token values into tracked files or logs.
+3. Configure only Forgejo MVP-supported behavior: polling mode, worker enabled, comment-only reviewer enabled for the reviewer case, and fixer/coordinator/dependency gates/webhook/routed/native review-thread/auto-merge disabled.
+4. Configure the real agent command from the local environment (`opencode`, `codex`, `claude`, or an explicit `agent.params.command`) and fail fast if the command is missing or not executable.
+5. Run deterministic preflight checks: validate config, confirm `git` resolves, confirm Forgejo token can identify the current user/repo through the supported Looper path, and confirm runtime directories are writable.
+6. For the worker case, provide the human with exact Forgejo-side issue creation/assignment instructions, then start local `looperd --config <local-config>` and observe whether Looper invokes the real agent, commits, pushes a branch, opens/updates a PR, and comments back to Forgejo.
+7. For the reviewer case, provide the human with exact Forgejo-side PR preparation/trigger instructions, then run local `looperd --config <local-config>` with only comment-only reviewer behavior enabled and observe whether Looper invokes the real reviewer agent and writes a normal Forgejo comment.
+8. Classify any failure as missing prerequisite, invalid local config, unsupported Forgejo MVP behavior, real agent execution failure, live Forgejo provider defect, or local Looper defect.
+9. Append command shapes, pass/fail status, artifact links/IDs, and failure classifications to `steps.md` without recording secrets.
+10. Commit the plan/progress with a `journal:` commit after each completed step or significant progress, and push only when explicitly requested.
+
+Human operations:
+
+1. Confirm which real agent command should be used locally (`opencode`, `codex`, `claude`, or another command) and ensure it is authenticated and safe to run against the sandbox worktree.
+2. Confirm the existing ignored `e2e/.env` still contains the live Forgejo sandbox values and token, or update it locally. Do not paste the token into tracked files.
+3. For the worker case, create a small Forgejo sandbox issue and assign it to the token user. The issue should request a tiny, low-risk repository change, such as adding one clearly named line to a sandbox test file or README section.
+4. Review and approve the worker issue prompt before `looperd` is started, because the real agent will act on that prompt and may push commits to the sandbox repository.
+5. For the reviewer case, prepare or approve a small Forgejo sandbox PR with a harmless diff that the reviewer can inspect. The expected reviewer output is a normal PR comment only, not inline review threads or approvals.
+6. If Forgejo permissions, branch protection, token scopes, agent login, local network access, or repository state block the run, make the required manual change and tell the AI what changed.
+7. Decide whether any leftover remote sandbox branches, PRs, labels, issues, or comments should be manually cleaned up. Remote destructive cleanup is a Human operation unless explicitly authorized.
+
 ## Progress
 
 - [x] Step 1: Mirror Inventory And Env Compatibility
@@ -130,6 +163,7 @@ Human operations:
 - [x] Step 5: EAG Validation
 - [x] Step 6: Documentation Sync
 - [x] Step 7: Pair-Mode Forgejo Live Sandbox Run
+- [ ] Step 8: Pair-Mode Forgejo Real-Agent Local Run
 
 ## Implementation
 
