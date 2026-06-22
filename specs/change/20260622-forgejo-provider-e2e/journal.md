@@ -106,3 +106,31 @@ AI operations completed:
 Next AI operation:
 
 - Start local `looperd` with the worker-only real-agent config and observe the worker run.
+
+## 2026-06-22: Step 8 worker real-agent run
+
+Status: partially completed; remote worker path succeeded, local recovery state failed after an induced shutdown.
+
+AI operations completed:
+
+- Started local `looperd` with `/var/folders/1d/0byj0hb96vd30xbwb4b4b3800000gn/T/opencode/looper-forgejo-real-agent/config-worker.toml`.
+- Observed scheduler claim one worker item for issue #10.
+- Observed Forgejo PR creation: `https://code.powerformer.net/core/looper-sandbox/pulls/11`.
+- Verified PR #11 is open and titled `Looper real-agent worker smoke test`.
+- Verified PR #11 changed exactly the intended worker smoke file: `looper-real-agent-worker-smoke.txt`.
+- Verified PR #11 has one commit: `cfd0a66db365` with message `Implement looper real-agent worker smoke test`.
+- Verified the PR head file content is `worker real-agent smoke test 2026-06-22`.
+- Re-ran local `looperd` after the first monitor script terminated the daemon too early, to let recovery settle.
+
+Failure classification:
+
+- Worker remote/live path result: passed. Real `codex` agent execution produced the intended file change, Looper pushed a branch, and Forgejo PR #11 was created.
+- Local daemon completion state: failed due an induced recovery-path defect. The first monitor script stopped `looperd` immediately after seeing the PR, before the worker queue item finished local bookkeeping.
+- Recovery result: `looperd` marked the interrupted run stale/orphaned, requeued work, then both worker queue items reached `manual_intervention` with `upsert run: UNIQUE constraint failed: runs.loop_id`.
+- Current local DB state includes one old run marked `interrupted` and one newer run left `running`; queue items are `manual_intervention`.
+
+Notes:
+
+- The recovery failure appears to be a local Looper recovery/idempotency defect exposed by the test harness shutdown timing, not a Forgejo provider API failure and not a real agent failure.
+- Remote side currently has one open PR for this worker issue; no duplicate PR was observed.
+- Issue #10 still has `looper:worker-ready`, and the local isolated runtime should not be reused for the reviewer case without resetting or using a separate DB.
