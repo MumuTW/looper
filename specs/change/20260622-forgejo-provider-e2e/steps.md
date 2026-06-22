@@ -33,6 +33,16 @@ Notes:
 
 Case failure classifications:
 
+- Deterministic Forgejo REST contract supported cases passed without implementation changes: current user, issue list/view, label add/remove, assignee add/remove, comment create/list/update, pull-request list/view/create/update, diff fetch, compare, pagination, request body/query/auth assertions, and sanitized provider errors remain classified as supported and enabled.
+- Non-live Forgejo e2e supported cases passed without implementation changes: Forgejo sandbox config parsing, fail-fast live prerequisite checks, GitHub sandbox repo env compatibility, Forgejo live mirror inventory, and disabled-live sandbox entrypoints remain classified as supported and enabled.
+- Unsupported MVP mirrors remain explicit skips rather than green-making skips for supported behavior: native review-thread resolution, Coordinator/dependency-gate behavior, and GitHub-style repo-form handling are still outside the current Forgejo capability set.
+- Live Forgejo sandbox execution was not configured in this environment because the required `LOOPER_E2E_FORGEJO=1`, `LOOPER_E2E_FORGEJO_BASE_URL`, `LOOPER_E2E_FORGEJO_SANDBOX_REPO`, and `LOOPER_E2E_FORGEJO_TOKEN` set was not fully present; no live provider defect was classified in Step 4.
+
+Verification:
+
+- `go test ./internal/e2e/forgejocontract -count=1`
+- `go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1`
+
 ## Step 5: EAG Validation
 
 Notes:

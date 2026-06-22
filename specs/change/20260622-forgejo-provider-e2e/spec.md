@@ -94,8 +94,8 @@ Depends on: Step 5
 
 - [x] Step 1: Mirror Inventory And Env Compatibility
 - [x] Step 2: Forgejo Contract E2E
-- [ ] Step 3: Forgejo Live Sandbox Mirror
-- [ ] Step 4: Copy-Run-Classify Supported Cases
+- [x] Step 3: Forgejo Live Sandbox Mirror
+- [x] Step 4: Copy-Run-Classify Supported Cases
 - [ ] Step 5: EAG Validation
 - [ ] Step 6: Documentation Sync
 
