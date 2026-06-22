@@ -19,11 +19,12 @@ import (
 )
 
 const (
-	envSandboxEnabled  = "LOOPER_E2E_GITHUB"
-	envSandboxRepo     = "LOOPER_E2E_SANDBOX_REPO"
-	envSandboxToken    = "LOOPER_E2E_GITHUB_TOKEN"
-	sandboxLabelName   = "looper-e2e"
-	sandboxMaxAttempts = 4
+	envSandboxEnabled    = "LOOPER_E2E_GITHUB"
+	envSandboxRepo       = "LOOPER_E2E_GITHUB_SANDBOX_REPO"
+	envSandboxRepoLegacy = "LOOPER_E2E_SANDBOX_REPO"
+	envSandboxToken      = "LOOPER_E2E_GITHUB_TOKEN"
+	sandboxLabelName     = "looper-e2e"
+	sandboxMaxAttempts   = 4
 )
 
 type sandboxConfig struct {
@@ -237,9 +238,9 @@ func requireSandboxConfig(tb testing.TB) sandboxConfig {
 	if strings.TrimSpace(os.Getenv(envSandboxEnabled)) != "1" {
 		tb.Skipf("set %s=1 to run real GitHub sandbox E2E", envSandboxEnabled)
 	}
-	repo := strings.TrimSpace(os.Getenv(envSandboxRepo))
+	repo := resolveGitHubSandboxRepoEnv(tb, os.Getenv)
 	if repo == "" {
-		tb.Fatalf("%s=1 requires %s to be set", envSandboxEnabled, envSandboxRepo)
+		tb.Fatalf("%s=1 requires %s to be set (or legacy %s)", envSandboxEnabled, envSandboxRepo, envSandboxRepoLegacy)
 	}
 	token := strings.TrimSpace(os.Getenv(envSandboxToken))
 	if token == "" {
@@ -257,6 +258,27 @@ func requireSandboxConfig(tb testing.TB) sandboxConfig {
 		tb.Fatalf("sandbox GitHub auth unavailable with %s: %v", envSandboxToken, err)
 	}
 	return sandboxConfig{Repo: repo, Owner: owner, Name: name, Token: token, RunID: runID, TitlePrefix: titlePrefix, BranchPrefix: branchPrefix, CmdEnv: cmdEnv}
+}
+
+func resolveGitHubSandboxRepoEnv(tb testing.TB, getenv func(string) string) string {
+	tb.Helper()
+	repo, err := parseGitHubSandboxRepoEnv(getenv)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return repo
+}
+
+func parseGitHubSandboxRepoEnv(getenv func(string) string) (string, error) {
+	preferred := strings.TrimSpace(getenv(envSandboxRepo))
+	legacy := strings.TrimSpace(getenv(envSandboxRepoLegacy))
+	if preferred != "" && legacy != "" && preferred != legacy {
+		return "", fmt.Errorf("%s and %s are both set to different repositories (%q != %q)", envSandboxRepo, envSandboxRepoLegacy, preferred, legacy)
+	}
+	if preferred != "" {
+		return preferred, nil
+	}
+	return legacy, nil
 }
 
 func sandboxEnvMap(sb sandboxConfig) map[string]string {
