@@ -90,6 +90,37 @@ Goal: Keep project documentation aligned with the implemented e2e behavior.
 Scope: If the implementation changes documented test commands, environment variables, live sandbox setup, or provider support, update relevant project docs.
 Depends on: Step 5
 
+### Step 7: Pair-Mode Forgejo Live Sandbox Run
+
+Type: Pair
+Goal: Run the opt-in Forgejo live sandbox e2e against a real dedicated Forgejo repository, with AI operations done autonomously and human operations isolated to required manual or risky actions.
+Scope: Prepare and validate the local test command, ask the human to provide only the required live Forgejo sandbox inputs, run deterministic preflight checks, run `go test ./internal/e2e -run '^TestForgejoSandbox' -count=1` with the provided live env, classify any failure as missing prerequisite, unsupported MVP behavior, live provider defect, or local test defect, and record the result in `steps.md`.
+Depends on: Step 6
+Acceptance criteria: The live sandbox command either passes, or fails fast with a clear recorded cause and no hidden fallback/mock behavior; all human-required actions are documented as Human operations before they are needed.
+
+#### Step 7 Pair Operations Plan
+
+AI operations:
+
+1. Confirm the deterministic contract gate is still green with `go test ./internal/e2e/forgejocontract -count=1` before touching the live sandbox path.
+2. Confirm the non-live Forgejo e2e entrypoints still compile and skip/validate as expected with `go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1`.
+3. Prepare the exact live command using only the human-provided `LOOPER_E2E_FORGEJO_BASE_URL`, `LOOPER_E2E_FORGEJO_SANDBOX_REPO`, and `LOOPER_E2E_FORGEJO_TOKEN` values; do not invent placeholder credentials or repos.
+4. Run the live command once prerequisites are provided: `LOOPER_E2E_FORGEJO=1 LOOPER_E2E_FORGEJO_BASE_URL=... LOOPER_E2E_FORGEJO_SANDBOX_REPO=... LOOPER_E2E_FORGEJO_TOKEN=... go test ./internal/e2e -run '^TestForgejoSandbox' -count=1`.
+5. If the live command fails, inspect only local test output and repository code needed to classify the failure; do not mutate the Forgejo instance outside the test's own run-scoped behavior.
+6. Append the observed live run command shape, pass/fail status, and failure classification to `steps.md`.
+7. Report the final result and any next required human decision.
+
+Human operations:
+
+1. Choose or create a dedicated existing Forgejo sandbox repository in `owner/repo` form. It must be safe for tests to create and clean run-scoped issues, branches, pull requests, labels, and comments.
+2. Create or choose a Forgejo token for that sandbox. The token must be allowed to read the current user, read the repository, list/create/update issues, list/create/update pull requests, create labels/comments, and push/delete test branches over HTTPS.
+3. Provide these values to the AI when asked:
+   - `LOOPER_E2E_FORGEJO_BASE_URL`, for example `https://code.example.com`
+   - `LOOPER_E2E_FORGEJO_SANDBOX_REPO`, for example `owner/repo`
+   - `LOOPER_E2E_FORGEJO_TOKEN`, preferably pasted only for the current shell/session and not committed to any file
+4. If Forgejo prompts, token scopes, branch protection, repository permissions, or network access block the test, perform the required Forgejo-side permission/configuration change manually and tell the AI what changed.
+5. Review any leftover sandbox artifacts if the live test aborts before cleanup; deleting remote branches, issues, PRs, labels, or comments manually is a Human operation unless you explicitly authorize the AI to perform that cleanup.
+
 ## Progress
 
 - [x] Step 1: Mirror Inventory And Env Compatibility
@@ -98,6 +129,7 @@ Depends on: Step 5
 - [x] Step 4: Copy-Run-Classify Supported Cases
 - [x] Step 5: EAG Validation
 - [x] Step 6: Documentation Sync
+- [ ] Step 7: Pair-Mode Forgejo Live Sandbox Run
 
 ## Implementation
 
