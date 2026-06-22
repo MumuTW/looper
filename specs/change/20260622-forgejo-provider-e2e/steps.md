@@ -70,6 +70,7 @@ Notes:
 - Classified and fixed a supported-case local test defect: live Forgejo issue creation expects numeric label IDs, so sandbox issue setup now resolves/creates the `looper-e2e` label and sends its ID.
 - Classified and fixed a supported-case local test defect: Forgejo worker issues must be pre-assigned to the token user, so sandbox issue setup now sends the current Forgejo user in issue creation assignees.
 - Classified and fixed a supported-case provider normalization defect: the live Forgejo compare API returned `total_commits` without `status/ahead_by`, so `ForgejoClient.CompareBranches` now treats `total_commits > 0` with missing ahead fields as an ahead comparison and has regression coverage for slash-containing head branches.
+- Reviewer live sandbox coverage is intentionally not added in this step. The current GitHub sandbox mirror exercises reviewer-adjacent behavior through fixer/native review-thread scenarios; those are outside Forgejo MVP and remain skipped. Forgejo MVP's comment-only reviewer is supported and covered by non-live runtime/provider tests, but this spec does not add a Forgejo-specific live reviewer case. When Forgejo later implements real reviewer + fixer/native review-thread behavior, add combined reviewer/fixer live sandbox coverage then.
 
 Verification:
 
