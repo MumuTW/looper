@@ -93,7 +93,7 @@ Depends on: Step 5
 ## Progress
 
 - [x] Step 1: Mirror Inventory And Env Compatibility
-- [ ] Step 2: Forgejo Contract E2E
+- [x] Step 2: Forgejo Contract E2E
 - [ ] Step 3: Forgejo Live Sandbox Mirror
 - [ ] Step 4: Copy-Run-Classify Supported Cases
 - [ ] Step 5: EAG Validation

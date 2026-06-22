@@ -14,6 +14,11 @@ Notes:
 
 Notes:
 
+- Added `internal/e2e/forgejocontract/contract_test.go` to mirror the GitHub contract posture against the real Forgejo REST boundary with a strict fake HTTP server that enforces exact request order, method, escaped path, query, auth header, JSON body, pagination, and sanitized error behavior.
+- Documented an authority source on every strict fake route using the Forgejo API docs, the instance OpenAPI contract, the current MVP capability surface, or recorded live observation, and added a guard test that fails if any route lacks authority metadata.
+- Covered supported REST-mapped cases for current user, issue list/view, label add/remove, assignee add/remove, comment create/list/update, pull-request list/view/create/update, diff fetch, compare, and token-redacted provider errors; unsupported dependency/repo-form counterparts remain present with explicit `t.Skip` reasons in the mirror inventory.
+- Verified with `go test ./internal/e2e/forgejocontract -count=1`.
+
 ## Step 3: Forgejo Live Sandbox Mirror
 
 Notes:
