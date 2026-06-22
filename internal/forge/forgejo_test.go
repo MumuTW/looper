@@ -271,6 +271,31 @@ func TestListOpenPullRequestsAppliesLimitAfterLabelFiltering(t *testing.T) {
 	}
 }
 
+func TestCompareBranchesNormalizesForgejoTotalCommitsOnlyResponse(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/api/v1/repos/acme/looper/compare/main...feature%2Freview" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.EscapedPath())
+		}
+		writeJSON(t, w, http.StatusOK, map[string]any{"total_commits": 1, "commits": []map[string]any{{"sha": "abc"}}})
+	}))
+	defer server.Close()
+
+	client, err := NewForgejoClient(RepositoryRef{ProviderID: "fj", Kind: ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "secret")
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+
+	comparison, err := client.CompareBranches(context.Background(), CompareBranchesInput{Base: "main", Head: "feature/review"})
+	if err != nil {
+		t.Fatalf("CompareBranches() error = %v", err)
+	}
+	if comparison.Status != "ahead" || comparison.AheadBy != 1 || comparison.TotalCommits != 1 {
+		t.Fatalf("comparison = %#v, want normalized ahead result", comparison)
+	}
+}
+
 func TestNewForgejoClientRejectsInvalidInputs(t *testing.T) {
 	_, err := NewForgejoClient(RepositoryRef{ProviderID: "", BaseURL: "https://forgejo.example.test", Repo: "acme/looper"}, "token")
 	if err == nil || !strings.Contains(err.Error(), "provider id") {

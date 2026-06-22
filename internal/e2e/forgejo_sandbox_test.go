@@ -330,12 +330,16 @@ func createForgejoSandboxIssue(tb testing.TB, sb forgejoSandboxConfig, scenario 
 	tb.Helper()
 	title := sb.TitlePrefix + " " + scenario
 	body := fmt.Sprintf("Sandbox E2E issue for %s (%s)", scenario, sb.RunID)
+	labelID, err := forgejoSandboxEnsureLabel(context.Background(), sb, forgejoSandboxLabelName, "5319e7", "Looper sandbox E2E resources")
+	if err != nil {
+		tb.Fatalf("ensure sandbox label: %v", err)
+	}
 	var issue struct {
 		Number  int64  `json:"number"`
 		HTMLURL string `json:"html_url"`
 		Title   string `json:"title"`
 	}
-	if err := forgejoSandboxAPI(context.Background(), sb, http.MethodPost, "repos/"+sb.Repo+"/issues", map[string]any{"title": title, "body": body, "labels": []string{forgejoSandboxLabelName}}, &issue); err != nil {
+	if err := forgejoSandboxAPI(context.Background(), sb, http.MethodPost, "repos/"+sb.Repo+"/issues", map[string]any{"title": title, "body": body, "labels": []int64{labelID}, "assignees": []string{sb.CurrentUser.Login}}, &issue); err != nil {
 		tb.Fatalf("create forgejo sandbox issue: %v", err)
 	}
 	return forgejoSandboxIssue{Number: issue.Number, URL: issue.HTMLURL, Title: issue.Title}

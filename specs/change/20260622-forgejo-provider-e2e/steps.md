@@ -60,3 +60,19 @@ Notes:
 - Updated `docs/configuration.md` with the Forgejo live sandbox e2e prerequisites and fail-fast behavior for enabled live runs.
 - Verified the documentation now names `LOOPER_E2E_FORGEJO`, `LOOPER_E2E_FORGEJO_BASE_URL`, `LOOPER_E2E_FORGEJO_SANDBOX_REPO`, `LOOPER_E2E_FORGEJO_TOKEN`, `LOOPER_E2E_GITHUB_SANDBOX_REPO`, and the legacy `LOOPER_E2E_SANDBOX_REPO` alias.
 - Re-ran `go test ./internal/e2e/forgejocontract -count=1` and `go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1` after the docs sync.
+
+## Step 7: Pair-Mode Forgejo Live Sandbox Run
+
+Notes:
+
+- Used repo-local live env layout: committed `e2e/.env.example`, ignored `e2e/.env*`, and kept the real token only in ignored `e2e/.env`.
+- Ran live sandbox against `https://code.powerformer.net/core/looper-sandbox` with `source e2e/.env && go test ./internal/e2e -run '^TestForgejoSandbox' -count=1`.
+- Classified and fixed a supported-case local test defect: live Forgejo issue creation expects numeric label IDs, so sandbox issue setup now resolves/creates the `looper-e2e` label and sends its ID.
+- Classified and fixed a supported-case local test defect: Forgejo worker issues must be pre-assigned to the token user, so sandbox issue setup now sends the current Forgejo user in issue creation assignees.
+- Classified and fixed a supported-case provider normalization defect: the live Forgejo compare API returned `total_commits` without `status/ahead_by`, so `ForgejoClient.CompareBranches` now treats `total_commits > 0` with missing ahead fields as an ahead comparison and has regression coverage for slash-containing head branches.
+
+Verification:
+
+- `go test ./internal/forge -run 'TestCompareBranchesNormalizesForgejoTotalCommitsOnlyResponse|TestForgejoClient' -count=1`
+- `go test ./internal/e2e/forgejocontract -count=1`
+- `source e2e/.env && go test ./internal/e2e -run '^TestForgejoSandbox' -count=1`

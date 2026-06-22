@@ -278,6 +278,10 @@ func (forgejo *ForgejoClient) CompareBranches(ctx context.Context, input Compare
 	if err := forgejo.do(ctx, http.MethodGet, path, nil, nil, &output); err != nil {
 		return CompareBranchesResult{}, err
 	}
+	if output.Status == "" && output.AheadBy == 0 && output.TotalCommits > 0 {
+		output.Status = "ahead"
+		output.AheadBy = output.TotalCommits
+	}
 	return CompareBranchesResult{
 		Status:       output.Status,
 		AheadBy:      output.AheadBy,

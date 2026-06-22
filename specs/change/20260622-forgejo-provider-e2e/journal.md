@@ -66,3 +66,29 @@ Next Human operation required:
 1. Copy `e2e/.env.example` to `e2e/.env`.
 2. Replace `replace-with-forgejo-token` with the real token.
 3. Tell the AI when `e2e/.env` is ready.
+
+## 2026-06-22: Step 7 live sandbox execution
+
+Status: completed.
+
+Human operations completed:
+
+- Created `e2e/.env` from the committed template with the live Forgejo token.
+- Confirmed `e2e/.env` was ready.
+
+AI operations completed:
+
+- Verified `e2e/.env` is ignored and not tracked by git.
+- Ran initial live sandbox command: `source e2e/.env && go test ./internal/e2e -run '^TestForgejoSandbox' -count=1`.
+- Classified the first live failure as a supported-case local test defect: the live Forgejo issue-create API expects label IDs, not label names, for `CreateIssueOption.labels`.
+- Fixed `createForgejoSandboxIssue` to ensure the sandbox label and send its numeric label ID when creating issues.
+- Classified the second live failure as a supported-case local test defect: Forgejo worker issues must be pre-assigned to the current user, and the live instance accepted assignees on issue creation rather than the separate assignee route.
+- Fixed `createForgejoSandboxIssue` to send `assignees` with the current Forgejo user during issue creation.
+- Classified the final live failure as a supported-case Forgejo provider normalization defect: the live Forgejo compare API returned `total_commits` plus commit/file data without `status` or `ahead_by`, so Looper misclassified an ahead branch as no-diff.
+- Fixed `ForgejoClient.CompareBranches` to normalize a `total_commits > 0` response with missing `status/ahead_by` to an ahead comparison, and added a unit regression test for slash-containing head branches.
+
+Verification completed:
+
+- `go test ./internal/forge -run 'TestCompareBranchesNormalizesForgejoTotalCommitsOnlyResponse|TestForgejoClient' -count=1` — passed.
+- `go test ./internal/e2e/forgejocontract -count=1` — passed.
+- `source e2e/.env && go test ./internal/e2e -run '^TestForgejoSandbox' -count=1` — passed.

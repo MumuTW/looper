@@ -129,7 +129,7 @@ Human operations:
 - [x] Step 4: Copy-Run-Classify Supported Cases
 - [x] Step 5: EAG Validation
 - [x] Step 6: Documentation Sync
-- [ ] Step 7: Pair-Mode Forgejo Live Sandbox Run
+- [x] Step 7: Pair-Mode Forgejo Live Sandbox Run
 
 ## Implementation
 
