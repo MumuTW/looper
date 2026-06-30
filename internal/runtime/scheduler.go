@@ -310,6 +310,15 @@ func forgeLabelNames(labels []forge.Label) []string {
 	return names
 }
 
+func appendLabels(label string, labels []string) []string {
+	result := make([]string, 0, len(labels)+1)
+	if label = strings.TrimSpace(label); label != "" {
+		result = append(result, label)
+	}
+	result = append(result, labels...)
+	return result
+}
+
 func forgeNetworkPolicyUsers(users []forge.Identity) []networkpolicy.GitHubUser {
 	if users == nil {
 		return nil
@@ -947,9 +956,40 @@ func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
 type fixerGitHubAdapter struct {
 	gateway *githubinfra.Gateway
 	stamper disclosure.Stamper
+	config  *config.Config
+}
+
+func (a fixerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForRepo(a.config, repo)
+	return client, ok, err
+}
+
+func (a fixerGitHubAdapter) forgejoForCWD(ctx context.Context, cwd string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForCWD(a.config, cwd)
+	return client, ok, err
 }
 
 func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixer.ListOpenPullRequestsInput) ([]fixer.PullRequestSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(input.Author) != "" {
+			return nil, fmt.Errorf("forgejo fixer does not support author-filter discovery")
+		}
+		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: input.Limit, Labels: appendLabels(input.Label, input.Labels)})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]fixer.PullRequestSummary, 0, len(pullRequests))
+		for _, pr := range pullRequests {
+			if input.BaseRefName != "" && pr.Base.Name != input.BaseRefName {
+				continue
+			}
+			result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, Author: pr.User.Login})
+		}
+		return result, nil
+	}
 	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Author: input.Author, Label: input.Label, Labels: input.Labels, BaseRefName: input.BaseRefName})
 	if err != nil {
 		return nil, err
@@ -962,14 +1002,45 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	if client, ok, err := a.forgejoForCWD(ctx, cwd); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		identity, err := client.CurrentUser(ctx)
+		return identity.Login, err
+	}
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
 
 func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
+		if err != nil {
+			return "", err
+		}
+		return pr.User.Login, nil
+	}
 	return a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return fixer.PullRequestDetail{}, err
+		}
+		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
+		if err != nil {
+			return fixer.PullRequestDetail{}, err
+		}
+		comments, err := client.ListIssueComments(ctx, input.PRNumber)
+		if err != nil {
+			return fixer.PullRequestDetail{}, err
+		}
+		return fixer.PullRequestDetail{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
+	}
 	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
@@ -1008,6 +1079,12 @@ func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
 }
 
 func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("forgejo fixer does not support native review threads")
+	}
 	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
 	if err != nil {
 		return nil, err
@@ -1024,6 +1101,12 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 }
 
 func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.ViewReviewThreadInput) (fixer.ReviewThread, error) {
+	if _, ok, err := a.forgejoForCWD(ctx, input.CWD); ok || err != nil {
+		if err != nil {
+			return fixer.ReviewThread{}, err
+		}
+		return fixer.ReviewThread{}, fmt.Errorf("forgejo fixer does not support native review threads")
+	}
 	thread, err := a.gateway.ViewReviewThread(ctx, githubinfra.ViewReviewThreadInput{ThreadID: input.ThreadID, CWD: input.CWD})
 	if err != nil {
 		return fixer.ReviewThread{}, err
@@ -1036,15 +1119,37 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 }
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("forgejo fixer does not support native review thread resolution")
+	}
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("forgejo fixer does not support native review thread replies")
+	}
 	body := a.stamper.ReviewComment(input.Body, "fixer")
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return fixer.CompareCommitsResult{}, err
+		}
+		out, err := client.CompareBranches(ctx, forge.CompareBranchesInput{Base: input.Base, Head: input.Head})
+		if err != nil {
+			return fixer.CompareCommitsResult{}, err
+		}
+		return fixer.CompareCommitsResult{Status: out.Status}, nil
+	}
 	out, err := a.gateway.CompareCommits(ctx, githubinfra.CompareCommitsInput{Repo: input.Repo, Base: input.Base, Head: input.Head, CWD: input.CWD})
 	if err != nil {
 		return fixer.CompareCommitsResult{}, err
@@ -1054,6 +1159,16 @@ func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.Comp
 
 func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.IssueCommentInput) (fixer.IssueCommentResult, error) {
 	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return fixer.IssueCommentResult{}, err
+		}
+		comment, err := client.CreateIssueComment(ctx, forge.CreateCommentInput{IssueNumber: input.IssueNumber, Body: body})
+		if err != nil {
+			return fixer.IssueCommentResult{}, err
+		}
+		return fixer.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
+	}
 	comment, err := a.gateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Body: body, CWD: input.CWD})
 	if err != nil {
 		return fixer.IssueCommentResult{}, err
@@ -1063,14 +1178,39 @@ func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.
 
 func (a fixerGitHubAdapter) UpdateIssueComment(ctx context.Context, input fixer.UpdateIssueCommentInput) error {
 	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdateIssueComment(ctx, forge.UpdateCommentInput{CommentID: input.CommentID, Body: body})
+		return err
+	}
 	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: body, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.AddIssueLabels(ctx, input.PRNumber, input.Labels)
+		return err
+	}
 	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		for _, label := range input.Labels {
+			if err := client.RemoveIssueLabel(ctx, input.PRNumber, label); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
@@ -1702,7 +1842,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	fixerRunner = fixer.New(fixer.Options{
 		DB:                 coordinator.DB(),
 		Repos:              repos,
-		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper},
+		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,

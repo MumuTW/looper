@@ -30,7 +30,11 @@
 
 ## Step 4 (AFK): Forgejo Role Integration And Validation
 
-<!-- Implementation and verification notes for the matching Plan step. -->
+- Routed the default runtime `fixerGitHubAdapter` through Forgejo provider operations so Forgejo Fixer can discover PRs, resolve current-user/author metadata, read top-level PR comments, publish/update the fixed Fixer Summary comment, compare heads for evidence reachability, and mutate PR labels without falling through to GitHub-only APIs.
+- Added explicit Forgejo no-native-review guards in the fixer runtime adapter so thread listing/reply/resolve paths fail fast if they are reached on Forgejo instead of silently attempting unsupported GitHub review-thread behavior.
+- Added runtime regression coverage in `internal/runtime/scheduler_forgejo_test.go` for the Forgejo Fixer summary-comment flow, including top-level comment create/update, compare, label mutation, and unsupported native review-thread rejection.
+- Added config validation coverage in `internal/config/config_test.go` proving Forgejo still rejects unsupported reviewer auto-merge, reviewer thread resolution, and fixer auto-discovery opt-ins.
+- Verified with `go test ./internal/runtime ./internal/config` and `go test ./...`.
 
 ## Step 5 (AFK): EAG Validation
 
