@@ -788,6 +788,50 @@ func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input rev
 	return reviewer.IssueCommentResult{ID: comment.ID, URL: comment.URL}, nil
 }
 
+func (a reviewerGitHubAdapter) ListIssueComments(ctx context.Context, input reviewer.ViewPullRequestInput) ([]reviewer.IssueComment, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		comments, err := client.ListIssueComments(ctx, input.PRNumber)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]reviewer.IssueComment, 0, len(comments))
+		for _, comment := range comments {
+			out = append(out, reviewer.IssueComment{ID: comment.ID, Body: comment.Body})
+		}
+		return out, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
+	comments, err := a.gateway.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]reviewer.IssueComment, 0, len(comments))
+	for _, comment := range comments {
+		out = append(out, reviewer.IssueComment{ID: comment.ID, Body: comment.Body})
+	}
+	return out, nil
+}
+
+func (a reviewerGitHubAdapter) UpdateIssueComment(ctx context.Context, input reviewer.UpdateIssueCommentInput) error {
+	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdateIssueComment(ctx, forge.UpdateCommentInput{CommentID: input.CommentID, Body: body})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: body, CWD: input.CWD})
+}
+
 func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
 	return a.gateway.SubmitReview(ctx, input)
 }

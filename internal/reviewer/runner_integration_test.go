@@ -241,6 +241,22 @@ func (a reviewerIntegrationGatewayAdapter) CreateIssueComment(ctx context.Contex
 	return IssueCommentResult{ID: comment.ID, URL: comment.URL}, nil
 }
 
+func (a reviewerIntegrationGatewayAdapter) ListIssueComments(ctx context.Context, input ViewPullRequestInput) ([]IssueComment, error) {
+	comments, err := a.Gateway.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IssueComment, 0, len(comments))
+	for _, comment := range comments {
+		out = append(out, IssueComment{ID: comment.ID, Body: comment.Body})
+	}
+	return out, nil
+}
+
+func (a reviewerIntegrationGatewayAdapter) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
+	return a.Gateway.UpdateIssueComment(ctx, githubinfra.UpdateIssueCommentInput{Repo: input.Repo, CommentID: input.CommentID, Body: input.Body, CWD: input.CWD})
+}
+
 func (a reviewerIntegrationGatewayAdapter) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
 	return a.Gateway.SubmitReview(ctx, input)
 }

@@ -8,7 +8,14 @@
 
 ## Step 2 (AFK): Reviewer Summary Publishing
 
-<!-- Implementation and verification notes for the matching Plan step. -->
+- Updated Forgejo reviewer comment-only publish to upsert exactly one fixed Reviewer Summary PR comment via `internal/forge/summary_protocol.go` instead of treating freeform markdown as protocol state.
+- Extended the comment-only reviewer completion contract in `internal/reviewer/runner.go` so the agent must return structured `summary` / `outcome` / `findings` data, with optional `review_item_id` reuse and `supersedes` links for materially redefined issues.
+- Added deterministic Reviewer Summary synthesis that preserves historical items, reuses referenced `review_item_id` values, allocates new `R-###` IDs, marks unmatched open items `resolved`, and marks explicitly replaced items `superseded`.
+- Added Forgejo reviewer adapter support for list/update top-level PR comments so summary comments can be edited in place.
+- Added focused reviewer tests for the prompt contract, summary-comment creation, clean summary publication, existing-summary update/id reuse/supersede behavior, and duplicate-summary failure.
+- Verified with:
+  - `gofmt -w "internal/reviewer/runner.go" "internal/reviewer/runner_test.go" "internal/reviewer/runner_integration_test.go" "internal/runtime/scheduler.go"`
+  - `go test ./internal/reviewer ./internal/runtime ./internal/forge`
 
 ## Step 3 (AFK): Fixer Summary Consumption And Publishing
 

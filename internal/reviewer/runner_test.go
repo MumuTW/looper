@@ -13,6 +13,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
@@ -8243,13 +8244,18 @@ func TestBuildReviewPromptCommentOnlyOmitsGitHubPublishInstructions(t *testing.T
 	if !strings.Contains(prompt, "comment-only") || !strings.Contains(prompt, "Looper will post your final completion summary") {
 		t.Fatalf("prompt missing comment-only publish instructions:\n%s", prompt)
 	}
+	for _, required := range []string{"`findings`", "`review_item_id`", "`supersedes`"} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("prompt missing %s contract:\n%s", required, prompt)
+		}
+	}
 }
 
 func TestProcessClaimedItemCommentOnlyPublishesOneCommentAndSkipsRediscoveryForSameHead(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "internal/reviewer/runner.go: add a regression test for Forgejo comment-only publish", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: add a regression test for Forgejo comment-only publish","outcome":"non_blocking"}`}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "internal/reviewer/runner.go: add a regression test for Forgejo comment-only publish", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: add a regression test for Forgejo comment-only publish","outcome":"non_blocking","findings":[{"title":"Regression coverage missing for comment-only publish","body":"Add a focused reviewer test that proves Forgejo comment-only publish upserts the fixed Reviewer Summary comment instead of treating freeform markdown as authority.","files":["internal/reviewer/runner_test.go"]}]}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
 
 	discovery, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -8282,8 +8288,15 @@ func TestProcessClaimedItemCommentOnlyPublishesOneCommentAndSkipsRediscoveryForS
 	if len(github.issueCommentCalls) != 1 {
 		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
 	}
-	if !strings.Contains(github.issueCommentCalls[0].Body, "Forgejo comment-only publish") || !strings.Contains(github.issueCommentCalls[0].Body, "<!-- looper:review") {
-		t.Fatalf("comment body = %q, want summary plus marker", github.issueCommentCalls[0].Body)
+	if !strings.Contains(github.issueCommentCalls[0].Body, "Forgejo comment-only publish") || !strings.Contains(github.issueCommentCalls[0].Body, forge.ReviewerSummaryMarker) {
+		t.Fatalf("comment body = %q, want reviewer summary marker", github.issueCommentCalls[0].Body)
+	}
+	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary() error = %v", err)
+	}
+	if len(parsedSummary.Items) != 1 || parsedSummary.Items[0].ReviewItemID != "R-001" || parsedSummary.Items[0].Status != forge.ReviewItemStatusOpen {
+		t.Fatalf("parsed summary = %#v, want single open item", parsedSummary)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
 	if err != nil || loop == nil {
@@ -8309,7 +8322,7 @@ func TestProcessClaimedItemCommentOnlyPublishesCleanNoopWithoutReactionOrLabelRe
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{}, currentLogin: "reviewer"}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean"}`, ParseStatus: "parsed"}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{specpr.ReviewingLabel}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -8329,8 +8342,12 @@ func TestProcessClaimedItemCommentOnlyPublishesCleanNoopWithoutReactionOrLabelRe
 	if len(github.issueCommentCalls) != 1 {
 		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
 	}
-	if !strings.Contains(github.issueCommentCalls[0].Body, "outcome=clean") {
-		t.Fatalf("comment body = %q, want clean outcome marker", github.issueCommentCalls[0].Body)
+	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary() error = %v", err)
+	}
+	if len(parsedSummary.Items) != 0 {
+		t.Fatalf("parsed summary items = %#v, want none", parsedSummary.Items)
 	}
 	if len(github.addReactionCalls) != 0 {
 		t.Fatalf("addReactionCalls = %#v, want no GitHub reaction for comment-only clean noop", github.addReactionCalls)
@@ -8344,7 +8361,7 @@ func TestProcessClaimedItemCommentOnlyPublishesBlockingOutcome(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "internal/reviewer/runner.go: nil worktree cleanup can deadlock reviewer retries", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: nil worktree cleanup can deadlock reviewer retries","outcome":"blocking"}`, ParseStatus: "parsed"}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "internal/reviewer/runner.go: nil worktree cleanup can deadlock reviewer retries", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: nil worktree cleanup can deadlock reviewer retries","outcome":"blocking","findings":[{"title":"Nil worktree cleanup can deadlock retries","body":"Guard the cleanup path so retry resume does not block forever when the worktree record is missing.","files":["internal/reviewer/runner.go"]}]}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -8364,8 +8381,80 @@ func TestProcessClaimedItemCommentOnlyPublishesBlockingOutcome(t *testing.T) {
 	if len(github.issueCommentCalls) != 1 {
 		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
 	}
-	if !strings.Contains(github.issueCommentCalls[0].Body, "outcome=blocking") {
-		t.Fatalf("comment body = %q, want blocking outcome marker", github.issueCommentCalls[0].Body)
+	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary() error = %v", err)
+	}
+	if len(parsedSummary.Items) != 1 || parsedSummary.Items[0].Status != forge.ReviewItemStatusOpen {
+		t.Fatalf("parsed summary = %#v, want one open item", parsedSummary)
+	}
+}
+
+func TestProcessClaimedItemCommentOnlyUpdatesSingleReviewerSummaryCommentAndReusesIDs(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	existing := forge.NewReviewerSummary(2, []forge.ReviewItem{
+		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Keep ID", Body: "Still broken.", Files: []string{"old.go"}, LastSeenRoundID: 2},
+		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Replace me", Body: "Old shape.", Files: []string{"old.go"}, LastSeenRoundID: 2},
+	})
+	existingBody, err := renderReviewerSummaryComment(existing, "Previous summary")
+	if err != nil {
+		t.Fatalf("renderReviewerSummaryComment() error = %v", err)
+	}
+	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer", issueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Updated findings", Stdout: `__LOOPER_RESULT__={"summary":"Updated findings","outcome":"blocking","findings":[{"review_item_id":"R-001","title":"Keep ID","body":"Still broken after the latest patch.","files":["internal/reviewer/runner.go"]},{"title":"Split replacement","body":"This issue replaces the old broad item with a narrower actionable finding.","files":["internal/reviewer/runner.go"],"supersedes":["R-002"]}]}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if len(github.issueCommentCalls) != 0 {
+		t.Fatalf("issueCommentCalls = %#v, want no new summary comment", github.issueCommentCalls)
+	}
+	if len(github.updateIssueCommentCalls) != 1 || github.updateIssueCommentCalls[0].CommentID != 91 {
+		t.Fatalf("updateIssueCommentCalls = %#v, want existing summary comment updated", github.updateIssueCommentCalls)
+	}
+	parsed, err := forge.ParseReviewerSummary(github.updateIssueCommentCalls[0].Body)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary() error = %v", err)
+	}
+	if parsed.ReviewRoundID != 3 {
+		t.Fatalf("review_round_id = %d, want 3", parsed.ReviewRoundID)
+	}
+	if len(parsed.Items) != 3 {
+		t.Fatalf("items = %#v, want 3", parsed.Items)
+	}
+	if parsed.Items[0].ReviewItemID != "R-001" || parsed.Items[0].Status != forge.ReviewItemStatusOpen {
+		t.Fatalf("item0 = %#v, want reused open R-001", parsed.Items[0])
+	}
+	if parsed.Items[1].Status != forge.ReviewItemStatusSuperseded || parsed.Items[1].SupersededBy != "R-003" {
+		t.Fatalf("item1 = %#v, want superseded by R-003", parsed.Items[1])
+	}
+	if parsed.Items[2].ReviewItemID != "R-003" || len(parsed.Items[2].Supersedes) != 1 || parsed.Items[2].Supersedes[0] != "R-002" {
+		t.Fatalf("item2 = %#v, want new R-003 superseding R-002", parsed.Items[2])
+	}
+}
+
+func TestPublishCommentOnlyReviewFailsOnDuplicateReviewerSummaryComments(t *testing.T) {
+	t.Parallel()
+	existing := forge.NewReviewerSummary(1, []forge.ReviewItem{{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Old", Body: "Body", LastSeenRoundID: 1}})
+	body, err := renderReviewerSummaryComment(existing, "Existing")
+	if err != nil {
+		t.Fatalf("renderReviewerSummaryComment() error = %v", err)
+	}
+	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer", issueComments: []map[string]any{{"id": int64(1), "body": body}, {"id": int64(2), "body": body}}}
+	runner := New(Options{GitHub: github, CommentOnlyPublish: true})
+	pending := pendingReviewCheckpoint{HeadSHA: "abc123", Summary: "No actionable findings", Outcome: "clean", ReviewerSummaryJSON: `{"summary":"No actionable findings","outcome":"clean","findings":[]}`}
+	input := stepInput{Repo: "acme/looper", PRNumber: 42, Project: storage.ProjectRecord{RepoPath: "/tmp/repo"}}
+	if err := runner.publishCommentOnlyReview(context.Background(), input, pending, PullRequestDetail{}); err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("publishCommentOnlyReview() error = %v, want duplicate summary failure", err)
 	}
 }
 
@@ -8787,11 +8876,14 @@ type fakeGitHubGateway struct {
 	removeLabelErr                  error
 	issueCommentErr                 error
 	issueCommentResult              IssueCommentResult
+	listIssueCommentsErr            error
+	updateIssueCommentErr           error
 	reviewThreads                   []ReviewThread
 	listReviewThreadsCalls          int
 	viewHeadSHA                     string
 	headSHACalls                    int
 	issueCommentCalls               []IssueCommentInput
+	updateIssueCommentCalls         []UpdateIssueCommentInput
 	submitReviewCalls               []githubinfra.SubmitReviewInput
 	enableAutoMergeCalls            []githubinfra.EnableAutoMergeInput
 	removeIssueLabelCalls           []githubinfra.IssueLabelsInput
@@ -9070,6 +9162,43 @@ func (g *fakeGitHubGateway) CreateIssueComment(_ context.Context, input IssueCom
 		return g.issueCommentResult, nil
 	}
 	return IssueCommentResult{ID: int64(len(g.issueCommentCalls)), URL: fmt.Sprintf("https://github.com/%s/pull/%d#issuecomment-%d", input.Repo, input.IssueNumber, len(g.issueCommentCalls))}, nil
+}
+
+func (g *fakeGitHubGateway) ListIssueComments(_ context.Context, input ViewPullRequestInput) ([]IssueComment, error) {
+	if g.listIssueCommentsErr != nil {
+		return nil, g.listIssueCommentsErr
+	}
+	out := make([]IssueComment, 0, len(g.issueComments))
+	for i, comment := range g.issueComments {
+		body, _ := comment["body"].(string)
+		id, _ := comment["id"].(int64)
+		if id == 0 {
+			id = int64(i + 1)
+		}
+		out = append(out, IssueComment{ID: id, Body: body})
+	}
+	_ = input
+	return out, nil
+}
+
+func (g *fakeGitHubGateway) UpdateIssueComment(_ context.Context, input UpdateIssueCommentInput) error {
+	g.updateIssueCommentCalls = append(g.updateIssueCommentCalls, input)
+	if g.updateIssueCommentErr != nil {
+		return g.updateIssueCommentErr
+	}
+	for i := range g.issueComments {
+		id, _ := g.issueComments[i]["id"].(int64)
+		if id == 0 {
+			id = int64(i + 1)
+			g.issueComments[i]["id"] = id
+		}
+		if id == input.CommentID {
+			g.issueComments[i]["body"] = input.Body
+			return nil
+		}
+	}
+	g.issueComments = append(g.issueComments, map[string]any{"id": input.CommentID, "body": input.Body})
+	return nil
 }
 
 func (g *fakeGitHubGateway) SubmitReview(_ context.Context, input githubinfra.SubmitReviewInput) error {
