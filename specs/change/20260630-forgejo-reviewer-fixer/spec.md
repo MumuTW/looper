@@ -77,7 +77,7 @@ Depends on: Step 5
 
 ## Progress
 
-- [ ] Step 1 (AFK): Summary Protocol Core
+- [x] Step 1 (AFK): Summary Protocol Core
 - [ ] Step 2 (AFK): Reviewer Summary Publishing
 - [ ] Step 3 (AFK): Fixer Summary Consumption And Publishing
 - [ ] Step 4 (AFK): Forgejo Role Integration And Validation

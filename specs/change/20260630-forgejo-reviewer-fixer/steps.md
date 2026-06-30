@@ -2,7 +2,9 @@
 
 ## Step 1 (AFK): Summary Protocol Core
 
-<!-- Implementation and verification notes for the matching Plan step. -->
+- Added `internal/forge/summary_protocol.go` with shared Forgejo Reviewer/Fixer Summary v1 types, constants, marker rendering/parsing, single-comment extraction, schema-version checks, enum validation, Review Item ID uniqueness/link validation, and Fixer-result validation against Reviewer Summary open items.
+- Added focused tests in `internal/forge/summary_protocol_test.go` for render/parse round trips, missing/duplicate/invalid marker failures, schema/enum/round validation, duplicate Review Item IDs, superseded-link invariants, and Fixer missing/unknown/non-open result rejection.
+- Verified with `go test ./internal/forge` and `go test ./...`.
 
 ## Step 2 (AFK): Reviewer Summary Publishing
 
