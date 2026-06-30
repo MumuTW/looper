@@ -1,7 +1,7 @@
 ---
 id: 20260630-forgejo-reviewer-fixer
 name: Forgejo Reviewer Fixer
-status: planned
+status: implemented
 created: '2026-06-30'
 ---
 
