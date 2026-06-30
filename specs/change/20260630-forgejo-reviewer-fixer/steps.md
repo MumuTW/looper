@@ -19,7 +19,14 @@
 
 ## Step 3 (AFK): Fixer Summary Consumption And Publishing
 
-<!-- Implementation and verification notes for the matching Plan step. -->
+- Updated `internal/fixer/runner.go` so Fixer consumes Forgejo Reviewer Summary comments as the repair-work authority, converts only `open` Review Items into fix items, and fails fast on invalid or duplicated Reviewer Summary protocol state during the collect/resolve path.
+- Added Forgejo Fixer Summary publishing in the resolve-comments phase: validates one agent result/explanation per open Review Item, renders the `looper:forgejo-fixer-summary` v1 marker plus visible Markdown, creates or updates the single Fixer Summary top-level comment, and no-ops when the Reviewer Summary has zero open items.
+- Preserved the no-resolve protocol by short-circuiting Forgejo summary-backed fixer runs before GitHub-style review-thread view/reply/resolve mutation logic.
+- Added focused tests for Reviewer Summary open-item consumption, Fixer Summary validation/render inputs, and missing per-item agent-result rejection.
+- Verified with:
+  - `gofmt -w "internal/fixer/runner.go" "internal/fixer/runner_test.go"`
+  - `go test ./internal/fixer ./internal/forge`
+  - `go test ./...`
 
 ## Step 4 (AFK): Forgejo Role Integration And Validation
 

@@ -14,6 +14,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
@@ -153,6 +154,68 @@ func TestBuildFixerPromptPrefersRoundSpecificCommitSubject(t *testing.T) {
 	}
 	if strings.Contains(prompt, "For commits, keep commit subjects unchanged and add a commit body trailer") {
 		t.Fatalf("prompt still contains old conflicting commit-subject guidance:\n%s", prompt)
+	}
+}
+
+func TestCollectFixItemsFromForgejoReviewerSummaryOpenItemsOnly(t *testing.T) {
+	t.Parallel()
+
+	summary := forge.NewReviewerSummary(3, []forge.ReviewItem{
+		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", Files: []string{"internal/forge/summary_protocol.go"}, LastSeenRoundID: 3},
+		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusResolved, Title: "Old issue", Body: "Already fixed.", LastSeenRoundID: 2},
+	})
+	marker, err := forge.RenderReviewerSummary(summary)
+	if err != nil {
+		t.Fatalf("RenderReviewerSummary() error = %v", err)
+	}
+
+	items, err := collectFixItemsFromCheckpointForStep(fixerCheckpoint{Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(101), "body": "visible\n" + marker, "url": "https://forgejo.test/comment/101"}}}})
+	if err != nil {
+		t.Fatalf("collectFixItemsFromCheckpointForStep() error = %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "R-001" || items[0].ThreadID != "R-001" || items[0].Path != "internal/forge/summary_protocol.go" {
+		t.Fatalf("items = %#v, want one open Reviewer Summary item", items)
+	}
+}
+
+func TestBuildForgejoFixerSummaryValidatesOneResultPerOpenItem(t *testing.T) {
+	t.Parallel()
+
+	reviewer := forge.NewReviewerSummary(4, []forge.ReviewItem{
+		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: 4},
+	})
+	checkpoint := fixerCheckpoint{
+		Detail:       &checkpointDetail{HeadSHA: "head-1"},
+		FixItems:     []FixItem{{Type: "comment", ID: "R-001", ThreadID: "R-001", Summary: "Fix parsing"}},
+		FixItemsHash: "hash-1",
+		Repair:       &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "R-001", ThreadID: "R-001", Action: "fixed", Explanation: "Added strict parsing."}}},
+		ReconcileCommits: &checkpointReconcileCommits{
+			FinalHeadSHA:     "head-2",
+			WorkingTreeClean: true,
+		},
+	}
+
+	summary, err := buildForgejoFixerSummary(checkpoint, reviewer, lookupReplyExplanations(checkpoint))
+	if err != nil {
+		t.Fatalf("buildForgejoFixerSummary() error = %v", err)
+	}
+	if err := forge.ValidateFixerResultsForReviewerSummary(reviewer, summary); err != nil {
+		t.Fatalf("ValidateFixerResultsForReviewerSummary() error = %v", err)
+	}
+	if summary.ConsumedReviewRoundID != 4 || len(summary.Results) != 1 || summary.Results[0].ReviewItemID != "R-001" || summary.Results[0].Result != forge.FixerItemResultFixed {
+		t.Fatalf("summary = %#v", summary)
+	}
+}
+
+func TestBuildForgejoFixerSummaryFailsWhenAgentOmitsOpenItemResult(t *testing.T) {
+	t.Parallel()
+
+	reviewer := forge.NewReviewerSummary(4, []forge.ReviewItem{{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: 4}})
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: []FixItem{{Type: "comment", ID: "R-001", ThreadID: "R-001", Summary: "Fix parsing"}}, Repair: &checkpointRepair{}}
+
+	_, err := buildForgejoFixerSummary(checkpoint, reviewer, lookupReplyExplanations(checkpoint))
+	if err == nil || !strings.Contains(err.Error(), "missing result explanation") {
+		t.Fatalf("buildForgejoFixerSummary() error = %v, want missing result explanation", err)
 	}
 }
 

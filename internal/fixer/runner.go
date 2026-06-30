@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -2070,7 +2071,10 @@ func (r *Runner) runCollectFixesStep(input stepInput) (fixerCheckpoint, error) {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because it is not eligible", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
-	fixItems := collectFixItemsFromCheckpoint(checkpoint)
+	fixItems, err := collectFixItemsFromCheckpointForStep(checkpoint)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	}
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = hashFixItems(fixItems)
 	if len(fixItems) == 0 {
@@ -2494,6 +2498,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
+	if _, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	} else if ok {
+		return r.runForgejoFixerSummaryStep(ctx, input)
+	}
 	if checkpoint.Validation == nil || !checkpoint.Validation.Passed {
 		return checkpoint, &loopError{message: "resolve-comments requires successful validation", kind: FailureRetryableAfterResume}
 	}
@@ -2697,6 +2706,131 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	reviewerSummary, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	}
+	if !ok {
+		return checkpoint, &loopError{message: "forgejo fixer requires reviewer summary comment", kind: FailureNonRetryable}
+	}
+	openItems := forgejoOpenReviewItems(reviewerSummary)
+	if len(openItems) == 0 {
+		checkpoint.SkipReason = fmt.Sprintf("Skipped %s#%d because reviewer summary has no open items", input.Repo, input.PRNumber)
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, nil
+	}
+	if checkpoint.Validation == nil || !checkpoint.Validation.Passed {
+		return checkpoint, &loopError{message: "forgejo fixer summary requires successful validation", kind: FailureRetryableAfterResume}
+	}
+	if checkpoint.Push == nil {
+		return checkpoint, &loopError{message: "forgejo fixer summary requires push step to complete", kind: FailureRetryableAfterResume}
+	}
+	summary, err := buildForgejoFixerSummary(checkpoint, reviewerSummary, lookupReplyExplanations(checkpoint))
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if err := forge.ValidateFixerResultsForReviewerSummary(reviewerSummary, summary); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	body, err := renderForgejoFixerSummaryComment(summary)
+	if err != nil {
+		return checkpoint, err
+	}
+	comments := forgeCommentsFromCheckpointDetail(checkpoint.Detail)
+	if existing, _, err := forge.ParseUniqueFixerSummaryComment(comments); err == nil {
+		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existing.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+			return checkpoint, err
+		}
+		checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: existing.ID, URL: existing.HTMLURL, HeadSHA: summary.ObservedHeadSHA, FixItemsHash: checkpoint.FixItemsHash, State: "updated", UpdatedAt: r.nowISO()}
+	} else if strings.Contains(err.Error(), forge.FixerSummaryMarker+" comment is missing") {
+		created, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath})
+		if err != nil {
+			return checkpoint, err
+		}
+		checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: created.ID, URL: created.URL, HeadSHA: summary.ObservedHeadSHA, FixItemsHash: checkpoint.FixItemsHash, State: "created", UpdatedAt: r.nowISO()}
+		r.appendEvent(ctx, eventInput{eventType: "fixer.forgejo_summary.posted", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"commentId": created.ID, "url": created.URL, "reviewRoundId": summary.ConsumedReviewRoundID, "fixRoundId": summary.FixRoundID, "items": len(summary.Results)}})
+	} else {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	}
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	return checkpoint, nil
+}
+
+func buildForgejoFixerSummary(checkpoint fixerCheckpoint, reviewerSummary forge.ReviewerSummary, explanationByID map[string]string) (forge.FixerSummary, error) {
+	fixRoundID := nextForgejoFixRoundID(checkpoint.Detail)
+	results := make([]forge.FixerResult, 0)
+	fixItemsByID := map[string]FixItem{}
+	for _, item := range checkpoint.FixItems {
+		fixItemsByID[item.ID] = item
+	}
+	for _, reviewItem := range reviewerSummary.Items {
+		if reviewItem.Status != forge.ReviewItemStatusOpen {
+			continue
+		}
+		fixItem, ok := fixItemsByID[reviewItem.ReviewItemID]
+		if !ok {
+			return forge.FixerSummary{}, fmt.Errorf("forgejo fixer missing fix item for open review_item_id %q", reviewItem.ReviewItemID)
+		}
+		explanation := strings.TrimSpace(explanationByID[fixItem.ID])
+		if explanation == "" {
+			return forge.FixerSummary{}, fmt.Errorf("forgejo fixer missing result explanation for open review_item_id %q", reviewItem.ReviewItemID)
+		}
+		result := forge.FixerItemResultFixed
+		if checkpoint.Repair != nil {
+			for _, reply := range checkpoint.Repair.ReplyExplanations {
+				if reply.FixItemID != fixItem.ID {
+					continue
+				}
+				switch normalizeReplyAction(reply.Action) {
+				case string(replyActionDeclined):
+					result = forge.FixerItemResultDeclined
+				case string(replyActionFixed):
+					result = forge.FixerItemResultFixed
+				default:
+					result = forge.FixerItemResultDeferred
+				}
+				break
+			}
+		}
+		results = append(results, forge.FixerResult{ReviewItemID: reviewItem.ReviewItemID, Result: result, Explanation: explanation})
+	}
+	summary := forge.NewFixerSummary(fixRoundID, reviewerSummary.ReviewRoundID, results)
+	summary.ObservedHeadSHA = detailHeadSHA(checkpoint.Detail)
+	if evidence := resolveFixEvidence(checkpoint, nil, checkpoint.FixItemsHash); evidence != nil && evidence.HeadSHA != "" {
+		summary.Evidence = forge.FixerEvidence{HeadSHA: evidence.HeadSHA, Reachable: forge.EvidenceReachabilityVerified}
+	} else if checkpoint.ReconcileCommits != nil && checkpoint.ReconcileCommits.FinalHeadSHA != "" {
+		summary.Evidence = forge.FixerEvidence{HeadSHA: checkpoint.ReconcileCommits.FinalHeadSHA, Reachable: forge.EvidenceReachabilityUnverified}
+	}
+	return summary, forge.ValidateFixerSummary(summary)
+}
+
+func nextForgejoFixRoundID(detail *checkpointDetail) int {
+	comments := forgeCommentsFromCheckpointDetail(detail)
+	_, existing, err := forge.ParseUniqueFixerSummaryComment(comments)
+	if err != nil || existing.FixRoundID <= 0 {
+		return 1
+	}
+	return existing.FixRoundID + 1
+}
+
+func renderForgejoFixerSummaryComment(summary forge.FixerSummary) (string, error) {
+	marker, err := forge.RenderFixerSummary(summary)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	b.WriteString("**Looper Forgejo Fixer Summary**\n\n")
+	b.WriteString(fmt.Sprintf("Consumed Reviewer Summary round `%d`; Fixer Summary round `%d`.\n\n", summary.ConsumedReviewRoundID, summary.FixRoundID))
+	for _, result := range summary.Results {
+		b.WriteString(fmt.Sprintf("- `%s`: `%s` — %s\n", result.ReviewItemID, result.Result, strings.ReplaceAll(strings.TrimSpace(result.Explanation), "\n", " ")))
+	}
+	b.WriteString("\n")
+	b.WriteString(marker)
+	return strings.TrimSpace(b.String()), nil
 }
 
 // replyToFixedComment posts a reply on the review thread acknowledging the fix
@@ -5280,11 +5414,112 @@ func collectFixItemsFromCheckpoint(checkpoint fixerCheckpoint) []FixItem {
 	if checkpoint.Detail == nil {
 		return nil
 	}
+	if summary, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err == nil && ok {
+		return forgejoReviewerSummaryFixItems(summary)
+	}
 	return normalizeFixItems(checkpoint.Detail.Comments, checkpoint.Detail.Checks, checkpoint.Detail.HasConflicts)
 }
 
+func collectFixItemsFromCheckpointForStep(checkpoint fixerCheckpoint) ([]FixItem, error) {
+	if checkpoint.Detail == nil {
+		return nil, nil
+	}
+	if summary, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
+		return nil, err
+	} else if ok {
+		return forgejoReviewerSummaryFixItems(summary), nil
+	}
+	return normalizeFixItems(checkpoint.Detail.Comments, checkpoint.Detail.Checks, checkpoint.Detail.HasConflicts), nil
+}
+
 func collectFixItems(detail PullRequestDetail) []FixItem {
+	checkpoint := checkpointDetail{IssueComments: cloneObjectSlice(detail.IssueComments)}
+	if summary, ok, err := reviewerSummaryFromCheckpointDetail(&checkpoint); err == nil && ok {
+		return forgejoReviewerSummaryFixItems(summary)
+	}
 	return normalizeFixItems(detail.Comments, detail.Checks, detail.HasConflicts)
+}
+
+func reviewerSummaryFromCheckpointDetail(detail *checkpointDetail) (forge.ReviewerSummary, bool, error) {
+	comments := forgeCommentsFromCheckpointDetail(detail)
+	if !containsForgeSummaryMarker(comments, forge.ReviewerSummaryMarker) {
+		return forge.ReviewerSummary{}, false, nil
+	}
+	_, summary, err := forge.ParseUniqueReviewerSummaryComment(comments)
+	if err != nil {
+		return forge.ReviewerSummary{}, false, err
+	}
+	return summary, true, nil
+}
+
+func containsForgeSummaryMarker(comments []forge.Comment, marker string) bool {
+	prefix := "<!-- " + marker
+	for _, comment := range comments {
+		if strings.Contains(comment.Body, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func forgeCommentsFromCheckpointDetail(detail *checkpointDetail) []forge.Comment {
+	if detail == nil {
+		return nil
+	}
+	comments := make([]forge.Comment, 0, len(detail.IssueComments))
+	for _, raw := range detail.IssueComments {
+		body, _ := stringFromAny(raw["body"])
+		id := issueCommentDatabaseID(raw)
+		url, _ := stringFromAny(raw["url"])
+		if url == "" {
+			url, _ = stringFromAny(raw["html_url"])
+		}
+		updatedAt, _ := stringFromAny(raw["updatedAt"])
+		if updatedAt == "" {
+			updatedAt, _ = stringFromAny(raw["updated_at"])
+		}
+		login := issueCommentAuthorLogin(raw)
+		comments = append(comments, forge.Comment{ID: id, Body: body, HTMLURL: url, UpdatedAt: updatedAt, User: forge.Identity{Login: login}})
+	}
+	return comments
+}
+
+func forgejoReviewerSummaryFixItems(summary forge.ReviewerSummary) []FixItem {
+	items := make([]FixItem, 0)
+	for _, item := range summary.Items {
+		if item.Status != forge.ReviewItemStatusOpen {
+			continue
+		}
+		items = append(items, FixItem{
+			Type:              "comment",
+			ID:                strings.TrimSpace(item.ReviewItemID),
+			ThreadID:          strings.TrimSpace(item.ReviewItemID),
+			ThreadFingerprint: normalizeThreadFingerprint("forgejo-reviewer-summary", strings.TrimSpace(item.ReviewItemID), strings.TrimSpace(item.ReviewItemID)),
+			Summary:           strings.TrimSpace(item.Title + "\n\n" + item.Body),
+			Files:             cloneStrings(item.Files),
+			Path:              firstNonEmptyFromSlice(item.Files),
+		})
+	}
+	return items
+}
+
+func forgejoOpenReviewItems(summary forge.ReviewerSummary) []forge.ReviewItem {
+	items := make([]forge.ReviewItem, 0)
+	for _, item := range summary.Items {
+		if item.Status == forge.ReviewItemStatusOpen {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func firstNonEmptyFromSlice(values []string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasConflicts bool) []FixItem {
