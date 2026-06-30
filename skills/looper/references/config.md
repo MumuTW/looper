@@ -132,8 +132,9 @@ Forgejo MVP role limits:
 
 - planner and worker are supported
 - worker only processes issues already assigned to the current Forgejo user; it does not self-assign
-- reviewer discovers by labels and publishes comment-only PR comments; default normal-review label is `looper:review`, while spec PRs use `looper:spec-reviewing`
-- fixer, coordinator, auto-merge, native reviews, review requests, thread resolution, routed network mode, and webhooks are unsupported for Forgejo
+- reviewer discovers by labels and publishes a top-level Reviewer Summary PR comment; default normal-review label is `looper:review`, while spec PRs use `looper:spec-reviewing`
+- fixer consumes open items from the Reviewer Summary and publishes a top-level Fixer Summary PR comment; it does not resolve native review threads
+- coordinator, auto-merge, native reviews, review requests, thread resolution, routed network mode, and webhooks are unsupported for Forgejo
 
 ## Role model guidance
 

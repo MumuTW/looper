@@ -194,7 +194,7 @@ repoPath = "/absolute/path/to/repo"
 Looper supports two provider kinds:
 
 - `github` — existing default behavior, backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
-- `forgejo` — REST-backed MVP for planner, worker, and comment-only reviewer flows. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
+- `forgejo` — REST-backed MVP for planner, worker, and summary-comment reviewer/fixer flows. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
 
 Forgejo provider example:
 
@@ -224,10 +224,10 @@ Forgejo rules:
 - Forgejo projects require explicit `provider` and `repo` (`owner/name`).
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
 - Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
-- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses label discovery and comment-only publish, and fixer/coordinator/auto-merge/thread resolution stay disabled.
+- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses label discovery and summary-comment publish, fixer uses the no-resolve summary-comment protocol, and coordinator/auto-merge/thread resolution stay disabled.
 - Explicitly re-enabling unsupported Forgejo behavior fails config validation instead of silently downgrading behavior.
 
-Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label.
+Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Reviewer writes the top-level Reviewer Summary comment that Fixer treats as its repair-work authority; Fixer writes a top-level Fixer Summary comment and never resolves native Forgejo review threads.
 
 ### Forgejo live sandbox e2e
 
@@ -830,8 +830,9 @@ Forgejo provider profile differences:
 
 - planner discovers labeled issues through the Forgejo REST provider
 - worker discovers only issues already assigned to the current Forgejo user and does not claim work by adding itself as assignee
-- reviewer discovers by configured labels and publishes a top-level comment-only review; it does not use review requests or native PR review events
-- fixer, coordinator, auto-merge, review-thread resolution, routed network mode, and webhook modes are unsupported for Forgejo in the MVP and fail fast if explicitly enabled
+- reviewer discovers by configured labels and publishes a top-level Reviewer Summary comment; it does not use review requests or native PR review events
+- fixer consumes open items from the Reviewer Summary and publishes a top-level Fixer Summary comment without native review-thread resolution
+- coordinator, auto-merge, review-thread resolution, routed network mode, and webhook modes are unsupported for Forgejo in the MVP and fail fast if explicitly enabled
 
 Common fields:
 

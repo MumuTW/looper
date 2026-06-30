@@ -83,4 +83,7 @@
 
 ## Step 6 (AFK): Documentation Sync
 
-<!-- Implementation and verification notes for the matching Plan step. -->
+- Updated user-facing Forgejo support wording in `README.md`, `docs/users-guide.md`, and `docs/configuration.md` from comment-only reviewer / unsupported fixer to the implemented summary-comment Reviewer/Fixer protocol.
+- Documented that Forgejo Reviewer publishes a top-level Reviewer Summary comment, Forgejo Fixer consumes only open Reviewer Summary items, publishes a top-level Fixer Summary comment, and does not use native review-thread resolution.
+- Kept the Looper skill config reference in `skills/looper/references/config.md` aligned with the same Forgejo role limits.
+- Verified documentation references with targeted Forgejo markdown searches and `go test ./internal/forge ./internal/reviewer ./internal/fixer ./internal/runtime ./internal/config`.
