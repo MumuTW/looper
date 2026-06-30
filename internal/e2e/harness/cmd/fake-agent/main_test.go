@@ -40,3 +40,14 @@ func TestPromptReviewThreadRepliesFallsBackWhenRequested(t *testing.T) {
 		t.Fatal("LOOPER_PROMPT env should remain set by test")
 	}
 }
+
+func TestPromptReviewThreadRepliesPreservesForgejoReviewerSummaryIDs(t *testing.T) {
+	t.Setenv(envLooperPrompt, "Fix items:\n- {\"type\":\"comment\",\"id\":\"R-001\",\"threadId\":\"R-001\"}")
+	replies := promptReviewThreadReplies("done", false, false)
+	if len(replies) != 1 {
+		t.Fatalf("len(replies) = %d, want 1", len(replies))
+	}
+	if replies[0]["fixItemId"] != "R-001" || replies[0]["threadId"] != "R-001" {
+		t.Fatalf("replies = %#v, want forgejo reviewer summary ids preserved", replies)
+	}
+}

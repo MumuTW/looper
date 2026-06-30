@@ -59,6 +59,12 @@ type forgejoSandboxPR struct {
 	HeadSHA    string
 }
 
+type forgejoSandboxSummaryComment struct {
+	ID   int64
+	URL  string
+	Body string
+}
+
 func TestForgejoSandboxWorkerCreatesPullRequest(t *testing.T) {
 	bins := harness.MustBinaries(t)
 	sb := requireForgejoSandboxConfig(t)
@@ -106,8 +112,61 @@ func TestForgejoSandboxWorkerCreatesPullRequest(t *testing.T) {
 }
 
 func TestForgejoSandboxFixerResolvesReviewThread(t *testing.T) {
-	requireForgejoSandboxConfig(t)
-	t.Skip("Forgejo fixer review-thread resolution is unsupported by the current MVP capability set")
+	bins := harness.MustBinaries(t)
+	sb := requireForgejoSandboxConfig(t)
+	repo := ensureForgejoSandboxProjectRepo(t, sb)
+	pr := createForgejoSandboxPR(t, sb, repo, "fixer summary protocol")
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("forgejo sandbox pr=%s branch=%s", pr.URL, pr.HeadBranch)
+		}
+	})
+	defer cleanupForgejoSandboxPR(t, sb, pr.Number, pr.HeadBranch)
+
+	reviewerHome := harness.NewTempHome(t)
+	reviewerCfg := forgejoReviewerSandboxConfig(t, bins, reviewerHome, repo, harness.NewFakeAgent(t, bins), harness.MustFreePort(t), sb, "forgejo-reviewer-open")
+	reviewerRun := runForgejoSandboxLoop(t, bins, reviewerHome, sb, reviewerCfg, map[string]any{"projectId": "project_1", "type": "reviewer", "targetType": "pull_request", "repo": sb.Repo, "prNumber": pr.Number, "metadata": map[string]any{"manual": true}}, 90*time.Second)
+	if reviewerRun.Status != "success" {
+		t.Fatalf("first reviewer status = %s, want success (pr=%s error=%q checkpoint=%s)", reviewerRun.Status, pr.URL, stringValue(reviewerRun.ErrorMessage), stringValue(reviewerRun.CheckpointJSON))
+	}
+	reviewerComment, reviewerSummary := requireSingleForgejoReviewerSummary(t, sb, pr.Number)
+	if len(reviewerSummary.Items) != 1 || reviewerSummary.Items[0].Status != forge.ReviewItemStatusOpen {
+		t.Fatalf("reviewer summary = %#v, want one open item", reviewerSummary)
+	}
+
+	fixerHome := harness.NewTempHome(t)
+	fixerCfg := forgejoFixerSandboxConfig(t, bins, fixerHome, repo, harness.NewFakeAgent(t, bins), harness.MustFreePort(t), sb, "commit")
+	fixerRun := runForgejoSandboxLoop(t, bins, fixerHome, sb, fixerCfg, map[string]any{"projectId": "project_1", "type": "fixer", "targetType": "pull_request", "repo": sb.Repo, "prNumber": pr.Number}, 90*time.Second)
+	if fixerRun.Status != "success" {
+		t.Fatalf("fixer status = %s, want success (pr=%s error=%q checkpoint=%s)", fixerRun.Status, pr.URL, stringValue(fixerRun.ErrorMessage), stringValue(fixerRun.CheckpointJSON))
+	}
+	fixerComment, fixerSummary := requireSingleForgejoFixerSummary(t, sb, pr.Number)
+	if fixerSummary.ConsumedReviewRoundID != reviewerSummary.ReviewRoundID {
+		t.Fatalf("fixer consumed_review_round_id = %d, want %d", fixerSummary.ConsumedReviewRoundID, reviewerSummary.ReviewRoundID)
+	}
+	if len(fixerSummary.Results) != 1 || fixerSummary.Results[0].ReviewItemID != reviewerSummary.Items[0].ReviewItemID {
+		t.Fatalf("fixer summary = %#v, want one result matching reviewer item", fixerSummary)
+	}
+
+	reviewerHome2 := harness.NewTempHome(t)
+	reviewerCfg2 := forgejoReviewerSandboxConfig(t, bins, reviewerHome2, repo, harness.NewFakeAgent(t, bins), harness.MustFreePort(t), sb, "forgejo-reviewer-clean")
+	reviewerRun2 := runForgejoSandboxLoop(t, bins, reviewerHome2, sb, reviewerCfg2, map[string]any{"projectId": "project_1", "type": "reviewer", "targetType": "pull_request", "repo": sb.Repo, "prNumber": pr.Number, "metadata": map[string]any{"manual": true}}, 90*time.Second)
+	if reviewerRun2.Status != "success" {
+		t.Fatalf("second reviewer status = %s, want success (pr=%s error=%q checkpoint=%s)", reviewerRun2.Status, pr.URL, stringValue(reviewerRun2.ErrorMessage), stringValue(reviewerRun2.CheckpointJSON))
+	}
+	updatedReviewerComment, updatedReviewerSummary := requireSingleForgejoReviewerSummary(t, sb, pr.Number)
+	if updatedReviewerComment.ID != reviewerComment.ID {
+		t.Fatalf("reviewer summary comment id = %d, want reused %d", updatedReviewerComment.ID, reviewerComment.ID)
+	}
+	if updatedReviewerSummary.ReviewRoundID <= reviewerSummary.ReviewRoundID {
+		t.Fatalf("review_round_id = %d, want > %d", updatedReviewerSummary.ReviewRoundID, reviewerSummary.ReviewRoundID)
+	}
+	if len(updatedReviewerSummary.Items) != 1 || updatedReviewerSummary.Items[0].ReviewItemID != reviewerSummary.Items[0].ReviewItemID || updatedReviewerSummary.Items[0].Status != forge.ReviewItemStatusResolved {
+		t.Fatalf("updated reviewer summary = %#v, want resolved prior item", updatedReviewerSummary)
+	}
+	if fixerComment.ID == 0 || !strings.Contains(fixerComment.Body, forge.FixerSummaryMarker) {
+		t.Fatalf("fixer summary comment = %#v, want marker", fixerComment)
+	}
 }
 
 func TestForgejoSandboxNoDiffPathsDoNotOpenOrResolve(t *testing.T) {
@@ -326,6 +385,27 @@ func forgejoWorkerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home 
 	return cfg
 }
 
+func forgejoReviewerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeAgent harness.FakeAgent, port int, sb forgejoSandboxConfig, agentMode string) config.Config {
+	tb.Helper()
+	cfg := forgejoWorkerSandboxConfig(tb, bins, home, repo, fakeAgent, port, sb, agentMode)
+	cfg.Defaults.OpenPRStrategy = config.OpenPRStrategyManual
+	cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
+	cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	cfg.Roles.Reviewer.Discovery.Triggers.LabelMode = config.LabelModeAll
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = config.ReviewerReviewEventComment
+	return cfg
+}
+
+func forgejoFixerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeAgent harness.FakeAgent, port int, sb forgejoSandboxConfig, agentMode string) config.Config {
+	tb.Helper()
+	cfg := forgejoWorkerSandboxConfig(tb, bins, home, repo, fakeAgent, port, sb, agentMode)
+	cfg.Defaults.OpenPRStrategy = config.OpenPRStrategyManual
+	cfg.Defaults.AllowRiskyFixes = true
+	cfg.Roles.Fixer.Triggers.AuthorFilter = config.FixerAuthorFilterAny
+	return cfg
+}
+
 func createForgejoSandboxIssue(tb testing.TB, sb forgejoSandboxConfig, scenario string) forgejoSandboxIssue {
 	tb.Helper()
 	title := sb.TitlePrefix + " " + scenario
@@ -343,6 +423,43 @@ func createForgejoSandboxIssue(tb testing.TB, sb forgejoSandboxConfig, scenario 
 		tb.Fatalf("create forgejo sandbox issue: %v", err)
 	}
 	return forgejoSandboxIssue{Number: issue.Number, URL: issue.HTMLURL, Title: issue.Title}
+}
+
+func createForgejoSandboxPR(tb testing.TB, sb forgejoSandboxConfig, repo harness.SeededRepo, scenario string) forgejoSandboxPR {
+	tb.Helper()
+	branch := sb.BranchPrefix + "-" + strings.ReplaceAll(strings.ToLower(scenario), " ", "-")
+	filePath := filepath.Join(repo.Path, "sandbox", "forgejo-summary-protocol.txt")
+	runSandboxCommandMust(tb, repo.Path, sb.CmdEnv, "git", "checkout", "main")
+	runSandboxCommandMust(tb, repo.Path, sb.CmdEnv, "git", "pull", "--ff-only", "origin", "main")
+	runSandboxCommandMust(tb, repo.Path, sb.CmdEnv, "git", "checkout", "-B", branch)
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		tb.Fatalf("mkdir forgejo sandbox dir: %v", err)
+	}
+	if err := os.WriteFile(filePath, []byte(fmt.Sprintf("sandbox reviewer target %s\n", sb.RunID)), 0o644); err != nil {
+		tb.Fatalf("write forgejo sandbox file: %v", err)
+	}
+	relPath := filepath.ToSlash(strings.TrimPrefix(filePath, repo.Path+string(os.PathSeparator)))
+	runSandboxCommandMust(tb, repo.Path, sb.CmdEnv, "git", "add", relPath)
+	title := sb.TitlePrefix + " " + scenario
+	runSandboxCommandMust(tb, repo.Path, sb.CmdEnv, "git", "commit", "-m", title)
+	headSHA := strings.TrimSpace(runSandboxCommandMust(tb, repo.Path, sb.CmdEnv, "git", "rev-parse", "HEAD"))
+	runSandboxCommandMust(tb, repo.Path, sb.CmdEnv, "git", "push", "-u", "origin", branch)
+	var pr struct {
+		Number  int64  `json:"number"`
+		HTMLURL string `json:"html_url"`
+		Title   string `json:"title"`
+	}
+	body := fmt.Sprintf("Sandbox PR for %s (%s)", scenario, sb.RunID)
+	if err := forgejoSandboxAPI(context.Background(), sb, http.MethodPost, "repos/"+sb.Repo+"/pulls", map[string]any{"title": title, "body": body, "head": branch, "base": repo.DefaultBranch}, &pr); err != nil {
+		tb.Fatalf("create forgejo sandbox pr: %v", err)
+	}
+	if _, err := forgejoSandboxEnsureLabel(context.Background(), sb, "looper:review", "0e8a16", "Looper reviewer discovery label"); err != nil {
+		tb.Fatalf("ensure forgejo reviewer label: %v", err)
+	}
+	if _, err := sb.Client.AddIssueLabels(context.Background(), pr.Number, []string{"looper:review"}); err != nil {
+		tb.Fatalf("label forgejo sandbox pr: %v", err)
+	}
+	return forgejoSandboxPR{Number: pr.Number, URL: pr.HTMLURL, Title: pr.Title, HeadBranch: branch, HeadSHA: headSHA}
 }
 
 func findForgejoSandboxPRsByTitle(tb testing.TB, sb forgejoSandboxConfig, title string) []forgejoSandboxPR {
@@ -387,6 +504,51 @@ func cleanupForgejoSandboxPR(tb testing.TB, sb forgejoSandboxConfig, prNumber in
 	if strings.TrimSpace(branch) != "" {
 		_ = forgejoSandboxAPI(context.Background(), sb, http.MethodDelete, "repos/"+sb.Repo+"/branches/"+url.PathEscape(branch), nil, nil)
 	}
+}
+
+func runForgejoSandboxLoop(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, sb forgejoSandboxConfig, cfg config.Config, payload map[string]any, timeout time.Duration) runView {
+	tb.Helper()
+	harness.WriteConfig(tb, home.ConfigPath, cfg, nil)
+	proc := harness.StartLooperd(tb, bins, home, home.ConfigPath, forgejoSandboxEnvMap(sb), cfg.Server.Host, cfg.Server.Port)
+	defer proc.Stop(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := proc.WaitForReady(ctx); err != nil {
+		tb.Fatalf("wait for ready: %v", err)
+	}
+	client := newAPIClient(proc.BaseURL())
+	var created struct {
+		ID string `json:"id"`
+	}
+	client.post(tb, "/api/v1/loops", payload, &created)
+	return waitForRunTerminal(tb, client, created.ID, timeout)
+}
+
+func listForgejoSandboxPRComments(tb testing.TB, sb forgejoSandboxConfig, prNumber int64) []forge.Comment {
+	tb.Helper()
+	comments, err := sb.Client.ListIssueComments(context.Background(), prNumber)
+	if err != nil {
+		tb.Fatalf("list forgejo sandbox PR comments: %v", err)
+	}
+	return comments
+}
+
+func requireSingleForgejoReviewerSummary(tb testing.TB, sb forgejoSandboxConfig, prNumber int64) (forgejoSandboxSummaryComment, forge.ReviewerSummary) {
+	tb.Helper()
+	comment, summary, err := forge.ParseUniqueReviewerSummaryComment(listForgejoSandboxPRComments(tb, sb, prNumber))
+	if err != nil {
+		tb.Fatalf("parse unique reviewer summary comment: %v", err)
+	}
+	return forgejoSandboxSummaryComment{ID: comment.ID, URL: comment.HTMLURL, Body: comment.Body}, summary
+}
+
+func requireSingleForgejoFixerSummary(tb testing.TB, sb forgejoSandboxConfig, prNumber int64) (forgejoSandboxSummaryComment, forge.FixerSummary) {
+	tb.Helper()
+	comment, summary, err := forge.ParseUniqueFixerSummaryComment(listForgejoSandboxPRComments(tb, sb, prNumber))
+	if err != nil {
+		tb.Fatalf("parse unique fixer summary comment: %v", err)
+	}
+	return forgejoSandboxSummaryComment{ID: comment.ID, URL: comment.HTMLURL, Body: comment.Body}, summary
 }
 
 func forgejoSandboxEnsureLabel(ctx context.Context, sb forgejoSandboxConfig, name, color, description string) (int64, error) {

@@ -8357,6 +8357,52 @@ func TestProcessClaimedItemCommentOnlyPublishesCleanNoopWithoutReactionOrLabelRe
 	}
 }
 
+func TestProcessClaimedItemForgejoProjectInfersCommentOnlyForCleanNoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`, ParseStatus: "parsed"}}}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: "/tmp/repos/looper"}}
+	cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
+	cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = config.ReviewerReviewEventComment
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if github.reviewMarkerCalls != 0 {
+		t.Fatalf("reviewMarkerCalls = %d, want none for inferred Forgejo comment-only clean noop", github.reviewMarkerCalls)
+	}
+	if len(github.issueCommentCalls) != 1 {
+		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
+	}
+	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary() error = %v", err)
+	}
+	if len(parsedSummary.Items) != 0 {
+		t.Fatalf("parsed summary items = %#v, want none", parsedSummary.Items)
+	}
+}
+
 func TestProcessClaimedItemCommentOnlyPublishesBlockingOutcome(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

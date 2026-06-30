@@ -87,6 +87,22 @@ func main() {
 		printCompletion(marker, map[string]any{"summary": "fake agent wrote file", "changedFiles": []string{path}})
 	case "success-no-diff":
 		printCompletion(marker, map[string]any{"summary": "fake agent no diff"})
+	case "forgejo-reviewer-open":
+		printCompletion(marker, map[string]any{
+			"summary": "Found actionable Forgejo review items",
+			"outcome": "non_blocking",
+			"findings": []map[string]any{{
+				"title": "Repair sandbox target file",
+				"body":  "The sandbox target file still needs the fake-agent repair applied.",
+				"files": []string{"sandbox/forgejo-summary-protocol.txt"},
+			}},
+		})
+	case "forgejo-reviewer-clean":
+		printCompletion(marker, map[string]any{
+			"summary":  "No actionable findings remain after the Forgejo fixer round",
+			"outcome":  "clean",
+			"findings": []map[string]any{},
+		})
 	case "modify-file":
 		path := envOr(envFakeAgentModifyFile, "README.md")
 		mustAppendFile(path, []byte("modified by fake agent\n"))
@@ -287,6 +303,10 @@ func parsePromptFixItems(prompt string) []promptFixItem {
 
 func fetchObservedThreadHashes(items []promptFixItem) map[string]string {
 	threadHashes := make(map[string]string, len(items))
+	ghPath := strings.TrimSpace(os.Getenv(envFakeAgentGHPath))
+	if ghPath == "" {
+		return threadHashes
+	}
 	for _, item := range items {
 		threadID := strings.TrimSpace(item.ThreadID)
 		if threadID == "" {
@@ -314,7 +334,6 @@ func fetchObservedThreadHashes(items []promptFixItem) map[string]string {
 			if cursor != "" {
 				args = append(args, "-F", "after="+cursor)
 			}
-			ghPath := envOr(envFakeAgentGHPath, "gh")
 			output := mustOutput(ghPath, args...)
 			var response ghThreadCommentsResponse
 			if err := json.Unmarshal([]byte(output), &response); err != nil {

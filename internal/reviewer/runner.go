@@ -2732,20 +2732,22 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
+		if r.commentOnlyPublishForProject(input.Project.ID) {
+			completion, err := parseReviewerCommentOnlyCompletion(result)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			payload, err := json.Marshal(completion)
+			if err != nil {
+				return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
+			}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload), CleanNoop: true}
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, nil
+		}
 		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
 		if policy.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
-			if r.commentOnlyPublishForProject(input.Project.ID) {
-				completion, err := parseReviewerCommentOnlyCompletion(result)
-				if err != nil {
-					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-				}
-				payload, err := json.Marshal(completion)
-				if err != nil {
-					return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
-				}
-				checkpoint.PendingReview.ReviewerSummaryJSON = string(payload)
-			}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -2763,17 +2765,6 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
-		if r.commentOnlyPublishForProject(input.Project.ID) {
-			completion, err := parseReviewerCommentOnlyCompletion(result)
-			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-			}
-			payload, err := json.Marshal(completion)
-			if err != nil {
-				return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
-			}
-			checkpoint.PendingReview.ReviewerSummaryJSON = string(payload)
-		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}

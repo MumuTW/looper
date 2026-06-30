@@ -38,20 +38,48 @@
 
 ## Step 5 (AFK): EAG Validation
 
-Record the EAG in detail here during implementation:
-
 - Contract E2E workflows/commands run:
+  - `go build ./...`
+  - `go vet ./...`
+  - `go test ./internal/e2e/forgejocontract -count=1`
+  - `go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1`
+  - `go test ./...`
 - Contract E2E observations:
+  - Forgejo contract/integration coverage passed after normalizing module metadata with `go mod tidy`.
+  - Added the missing real-sandbox summary-protocol slice and supporting fake-agent/test helpers, then reran `go test ./internal/e2e/...` successfully.
 - Sandbox repository: `https://code.powerformer.net/core/looper-sandbox`
 - Sandbox operating reference: `specs/change/20260622-forgejo-provider-e2e/real-agent-e2e.md`
 - Isolated runtime/config validation/daemon observation notes:
+  - Live run used the gated local sandbox env from `e2e/.env`, but forced `/opt/homebrew/bin/go` first on `PATH` and unset Go-specific env overrides so the repo used Go 1.26 instead of the older Go binary exposed by the sandbox env file.
+  - Live validation command: `bash -lc 'set -a; . "e2e/.env"; set +a; export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:$PATH"; unset GOFLAGS GO111MODULE GOPROXY GOSUMDB GOPRIVATE GOPATH GOMODCACHE GOWORK GOROOT GOTOOLCHAIN; go test -run "^TestForgejoSandboxFixerResolvesReviewThread$" ./internal/e2e -count=1 -v'`
+  - The sandbox test used isolated temp homes/worktrees and bounded daemon runs for reviewer → fixer → reviewer, matching the real-agent e2e operating pattern.
 - Sandbox PR/branch/artifacts used:
+  - `TestForgejoSandboxFixerResolvesReviewThread` created an ephemeral sandbox PR with the `looper-e2e:<runID>` title prefix and `looper-e2e-<runID>-fixer-summary-protocol` branch naming, then auto-closed the PR and deleted the branch on success.
+  - The run used three isolated temp homes (reviewer-open, fixer, reviewer-clean) plus fake-agent artifact dirs under the test temp root.
 - Reviewer Summary comment observed:
+  - Reviewer round 1 published exactly one top-level PR comment containing the visible `Looper Forgejo Reviewer Summary` markdown plus the embedded `<!-- looper:forgejo-reviewer-summary ... -->` JSON marker.
+  - Reviewer round 2 updated the same summary comment in place and marked the prior `R-001` item `resolved`.
 - Fixer Summary comment observed:
+  - Fixer published exactly one top-level PR comment containing the visible `Looper Forgejo Fixer Summary` markdown plus the embedded `<!-- looper:forgejo-fixer-summary ... -->` JSON marker.
+  - The Fixer Summary consumed the Reviewer Summary open item and recorded a single result for `R-001`.
 - No-resolve/native-review mutation observations:
+  - Forgejo summary-protocol validation completed without native review-thread resolve/unresolve APIs.
+  - The live sandbox path stayed on top-level PR comments for Reviewer/Fixer protocol state; no native review resolution behavior was required or asserted.
 - Issues discovered during EAG:
+  - `go build ./...` initially failed because `go.mod`/`go.sum` were out of sync.
+  - The repository had no real Forgejo sandbox coverage for the new reviewer/fixer summary protocol.
+  - The initial sandbox reviewer setup used the wrong review label/path for Forgejo summary publishing.
+  - The fake-agent commit mode tried to fetch observed review-thread hashes even when no explicit GitHub CLI path was configured.
+  - The clean reviewer sandbox helper initially used GitHub-style APPROVE semantics instead of Forgejo comment-only review events.
 - Fixes made during EAG:
+  - Ran `go mod tidy` to restore buildable module metadata.
+  - Added `TestForgejoSandboxFixerResolvesReviewThread` plus Forgejo sandbox helper/config coverage in `internal/e2e/forgejo_sandbox_test.go` and updated `internal/e2e/forgejo_mirror_inventory_test.go`.
+  - Added bounded fake-agent modes for Forgejo reviewer summary rounds in `internal/e2e/harness/cmd/fake-agent/main.go` plus targeted fake-agent tests.
+  - Fixed sandbox reviewer setup to use the Forgejo comment-only `looper:review` path, manual reviewer loops, and COMMENT/COMMENT review events.
+  - Guarded fake-agent thread-hash fetching behind an explicit `LOOPER_E2E_FAKE_AGENT_GH_PATH` and added reviewer regression coverage for inferred Forgejo comment-only clean handling.
 - Cleanup status:
+  - Successful live sandbox runs auto-closed the ephemeral PR and deleted the ephemeral branch.
+  - Follow-up read-only API inspection for recently closed matching PRs returned `403`, so post-cleanup IDs were not retained outside the test logs.
 
 ## Step 6 (AFK): Documentation Sync
 
