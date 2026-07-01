@@ -2729,6 +2729,18 @@ func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput
 	if checkpoint.Push == nil {
 		return checkpoint, &loopError{message: "forgejo fixer summary requires push step to complete", kind: FailureRetryableAfterResume}
 	}
+	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
+	reviewerSummary, ok, err = reviewerSummaryFromCheckpointDetail(checkpoint.Detail)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	}
+	if !ok {
+		return checkpoint, &loopError{message: "forgejo fixer requires reviewer summary comment", kind: FailureNonRetryable}
+	}
 	summary, err := buildForgejoFixerSummary(checkpoint, reviewerSummary, lookupReplyExplanations(checkpoint))
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2740,21 +2752,28 @@ func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput
 	if err != nil {
 		return checkpoint, err
 	}
-	comments := forgeCommentsFromCheckpointDetail(checkpoint.Detail)
-	if existing, _, err := forge.ParseUniqueFixerSummaryComment(comments); err == nil {
-		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existing.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+	if checkpoint.SummaryComment != nil && checkpoint.SummaryComment.CommentID != 0 {
+		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: checkpoint.SummaryComment.CommentID, Body: body, CWD: input.Project.RepoPath}); err != nil {
 			return checkpoint, err
 		}
-		checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: existing.ID, URL: existing.HTMLURL, HeadSHA: summary.ObservedHeadSHA, FixItemsHash: checkpoint.FixItemsHash, State: "updated", UpdatedAt: r.nowISO()}
-	} else if strings.Contains(err.Error(), forge.FixerSummaryMarker+" comment is missing") {
-		created, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath})
-		if err != nil {
-			return checkpoint, err
-		}
-		checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: created.ID, URL: created.URL, HeadSHA: summary.ObservedHeadSHA, FixItemsHash: checkpoint.FixItemsHash, State: "created", UpdatedAt: r.nowISO()}
-		r.appendEvent(ctx, eventInput{eventType: "fixer.forgejo_summary.posted", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"commentId": created.ID, "url": created.URL, "reviewRoundId": summary.ConsumedReviewRoundID, "fixRoundId": summary.FixRoundID, "items": len(summary.Results)}})
+		checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: checkpoint.SummaryComment.CommentID, URL: checkpoint.SummaryComment.URL, HeadSHA: summary.ObservedHeadSHA, FixItemsHash: checkpoint.FixItemsHash, State: "updated", UpdatedAt: r.nowISO()}
 	} else {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+		comments := forgeCommentsFromCheckpointDetail(checkpoint.Detail)
+		if existing, _, err := forge.ParseUniqueFixerSummaryComment(comments); err == nil {
+			if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existing.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+				return checkpoint, err
+			}
+			checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: existing.ID, URL: existing.HTMLURL, HeadSHA: summary.ObservedHeadSHA, FixItemsHash: checkpoint.FixItemsHash, State: "updated", UpdatedAt: r.nowISO()}
+		} else if strings.Contains(err.Error(), forge.FixerSummaryMarker+" comment is missing") {
+			created, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath})
+			if err != nil {
+				return checkpoint, err
+			}
+			checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: created.ID, URL: created.URL, HeadSHA: summary.ObservedHeadSHA, FixItemsHash: checkpoint.FixItemsHash, State: "created", UpdatedAt: r.nowISO()}
+			r.appendEvent(ctx, eventInput{eventType: "fixer.forgejo_summary.posted", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"commentId": created.ID, "url": created.URL, "reviewRoundId": summary.ConsumedReviewRoundID, "fixRoundId": summary.FixRoundID, "items": len(summary.Results)}})
+		} else {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+		}
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil

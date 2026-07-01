@@ -6891,6 +6891,86 @@ func TestPublishRoundSummaryCommentPostsForAgentEvidenceWithoutLocalNewCommits(t
 	}
 }
 
+func TestRunForgejoFixerSummaryStepRefreshesLiveSummaryComment(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	reviewerSummary := forge.NewReviewerSummary(2, []forge.ReviewItem{{
+		ReviewItemID:    "R-001",
+		Status:          forge.ReviewItemStatusOpen,
+		Title:           "Keep fixer summary idempotent",
+		Body:            "Refresh live comments before choosing create vs update.",
+		LastSeenRoundID: 2,
+	}})
+	reviewerMarker, err := forge.RenderReviewerSummary(reviewerSummary)
+	if err != nil {
+		t.Fatalf("RenderReviewerSummary() error = %v", err)
+	}
+	existingFixerBody, err := renderForgejoFixerSummaryComment(forge.NewFixerSummary(3, reviewerSummary.ReviewRoundID, []forge.FixerResult{{
+		ReviewItemID: "R-001",
+		Result:       forge.FixerItemResultFixed,
+		Explanation:  "Earlier fixer run result.",
+	}}))
+	if err != nil {
+		t.Fatalf("renderForgejoFixerSummaryComment() error = %v", err)
+	}
+	staleDetail := &checkpointDetail{
+		HeadSHA:       "head-sha",
+		HeadRefName:   "reviewer-fixer",
+		BaseRefName:   "main",
+		IssueComments: []map[string]any{{"id": int64(101), "body": reviewerMarker, "url": "https://example.test/comments/101"}},
+	}
+	liveDetail := PullRequestDetail{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "head-sha",
+		HeadRefName: "reviewer-fixer",
+		BaseRefName: "main",
+		IssueComments: []map[string]any{
+			{"id": int64(101), "body": reviewerMarker, "url": "https://example.test/comments/101"},
+			{"id": int64(202), "body": existingFixerBody, "url": "https://example.test/comments/202"},
+		},
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{liveDetail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Now: fixture.now, Logger: fixture.logger})
+	checkpoint := fixerCheckpoint{
+		Detail:       staleDetail,
+		FixItemsHash: "fix-items-hash",
+		FixItems:     []FixItem{{ID: "R-001", Type: "comment"}},
+		Validation:   &ValidationResult{Passed: true},
+		Push:         &checkpointPush{Pushed: true, HeadSHA: "head-sha"},
+		Repair:       &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "R-001", Action: "fixed", Explanation: "Refetched live PR comments before upserting the Forgejo fixer summary."}}},
+	}
+
+	got, err := runner.runForgejoFixerSummaryStep(context.Background(), stepInput{
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Checkpoint: checkpoint,
+	})
+	if err != nil {
+		t.Fatalf("runForgejoFixerSummaryStep() error = %v", err)
+	}
+	if len(github.createIssueComments) != 0 {
+		t.Fatalf("createIssueComments calls = %d, want 0 when live summary already exists", len(github.createIssueComments))
+	}
+	if len(github.updateIssueComments) != 1 {
+		t.Fatalf("updateIssueComments calls = %d, want 1", len(github.updateIssueComments))
+	}
+	if github.updateIssueComments[0].CommentID != 202 {
+		t.Fatalf("updateIssueComments[0].CommentID = %d, want 202", github.updateIssueComments[0].CommentID)
+	}
+	parsedFixer, err := forge.ParseFixerSummary(github.updateIssueComments[0].Body)
+	if err != nil {
+		t.Fatalf("ParseFixerSummary(updated body) error = %v", err)
+	}
+	if parsedFixer.FixRoundID != 4 {
+		t.Fatalf("updated fixer summary round = %d, want 4 from live existing summary", parsedFixer.FixRoundID)
+	}
+	if got.SummaryComment == nil || got.SummaryComment.CommentID != 202 || got.SummaryComment.State != "updated" {
+		t.Fatalf("SummaryComment = %#v, want updated live comment 202", got.SummaryComment)
+	}
+}
+
 func TestSkippedNoEvidenceThreadIDs(t *testing.T) {
 	t.Parallel()
 	fixItems := []FixItem{
