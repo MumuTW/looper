@@ -8251,6 +8251,26 @@ func TestBuildReviewPromptCommentOnlyOmitsGitHubPublishInstructions(t *testing.T
 	}
 }
 
+func TestBuildReviewPromptCommentOnlyIncludesExistingReviewerSummaryAuthority(t *testing.T) {
+	t.Parallel()
+
+	existing := forge.NewReviewerSummary(2, []forge.ReviewItem{{ReviewItemID: "R-007", Status: forge.ReviewItemStatusOpen, Title: "Keep ID", Body: "Still broken.", Files: []string{"internal/reviewer/runner.go"}, LastSeenRoundID: 2}})
+	existingBody, err := renderReviewerSummaryComment(existing, "Previous summary")
+	if err != nil {
+		t.Fatalf("renderReviewerSummaryComment() error = %v", err)
+	}
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}, Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true)
+
+	if !strings.Contains(prompt, "Existing Reviewer Summary authority") {
+		t.Fatalf("prompt missing reviewer summary authority:\n%s", prompt)
+	}
+	for _, required := range []string{"\"review_round_id\": 2", "\"review_item_id\": \"R-007\"", "\"title\": \"Keep ID\""} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("prompt missing %s in reviewer summary context:\n%s", required, prompt)
+		}
+	}
+}
+
 func TestProcessClaimedItemCommentOnlyPublishesOneCommentAndSkipsRediscoveryForSameHead(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -8485,6 +8505,75 @@ func TestProcessClaimedItemCommentOnlyUpdatesSingleReviewerSummaryCommentAndReus
 	}
 	if parsed.Items[2].ReviewItemID != "R-003" || len(parsed.Items[2].Supersedes) != 1 || parsed.Items[2].Supersedes[0] != "R-002" {
 		t.Fatalf("item2 = %#v, want new R-003 superseding R-002", parsed.Items[2])
+	}
+}
+
+func TestBuildReviewerSummaryFromCompletionRejectsSupersededUpdatedReviewItemID(t *testing.T) {
+	t.Parallel()
+
+	existing := forge.NewReviewerSummary(2, []forge.ReviewItem{
+		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Keep ID", Body: "Still broken.", LastSeenRoundID: 2},
+		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Replace me", Body: "Old shape.", LastSeenRoundID: 2},
+	})
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Updated findings",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{ReviewItemID: "R-001", Title: "Keep ID", Body: "Still broken after the latest patch."},
+			{Title: "Replacement", Body: "This narrows the old broad issue.", Supersedes: []string{"R-001"}},
+		},
+	}
+
+	_, err := buildReviewerSummaryFromCompletion(existing, completion)
+	if err == nil || !strings.Contains(err.Error(), `supersedes updated review_item_id "R-001"`) {
+		t.Fatalf("buildReviewerSummaryFromCompletion() error = %v, want updated supersedes failure", err)
+	}
+}
+
+func TestProcessClaimedItemCommentOnlyDoesNotMarkActionableNoActionSummaryAsCleanNoop(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings, but this still has a blocking issue", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings, but this still has a blocking issue","outcome":"blocking","findings":[{"title":"Blocking issue remains","body":"The structured outcome is still blocking and must publish an open reviewer item.","files":["internal/reviewer/runner.go"]}]}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(github.issueCommentCalls) != 1 {
+		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
+	}
+	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary() error = %v", err)
+	}
+	if len(parsedSummary.Items) != 1 || parsedSummary.Items[0].Status != forge.ReviewItemStatusOpen {
+		t.Fatalf("parsed summary = %#v, want one open item", parsedSummary)
+	}
+	if len(github.addReactionCalls) != 0 {
+		t.Fatalf("addReactionCalls = %#v, want no clean reaction side effects", github.addReactionCalls)
+	}
+	if len(github.removeLabelCalls) != 0 {
+		t.Fatalf("removeLabelCalls = %#v, want no clean noop label removal", github.removeLabelCalls)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	if !contains(*loop.MetadataJSON, `"lastOutputFingerprint":"`) {
+		t.Fatalf("loop metadata = %s, want actionable output fingerprint recorded", *loop.MetadataJSON)
 	}
 }
 

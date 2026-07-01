@@ -2741,7 +2741,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			if err != nil {
 				return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
 			}
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload), CleanNoop: true}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload), CleanNoop: completion.Outcome == "clean"}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -3923,6 +3923,12 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 			maxID = n
 		}
 	}
+	updatedExistingIDs := map[string]struct{}{}
+	for _, finding := range completion.Findings {
+		if finding.ReviewItemID != "" {
+			updatedExistingIDs[finding.ReviewItemID] = struct{}{}
+		}
+	}
 	assigned := map[string]struct{}{}
 	supersededTargets := map[string]string{}
 	updated := make([]forge.ReviewItem, 0, len(existing.Items)+len(completion.Findings))
@@ -3944,6 +3950,9 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 			old, ok := itemsByID[supersededID]
 			if !ok {
 				return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion supersedes unknown review_item_id %q", supersededID)
+			}
+			if _, exists := updatedExistingIDs[supersededID]; exists {
+				return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion supersedes updated review_item_id %q", supersededID)
 			}
 			if old.Status == forge.ReviewItemStatusSuperseded && old.SupersededBy != id {
 				return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion cannot supersede already-superseded review_item_id %q", supersededID)
@@ -6111,6 +6120,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		}
 		if checkpoint.Snapshot.UnresolvedThreadCount != nil {
 			parts = append(parts, fmt.Sprintf("Unresolved threads: %d", *checkpoint.Snapshot.UnresolvedThreadCount))
+		}
+	}
+	if commentOnlyPublish && checkpoint.Detail != nil {
+		if summaryContext := reviewerSummaryPromptContext(checkpoint.Detail.IssueComments); summaryContext != "" {
+			parts = append(parts, summaryContext)
 		}
 	}
 	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "reviewer")
