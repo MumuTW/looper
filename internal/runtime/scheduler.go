@@ -1816,7 +1816,7 @@ type workerAgentExecutionAdapter struct {
 }
 
 func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
 	if err != nil {
 		return nil, err
 	}
@@ -2089,6 +2089,10 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		OnQueueItemEnqueued: requestWake,
 		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
+		},
+		HITLEnabled: cfg.HITL.Enabled,
+		HITLNotify: func(ctx context.Context, ask worker.HITLAskNotification) error {
+			return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{ProjectID: ask.ProjectID, LoopSeq: ask.LoopSeq, Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options})
 		},
 	})
 	claimMu := &sync.Mutex{}

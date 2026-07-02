@@ -193,6 +193,51 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		}
 	})
 
+	t.Run("SendHITLAsk posts a card with option buttons carrying loop seq + answer", func(t *testing.T) {
+		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+		var calls []capturedFeishuCall
+		gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+
+		if err := gateway.SendHITLAsk(ctx, HITLAskCard{ProjectID: "od", LoopSeq: 71, Repo: "acme/looper", Title: "Which datastore?", Question: "Redis or Postgres for the cache?", Options: []string{"redis", "postgres"}}); err != nil {
+			t.Fatalf("SendHITLAsk() error = %v", err)
+		}
+		if len(calls) != 2 {
+			t.Fatalf("feishu calls = %d, want 2 (token + message)", len(calls))
+		}
+		var envelope struct {
+			MsgType string `json:"msg_type"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(calls[1].body, &envelope); err != nil {
+			t.Fatalf("message body not JSON: %v", err)
+		}
+		if envelope.MsgType != "interactive" {
+			t.Fatalf("msg_type = %q, want interactive", envelope.MsgType)
+		}
+		if !strings.Contains(envelope.Content, "Redis or Postgres") {
+			t.Fatalf("card missing question: %s", envelope.Content)
+		}
+		// Each option becomes a button whose value carries loopSeq + answer.
+		if !strings.Contains(envelope.Content, `"loopSeq":"71"`) || !strings.Contains(envelope.Content, `"answer":"redis"`) || !strings.Contains(envelope.Content, `"answer":"postgres"`) {
+			t.Fatalf("card missing option buttons with loopSeq/answer values: %s", envelope.Content)
+		}
+	})
+
+	t.Run("SendHITLAsk errors when app not configured", func(t *testing.T) {
+		cfg := appModeConfig()
+		cfg.ChatID = ""
+		var calls []capturedFeishuCall
+		gateway := newFeishuAppGateway(t, cfg, &calls)
+		if err := gateway.SendHITLAsk(ctx, HITLAskCard{LoopSeq: 1, Question: "q"}); err == nil {
+			t.Fatal("SendHITLAsk() error = nil, want error when chatId missing")
+		}
+		if len(calls) != 0 {
+			t.Fatalf("feishu calls = %d, want 0 when unconfigured", len(calls))
+		}
+	})
+
 	t.Run("info level filtered out", func(t *testing.T) {
 		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
 		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")

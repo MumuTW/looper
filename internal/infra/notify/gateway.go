@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -467,6 +468,100 @@ func (g *Gateway) recordFeishuApp(ctx context.Context, payload SystemNotificatio
 	}
 
 	return persist(build("success", "", stringPointer(nowISO)))
+}
+
+// HITLAskCard is a mid-run human-in-the-loop question rendered as an interactive
+// Feishu card with one button per option. Each button's value carries the loop
+// seq + the chosen answer so a card-action callback identifies the loop + reply.
+type HITLAskCard struct {
+	ProjectID string
+	LoopSeq   int64
+	Repo      string
+	Title     string
+	Question  string
+	Options   []string
+}
+
+// SendHITLAsk delivers an ask-card to the Feishu app-bot target chat. It reuses
+// the app-bot credentials in notifications.webhook (appIdEnv/appSecretEnv/chatId)
+// and is a no-op error when they are not configured. Best-effort; caller logs.
+func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	chatID := strings.TrimSpace(cfg.ChatID)
+	if appID == "" || appSecret == "" || chatID == "" {
+		return fmt.Errorf("feishu app-bot is not configured for HITL asks (need appIdEnv/appSecretEnv/chatId)")
+	}
+	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return err
+	}
+	cardJSON, err := buildFeishuAskCard(card)
+	if err != nil {
+		return err
+	}
+	messageBody, err := json.Marshal(map[string]any{"receive_id": chatID, "msg_type": "interactive", "content": string(cardJSON)})
+	if err != nil {
+		return err
+	}
+	status, respBody, err := g.feishuAppHTTP(ctx, http.MethodPost, feishuAPIBase+"/open-apis/im/v1/messages?receive_id_type=chat_id", map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json; charset=utf-8",
+	}, messageBody)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("feishu im responded with status %d", status)
+	}
+	if code, msg := feishuResponseCode(respBody); code != 0 {
+		return fmt.Errorf("feishu im error code %d: %s", code, msg)
+	}
+	return nil
+}
+
+func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
+	title := strings.TrimSpace(card.Title)
+	if title == "" {
+		title = "Looper needs a decision"
+	}
+	body := strings.TrimSpace(card.Question)
+	if body == "" {
+		body = title
+	}
+	seq := strconv.FormatInt(card.LoopSeq, 10)
+	actions := make([]any, 0, len(card.Options))
+	for _, option := range card.Options {
+		option = strings.TrimSpace(option)
+		if option == "" {
+			continue
+		}
+		actions = append(actions, map[string]any{
+			"tag":   "button",
+			"type":  "primary",
+			"text":  map[string]any{"tag": "plain_text", "content": option},
+			"value": map[string]any{"loopSeq": seq, "answer": option},
+		})
+	}
+	noteParts := []string{"Looper HITL · loop " + seq}
+	if strings.TrimSpace(card.Repo) != "" {
+		noteParts = append(noteParts, card.Repo)
+	}
+	elements := []any{
+		map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": "**" + title + "**\n" + body}},
+	}
+	if len(actions) > 0 {
+		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
+	}
+	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ") + " · reply in-thread or click an option"}}})
+
+	cardObj := map[string]any{
+		"config":   map[string]any{"wide_screen_mode": true},
+		"header":   map[string]any{"template": "orange", "title": map[string]any{"tag": "plain_text", "content": "Looper needs a decision"}},
+		"elements": elements,
+	}
+	return json.Marshal(cardObj)
 }
 
 // feishuTenantToken returns a cached tenant_access_token when still valid, else
