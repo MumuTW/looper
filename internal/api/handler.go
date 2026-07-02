@@ -3055,6 +3055,11 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
 		return h.retryLoop(r.Context(), r, loop.ID)
+	case "respond":
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		return h.respondToLoop(r.Context(), r, loop.ID)
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
@@ -4336,6 +4341,72 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 	}
 
 	return serializeLoop(updated), nil
+}
+
+type respondLoopRequest struct {
+	Answer string `json:"answer"`
+}
+
+// respondToLoop delivers a human's answer to a loop suspended mid-run as
+// awaiting_human: it validates the loop is awaiting a human, stores the answer
+// on the loop's HITL metadata, and transitions the loop back to running (which
+// requeues it and triggers a scheduler tick) so the next run resumes the same
+// agent session with the answer. This is the testable core of the HITL bridge.
+func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID string) (loopResponse, error) {
+	var body respondLoopRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid respond request: %v", err)}
+		}
+	}
+	answer := strings.TrimSpace(body.Answer)
+	if answer == "" {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "respond requires a non-empty answer"}
+	}
+
+	services := h.context.Runtime.Services()
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if loop == nil {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
+		}
+		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		ask.Answer = answer
+		ask.Status = "answered"
+		ask.AnsweredAt = nowISO
+		metadataJSON, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		updated := *loop
+		updated.MetadataJSON = stringPtrOrNil(metadataJSON)
+		updated.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		return updated, nil
+	})
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return loopResponse{}, typed
+		}
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)
+	// so the next claim resumes the run with the stored answer.
+	return h.mutateLoopStatus(ctx, loopID, domain.LoopStatusRunning)
 }
 
 func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string) (retryLoopResponse, error) {

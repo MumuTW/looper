@@ -149,6 +149,9 @@
         "enabled": true,
         "maxBytes": 8192
       },
+      "hitl": {
+        "enabled": false
+      },
       "roles": {
         "coordinator": {
           "enabled": false,

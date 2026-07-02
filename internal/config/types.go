@@ -611,9 +611,21 @@ type Config struct {
 	Package       PackageConfig      `json:"package"`
 	Defaults      DefaultsConfig     `json:"defaults"`
 	Instructions  InstructionsConfig `json:"instructions"`
+	HITL          HITLConfig         `json:"hitl"`
 	Roles         RoleConfigs        `json:"roles"`
 	Providers     []ProviderConfig   `json:"providers,omitempty"`
 	Projects      []ProjectRefConfig `json:"projects"`
+}
+
+// HITLConfig gates the mid-run human-in-the-loop feature: when Enabled, agents
+// may pause mid-run to ask a human (by writing .looper/ask.json), the loop
+// suspends as awaiting_human, an ask-card is sent via the app-bot notifier, and
+// POST /api/v1/loops/{seq}/respond resumes the same agent session with the
+// answer. When Disabled (the default) every HITL code path is skipped and
+// runners behave exactly as before. It reuses the app-bot credentials in
+// notifications.webhook (appIdEnv/appSecretEnv/chatId) for send + listen.
+type HITLConfig struct {
+	Enabled bool `json:"enabled"`
 }
 
 type PartialServerConfig struct {
@@ -844,6 +856,10 @@ type PartialInstructionsConfig struct {
 	MaxBytes *int  `json:"maxBytes,omitempty"`
 }
 
+type PartialHITLConfig struct {
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
 type PartialIssueRoleTriggersConfig struct {
 	Labels                     *[]string  `json:"labels,omitempty"`
 	LabelMode                  *LabelMode `json:"labelMode,omitempty"`
@@ -986,6 +1002,7 @@ type PartialConfig struct {
 	Defaults       *PartialDefaultsConfig     `json:"defaults,omitempty"`
 	LegacyReviewer *PartialReviewerConfig     `json:"reviewer,omitempty"`
 	Instructions   *PartialInstructionsConfig `json:"instructions,omitempty"`
+	HITL           *PartialHITLConfig         `json:"hitl,omitempty"`
 	Roles          *PartialRoleConfigs        `json:"roles,omitempty"`
 	Providers      *[]PartialProviderConfig   `json:"providers,omitempty"`
 	Projects       *[]PartialProjectRefConfig `json:"projects,omitempty"`

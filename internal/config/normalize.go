@@ -304,6 +304,10 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeInstructionsConfig(&config.Instructions, *partial.Instructions)
 	}
 
+	if partial.HITL != nil && partial.HITL.Enabled != nil {
+		config.HITL.Enabled = *partial.HITL.Enabled
+	}
+
 	if partial.Roles != nil {
 		mergeRoleConfigs(&config.Roles, *partial.Roles)
 	}
@@ -1361,6 +1365,14 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 	if partial.Defaults != nil {
 		defaults := *partial.Defaults
 		cloned.Defaults = &defaults
+	}
+	if partial.HITL != nil {
+		hitl := *partial.HITL
+		if partial.HITL.Enabled != nil {
+			enabled := *partial.HITL.Enabled
+			hitl.Enabled = &enabled
+		}
+		cloned.HITL = &hitl
 	}
 	if partial.LegacyReviewer != nil {
 		cloned.LegacyReviewer = clonePartialReviewerConfig(partial.LegacyReviewer)

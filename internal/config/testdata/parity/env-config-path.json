@@ -383,6 +383,9 @@
       "instructions": {
         "enabled": true,
         "maxBytes": 8192
+      },
+      "hitl": {
+        "enabled": false
       }
     },
     "metadata": {
