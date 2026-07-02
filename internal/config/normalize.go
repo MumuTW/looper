@@ -686,6 +686,10 @@ func mergeWebhookNotificationConfig(config *WebhookNotificationConfig, partial P
 	if partial.ChatID != nil {
 		config.ChatID = strings.TrimSpace(*partial.ChatID)
 	}
+
+	if partial.VerificationTokenEnv != nil {
+		config.VerificationTokenEnv = strings.TrimSpace(*partial.VerificationTokenEnv)
+	}
 }
 
 func mergeOsascriptNotificationConfig(config *OsascriptNotificationConfig, partial PartialOsascriptNotificationConfig) {

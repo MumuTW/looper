@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/loops"
+	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -111,6 +113,10 @@ func TestHandlerRespondRejectsNonAwaitingLoop(t *testing.T) {
 func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.HITL.Enabled = true
+	// The card-action route is fail-closed: it requires a configured, matching
+	// Feishu verification token before it will deliver an answer.
+	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN", "verify-tok-123")
+	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN"
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
 	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
@@ -126,7 +132,7 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	body := `{"action":{"tag":"button","value":{"loopSeq":"81","answer":"redis"}}}`
+	body := `{"token":"verify-tok-123","action":{"tag":"button","value":{"loopSeq":"81","answer":"redis"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
@@ -143,6 +149,69 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok || ask.Answer != "redis" || ask.Status != "answered" {
 		t.Fatalf("ask = %#v (ok=%v), want answer redis + answered", ask, ok)
+	}
+}
+
+// setupAwaitingCardLoop seeds a project + awaiting_human loop and returns the
+// handler + services for card-action security tests.
+func setupAwaitingCardLoop(t *testing.T, cfg config.Config, rt *looperdruntime.Runtime, projectID, loopID string, seq int64) *Handler {
+	t.Helper()
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	targetID := projectID
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting"}}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: seq, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	return h
+}
+
+func TestHandlerFeishuCardActionRejectsWhenTokenNotConfigured(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	// No verificationTokenEnv configured -> the injection route must fail closed.
+	h := setupAwaitingCardLoop(t, cfg, rt, "project_card_notok", "loop_card_notok", 82)
+
+	body := `{"token":"anything","action":{"tag":"button","value":{"loopSeq":"82","answer":"redis"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 when verification token unconfigured; body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := rt.Services().Repositories.Loops.GetByID(context.Background(), "loop_card_notok")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop.Status = %q, want unchanged awaiting_human (no answer delivered)", loop.Status)
+	}
+}
+
+func TestHandlerFeishuCardActionRejectsTokenMismatch(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN2", "the-real-token")
+	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN2"
+	h := setupAwaitingCardLoop(t, cfg, rt, "project_card_bad", "loop_card_bad", 83)
+
+	body := `{"token":"wrong-token","action":{"tag":"button","value":{"loopSeq":"83","answer":"redis"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 on token mismatch; body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := rt.Services().Repositories.Loops.GetByID(context.Background(), "loop_card_bad")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop.Status = %q, want unchanged awaiting_human (no answer delivered)", loop.Status)
 	}
 }
 

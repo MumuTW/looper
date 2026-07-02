@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -4425,7 +4426,11 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 type feishuCardActionEnvelope struct {
 	Type      string `json:"type"`
 	Challenge string `json:"challenge"`
-	Action    struct {
+	// Token is the Feishu app Verification Token, echoed by Feishu in every event
+	// and card-action callback. It is the shared secret that proves the request
+	// originated from Feishu rather than an arbitrary client.
+	Token  string `json:"token"`
+	Action struct {
 		Tag   string          `json:"tag"`
 		Value json.RawMessage `json:"value"`
 	} `json:"action"`
@@ -4458,14 +4463,41 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "invalid Feishu callback body"})
 		return
 	}
-	// Feishu URL-verification handshake: echo the challenge verbatim.
+	// Resolve the configured Feishu Verification Token (a shared secret Feishu
+	// echoes in every callback). This is the ONLY origin check on this route, and
+	// it is independent of authMode because Feishu's servers cannot send a looper
+	// Bearer token.
+	expectedToken := ""
+	if envName := strings.TrimSpace(h.context.Config.Notifications.Webhook.VerificationTokenEnv); envName != "" {
+		expectedToken = strings.TrimSpace(os.Getenv(envName))
+	}
+	tokenMatches := expectedToken != "" && subtle.ConstantTimeCompare([]byte(strings.TrimSpace(envelope.Token)), []byte(expectedToken)) == 1
+
+	// Feishu URL-verification handshake: echo the challenge verbatim. When a token
+	// is configured, require it to match even for the handshake.
 	if envelope.Type == "url_verification" {
+		if expectedToken != "" && !tokenMatches {
+			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
 		return
 	}
 	if !h.context.Config.HITL.Enabled {
 		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "hitl.enabled is false"})
+		return
+	}
+	// A card action delivers human-authored text into an agent's coding session, so
+	// it MUST be authenticated. Fail closed: require a configured, matching
+	// verification token — otherwise any client that can reach this route could
+	// inject arbitrary answers into any awaiting_human loop.
+	if expectedToken == "" {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "Feishu card-action callback requires notifications.webhook.verificationTokenEnv to be configured"})
+		return
+	}
+	if !tokenMatches {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
 		return
 	}
 	var value struct {

@@ -274,6 +274,11 @@ type WebhookNotificationConfig struct {
 	AppIDEnv     string `json:"appIdEnv,omitempty"`
 	AppSecretEnv string `json:"appSecretEnv,omitempty"`
 	ChatID       string `json:"chatId,omitempty"`
+	// VerificationTokenEnv names the env var holding the Feishu app Verification
+	// Token. It gates the inbound HITL card-action callback (/hitl/feishu): the
+	// callback's envelope token must match, proving the request came from Feishu.
+	// A NAME, never the secret value — looper is open source.
+	VerificationTokenEnv string `json:"verificationTokenEnv,omitempty"`
 }
 
 type LoggingConfig struct {
@@ -725,6 +730,7 @@ type PartialWebhookNotificationConfig struct {
 	AppIDEnv              *string                   `json:"appIdEnv,omitempty"`
 	AppSecretEnv          *string                   `json:"appSecretEnv,omitempty"`
 	ChatID                *string                   `json:"chatId,omitempty"`
+	VerificationTokenEnv  *string                   `json:"verificationTokenEnv,omitempty"`
 }
 
 type PartialLoggingConfig struct {
