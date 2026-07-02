@@ -138,8 +138,18 @@ func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord)
 // agent's native session id (so the run can resume the same session).
 func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
 	ask, err := consumeAskSentinel(worktreePath)
-	if err != nil || ask == nil {
-		// Best-effort: a read error is treated as "no ask" rather than failing the run.
+	if err != nil {
+		// Best-effort: a read error is treated as "no ask" rather than failing the
+		// run, but surface it — a present-but-unreadable sentinel means the agent
+		// wanted to ask a human and we're about to proceed as if it didn't.
+		if r.logger != nil {
+			r.logger.Warn("worker could not read HITL ask sentinel; proceeding as no ask", map[string]any{
+				"loopId": input.Loop.ID, "loopSeq": input.Loop.Seq, "error": err.Error(),
+			})
+		}
+		return nil, nil
+	}
+	if ask == nil {
 		return nil, nil
 	}
 	sessionID, vendor := r.latestAgentSession(ctx, input.Loop.ID)

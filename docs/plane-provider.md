@@ -114,6 +114,40 @@ Validation rules for a plane provider/project:
 - `providers[].kind = "plane"` requires `tokenEnv`, `workspace`, and `projectId`. `baseUrl` is optional (defaults to the public Plane API base) but must be an absolute `http(s)` URL when set.
 - The bound project requires `provider` (the plane provider id) and `repo` (the GitHub code repo, `owner/name`).
 
+## Interactive HITL (mid-run ask / answer)
+
+The `notifications.webhook` block above is **send-only** (an incoming-webhook URL): it posts run updates but can't collect an answer. To let an agent **pause mid-run, ask a human, and resume the same session with the reply**, enable HITL and switch the webhook to Feishu **app-bot** mode, which sends an interactive card with option buttons and receives the click back.
+
+```jsonc
+{
+  "hitl": { "enabled": true },
+  "notifications": {
+    "webhook": {
+      "enabled": true,
+      "mode": "app",                                // app-bot instead of incoming-webhook
+      "appIdEnv": "LOOPER_FEISHU_APP_ID",           // env var NAMES, never the secret values
+      "appSecretEnv": "LOOPER_FEISHU_APP_SECRET",
+      "chatId": "oc_xxxxxxxxxxxxxxxx",              // target group/chat for ask-cards
+      "verificationTokenEnv": "LOOPER_FEISHU_VERIFY_TOKEN"  // required for the inbound callback
+    }
+  }
+}
+```
+
+How it works:
+
+1. When an agent hits a genuine blocker it writes `.looper/ask.json` (`{"question": "...", "options": ["A", "B"]}`) and stops. The worker suspends the loop to `awaiting_human` and sends the ask-card to `chatId`.
+2. A human answers one of two ways:
+   - **Click a button** on the card → Feishu POSTs the card action to `POST <daemon>/api/v1/hitl/feishu` (point the app's *card callback / event* URL there).
+   - **API** → `POST <daemon>/api/v1/loops/<seq>/respond -d '{"answer":"A"}'` (no Feishu needed).
+3. The loop transitions back to `running` and the agent **resumes the same vendor session** (Codex/Claude/OpenCode) with the decision injected — not a fresh run.
+
+**Security — the inbound callback is fail-closed.** `/hitl/feishu` delivers human text straight into a coding-agent session, so it verifies the Feishu app **Verification Token** on every request:
+
+- `verificationTokenEnv` **must** be set (to the env var holding your app's Verification Token) or the callback returns `403` — button clicks won't work until it's configured. This check is independent of `server.authMode` (Feishu's servers can't send a Looper bearer token). The `POST /loops/<seq>/respond` API is unaffected and still governed by `authMode`.
+- Turn the app's **Encrypt Key OFF** for the event subscription. Looper reads the callback as plain JSON; an encrypted (`{"encrypt":"…"}`) payload can't be decoded and the answer is dropped.
+- Asks with **no options** render a card with no buttons; answer those via the `/respond` API (free-text card replies are not consumed yet).
+
 ## How discovery maps Plane labels to roles
 
 - Planner and Worker discovery poll the Plane project and keep only work-items that carry **all** of `roles.<role>.triggers.labels` (label UUIDs are resolved to names first). With the bootstrap defaults both roles trigger on a single `--trigger-label` (default `looper:plan`).
