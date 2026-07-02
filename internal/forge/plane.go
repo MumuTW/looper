@@ -182,12 +182,19 @@ func (plane *PlaneClient) ListOpenIssues(ctx context.Context, input ListIssuesIn
 	if err != nil {
 		return nil, err
 	}
-	workItems, err := plane.listWorkItems(ctx, input.Limit)
+	required := normalizedLabelSet(input.Labels)
+	assignee := strings.TrimSpace(input.Assignee)
+	// When filtering by label/assignee, the match may sit beyond the first
+	// `Limit` work-items, so fetch ALL pages and let Limit cap the FILTERED
+	// output below — not the pre-filter fetch (which would silently drop matches).
+	fetchLimit := input.Limit
+	if len(required) > 0 || assignee != "" {
+		fetchLimit = 0
+	}
+	workItems, err := plane.listWorkItems(ctx, fetchLimit)
 	if err != nil {
 		return nil, err
 	}
-	required := normalizedLabelSet(input.Labels)
-	assignee := strings.TrimSpace(input.Assignee)
 	issues := make([]Issue, 0, len(workItems))
 	for _, item := range workItems {
 		issue := plane.convertWorkItem(item, labelNames)
