@@ -95,7 +95,7 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 		providers := cloneProviderConfigs(*normalized.Providers)
 		partials := make([]PartialProviderConfig, len(providers))
 		for i, provider := range providers {
-			partials[i] = PartialProviderConfig{ID: provider.ID, Kind: &provider.Kind, BaseURL: &provider.BaseURL, GHPath: provider.GHPath, TokenEnv: provider.TokenEnv}
+			partials[i] = PartialProviderConfig{ID: provider.ID, Kind: &provider.Kind, BaseURL: &provider.BaseURL, GHPath: provider.GHPath, TokenEnv: provider.TokenEnv, Workspace: provider.Workspace, ProjectID: provider.ProjectID}
 		}
 		normalized.Providers = &partials
 	}
