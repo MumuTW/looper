@@ -219,6 +219,7 @@ type AgentTimeoutConfig struct {
 type NotificationConfig struct {
 	InApp     bool                        `json:"inApp"`
 	Osascript OsascriptNotificationConfig `json:"osascript"`
+	Webhook   WebhookNotificationConfig   `json:"webhook"`
 }
 
 type DisclosureConfig struct {
@@ -248,6 +249,14 @@ type RoleConfig struct {
 type OsascriptNotificationConfig struct {
 	Enabled               bool                     `json:"enabled"`
 	SoundForLevels        []NotificationSoundLevel `json:"soundForLevels"`
+	ThrottleWindowSeconds int                      `json:"throttleWindowSeconds"`
+}
+
+type WebhookNotificationConfig struct {
+	Enabled               bool                     `json:"enabled"`
+	URLEnv                string                   `json:"urlEnv"`
+	Format                string                   `json:"format"`
+	Levels                []NotificationSoundLevel `json:"levels"`
 	ThrottleWindowSeconds int                      `json:"throttleWindowSeconds"`
 }
 
@@ -652,6 +661,7 @@ type PartialAgentTimeoutConfig struct {
 type PartialNotificationConfig struct {
 	InApp     *bool                               `json:"inApp,omitempty"`
 	Osascript *PartialOsascriptNotificationConfig `json:"osascript,omitempty"`
+	Webhook   *PartialWebhookNotificationConfig   `json:"webhook,omitempty"`
 }
 
 type PartialDisclosureConfig struct {
@@ -672,6 +682,14 @@ type PartialDisclosureChannelsConfig struct {
 type PartialOsascriptNotificationConfig struct {
 	Enabled               *bool                     `json:"enabled,omitempty"`
 	SoundForLevels        *[]NotificationSoundLevel `json:"soundForLevels,omitempty"`
+	ThrottleWindowSeconds *int                      `json:"throttleWindowSeconds,omitempty"`
+}
+
+type PartialWebhookNotificationConfig struct {
+	Enabled               *bool                     `json:"enabled,omitempty"`
+	URLEnv                *string                   `json:"urlEnv,omitempty"`
+	Format                *string                   `json:"format,omitempty"`
+	Levels                *[]NotificationSoundLevel `json:"levels,omitempty"`
 	ThrottleWindowSeconds *int                      `json:"throttleWindowSeconds,omitempty"`
 }
 

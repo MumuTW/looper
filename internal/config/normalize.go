@@ -634,6 +634,32 @@ func mergeNotificationConfig(config *NotificationConfig, partial PartialNotifica
 	if partial.Osascript != nil {
 		mergeOsascriptNotificationConfig(&config.Osascript, *partial.Osascript)
 	}
+
+	if partial.Webhook != nil {
+		mergeWebhookNotificationConfig(&config.Webhook, *partial.Webhook)
+	}
+}
+
+func mergeWebhookNotificationConfig(config *WebhookNotificationConfig, partial PartialWebhookNotificationConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+
+	if partial.URLEnv != nil {
+		config.URLEnv = *partial.URLEnv
+	}
+
+	if partial.Format != nil {
+		config.Format = *partial.Format
+	}
+
+	if partial.Levels != nil {
+		config.Levels = cloneSoundLevels(*partial.Levels)
+	}
+
+	if partial.ThrottleWindowSeconds != nil {
+		config.ThrottleWindowSeconds = *partial.ThrottleWindowSeconds
+	}
 }
 
 func mergeOsascriptNotificationConfig(config *OsascriptNotificationConfig, partial PartialOsascriptNotificationConfig) {

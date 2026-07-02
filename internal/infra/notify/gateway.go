@@ -1,9 +1,13 @@
 package notify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -13,9 +17,16 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-const osascriptTimeout = 35 * time.Second
+const (
+	osascriptTimeout = 35 * time.Second
+	webhookTimeout   = 10 * time.Second
+)
 
 type RunCommandFunc func(context.Context, shell.Options) (shell.Result, error)
+
+// HTTPPostFunc delivers a webhook notification body to url and returns the
+// HTTP status code. It is injectable so tests can avoid real network calls.
+type HTTPPostFunc func(url string, body []byte) (int, error)
 
 type Options struct {
 	Config        config.NotificationConfig
@@ -24,6 +35,7 @@ type Options struct {
 	Repositories  *storage.Repositories
 	Now           func() time.Time
 	RunCommand    RunCommandFunc
+	HTTPPost      HTTPPostFunc
 }
 
 type SystemNotificationPayload struct {
@@ -49,6 +61,7 @@ type Gateway struct {
 	repositories  *storage.Repositories
 	now           func() time.Time
 	runCommand    RunCommandFunc
+	httpPost      HTTPPostFunc
 }
 
 func NewGateway(options Options) *Gateway {
@@ -62,6 +75,11 @@ func NewGateway(options Options) *Gateway {
 		runCommand = shell.Run
 	}
 
+	httpPost := options.HTTPPost
+	if httpPost == nil {
+		httpPost = defaultWebhookPost
+	}
+
 	return &Gateway{
 		config:        options.Config,
 		osascriptPath: options.OsascriptPath,
@@ -69,17 +87,22 @@ func NewGateway(options Options) *Gateway {
 		repositories:  options.Repositories,
 		now:           now,
 		runCommand:    runCommand,
+		httpPost:      httpPost,
 	}
 }
 
 func (g *Gateway) Notify(ctx context.Context, payload SystemNotificationPayload) []storage.NotificationRecord {
-	records := make([]storage.NotificationRecord, 0, 2)
+	records := make([]storage.NotificationRecord, 0, 3)
 
 	if record, ok := g.recordInApp(ctx, payload); ok {
 		records = append(records, record)
 	}
 
 	if record, ok := g.recordOsascript(ctx, payload); ok {
+		records = append(records, record)
+	}
+
+	if record, ok := g.recordWebhook(ctx, payload); ok {
 		records = append(records, record)
 	}
 
@@ -236,6 +259,168 @@ func (g *Gateway) recordOsascript(ctx context.Context, payload SystemNotificatio
 	}
 
 	return record, true
+}
+
+func (g *Gateway) recordWebhook(ctx context.Context, payload SystemNotificationPayload) (storage.NotificationRecord, bool) {
+	nowISO := eventlog.FormatJavaScriptISOString(g.now())
+	id := eventlog.NewEventID("notification")
+
+	build := func(status, errorMessage string, sentAt *string) storage.NotificationRecord {
+		return storage.NotificationRecord{
+			ID:           id,
+			ProjectID:    nilIfEmpty(payload.ProjectID),
+			LoopID:       nilIfEmpty(payload.LoopID),
+			RunID:        nilIfEmpty(payload.RunID),
+			EntityType:   nilIfEmpty(payload.EntityType),
+			EntityID:     nilIfEmpty(payload.EntityID),
+			Channel:      "webhook",
+			Level:        payload.Level,
+			Title:        payload.Title,
+			Subtitle:     nilIfEmpty(payload.Subtitle),
+			Body:         payload.Body,
+			Status:       status,
+			DedupeKey:    nilIfEmpty(payload.DedupeKey),
+			ErrorMessage: nilIfEmpty(errorMessage),
+			PayloadJSON:  stringPointer(mustMarshalPayload(payload)),
+			SentAt:       sentAt,
+			CreatedAt:    nowISO,
+			UpdatedAt:    nowISO,
+		}
+	}
+
+	persist := func(record storage.NotificationRecord) (storage.NotificationRecord, bool) {
+		if err := g.persistNotification(ctx, record); err != nil {
+			return storage.NotificationRecord{}, false
+		}
+		return record, true
+	}
+
+	if !g.config.Webhook.Enabled {
+		return persist(build("skipped", "disabled", nil))
+	}
+
+	url := ""
+	if envName := strings.TrimSpace(g.config.Webhook.URLEnv); envName != "" {
+		url = strings.TrimSpace(os.Getenv(envName))
+	}
+	if url == "" {
+		return persist(build("skipped", "no url", nil))
+	}
+
+	if !webhookLevelAllowed(g.config.Webhook.Levels, payload.Level) {
+		return persist(build("skipped", "level filtered", nil))
+	}
+
+	if payload.DedupeKey != "" && g.repositories != nil && g.repositories.Notifications != nil {
+		dedupeRecord, err := g.repositories.Notifications.GetLatestByDedupe(ctx, "webhook", payload.DedupeKey)
+		if err == nil && dedupeRecord != nil {
+			createdAt, parseErr := time.Parse(time.RFC3339Nano, dedupeRecord.CreatedAt)
+			if parseErr == nil {
+				throttleWindow := time.Duration(g.config.Webhook.ThrottleWindowSeconds) * time.Second
+				if g.now().UTC().Sub(createdAt.UTC()) < throttleWindow {
+					return persist(build("skipped", "deduped", nil))
+				}
+			}
+		}
+	}
+
+	body, err := buildWebhookBody(g.config.Webhook.Format, payload)
+	if err != nil {
+		return persist(build("failed", err.Error(), nil))
+	}
+
+	status, err := g.httpPost(url, body)
+	if err != nil {
+		return persist(build("failed", err.Error(), nil))
+	}
+	if status < 200 || status >= 300 {
+		return persist(build("failed", fmt.Sprintf("webhook responded with status %d", status), nil))
+	}
+
+	return persist(build("success", "", stringPointer(nowISO)))
+}
+
+func webhookLevelAllowed(levels []config.NotificationSoundLevel, level string) bool {
+	allowed := levels
+	if len(allowed) == 0 {
+		allowed = []config.NotificationSoundLevel{
+			config.NotificationSoundLevelActionRequired,
+			config.NotificationSoundLevelFailure,
+		}
+	}
+
+	for _, candidate := range allowed {
+		if string(candidate) == level {
+			return true
+		}
+	}
+
+	return false
+}
+
+type webhookGenericBody struct {
+	Level      string `json:"level"`
+	Title      string `json:"title"`
+	Subtitle   string `json:"subtitle,omitempty"`
+	Body       string `json:"body"`
+	ProjectID  string `json:"projectId,omitempty"`
+	LoopID     string `json:"loopId,omitempty"`
+	RunID      string `json:"runId,omitempty"`
+	EntityType string `json:"entityType,omitempty"`
+	EntityID   string `json:"entityId,omitempty"`
+	DedupeKey  string `json:"dedupeKey,omitempty"`
+}
+
+func buildWebhookBody(format string, payload SystemNotificationPayload) ([]byte, error) {
+	if format == "feishu" {
+		text := payload.Title
+		if strings.TrimSpace(payload.Subtitle) != "" {
+			text += "\n" + payload.Subtitle
+		}
+		if strings.TrimSpace(payload.Body) != "" {
+			text += "\n" + payload.Body
+		}
+
+		return json.Marshal(map[string]any{
+			"msg_type": "text",
+			"content": map[string]any{
+				"text": text,
+			},
+		})
+	}
+
+	return json.Marshal(webhookGenericBody{
+		Level:      payload.Level,
+		Title:      payload.Title,
+		Subtitle:   payload.Subtitle,
+		Body:       payload.Body,
+		ProjectID:  payload.ProjectID,
+		LoopID:     payload.LoopID,
+		RunID:      payload.RunID,
+		EntityType: payload.EntityType,
+		EntityID:   payload.EntityID,
+		DedupeKey:  payload.DedupeKey,
+	})
+}
+
+func defaultWebhookPost(url string, body []byte) (int, error) {
+	client := &http.Client{Timeout: webhookTimeout}
+
+	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+
+	_, _ = io.Copy(io.Discard, response.Body)
+
+	return response.StatusCode, nil
 }
 
 func (g *Gateway) persistNotification(ctx context.Context, record storage.NotificationRecord) error {

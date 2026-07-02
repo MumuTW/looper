@@ -171,6 +171,13 @@
             "failure"
           ],
           "throttleWindowSeconds": 120
+        },
+        "webhook": {
+          "enabled": false,
+          "urlEnv": "",
+          "format": "generic",
+          "levels": null,
+          "throttleWindowSeconds": 60
         }
       },
       "disclosure": {
