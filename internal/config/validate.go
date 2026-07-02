@@ -132,6 +132,24 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 	}
 
+	switch strings.TrimSpace(config.Notifications.Webhook.Mode) {
+	case "", "webhook":
+	case "app":
+		if config.Notifications.Webhook.Enabled {
+			if strings.TrimSpace(config.Notifications.Webhook.AppIDEnv) == "" {
+				issues = append(issues, ValidationIssue{Path: "notifications.webhook.appIdEnv", Message: "is required when notifications.webhook.mode is app"})
+			}
+			if strings.TrimSpace(config.Notifications.Webhook.AppSecretEnv) == "" {
+				issues = append(issues, ValidationIssue{Path: "notifications.webhook.appSecretEnv", Message: "is required when notifications.webhook.mode is app"})
+			}
+			if strings.TrimSpace(config.Notifications.Webhook.ChatID) == "" {
+				issues = append(issues, ValidationIssue{Path: "notifications.webhook.chatId", Message: "is required when notifications.webhook.mode is app"})
+			}
+		}
+	default:
+		issues = append(issues, ValidationIssue{Path: "notifications.webhook.mode", Message: "must be one of: webhook, app"})
+	}
+
 	if !isValidDaemonMode(config.Daemon.Mode) {
 		issues = append(issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
 	}

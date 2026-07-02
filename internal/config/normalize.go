@@ -666,6 +666,22 @@ func mergeWebhookNotificationConfig(config *WebhookNotificationConfig, partial P
 	if partial.ThrottleWindowSeconds != nil {
 		config.ThrottleWindowSeconds = *partial.ThrottleWindowSeconds
 	}
+
+	if partial.Mode != nil {
+		config.Mode = strings.TrimSpace(*partial.Mode)
+	}
+
+	if partial.AppIDEnv != nil {
+		config.AppIDEnv = strings.TrimSpace(*partial.AppIDEnv)
+	}
+
+	if partial.AppSecretEnv != nil {
+		config.AppSecretEnv = strings.TrimSpace(*partial.AppSecretEnv)
+	}
+
+	if partial.ChatID != nil {
+		config.ChatID = strings.TrimSpace(*partial.ChatID)
+	}
 }
 
 func mergeOsascriptNotificationConfig(config *OsascriptNotificationConfig, partial PartialOsascriptNotificationConfig) {

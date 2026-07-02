@@ -266,6 +266,14 @@ type WebhookNotificationConfig struct {
 	Format                string                   `json:"format"`
 	Levels                []NotificationSoundLevel `json:"levels"`
 	ThrottleWindowSeconds int                      `json:"throttleWindowSeconds"`
+	// Mode selects the delivery transport: "webhook" (default; an incoming-webhook
+	// POST to URLEnv) or "app" (a Feishu app bot that posts an interactive card to
+	// ChatID via the IM API). App mode reads the app id/secret from AppIDEnv and
+	// AppSecretEnv — env var NAMES, never the secret values.
+	Mode         string `json:"mode,omitempty"`
+	AppIDEnv     string `json:"appIdEnv,omitempty"`
+	AppSecretEnv string `json:"appSecretEnv,omitempty"`
+	ChatID       string `json:"chatId,omitempty"`
 }
 
 type LoggingConfig struct {
@@ -701,6 +709,10 @@ type PartialWebhookNotificationConfig struct {
 	Format                *string                   `json:"format,omitempty"`
 	Levels                *[]NotificationSoundLevel `json:"levels,omitempty"`
 	ThrottleWindowSeconds *int                      `json:"throttleWindowSeconds,omitempty"`
+	Mode                  *string                   `json:"mode,omitempty"`
+	AppIDEnv              *string                   `json:"appIdEnv,omitempty"`
+	AppSecretEnv          *string                   `json:"appSecretEnv,omitempty"`
+	ChatID                *string                   `json:"chatId,omitempty"`
 }
 
 type PartialLoggingConfig struct {
