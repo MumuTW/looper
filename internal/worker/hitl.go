@@ -75,33 +75,62 @@ func asAwaitingHumanError(err error) (*awaitingHumanError, bool) {
 	return nil, false
 }
 
-// consumePendingHumanAnswer returns a resume prompt + native session id when the
-// loop carries a human answer to a prior mid-run question. It marks the answer
-// consumed so a later turn does not re-inject it. Returns empty strings when no
-// answer is pending. Only called when hitl.enabled is true.
-func (r *Runner) consumePendingHumanAnswer(ctx context.Context, loop *storage.LoopRecord) (string, string) {
-	fresh := loop
-	if r.repos != nil && r.repos.Loops != nil {
-		if got, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && got != nil {
-			fresh = got
-		}
-	}
-	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+// pendingHumanAnswer returns a resume prompt + native session id when the loop
+// carries a human answer to a prior mid-run question. It is READ-ONLY: it does
+// NOT mark the answer consumed. That matters because a resumed agent turn can
+// fail or time out before completing — leaving the answer "answered" lets the
+// retry re-read and re-deliver it instead of silently dropping the human's
+// decision. The answer is flipped to "consumed" only once the turn completes,
+// via markHumanAnswerConsumed. Returns empty strings when no answer is pending.
+// Only called when hitl.enabled is true.
+func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecord) (string, string) {
+	ask, ok := r.readFreshHITLAsk(ctx, loop)
 	if !ok || ask.Status != "answered" || strings.TrimSpace(ask.Answer) == "" {
 		return "", ""
 	}
 	resumePrompt := fmt.Sprintf("A human answered the question you asked earlier (%q). Their decision: %s\nContinue the task using this decision; do not ask the same question again.", ask.Question, ask.Answer)
-	sessionID := ask.SessionID
+	return resumePrompt, ask.SessionID
+}
+
+// markHumanAnswerConsumed flips a delivered human answer from "answered" to
+// "consumed" so it is not re-injected on any later run of the same loop. It is
+// called only after the resumed agent turn completes successfully. No-op when
+// there is no answered ask. Persists against the freshest loop record so it does
+// not clobber concurrent metadata writes. Only called when hitl.enabled is true.
+func (r *Runner) markHumanAnswerConsumed(ctx context.Context, loop *storage.LoopRecord) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !ok || ask.Status != "answered" {
+		return
+	}
 	ask.Status = "consumed"
-	if meta, err := loops.WriteHITLAsk(fresh.MetadataJSON, ask); err == nil {
-		fresh.MetadataJSON = &meta
-		fresh.UpdatedAt = r.nowISO()
-		if r.repos != nil && r.repos.Loops != nil {
-			_ = r.repos.Loops.Upsert(ctx, *fresh)
-		}
+	meta, werr := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
+	if werr != nil {
+		return
+	}
+	fresh.MetadataJSON = &meta
+	fresh.UpdatedAt = r.nowISO()
+	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
 		loop.MetadataJSON = &meta
 	}
-	return resumePrompt, sessionID
+}
+
+// readFreshHITLAsk reads the loop's HITL ask from the freshest persisted record,
+// falling back to the in-memory copy when the store is unavailable.
+func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord) (loops.HITLAsk, bool) {
+	meta := loop.MetadataJSON
+	if r.repos != nil && r.repos.Loops != nil {
+		if got, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && got != nil {
+			meta = got.MetadataJSON
+		}
+	}
+	return loops.ReadHITLAsk(meta)
 }
 
 // detectHumanAsk consumes the agent's ask sentinel (if any) and, when present,

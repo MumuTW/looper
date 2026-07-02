@@ -1644,7 +1644,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		nativeSessionID := ""
 		if r.hitlEnabled {
 			prompt += hitlPromptInstruction
-			nativeResumePrompt, nativeSessionID = r.consumePendingHumanAnswer(ctx, &input.Loop)
+			nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop)
 			if nativeResumePrompt != "" {
 				prompt += "\n\n" + nativeResumePrompt
 			}
@@ -1687,6 +1687,13 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				kind = FailureRetryableTransient
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
+		}
+		// HITL (gated): the resumed turn completed without asking again, so the human
+		// answer that seeded it has been acted on. Flip it to "consumed" now — after
+		// the turn, never before — so a failed/timed-out turn re-reads the answer on
+		// retry, while a successful one never re-injects it on a later run.
+		if r.hitlEnabled {
+			r.markHumanAnswerConsumed(ctx, &input.Loop)
 		}
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 			return checkpoint, err
@@ -2414,10 +2421,6 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	if r.db == nil {
 		return fmt.Errorf("worker runner database is not configured")
 	}
-	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"prUrl": pr.URL, "prNumber": pr.Number, "repo": repo})
-	if err != nil {
-		return err
-	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, pr.Number)
 	updatedQueue := queueItem
 	updatedQueue.TargetType = "pull_request"
@@ -2442,6 +2445,15 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 		}
 		if current == nil {
 			return fmt.Errorf("loop not found: %s", loop.ID)
+		}
+		// Merge the PR fields into the FRESH metadata read inside this transaction,
+		// not the stale passed-in loop copy. Otherwise concurrent metadata writes made
+		// earlier in this same run — e.g. the HITL answer marked "consumed" by
+		// markHumanAnswerConsumed — are silently clobbered back to their pre-run value,
+		// which would re-inject an already-consumed human answer on any later re-run.
+		metadataJSON, err := mergeLoopMetadataJSON(current.MetadataJSON, map[string]any{"prUrl": pr.URL, "prNumber": pr.Number, "repo": repo})
+		if err != nil {
+			return err
 		}
 		updatedLoop := *current
 		updatedLoop.Repo = stringPtr(repo)
