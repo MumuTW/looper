@@ -108,6 +108,73 @@ func TestHandlerRespondRejectsNonAwaitingLoop(t *testing.T) {
 	}
 }
 
+func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_card"
+	loopID := "loop_card"
+	targetID := projectID
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 81, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	body := `{"action":{"tag":"button","value":{"loopSeq":"81","answer":"redis"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "running" {
+		t.Fatalf("loop.Status = %q, want running", loop.Status)
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Answer != "redis" || ask.Status != "answered" {
+		t.Fatalf("ask = %#v (ok=%v), want answer redis + answered", ask, ok)
+	}
+}
+
+func TestHandlerFeishuCardActionAnswersChallenge(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(`{"type":"url_verification","challenge":"abc123","token":"t"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"challenge":"abc123"`) {
+		t.Fatalf("challenge echo missing: %s", recorder.Body.String())
+	}
+}
+
+func TestHandlerFeishuCardActionGatedWhenHITLDisabled(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	// cfg.HITL.Enabled defaults to false.
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+
+	body := `{"action":{"tag":"button","value":{"loopSeq":"81","answer":"redis"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 when hitl disabled; body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestHandlerRespondRequiresAnswer(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

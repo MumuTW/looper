@@ -323,6 +323,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if path == apiBasePath+"/hitl/feishu" {
+		h.handleFeishuCardActionRoute(w, r, requestID)
+		return
+	}
+
 	if strings.HasPrefix(path, apiBasePath+"/loops/") {
 		if isFollowLoopLogsRequest(r, path) {
 			if err := h.streamLoopLogsRoute(w, r, path, requestID); err != nil {
@@ -4361,7 +4366,15 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 			return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid respond request: %v", err)}
 		}
 	}
-	answer := strings.TrimSpace(body.Answer)
+	return h.deliverHumanAnswer(ctx, loopID, body.Answer)
+}
+
+// deliverHumanAnswer is the shared core of the HITL respond path: it validates
+// the loop is awaiting_human, stores the answer on the loop's HITL metadata, and
+// transitions the loop back to running (requeue + scheduler tick). Both the
+// /respond API endpoint and the Feishu card-action receiver call it.
+func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnswer string) (loopResponse, error) {
+	answer := strings.TrimSpace(rawAnswer)
 	if answer == "" {
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "respond requires a non-empty answer"}
 	}
@@ -4407,6 +4420,85 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)
 	// so the next claim resumes the run with the stored answer.
 	return h.mutateLoopStatus(ctx, loopID, domain.LoopStatusRunning)
+}
+
+type feishuCardActionEnvelope struct {
+	Type      string `json:"type"`
+	Challenge string `json:"challenge"`
+	Action    struct {
+		Tag   string          `json:"tag"`
+		Value json.RawMessage `json:"value"`
+	} `json:"action"`
+}
+
+// handleFeishuCardActionRoute is the thin Feishu listener (receive side of the
+// app-bot integration whose send side ships in the notifier). It receives a
+// card-action callback when a human clicks an option button on an ask-card, maps
+// the button value {loopSeq, answer} to the awaiting loop, and calls the shared
+// respond logic in-process. It also answers Feishu's url_verification challenge.
+// The whole route is gated by hitl.enabled.
+//
+// Transport choice: this uses the card-action WEBHOOK RECEIVER over looper's
+// existing HTTP server rather than the larksuite long-connection WS SDK, to
+// avoid a heavy new dependency. Point the Feishu app's event/card-callback URL
+// at <daemon>/api/v1/hitl/feishu. Typed free-text replies (message events) are a
+// documented future extension; button clicks are handled today.
+func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Request, requestID string) {
+	if r.Method != http.MethodPost {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: "Feishu card-action route requires POST"})
+		return
+	}
+	var raw []byte
+	if r.Body != nil {
+		defer r.Body.Close()
+		raw, _ = io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	}
+	var envelope feishuCardActionEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "invalid Feishu callback body"})
+		return
+	}
+	// Feishu URL-verification handshake: echo the challenge verbatim.
+	if envelope.Type == "url_verification" {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
+		return
+	}
+	if !h.context.Config.HITL.Enabled {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "hitl.enabled is false"})
+		return
+	}
+	var value struct {
+		LoopSeq string `json:"loopSeq"`
+		Answer  string `json:"answer"`
+	}
+	if len(envelope.Action.Value) > 0 {
+		_ = json.Unmarshal(envelope.Action.Value, &value)
+	}
+	loopSeq := strings.TrimSpace(value.LoopSeq)
+	answer := strings.TrimSpace(value.Answer)
+	if loopSeq == "" || answer == "" {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "card action must carry value.loopSeq and value.answer"})
+		return
+	}
+	loop, err := h.resolveLoop(r.Context(), loopSeq)
+	if err != nil {
+		var typed apiError
+		if !asAPIError(err, &typed) {
+			typed = internalServerError(err)
+		}
+		h.writeError(w, requestID, typed)
+		return
+	}
+	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer); err != nil {
+		var typed apiError
+		if !asAPIError(err, &typed) {
+			typed = internalServerError(err)
+		}
+		h.writeError(w, requestID, typed)
+		return
+	}
+	h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": true})
 }
 
 func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string) (retryLoopResponse, error) {
