@@ -420,6 +420,12 @@ func normalizeProviderConfig(provider *ProviderConfig) {
 	if provider.TokenEnv != nil {
 		provider.TokenEnv = stringPtr(strings.TrimSpace(*provider.TokenEnv))
 	}
+	if provider.Workspace != nil {
+		provider.Workspace = stringPtr(strings.TrimSpace(*provider.Workspace))
+	}
+	if provider.ProjectID != nil {
+		provider.ProjectID = stringPtr(strings.TrimSpace(*provider.ProjectID))
+	}
 }
 
 func normalizeBaseURL(value string) string {
@@ -1358,6 +1364,8 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 			providers[i].BaseURL = cloneStringPtr(providers[i].BaseURL)
 			providers[i].GHPath = cloneStringPtr(providers[i].GHPath)
 			providers[i].TokenEnv = cloneStringPtr(providers[i].TokenEnv)
+			providers[i].Workspace = cloneStringPtr(providers[i].Workspace)
+			providers[i].ProjectID = cloneStringPtr(providers[i].ProjectID)
 		}
 		cloned.Providers = &providers
 	}
@@ -1498,10 +1506,12 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 			kind = *provider.Kind
 		}
 		cloned[index] = ProviderConfig{
-			ID:       strings.TrimSpace(provider.ID),
-			Kind:     kind,
-			GHPath:   cloneStringPtr(provider.GHPath),
-			TokenEnv: cloneStringPtr(provider.TokenEnv),
+			ID:        strings.TrimSpace(provider.ID),
+			Kind:      kind,
+			GHPath:    cloneStringPtr(provider.GHPath),
+			TokenEnv:  cloneStringPtr(provider.TokenEnv),
+			Workspace: cloneStringPtr(provider.Workspace),
+			ProjectID: cloneStringPtr(provider.ProjectID),
 		}
 		if provider.BaseURL != nil {
 			cloned[index].BaseURL = normalizeBaseURL(*provider.BaseURL)

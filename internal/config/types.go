@@ -177,6 +177,10 @@ type ProviderKind string
 const (
 	ProviderKindGitHub  ProviderKind = "github"
 	ProviderKindForgejo ProviderKind = "forgejo"
+	// ProviderKindPlane is a task-source provider: issues (work-items) are read
+	// from a Plane project, while pull requests / diffs / reviews are delegated
+	// to the project's GitHub code repo. See internal/forge/plane.go.
+	ProviderKindPlane ProviderKind = "plane"
 )
 
 type ProviderConfig struct {
@@ -185,6 +189,10 @@ type ProviderConfig struct {
 	BaseURL  string       `json:"baseUrl,omitempty"`
 	GHPath   *string      `json:"ghPath,omitempty"`
 	TokenEnv *string      `json:"tokenEnv,omitempty"`
+	// Workspace and ProjectID identify the Plane project a plane provider reads
+	// its work-items from. Ignored for github/forgejo providers.
+	Workspace *string `json:"workspace,omitempty"`
+	ProjectID *string `json:"projectId,omitempty"`
 }
 
 type AgentConfig struct {
@@ -571,11 +579,13 @@ type PartialProjectWebhookConfig struct {
 }
 
 type PartialProviderConfig struct {
-	ID       string        `json:"id"`
-	Kind     *ProviderKind `json:"kind,omitempty"`
-	BaseURL  *string       `json:"baseUrl,omitempty"`
-	GHPath   *string       `json:"ghPath,omitempty"`
-	TokenEnv *string       `json:"tokenEnv,omitempty"`
+	ID        string        `json:"id"`
+	Kind      *ProviderKind `json:"kind,omitempty"`
+	BaseURL   *string       `json:"baseUrl,omitempty"`
+	GHPath    *string       `json:"ghPath,omitempty"`
+	TokenEnv  *string       `json:"tokenEnv,omitempty"`
+	Workspace *string       `json:"workspace,omitempty"`
+	ProjectID *string       `json:"projectId,omitempty"`
 }
 
 type Config struct {

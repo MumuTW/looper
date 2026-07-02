@@ -250,7 +250,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			providerIDs[provider.ID] = provider.Kind
 		}
 		if !isValidProviderKind(provider.Kind) {
-			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be one of: %s, %s", ProviderKindGitHub, ProviderKindForgejo)})
+			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be one of: %s, %s, %s", ProviderKindGitHub, ProviderKindForgejo, ProviderKindPlane)})
 		}
 		if provider.Kind == ProviderKindForgejo {
 			if !isAbsoluteHTTPURL(provider.BaseURL) {
@@ -258,6 +258,22 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			}
 			if isNilOrEmptyString(provider.TokenEnv) {
 				issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "is required for forgejo providers"})
+			}
+		}
+		if provider.Kind == ProviderKindPlane {
+			// baseUrl is optional (a default Plane host is used when omitted); if
+			// provided it must be an absolute http(s) URL.
+			if strings.TrimSpace(provider.BaseURL) != "" && !isAbsoluteHTTPURL(provider.BaseURL) {
+				issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL for plane providers"})
+			}
+			if isNilOrEmptyString(provider.TokenEnv) {
+				issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "is required for plane providers (names the env var holding the Plane API key)"})
+			}
+			if isNilOrEmptyString(provider.Workspace) {
+				issues = append(issues, ValidationIssue{Path: prefix + ".workspace", Message: "is required for plane providers (Plane workspace slug)"})
+			}
+			if isNilOrEmptyString(provider.ProjectID) {
+				issues = append(issues, ValidationIssue{Path: prefix + ".projectId", Message: "is required for plane providers (Plane project UUID)"})
 			}
 		}
 	}
@@ -301,6 +317,16 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			}
 			if strings.TrimSpace(project.Repo) == "" {
 				issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: "is required for forgejo projects"})
+			}
+		}
+		if providerKind == ProviderKindPlane {
+			if strings.TrimSpace(project.Provider) == "" {
+				issues = append(issues, ValidationIssue{Path: prefix + ".provider", Message: "is required for plane projects"})
+			}
+			// repo names the GitHub code repository (owner/name) where pull
+			// requests are opened; Plane only supplies the work-items.
+			if strings.TrimSpace(project.Repo) == "" {
+				issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: "is required for plane projects (the GitHub code repo, owner/name, where PRs are opened)"})
 			}
 		}
 		if strings.TrimSpace(project.Repo) != "" {
@@ -409,7 +435,7 @@ func isValidNetworkMode(mode NetworkMode) bool {
 }
 
 func isValidProviderKind(kind ProviderKind) bool {
-	return kind == ProviderKindGitHub || kind == ProviderKindForgejo
+	return kind == ProviderKindGitHub || kind == ProviderKindForgejo || kind == ProviderKindPlane
 }
 
 func isAbsoluteHTTPURL(value string) bool {
