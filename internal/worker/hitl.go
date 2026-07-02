@@ -167,7 +167,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		return ProcessResult{}, err
 	}
 	if r.hitlNotify != nil {
-		_ = r.hitlNotify(ctx, HITLAskNotification{
+		if err := r.hitlNotify(ctx, HITLAskNotification{
 			ProjectID: input.Project.ID,
 			LoopID:    input.Loop.ID,
 			LoopSeq:   input.Loop.Seq,
@@ -176,7 +176,14 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			Title:     awaiting.question,
 			Question:  awaiting.question,
 			Options:   awaiting.options,
-		})
+		}); err != nil && r.logger != nil {
+			// The loop is already parked in awaiting_human; if the human is never
+			// notified they must find it via the dashboard / API. Surface loudly so an
+			// unconfigured or failing notifier can't silently strand a run.
+			r.logger.Warn("worker HITL ask notification failed; loop parked awaiting human with no notification sent", map[string]any{
+				"loopId": input.Loop.ID, "loopSeq": input.Loop.Seq, "runId": run.ID, "error": err.Error(),
+			})
+		}
 	}
 	return ProcessResult{LoopID: input.Loop.ID, RunID: run.ID, QueueItemID: input.QueueItem.ID, Status: "awaiting_human", Summary: summary}, nil
 }
