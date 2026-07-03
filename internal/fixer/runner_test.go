@@ -5779,6 +5779,9 @@ type fakeGitHubGateway struct {
 	resolveCalls          []ResolveReviewThreadInput
 	addLabelCalls         []PullRequestLabelsInput
 	removeLabelCalls      []PullRequestLabelsInput
+	reviewerRequests      []PullRequestReviewersInput
+	reviews               []ReviewSummary
+	dismissedReviews      []DismissReviewInput
 	replyCalls            []AddReviewThreadReplyInput
 	replyErr              error
 	resolveErr            error
@@ -5933,6 +5936,20 @@ func (f *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRe
 
 func (f *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
 	f.removeLabelCalls = append(f.removeLabelCalls, input)
+	return nil
+}
+
+func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input PullRequestReviewersInput) error {
+	f.reviewerRequests = append(f.reviewerRequests, input)
+	return nil
+}
+
+func (f *fakeGitHubGateway) ListPullRequestReviews(_ context.Context, _ ViewPullRequestInput) ([]ReviewSummary, error) {
+	return f.reviews, nil
+}
+
+func (f *fakeGitHubGateway) DismissReview(_ context.Context, input DismissReviewInput) error {
+	f.dismissedReviews = append(f.dismissedReviews, input)
 	return nil
 }
 
@@ -7018,5 +7035,32 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 	}
 	if persisted == nil || persisted.Status != "terminated" {
 		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
+	}
+}
+
+func TestReRequestReviewersAfterFix(t *testing.T) {
+	github := &fakeGitHubGateway{
+		currentUser: "looper-bot",
+		reviews: []ReviewSummary{
+			{ID: 1, State: "CHANGES_REQUESTED", Author: "reviewer-a"},
+			{ID: 2, State: "COMMENTED", Author: "reviewer-b"},
+			{ID: 3, State: "APPROVED", Author: "reviewer-c"},        // approved -> not re-requested
+			{ID: 4, State: "CHANGES_REQUESTED", Author: "looper-bot"}, // self -> excluded
+			{ID: 5, State: "CHANGES_REQUESTED", Author: "reviewer-a"}, // duplicate -> once
+		},
+	}
+	runner := New(Options{GitHub: github, RetryMaxAttempts: -1})
+	runner.reRequestReviewersAfterFix(context.Background(), stepInput{Repo: "acme/x", PRNumber: 7, Project: storage.ProjectRecord{RepoPath: "/tmp"}})
+
+	if len(github.reviewerRequests) != 1 {
+		t.Fatalf("reviewerRequests = %d, want 1 (one re-request call)", len(github.reviewerRequests))
+	}
+	got := github.reviewerRequests[0].Reviewers
+	if len(got) != 2 {
+		t.Fatalf("re-requested %v, want [reviewer-a reviewer-b] (approved/self/dup excluded)", got)
+	}
+	set := map[string]bool{got[0]: true, got[1]: true}
+	if !set["reviewer-a"] || !set["reviewer-b"] {
+		t.Fatalf("re-requested %v, want reviewer-a + reviewer-b", got)
 	}
 }

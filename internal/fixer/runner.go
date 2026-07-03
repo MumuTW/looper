@@ -180,6 +180,22 @@ type ViewPullRequestInput struct {
 	CWD      string
 }
 
+type PullRequestReviewersInput struct {
+	Repo      string
+	PRNumber  int64
+	Reviewers []string
+	CWD       string
+}
+
+// ReviewSummary is a submitted review (used to re-request the reviewers who
+// weighed in after a fix, and to dismiss unreasonable ones).
+type ReviewSummary struct {
+	ID     int64
+	State  string
+	Author string
+	Body   string
+}
+
 type ListReviewThreadsInput struct {
 	Repo     string
 	PRNumber int64
@@ -277,6 +293,17 @@ type GitHubGateway interface {
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
+	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
+	ListPullRequestReviews(context.Context, ViewPullRequestInput) ([]ReviewSummary, error)
+	DismissReview(context.Context, DismissReviewInput) error
+}
+
+type DismissReviewInput struct {
+	Repo     string
+	PRNumber int64
+	ReviewID int64
+	Message  string
+	CWD      string
 }
 
 type CreateWorktreeInput struct {
@@ -2353,6 +2380,9 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		r.appendEvent(ctx, eventInput{eventType: eventType, projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "message": message}})
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
+	// After pushing a fix, re-request the reviewers who weighed in so the PR gets
+	// re-reviewed promptly instead of waiting for the coordinator lane.
+	r.reRequestReviewersAfterFix(ctx, input)
 	finalHeadSHA := checkpoint.ReconcileCommits.FinalHeadSHA
 	if finalHeadSHA == "" {
 		return checkpoint, &loopError{message: "reconcileCommits.finalHeadSha is required", kind: FailureRetryableAfterResume}
@@ -7365,4 +7395,37 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 		return ""
 	}
 	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
+}
+
+// reRequestReviewersAfterFix re-requests the human reviewers who left a review
+// (changes-requested or commented) so a fresh fix gets re-reviewed promptly,
+// rather than waiting for the coordinator lane to notice. Best-effort.
+func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput) {
+	if r.github == nil || input.PRNumber <= 0 {
+		return
+	}
+	reviews, err := r.github.ListPullRequestReviews(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return
+	}
+	self, _ := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	seen := map[string]bool{}
+	reviewers := make([]string, 0, len(reviews))
+	for _, rv := range reviews {
+		if rv.State != "CHANGES_REQUESTED" && rv.State != "COMMENTED" {
+			continue
+		}
+		author := strings.TrimSpace(rv.Author)
+		if author == "" || strings.EqualFold(author, strings.TrimSpace(self)) || seen[strings.ToLower(author)] {
+			continue
+		}
+		seen[strings.ToLower(author)] = true
+		reviewers = append(reviewers, author)
+	}
+	if len(reviewers) == 0 {
+		return
+	}
+	if err := r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: reviewers, CWD: input.Project.RepoPath}); err != nil && r.logger != nil {
+		r.logger.Warn("fixer: re-request reviewers after fix failed", map[string]any{"repo": input.Repo, "pr": input.PRNumber, "error": err.Error()})
+	}
 }
