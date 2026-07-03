@@ -78,6 +78,14 @@ type Gateway struct {
 	feishuTokenMu  sync.Mutex
 	feishuToken    string
 	feishuTokenExp time.Time
+
+	// threadMu guards threadRoots, an in-memory loopID -> Feishu root message id
+	// map. All notifications for one loop are threaded under that root so a task's
+	// messages aggregate into a single Feishu thread instead of separate cards.
+	// In-memory is sufficient: a loop's messages arrive within one daemon session;
+	// a restart just starts a fresh thread for any still-running loop.
+	threadMu    sync.Mutex
+	threadRoots map[string]string
 }
 
 func NewGateway(options Options) *Gateway {
@@ -110,6 +118,7 @@ func NewGateway(options Options) *Gateway {
 		runCommand:    runCommand,
 		httpPost:      httpPost,
 		feishuAppHTTP: feishuAppHTTP,
+		threadRoots:   map[string]string{},
 	}
 }
 
@@ -440,34 +449,35 @@ func (g *Gateway) recordFeishuApp(ctx context.Context, payload SystemNotificatio
 		return persist(build("failed", err.Error(), nil))
 	}
 
-	card, err := buildFeishuCard(payload)
+	// Non-interactive updates (PR opened, progress, completion) are plain text —
+	// only a mid-run question needs an interactive card with buttons. Thread the
+	// message under the loop's root so a task's updates aggregate into one Feishu
+	// thread instead of stacking as separate cards.
+	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, payload.LoopID)
+	content, err := json.Marshal(map[string]string{"text": feishuNotificationText(payload)})
 	if err != nil {
 		return persist(build("failed", err.Error(), nil))
 	}
-	messageBody, err := json.Marshal(map[string]any{
-		"receive_id": chatID,
-		"msg_type":   "interactive",
-		"content":    string(card),
-	})
-	if err != nil {
+	if _, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "text", string(content)); err != nil {
 		return persist(build("failed", err.Error(), nil))
-	}
-
-	status, respBody, err := g.feishuAppHTTP(ctx, http.MethodPost, feishuAPIBase+"/open-apis/im/v1/messages?receive_id_type=chat_id", map[string]string{
-		"Authorization": "Bearer " + token,
-		"Content-Type":  "application/json; charset=utf-8",
-	}, messageBody)
-	if err != nil {
-		return persist(build("failed", err.Error(), nil))
-	}
-	if status < 200 || status >= 300 {
-		return persist(build("failed", fmt.Sprintf("feishu im responded with status %d", status), nil))
-	}
-	if code, msg := feishuResponseCode(respBody); code != 0 {
-		return persist(build("failed", fmt.Sprintf("feishu im error code %d: %s", code, msg), nil))
 	}
 
 	return persist(build("success", "", stringPointer(nowISO)))
+}
+
+// feishuNotificationText renders a system notification as a plain-text body for
+// the app bot. Feishu auto-links any URLs it contains (e.g. the PR link).
+func feishuNotificationText(payload SystemNotificationPayload) string {
+	lines := make([]string, 0, 3)
+	for _, part := range []string{payload.Title, payload.Subtitle, payload.Body} {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+	if len(lines) == 0 {
+		return "Looper update"
+	}
+	return strings.Join(lines, "\n")
 }
 
 // HITLAskCard is a mid-run human-in-the-loop question rendered as an interactive
@@ -475,6 +485,7 @@ func (g *Gateway) recordFeishuApp(ctx context.Context, payload SystemNotificatio
 // seq + the chosen answer so a card-action callback identifies the loop + reply.
 type HITLAskCard struct {
 	ProjectID string
+	LoopID    string
 	LoopSeq   int64
 	Repo      string
 	Title     string
@@ -501,22 +512,11 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	if err != nil {
 		return err
 	}
-	messageBody, err := json.Marshal(map[string]any{"receive_id": chatID, "msg_type": "interactive", "content": string(cardJSON)})
-	if err != nil {
+	// Thread the ask card under the loop's root so the question lands in the same
+	// thread as the task's other updates. Card buttons still work inside a thread.
+	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, card.LoopID)
+	if _, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON)); err != nil {
 		return err
-	}
-	status, respBody, err := g.feishuAppHTTP(ctx, http.MethodPost, feishuAPIBase+"/open-apis/im/v1/messages?receive_id_type=chat_id", map[string]string{
-		"Authorization": "Bearer " + token,
-		"Content-Type":  "application/json; charset=utf-8",
-	}, messageBody)
-	if err != nil {
-		return err
-	}
-	if status < 200 || status >= 300 {
-		return fmt.Errorf("feishu im responded with status %d", status)
-	}
-	if code, msg := feishuResponseCode(respBody); code != 0 {
-		return fmt.Errorf("feishu im error code %d: %s", code, msg)
 	}
 	return nil
 }
@@ -554,7 +554,7 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if len(actions) > 0 {
 		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
 	}
-	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ") + " · reply in-thread or click an option"}}})
+	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ") + " · click an option to answer"}}})
 
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
@@ -622,62 +622,156 @@ func feishuResponseCode(body []byte) (int, string) {
 	return parsed.Code, parsed.Msg
 }
 
-// buildFeishuCard renders a notification payload into a simple Feishu
-// interactive card (header + markdown body + note).
-func buildFeishuCard(payload SystemNotificationPayload) ([]byte, error) {
-	template := "blue"
-	switch payload.Level {
-	case "action_required":
-		template = "orange"
-	case "failure":
-		template = "red"
+// feishuMessageID extracts data.message_id from a Feishu send/reply response.
+func feishuMessageID(body []byte) string {
+	var parsed struct {
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
 	}
-
-	title := strings.TrimSpace(payload.Title)
-	if title == "" {
-		title = "Looper"
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return ""
 	}
+	return strings.TrimSpace(parsed.Data.MessageID)
+}
 
-	body := strings.TrimSpace(payload.Body)
-	if strings.TrimSpace(payload.Subtitle) != "" {
-		if body != "" {
-			body = payload.Subtitle + "\n\n" + body
-		} else {
-			body = payload.Subtitle
+// postFeishuAppMessage sends one message through the app bot. When rootMessageID
+// is non-empty the message is threaded as a reply under that root
+// (reply_in_thread), so all of a loop's messages collapse into one thread;
+// otherwise it is posted top-level to chatID. Returns the new message id.
+func (g *Gateway) postFeishuAppMessage(ctx context.Context, token, chatID, rootMessageID, msgType, content string) (string, error) {
+	var apiURL string
+	var payload map[string]any
+	if strings.TrimSpace(rootMessageID) != "" {
+		apiURL = feishuAPIBase + "/open-apis/im/v1/messages/" + strings.TrimSpace(rootMessageID) + "/reply"
+		payload = map[string]any{"msg_type": msgType, "content": content, "reply_in_thread": true}
+	} else {
+		apiURL = feishuAPIBase + "/open-apis/im/v1/messages?receive_id_type=chat_id"
+		payload = map[string]any{"receive_id": chatID, "msg_type": msgType, "content": content}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	status, respBody, err := g.feishuAppHTTP(ctx, http.MethodPost, apiURL, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json; charset=utf-8",
+	}, body)
+	if err != nil {
+		return "", err
+	}
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("feishu im responded with status %d", status)
+	}
+	if code, msg := feishuResponseCode(respBody); code != 0 {
+		return "", fmt.Errorf("feishu im error code %d: %s", code, msg)
+	}
+	return feishuMessageID(respBody), nil
+}
+
+// ensureFeishuThreadRoot returns the Feishu root message id a loop's notifications
+// thread under, creating it (a plain-text "开始处理" header) on first use. Returns
+// "" when loopID is empty or the root can't be created — callers then post
+// top-level, so threading degrades gracefully rather than dropping messages.
+func (g *Gateway) ensureFeishuThreadRoot(ctx context.Context, token, chatID, loopID string) string {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" {
+		return ""
+	}
+	g.threadMu.Lock()
+	existing, ok := g.threadRoots[loopID]
+	g.threadMu.Unlock()
+	if ok {
+		return existing
+	}
+	content, err := json.Marshal(map[string]string{"text": g.feishuThreadHeaderText(ctx, loopID)})
+	if err != nil {
+		return ""
+	}
+	msgID, err := g.postFeishuAppMessage(ctx, token, chatID, "", "text", string(content))
+	if err != nil || msgID == "" {
+		return ""
+	}
+	g.threadMu.Lock()
+	defer g.threadMu.Unlock()
+	// A concurrent notification for the same loop may have created a root already;
+	// keep the first winner so every message threads under one root.
+	if winner, raced := g.threadRoots[loopID]; raced {
+		return winner
+	}
+	g.threadRoots[loopID] = msgID
+	return msgID
+}
+
+// feishuThreadHeaderText builds a loop thread's plain-text root header, e.g.
+// "🔧 开始处理 #360 · owner/repo\n<title>". Best-effort; falls back to the loop id.
+func (g *Gateway) feishuThreadHeaderText(ctx context.Context, loopID string) string {
+	var loop *storage.LoopRecord
+	if g.repositories != nil && g.repositories.Loops != nil {
+		if got, err := g.repositories.Loops.GetByID(ctx, loopID); err == nil {
+			loop = got
 		}
 	}
-	if body == "" {
-		body = title
+	if loop == nil {
+		return "🔧 开始处理任务 " + loopID
 	}
-
-	noteParts := make([]string, 0, 3)
-	if strings.TrimSpace(payload.Level) != "" {
-		noteParts = append(noteParts, "Looper · "+payload.Level)
-	} else {
-		noteParts = append(noteParts, "Looper")
+	head := "🔧 开始处理"
+	target := ""
+	if loop.TargetID != nil {
+		target = *loop.TargetID
 	}
-	if strings.TrimSpace(payload.ProjectID) != "" {
-		noteParts = append(noteParts, payload.ProjectID)
+	if label := humanizeLoopTarget(target); label != "" {
+		head += " " + label
 	}
-	if strings.TrimSpace(payload.LoopID) != "" {
-		noteParts = append(noteParts, payload.LoopID)
+	if loop.Repo != nil && strings.TrimSpace(*loop.Repo) != "" {
+		head += " · " + strings.TrimSpace(*loop.Repo)
 	}
-
-	card := map[string]any{
-		"config": map[string]any{"wide_screen_mode": true},
-		"header": map[string]any{
-			"template": template,
-			"title":    map[string]any{"tag": "plain_text", "content": title},
-		},
-		"elements": []any{
-			map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": body}},
-			map[string]any{"tag": "note", "elements": []any{
-				map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")},
-			}},
-		},
+	if title := loopTitleFromMetadata(loop.MetadataJSON); title != "" {
+		head += "\n" + title
 	}
-	return json.Marshal(card)
+	return head
 }
+
+// humanizeLoopTarget turns a loop target id ("issue:owner/repo:360",
+// "pr:owner/repo:8") into a short "#360" / "PR #8" label. Returns "" when the
+// trailing segment is not a number (e.g. project-scoped loops).
+func humanizeLoopTarget(targetID string) string {
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
+		return ""
+	}
+	parts := strings.Split(targetID, ":")
+	num := strings.TrimSpace(parts[len(parts)-1])
+	if _, err := strconv.Atoi(num); err != nil {
+		return ""
+	}
+	if strings.HasPrefix(targetID, "pr:") || strings.HasPrefix(targetID, "pull_request:") {
+		return "PR #" + num
+	}
+	return "#" + num
+}
+
+// loopTitleFromMetadata best-effort reads a human task title from loop metadata,
+// tolerating both a top-level "title" and a nested "worker.title".
+func loopTitleFromMetadata(metadataJSON *string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return ""
+	}
+	if t, ok := meta["title"].(string); ok && strings.TrimSpace(t) != "" {
+		return strings.TrimSpace(t)
+	}
+	if w, ok := meta["worker"].(map[string]any); ok {
+		if t, ok := w["title"].(string); ok && strings.TrimSpace(t) != "" {
+			return strings.TrimSpace(t)
+		}
+	}
+	return ""
+}
+
 
 func defaultFeishuAppHTTP(ctx context.Context, method, url string, headers map[string]string, body []byte) (int, []byte, error) {
 	client := &http.Client{Timeout: webhookTimeout}

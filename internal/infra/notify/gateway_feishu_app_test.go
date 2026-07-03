@@ -39,7 +39,7 @@ func newFeishuAppGateway(t *testing.T, cfg config.WebhookNotificationConfig, cal
 			if strings.Contains(url, "/auth/v3/tenant_access_token/internal") {
 				return 200, []byte(`{"code":0,"msg":"ok","tenant_access_token":"t-abc123","expire":7200}`), nil
 			}
-			return 200, []byte(`{"code":0,"msg":"success"}`), nil
+			return 200, []byte(`{"code":0,"msg":"success","data":{"message_id":"om_msg"}}`), nil
 		},
 	})
 }
@@ -69,7 +69,7 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		DedupeKey:  "worker.attention:task:task_1",
 	}
 
-	t.Run("app mode fetches token then posts interactive card", func(t *testing.T) {
+	t.Run("app mode fetches token then posts text message", func(t *testing.T) {
 		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
 		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
 
@@ -114,18 +114,16 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		if envelope.ReceiveID != "oc_group_chat_123" {
 			t.Fatalf("receive_id = %q, want oc_group_chat_123", envelope.ReceiveID)
 		}
-		if envelope.MsgType != "interactive" {
-			t.Fatalf("msg_type = %q, want interactive", envelope.MsgType)
+		// System updates are plain text now (only mid-run asks are cards).
+		if envelope.MsgType != "text" {
+			t.Fatalf("msg_type = %q, want text", envelope.MsgType)
 		}
-		// content is a JSON string containing the card; assert title/body + orange header.
+		// content is a JSON string {"text":"..."} with title + subtitle + body.
 		if !strings.Contains(envelope.Content, "Looper Worker Needs Attention") {
-			t.Fatalf("card content missing title: %s", envelope.Content)
+			t.Fatalf("text content missing title: %s", envelope.Content)
 		}
 		if !strings.Contains(envelope.Content, "A worker paused for human input") {
-			t.Fatalf("card content missing body: %s", envelope.Content)
-		}
-		if !strings.Contains(envelope.Content, `"template":"orange"`) {
-			t.Fatalf("card content missing orange header for action_required: %s", envelope.Content)
+			t.Fatalf("text content missing body: %s", envelope.Content)
 		}
 
 		if got := notificationStatus(records, "feishu_app"); got != "success" {
@@ -136,7 +134,7 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		}
 	})
 
-	t.Run("failure level uses red header", func(t *testing.T) {
+	t.Run("failure level posts plain text", func(t *testing.T) {
 		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
 		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
 
@@ -148,13 +146,66 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 			t.Fatalf("feishu calls = %d, want 2", len(calls))
 		}
 		var envelope struct {
+			MsgType string `json:"msg_type"`
 			Content string `json:"content"`
 		}
 		if err := json.Unmarshal(calls[1].body, &envelope); err != nil {
 			t.Fatalf("message body not JSON: %v", err)
 		}
-		if !strings.Contains(envelope.Content, `"template":"red"`) {
-			t.Fatalf("failure card missing red header: %s", envelope.Content)
+		if envelope.MsgType != "text" {
+			t.Fatalf("msg_type = %q, want text", envelope.MsgType)
+		}
+		if !strings.Contains(envelope.Content, "Run failed") || !strings.Contains(envelope.Content, "boom") {
+			t.Fatalf("text content missing title/body: %s", envelope.Content)
+		}
+	})
+
+	t.Run("loop notifications thread under a per-loop root", func(t *testing.T) {
+		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+		var calls []capturedFeishuCall
+		gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+
+		// First notification for the loop: token + root header + the message reply.
+		gateway.Notify(ctx, SystemNotificationPayload{Level: "action_required", LoopID: "loop_thread_1", Title: "PR opened", Body: "https://example/pr/1"})
+		if len(calls) != 3 {
+			t.Fatalf("first loop notification calls = %d, want 3 (token + root + reply)", len(calls))
+		}
+		// calls[1] is the root header, posted top-level as text.
+		var root struct {
+			MsgType string `json:"msg_type"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(calls[1].body, &root); err != nil {
+			t.Fatalf("root body not JSON: %v", err)
+		}
+		if root.MsgType != "text" {
+			t.Fatalf("root msg_type = %q, want text", root.MsgType)
+		}
+		if !strings.Contains(calls[1].url, "/im/v1/messages?receive_id_type=chat_id") {
+			t.Fatalf("root should be posted top-level, url = %q", calls[1].url)
+		}
+		// calls[2] is the actual notification, threaded as a reply to the root.
+		if !strings.Contains(calls[2].url, "/im/v1/messages/om_msg/reply") {
+			t.Fatalf("notification should reply to root om_msg, url = %q", calls[2].url)
+		}
+		var reply map[string]any
+		if err := json.Unmarshal(calls[2].body, &reply); err != nil {
+			t.Fatalf("reply body not JSON: %v", err)
+		}
+		if reply["reply_in_thread"] != true {
+			t.Fatalf("reply_in_thread = %v, want true", reply["reply_in_thread"])
+		}
+
+		// Second notification for the SAME loop reuses the root: just one reply call.
+		before := len(calls)
+		gateway.Notify(ctx, SystemNotificationPayload{Level: "action_required", LoopID: "loop_thread_1", Title: "done", Body: "merged"})
+		if got := len(calls) - before; got != 1 {
+			t.Fatalf("second notification calls = %d, want 1 (root reused, reply only)", got)
+		}
+		if !strings.Contains(calls[before].url, "/im/v1/messages/om_msg/reply") {
+			t.Fatalf("second notification should reply to cached root, url = %q", calls[before].url)
 		}
 	})
 

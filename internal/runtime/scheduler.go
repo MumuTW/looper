@@ -2092,7 +2092,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		},
 		HITLEnabled: cfg.HITL.Enabled,
 		HITLNotify: func(ctx context.Context, ask worker.HITLAskNotification) error {
-			return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{ProjectID: ask.ProjectID, LoopSeq: ask.LoopSeq, Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options})
+			return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq, Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options})
 		},
 	})
 	claimMu := &sync.Mutex{}
