@@ -822,6 +822,51 @@ func (g *Gateway) FetchBranch(ctx context.Context, repoPath, remote, branch stri
 	return g.runGit(ctx, repoPath, nil, "fetch", remote, branch)
 }
 
+// MergeBaseInput asks to merge a remote base branch into a worktree.
+type MergeBaseInput struct {
+	WorktreePath string
+	Remote       string
+	BaseBranch   string
+}
+
+// MergeBaseResult reports the outcome of a base merge.
+type MergeBaseResult struct {
+	AlreadyUpToDate bool
+	// Conflicted is true when the merge left conflict markers in the worktree for
+	// an agent to resolve (the merge is intentionally NOT aborted in that case).
+	Conflicted bool
+}
+
+// MergeBaseIntoWorktree fetches the base branch and merges it into the worktree.
+// On a clean merge it returns AlreadyUpToDate as appropriate; on conflicts it
+// leaves the conflict markers in place and returns Conflicted=true so the caller
+// can hand the worktree to an agent; on any other merge failure it aborts to keep
+// the worktree clean and returns the error.
+func (g *Gateway) MergeBaseIntoWorktree(ctx context.Context, input MergeBaseInput) (MergeBaseResult, error) {
+	remote := strings.TrimSpace(input.Remote)
+	if remote == "" {
+		remote = "origin"
+	}
+	base := strings.TrimSpace(input.BaseBranch)
+	if base == "" {
+		return MergeBaseResult{}, fmt.Errorf("base branch is required")
+	}
+	if err := g.FetchBranch(ctx, input.WorktreePath, remote, base); err != nil {
+		return MergeBaseResult{}, err
+	}
+	res, err := g.runGitResult(ctx, input.WorktreePath, nil, "merge", "--no-edit", remote+"/"+base)
+	out := res.Stdout + res.Stderr
+	if err == nil {
+		return MergeBaseResult{AlreadyUpToDate: strings.Contains(out, "Already up to date")}, nil
+	}
+	if strings.Contains(out, "CONFLICT") || strings.Contains(out, "Automatic merge failed") {
+		return MergeBaseResult{Conflicted: true}, nil
+	}
+	// Some other merge failure — abort so the worktree isn't left half-merged.
+	_, _ = g.runGitResult(ctx, input.WorktreePath, nil, "merge", "--abort")
+	return MergeBaseResult{}, err
+}
+
 func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
 	_, err := g.runGitResult(ctx, repoPath, nil, "merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {

@@ -2423,6 +2423,40 @@ func (g *Gateway) ListPullRequestReviews(ctx context.Context, input ViewPullRequ
 	return reviews, nil
 }
 
+// UpdatePullRequestBranch merges the base branch into the PR head via GitHub's
+// native update-branch (the clean, no-conflict case of keeping a PR current).
+// Returns a conflict error when the merge is not clean, so the caller can fall
+// back to an agent-driven resolve. Idempotent-ish: a 422 "already up to date" is
+// treated as success.
+func (g *Gateway) UpdatePullRequestBranch(ctx context.Context, input ViewPullRequestInput) error {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/update-branch", repo, input.PRNumber), "--method", "PUT", "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		if msg := err.Error(); strings.Contains(msg, "merge conflict") || strings.Contains(msg, "not mergeable") {
+			return &MergeConflictError{Repo: input.Repo, PRNumber: input.PRNumber}
+		}
+		if strings.Contains(err.Error(), "already up to date") {
+			return nil
+		}
+	}
+	return err
+}
+
+// MergeConflictError signals that a base merge cannot be done cleanly and needs an
+// agent to resolve conflicts.
+type MergeConflictError struct {
+	Repo     string
+	PRNumber int64
+}
+
+func (e *MergeConflictError) Error() string {
+	return fmt.Sprintf("pull request %s#%d has merge conflicts with its base", e.Repo, e.PRNumber)
+}
+
 type DismissReviewInput struct {
 	Repo     string
 	PRNumber int64
