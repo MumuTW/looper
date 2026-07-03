@@ -20,13 +20,19 @@ type githubAnswerComment struct {
 	Body   string
 }
 
+// looperCommentMarker tags every comment looper itself posts (the ask marker and
+// the disclosure stamp both start with it), so a comment carrying it is
+// bot-authored and can never be mistaken for a human answer — this is robust even
+// when the bot and a human share the same GitHub account.
+const looperCommentMarker = "<!-- looper:"
+
 // detectGitHubHITLAnswer returns the human's answer to a GitHub HITL ask, or ""
 // when none has arrived yet. The answer is the FIRST comment posted after the ask
-// (comment id > askCommentID; GitHub comment ids are monotonic) by someone other
-// than the bot itself (author != selfLogin). When answerAuthors is non-empty the
-// commenter must be on that allowlist; otherwise any non-bot human may answer.
+// (comment id > askCommentID; GitHub comment ids are monotonic) that is NOT one of
+// looper's own comments (no looper marker). When answerAuthors is non-empty the
+// commenter must be on that allowlist; otherwise any human reply may answer.
 // Empty-bodied comments are ignored so ordinary reactions/edits don't count.
-func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, selfLogin string, answerAuthors []string) string {
+func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, answerAuthors []string) string {
 	allow := make(map[string]bool, len(answerAuthors))
 	for _, a := range answerAuthors {
 		if a = strings.TrimSpace(a); a != "" {
@@ -39,8 +45,11 @@ func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, 
 		if c.ID <= askCommentID {
 			continue
 		}
+		if strings.Contains(c.Body, looperCommentMarker) {
+			continue // looper's own comment (ask / progress / decision-log), never an answer
+		}
 		author := strings.TrimSpace(c.Author)
-		if author == "" || strings.EqualFold(author, strings.TrimSpace(selfLogin)) {
+		if author == "" {
 			continue
 		}
 		if len(allow) > 0 && !allow[strings.ToLower(author)] {
@@ -64,9 +73,6 @@ type githubHITLPollDeps struct {
 	// listComments returns a PR's issue comments (oldest-first is fine; the
 	// detector orders by id).
 	listComments func(ctx contextType, repo string, prNumber int64, cwd string) ([]githubAnswerComment, error)
-	// currentUser returns the bot's own login for the repo's host (to exclude the
-	// bot's own comments).
-	currentUser func(ctx contextType, cwd string) string
 	// deliverAnswer feeds the human's answer into the shared HITL core (flips the
 	// loop to running + requeues for resume). Wired to the api handler.
 	deliverAnswer func(ctx contextType, loopID, answer string) error
@@ -117,11 +123,7 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 			}
 			continue
 		}
-		self := ""
-		if deps.currentUser != nil {
-			self = deps.currentUser(ctx, cwd)
-		}
-		answer := detectGitHubHITLAnswer(comments, loop.AskCommentID, self, deps.answerAuthors)
+		answer := detectGitHubHITLAnswer(comments, loop.AskCommentID, deps.answerAuthors)
 		if answer == "" {
 			continue
 		}
@@ -234,10 +236,6 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 				out = append(out, githubAnswerComment{ID: c.ID, Author: c.Author, Body: c.Body})
 			}
 			return out, nil
-		},
-		currentUser: func(ctx contextType, cwd string) string {
-			login, _ := gw.GetCurrentUserLogin(ctx, cwd)
-			return login
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
 			return deliverGitHubHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer)

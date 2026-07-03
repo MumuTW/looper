@@ -7,34 +7,35 @@ import (
 
 func TestDetectGitHubHITLAnswer(t *testing.T) {
 	comments := []githubAnswerComment{
-		{ID: 100, Author: "looper-bot", Body: "<!-- looper:hitl:ask --> which one?"}, // the ask (== askCommentID)
-		{ID: 101, Author: "looper-bot", Body: "some other bot note"},                  // bot, ignored
-		{ID: 105, Author: "lefarcen", Body: "用 A,改 resize handle"},                    // first human answer
-		{ID: 110, Author: "someoneelse", Body: "later comment"},                        // later, not chosen
+		{ID: 100, Author: "lefarcen", Body: "<!-- looper:hitl:ask v=1 --> which one?"}, // the ask (bot marker), == askCommentID
+		{ID: 101, Author: "lefarcen", Body: "<!-- looper:stamp --> still working"},     // bot marker, ignored even if same login
+		{ID: 105, Author: "lefarcen", Body: "用 A,改 resize handle"},                     // human reply, no marker -> first answer
+		{ID: 110, Author: "someoneelse", Body: "later comment"},
 	}
-	// First non-bot comment after the ask wins.
-	if got := detectGitHubHITLAnswer(comments, 100, "looper-bot", nil); got != "用 A,改 resize handle" {
+	// First non-looper comment after the ask wins — even though the bot and human
+	// share the "lefarcen" account, the marker distinguishes them.
+	if got := detectGitHubHITLAnswer(comments, 100, nil); got != "用 A,改 resize handle" {
 		t.Fatalf("answer = %q, want the first human reply", got)
 	}
-	// No qualifying comment yet (only the ask + bot notes).
-	if got := detectGitHubHITLAnswer(comments[:2], 100, "looper-bot", nil); got != "" {
+	// Only the ask + a marked bot note -> no answer yet.
+	if got := detectGitHubHITLAnswer(comments[:2], 100, nil); got != "" {
 		t.Fatalf("answer = %q, want empty (no human reply yet)", got)
 	}
-	// Allowlist excludes lefarcen -> the next allowed author (someoneelse) answers.
-	if got := detectGitHubHITLAnswer(comments, 100, "looper-bot", []string{"someoneelse"}); got != "later comment" {
+	// Allowlist excludes lefarcen -> the next allowed author answers.
+	if got := detectGitHubHITLAnswer(comments, 100, []string{"someoneelse"}); got != "later comment" {
 		t.Fatalf("answer = %q, want the allowlisted author's comment", got)
 	}
-	// The bot's own reply is never an answer even if after the ask.
-	self := []githubAnswerComment{{ID: 200, Author: "looper-bot", Body: "still working"}}
-	if got := detectGitHubHITLAnswer(self, 100, "looper-bot", nil); got != "" {
-		t.Fatalf("answer = %q, want empty (bot's own comment)", got)
+	// A looper-marked comment after the ask is never an answer.
+	marked := []githubAnswerComment{{ID: 200, Author: "lefarcen", Body: "<!-- looper:decision-log --> recorded"}}
+	if got := detectGitHubHITLAnswer(marked, 100, nil); got != "" {
+		t.Fatalf("answer = %q, want empty (looper's own comment)", got)
 	}
 }
 
 func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 	commentsByPR := map[int64][]githubAnswerComment{
-		42: {{ID: 500, Author: "bot", Body: "ask"}, {ID: 501, Author: "human", Body: "go with A"}},
-		43: {{ID: 600, Author: "bot", Body: "ask"}}, // no human reply yet
+		42: {{ID: 500, Author: "lefarcen", Body: "<!-- looper:hitl:ask --> ask"}, {ID: 501, Author: "lefarcen", Body: "go with A"}},
+		43: {{ID: 600, Author: "lefarcen", Body: "<!-- looper:hitl:ask --> ask"}}, // no human reply yet
 	}
 	var deliveredTo []string
 	var cleared []int64
@@ -42,8 +43,10 @@ func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 		listComments: func(_ contextType, _ string, pr int64, _ string) ([]githubAnswerComment, error) {
 			return commentsByPR[pr], nil
 		},
-		currentUser:   func(_ contextType, _ string) string { return "bot" },
-		deliverAnswer: func(_ contextType, loopID, answer string) error { deliveredTo = append(deliveredTo, loopID+"="+answer); return nil },
+		deliverAnswer: func(_ contextType, loopID, answer string) error {
+			deliveredTo = append(deliveredTo, loopID+"="+answer)
+			return nil
+		},
 		clearAwaiting: func(_ contextType, _ string, pr int64, _ string) { cleared = append(cleared, pr) },
 		projectCWD:    func(string) string { return "/tmp/repo" },
 	}
