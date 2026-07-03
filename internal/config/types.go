@@ -641,6 +641,20 @@ type HITLConfig struct {
 	// "respond" (only the /respond API). Empty defaults to "github".
 	AnswerTransport string            `json:"answerTransport,omitempty"`
 	GitHub          *HITLGitHubConfig `json:"github,omitempty"`
+	Feishu          *HITLFeishuConfig `json:"feishu,omitempty"`
+}
+
+// HITLFeishuConfig tunes the Feishu HITL transport (answers come back via the
+// shared-app Cloudflare event inbox that the looper polls).
+type HITLFeishuConfig struct {
+	// Inbound selects how the answer reaches this looper: "cf-inbox" (poll the
+	// shared Cloudflare inbox) is the supported mode.
+	Inbound string `json:"inbound,omitempty"`
+	// EventInboxURLEnv names the env var holding the inbox poll URL
+	// (https://…/events). EventInboxTokenEnv names the env var holding the shared
+	// bearer token. Env var NAMES, never the values.
+	EventInboxURLEnv   string `json:"eventInboxUrlEnv,omitempty"`
+	EventInboxTokenEnv string `json:"eventInboxTokenEnv,omitempty"`
 }
 
 // HITLGitHubConfig tunes the GitHub PR-comment HITL transport.
@@ -889,12 +903,19 @@ type PartialHITLConfig struct {
 	Enabled         *bool                    `json:"enabled,omitempty"`
 	AnswerTransport *string                  `json:"answerTransport,omitempty"`
 	GitHub          *PartialHITLGitHubConfig `json:"github,omitempty"`
+	Feishu          *PartialHITLFeishuConfig `json:"feishu,omitempty"`
 }
 
 type PartialHITLGitHubConfig struct {
 	AwaitingLabel *string   `json:"awaitingLabel,omitempty"`
 	MentionLogins *[]string `json:"mentionLogins,omitempty"`
 	AnswerAuthors *[]string `json:"answerAuthors,omitempty"`
+}
+
+type PartialHITLFeishuConfig struct {
+	Inbound            *string `json:"inbound,omitempty"`
+	EventInboxURLEnv   *string `json:"eventInboxUrlEnv,omitempty"`
+	EventInboxTokenEnv *string `json:"eventInboxTokenEnv,omitempty"`
 }
 
 type PartialIssueRoleTriggersConfig struct {

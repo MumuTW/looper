@@ -141,11 +141,11 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 	return delivered
 }
 
-// deliverGitHubHITLAnswerToLoop is the runtime-side equivalent of the api
+// deliverHITLAnswerToLoop is the runtime-side equivalent of the api
 // handler's deliverHumanAnswer for the poll lane: it stores the human's answer on
 // an awaiting_human loop, flips it back to running, and requeues the queue item
 // that suspendForHuman cancelled — so the worker resumes with the answer.
-func deliverGitHubHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
+func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
 	loop, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil || loop == nil {
 		return err
@@ -238,7 +238,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			return out, nil
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverGitHubHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer)
+			return deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer)
 		},
 		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {
 			_ = gw.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{awaitingLabel}, CWD: cwd})

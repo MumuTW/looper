@@ -2371,6 +2371,10 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		runGitHubHITLPoll(ctx, input, project)
 	}
 
+	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and
+	// deliver any answers for this looper's awaiting loops.
+	runFeishuHITLPoll(ctx, input)
+
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
 
