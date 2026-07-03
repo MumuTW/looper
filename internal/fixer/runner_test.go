@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -7070,5 +7071,35 @@ func TestReRequestReviewersAfterFix(t *testing.T) {
 	set := map[string]bool{got[0]: true, got[1]: true}
 	if !set["reviewer-a"] || !set["reviewer-b"] {
 		t.Fatalf("re-requested %v, want reviewer-a + reviewer-b", got)
+	}
+}
+
+func TestApplyReviewDismissals(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".looper"), 0o755); err != nil {
+		t.Fatalf("MkdirAll error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".looper", "dismiss.json"), []byte(`{"dismissals":[{"reviewer":"reviewer-x","reason":"this behavior is intentional"}]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	github := &fakeGitHubGateway{
+		reviews: []ReviewSummary{
+			{ID: 10, State: "CHANGES_REQUESTED", Author: "reviewer-x"}, // named + changes-requested -> dismiss
+			{ID: 11, State: "CHANGES_REQUESTED", Author: "reviewer-y"}, // not named -> keep
+			{ID: 12, State: "APPROVED", Author: "reviewer-x"},          // not changes-requested -> keep
+		},
+	}
+	runner := New(Options{GitHub: github, RetryMaxAttempts: -1})
+	runner.applyReviewDismissals(context.Background(), stepInput{Repo: "acme/x", PRNumber: 9, Project: storage.ProjectRecord{RepoPath: "/tmp"}}, dir)
+
+	if len(github.dismissedReviews) != 1 {
+		t.Fatalf("dismissed = %d, want exactly 1", len(github.dismissedReviews))
+	}
+	d := github.dismissedReviews[0]
+	if d.ReviewID != 10 || d.Message != "this behavior is intentional" {
+		t.Fatalf("dismissed = %#v, want review 10 with the agent's reason", d)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".looper", "dismiss.json")); !os.IsNotExist(err) {
+		t.Fatal("dismiss.json must be consumed (removed) after processing")
 	}
 }

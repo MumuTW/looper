@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -2274,6 +2276,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err
 	}
+	// If the agent judged one or more CHANGES_REQUESTED reviews unreasonable it
+	// wrote a dismiss sentinel — dismiss those reviews (best-effort).
+	r.applyReviewDismissals(ctx, input, worktree.Path)
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
@@ -5838,6 +5843,7 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 	parts = append(parts,
 		"Fix items:\n"+strings.Join(encodedItems, "\n"),
 		"Only perform repair changes for the listed fix items.",
+		"If — and only if — a reviewer's requested change is genuinely unreasonable, incorrect, or would make the code worse, you may decline it: write a JSON file at `.looper/dismiss.json` in the repo root with the shape {\"dismissals\":[{\"reviewer\":\"<their github login>\",\"reason\":\"<a concise, respectful explanation>\"}]} and do NOT make that change — Looper will dismiss that review with your reason. Use this sparingly and only when confident; when in doubt, implement the requested change.",
 	)
 	if instruction := buildFixerReplyExplanationInstruction(fixItems); instruction != "" {
 		parts = append(parts, instruction)
@@ -7457,5 +7463,64 @@ func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput
 	}
 	if err := r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: reviewers, CWD: input.Project.RepoPath}); err != nil && r.logger != nil {
 		r.logger.Warn("fixer: re-request reviewers after fix failed", map[string]any{"repo": input.Repo, "pr": input.PRNumber, "error": err.Error()})
+	}
+}
+
+// fixerDismissSentinel is what the fixer agent writes to .looper/dismiss.json when
+// it judges a reviewer's requested change unreasonable and wants it dismissed
+// rather than implemented.
+type fixerDismissSentinel struct {
+	Dismissals []struct {
+		Reviewer string `json:"reviewer"`
+		Reason   string `json:"reason"`
+	} `json:"dismissals"`
+}
+
+// applyReviewDismissals reads the agent's dismiss sentinel and dismisses the named
+// CHANGES_REQUESTED reviews with the agent's reason. Best-effort; a missing
+// sentinel is the common (no-dismissal) case.
+func (r *Runner) applyReviewDismissals(ctx context.Context, input stepInput, worktreePath string) {
+	if r.github == nil || strings.TrimSpace(worktreePath) == "" || input.PRNumber <= 0 {
+		return
+	}
+	path := filepath.Join(worktreePath, ".looper", "dismiss.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	_ = os.Remove(path)
+	var sentinel fixerDismissSentinel
+	if err := json.Unmarshal(raw, &sentinel); err != nil || len(sentinel.Dismissals) == 0 {
+		return
+	}
+	reasons := make(map[string]string, len(sentinel.Dismissals))
+	for _, d := range sentinel.Dismissals {
+		login := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(d.Reviewer), "@")))
+		if login != "" {
+			reasons[login] = strings.TrimSpace(d.Reason)
+		}
+	}
+	if len(reasons) == 0 {
+		return
+	}
+	reviews, err := r.github.ListPullRequestReviews(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return
+	}
+	for _, rv := range reviews {
+		if rv.State != "CHANGES_REQUESTED" {
+			continue
+		}
+		reason, ok := reasons[strings.ToLower(strings.TrimSpace(rv.Author))]
+		if !ok {
+			continue
+		}
+		message := reason
+		if message == "" {
+			message = "looper dismissed this requested change as unnecessary after review."
+		}
+		if err := r.github.DismissReview(ctx, DismissReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, ReviewID: rv.ID, Message: message, CWD: input.Project.RepoPath}); err != nil && r.logger != nil {
+			r.logger.Warn("fixer: dismiss review failed", map[string]any{"repo": input.Repo, "pr": input.PRNumber, "reviewId": rv.ID, "error": err.Error()})
+		}
 	}
 }
