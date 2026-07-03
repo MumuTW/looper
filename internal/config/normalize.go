@@ -304,8 +304,27 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeInstructionsConfig(&config.Instructions, *partial.Instructions)
 	}
 
-	if partial.HITL != nil && partial.HITL.Enabled != nil {
-		config.HITL.Enabled = *partial.HITL.Enabled
+	if partial.HITL != nil {
+		if partial.HITL.Enabled != nil {
+			config.HITL.Enabled = *partial.HITL.Enabled
+		}
+		if partial.HITL.AnswerTransport != nil {
+			config.HITL.AnswerTransport = strings.TrimSpace(*partial.HITL.AnswerTransport)
+		}
+		if gh := partial.HITL.GitHub; gh != nil {
+			if config.HITL.GitHub == nil {
+				config.HITL.GitHub = &HITLGitHubConfig{}
+			}
+			if gh.AwaitingLabel != nil {
+				config.HITL.GitHub.AwaitingLabel = strings.TrimSpace(*gh.AwaitingLabel)
+			}
+			if gh.MentionLogins != nil {
+				config.HITL.GitHub.MentionLogins = append([]string(nil), (*gh.MentionLogins)...)
+			}
+			if gh.AnswerAuthors != nil {
+				config.HITL.GitHub.AnswerAuthors = append([]string(nil), (*gh.AnswerAuthors)...)
+			}
+		}
 	}
 
 	if partial.Roles != nil {

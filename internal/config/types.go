@@ -635,6 +635,24 @@ type Config struct {
 // notifications.webhook (appIdEnv/appSecretEnv/chatId) for send + listen.
 type HITLConfig struct {
 	Enabled bool `json:"enabled"`
+	// AnswerTransport selects how a mid-run question is delivered and how the
+	// human's answer comes back: "github" (PR comment, the zero-infra default),
+	// "feishu" (a team that lives in Feishu; needs the feishu transport), or
+	// "respond" (only the /respond API). Empty defaults to "github".
+	AnswerTransport string            `json:"answerTransport,omitempty"`
+	GitHub          *HITLGitHubConfig `json:"github,omitempty"`
+}
+
+// HITLGitHubConfig tunes the GitHub PR-comment HITL transport.
+type HITLGitHubConfig struct {
+	// AwaitingLabel marks a PR whose loop is waiting on a human. Empty defaults to
+	// "looper:awaiting-human".
+	AwaitingLabel string `json:"awaitingLabel,omitempty"`
+	// MentionLogins are GitHub logins to /cc on an ask so a human is notified.
+	MentionLogins []string `json:"mentionLogins,omitempty"`
+	// AnswerAuthors, when non-empty, restricts who may answer to these logins.
+	// Empty means any non-bot commenter.
+	AnswerAuthors []string `json:"answerAuthors,omitempty"`
 }
 
 type PartialServerConfig struct {
@@ -868,7 +886,15 @@ type PartialInstructionsConfig struct {
 }
 
 type PartialHITLConfig struct {
-	Enabled *bool `json:"enabled,omitempty"`
+	Enabled         *bool                    `json:"enabled,omitempty"`
+	AnswerTransport *string                  `json:"answerTransport,omitempty"`
+	GitHub          *PartialHITLGitHubConfig `json:"github,omitempty"`
+}
+
+type PartialHITLGitHubConfig struct {
+	AwaitingLabel *string   `json:"awaitingLabel,omitempty"`
+	MentionLogins *[]string `json:"mentionLogins,omitempty"`
+	AnswerAuthors *[]string `json:"answerAuthors,omitempty"`
 }
 
 type PartialIssueRoleTriggersConfig struct {
