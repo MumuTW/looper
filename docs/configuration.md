@@ -229,6 +229,26 @@ Forgejo rules:
 
 Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Reviewer writes the top-level Reviewer Summary comment that Fixer treats as its repair-work authority; Fixer writes a top-level Fixer Summary comment and never resolves native Forgejo review threads.
 
+GitHub projects can opt into Odcrew for bot-backed write operations while keeping the legacy `gh` read path:
+
+```toml
+[tools]
+odcPath = "/opt/homebrew/bin/odc"
+
+[[projects]]
+id = "open-design"
+name = "Open Design"
+repoPath = "/absolute/path/to/open-design"
+repo = "nexu-io/open-design"
+githubWriteProvider = "odcrew"
+githubReadFallback = "odcrew"
+```
+
+- `githubWriteProvider = "odcrew"` rewrites supported GitHub PR writes through `odc gh ...` and uses `odc gh pr push` instead of direct `git push` for Looper-managed PR branches.
+- `githubReadFallback = "odcrew"` keeps `gh` as the primary read path and tries `odc gh ...` only after a supported `gh pr` or `gh issue` read command fails.
+- Omit both fields to keep the legacy `gh` and local git push behavior.
+- Forgejo projects ignore these GitHub-only fields.
+
 ### Forgejo live sandbox e2e
 
 Forgejo live sandbox e2e is a local/manual developer check, not a normal CI job. It is skipped unless explicitly enabled:

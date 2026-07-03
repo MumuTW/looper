@@ -503,6 +503,41 @@ func (r *Runner) providerKindForProject(projectID string) config.ProviderKind {
 	return config.ProviderKindGitHub
 }
 
+func (r *Runner) pushWorkerBranch(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, worktreeRoot, worktreePath, branch string, protectedBranches []string) error {
+	if !r.projectUsesOdcrewGitHubWrites(project.ID) {
+		return r.git.Push(ctx, PushInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktreePath, Branch: branch, ProtectedBranches: protectedBranches})
+	}
+	if prNumber <= 0 {
+		return errors.New("odcrew write provider requires a pull request number for push")
+	}
+	odcPath := strings.TrimSpace(derefString(r.customInstructions.Tools.ODCPath))
+	if odcPath == "" {
+		odcPath = "odc"
+	}
+	result, err := shell.Run(ctx, shell.Options{
+		Command: odcPath,
+		Args:    []string{"gh", "pr", "push", "--repo", repo, strconv.FormatInt(prNumber, 10)},
+		CWD:     worktreePath,
+		Timeout: 5 * time.Minute,
+	})
+	if err != nil {
+		return &shell.CommandExecutionError{Message: strings.TrimSpace(firstNonEmpty(result.Stderr, result.Stdout, err.Error())), Result: result}
+	}
+	return nil
+}
+
+func (r *Runner) projectUsesOdcrewGitHubWrites(projectID string) bool {
+	if r == nil || r.projectRoleConfig == nil {
+		return false
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if project.ID == projectID {
+			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "odcrew")
+		}
+	}
+	return false
+}
+
 type ProcessResult struct {
 	LoopID            string
 	RunID             string
@@ -1822,7 +1857,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			if rootErr != nil {
 				return checkpoint, rootErr
 			}
-			if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+			if err := r.pushWorkerBranch(ctx, input.Project, work.Repo, checkpoint.PullRequest.Number, worktreeRoot, worktree.Path, worktree.Branch, compactStrings([]string{work.BaseBranch})); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			pushedByFallback = true
@@ -1851,7 +1886,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if rootErr != nil {
 			return checkpoint, rootErr
 		}
-		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(work.Branch, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+		if err := r.pushWorkerBranch(ctx, input.Project, work.Repo, work.PRNumber, worktreeRoot, worktree.Path, firstNonEmpty(work.Branch, worktree.Branch), compactStrings([]string{work.BaseBranch})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		_ = r.renamePlannerSpecPullRequestAfterTakeover(ctx, work, input.Project.RepoPath)
@@ -1891,7 +1926,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, rootErr
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
-		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(existing.HeadRefName, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+		if err := r.pushWorkerBranch(ctx, input.Project, work.Repo, existing.Number, worktreeRoot, worktree.Path, firstNonEmpty(existing.HeadRefName, worktree.Branch), compactStrings([]string{work.BaseBranch})); err != nil {
 			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
 				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 			}
@@ -1910,11 +1945,13 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
 	}
-	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
-		if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
-			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+	if !r.projectUsesOdcrewGitHubWrites(input.Project.ID) {
+		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
+				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+			}
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	ahead, err := r.workerBranchAheadOfBase(ctx, input.Project, work, worktree)
 	if err != nil {

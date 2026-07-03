@@ -568,6 +568,18 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	return DiscoveryPolicy{AutoDiscovery: roles.Planner.AutoDiscovery, Labels: append([]string(nil), roles.Planner.Triggers.Labels...), LabelMode: roles.Planner.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Planner.Triggers.RequireAssigneeCurrentUser}
 }
 
+func (r *Runner) projectUsesOdcrewGitHubWrites(projectID string) bool {
+	if r == nil || r.projectRoleConfig == nil {
+		return false
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if project.ID == projectID {
+			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "odcrew")
+		}
+	}
+	return false
+}
+
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
 	if r.repos == nil || r.repos.Queue == nil {
 		return nil, fmt.Errorf("planner queue repository is not configured")
@@ -1059,15 +1071,17 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		if rootErr != nil {
 			return checkpoint, rootErr
 		}
-		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: []string{worktree.BaseBranch}}); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-		}
-		checkpoint.Publish.Pushed = true
-		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
-		checkpoint.Lifecycle.Actions.Push = lifecycle.ActionSourceFallback
-		checkpoint.Lifecycle.Pushed = true
-		if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
-			return checkpoint, wrapRetryableAfterResume(err)
+		if !r.projectUsesOdcrewGitHubWrites(input.Project.ID) {
+			if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: []string{worktree.BaseBranch}}); err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			checkpoint.Publish.Pushed = true
+			checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
+			checkpoint.Lifecycle.Actions.Push = lifecycle.ActionSourceFallback
+			checkpoint.Lifecycle.Pushed = true
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
+				return checkpoint, wrapRetryableAfterResume(err)
+			}
 		}
 	}
 	if checkpoint.Publish.PullRequest == nil {
@@ -1133,6 +1147,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		}
 		checkpoint.Publish.PullRequest = &checkpointPullRequest{Number: pr.Number, URL: pr.URL, Body: body}
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
+		checkpoint.Publish.Pushed = true
+		checkpoint.Lifecycle.Pushed = true
 		checkpoint.Lifecycle.PRNumber = pr.Number
 		checkpoint.Lifecycle.PRURL = pr.URL
 		checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback

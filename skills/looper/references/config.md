@@ -136,6 +136,26 @@ Forgejo MVP role limits:
 - fixer consumes open items from the Reviewer Summary and publishes a top-level Fixer Summary PR comment; it does not resolve native review threads
 - coordinator, auto-merge, native reviews, review requests, thread resolution, routed network mode, and webhooks are unsupported for Forgejo
 
+GitHub projects can opt into Odcrew for bot-backed writes:
+
+```toml
+[tools]
+odcPath = "/opt/homebrew/bin/odc"
+
+[[projects]]
+id = "open-design"
+name = "Open Design"
+repoPath = "/absolute/path/to/open-design"
+repo = "nexu-io/open-design"
+githubWriteProvider = "odcrew"
+githubReadFallback = "odcrew"
+```
+
+- `githubWriteProvider = "odcrew"` sends supported GitHub PR writes through `odc gh ...` and uses `odc gh pr push` for Looper-managed PR branch updates.
+- `githubReadFallback = "odcrew"` keeps `gh` as the primary read path and tries `odc gh ...` after supported `gh pr` or `gh issue` read commands fail.
+- Omit both fields for the legacy `gh` and local git push behavior.
+- Forgejo projects ignore these GitHub-only fields.
+
 ## Role model guidance
 
 All role-specific config lives under `roles.<role>`.
@@ -281,6 +301,7 @@ enabled = true
 [tools]
 gitPath = "/usr/bin/git"
 ghPath = "/opt/homebrew/bin/gh"
+odcPath = "/opt/homebrew/bin/odc"
 osascriptPath = "/usr/bin/osascript"
 
 [[providers]]

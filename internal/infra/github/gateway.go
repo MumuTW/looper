@@ -43,6 +43,8 @@ var ErrDiffTooLarge = errors.New("github pull request diff is too large")
 
 type Options struct {
 	GHPath                 string
+	ODCPath                string
+	OdcrewPolicies         map[string]OdcrewPolicy
 	CWD                    string
 	Now                    func() time.Time
 	DiscoveryCacheTTL      time.Duration
@@ -50,8 +52,15 @@ type Options struct {
 	ReviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
+type OdcrewPolicy struct {
+	WriteProvider string
+	ReadFallback  string
+}
+
 type Gateway struct {
 	ghPath                 string
+	odcPath                string
+	odcrewPolicies         map[string]OdcrewPolicy
 	cwd                    string
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
@@ -654,6 +663,10 @@ func New(options Options) *Gateway {
 	if ghPath == "" {
 		ghPath = "gh"
 	}
+	odcPath := strings.TrimSpace(options.ODCPath)
+	if odcPath == "" {
+		odcPath = "odc"
+	}
 	now := options.Now
 	if now == nil {
 		now = time.Now
@@ -662,7 +675,7 @@ func New(options Options) *Gateway {
 	if ghRun == nil {
 		ghRun = shell.Run
 	}
-	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
+	return &Gateway{ghPath: ghPath, odcPath: odcPath, odcrewPolicies: normalizeOdcrewPolicies(options.OdcrewPolicies), cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -2347,6 +2360,14 @@ func (g *Gateway) AddPullRequestLabels(ctx context.Context, input PullRequestLab
 	if len(input.Labels) == 0 {
 		return nil
 	}
+	if g.odcrewWriteEnabled(input.Repo) {
+		args := []string{"pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
+		for _, label := range input.Labels {
+			args = append(args, "--add-label", label)
+		}
+		_, err := g.runOdcGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
+		return err
+	}
 	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
 		return err
 	}
@@ -2361,6 +2382,14 @@ func (g *Gateway) AddPullRequestLabels(ctx context.Context, input PullRequestLab
 func (g *Gateway) RemovePullRequestLabels(ctx context.Context, input PullRequestLabelsInput) error {
 	if len(input.Labels) == 0 {
 		return nil
+	}
+	if g.odcrewWriteEnabled(input.Repo) {
+		args := []string{"pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
+		for _, label := range input.Labels {
+			args = append(args, "--remove-label", label)
+		}
+		_, err := g.runOdcGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
+		return err
 	}
 	for _, label := range input.Labels {
 		_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", input.Repo, input.PRNumber, encodeURIComponent(label)), "--method", "DELETE")
@@ -2378,6 +2407,14 @@ func (g *Gateway) RemovePullRequestLabels(ctx context.Context, input PullRequest
 func (g *Gateway) AddPullRequestReviewers(ctx context.Context, input PullRequestReviewersInput) error {
 	if len(input.Reviewers) == 0 {
 		return nil
+	}
+	if g.odcrewWriteEnabled(input.Repo) {
+		args := []string{"pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
+		for _, reviewer := range input.Reviewers {
+			args = append(args, "--add-reviewer", reviewer)
+		}
+		_, err := g.runOdcGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
+		return err
 	}
 	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/requested_reviewers", input.Repo, input.PRNumber), "--method", "POST"}
 	for _, reviewer := range input.Reviewers {
@@ -2941,11 +2978,99 @@ func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) 
 }
 
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
+	repo := ghRepoArg(args)
+	if g.odcrewWriteEnabled(repo) && odcrewWritableGhArgs(args) {
+		return g.runOdcGh(ctx, cwd, stdin, timeout, args...)
+	}
 	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+	if err != nil && g.odcrewReadFallbackEnabled(repo) && odcrewReadableGhArgs(args) {
+		fallbackResult, fallbackErr := g.runOdcGh(ctx, cwd, stdin, timeout, args...)
+		if fallbackErr == nil {
+			return fallbackResult, nil
+		}
+	}
 	if err != nil && isTransientGitHubMessage(strings.Join([]string{err.Error(), result.Stdout, result.Stderr}, "\n")) {
 		return result, &TransientError{Err: err}
 	}
 	return result, err
+}
+
+func (g *Gateway) runOdcGh(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
+	odcArgs := append([]string{"gh"}, args...)
+	return g.ghRun(ctx, shell.Options{Command: g.odcPath, Args: odcArgs, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+}
+
+func normalizeOdcrewPolicies(input map[string]OdcrewPolicy) map[string]OdcrewPolicy {
+	if len(input) == 0 {
+		return nil
+	}
+	out := make(map[string]OdcrewPolicy, len(input))
+	for repo, policy := range input {
+		key := strings.ToLower(strings.TrimSpace(repo))
+		if key == "" {
+			continue
+		}
+		out[key] = OdcrewPolicy{WriteProvider: strings.ToLower(strings.TrimSpace(policy.WriteProvider)), ReadFallback: strings.ToLower(strings.TrimSpace(policy.ReadFallback))}
+	}
+	return out
+}
+
+func (g *Gateway) odcrewWriteEnabled(repo string) bool {
+	if repo == "" {
+		return false
+	}
+	return g.odcrewPolicies[strings.ToLower(repo)].WriteProvider == "odcrew"
+}
+
+func (g *Gateway) odcrewReadFallbackEnabled(repo string) bool {
+	if repo == "" {
+		return false
+	}
+	return g.odcrewPolicies[strings.ToLower(repo)].ReadFallback == "odcrew"
+}
+
+func ghRepoArg(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--repo" || arg == "-R" {
+			if i+1 < len(args) {
+				return strings.TrimSpace(args[i+1])
+			}
+			return ""
+		}
+		if strings.HasPrefix(arg, "--repo=") {
+			return strings.TrimSpace(strings.TrimPrefix(arg, "--repo="))
+		}
+		if strings.HasPrefix(arg, "-R=") {
+			return strings.TrimSpace(strings.TrimPrefix(arg, "-R="))
+		}
+	}
+	return ""
+}
+
+func odcrewWritableGhArgs(args []string) bool {
+	if len(args) < 2 || args[0] != "pr" {
+		return false
+	}
+	switch args[1] {
+	case "create", "comment", "review", "edit":
+		return true
+	default:
+		return false
+	}
+}
+
+func odcrewReadableGhArgs(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	if args[0] == "pr" {
+		return args[1] == "view" || args[1] == "list" || args[1] == "checks"
+	}
+	if args[0] == "issue" {
+		return args[1] == "view" || args[1] == "list"
+	}
+	return false
 }
 
 func isDiffTooLargeError(err error) bool {

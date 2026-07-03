@@ -2344,7 +2344,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
-	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: branch, ExpectedRemoteHeadSHA: worktree.BaseHeadSHA}); err != nil {
+	if err := r.pushPullRequestBranch(ctx, input, worktreeRoot, worktree.Path, branch, worktree.BaseHeadSHA); err != nil {
 		message := err.Error()
 		eventType := "fixer.push.retryable"
 		if strings.Contains(strings.ToLower(message), "remote head changed") {
@@ -2400,6 +2400,41 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) pushPullRequestBranch(ctx context.Context, input stepInput, worktreeRoot, worktreePath, branch, expectedRemoteHeadSHA string) error {
+	if !r.projectUsesOdcrewGitHubWrites(input.Project.ID) {
+		return r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktreePath, Branch: branch, ExpectedRemoteHeadSHA: expectedRemoteHeadSHA})
+	}
+	if input.PRNumber <= 0 {
+		return errors.New("odcrew write provider requires a pull request number for push")
+	}
+	odcPath := strings.TrimSpace(derefString(r.customInstructions.Tools.ODCPath))
+	if odcPath == "" {
+		odcPath = "odc"
+	}
+	result, err := shell.Run(ctx, shell.Options{
+		Command: odcPath,
+		Args:    []string{"gh", "pr", "push", "--repo", input.Repo, strconv.FormatInt(input.PRNumber, 10)},
+		CWD:     worktreePath,
+		Timeout: 5 * time.Minute,
+	})
+	if err != nil {
+		return &shell.CommandExecutionError{Message: strings.TrimSpace(firstNonEmpty(result.Stderr, result.Stdout, err.Error())), Result: result}
+	}
+	return nil
+}
+
+func (r *Runner) projectUsesOdcrewGitHubWrites(projectID string) bool {
+	if r == nil || r.projectRoleConfig == nil {
+		return false
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if project.ID == projectID {
+			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "odcrew")
+		}
+	}
+	return false
 }
 
 func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch string) (bool, fixerCheckpoint, error) {

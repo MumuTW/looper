@@ -260,6 +260,7 @@ type LoggingConfig struct {
 type ToolPathsConfig struct {
 	GitPath       *string `json:"gitPath,omitempty"`
 	GHPath        *string `json:"ghPath,omitempty"`
+	ODCPath       *string `json:"odcPath,omitempty"`
 	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
 }
@@ -521,17 +522,19 @@ type RoleConfigs struct {
 }
 
 type ProjectRefConfig struct {
-	ID           string               `json:"id"`
-	Name         string               `json:"name"`
-	Provider     string               `json:"provider,omitempty"`
-	Repo         string               `json:"repo,omitempty"`
-	RepoPath     string               `json:"repoPath"`
-	Path         string               `json:"path,omitempty"`
-	BaseBranch   *string              `json:"baseBranch,omitempty"`
-	WorktreeRoot *string              `json:"worktreeRoot,omitempty"`
-	Network      ProjectNetworkConfig `json:"network,omitempty"`
-	Webhook      ProjectWebhookConfig `json:"webhook,omitempty"`
-	Roles        *PartialRoleConfigs  `json:"roles,omitempty"`
+	ID                  string               `json:"id"`
+	Name                string               `json:"name"`
+	Provider            string               `json:"provider,omitempty"`
+	Repo                string               `json:"repo,omitempty"`
+	GitHubWriteProvider string               `json:"githubWriteProvider,omitempty"`
+	GitHubReadFallback  string               `json:"githubReadFallback,omitempty"`
+	RepoPath            string               `json:"repoPath"`
+	Path                string               `json:"path,omitempty"`
+	BaseBranch          *string              `json:"baseBranch,omitempty"`
+	WorktreeRoot        *string              `json:"worktreeRoot,omitempty"`
+	Network             ProjectNetworkConfig `json:"network,omitempty"`
+	Webhook             ProjectWebhookConfig `json:"webhook,omitempty"`
+	Roles               *PartialRoleConfigs  `json:"roles,omitempty"`
 }
 
 type ProjectWebhookConfig struct {
@@ -539,18 +542,20 @@ type ProjectWebhookConfig struct {
 }
 
 type PartialProjectRefConfig struct {
-	ID           string                       `json:"id"`
-	Name         string                       `json:"name"`
-	Provider     *string                      `json:"provider,omitempty"`
-	Repo         *string                      `json:"repo,omitempty"`
-	RepoPath     string                       `json:"repoPath"`
-	Path         string                       `json:"path,omitempty"`
-	BaseBranch   *string                      `json:"baseBranch,omitempty"`
-	WorktreeRoot *string                      `json:"worktreeRoot,omitempty"`
-	Network      *PartialProjectNetworkConfig `json:"network,omitempty"`
-	Webhook      *PartialProjectWebhookConfig `json:"webhook,omitempty"`
-	Instructions map[string]string            `json:"instructions,omitempty"`
-	Roles        *PartialRoleConfigs          `json:"roles,omitempty"`
+	ID                  string                       `json:"id"`
+	Name                string                       `json:"name"`
+	Provider            *string                      `json:"provider,omitempty"`
+	Repo                *string                      `json:"repo,omitempty"`
+	GitHubWriteProvider *string                      `json:"githubWriteProvider,omitempty"`
+	GitHubReadFallback  *string                      `json:"githubReadFallback,omitempty"`
+	RepoPath            string                       `json:"repoPath"`
+	Path                string                       `json:"path,omitempty"`
+	BaseBranch          *string                      `json:"baseBranch,omitempty"`
+	WorktreeRoot        *string                      `json:"worktreeRoot,omitempty"`
+	Network             *PartialProjectNetworkConfig `json:"network,omitempty"`
+	Webhook             *PartialProjectWebhookConfig `json:"webhook,omitempty"`
+	Instructions        map[string]string            `json:"instructions,omitempty"`
+	Roles               *PartialRoleConfigs          `json:"roles,omitempty"`
 }
 
 type PartialProjectNetworkConfig struct {
@@ -684,6 +689,7 @@ type PartialLoggingConfig struct {
 type PartialToolPathsConfig struct {
 	GitPath       *string `json:"gitPath,omitempty"`
 	GHPath        *string `json:"ghPath,omitempty"`
+	ODCPath       *string `json:"odcPath,omitempty"`
 	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
 }
