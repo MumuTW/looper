@@ -271,12 +271,38 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkp
 	} else if input.Loop.PRNumber != nil && *input.Loop.PRNumber > 0 {
 		prNumber = *input.Loop.PRNumber
 	}
+	// On a later ask (e.g. a multi-turn second question) the loop/checkpoint may not
+	// carry the PR that an earlier ask already opened for this branch — find and
+	// reuse it instead of trying to open a duplicate (which gh rejects).
+	if prNumber == 0 && checkpoint.Worktree != nil && strings.TrimSpace(checkpoint.Worktree.Branch) != "" {
+		base := strings.TrimSpace(checkpoint.Worktree.BaseBranch)
+		var aliases []string
+		if checkpoint.Work != nil {
+			if base == "" {
+				base = strings.TrimSpace(checkpoint.Work.BaseBranch)
+			}
+			aliases = buildWorkerBranchAliases(*checkpoint.Work, input.Loop.ID)
+		}
+		aliases = append(aliases, checkpoint.Worktree.Branch)
+		if base == "" {
+			base = "main"
+		}
+		if existing, err := r.findOpenPullRequestForBranch(ctx, repo, aliases, base, cwd); err == nil && existing != nil {
+			prNumber = existing.Number
+		}
+	}
 	if prNumber == 0 {
 		created, err := r.ensureDraftPRForAsk(ctx, input, checkpoint, repo, cwd)
 		if err != nil {
 			return err
 		}
 		prNumber = created
+	}
+	// Persist the PR onto the loop so later asks + the answer-poll resolve it fast.
+	if prNumber > 0 && (input.Loop.PRNumber == nil || *input.Loop.PRNumber != prNumber) {
+		_, _ = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+			updated.PRNumber = int64Ptr(prNumber)
+		})
 	}
 	if prNumber == 0 {
 		return fmt.Errorf("hitl github: could not resolve a PR for loop %s", input.Loop.ID)
