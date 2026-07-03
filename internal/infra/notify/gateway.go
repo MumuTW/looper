@@ -484,13 +484,26 @@ func feishuNotificationText(payload SystemNotificationPayload) string {
 // Feishu card with one button per option. Each button's value carries the loop
 // seq + the chosen answer so a card-action callback identifies the loop + reply.
 type HITLAskCard struct {
-	ProjectID string
-	LoopID    string
-	LoopSeq   int64
-	Repo      string
-	Title     string
-	Question  string
-	Options   []string
+	ProjectID      string
+	LoopID         string
+	LoopSeq        int64
+	Repo           string
+	Title          string
+	Question       string
+	Options        []string
+	MentionOpenIds []string
+}
+
+// feishuMentionMarkup renders Feishu open_ids as card @-mention tags, e.g.
+// "<at id=ou_x></at> <at id=ou_y></at>". Returns "" when there is nothing to ping.
+func feishuMentionMarkup(openIDs []string) string {
+	tags := make([]string, 0, len(openIDs))
+	for _, id := range openIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			tags = append(tags, "<at id="+id+"></at>")
+		}
+	}
+	return strings.Join(tags, " ")
 }
 
 // SendHITLAsk delivers an ask-card to the Feishu app-bot target chat. It reuses
@@ -507,6 +520,10 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	token, err := g.feishuTenantToken(ctx, appID, appSecret)
 	if err != nil {
 		return err
+	}
+	// The @-mention targets come from config (deployment-specific), not the caller.
+	if len(card.MentionOpenIds) == 0 {
+		card.MentionOpenIds = cfg.MentionOpenIds
 	}
 	cardJSON, err := buildFeishuAskCard(card)
 	if err != nil {
@@ -548,9 +565,12 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if strings.TrimSpace(card.Repo) != "" {
 		noteParts = append(noteParts, card.Repo)
 	}
-	elements := []any{
-		map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": "**" + title + "**\n" + body}},
+	elements := make([]any, 0, 4)
+	// @-mention the humans who need to act, so an ask isn't missed in a busy group.
+	if mention := feishuMentionMarkup(card.MentionOpenIds); mention != "" {
+		elements = append(elements, map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": mention + " 需要你定夺 👇"}})
 	}
+	elements = append(elements, map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": "**" + title + "**\n" + body}})
 	if len(actions) > 0 {
 		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
 	}

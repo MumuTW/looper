@@ -279,6 +279,10 @@ type WebhookNotificationConfig struct {
 	// callback's envelope token must match, proving the request came from Feishu.
 	// A NAME, never the secret value — looper is open source.
 	VerificationTokenEnv string `json:"verificationTokenEnv,omitempty"`
+	// MentionOpenIds are Feishu open_ids to @-mention on messages that need a human
+	// (the mid-run ask, and failures), so follow-up items aren't missed in a busy
+	// group. Plain user ids, not secrets.
+	MentionOpenIds []string `json:"mentionOpenIds,omitempty"`
 }
 
 type LoggingConfig struct {
@@ -731,6 +735,7 @@ type PartialWebhookNotificationConfig struct {
 	AppSecretEnv          *string                   `json:"appSecretEnv,omitempty"`
 	ChatID                *string                   `json:"chatId,omitempty"`
 	VerificationTokenEnv  *string                   `json:"verificationTokenEnv,omitempty"`
+	MentionOpenIds        *[]string                 `json:"mentionOpenIds,omitempty"`
 }
 
 type PartialLoggingConfig struct {

@@ -308,3 +308,49 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildFeishuAskCardRendersMention(t *testing.T) {
+	card, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq: 7, Repo: "acme/looper", Question: "A or B?",
+		Options:        []string{"A", "B"},
+		MentionOpenIds: []string{"ou_abc123", " ", "ou_def456"},
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard() error = %v", err)
+	}
+	// json.Marshal escapes < and > to </>; Feishu unescapes them back, so
+	// decode the card and inspect the element content the way Feishu will see it.
+	if !strings.Contains(cardText(t, card), "<at id=ou_abc123></at>") || !strings.Contains(cardText(t, card), "<at id=ou_def456></at>") {
+		t.Fatalf("card missing @-mention tags: %s", cardText(t, card))
+	}
+
+	// No mention configured -> no <at> tag.
+	plain, err := buildFeishuAskCard(HITLAskCard{LoopSeq: 7, Question: "A or B?", Options: []string{"A"}})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(no mention) error = %v", err)
+	}
+	if strings.Contains(cardText(t, plain), "<at ") {
+		t.Fatalf("unexpected @-mention when none configured: %s", cardText(t, plain))
+	}
+}
+
+// cardText concatenates all lark_md element contents from a card JSON, decoded
+// (so JSON < escapes appear as the < the way Feishu renders them).
+func cardText(t *testing.T, card []byte) string {
+	t.Helper()
+	var parsed struct {
+		Elements []struct {
+			Text struct {
+				Content string `json:"content"`
+			} `json:"text"`
+		} `json:"elements"`
+	}
+	if err := json.Unmarshal(card, &parsed); err != nil {
+		t.Fatalf("card not JSON: %v", err)
+	}
+	parts := make([]string, 0, len(parsed.Elements))
+	for _, e := range parsed.Elements {
+		parts = append(parts, e.Text.Content)
+	}
+	return strings.Join(parts, "\n")
+}

@@ -690,6 +690,16 @@ func mergeWebhookNotificationConfig(config *WebhookNotificationConfig, partial P
 	if partial.VerificationTokenEnv != nil {
 		config.VerificationTokenEnv = strings.TrimSpace(*partial.VerificationTokenEnv)
 	}
+
+	if partial.MentionOpenIds != nil {
+		ids := make([]string, 0, len(*partial.MentionOpenIds))
+		for _, id := range *partial.MentionOpenIds {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				ids = append(ids, trimmed)
+			}
+		}
+		config.MentionOpenIds = ids
+	}
 }
 
 func mergeOsascriptNotificationConfig(config *OsascriptNotificationConfig, partial PartialOsascriptNotificationConfig) {
