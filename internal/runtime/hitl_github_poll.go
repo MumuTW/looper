@@ -3,6 +3,11 @@ package runtime
 import (
 	"context"
 	"strings"
+
+	"github.com/nexu-io/looper/internal/eventlog"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 type contextType = context.Context
@@ -132,4 +137,122 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 		delivered++
 	}
 	return delivered
+}
+
+// deliverGitHubHITLAnswerToLoop is the runtime-side equivalent of the api
+// handler's deliverHumanAnswer for the poll lane: it stores the human's answer on
+// an awaiting_human loop, flips it back to running, and requeues the queue item
+// that suspendForHuman cancelled — so the worker resumes with the answer.
+func deliverGitHubHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return err
+	}
+	if loop.Status != "awaiting_human" {
+		return nil
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok {
+		return nil
+	}
+	ask.Answer = answer
+	ask.Status = "answered"
+	ask.AnsweredAt = nowISO
+	meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+	if werr != nil {
+		return werr
+	}
+	updated := *loop
+	updated.MetadataJSON = &meta
+	updated.Status = "running"
+	updated.NextRunAt = &nowISO
+	updated.UpdatedAt = nowISO
+	if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		return err
+	}
+	_, err = repos.Queue.RequeueLatestCancelledByLoop(ctx, loopID, nowISO)
+	return err
+}
+
+// runGitHubHITLPoll runs one answer-poll pass for a project's awaiting_human
+// loops that carry a GitHub ask. Gated by hitl.enabled + the github transport;
+// a no-op otherwise.
+func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, project storage.ProjectRecord) {
+	if input.Config == nil || !input.Config.HITL.Enabled || input.GitHubGateway == nil || input.Repos == nil {
+		return
+	}
+	transport := strings.TrimSpace(strings.ToLower(input.Config.HITL.AnswerTransport))
+	if transport != "" && transport != "github" {
+		return
+	}
+
+	allLoops, err := input.Repos.Loops.List(ctx)
+	if err != nil {
+		return
+	}
+	awaiting := make([]githubHITLAwaitingLoop, 0)
+	for _, l := range allLoops {
+		if l.ProjectID != project.ID || l.Status != "awaiting_human" {
+			continue
+		}
+		ask, ok := loops.ReadHITLAsk(l.MetadataJSON)
+		if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") || ask.PRNumber == 0 {
+			continue
+		}
+		repo := ""
+		if l.Repo != nil {
+			repo = *l.Repo
+		}
+		awaiting = append(awaiting, githubHITLAwaitingLoop{
+			ID: l.ID, ProjectID: l.ProjectID, Repo: repo,
+			Transport: ask.Transport, AskStatus: ask.Status, PRNumber: ask.PRNumber, AskCommentID: ask.AskCommentID,
+		})
+	}
+	if len(awaiting) == 0 {
+		return
+	}
+
+	awaitingLabel := "looper:awaiting-human"
+	var answerAuthors []string
+	if gh := input.Config.HITL.GitHub; gh != nil {
+		if strings.TrimSpace(gh.AwaitingLabel) != "" {
+			awaitingLabel = strings.TrimSpace(gh.AwaitingLabel)
+		}
+		answerAuthors = gh.AnswerAuthors
+	}
+	gw := input.GitHubGateway
+	nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
+
+	deps := githubHITLPollDeps{
+		listComments: func(ctx contextType, repo string, pr int64, cwd string) ([]githubAnswerComment, error) {
+			cs, err := gw.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: pr, CWD: cwd})
+			if err != nil {
+				return nil, err
+			}
+			out := make([]githubAnswerComment, 0, len(cs))
+			for _, c := range cs {
+				out = append(out, githubAnswerComment{ID: c.ID, Author: c.Author, Body: c.Body})
+			}
+			return out, nil
+		},
+		currentUser: func(ctx contextType, cwd string) string {
+			login, _ := gw.GetCurrentUserLogin(ctx, cwd)
+			return login
+		},
+		deliverAnswer: func(ctx contextType, loopID, answer string) error {
+			return deliverGitHubHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer)
+		},
+		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {
+			_ = gw.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{awaitingLabel}, CWD: cwd})
+		},
+		projectCWD:    func(string) string { return project.RepoPath },
+		answerAuthors: answerAuthors,
+	}
+	if input.Logger != nil {
+		deps.logWarn = func(msg string, fields map[string]any) { input.Logger.Warn(msg, fields) }
+	}
+
+	if n := pollGitHubHITLAnswersOnce(ctx, awaiting, deps); n > 0 && input.Logger != nil {
+		input.Logger.Info("hitl github: delivered human answers", map[string]any{"projectId": project.ID, "count": n})
+	}
 }
