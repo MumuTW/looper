@@ -1684,6 +1684,14 @@ func (a workerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input wor
 	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
+// providerHasGitHubPullRequests reports whether a project of this provider kind
+// has its pull requests on GitHub — so the coordinator/fixer PR-follow-up lanes
+// apply. GitHub projects obviously do; Plane projects too (Plane is the task
+// source, but the code + PRs live on the bound GitHub repo).
+func providerHasGitHubPullRequests(kind config.ProviderKind) bool {
+	return kind == config.ProviderKindGitHub || kind == config.ProviderKindPlane
+}
+
 // hitlGitHubSettings maps the HITL GitHub config into the worker's settings.
 func hitlGitHubSettings(cfg *config.HITLGitHubConfig) worker.HITLGitHubSettings {
 	if cfg == nil {
@@ -2313,7 +2321,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("planner auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Coordinator != nil && coordinatorEnabledForProject(input, project.ID) {
-			if providerKind != config.ProviderKindGitHub {
+			if !providerHasGitHubPullRequests(providerKind) {
 				if input.Logger != nil {
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "coordinator discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
@@ -2338,7 +2346,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
-			if providerKind != config.ProviderKindGitHub {
+			if !providerHasGitHubPullRequests(providerKind) {
 				if input.Logger != nil {
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "fixer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
