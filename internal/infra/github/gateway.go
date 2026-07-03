@@ -2388,6 +2388,65 @@ func (g *Gateway) AddPullRequestReviewers(ctx context.Context, input PullRequest
 	return err
 }
 
+type ReviewSummary struct {
+	ID     int64
+	State  string // "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "DISMISSED"
+	Author string
+	Body   string
+}
+
+// ListPullRequestReviews returns a PR's submitted reviews (REST), with the numeric
+// review id needed to dismiss one.
+func (g *Gateway) ListPullRequestReviews(ctx context.Context, input ViewPullRequestInput) ([]ReviewSummary, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, input.PRNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	reviews := make([]ReviewSummary, 0, len(rows))
+	for _, row := range rows {
+		reviews = append(reviews, ReviewSummary{
+			ID:     asInt64(firstNonNil(row["id"], row["databaseId"])),
+			State:  asString(row["state"]),
+			Body:   asString(row["body"]),
+			Author: extractAuthor(firstNonNil(row["user"], row["author"])),
+		})
+	}
+	return reviews, nil
+}
+
+type DismissReviewInput struct {
+	Repo     string
+	PRNumber int64
+	ReviewID int64
+	Message  string
+	CWD      string
+}
+
+// DismissReview dismisses a submitted review (e.g. an unreasonable
+// CHANGES_REQUESTED) with an explanation, so it stops blocking the PR.
+func (g *Gateway) DismissReview(ctx context.Context, input DismissReviewInput) error {
+	hostname, repo := splitRepoHostname(input.Repo)
+	message := strings.TrimSpace(input.Message)
+	if message == "" {
+		message = "Dismissed by looper."
+	}
+	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/reviews/%d/dismissals", repo, input.PRNumber, input.ReviewID), "--method", "PUT", "-f", "message=" + message, "-f", "event=DISMISS"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
 func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (CreatePullRequestResult, error) {
 	args := []string{"pr", "create", "--repo", input.Repo, "--head", input.HeadBranch, "--base", input.BaseBranch, "--title", input.Title, "--body", input.Body}
 	if input.Draft {
