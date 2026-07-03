@@ -187,6 +187,16 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		Status:      "awaiting",
 		AskedAt:     nowISO,
 	}
+	// GitHub transport (default): post the question on a (draft) PR before parking,
+	// so the ask metadata carries the PR + comment id the answer-poll lane needs.
+	// Best-effort — the loop still parks awaiting_human if delivery fails.
+	if r.hitlTransportGitHub() {
+		if err := r.deliverAskToGitHub(ctx, input, checkpoint, awaiting, &ask); err != nil && r.logger != nil {
+			r.logger.Warn("worker HITL github ask delivery failed; loop parked awaiting human without a PR comment", map[string]any{
+				"loopId": input.Loop.ID, "error": err.Error(),
+			})
+		}
+	}
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
 			updated.MetadataJSON = &meta
@@ -205,7 +215,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
-	if r.hitlNotify != nil {
+	if !r.hitlTransportGitHub() && r.hitlNotify != nil {
 		if err := r.hitlNotify(ctx, HITLAskNotification{
 			ProjectID: input.Project.ID,
 			LoopID:    input.Loop.ID,
@@ -225,4 +235,141 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		}
 	}
 	return ProcessResult{LoopID: input.Loop.ID, RunID: run.ID, QueueItemID: input.QueueItem.ID, Status: "awaiting_human", Summary: summary}, nil
+}
+
+// hitlTransportGitHub reports whether the GitHub PR-comment ask transport is
+// active. GitHub is the default when hitl is enabled and no transport is set.
+func (r *Runner) hitlTransportGitHub() bool {
+	t := strings.TrimSpace(strings.ToLower(r.hitlAnswerTransport))
+	return t == "" || t == "github"
+}
+
+func (r *Runner) hitlAwaitingLabel() string {
+	if l := strings.TrimSpace(r.hitlGitHub.AwaitingLabel); l != "" {
+		return l
+	}
+	return "looper:awaiting-human"
+}
+
+// deliverAskToGitHub ensures a (draft) PR exists for the loop, posts the agent's
+// question as a marked PR comment, labels the PR so the answer-poll lane finds
+// it, and records the PR + comment id on the ask. Best-effort; returns an error
+// the caller logs while still parking the loop awaiting_human.
+func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkpoint workerCheckpoint, awaiting *awaitingHumanError, ask *loops.HITLAsk) error {
+	repo := derefString(input.Loop.Repo)
+	if repo == "" && checkpoint.Work != nil {
+		repo = checkpoint.Work.Repo
+	}
+	if strings.TrimSpace(repo) == "" {
+		return fmt.Errorf("hitl github: no repo for loop %s", input.Loop.ID)
+	}
+	cwd := input.Project.RepoPath
+
+	prNumber := int64(0)
+	if checkpoint.PullRequest != nil && checkpoint.PullRequest.Number > 0 {
+		prNumber = checkpoint.PullRequest.Number
+	} else if input.Loop.PRNumber != nil && *input.Loop.PRNumber > 0 {
+		prNumber = *input.Loop.PRNumber
+	}
+	if prNumber == 0 {
+		created, err := r.ensureDraftPRForAsk(ctx, input, checkpoint, repo, cwd)
+		if err != nil {
+			return err
+		}
+		prNumber = created
+	}
+	if prNumber == 0 {
+		return fmt.Errorf("hitl github: could not resolve a PR for loop %s", input.Loop.ID)
+	}
+
+	body := buildGitHubAskComment(input.Loop.Seq, awaiting.question, awaiting.options, r.hitlGitHub.MentionLogins)
+	res, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: prNumber, Body: body, CWD: cwd})
+	if err != nil {
+		return err
+	}
+	if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: repo, PRNumber: prNumber, Labels: []string{r.hitlAwaitingLabel()}, CWD: cwd}); err != nil && r.logger != nil {
+		r.logger.Warn("hitl github: failed to add awaiting-human label", map[string]any{"repo": repo, "pr": prNumber, "error": err.Error()})
+	}
+
+	ask.Transport = "github"
+	ask.PRNumber = prNumber
+	ask.AskCommentID = res.ID
+	return nil
+}
+
+// ensureDraftPRForAsk pushes the loop's WIP branch and opens a draft PR to carry
+// the question. Requires committed WIP on the branch; returns an error when there
+// is nothing to open a PR from.
+func (r *Runner) ensureDraftPRForAsk(ctx context.Context, input stepInput, checkpoint workerCheckpoint, repo, cwd string) (int64, error) {
+	if checkpoint.Worktree == nil || strings.TrimSpace(checkpoint.Worktree.Branch) == "" {
+		return 0, fmt.Errorf("hitl github: no worktree branch to open a draft PR for loop %s", input.Loop.ID)
+	}
+	base := strings.TrimSpace(checkpoint.Worktree.BaseBranch)
+	title := ""
+	if checkpoint.Work != nil {
+		if base == "" {
+			base = strings.TrimSpace(checkpoint.Work.BaseBranch)
+		}
+		title = strings.TrimSpace(checkpoint.Work.Title)
+	}
+	if base == "" {
+		base = "main"
+	}
+	if title == "" {
+		title = "Looper WIP — awaiting a human decision"
+	}
+	worktreeRoot, err := workerWorktreeRoot(input.Project)
+	if err != nil {
+		return 0, err
+	}
+	if err := r.git.Push(ctx, PushInput{RepoPath: cwd, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: compactStrings([]string{base})}); err != nil {
+		return 0, err
+	}
+	created, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{
+		Repo:       repo,
+		HeadBranch: checkpoint.Worktree.Branch,
+		BaseBranch: base,
+		Title:      title,
+		Body:       "🚧 Draft opened by looper to ask a mid-run question — see the comment below. Not ready for review.",
+		Draft:      true,
+		CWD:        cwd,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return created.Number, nil
+}
+
+const hitlGitHubAskMarkerPrefix = "<!-- looper:hitl:ask v=1"
+
+// buildGitHubAskComment renders the ask as a PR comment carrying a machine marker
+// (so the poll lane finds it and never mistakes it for a human answer).
+func buildGitHubAskComment(loopSeq int64, question string, options []string, mentionLogins []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s loop=%d -->\n", hitlGitHubAskMarkerPrefix, loopSeq)
+	b.WriteString("🤔 **looper needs a decision to continue.**\n\n")
+	b.WriteString(strings.TrimSpace(question))
+	for _, o := range options {
+		if o = strings.TrimSpace(o); o != "" {
+			fmt.Fprintf(&b, "\n- %s", o)
+		}
+	}
+	b.WriteString("\n\nReply to this comment with your choice — a letter, an option, or free-form guidance. I'll pick it up and continue on this PR.")
+	if m := githubMentionLine(mentionLogins); m != "" {
+		b.WriteString("\n\n" + m)
+	}
+	return b.String()
+}
+
+func githubMentionLine(logins []string) string {
+	parts := make([]string, 0, len(logins))
+	for _, l := range logins {
+		if l = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(l), "@")); l != "" {
+			parts = append(parts, "@"+l)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "/cc " + strings.Join(parts, " ")
 }

@@ -458,6 +458,7 @@ type CreatePullRequestInput struct {
 	BaseBranch string
 	Title      string
 	Body       string
+	Draft      bool
 	CWD        string
 }
 
@@ -2388,7 +2389,11 @@ func (g *Gateway) AddPullRequestReviewers(ctx context.Context, input PullRequest
 }
 
 func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (CreatePullRequestResult, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "create", "--repo", input.Repo, "--head", input.HeadBranch, "--base", input.BaseBranch, "--title", input.Title, "--body", input.Body)
+	args := []string{"pr", "create", "--repo", input.Repo, "--head", input.HeadBranch, "--base", input.BaseBranch, "--title", input.Title, "--body", input.Body}
+	if input.Draft {
+		args = append(args, "--draft")
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return CreatePullRequestResult{}, err
 	}

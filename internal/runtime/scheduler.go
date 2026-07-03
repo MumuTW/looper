@@ -1663,11 +1663,36 @@ func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker
 	if a.gateway == nil {
 		return worker.CreatePullRequestResult{}, fmt.Errorf("github gateway is not configured")
 	}
-	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, CWD: input.CWD})
+	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, Draft: input.Draft, CWD: input.CWD})
 	if err != nil {
 		return worker.CreatePullRequestResult{}, err
 	}
 	return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
+}
+
+func (a workerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err := client.AddIssueLabels(ctx, input.PRNumber, input.Labels)
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+// hitlGitHubSettings maps the HITL GitHub config into the worker's settings.
+func hitlGitHubSettings(cfg *config.HITLGitHubConfig) worker.HITLGitHubSettings {
+	if cfg == nil {
+		return worker.HITLGitHubSettings{}
+	}
+	return worker.HITLGitHubSettings{
+		AwaitingLabel: cfg.AwaitingLabel,
+		MentionLogins: append([]string(nil), cfg.MentionLogins...),
+	}
 }
 
 func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.CompareBranchesInput) (worker.CompareBranchesResult, error) {
@@ -2090,7 +2115,9 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},
-		HITLEnabled: cfg.HITL.Enabled,
+		HITLEnabled:         cfg.HITL.Enabled,
+		HITLAnswerTransport: cfg.HITL.AnswerTransport,
+		HITLGitHub:          hitlGitHubSettings(cfg.HITL.GitHub),
 		HITLNotify: func(ctx context.Context, ask worker.HITLAskNotification) error {
 			return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq, Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options})
 		},

@@ -153,6 +153,7 @@ type CreatePullRequestInput struct {
 	BaseBranch string
 	Title      string
 	Body       string
+	Draft      bool
 	CWD        string
 }
 
@@ -244,6 +245,7 @@ type GitHubGateway interface {
 	CompareBranches(context.Context, CompareBranchesInput) (CompareBranchesResult, error)
 	UpdatePullRequestBody(context.Context, UpdatePullRequestBodyInput) error
 	UpdatePullRequestTitle(context.Context, UpdatePullRequestTitleInput) error
+	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
 }
@@ -456,6 +458,16 @@ type Options struct {
 	// before. HITLNotify, when set, sends the ask-card to the human channel.
 	HITLEnabled bool
 	HITLNotify  HITLNotifyFunc
+	// HITLAnswerTransport selects how a mid-run ask is delivered: "github" (post it
+	// as a PR comment; the default) or "feishu"/"respond" (via HITLNotify / the API).
+	HITLAnswerTransport string
+	HITLGitHub          HITLGitHubSettings
+}
+
+// HITLGitHubSettings tunes the GitHub PR-comment ask transport.
+type HITLGitHubSettings struct {
+	AwaitingLabel string
+	MentionLogins []string
 }
 
 // HITLAskNotification is the payload the worker hands to HITLNotify when an agent
@@ -515,6 +527,8 @@ type Runner struct {
 	network                 NetworkStatusGateway
 	hitlEnabled             bool
 	hitlNotify              HITLNotifyFunc
+	hitlAnswerTransport     string
+	hitlGitHub              HITLGitHubSettings
 }
 
 func (r *Runner) providerKindForProject(projectID string) config.ProviderKind {
@@ -777,6 +791,8 @@ func New(options Options) *Runner {
 		network:                 options.Network,
 		hitlEnabled:             options.HITLEnabled,
 		hitlNotify:              options.HITLNotify,
+		hitlAnswerTransport:     options.HITLAnswerTransport,
+		hitlGitHub:              options.HITLGitHub,
 	}
 }
 

@@ -23,6 +23,12 @@ type HITLAsk struct {
 	Status      string   `json:"status,omitempty"` // "awaiting" | "answered" | "consumed"
 	AskedAt     string   `json:"askedAt,omitempty"`
 	AnsweredAt  string   `json:"answeredAt,omitempty"`
+	// Transport records how the ask was delivered ("github" | "feishu"). GitHub
+	// asks carry the PR + ask-comment id so the answer-poll lane can find the human
+	// reply that came after the ask and resolve/re-request on that PR.
+	Transport    string `json:"transport,omitempty"`
+	PRNumber     int64  `json:"prNumber,omitempty"`
+	AskCommentID int64  `json:"askCommentId,omitempty"`
 }
 
 // ReadHITLAsk extracts the HITL ask state from a loop's metadata JSON. The
