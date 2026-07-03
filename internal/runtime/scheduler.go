@@ -1398,6 +1398,14 @@ func (a fixerGitAdapter) FetchBranch(ctx context.Context, repoPath, remote, bran
 	return a.gateway.FetchBranch(ctx, repoPath, remote, branch)
 }
 
+func (a fixerGitAdapter) MergeBaseIntoWorktree(ctx context.Context, input fixer.MergeBaseInput) (fixer.MergeBaseResult, error) {
+	res, err := a.gateway.MergeBaseIntoWorktree(ctx, gitinfra.MergeBaseInput{WorktreePath: input.WorktreePath, Remote: input.Remote, BaseBranch: input.BaseBranch})
+	if err != nil {
+		return fixer.MergeBaseResult{}, err
+	}
+	return fixer.MergeBaseResult{AlreadyUpToDate: res.AlreadyUpToDate, Conflicted: res.Conflicted}, nil
+}
+
 func (a fixerGitAdapter) IsAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
 	return a.gateway.IsAncestor(ctx, repoPath, ancestor, descendant)
 }

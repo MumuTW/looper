@@ -387,7 +387,19 @@ type GitGateway interface {
 	Push(context.Context, PushInput) error
 	FetchBranch(context.Context, string, string, string) error
 	IsAncestor(context.Context, string, string, string) (bool, error)
+	MergeBaseIntoWorktree(context.Context, MergeBaseInput) (MergeBaseResult, error)
 	CleanupWorktree(context.Context, CleanupWorktreeInput) error
+}
+
+type MergeBaseInput struct {
+	WorktreePath string
+	Remote       string
+	BaseBranch   string
+}
+
+type MergeBaseResult struct {
+	AlreadyUpToDate bool
+	Conflicted      bool
 }
 
 type AgentRunInput struct {
@@ -2179,14 +2191,17 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if len(checkpoint.FixItems) == 0 {
 		return checkpoint, &loopError{message: "Missing fix items checkpoint for repair step", kind: FailureRetryableTransient}
 	}
-	if !r.allowRiskyFixes {
-		for _, item := range checkpoint.FixItems {
-			if item.Type == "conflict" {
-				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
-				return checkpoint, &loopError{message: fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber), kind: FailureManualIntervention}
-			}
+	hasConflict := false
+	for _, item := range checkpoint.FixItems {
+		if item.Type == "conflict" {
+			hasConflict = true
+			break
 		}
+	}
+	if hasConflict && !r.allowRiskyFixes {
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
+		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber), kind: FailureManualIntervention}
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
@@ -2211,6 +2226,21 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		}
 		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 			return checkpoint, err
+		}
+	}
+	// Autonomous conflict resolution (risky fixes on): merge the base into the
+	// worktree so the agent has the conflict markers to resolve, instead of punting
+	// the conflict to a human. A merge that fails for a non-conflict reason falls
+	// back to manual intervention.
+	if hasConflict {
+		base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
+		if base == "" {
+			base = "main"
+		}
+		if _, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base}); mergeErr != nil {
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
+			return checkpoint, &loopError{message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), kind: FailureManualIntervention}
 		}
 	}
 	executionID := eventlog.NewEventID("agent")
