@@ -4428,12 +4428,35 @@ type feishuCardActionEnvelope struct {
 	Challenge string `json:"challenge"`
 	// Token is the Feishu app Verification Token, echoed by Feishu in every event
 	// and card-action callback. It is the shared secret that proves the request
-	// originated from Feishu rather than an arbitrary client.
+	// originated from Feishu rather than an arbitrary client. (v1 card-action /
+	// url_verification carry it at top level; v2 events carry it in header.token.)
 	Token  string `json:"token"`
 	Action struct {
 		Tag   string          `json:"tag"`
 		Value json.RawMessage `json:"value"`
 	} `json:"action"`
+	// v2 event envelope, used for im.message.receive_v1 (a human typing a free-text
+	// reply in the ask thread).
+	Header struct {
+		EventType string `json:"event_type"`
+		Token     string `json:"token"`
+	} `json:"header"`
+	Event struct {
+		Message struct {
+			MessageID   string `json:"message_id"`
+			RootID      string `json:"root_id"`
+			ThreadID    string `json:"thread_id"`
+			ChatID      string `json:"chat_id"`
+			MessageType string `json:"message_type"`
+			Content     string `json:"content"`
+		} `json:"message"`
+		Sender struct {
+			SenderType string `json:"sender_type"`
+			SenderID   struct {
+				OpenID string `json:"open_id"`
+			} `json:"sender_id"`
+		} `json:"sender"`
+	} `json:"event"`
 }
 
 // handleFeishuCardActionRoute is the thin Feishu listener (receive side of the
@@ -4471,7 +4494,13 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 	if envName := strings.TrimSpace(h.context.Config.Notifications.Webhook.VerificationTokenEnv); envName != "" {
 		expectedToken = strings.TrimSpace(os.Getenv(envName))
 	}
-	tokenMatches := expectedToken != "" && subtle.ConstantTimeCompare([]byte(strings.TrimSpace(envelope.Token)), []byte(expectedToken)) == 1
+	// v1 card-action / url_verification carry the token at the top level; v2 events
+	// carry it in header.token.
+	presentedToken := strings.TrimSpace(envelope.Token)
+	if presentedToken == "" {
+		presentedToken = strings.TrimSpace(envelope.Header.Token)
+	}
+	tokenMatches := expectedToken != "" && subtle.ConstantTimeCompare([]byte(presentedToken), []byte(expectedToken)) == 1
 
 	// Feishu URL-verification handshake: echo the challenge verbatim. When a token
 	// is configured, require it to match even for the handshake.
@@ -4498,6 +4527,12 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 	}
 	if !tokenMatches {
 		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
+		return
+	}
+	// A human typing a free-text reply in the ask thread arrives as a message event
+	// rather than a card action — route it to the free-text handler.
+	if envelope.Header.EventType == "im.message.receive_v1" {
+		h.handleFeishuThreadReply(w, r, requestID, envelope)
 		return
 	}
 	var value struct {
@@ -4531,6 +4566,54 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 		return
 	}
 	h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": true})
+}
+
+// handleFeishuThreadReply consumes a human's free-text reply typed in an ask
+// thread (a Feishu im.message.receive_v1 event). It reverse-maps the thread root
+// to the loop that asked and delivers the typed text as the answer — the lossless,
+// type-anything counterpart to clicking an option button. Ordinary thread chatter
+// (no matching awaiting_human loop) is ignored with 200 so Feishu stops retrying.
+func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request, requestID string, envelope feishuCardActionEnvelope) {
+	msg := envelope.Event.Message
+	if msg.MessageType != "text" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "non-text message"})
+		return
+	}
+	rootID := strings.TrimSpace(msg.RootID)
+	if rootID == "" {
+		rootID = strings.TrimSpace(msg.ThreadID)
+	}
+	if rootID == "" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "not a thread reply"})
+		return
+	}
+	var textContent struct {
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal([]byte(msg.Content), &textContent)
+	answer := strings.TrimSpace(textContent.Text)
+	if answer == "" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "empty text"})
+		return
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.FeishuThreads == nil {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "thread mapping unavailable"})
+		return
+	}
+	loopID, err := services.Repositories.FeishuThreads.LoopByRoot(r.Context(), rootID)
+	if err != nil || strings.TrimSpace(loopID) == "" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "no loop for thread"})
+		return
+	}
+	// deliverHumanAnswer only accepts an awaiting_human loop, so this naturally
+	// drops the bot's own thread posts, replies after the loop resumed, and any
+	// duplicate Feishu retries.
+	if _, err := h.deliverHumanAnswer(r.Context(), loopID, answer); err != nil {
+		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop not awaiting a human"})
+		return
+	}
+	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": true})
 }
 
 func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string) (retryLoopResponse, error) {

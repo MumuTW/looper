@@ -244,6 +244,65 @@ func TestHandlerFeishuCardActionGatedWhenHITLDisabled(t *testing.T) {
 	}
 }
 
+func TestHandlerFeishuThreadReplyDeliversTypedAnswer(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN3", "verify-tok-123")
+	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN3"
+	h := setupAwaitingCardLoop(t, cfg, rt, "project_thread", "loop_thread", 91)
+	services := rt.Services()
+	// The gateway would have recorded this when it created the thread root.
+	if err := services.Repositories.FeishuThreads.Upsert(context.Background(), "om_root_91", "loop_thread", "oc_group", "2026-04-11T12:00:00.000Z"); err != nil {
+		t.Fatalf("FeishuThreads.Upsert() error = %v", err)
+	}
+
+	// A human types a free-text reply in the ask thread (im.message.receive_v1).
+	body := `{"schema":"2.0","header":{"event_type":"im.message.receive_v1","token":"verify-tok-123"},"event":{"message":{"message_id":"om_reply","root_id":"om_root_91","chat_id":"oc_group","message_type":"text","content":"{\"text\":\"用 A 改 resize handle\"}"},"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), "loop_thread")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "running" {
+		t.Fatalf("loop.Status = %q, want running (resumed by typed reply)", loop.Status)
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Answer != "用 A 改 resize handle" || ask.Status != "answered" {
+		t.Fatalf("ask = %#v (ok=%v), want the typed free-text answer", ask, ok)
+	}
+}
+
+func TestHandlerFeishuThreadReplyIgnoresUnknownThread(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN4", "verify-tok-123")
+	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN4"
+	h := setupAwaitingCardLoop(t, cfg, rt, "project_thread2", "loop_thread2", 92)
+
+	// A reply in a thread with no mapped loop must be ignored (200, not delivered),
+	// so ordinary group chatter doesn't error or touch any loop.
+	body := `{"schema":"2.0","header":{"event_type":"im.message.receive_v1","token":"verify-tok-123"},"event":{"message":{"message_id":"om_x","root_id":"om_unknown","chat_id":"oc_group","message_type":"text","content":"{\"text\":\"just chatting\"}"},"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (ignored); body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := rt.Services().Repositories.Loops.GetByID(context.Background(), "loop_thread2")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop.Status = %q, want unchanged awaiting_human", loop.Status)
+	}
+}
+
 func TestHandlerRespondRequiresAnswer(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

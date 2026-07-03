@@ -78,14 +78,6 @@ type Gateway struct {
 	feishuTokenMu  sync.Mutex
 	feishuToken    string
 	feishuTokenExp time.Time
-
-	// threadMu guards threadRoots, an in-memory loopID -> Feishu root message id
-	// map. All notifications for one loop are threaded under that root so a task's
-	// messages aggregate into a single Feishu thread instead of separate cards.
-	// In-memory is sufficient: a loop's messages arrive within one daemon session;
-	// a restart just starts a fresh thread for any still-running loop.
-	threadMu    sync.Mutex
-	threadRoots map[string]string
 }
 
 func NewGateway(options Options) *Gateway {
@@ -118,7 +110,6 @@ func NewGateway(options Options) *Gateway {
 		runCommand:    runCommand,
 		httpPost:      httpPost,
 		feishuAppHTTP: feishuAppHTTP,
-		threadRoots:   map[string]string{},
 	}
 }
 
@@ -695,14 +686,11 @@ func (g *Gateway) postFeishuAppMessage(ctx context.Context, token, chatID, rootM
 // top-level, so threading degrades gracefully rather than dropping messages.
 func (g *Gateway) ensureFeishuThreadRoot(ctx context.Context, token, chatID, loopID string) string {
 	loopID = strings.TrimSpace(loopID)
-	if loopID == "" {
+	if loopID == "" || g.repositories == nil || g.repositories.FeishuThreads == nil {
 		return ""
 	}
-	g.threadMu.Lock()
-	existing, ok := g.threadRoots[loopID]
-	g.threadMu.Unlock()
-	if ok {
-		return existing
+	if root, err := g.repositories.FeishuThreads.RootByLoop(ctx, loopID); err == nil && root != "" {
+		return root
 	}
 	content, err := json.Marshal(map[string]string{"text": g.feishuThreadHeaderText(ctx, loopID)})
 	if err != nil {
@@ -712,14 +700,9 @@ func (g *Gateway) ensureFeishuThreadRoot(ctx context.Context, token, chatID, loo
 	if err != nil || msgID == "" {
 		return ""
 	}
-	g.threadMu.Lock()
-	defer g.threadMu.Unlock()
-	// A concurrent notification for the same loop may have created a root already;
-	// keep the first winner so every message threads under one root.
-	if winner, raced := g.threadRoots[loopID]; raced {
-		return winner
-	}
-	g.threadRoots[loopID] = msgID
+	// Persisted (not just in-memory) so the inbound callback can reverse-map a
+	// thread reply back to this loop, and so it survives a daemon restart.
+	_ = g.repositories.FeishuThreads.Upsert(ctx, msgID, loopID, chatID, eventlog.FormatJavaScriptISOString(g.now()))
 	return msgID
 }
 
