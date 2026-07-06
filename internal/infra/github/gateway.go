@@ -3143,19 +3143,34 @@ func ghRepoArg(args []string) string {
 			return strings.TrimSpace(strings.TrimPrefix(arg, "-R="))
 		}
 	}
+	if repo := ghAPIRepoArg(args); repo != "" {
+		return repo
+	}
+	if repo := ghGraphQLRepoArg(args); repo != "" {
+		return repo
+	}
 	return ""
 }
 
 func externalWritableGhArgs(args []string) bool {
-	if len(args) < 2 || args[0] != "pr" {
+	if len(args) < 2 {
 		return false
 	}
-	switch args[1] {
-	case "create", "comment", "review", "edit":
-		return true
-	default:
-		return false
+	if args[0] == "pr" {
+		switch args[1] {
+		case "create", "comment", "review", "edit":
+			return true
+		default:
+			return false
+		}
 	}
+	if args[0] == "api" {
+		if len(args) >= 2 && args[1] == "graphql" {
+			return ghGraphQLMutationArg(args)
+		}
+		return ghAPIWriteMethod(args) && ghAPIRepoArg(args) != ""
+	}
+	return false
 }
 
 func externalReadableGhArgs(args []string) bool {
@@ -3167,6 +3182,102 @@ func externalReadableGhArgs(args []string) bool {
 	}
 	if args[0] == "issue" {
 		return args[1] == "view" || args[1] == "list"
+	}
+	return false
+}
+
+func ghAPIRepoArg(args []string) string {
+	if len(args) < 2 || args[0] != "api" {
+		return ""
+	}
+	endpoint := ""
+	for _, arg := range args[1:] {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if arg == "graphql" {
+			return ""
+		}
+		endpoint = strings.Trim(arg, "/")
+		break
+	}
+	parts := strings.Split(endpoint, "/")
+	if len(parts) < 3 || parts[0] != "repos" {
+		return ""
+	}
+	owner := strings.TrimSpace(parts[1])
+	repo := strings.TrimSpace(parts[2])
+	if owner == "" || repo == "" {
+		return ""
+	}
+	return owner + "/" + repo
+}
+
+func ghAPIWriteMethod(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		value := ""
+		if arg == "--method" || arg == "-X" {
+			if i+1 < len(args) {
+				value = args[i+1]
+			}
+		} else if strings.HasPrefix(arg, "--method=") {
+			value = strings.TrimPrefix(arg, "--method=")
+		} else if strings.HasPrefix(arg, "-X=") {
+			value = strings.TrimPrefix(arg, "-X=")
+		}
+		switch strings.ToUpper(strings.TrimSpace(value)) {
+		case "POST", "PUT", "PATCH", "DELETE":
+			return true
+		}
+	}
+	return false
+}
+
+func ghGraphQLRepoArg(args []string) string {
+	if len(args) < 2 || args[0] != "api" || args[1] != "graphql" {
+		return ""
+	}
+	values := map[string]string{}
+	for i := 2; i < len(args); i++ {
+		arg := args[i]
+		if (arg == "-F" || arg == "-f") && i+1 < len(args) {
+			recordGhFieldArg(values, args[i+1])
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-F=") || strings.HasPrefix(arg, "-f=") {
+			recordGhFieldArg(values, strings.TrimPrefix(strings.TrimPrefix(arg, "-F="), "-f="))
+		}
+	}
+	owner := firstNonEmpty(values["owner"], values["repositoryOwner"])
+	repo := firstNonEmpty(values["name"], values["repo"], values["repositoryName"])
+	if owner == "" || repo == "" {
+		return ""
+	}
+	return owner + "/" + repo
+}
+
+func recordGhFieldArg(values map[string]string, arg string) {
+	key, value, ok := strings.Cut(arg, "=")
+	if !ok {
+		return
+	}
+	values[strings.TrimSpace(key)] = strings.TrimSpace(value)
+}
+
+func ghGraphQLMutationArg(args []string) bool {
+	for i := 2; i < len(args); i++ {
+		arg := args[i]
+		value := ""
+		if (arg == "-F" || arg == "-f") && i+1 < len(args) {
+			value = args[i+1]
+		} else if strings.HasPrefix(arg, "-F=") || strings.HasPrefix(arg, "-f=") {
+			value = strings.TrimPrefix(strings.TrimPrefix(arg, "-F="), "-f=")
+		}
+		if key, query, ok := strings.Cut(value, "="); ok && strings.TrimSpace(key) == "query" {
+			return strings.Contains(strings.ToLower(query), "mutation")
+		}
 	}
 	return false
 }

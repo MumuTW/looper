@@ -562,16 +562,17 @@ func (r *Runner) pushWorkerBranch(ctx context.Context, project storage.ProjectRe
 	if !r.projectUsesExternalGitHubWrites(project.ID) {
 		return r.git.Push(ctx, PushInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktreePath, Branch: branch, ProtectedBranches: protectedBranches})
 	}
-	if prNumber <= 0 {
-		return errors.New("external GitHub write provider requires a pull request number for push")
-	}
 	githubWritePath := strings.TrimSpace(derefString(r.customInstructions.Tools.GitHubWritePath))
 	if githubWritePath == "" {
 		return errors.New("tools.githubWritePath is required when githubWriteProvider is external")
 	}
+	args := []string{"gh", "pr", "push", "--repo", repo}
+	if prNumber > 0 {
+		args = append(args, strconv.FormatInt(prNumber, 10))
+	}
 	result, err := shell.Run(ctx, shell.Options{
 		Command: githubWritePath,
-		Args:    []string{"gh", "pr", "push", "--repo", repo, strconv.FormatInt(prNumber, 10)},
+		Args:    args,
 		CWD:     worktreePath,
 		Timeout: 5 * time.Minute,
 	})
@@ -2086,6 +2087,14 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.SkipReason = fmt.Sprintf("Worker stopped because branch %s has no commits ahead of %s", worktree.Branch, work.BaseBranch)
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
+	}
+	if r.projectUsesExternalGitHubWrites(input.Project.ID) {
+		if err := r.pushWorkerBranch(ctx, input.Project, work.Repo, 0, worktreeRoot, worktree.Path, worktree.Branch, compactStrings([]string{work.BaseBranch})); err != nil {
+			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
+				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+			}
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)

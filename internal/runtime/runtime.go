@@ -820,7 +820,9 @@ func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 func githubExternalPolicies(cfg config.Config) map[string]githubinfra.ExternalGitHubPolicy {
 	policies := map[string]githubinfra.ExternalGitHubPolicy{}
 	for _, project := range cfg.Projects {
-		if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindGitHub {
+		switch config.ResolvedProjectProviderKind(cfg, project) {
+		case config.ProviderKindGitHub, config.ProviderKindPlane:
+		default:
 			continue
 		}
 		repo := strings.ToLower(strings.TrimSpace(project.Repo))
