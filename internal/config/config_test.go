@@ -2911,6 +2911,40 @@ func TestValidateRejectsInvalidReviewerReviewEvents(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsPlannerWorkerTriggerLabelOverlap(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	// The P4 misconfig: worker shares the planner's trigger label while both still
+	// route by the current GitHub user, so one issue fires both roles (two PRs).
+	cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser = true
+	cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = true
+	cfg.Roles.Planner.Triggers.Labels = []string{"looper:plan"}
+	cfg.Roles.Worker.Triggers.Labels = []string{"looper:plan"}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "overlaps roles.planner.triggers.labels") {
+		t.Fatalf("ValidateWithOptions() error = %v, want planner/worker label-overlap failure", err)
+	}
+}
+
+func TestValidateAllowsSharedTriggerLabelForPlaneAssigneeRouting(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	// The Plane lifecycle legitimately runs planner+worker off one label, routed by
+	// assignee UUID (RequireAssigneeCurrentUser=false on both). This must NOT be
+	// flagged as an overlap — it's the intended single-label plan→implement flow.
+	cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser = false
+	cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = false
+	cfg.Roles.Planner.Triggers.Labels = []string{"looper:plan"}
+	cfg.Roles.Worker.Triggers.Labels = []string{"looper:plan"}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+		t.Fatalf("ValidateWithOptions() error = %v, want no overlap failure for the Plane single-label flow", err)
+	}
+}
+
 func TestLoadFileRejectsUnknownCLIFlagsInsteadOfPrefixMatchingThem(t *testing.T) {
 	_, err := LoadFile(LoadFileOptions{Args: []string{"--hostfoo", "127.0.0.99"}, LookupEnv: emptyEnvLookup})
 	if err == nil {
