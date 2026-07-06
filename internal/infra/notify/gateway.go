@@ -103,6 +103,12 @@ type Gateway struct {
 	// re-checks, so exactly one anchor is created.
 	rootMu    sync.Mutex
 	rootLocks map[string]*sync.Mutex
+	// closedFollowup remembers which finished tasks already got the one "task is
+	// done, continue on the issue/PR or open a new one" reply (§F option B), so a
+	// stream of follow-up messages in the thread gets a single honest ack, not a
+	// silent drop and not a spammed one.
+	closedFollowupMu sync.Mutex
+	closedFollowup   map[string]struct{}
 }
 
 type askCardState struct {
@@ -1596,6 +1602,49 @@ func (g *Gateway) updateFeishuThreadHeader(ctx context.Context, token, loopID st
 		return
 	}
 	_ = g.patchFeishuAppCard(ctx, token, root, cardJSON)
+}
+
+// PostTaskClosedFollowup posts a single honest reply in a finished task's thread
+// when a human keeps talking to it (§F option B / P5): rather than silently
+// swallowing the message on a loop that will never run again, it says the task is
+// done and where to continue. At most once per loop. App-mode + best-effort.
+func (g *Gateway) PostTaskClosedFollowup(ctx context.Context, loopID string) error {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+		return nil
+	}
+	g.closedFollowupMu.Lock()
+	if g.closedFollowup == nil {
+		g.closedFollowup = map[string]struct{}{}
+	}
+	if _, done := g.closedFollowup[loopID]; done {
+		g.closedFollowupMu.Unlock()
+		return nil
+	}
+	g.closedFollowup[loopID] = struct{}{}
+	g.closedFollowupMu.Unlock()
+
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	if appID == "" || appSecret == "" {
+		return nil
+	}
+	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return err
+	}
+	root := g.threadRootForLoop(ctx, loopID)
+	chatID := strings.TrimSpace(cfg.ChatID)
+	if strings.TrimSpace(root) == "" || chatID == "" {
+		return nil
+	}
+	raw, err := json.Marshal(map[string]string{"text": "✅ 本任务已完成。如需继续,请在对应的 issue / PR 上留言,或新建一个任务 —— 这个话题不再自动接管了。"})
+	if err != nil {
+		return err
+	}
+	_, err = g.postFeishuAppMessage(ctx, token, chatID, root, "text", string(raw))
+	return err
 }
 
 // patchFeishuAppCard updates an already-sent interactive card in place.

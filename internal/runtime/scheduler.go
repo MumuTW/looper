@@ -103,6 +103,9 @@ type defaultSchedulerTickInput struct {
 	// OnPullRequestSnapshot, when set, is called after a PR snapshot is captured, so
 	// the task's anchor card can re-render with the PR's fresh review-cycle state (§A).
 	OnPullRequestSnapshot func(ctx context.Context, repo string, prNumber int64)
+	// PostTaskClosedFollowup, when set, posts the one "task is done, continue on the
+	// issue/PR" reply for a finished loop that a human keeps messaging (§F option B).
+	PostTaskClosedFollowup func(ctx context.Context, loopID string) error
 }
 
 type defaultSchedulerHandlers struct {
@@ -2270,6 +2273,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 			OnPullRequestSnapshot:    refreshTaskCardForPR,
+			PostTaskClosedFollowup:   notificationGateway.PostTaskClosedFollowup,
 		}
 	}
 
