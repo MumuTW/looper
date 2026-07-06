@@ -302,6 +302,43 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	}
 }
 
+func TestFeishuThreadsRootByTaskSharesOneCardAcrossLoops(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	const taskKey = "issue:owner/repo:7"
+	// Planner loop opens the task's anchor card.
+	if err := repos.FeishuThreads.Upsert(ctx, "om_root_planner", "loop_planner", taskKey, "oc_group", "2026-04-11T12:00:00.000Z"); err != nil {
+		t.Fatalf("Upsert(planner) error = %v", err)
+	}
+	// Worker loop for the SAME issue must resolve to the planner's card, not post a new one.
+	root, err := repos.FeishuThreads.RootByTask(ctx, taskKey)
+	if err != nil || root != "om_root_planner" {
+		t.Fatalf("RootByTask() = %q, %v; want om_root_planner", root, err)
+	}
+	// Worker joins the same card and re-points reply routing at itself.
+	if err := repos.FeishuThreads.Upsert(ctx, "om_root_planner", "loop_worker", taskKey, "oc_group", "2026-04-11T12:05:00.000Z"); err != nil {
+		t.Fatalf("Upsert(worker join) error = %v", err)
+	}
+	if loop, err := repos.FeishuThreads.LoopByRoot(ctx, "om_root_planner"); err != nil || loop != "loop_worker" {
+		t.Fatalf("LoopByRoot() = %q, %v; want loop_worker (reply routes to active loop)", loop, err)
+	}
+
+	// A task-less loop (empty taskKey) keeps per-loop keying and does not collide.
+	if err := repos.FeishuThreads.Upsert(ctx, "om_root_pr", "loop_pr", "", "oc_group", "2026-04-11T12:10:00.000Z"); err != nil {
+		t.Fatalf("Upsert(taskless) error = %v", err)
+	}
+	if root, err := repos.FeishuThreads.RootByTask(ctx, ""); err != nil || root != "" {
+		t.Fatalf("RootByTask(\"\") = %q, %v; want empty", root, err)
+	}
+	if root, err := repos.FeishuThreads.RootByLoop(ctx, "loop_pr"); err != nil || root != "om_root_pr" {
+		t.Fatalf("RootByLoop(loop_pr) = %q, %v; want om_root_pr", root, err)
+	}
+}
+
 func TestRepositoriesStatusAggregates(t *testing.T) {
 	t.Parallel()
 

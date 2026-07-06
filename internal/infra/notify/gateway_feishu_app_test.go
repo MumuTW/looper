@@ -496,6 +496,48 @@ func TestFeishuLoopStatusStyle(t *testing.T) {
 	}
 }
 
+func TestLoopIssueNumberReadsBothMetadataShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		meta string
+		want int64
+	}{
+		{"planner top-level", `{"loopType":"planner","issueNumber":42}`, 42},
+		{"worker nested", `{"worker":{"issueNumber":7,"issueUrl":"https://x/issues/7"}}`, 7},
+		{"numeric string", `{"issueNumber":"13"}`, 13},
+		{"none", `{"repo":"owner/repo"}`, 0},
+		{"empty", ``, 0},
+	}
+	for _, tc := range cases {
+		meta := tc.meta
+		if got := loopIssueNumber(&meta); got != tc.want {
+			t.Fatalf("%s: loopIssueNumber = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestLoopTaskKeyFromRecordCollapsesSiblingLoops(t *testing.T) {
+	repo := "owner/repo"
+	plannerMeta := `{"loopType":"planner","issueNumber":9}`
+	workerMeta := `{"worker":{"issueNumber":9}}`
+	planner := &storage.LoopRecord{Repo: &repo, MetadataJSON: &plannerMeta}
+	worker := &storage.LoopRecord{Repo: &repo, MetadataJSON: &workerMeta}
+	// Planner and worker for the same issue must derive the SAME task key → one card.
+	if pk, wk := loopTaskKeyFromRecord(planner), loopTaskKeyFromRecord(worker); pk != "issue:owner/repo:9" || pk != wk {
+		t.Fatalf("task keys planner=%q worker=%q; want both issue:owner/repo:9", pk, wk)
+	}
+	// No issue number → no task key (falls back to per-loop keying).
+	noIssueMeta := `{"repo":"owner/repo"}`
+	if k := loopTaskKeyFromRecord(&storage.LoopRecord{Repo: &repo, MetadataJSON: &noIssueMeta}); k != "" {
+		t.Fatalf("task key for issue-less loop = %q, want empty", k)
+	}
+	// No repo → no task key.
+	onlyIssueMeta := `{"issueNumber":5}`
+	if k := loopTaskKeyFromRecord(&storage.LoopRecord{MetadataJSON: &onlyIssueMeta}); k != "" {
+		t.Fatalf("task key without repo = %q, want empty", k)
+	}
+}
+
 // cardText concatenates all lark_md element contents from a card JSON, decoded
 // (so JSON < escapes appear as the < the way Feishu renders them).
 func cardText(t *testing.T, card []byte) string {
