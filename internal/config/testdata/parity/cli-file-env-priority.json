@@ -372,7 +372,8 @@
         "gitPath": "configured",
         "ghPath": "configured",
         "looperPath": "detected",
-        "osascriptPath": "configured"
+        "osascriptPath": "configured",
+        "planePath": "missing"
       }
     }
   }

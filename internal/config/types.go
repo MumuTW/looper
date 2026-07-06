@@ -296,6 +296,9 @@ type ToolPathsConfig struct {
 	GHPath        *string `json:"ghPath,omitempty"`
 	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
+	// PlanePath is the `plane` CLI used to read/write Plane spec documents (§8.2).
+	// Optional; auto-detected on PATH when unset.
+	PlanePath *string `json:"planePath,omitempty"`
 }
 
 type ToolDetectionStatus string
@@ -801,6 +804,7 @@ type PartialToolPathsConfig struct {
 	GHPath        *string `json:"ghPath,omitempty"`
 	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
+	PlanePath     *string `json:"planePath,omitempty"`
 }
 
 type PartialDaemonConfig struct {
