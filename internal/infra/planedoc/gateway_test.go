@@ -207,6 +207,42 @@ func TestWriteTechSpecCreatesPageAndLinks(t *testing.T) {
 	}
 }
 
+func TestAssociateDroppedSpecLinksAURL(t *testing.T) {
+	// Human dropped a doc link in the thread → link it directly (list empty → create).
+	f := &fakeRun{stdouts: []string{`{"results":[]}`, `{"id":"l-new"}`}}
+	g := newGateway(f)
+	url, err := g.AssociateDroppedSpec(context.Background(), "p1", "wi-1", SpecKindProduct, "https://feishu.cn/docs/xyz", "", "")
+	if err != nil || url != "https://feishu.cn/docs/xyz" {
+		t.Fatalf("AssociateDroppedSpec(url) = %q, %v", url, err)
+	}
+	if len(f.calls) != 2 || !argsContain(f.calls[1], "link", "create", `"title":"looper:product-spec"`) {
+		t.Fatalf("calls = %v; want list + product-spec link create", f.calls)
+	}
+}
+
+func TestAssociateDroppedSpecWritesPageForInlineText(t *testing.T) {
+	// Human pasted raw spec text → write a Plane page first, then link it.
+	f := &fakeRun{stdouts: []string{`{"id":"pg-7","name":"prod"}`, `{"results":[]}`, `{"id":"l-new"}`}}
+	g := newGateway(f)
+	url, err := g.AssociateDroppedSpec(context.Background(), "p1", "wi-1", SpecKindProduct, "", "# 需求\n验收标准…", "产品方案 #9")
+	if err != nil || !strings.Contains(url, "pg-7") {
+		t.Fatalf("AssociateDroppedSpec(inline) = %q, %v", url, err)
+	}
+	if len(f.calls) != 3 || !argsContain(f.calls[0], "page", "create") || !argsContain(f.calls[2], "link", "create") {
+		t.Fatalf("calls = %v; want page create + list + link create", f.calls)
+	}
+}
+
+func TestAssociateDroppedSpecRejectsEmptyAndUnknownKind(t *testing.T) {
+	g := newGateway(&fakeRun{})
+	if _, err := g.AssociateDroppedSpec(context.Background(), "p1", "wi-1", SpecKindTech, "", "", ""); err == nil {
+		t.Fatal("want error when neither url nor inline text is given")
+	}
+	if _, err := g.AssociateDroppedSpec(context.Background(), "p1", "wi-1", SpecKind("bogus"), "https://x", "", ""); err == nil {
+		t.Fatal("want error for unknown spec kind")
+	}
+}
+
 func TestDecodeLinksToleratesBareArray(t *testing.T) {
 	links, err := decodeLinks(`[{"id":"l1","title":"t","url":"u"}]`)
 	if err != nil || len(links) != 1 || links[0].ID != "l1" {

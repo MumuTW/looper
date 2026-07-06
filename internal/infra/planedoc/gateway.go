@@ -264,6 +264,63 @@ func PageIDFromURL(pageURL string) string {
 	return id
 }
 
+// SpecKind is which spec a dropped document is — decides the link title tag.
+type SpecKind string
+
+const (
+	SpecKindProduct SpecKind = "product"
+	SpecKindTech    SpecKind = "tech"
+)
+
+func (k SpecKind) linkTitle() (string, bool) {
+	switch k {
+	case SpecKindProduct:
+		return ProductSpecLinkTitle, true
+	case SpecKindTech:
+		return TechSpecLinkTitle, true
+	default:
+		return "", false
+	}
+}
+
+// AssociateDroppedSpec acts on an agent's judgment that a thread message is a spec
+// (plan §8.3, "looper 主动关联"): people often won't create the Plane link
+// themselves — they just drop the spec in the thread. Given a URL, it links it
+// directly; given inline spec text, it first writes a Plane page (named `pageName`)
+// then links that. Returns the associated URL. Idempotent via UpsertSpecLink.
+func (g *Gateway) AssociateDroppedSpec(ctx context.Context, projectID, workItemID string, kind SpecKind, url, inlineText, pageName string) (string, error) {
+	title, ok := kind.linkTitle()
+	if !ok {
+		return "", fmt.Errorf("planedoc: AssociateDroppedSpec unknown spec kind %q", kind)
+	}
+	url = strings.TrimSpace(url)
+	inlineText = strings.TrimSpace(inlineText)
+	switch {
+	case url != "":
+		// A link (Plane page / Feishu doc / any URL) — associate it as-is.
+		if err := g.UpsertSpecLink(ctx, projectID, workItemID, title, url); err != nil {
+			return "", err
+		}
+		return url, nil
+	case inlineText != "":
+		// Raw spec text pasted in the thread — capture it into a Plane page first.
+		name := strings.TrimSpace(pageName)
+		if name == "" {
+			name = string(kind) + " spec"
+		}
+		page, err := g.CreatePage(ctx, projectID, name, inlineText)
+		if err != nil {
+			return "", err
+		}
+		if err := g.UpsertSpecLink(ctx, projectID, workItemID, title, page.URL); err != nil {
+			return page.URL, err
+		}
+		return page.URL, nil
+	default:
+		return "", fmt.Errorf("planedoc: AssociateDroppedSpec needs a url or inline text")
+	}
+}
+
 // pageWebURL constructs a page's human URL from the API base (Plane's page API
 // returns none). Best-effort; the page id is embedded so it round-trips.
 func (g *Gateway) pageWebURL(projectID, pageID string) string {
