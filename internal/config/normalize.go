@@ -794,6 +794,10 @@ func mergeToolPathsConfig(config *ToolPathsConfig, partial PartialToolPathsConfi
 		config.GHPath = stringPtr(*partial.GHPath)
 	}
 
+	if partial.GitHubWritePath != nil {
+		config.GitHubWritePath = stringPtr(*partial.GitHubWritePath)
+	}
+
 	if partial.LooperPath != nil {
 		config.LooperPath = stringPtr(*partial.LooperPath)
 	}
