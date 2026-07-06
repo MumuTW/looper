@@ -3628,6 +3628,7 @@ type fakeGitHubGateway struct {
 	updatePRTitleErrors     []error
 	updatePRTitleIndex      int
 	removeLabels            []PullRequestLabelsInput
+	addLabels               []PullRequestLabelsInput
 	reviewerCalls           []PullRequestReviewersInput
 	addAssigneeCalls        []IssueAssigneesInput
 	addAssigneeErr          error
@@ -3754,6 +3755,11 @@ func (f *fakeGitHubGateway) UpdatePullRequestBody(_ context.Context, input Updat
 
 func (f *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
 	f.removeLabels = append(f.removeLabels, input)
+	return nil
+}
+
+func (f *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
+	f.addLabels = append(f.addLabels, input)
 	return nil
 }
 

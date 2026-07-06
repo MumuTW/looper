@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -52,6 +53,11 @@ type ExecutorConfig struct {
 	Params              map[string]any
 	Env                 map[string]string
 	NativeResumeEnabled bool
+	// LiveToolEvents runs codex with `--json` and parses its JSONL event stream so
+	// the live status card can show a structured tool-call feed ("✅ <cmd>"). Only
+	// affects the codex vendor; the result + session are read from the JSONL. Off
+	// by default (env-gated) so it can't disturb the text-mode path until proven.
+	LiveToolEvents bool
 }
 
 type ExecutorOptions struct {
@@ -59,6 +65,20 @@ type ExecutorOptions struct {
 	Repos  *storage.Repositories
 	LogDir string
 	Now    func() time.Time
+	// OnProgress, when set, is called (throttled) while an agent run streams
+	// output, so a transport can surface live progress. Vendor-agnostic: it works
+	// off the subprocess's stdout tail, whatever agent (codex/opencode/claude) runs.
+	OnProgress func(context.Context, ProgressUpdate)
+}
+
+// ProgressUpdate is a throttled snapshot of a running agent's activity: the last
+// few lines it has emitted, plus how long it has been running.
+type ProgressUpdate struct {
+	LoopID         string
+	RunID          string
+	ExecutionID    string
+	TailLines      []string
+	ElapsedSeconds int64
 }
 
 type RunInput struct {
@@ -115,10 +135,11 @@ type Execution interface {
 }
 
 type ConfiguredExecutor struct {
-	config ExecutorConfig
-	repos  *storage.Repositories
-	logDir string
-	now    func() time.Time
+	config     ExecutorConfig
+	repos      *storage.Repositories
+	logDir     string
+	now        func() time.Time
+	onProgress func(context.Context, ProgressUpdate)
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
@@ -126,8 +147,15 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 	if now == nil {
 		now = time.Now
 	}
-	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now}
+	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now, onProgress: options.OnProgress}
 }
+
+// liveProgressInterval throttles OnProgress so a chatty agent doesn't hammer the
+// transport: at most one update per window while output streams.
+const liveProgressInterval = 5 * time.Second
+
+// liveProgressTailLines is how many recent output lines a progress update carries.
+const liveProgressTailLines = 5
 
 type nativeResumeInfo struct {
 	Enabled           bool
@@ -316,6 +344,7 @@ type execution struct {
 	maxOutputBytes     int
 	lastHeartbeatAtISO string
 	lastOutputAt       time.Time
+	lastProgressAt     time.Time
 
 	mu                      sync.Mutex
 	status                  string
@@ -509,6 +538,17 @@ func (x *execution) run(ctx context.Context) {
 		}
 	}
 	completion := parseCompletion(stdout, stderr)
+	if x.jsonMode() {
+		// codex --json: stdout is JSONL. The completion marker + final message live
+		// inside agent_message / command-output events, and the session is the
+		// thread id — read both from the parsed event stream instead of raw stdout.
+		tr := newCodexJSONLTranslator()
+		tr.ingestAll(stdout)
+		completion = parseCompletion(tr.combinedText(), stderr)
+		if tr.threadID != "" {
+			x.nativeSessionID = tr.threadID
+		}
+	}
 	if status != "completed" {
 		completion = completionParse{ParseStatus: "missing"}
 	}
@@ -812,14 +852,112 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	heartbeatCount := x.heartbeatCount
 	stdout := string(x.stdout)
 	stderr := string(x.stderr)
+	// Capture the native session id AS SOON as it appears, so it's persisted while
+	// the run is live (a human taking over mid-run needs it — completion is too
+	// late). Text-mode ids can stream in across chunks, so re-extract each time; the
+	// codex --json thread id arrives whole in a thread.started line, so capture it
+	// once (only when text extraction found nothing and it's not already known).
 	if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
 		x.nativeSessionID = nativeSessionID
+	} else if x.jsonMode() && strings.TrimSpace(x.nativeSessionID) == "" {
+		if threadID := extractCodexThreadID(stdout); threadID != "" {
+			x.nativeSessionID = threadID
+		}
 	}
 	x.mu.Unlock()
 
 	outputJSON := x.outputJSON(stdout, stderr)
 	x.persistStatus(x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON)
 	x.bumpRunHeartbeat(nowISO)
+	x.maybeEmitProgress(now, stdout, stderr)
+}
+
+// maybeEmitProgress hands a throttled activity snapshot (last few output lines +
+// elapsed) to the injected OnProgress callback, at most once per interval. It
+// reads both stdout and stderr because agents narrate on different streams
+// (codex logs activity to stderr; the final answer lands on stdout).
+func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
+	if x.executor == nil || x.executor.onProgress == nil {
+		return
+	}
+	x.mu.Lock()
+	if !x.lastProgressAt.IsZero() && now.Sub(x.lastProgressAt) < liveProgressInterval {
+		x.mu.Unlock()
+		return
+	}
+	x.lastProgressAt = now
+	x.mu.Unlock()
+	elapsed := int64(now.Sub(x.startedAt).Seconds())
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	var tail []string
+	if x.jsonMode() {
+		// Structured codex tool-call feed ("✅ <cmd>") parsed from the JSONL stream.
+		tail = codexToolTail(stdout, liveProgressTailLines)
+	} else {
+		// Combine streams; the last N lines skew toward whichever is actively writing.
+		tail = lastNonEmptyLines(stdout+"\n"+stderr, liveProgressTailLines)
+	}
+	x.executor.onProgress(context.Background(), ProgressUpdate{
+		LoopID:         x.input.LoopID,
+		RunID:          x.input.RunID,
+		ExecutionID:    x.input.ExecutionID,
+		TailLines:      tail,
+		ElapsedSeconds: elapsed,
+	})
+}
+
+// jsonMode reports whether this run is a codex `--json` run (structured events).
+func (x *execution) jsonMode() bool {
+	return x.executor != nil && x.executor.config.LiveToolEvents && x.executor.config.Vendor == config.AgentVendorCodex
+}
+
+// codexToolTail renders the last n command executions from a codex JSONL blob.
+func codexToolTail(stdout string, n int) []string {
+	tr := newCodexJSONLTranslator()
+	tr.ingestAll(stdout)
+	return tr.recentToolLines(n)
+}
+
+var ansiEscapeRe = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
+
+// lastNonEmptyLines returns the final n meaningful lines of s, in order: ANSI
+// colour codes stripped, and pure-punctuation / diff-fragment / lifecycle-hook
+// noise skipped so the tail reads as activity rather than terminal spew.
+func lastNonEmptyLines(s string, n int) []string {
+	if n <= 0 || strings.TrimSpace(s) == "" {
+		return nil
+	}
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, n)
+	for i := len(lines) - 1; i >= 0 && len(out) < n; i-- {
+		line := strings.TrimSpace(ansiEscapeRe.ReplaceAllString(lines[i], ""))
+		if !meaningfulProgressLine(line) {
+			continue
+		}
+		out = append([]string{line}, out...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// meaningfulProgressLine drops lines that are pure diff/bracket punctuation or
+// lifecycle-hook noise, which otherwise dominate a raw agent stream.
+func meaningfulProgressLine(line string) bool {
+	if len(line) < 4 {
+		return false
+	}
+	if strings.Trim(line, "+-}{[]()<> ,;:.\"'`|") == "" {
+		return false
+	}
+	lower := strings.ToLower(line)
+	if strings.HasPrefix(lower, "hook:") || strings.Contains(lower, " hook:") || strings.HasPrefix(lower, "+ ") || strings.HasPrefix(lower, "- ") {
+		return false
+	}
+	return true
 }
 
 func (x *execution) bumpRunHeartbeat(nowISO string) {
@@ -1092,6 +1230,64 @@ func ResolveSpawnWithNativeResume(cfg ExecutorConfig, workingDirectory string, p
 	return command, args
 }
 
+// InteractiveTakeoverSupported reports whether a human can take over a loop's
+// agent session INTERACTIVELY for the given vendor. Distinct from
+// nativeResumeSupported (the daemon's headless resume): only vendors whose
+// interactive resume is verified to preserve the session id AND accumulate
+// history — so the daemon's later native-resume sees the human's turns — are
+// enabled. Verified 2026-07: codex (`codex resume <id>`) and claude-code
+// (`claude --resume <id>`) both keep the id and thread the conversation.
+// opencode/cursor stay disabled until the same 3-turn check passes for them.
+func InteractiveTakeoverSupported(vendor config.AgentVendor) bool {
+	switch vendor {
+	case config.AgentVendorCodex, config.AgentVendorClaudeCode:
+		return true
+	default:
+		return false
+	}
+}
+
+// InteractiveResumeCommandLine renders the shell command a human runs to take
+// over a loop's agent session interactively: the SAME native session id the
+// daemon was driving, in the loop's worktree. Because a resume preserves the id
+// and appends to the same conversation, the daemon's later native-resume then
+// sees everything the human did. Returns ("", false) when takeover isn't
+// supported for the vendor or the session id is missing.
+func InteractiveResumeCommandLine(cfg ExecutorConfig, workingDirectory, sessionID string) (string, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	workingDirectory = strings.TrimSpace(workingDirectory)
+	if sessionID == "" || !InteractiveTakeoverSupported(cfg.Vendor) {
+		return "", false
+	}
+	command := resolveCommand(cfg)
+	var resume string
+	switch cfg.Vendor {
+	case config.AgentVendorCodex:
+		resume = command + " resume " + shellSingleQuote(sessionID)
+	case config.AgentVendorClaudeCode:
+		resume = command + " --resume " + shellSingleQuote(sessionID)
+	default:
+		return "", false
+	}
+	if workingDirectory != "" {
+		return "cd " + shellSingleQuote(workingDirectory) + " && " + resume, true
+	}
+	return resume, true
+}
+
+// shellSingleQuote makes a string safe to paste into a POSIX shell. UUIDs and
+// plain paths pass through unquoted; anything with shell-special characters is
+// single-quoted with embedded quotes escaped.
+func shellSingleQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(s, " \t\n'\"\\$`&|;<>()*?[]{}#~!") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 func resolveCommand(cfg ExecutorConfig) string {
 	if override, ok := cfg.Params["command"].(string); ok && strings.TrimSpace(override) != "" {
 		return override
@@ -1137,6 +1333,9 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 	resolved := append([]string{}, args...)
 	if !containsArg(resolved, "exec") {
 		resolved = append([]string{"exec"}, resolved...)
+	}
+	if cfg.LiveToolEvents && !containsArg(resolved, "--json") {
+		resolved = append(resolved, "--json")
 	}
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
 	if hasAnyFlag(withModel, []string{"-"}) {
@@ -1338,11 +1537,27 @@ func stringArgs(value any) []string {
 	return result
 }
 
+// ansiEscapePattern matches ANSI CSI escape sequences (e.g. "\x1b[1m", "\x1b[0m").
+// Codex prints its session id as a styled human line rather than JSON, so escape
+// codes must be stripped before the id can be parsed out.
+var ansiEscapePattern = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
+
+func stripANSIEscapes(s string) string {
+	if !strings.Contains(s, "\x1b") {
+		return s
+	}
+	return ansiEscapePattern.ReplaceAllString(s, "")
+}
+
 func extractNativeSessionID(outputs ...string) string {
-	keys := []string{"nativeSessionId", "native_session_id", "sessionId", "session_id", "chatId", "chat_id"}
+	// "session id" (with a space) matches Codex's human-readable line
+	// "\x1b[1msession id:\x1b[0m <uuid>"; the others match JSON-emitting vendors.
+	keys := []string{"nativeSessionId", "native_session_id", "sessionId", "session_id", "session id", "chatId", "chat_id"}
 	for _, output := range outputs {
 		for _, line := range strings.Split(output, "\n") {
-			line = strings.TrimSpace(line)
+			// Strip ANSI styling first: Codex wraps the session id in escape codes,
+			// and a JSON line without styling passes through unchanged.
+			line = strings.TrimSpace(stripANSIEscapes(line))
 			if line == "" {
 				continue
 			}

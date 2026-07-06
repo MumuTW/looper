@@ -92,6 +92,7 @@ type IssueSummary struct {
 	Title         string
 	Body          string
 	URL           string
+	Author        string
 	Assignees     []string
 	AssigneeUsers []networkpolicy.GitHubUser
 	Labels        []string
@@ -153,6 +154,7 @@ type CreatePullRequestInput struct {
 	BaseBranch string
 	Title      string
 	Body       string
+	Draft      bool
 	CWD        string
 }
 
@@ -244,6 +246,7 @@ type GitHubGateway interface {
 	CompareBranches(context.Context, CompareBranchesInput) (CompareBranchesResult, error)
 	UpdatePullRequestBody(context.Context, UpdatePullRequestBodyInput) error
 	UpdatePullRequestTitle(context.Context, UpdatePullRequestTitleInput) error
+	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
 }
@@ -340,16 +343,18 @@ type GitGateway interface {
 }
 
 type AgentRunInput struct {
-	ExecutionID      string
-	ProjectID        string
-	LoopID           string
-	RunID            string
-	Prompt           string
-	WorkingDirectory string
-	Timeout          time.Duration
-	HeartbeatTimeout time.Duration
-	Metadata         map[string]any
-	IdempotencyKey   string
+	ExecutionID        string
+	ProjectID          string
+	LoopID             string
+	RunID              string
+	Prompt             string
+	NativeResumePrompt string
+	NativeSessionID    string
+	WorkingDirectory   string
+	Timeout            time.Duration
+	HeartbeatTimeout   time.Duration
+	Metadata           map[string]any
+	IdempotencyKey     string
 }
 
 type AgentResult struct {
@@ -449,7 +454,53 @@ type Options struct {
 	DiscoveryPolicy                 DiscoveryPolicy
 	OnQueueItemEnqueued             func()
 	Network                         NetworkStatusGateway
+	// HITLEnabled gates the mid-run human-in-the-loop feature. When false (the
+	// default) none of the HITL code paths run and the worker behaves exactly as
+	// before. HITLNotify, when set, sends the ask-card to the human channel.
+	HITLEnabled bool
+	HITLNotify  HITLNotifyFunc
+	// HITLAnswerTransport selects how a mid-run ask is delivered: "github" (post it
+	// as a PR comment; the default) or "feishu"/"respond" (via HITLNotify / the API).
+	HITLAnswerTransport string
+	HITLGitHub          HITLGitHubSettings
 }
+
+// HITLGitHubSettings tunes the GitHub PR-comment ask transport.
+type HITLGitHubSettings struct {
+	AwaitingLabel string
+	MentionLogins []string
+}
+
+// HITLAskNotification is the payload the worker hands to HITLNotify when an agent
+// pauses mid-run to ask a human.
+type HITLAskNotification struct {
+	ProjectID string
+	LoopID    string
+	LoopSeq   int64
+	RunID     string
+	Repo      string
+	Title     string
+	Question  string
+	Options   []string
+
+	// Source + trigger, so the human knows what they are deciding and whose task
+	// it is. SourceType/Ref/URL identify the origin (GitHub Issue #132 → link);
+	// TriggerLogin is who created it.
+	SourceType   string
+	SourceRef    string
+	SourceURL    string
+	TriggerLogin string
+
+	// The agent's decision brief.
+	Recommendation    string
+	RecommendedOption string
+	Consequences      map[string]string
+	Confidence        string
+}
+
+// HITLNotifyFunc delivers a mid-run ask to the human channel (e.g. a Feishu
+// app-bot card). Best-effort; a returned error is logged, not fatal.
+type HITLNotifyFunc func(context.Context, HITLAskNotification) error
 
 type DiscoveryPolicy struct {
 	AutoDiscovery              bool
@@ -489,6 +540,10 @@ type Runner struct {
 	discoveryPolicy         DiscoveryPolicy
 	onQueueItemEnqueued     func()
 	network                 NetworkStatusGateway
+	hitlEnabled             bool
+	hitlNotify              HITLNotifyFunc
+	hitlAnswerTransport     string
+	hitlGitHub              HITLGitHubSettings
 }
 
 func (r *Runner) providerKindForProject(projectID string) config.ProviderKind {
@@ -567,11 +622,14 @@ type workerInput struct {
 	SpecPath string `json:"specPath,omitempty"`
 	Repo     string `json:"repo,omitempty"`
 	// IssueRepo is the source issue repository, which may differ from Repo for cross-repo closing references.
-	IssueRepo            string   `json:"issueRepo,omitempty"`
-	BaseBranch           string   `json:"baseBranch,omitempty"`
-	ExecutionMode        string   `json:"executionMode,omitempty"`
-	IssueNumber          int64    `json:"issueNumber,omitempty"`
-	IssueURL             string   `json:"issueUrl,omitempty"`
+	IssueRepo     string `json:"issueRepo,omitempty"`
+	BaseBranch    string `json:"baseBranch,omitempty"`
+	ExecutionMode string `json:"executionMode,omitempty"`
+	IssueNumber   int64  `json:"issueNumber,omitempty"`
+	IssueURL      string `json:"issueUrl,omitempty"`
+	// TriggerLogin is who created/assigned the source issue (GitHub login), shown
+	// as attribution on the HITL ask card so a human knows whose task this is.
+	TriggerLogin         string   `json:"triggerLogin,omitempty"`
 	PRNumber             int64    `json:"prNumber,omitempty"`
 	PRTitle              string   `json:"prTitle,omitempty"`
 	Branch               string   `json:"branch,omitempty"`
@@ -784,6 +842,10 @@ func New(options Options) *Runner {
 		discoveryPolicy:         policy,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 		network:                 options.Network,
+		hitlEnabled:             options.HITLEnabled,
+		hitlNotify:              options.HITLNotify,
+		hitlAnswerTransport:     options.HITLAnswerTransport,
+		hitlGitHub:              options.HITLGitHub,
 	}
 }
 
@@ -857,7 +919,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" {
+		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "human_takeover" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" || loopResult.record.Status == "awaiting_human" {
 			result.Skipped++
 			continue
 		}
@@ -958,7 +1020,7 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 	}
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.LastRunAt = stringPtr(r.nowISO())
-		if updated.Status == "paused" {
+		if updated.Status == "paused" || updated.Status == "human_takeover" {
 			updated.NextRunAt = nil
 		} else if failedQueue != nil && failedQueue.Status == "queued" {
 			updated.Status = "queued"
@@ -1067,7 +1129,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 			updated.LastRunAt = stringPtr(r.nowISO())
-			if updated.Status == "paused" {
+			if updated.Status == "paused" || updated.Status == "human_takeover" {
 				updated.NextRunAt = nil
 			} else if failedQueue != nil && failedQueue.Status == "queued" {
 				updated.Status = "queued"
@@ -1089,6 +1151,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
+		if awaiting, ok := asAwaitingHumanError(err); ok {
+			return r.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint}, run, checkpoint, awaiting)
+		}
 		if err != nil {
 			failure := r.classifyFailureWithBoundary(err, workerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
@@ -1105,7 +1170,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
-				if updated.Status == "paused" {
+				if updated.Status == "paused" || updated.Status == "human_takeover" {
 					updated.NextRunAt = nil
 				} else if failedQueue != nil && failedQueue.Status == "queued" {
 					updated.Status = "queued"
@@ -1642,12 +1707,53 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, err
 		}
+		// HITL (gated): let the agent pause to ask a human, and on resume feed the
+		// human's answer back into the same agent session.
+		nativeResumePrompt := ""
+		nativeSessionID := ""
+		if r.hitlEnabled {
+			prompt += hitlPromptInstruction
+			nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop)
+			if nativeResumePrompt != "" {
+				prompt += "\n\n" + nativeResumePrompt
+			}
+		}
+		// Handed back from an interactive human takeover: resume the exact session
+		// the human drove (independent of HITL) so the daemon sees their turns.
+		if nativeSessionID == "" {
+			if takeoverPrompt, takeoverSession := r.pendingTakeoverResume(&input.Loop); takeoverSession != "" {
+				nativeResumePrompt, nativeSessionID = takeoverPrompt, takeoverSession
+				prompt += "\n\n" + takeoverPrompt
+			}
+		}
+		// Free-text human messages queued in the thread at any time (a follow-up
+		// question, a new instruction, or an answer to interpret) — drain them into
+		// this turn, resuming the same session so the agent has the full
+		// conversation. Conversational: the agent may answer + ask again rather than
+		// treat them as a final decision.
+		if r.hitlEnabled {
+			if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
+				var msgs strings.Builder
+				msgs.WriteString("While you were working, the human sent these messages in the task thread:")
+				for _, m := range inbox {
+					if t := strings.TrimSpace(m.Text); t != "" {
+						msgs.WriteString("\n- ")
+						msgs.WriteString(t)
+					}
+				}
+				msgs.WriteString("\nRead them in context and respond appropriately: if a message answers a question you asked, proceed using it; if it is a follow-up question or a new instruction, address it — and if you still need a human decision, ask again (write .looper/ask.json) with your response to what they said. Do not ignore these messages.")
+				prompt += "\n\n" + msgs.String()
+				if nativeSessionID == "" {
+					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID)
+				}
+			}
+		}
 		executionID := eventlog.NewEventID("agent")
 		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1657,6 +1763,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		result, err := execution.Wait(ctx)
 		if err != nil {
 			return checkpoint, err
+		}
+		// HITL (gated): after the agent turn, if it wrote an ask sentinel, suspend
+		// the run so a human can answer. Returned as a typed error the step loop
+		// converts into an awaiting_human suspension (not a failure).
+		if r.hitlEnabled && result.Status == "completed" {
+			if awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, executionID); awaitErr != nil {
+				return checkpoint, awaitErr
+			} else if awaiting != nil {
+				return checkpoint, awaiting
+			}
 		}
 		if result.Status != "completed" {
 			checkpoint.Execution = checkpointExecutionFromAgentResult(result)
@@ -1671,6 +1787,15 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
+		// HITL (gated): the resumed turn completed without asking again, so the human
+		// answer that seeded it has been acted on. Flip it to "consumed" now — after
+		// the turn, never before — so a failed/timed-out turn re-reads the answer on
+		// retry, while a successful one never re-injects it on a later run.
+		if r.hitlEnabled {
+			r.markHumanAnswerConsumed(ctx, &input.Loop)
+			r.clearHumanInbox(ctx, &input.Loop)
+		}
+		r.markTakeoverResumeConsumed(ctx, &input.Loop)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 			return checkpoint, err
 		}
@@ -2020,7 +2145,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	projectMetadata := parseJSONObject(project.MetadataJSON)
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Reviewers: stringSliceFromAny(source["reviewers"])}
 	if work.IssueNumber == 0 && loop.TargetType == "issue" {
 		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
 	}
@@ -2399,10 +2524,6 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	if r.db == nil {
 		return fmt.Errorf("worker runner database is not configured")
 	}
-	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"prUrl": pr.URL, "prNumber": pr.Number, "repo": repo})
-	if err != nil {
-		return err
-	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, pr.Number)
 	updatedQueue := queueItem
 	updatedQueue.TargetType = "pull_request"
@@ -2428,6 +2549,15 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 		if current == nil {
 			return fmt.Errorf("loop not found: %s", loop.ID)
 		}
+		// Merge the PR fields into the FRESH metadata read inside this transaction,
+		// not the stale passed-in loop copy. Otherwise concurrent metadata writes made
+		// earlier in this same run — e.g. the HITL answer marked "consumed" by
+		// markHumanAnswerConsumed — are silently clobbered back to their pre-run value,
+		// which would re-inject an already-consumed human answer on any later re-run.
+		metadataJSON, err := mergeLoopMetadataJSON(current.MetadataJSON, map[string]any{"prUrl": pr.URL, "prNumber": pr.Number, "repo": repo})
+		if err != nil {
+			return err
+		}
 		updatedLoop := *current
 		updatedLoop.Repo = stringPtr(repo)
 		updatedLoop.TargetType = "pull_request"
@@ -2446,7 +2576,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, AutoDiscovered: true}
+	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, TriggerLogin: issue.Author, AutoDiscovered: true}
 	workerMeta := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)}
 	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
@@ -2454,7 +2584,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	}
 	for _, existing := range existingLoops {
 		if workerLoopTracksIssue(existing, project.ID, repo, issue.Number) {
-			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed"
+			pausedOrCompleted := existing.Status == "paused" || existing.Status == "human_takeover" || existing.Status == "completed" || existing.Status == "awaiting_human"
 			prLinked := existing.TargetType == "pull_request" || derefInt64(existing.PRNumber) > 0
 			if prLinked {
 				return loopUpsertResult{record: existing, skipEnqueue: true}, nil
@@ -2500,7 +2630,7 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	}
 	nowISO := r.nowISO()
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "autoDiscovered": true, "discoveryFingerprint": fingerprint})
+	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "discoveryFingerprint": fingerprint})
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := targetID
 	projectID := project.ID

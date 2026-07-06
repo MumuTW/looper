@@ -39,6 +39,17 @@ const (
 	LoopStatusCompleted   LoopStatus = "completed"
 	LoopStatusFailed      LoopStatus = "failed"
 	LoopStatusInterrupted LoopStatus = "interrupted"
+	// LoopStatusAwaitingHuman is a mid-run HITL suspension: the agent asked a
+	// human a question and the run is parked until the human answers (via
+	// POST /api/v1/loops/{seq}/respond), which transitions it back to running.
+	// Only reachable when hitl.enabled is true.
+	LoopStatusAwaitingHuman LoopStatus = "awaiting_human"
+	// LoopStatusHumanTakeover means a human has taken the loop's agent session
+	// over interactively (via `looper resume <seq>`): the daemon's in-flight run
+	// was stopped and the scheduler leaves the loop alone until the human hands it
+	// back (POST /api/v1/loops/{seq}/handback → queued). The native session id and
+	// worktree are preserved so the daemon resumes seeing the human's turns.
+	LoopStatusHumanTakeover LoopStatus = "human_takeover"
 )
 
 type RunStatus string
@@ -76,11 +87,11 @@ type LoopSummary struct {
 }
 
 var activeLoopStatuses = map[LoopStatus]struct{}{
-	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {}, LoopStatusWaiting: {},
+	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {}, LoopStatusWaiting: {}, LoopStatusAwaitingHuman: {}, LoopStatusHumanTakeover: {},
 }
 
 var conflictingActiveLoopStatuses = map[LoopStatus]struct{}{
-	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {},
+	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {}, LoopStatusAwaitingHuman: {}, LoopStatusHumanTakeover: {},
 }
 
 var terminalRunStatuses = map[RunStatus]struct{}{
@@ -88,16 +99,18 @@ var terminalRunStatuses = map[RunStatus]struct{}{
 }
 
 var loopStatusTransitions = map[LoopStatus][]LoopStatus{
-	LoopStatusIdle:        {LoopStatusQueued, LoopStatusPaused, LoopStatusTerminated},
-	LoopStatusQueued:      {LoopStatusRunning, LoopStatusPaused, LoopStatusTerminated},
-	LoopStatusRunning:     {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted, LoopStatusWaiting, LoopStatusTerminated},
-	LoopStatusPaused:      {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped, LoopStatusTerminated},
-	LoopStatusWaiting:     {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusTerminated},
-	LoopStatusStopped:     {},
-	LoopStatusTerminated:  {},
-	LoopStatusCompleted:   {},
-	LoopStatusFailed:      {},
-	LoopStatusInterrupted: {LoopStatusQueued, LoopStatusFailed},
+	LoopStatusIdle:          {LoopStatusQueued, LoopStatusPaused, LoopStatusTerminated},
+	LoopStatusQueued:        {LoopStatusRunning, LoopStatusPaused, LoopStatusTerminated},
+	LoopStatusRunning:       {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted, LoopStatusWaiting, LoopStatusAwaitingHuman, LoopStatusHumanTakeover, LoopStatusTerminated},
+	LoopStatusPaused:        {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
+	LoopStatusWaiting:       {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusTerminated},
+	LoopStatusAwaitingHuman: {LoopStatusRunning, LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
+	LoopStatusHumanTakeover: {LoopStatusQueued, LoopStatusRunning, LoopStatusStopped, LoopStatusTerminated},
+	LoopStatusStopped:       {},
+	LoopStatusTerminated:    {},
+	LoopStatusCompleted:     {},
+	LoopStatusFailed:        {},
+	LoopStatusInterrupted:   {LoopStatusQueued, LoopStatusFailed},
 }
 
 var runStatusTransitions = map[RunStatus][]RunStatus{
@@ -132,7 +145,7 @@ func AssertKnownLoopStatus(status LoopStatus) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("loop.status must be one of: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s", LoopStatusIdle, LoopStatusQueued, LoopStatusRunning, LoopStatusPaused, LoopStatusWaiting, LoopStatusStopped, LoopStatusTerminated, LoopStatusCompleted, LoopStatusFailed, LoopStatusInterrupted)
+	return fmt.Errorf("loop.status must be one of: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s", LoopStatusIdle, LoopStatusQueued, LoopStatusRunning, LoopStatusPaused, LoopStatusWaiting, LoopStatusStopped, LoopStatusTerminated, LoopStatusCompleted, LoopStatusFailed, LoopStatusInterrupted, LoopStatusAwaitingHuman)
 }
 
 func IsActiveLoopStatus(status LoopStatus) bool {

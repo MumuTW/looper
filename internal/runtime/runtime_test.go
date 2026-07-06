@@ -1861,6 +1861,34 @@ func TestCommandPrefixMatchesRejectsMissingTail(t *testing.T) {
 	}
 }
 
+func TestCommandPrefixMatchesRejectsPSEscapedNewlinesAsAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	if commandPrefixMatches(
+		[]string{"codex", "exec", "Fix pull request nexu-io/vela#594.\n\nMinimal PR seed"},
+		splitProcessCommand(`codex exec Fix pull request nexu-io/vela#594.\012\012Minimal PR seed`),
+	) {
+		t.Fatal("commandPrefixMatches() = true, want false for ambiguous ps-escaped newline prompt")
+	}
+}
+
+func TestCommandPrefixMatchesPreservesLiteralOctalBackslashes(t *testing.T) {
+	t.Parallel()
+
+	if !commandPrefixMatches(
+		[]string{"codex", "exec", `Review code block containing \012 literally`},
+		splitProcessCommand(`codex exec Review code block containing \012 literally`),
+	) {
+		t.Fatal("commandPrefixMatches() = false, want true for literal octal-looking backslashes")
+	}
+	if commandPrefixMatches(
+		[]string{"codex", "exec", `Review code block containing \012 literally`},
+		splitProcessCommand(`codex exec Review code block containing \012 changed`),
+	) {
+		t.Fatal("commandPrefixMatches() = true, want false for changed literal octal-looking backslash tail")
+	}
+}
+
 func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
 	t.Parallel()
 
@@ -3649,6 +3677,11 @@ func TestShouldRequeueLoopKeepsPausedLoopsExcluded(t *testing.T) {
 
 	if shouldRequeueLoop(storage.LoopRecord{Status: "paused"}, &storage.RunRecord{Status: "interrupted"}, false) {
 		t.Fatal("shouldRequeueLoop() = true, want false for paused loop")
+	}
+	// A human-takeover loop's run is killed (looks interrupted) but must NOT be
+	// re-queued by recovery — only an explicit handback resumes it.
+	if shouldRequeueLoop(storage.LoopRecord{Status: "human_takeover"}, &storage.RunRecord{Status: "interrupted"}, false) {
+		t.Fatal("shouldRequeueLoop() = true, want false for human_takeover loop")
 	}
 }
 

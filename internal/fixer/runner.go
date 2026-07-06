@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -180,6 +182,22 @@ type ViewPullRequestInput struct {
 	CWD      string
 }
 
+type PullRequestReviewersInput struct {
+	Repo      string
+	PRNumber  int64
+	Reviewers []string
+	CWD       string
+}
+
+// ReviewSummary is a submitted review (used to re-request the reviewers who
+// weighed in after a fix, and to dismiss unreasonable ones).
+type ReviewSummary struct {
+	ID     int64
+	State  string
+	Author string
+	Body   string
+}
+
 type ListReviewThreadsInput struct {
 	Repo     string
 	PRNumber int64
@@ -277,6 +295,17 @@ type GitHubGateway interface {
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
+	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
+	ListPullRequestReviews(context.Context, ViewPullRequestInput) ([]ReviewSummary, error)
+	DismissReview(context.Context, DismissReviewInput) error
+}
+
+type DismissReviewInput struct {
+	Repo     string
+	PRNumber int64
+	ReviewID int64
+	Message  string
+	CWD      string
 }
 
 type CreateWorktreeInput struct {
@@ -360,7 +389,19 @@ type GitGateway interface {
 	Push(context.Context, PushInput) error
 	FetchBranch(context.Context, string, string, string) error
 	IsAncestor(context.Context, string, string, string) (bool, error)
+	MergeBaseIntoWorktree(context.Context, MergeBaseInput) (MergeBaseResult, error)
 	CleanupWorktree(context.Context, CleanupWorktreeInput) error
+}
+
+type MergeBaseInput struct {
+	WorktreePath string
+	Remote       string
+	BaseBranch   string
+}
+
+type MergeBaseResult struct {
+	AlreadyUpToDate bool
+	Conflicted      bool
 }
 
 type AgentRunInput struct {
@@ -2152,14 +2193,17 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if len(checkpoint.FixItems) == 0 {
 		return checkpoint, &loopError{message: "Missing fix items checkpoint for repair step", kind: FailureRetryableTransient}
 	}
-	if !r.allowRiskyFixes {
-		for _, item := range checkpoint.FixItems {
-			if item.Type == "conflict" {
-				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
-				return checkpoint, &loopError{message: fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber), kind: FailureManualIntervention}
-			}
+	hasConflict := false
+	for _, item := range checkpoint.FixItems {
+		if item.Type == "conflict" {
+			hasConflict = true
+			break
 		}
+	}
+	if hasConflict && !r.allowRiskyFixes {
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
+		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber), kind: FailureManualIntervention}
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
@@ -2184,6 +2228,21 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		}
 		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 			return checkpoint, err
+		}
+	}
+	// Autonomous conflict resolution (risky fixes on): merge the base into the
+	// worktree so the agent has the conflict markers to resolve, instead of punting
+	// the conflict to a human. A merge that fails for a non-conflict reason falls
+	// back to manual intervention.
+	if hasConflict {
+		base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
+		if base == "" {
+			base = "main"
+		}
+		if _, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base}); mergeErr != nil {
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
+			return checkpoint, &loopError{message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), kind: FailureManualIntervention}
 		}
 	}
 	executionID := eventlog.NewEventID("agent")
@@ -2217,6 +2276,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err
 	}
+	// If the agent judged one or more CHANGES_REQUESTED reviews unreasonable it
+	// wrote a dismiss sentinel — dismiss those reviews (best-effort).
+	r.applyReviewDismissals(ctx, input, worktree.Path)
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
@@ -2353,6 +2415,9 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		r.appendEvent(ctx, eventInput{eventType: eventType, projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "message": message}})
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
+	// After pushing a fix, re-request the reviewers who weighed in so the PR gets
+	// re-reviewed promptly instead of waiting for the coordinator lane.
+	r.reRequestReviewersAfterFix(ctx, input)
 	finalHeadSHA := checkpoint.ReconcileCommits.FinalHeadSHA
 	if finalHeadSHA == "" {
 		return checkpoint, &loopError{message: "reconcileCommits.finalHeadSha is required", kind: FailureRetryableAfterResume}
@@ -5813,6 +5878,7 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 	parts = append(parts,
 		"Fix items:\n"+strings.Join(encodedItems, "\n"),
 		"Only perform repair changes for the listed fix items.",
+		"If — and only if — a reviewer's requested change is genuinely unreasonable, incorrect, or would make the code worse, you may decline it: write a JSON file at `.looper/dismiss.json` in the repo root with the shape {\"dismissals\":[{\"reviewer\":\"<their github login>\",\"reason\":\"<a concise, respectful explanation>\"}]} and do NOT make that change — Looper will dismiss that review with your reason. Use this sparingly and only when confident; when in doubt, implement the requested change.",
 	)
 	if instruction := buildFixerReplyExplanationInstruction(fixItems); instruction != "" {
 		parts = append(parts, instruction)
@@ -7400,4 +7466,96 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 		return ""
 	}
 	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
+}
+
+// reRequestReviewersAfterFix re-requests the human reviewers who left a review
+// (changes-requested or commented) so a fresh fix gets re-reviewed promptly,
+// rather than waiting for the coordinator lane to notice. Best-effort.
+func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput) {
+	if r.github == nil || input.PRNumber <= 0 {
+		return
+	}
+	reviews, err := r.github.ListPullRequestReviews(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return
+	}
+	self, _ := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	seen := map[string]bool{}
+	reviewers := make([]string, 0, len(reviews))
+	for _, rv := range reviews {
+		if rv.State != "CHANGES_REQUESTED" && rv.State != "COMMENTED" {
+			continue
+		}
+		author := strings.TrimSpace(rv.Author)
+		if author == "" || strings.EqualFold(author, strings.TrimSpace(self)) || seen[strings.ToLower(author)] {
+			continue
+		}
+		seen[strings.ToLower(author)] = true
+		reviewers = append(reviewers, author)
+	}
+	if len(reviewers) == 0 {
+		return
+	}
+	if err := r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: reviewers, CWD: input.Project.RepoPath}); err != nil && r.logger != nil {
+		r.logger.Warn("fixer: re-request reviewers after fix failed", map[string]any{"repo": input.Repo, "pr": input.PRNumber, "error": err.Error()})
+	}
+}
+
+// fixerDismissSentinel is what the fixer agent writes to .looper/dismiss.json when
+// it judges a reviewer's requested change unreasonable and wants it dismissed
+// rather than implemented.
+type fixerDismissSentinel struct {
+	Dismissals []struct {
+		Reviewer string `json:"reviewer"`
+		Reason   string `json:"reason"`
+	} `json:"dismissals"`
+}
+
+// applyReviewDismissals reads the agent's dismiss sentinel and dismisses the named
+// CHANGES_REQUESTED reviews with the agent's reason. Best-effort; a missing
+// sentinel is the common (no-dismissal) case.
+func (r *Runner) applyReviewDismissals(ctx context.Context, input stepInput, worktreePath string) {
+	if r.github == nil || strings.TrimSpace(worktreePath) == "" || input.PRNumber <= 0 {
+		return
+	}
+	path := filepath.Join(worktreePath, ".looper", "dismiss.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	_ = os.Remove(path)
+	var sentinel fixerDismissSentinel
+	if err := json.Unmarshal(raw, &sentinel); err != nil || len(sentinel.Dismissals) == 0 {
+		return
+	}
+	reasons := make(map[string]string, len(sentinel.Dismissals))
+	for _, d := range sentinel.Dismissals {
+		login := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(d.Reviewer), "@")))
+		if login != "" {
+			reasons[login] = strings.TrimSpace(d.Reason)
+		}
+	}
+	if len(reasons) == 0 {
+		return
+	}
+	reviews, err := r.github.ListPullRequestReviews(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return
+	}
+	for _, rv := range reviews {
+		if rv.State != "CHANGES_REQUESTED" {
+			continue
+		}
+		reason, ok := reasons[strings.ToLower(strings.TrimSpace(rv.Author))]
+		if !ok {
+			continue
+		}
+		message := reason
+		if message == "" {
+			message = "looper dismissed this requested change as unnecessary after review."
+		}
+		if err := r.github.DismissReview(ctx, DismissReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, ReviewID: rv.ID, Message: message, CWD: input.Project.RepoPath}); err != nil && r.logger != nil {
+			r.logger.Warn("fixer: dismiss review failed", map[string]any{"repo": input.Repo, "pr": input.PRNumber, "reviewId": rv.ID, "error": err.Error()})
+		}
+	}
 }

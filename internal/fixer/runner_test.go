@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -5779,6 +5780,9 @@ type fakeGitHubGateway struct {
 	resolveCalls          []ResolveReviewThreadInput
 	addLabelCalls         []PullRequestLabelsInput
 	removeLabelCalls      []PullRequestLabelsInput
+	reviewerRequests      []PullRequestReviewersInput
+	reviews               []ReviewSummary
+	dismissedReviews      []DismissReviewInput
 	replyCalls            []AddReviewThreadReplyInput
 	replyErr              error
 	resolveErr            error
@@ -5936,6 +5940,20 @@ func (f *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input Pul
 	return nil
 }
 
+func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input PullRequestReviewersInput) error {
+	f.reviewerRequests = append(f.reviewerRequests, input)
+	return nil
+}
+
+func (f *fakeGitHubGateway) ListPullRequestReviews(_ context.Context, _ ViewPullRequestInput) ([]ReviewSummary, error) {
+	return f.reviews, nil
+}
+
+func (f *fakeGitHubGateway) DismissReview(_ context.Context, input DismissReviewInput) error {
+	f.dismissedReviews = append(f.dismissedReviews, input)
+	return nil
+}
+
 func (f *fakeGitHubGateway) CompareCommits(_ context.Context, input CompareCommitsInput) (CompareCommitsResult, error) {
 	f.compareCalls = append(f.compareCalls, input)
 	if f.compareErr != nil {
@@ -5961,13 +5979,16 @@ type fakeGitGateway struct {
 	pushErrors     []error
 	pushIndex      int
 
-	createCalls  []CreateWorktreeInput
-	prepareCalls []PrepareWorktreeInput
-	inspectCalls []InspectHeadInput
-	commitCalls  []CommitInput
-	pushCalls    []PushInput
-	fetchCalls   []string
-	cleanupCalls []CleanupWorktreeInput
+	createCalls     []CreateWorktreeInput
+	prepareCalls    []PrepareWorktreeInput
+	inspectCalls    []InspectHeadInput
+	commitCalls     []CommitInput
+	pushCalls       []PushInput
+	fetchCalls      []string
+	mergeBaseCalls  []MergeBaseInput
+	mergeBaseResult MergeBaseResult
+	mergeBaseErr    error
+	cleanupCalls    []CleanupWorktreeInput
 }
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
@@ -6038,6 +6059,11 @@ func (f *fakeGitGateway) FetchBranch(_ context.Context, repoPath, remote, branch
 		return err
 	}
 	return f.fetchErr
+}
+
+func (f *fakeGitGateway) MergeBaseIntoWorktree(_ context.Context, input MergeBaseInput) (MergeBaseResult, error) {
+	f.mergeBaseCalls = append(f.mergeBaseCalls, input)
+	return f.mergeBaseResult, f.mergeBaseErr
 }
 
 func (f *fakeGitGateway) IsAncestor(_ context.Context, _ string, ancestor, descendant string) (bool, error) {
@@ -7018,5 +7044,62 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 	}
 	if persisted == nil || persisted.Status != "terminated" {
 		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
+	}
+}
+
+func TestReRequestReviewersAfterFix(t *testing.T) {
+	github := &fakeGitHubGateway{
+		currentUser: "looper-bot",
+		reviews: []ReviewSummary{
+			{ID: 1, State: "CHANGES_REQUESTED", Author: "reviewer-a"},
+			{ID: 2, State: "COMMENTED", Author: "reviewer-b"},
+			{ID: 3, State: "APPROVED", Author: "reviewer-c"},          // approved -> not re-requested
+			{ID: 4, State: "CHANGES_REQUESTED", Author: "looper-bot"}, // self -> excluded
+			{ID: 5, State: "CHANGES_REQUESTED", Author: "reviewer-a"}, // duplicate -> once
+		},
+	}
+	runner := New(Options{GitHub: github, RetryMaxAttempts: -1})
+	runner.reRequestReviewersAfterFix(context.Background(), stepInput{Repo: "acme/x", PRNumber: 7, Project: storage.ProjectRecord{RepoPath: "/tmp"}})
+
+	if len(github.reviewerRequests) != 1 {
+		t.Fatalf("reviewerRequests = %d, want 1 (one re-request call)", len(github.reviewerRequests))
+	}
+	got := github.reviewerRequests[0].Reviewers
+	if len(got) != 2 {
+		t.Fatalf("re-requested %v, want [reviewer-a reviewer-b] (approved/self/dup excluded)", got)
+	}
+	set := map[string]bool{got[0]: true, got[1]: true}
+	if !set["reviewer-a"] || !set["reviewer-b"] {
+		t.Fatalf("re-requested %v, want reviewer-a + reviewer-b", got)
+	}
+}
+
+func TestApplyReviewDismissals(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".looper"), 0o755); err != nil {
+		t.Fatalf("MkdirAll error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".looper", "dismiss.json"), []byte(`{"dismissals":[{"reviewer":"reviewer-x","reason":"this behavior is intentional"}]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	github := &fakeGitHubGateway{
+		reviews: []ReviewSummary{
+			{ID: 10, State: "CHANGES_REQUESTED", Author: "reviewer-x"}, // named + changes-requested -> dismiss
+			{ID: 11, State: "CHANGES_REQUESTED", Author: "reviewer-y"}, // not named -> keep
+			{ID: 12, State: "APPROVED", Author: "reviewer-x"},          // not changes-requested -> keep
+		},
+	}
+	runner := New(Options{GitHub: github, RetryMaxAttempts: -1})
+	runner.applyReviewDismissals(context.Background(), stepInput{Repo: "acme/x", PRNumber: 9, Project: storage.ProjectRecord{RepoPath: "/tmp"}}, dir)
+
+	if len(github.dismissedReviews) != 1 {
+		t.Fatalf("dismissed = %d, want exactly 1", len(github.dismissedReviews))
+	}
+	d := github.dismissedReviews[0]
+	if d.ReviewID != 10 || d.Message != "this behavior is intentional" {
+		t.Fatalf("dismissed = %#v, want review 10 with the agent's reason", d)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".looper", "dismiss.json")); !os.IsNotExist(err) {
+		t.Fatal("dismiss.json must be consumed (removed) after processing")
 	}
 }

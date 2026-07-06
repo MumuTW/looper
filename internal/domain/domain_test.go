@@ -88,6 +88,40 @@ func TestAssertStatusTransitions(t *testing.T) {
 	if err := AssertLoopStatusTransition(LoopStatusQueued, LoopStatusCompleted); err == nil {
 		t.Fatal("AssertLoopStatusTransition(queued, completed) error = nil, want failure")
 	}
+	if err := AssertLoopStatusTransition(LoopStatusRunning, LoopStatusAwaitingHuman); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(running, awaiting_human) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusAwaitingHuman, LoopStatusRunning); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(awaiting_human, running) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusCompleted, LoopStatusAwaitingHuman); err == nil {
+		t.Fatal("AssertLoopStatusTransition(completed, awaiting_human) error = nil, want failure")
+	}
+	if err := AssertKnownLoopStatus(LoopStatusAwaitingHuman); err != nil {
+		t.Fatalf("AssertKnownLoopStatus(awaiting_human) error = %v", err)
+	}
+	if !IsActiveLoopStatus(LoopStatusAwaitingHuman) {
+		t.Fatal("IsActiveLoopStatus(awaiting_human) = false, want true")
+	}
+	// Human takeover: reachable from running / awaiting_human; hands back to queued.
+	if err := AssertLoopStatusTransition(LoopStatusRunning, LoopStatusHumanTakeover); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(running, human_takeover) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusAwaitingHuman, LoopStatusHumanTakeover); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(awaiting_human, human_takeover) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusHumanTakeover, LoopStatusQueued); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(human_takeover, queued) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusQueued, LoopStatusHumanTakeover); err == nil {
+		t.Fatal("AssertLoopStatusTransition(queued, human_takeover) error = nil, want failure")
+	}
+	if err := AssertKnownLoopStatus(LoopStatusHumanTakeover); err != nil {
+		t.Fatalf("AssertKnownLoopStatus(human_takeover) error = %v", err)
+	}
+	if !IsActiveLoopStatus(LoopStatusHumanTakeover) {
+		t.Fatal("IsActiveLoopStatus(human_takeover) = false, want true")
+	}
 	if err := AssertRunStatusTransition(RunStatusQueued, RunStatusRunning); err != nil {
 		t.Fatalf("AssertRunStatusTransition(queued, running) error = %v", err)
 	}

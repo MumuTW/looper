@@ -805,7 +805,12 @@ func runtimeProjectRepo(metadataJSON *string) string {
 
 func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 	for _, project := range cfg.Projects {
-		if config.ResolvedProjectProviderKind(cfg, project) == config.ProviderKindGitHub {
+		switch config.ResolvedProjectProviderKind(cfg, project) {
+		case config.ProviderKindGitHub:
+			return true
+		case config.ProviderKindPlane:
+			// Plane is a task-source only: its pull requests live on the
+			// project's GitHub code repo, so the GitHub gateway is required.
 			return true
 		}
 	}
@@ -2510,13 +2515,17 @@ func commandPrefixMatches(expected, actual []string) bool {
 		return false
 	}
 	for i := 1; i < len(expected)-1; i++ {
-		if expected[i] != actual[i] {
+		if !processCommandTokenMatches(expected[i], actual[i]) {
 			return false
 		}
 	}
 	actualTail := strings.Join(actual[len(expected)-1:], " ")
 	expectedTail := expected[len(expected)-1]
-	return actualTail == expectedTail
+	return processCommandTokenMatches(expectedTail, actualTail)
+}
+
+func processCommandTokenMatches(expected, actual string) bool {
+	return expected == actual
 }
 
 func splitProcessCommand(command string) []string {
@@ -2938,7 +2947,10 @@ func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, la
 	if terminalReviewerRecoveryMetadataStatus(loop) != "" {
 		return false
 	}
-	if loop.Status == "paused" {
+	// paused + human_takeover are deliberately parked: a human paused it, or is
+	// driving its agent session via takeover. Recovery must NOT re-queue them (the
+	// killed run looks "interrupted", but that's expected) — only a handback does.
+	if loop.Status == "paused" || loop.Status == string(domain.LoopStatusHumanTakeover) {
 		return false
 	}
 	if loop.Status == "completed" || loop.Status == "failed" || loop.Status == "terminated" || loop.Status == "stopped" {
