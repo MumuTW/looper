@@ -75,12 +75,19 @@ HITL 已随 **v0.10.1** 上线(决策卡、多轮对话、任务 thread、按人
 - **全程 HITL 照常**:真拿不准仍发决策卡问人。「自动」≠「不问」,只是不用人手动推进阶段。
 - 修 bundle 误配:worker 触发器应是 `looper:worker-ready`,不是 `looper:plan`。
 
-### D. spec 处理
+### D. spec 的编写与评审 —— 用 spec-forge(前端),looper 只管执行(后端)
 
-- spec-first **只对方案要先拍板的复杂需求**;简单活直接实现。
-- **「已批准但不合并的 spec PR」是坏味道**,避免:
-  - `looper:auto` 档:**spec 直接 commit 进实现分支,不单开 spec PR**。
-  - `looper:plan`(要人评审)档:评审走 **Plane/飞书**(spec-forge 的 `spec:reviewing → approve`),或 **approve = 合并 spec 文档**。
+**分层,不内嵌**:
+- **spec-forge(Agent Skill)= 前端**:AUTHOR 写齐 → GRILL 独立 fresh agent 对抗拷问 → DECIDE(能 AFK 还是要 HITL)→ PUBLISH 到 Plane work item、置 `spec:reviewing`、交人 approve。
+- **looper = 执行后端**:approve 后,Plane item 按 spec-forge 的 execution_mode 打 looper label(能 AFK → `looper:auto`;要人盯 → `looper:plan`/`worker-ready`),**looper 原生 Plane provider 接手实现已批准的 spec**。
+
+**好处**:①spec 被 grill 过、质量高,胜过 looper planner 的「autonomous 写个 md」;②**评审在 Plane 的 `spec:reviewing → approve`,不是悬空 GitHub PR** → 根治「已批准但不合并的 spec PR」;③execution_mode 直接决定 looper 档;④looper 自带 planner **降级**为轻量可选或弃用。
+
+**为什么松耦合、不把 spec-forge 塞进 looper planner**:GRILL 的对抗价值要独立 fresh agent + 真人,塞进 looper 的自主 loop 里成本高且削弱对抗性;两层靠 Plane label 衔接即可(技术上 looper 的 planner 能调 SKILL.md,但不划算)。
+
+**待定**:approve 后谁给 Plane item 打 looper label —— 人手动 / spec-forge PUBLISH 时按 DECIDE 预置 / approve→label 小 hook。
+
+> 简单活(无需 spec)不走这条:直接 `looper:worker-ready`(或 `looper:auto` 让 looper 自己规划实现,不产出正式 spec 评审)。
 
 ### E. 恢复 / 本地部署健壮性(笔记本随时关)
 
@@ -122,7 +129,8 @@ PR 未合并前 thread 一直活,追问可路由(转 fixer/looper 应答)。**�
 
 - [ ] **auto 档 label 名**:`looper:auto` / `looper:ship` / `looper:build`?(`looper:go` 别用,撞 afk:go)
 - [ ] **rollout 默认档**:worker-only(关 planner)/ 全 auto / 保留 plan 评审流水线?
-- [ ] **auto 档 spec**:内联 commit(不开 spec PR)—— 确认?
+- [ ] **spec 走 spec-forge**(Plane 评审)而非 looper planner —— 确认这个分层?
+- [ ] **approve→looper label 谁来打**:人手动 / spec-forge PUBLISH 预置 / approve 小 hook?
 - [ ] **「任务完成」判定**:源 issue 关闭 / 名下 PR 全合并 / 两者兼顾?
 - [ ] **完成后追问**:A / B / C?
 - [ ] **状态刷新**:webhook 为主 + 兜底轮询间隔(如 60s)?
