@@ -189,8 +189,8 @@ PR 没合并前,卡片一直活,追问能接住(转给「修 PR」应答)。**�
 - [x] **状态刷新 = 事件驱动为主(快照捕获后刷卡)+ 兜底轮询** ✅(已定;已实现事件驱动,无 webhook 基建前不做独立 poller)
 - [x] **测试群 = 「agent 通知」群**(`oc_4d1e…`,bot 已在);生产群「Looper 协作」不碰 ✅
 - [x] **产品负责人 open_id = `ou_a9fe1adce639660facbd26d7599a24e0`(杨瑾龙)** ✅(已定;已落 productOwner 配置)
-- [ ] **page↔work-item 关联约定**(§8.2 硬前置,涉及团队流程):命名约定 / work-item 描述塞 page 链接 / 评论贴链接?—— **仍需团队拍板**
-- [ ] **coordinator 是否 / 何时全队启用**(§8.1/§8.4 前置;默认关,启用影响面大)—— **仍需团队拍板**
+- [x] **page↔work-item 关联约定 = Plane 原生 work-item link** ✅(已定 + spike 实测通,2026-07-07):把方案页 URL 作为 work-item 的原生 link(`plane api link create --data {url,title}`),title 打机器标 `looper:product-spec` / `looper:tech-spec`;反查用 `plane api link list --work-item <id>` 按 title 过滤。原生、结构化、可反查、Plane UI 人可见,比描述 marker / 评论 干净。
+- [ ] **coordinator(分诊)是否 / 何时全队启用**(§8.1/§8.4 前置;默认关,启用影响面大)—— **暂缓(用户:分诊先不急)**;短期先靠每-issue `looper:auto` opt-in 或单台中心 looper
 
 ## 10. 实现状态(2026-07-07)
 
@@ -208,7 +208,7 @@ PR 没合并前,卡片一直活,追问能接住(转给「修 PR」应答)。**�
 
 **未实现(§8 流水线,「大头」;有硬前置):**
 - ⏳ §8.1 kind 路由消费 + bug 模式(reproduce→定位→修 提示词):需给 worker 喂 kind + 启用 coordinator
-- ⏳ §8.2 Plane 方案读写:需 **Plane-Go 集成**(现 `internal/forge/plane.go` 无 page 方法,plane 是独立 CLI)+ **page↔work-item 关联约定**(团队决策)
+- ⏳ §8.2 Plane 方案读写:需 **Plane-Go 集成**(现 `internal/forge/plane.go` 无 page 方法,plane 是独立 CLI)。page↔work-item 关联约定**已定+实测**(原生 link,见 §6/§8.2)
 - ⏳ §8.5/§8.6 grill + Plane 评审 **@人 approve 新状态机**(reviewer 现自批,`looper:needs-human` 是死标签)
 - ⏳ §8.3 @产品补 spec 的等待/恢复(依赖 §8.2 关联约定 + Plane 轮询)
 - ⏳ §8.4/§8.10-P4 `looper:auto` 全程 intake→spec→impl 串接(依赖以上 + coordinator 启用)
@@ -247,7 +247,7 @@ work item
 
 ### 8.2 分流②:产品方案存在性检查(全新)
 - 需求要有一份 **product spec(Plane 文档)**。检查这个需求有没有一份产品方案页。
-- ⚠️ **硬前置:page↔work-item 关联在 Plane 里不存在**。spike 只证了「项目级 page 的 CRUD + work-item 评论」通,**没证「反查某 work item 的关联页」**(Plane 无原生绑定)。所以先得定一个**关联约定**(命名约定 / work-item 描述里塞 page 链接 / 评论里贴链接)——这是 **P2 的硬前置**,不是小细节。约定定了,这一步才是机械查。
+- ✅ **硬前置已解:page↔work-item 用 Plane 原生 work-item link**(spike 实测 2026-07-07:`link create {url,title}` → `link list --work-item` 反查拿回 → `link delete` 全通)。产品/技术方案页各挂一条 link,title 打 `looper:product-spec` / `looper:tech-spec` 机器标;查某 work item 的方案 = `link list --work-item <id>` 按 title 过滤。这一步就是机械查。
 - **可选 LLM 质量门**:「这份页面够不够格当产品方案(讲清了 what / why / 验收没)?」不够 → 当『缺』处理。
 
 ### 8.3 缺产品方案 → @产品同学补(全新机制 + 全新配置)
