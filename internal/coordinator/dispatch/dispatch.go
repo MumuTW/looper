@@ -15,6 +15,12 @@ const (
 	DispatchPlan      = "dispatch/plan"
 	DispatchImplement = "dispatch/implement"
 
+	// AutoLabel is the per-issue opt-in to full autonomy (plan §C/§D): a human
+	// labels the issue once and looper carries it plan → implement on its own,
+	// without a /plan or /implement command, even when the coordinator is otherwise
+	// human-gated.
+	AutoLabel = "looper:auto"
+
 	ReactionSuccess = "+1"
 	ReactionFailure = "confused"
 )
@@ -57,10 +63,25 @@ type Action struct {
 }
 
 func Decide(issue Issue, cfg Config, now time.Time, graph *depgraph.DependencyGraph) Action {
+	// looper:auto opts a single issue into full autonomy regardless of the
+	// coordinator's mode: the human labelled it to run on its own, so it takes the
+	// autonomous path with no dispatch delay (they've already committed to it). It
+	// still respects triage state and dependency gates.
+	if hasLabel(issue.Labels, AutoLabel) {
+		return decideAutonomous(issue, withImmediateDispatch(cfg), now, graph)
+	}
 	if cfg.Mode == ModeAutonomous {
 		return decideAutonomous(issue, cfg, now, graph)
 	}
 	return decideHumanGated(issue, cfg, graph)
+}
+
+// withImmediateDispatch drops the autonomous cool-off for a looper:auto issue: the
+// human explicitly opted in by labelling it, so there's no need to wait out the
+// "changed my mind" delay that guards the fully-autonomous mode.
+func withImmediateDispatch(cfg Config) Config {
+	cfg.AutonomousDelay = 0
+	return cfg
 }
 
 func NeedsDependencyGate(issue Issue, cfg Config, now time.Time) bool {
