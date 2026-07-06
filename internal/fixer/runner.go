@@ -2403,18 +2403,18 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 }
 
 func (r *Runner) pushPullRequestBranch(ctx context.Context, input stepInput, worktreeRoot, worktreePath, branch, expectedRemoteHeadSHA string) error {
-	if !r.projectUsesOdcrewGitHubWrites(input.Project.ID) {
+	if !r.projectUsesExternalGitHubWrites(input.Project.ID) {
 		return r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktreePath, Branch: branch, ExpectedRemoteHeadSHA: expectedRemoteHeadSHA})
 	}
 	if input.PRNumber <= 0 {
-		return errors.New("odcrew write provider requires a pull request number for push")
+		return errors.New("external GitHub write provider requires a pull request number for push")
 	}
-	odcPath := strings.TrimSpace(derefString(r.customInstructions.Tools.ODCPath))
-	if odcPath == "" {
-		odcPath = "odc"
+	githubWritePath := strings.TrimSpace(derefString(r.customInstructions.Tools.GitHubWritePath))
+	if githubWritePath == "" {
+		return errors.New("tools.githubWritePath is required when githubWriteProvider is external")
 	}
 	result, err := shell.Run(ctx, shell.Options{
-		Command: odcPath,
+		Command: githubWritePath,
 		Args:    []string{"gh", "pr", "push", "--repo", input.Repo, strconv.FormatInt(input.PRNumber, 10)},
 		CWD:     worktreePath,
 		Timeout: 5 * time.Minute,
@@ -2425,13 +2425,13 @@ func (r *Runner) pushPullRequestBranch(ctx context.Context, input stepInput, wor
 	return nil
 }
 
-func (r *Runner) projectUsesOdcrewGitHubWrites(projectID string) bool {
+func (r *Runner) projectUsesExternalGitHubWrites(projectID string) bool {
 	if r == nil || r.projectRoleConfig == nil {
 		return false
 	}
 	for _, project := range r.projectRoleConfig.Projects {
 		if project.ID == projectID {
-			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "odcrew")
+			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "external")
 		}
 	}
 	return false

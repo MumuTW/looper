@@ -43,8 +43,8 @@ var ErrDiffTooLarge = errors.New("github pull request diff is too large")
 
 type Options struct {
 	GHPath                 string
-	ODCPath                string
-	OdcrewPolicies         map[string]OdcrewPolicy
+	GitHubWritePath        string
+	ExternalGitHubPolicies map[string]ExternalGitHubPolicy
 	CWD                    string
 	Now                    func() time.Time
 	DiscoveryCacheTTL      time.Duration
@@ -52,15 +52,15 @@ type Options struct {
 	ReviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
-type OdcrewPolicy struct {
+type ExternalGitHubPolicy struct {
 	WriteProvider string
 	ReadFallback  string
 }
 
 type Gateway struct {
 	ghPath                 string
-	odcPath                string
-	odcrewPolicies         map[string]OdcrewPolicy
+	githubWritePath        string
+	externalGitHubPolicies map[string]ExternalGitHubPolicy
 	cwd                    string
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
@@ -663,10 +663,7 @@ func New(options Options) *Gateway {
 	if ghPath == "" {
 		ghPath = "gh"
 	}
-	odcPath := strings.TrimSpace(options.ODCPath)
-	if odcPath == "" {
-		odcPath = "odc"
-	}
+	githubWritePath := strings.TrimSpace(options.GitHubWritePath)
 	now := options.Now
 	if now == nil {
 		now = time.Now
@@ -675,7 +672,7 @@ func New(options Options) *Gateway {
 	if ghRun == nil {
 		ghRun = shell.Run
 	}
-	return &Gateway{ghPath: ghPath, odcPath: odcPath, odcrewPolicies: normalizeOdcrewPolicies(options.OdcrewPolicies), cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
+	return &Gateway{ghPath: ghPath, githubWritePath: githubWritePath, externalGitHubPolicies: normalizeExternalGitHubPolicies(options.ExternalGitHubPolicies), cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -2360,12 +2357,12 @@ func (g *Gateway) AddPullRequestLabels(ctx context.Context, input PullRequestLab
 	if len(input.Labels) == 0 {
 		return nil
 	}
-	if g.odcrewWriteEnabled(input.Repo) {
+	if g.externalGitHubWriteEnabled(input.Repo) {
 		args := []string{"pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
 		for _, label := range input.Labels {
 			args = append(args, "--add-label", label)
 		}
-		_, err := g.runOdcGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
+		_, err := g.runExternalGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
 		return err
 	}
 	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
@@ -2383,12 +2380,12 @@ func (g *Gateway) RemovePullRequestLabels(ctx context.Context, input PullRequest
 	if len(input.Labels) == 0 {
 		return nil
 	}
-	if g.odcrewWriteEnabled(input.Repo) {
+	if g.externalGitHubWriteEnabled(input.Repo) {
 		args := []string{"pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
 		for _, label := range input.Labels {
 			args = append(args, "--remove-label", label)
 		}
-		_, err := g.runOdcGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
+		_, err := g.runExternalGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
 		return err
 	}
 	for _, label := range input.Labels {
@@ -2408,12 +2405,12 @@ func (g *Gateway) AddPullRequestReviewers(ctx context.Context, input PullRequest
 	if len(input.Reviewers) == 0 {
 		return nil
 	}
-	if g.odcrewWriteEnabled(input.Repo) {
+	if g.externalGitHubWriteEnabled(input.Repo) {
 		args := []string{"pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
 		for _, reviewer := range input.Reviewers {
 			args = append(args, "--add-reviewer", reviewer)
 		}
-		_, err := g.runOdcGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
+		_, err := g.runExternalGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
 		return err
 	}
 	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/requested_reviewers", input.Repo, input.PRNumber), "--method", "POST"}
@@ -2979,12 +2976,12 @@ func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) 
 
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
 	repo := ghRepoArg(args)
-	if g.odcrewWriteEnabled(repo) && odcrewWritableGhArgs(args) {
-		return g.runOdcGh(ctx, cwd, stdin, timeout, args...)
+	if g.externalGitHubWriteEnabled(repo) && externalWritableGhArgs(args) {
+		return g.runExternalGh(ctx, cwd, stdin, timeout, args...)
 	}
 	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
-	if err != nil && g.odcrewReadFallbackEnabled(repo) && odcrewReadableGhArgs(args) {
-		fallbackResult, fallbackErr := g.runOdcGh(ctx, cwd, stdin, timeout, args...)
+	if err != nil && g.externalGitHubReadFallbackEnabled(repo) && externalReadableGhArgs(args) {
+		fallbackResult, fallbackErr := g.runExternalGh(ctx, cwd, stdin, timeout, args...)
 		if fallbackErr == nil {
 			return fallbackResult, nil
 		}
@@ -2995,38 +2992,41 @@ func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeo
 	return result, err
 }
 
-func (g *Gateway) runOdcGh(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
-	odcArgs := append([]string{"gh"}, args...)
-	return g.ghRun(ctx, shell.Options{Command: g.odcPath, Args: odcArgs, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+func (g *Gateway) runExternalGh(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
+	if strings.TrimSpace(g.githubWritePath) == "" {
+		return shell.Result{}, fmt.Errorf("tools.githubWritePath is required when a GitHub external write provider is enabled")
+	}
+	externalArgs := append([]string{"gh"}, args...)
+	return g.ghRun(ctx, shell.Options{Command: g.githubWritePath, Args: externalArgs, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
 }
 
-func normalizeOdcrewPolicies(input map[string]OdcrewPolicy) map[string]OdcrewPolicy {
+func normalizeExternalGitHubPolicies(input map[string]ExternalGitHubPolicy) map[string]ExternalGitHubPolicy {
 	if len(input) == 0 {
 		return nil
 	}
-	out := make(map[string]OdcrewPolicy, len(input))
+	out := make(map[string]ExternalGitHubPolicy, len(input))
 	for repo, policy := range input {
 		key := strings.ToLower(strings.TrimSpace(repo))
 		if key == "" {
 			continue
 		}
-		out[key] = OdcrewPolicy{WriteProvider: strings.ToLower(strings.TrimSpace(policy.WriteProvider)), ReadFallback: strings.ToLower(strings.TrimSpace(policy.ReadFallback))}
+		out[key] = ExternalGitHubPolicy{WriteProvider: strings.ToLower(strings.TrimSpace(policy.WriteProvider)), ReadFallback: strings.ToLower(strings.TrimSpace(policy.ReadFallback))}
 	}
 	return out
 }
 
-func (g *Gateway) odcrewWriteEnabled(repo string) bool {
+func (g *Gateway) externalGitHubWriteEnabled(repo string) bool {
 	if repo == "" {
 		return false
 	}
-	return g.odcrewPolicies[strings.ToLower(repo)].WriteProvider == "odcrew"
+	return g.externalGitHubPolicies[strings.ToLower(repo)].WriteProvider == "external"
 }
 
-func (g *Gateway) odcrewReadFallbackEnabled(repo string) bool {
+func (g *Gateway) externalGitHubReadFallbackEnabled(repo string) bool {
 	if repo == "" {
 		return false
 	}
-	return g.odcrewPolicies[strings.ToLower(repo)].ReadFallback == "odcrew"
+	return g.externalGitHubPolicies[strings.ToLower(repo)].ReadFallback == "external"
 }
 
 func ghRepoArg(args []string) string {
@@ -3048,7 +3048,7 @@ func ghRepoArg(args []string) string {
 	return ""
 }
 
-func odcrewWritableGhArgs(args []string) bool {
+func externalWritableGhArgs(args []string) bool {
 	if len(args) < 2 || args[0] != "pr" {
 		return false
 	}
@@ -3060,7 +3060,7 @@ func odcrewWritableGhArgs(args []string) bool {
 	}
 }
 
-func odcrewReadableGhArgs(args []string) bool {
+func externalReadableGhArgs(args []string) bool {
 	if len(args) < 2 {
 		return false
 	}

@@ -543,7 +543,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
 	var githubGateway *githubinfra.Gateway
 	if runtimeConfigHasGitHubProjects(r.config) {
-		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), ODCPath: derefString(r.config.Tools.ODCPath), OdcrewPolicies: githubOdcrewPolicies(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), GitHubWritePath: derefString(r.config.Tools.GitHubWritePath), ExternalGitHubPolicies: githubExternalPolicies(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	}
 	projectService := &projects.Service{
 		DB:     coordinator.DB(),
@@ -812,8 +812,8 @@ func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 	return len(cfg.Projects) == 0
 }
 
-func githubOdcrewPolicies(cfg config.Config) map[string]githubinfra.OdcrewPolicy {
-	policies := map[string]githubinfra.OdcrewPolicy{}
+func githubExternalPolicies(cfg config.Config) map[string]githubinfra.ExternalGitHubPolicy {
+	policies := map[string]githubinfra.ExternalGitHubPolicy{}
 	for _, project := range cfg.Projects {
 		if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindGitHub {
 			continue
@@ -827,7 +827,7 @@ func githubOdcrewPolicies(cfg config.Config) map[string]githubinfra.OdcrewPolicy
 		if writeProvider == "" && readFallback == "" {
 			continue
 		}
-		policies[repo] = githubinfra.OdcrewPolicy{WriteProvider: writeProvider, ReadFallback: readFallback}
+		policies[repo] = githubinfra.ExternalGitHubPolicy{WriteProvider: writeProvider, ReadFallback: readFallback}
 	}
 	if len(policies) == 0 {
 		return nil

@@ -568,13 +568,13 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	return DiscoveryPolicy{AutoDiscovery: roles.Planner.AutoDiscovery, Labels: append([]string(nil), roles.Planner.Triggers.Labels...), LabelMode: roles.Planner.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Planner.Triggers.RequireAssigneeCurrentUser}
 }
 
-func (r *Runner) projectUsesOdcrewGitHubWrites(projectID string) bool {
+func (r *Runner) projectUsesExternalGitHubWrites(projectID string) bool {
 	if r == nil || r.projectRoleConfig == nil {
 		return false
 	}
 	for _, project := range r.projectRoleConfig.Projects {
 		if project.ID == projectID {
-			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "odcrew")
+			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "external")
 		}
 	}
 	return false
@@ -1071,7 +1071,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		if rootErr != nil {
 			return checkpoint, rootErr
 		}
-		if !r.projectUsesOdcrewGitHubWrites(input.Project.ID) {
+		if !r.projectUsesExternalGitHubWrites(input.Project.ID) {
 			if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: []string{worktree.BaseBranch}}); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}

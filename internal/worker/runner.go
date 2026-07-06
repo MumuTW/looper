@@ -504,18 +504,18 @@ func (r *Runner) providerKindForProject(projectID string) config.ProviderKind {
 }
 
 func (r *Runner) pushWorkerBranch(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, worktreeRoot, worktreePath, branch string, protectedBranches []string) error {
-	if !r.projectUsesOdcrewGitHubWrites(project.ID) {
+	if !r.projectUsesExternalGitHubWrites(project.ID) {
 		return r.git.Push(ctx, PushInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktreePath, Branch: branch, ProtectedBranches: protectedBranches})
 	}
 	if prNumber <= 0 {
-		return errors.New("odcrew write provider requires a pull request number for push")
+		return errors.New("external GitHub write provider requires a pull request number for push")
 	}
-	odcPath := strings.TrimSpace(derefString(r.customInstructions.Tools.ODCPath))
-	if odcPath == "" {
-		odcPath = "odc"
+	githubWritePath := strings.TrimSpace(derefString(r.customInstructions.Tools.GitHubWritePath))
+	if githubWritePath == "" {
+		return errors.New("tools.githubWritePath is required when githubWriteProvider is external")
 	}
 	result, err := shell.Run(ctx, shell.Options{
-		Command: odcPath,
+		Command: githubWritePath,
 		Args:    []string{"gh", "pr", "push", "--repo", repo, strconv.FormatInt(prNumber, 10)},
 		CWD:     worktreePath,
 		Timeout: 5 * time.Minute,
@@ -526,13 +526,13 @@ func (r *Runner) pushWorkerBranch(ctx context.Context, project storage.ProjectRe
 	return nil
 }
 
-func (r *Runner) projectUsesOdcrewGitHubWrites(projectID string) bool {
+func (r *Runner) projectUsesExternalGitHubWrites(projectID string) bool {
 	if r == nil || r.projectRoleConfig == nil {
 		return false
 	}
 	for _, project := range r.projectRoleConfig.Projects {
 		if project.ID == projectID {
-			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "odcrew")
+			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "external")
 		}
 	}
 	return false
@@ -1945,7 +1945,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
 	}
-	if !r.projectUsesOdcrewGitHubWrites(input.Project.ID) {
+	if !r.projectUsesExternalGitHubWrites(input.Project.ID) {
 		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
 				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover

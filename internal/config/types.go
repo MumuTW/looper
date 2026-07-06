@@ -258,11 +258,11 @@ type LoggingConfig struct {
 }
 
 type ToolPathsConfig struct {
-	GitPath       *string `json:"gitPath,omitempty"`
-	GHPath        *string `json:"ghPath,omitempty"`
-	ODCPath       *string `json:"odcPath,omitempty"`
-	LooperPath    *string `json:"looperPath,omitempty"`
-	OsascriptPath *string `json:"osascriptPath,omitempty"`
+	GitPath         *string `json:"gitPath,omitempty"`
+	GHPath          *string `json:"ghPath,omitempty"`
+	GitHubWritePath *string `json:"githubWritePath,omitempty"`
+	LooperPath      *string `json:"looperPath,omitempty"`
+	OsascriptPath   *string `json:"osascriptPath,omitempty"`
 }
 
 type ToolDetectionStatus string
@@ -687,11 +687,11 @@ type PartialLoggingConfig struct {
 }
 
 type PartialToolPathsConfig struct {
-	GitPath       *string `json:"gitPath,omitempty"`
-	GHPath        *string `json:"ghPath,omitempty"`
-	ODCPath       *string `json:"odcPath,omitempty"`
-	LooperPath    *string `json:"looperPath,omitempty"`
-	OsascriptPath *string `json:"osascriptPath,omitempty"`
+	GitPath         *string `json:"gitPath,omitempty"`
+	GHPath          *string `json:"ghPath,omitempty"`
+	GitHubWritePath *string `json:"githubWritePath,omitempty"`
+	LooperPath      *string `json:"looperPath,omitempty"`
+	OsascriptPath   *string `json:"osascriptPath,omitempty"`
 }
 
 type PartialDaemonConfig struct {

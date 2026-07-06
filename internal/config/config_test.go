@@ -3037,6 +3037,64 @@ func TestValidateAllowsLegacyProjectIDsForUpgradeCompatibility(t *testing.T) {
 	}
 }
 
+func TestValidateGitHubExternalWriteProviderRequiresExplicitCommand(t *testing.T) {
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	config.Projects = []ProjectRefConfig{{
+		ID:                  "demo",
+		Name:                "Demo",
+		RepoPath:            "/repos/demo",
+		Repo:                "acme/demo",
+		GitHubWriteProvider: "external",
+	}}
+
+	err = Validate(config)
+	if err == nil {
+		t.Fatal("Validate() error = nil, want validation error")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "tools.githubWritePath", "is required when a GitHub project uses external write or read fallback")
+
+	path := "/usr/local/bin/github-write"
+	config.Tools.GitHubWritePath = &path
+	if err := Validate(config); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
+
+func TestValidateGitHubExternalWriteProviderRejectsUnknownValues(t *testing.T) {
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	path := "/usr/local/bin/github-write"
+	config.Tools.GitHubWritePath = &path
+	config.Projects = []ProjectRefConfig{{
+		ID:                  "demo",
+		Name:                "Demo",
+		RepoPath:            "/repos/demo",
+		Repo:                "acme/demo",
+		GitHubWriteProvider: "custom",
+		GitHubReadFallback:  "custom",
+	}}
+
+	err = Validate(config)
+	if err == nil {
+		t.Fatal("Validate() error = nil, want validation error")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[0].githubWriteProvider", "must be omitted or external")
+	assertValidationIssue(t, validationErr, "projects[0].githubReadFallback", "must be omitted or external")
+}
+
 func TestValidateDaemonSupervisionConfig(t *testing.T) {
 	t.Parallel()
 

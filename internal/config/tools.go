@@ -35,7 +35,6 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 	}{
 		{key: "gitPath", executable: "git", target: &paths.GitPath},
 		{key: "ghPath", executable: "gh", target: &paths.GHPath},
-		{key: "odcPath", executable: "odc", target: &paths.ODCPath},
 		{key: "looperPath", executable: "looper", target: &paths.LooperPath},
 		{key: "osascriptPath", executable: "osascript", target: &paths.OsascriptPath},
 	}
