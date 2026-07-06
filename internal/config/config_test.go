@@ -3954,3 +3954,26 @@ func validationIssuesContainPath(issues []ValidationIssue, path string) bool {
 	}
 	return false
 }
+
+func TestProjectProductOwnerResolvesAndValidates(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	if len(cfg.Projects) == 0 {
+		t.Skip("default config has no projects to attach a product owner to")
+	}
+	// Valid open_id resolves back through ProjectProductOwner.
+	cfg.Projects[0].ProductOwner = &ProductOwnerConfig{FeishuOpenID: "ou_a9fe1adce639660facbd26d7599a24e0"}
+	if got := ProjectProductOwner(cfg, cfg.Projects[0].ID).FeishuOpenID; got != "ou_a9fe1adce639660facbd26d7599a24e0" {
+		t.Fatalf("ProjectProductOwner() = %q, want the configured open_id", got)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+		t.Fatalf("ValidateWithOptions() with valid product owner error = %v", err)
+	}
+	// A non-open_id value is rejected.
+	cfg.Projects[0].ProductOwner = &ProductOwnerConfig{FeishuOpenID: "杨瑾龙"}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "open_id") {
+		t.Fatalf("ValidateWithOptions() error = %v, want open_id rejection", err)
+	}
+}

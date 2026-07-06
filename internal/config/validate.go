@@ -387,6 +387,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if effectiveProjectRoles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 		}
+		validateProductOwner(project.ProductOwner, prefix+".productOwner", &issues)
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
 		}
@@ -1080,6 +1081,26 @@ func validateNoIssueRoleTriggerLabelOverlap(planner PlannerRoleConfig, worker Wo
 				Message: fmt.Sprintf("overlaps roles.planner.triggers.labels: %q would trigger both the planner and the worker for one issue", trimmed),
 			})
 		}
+	}
+}
+
+// validateProductOwner checks the optional per-project product owner (plan §8.3):
+// when set, the Feishu open_id must be trimmed and shaped like an open_id (ou_…),
+// so an @-mention doesn't silently resolve to nobody.
+func validateProductOwner(owner *ProductOwnerConfig, path string, issues *[]ValidationIssue) {
+	if owner == nil {
+		return
+	}
+	openID := owner.FeishuOpenID
+	if openID == "" {
+		return
+	}
+	if strings.TrimSpace(openID) != openID {
+		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must not contain leading or trailing whitespace"})
+		return
+	}
+	if !strings.HasPrefix(openID, "ou_") {
+		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must be a Feishu open_id (starts with ou_)"})
 	}
 }
 
