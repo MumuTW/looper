@@ -173,19 +173,47 @@ PR 没合并前,卡片一直活,追问能接住(转给「修 PR」应答)。**�
 
 ## 6. 待拍板的决策
 
-- [ ] **全自动档标签名**:`looper:auto` / `looper:ship` / `looper:build`?(`looper:go` 别用,撞 `afk:go`)
-- [ ] **默认怎么配**:只留「写代码」/ 全自动 / 保留「先评审方案」?(注意「写方案」是迁移不是删)
+> 下面标 **[x] …(已定 2026-07-07,实现时取推荐默认)** 的,是实现 §3+§C/§D+§E+§F 时按推荐路径**自主拍板**并落进代码的默认值;仍标 [ ] 的,是 §8 流水线才需要、且**涉及团队流程 / 需人参与**的开放项(见 §10 实现状态)。
+
+- [x] **全自动档标签名 = `looper:auto`** ✅(已定;通篇在用,`looper:go` 撞 `afk:go`。已实现:label + dispatch 每-issue 自主 opt-in)
+- [x] **默认配置 = worker + looper:auto 可用;planner 迁移不删、bundle 里先关** ✅(已定)
 - [x] **方案存 Plane 文档(产品 + 技术两份),评审在 Plane,不进代码仓** ✅(已定)
 - [x] **不分档位;HITL 一直在、卡住就问;标签只在最前打一次** ✅
 - [x] **product spec 产品同学写;looper 只写 tech spec + 评审 + 实现** ✅(已定)
 - [x] **looper 读写 Plane 文档走 `plane` CLI** ✅(§9 spike 实测通;遗留:page↔work-item 关联约定待定)
-- [ ] **简单活是否跳过技术方案**(直接触发实现)?
-- [ ] **技术方案评审**:agent 帮审 + @人 approve,琐碎的允许 agent 自己过 —— 确认?(注意这是新状态机)
-- [ ] **全自动档触发范围**:一个标从「写方案」一路到「实现」(需要一个调度器把 spec-forge 和 looper 串起来),还是「方案批准后」才进 looper?
-- [ ] **「任务完成」怎么算**:源需求关闭 / 名下 PR 全合并 / 两者兼顾?
-- [ ] **完成后追问**:A / B / C?
-- [ ] **状态刷新**:以 GitHub 事件推送为主 + 兜底轮询(如 60 秒)?
-- [ ] **测试群**:用「agent 通知」群(`oc_4d1e…`,bot 已在);生产群「Looper 协作」不碰。
+- [x] **简单活跳过技术方案 = 是** ✅(已定;bug / 小活直接实现)
+- [x] **技术方案评审 = agent 审 + @人 approve,琐碎 agent 自过** ✅(已定;⚠️ 这是 §8.6 新状态机,尚未实现——reviewer 现仍自批)
+- [x] **全自动档触发范围 = 一个标一路到底**(planner→worker 内部串)✅(已定;完整串接依赖 §8.6 + coordinator 启用)
+- [x] **「任务完成」= 名下 PR 全合并** ✅(已定;issue 关闭不可靠。卡片「🎉 已合并」是唯一终点,靠 merge 检测)
+- [x] **完成后追问 = 方案 B**(回一句「已完成,继续请在 issue/PR 或新任务」)✅(已定,已实现)
+- [x] **状态刷新 = 事件驱动为主(快照捕获后刷卡)+ 兜底轮询** ✅(已定;已实现事件驱动,无 webhook 基建前不做独立 poller)
+- [x] **测试群 = 「agent 通知」群**(`oc_4d1e…`,bot 已在);生产群「Looper 协作」不碰 ✅
+- [x] **产品负责人 open_id = `ou_a9fe1adce639660facbd26d7599a24e0`(杨瑾龙)** ✅(已定;已落 productOwner 配置)
+- [ ] **page↔work-item 关联约定**(§8.2 硬前置,涉及团队流程):命名约定 / work-item 描述塞 page 链接 / 评论贴链接?—— **仍需团队拍板**
+- [ ] **coordinator 是否 / 何时全队启用**(§8.1/§8.4 前置;默认关,启用影响面大)—— **仍需团队拍板**
+
+## 10. 实现状态(2026-07-07)
+
+分支 `feat/onboarding-daemon-health`,每 tier 独立 commit + 单元测试,`scripts/verify.sh` 全绿。
+
+**已实现 + 已测(§3 全 + §C/§D + §E + §F):**
+- ✅ §G/P1 去重锚点卡(claim-before-post 锁) · P2 去露命令 · P3 诚实措辞 —— **真机验证过**(agent 通知群)
+- ✅ §C P4 跨角色 label 重叠校验(豁免 Plane 单标签生命周期)
+- ✅ §B 任务身份:一个 work item 一张卡(task_key = issue:repo:N,migration 0019;兄弟 loop 汇一卡,PR/项目级/无 issue 兜底回按-loop)
+- ✅ §A 卡片镜像 PR review-cycle 状态(👀 待 review → 🔄 CI 检查中 → ✋ 待修改 / ❌ CI 失败 → ✅ 待合并),事件驱动(快照捕获后刷卡)。「🎉 已合并」仍需 merge 检测(待补)
+- ✅ §F 完成后追问 = 方案 B(回一句,不冷场;每 loop 一次)
+- ✅ §E 睡醒 + 定时 reconcile(检测 wall-clock 跳变=合盖;释放过期锁 + stale-run reconcile;不强杀活 run)。§E.1 launchd 常驻已上;§E.3 卡片不重复由 §B 覆盖
+- ✅ §C/§D `looper:auto` label + dispatch 每-issue 自主 opt-in(coordinator 默认关=零生产风险)
+- ✅ §8.3 productOwner 配置(杨瑾龙 open_id)+ 校验(基础;@产品补 spec 的检测/等待/恢复依赖 §8.2)
+
+**未实现(§8 流水线,「大头」;有硬前置):**
+- ⏳ §8.1 kind 路由消费 + bug 模式(reproduce→定位→修 提示词):需给 worker 喂 kind + 启用 coordinator
+- ⏳ §8.2 Plane 方案读写:需 **Plane-Go 集成**(现 `internal/forge/plane.go` 无 page 方法,plane 是独立 CLI)+ **page↔work-item 关联约定**(团队决策)
+- ⏳ §8.5/§8.6 grill + Plane 评审 **@人 approve 新状态机**(reviewer 现自批,`looper:needs-human` 是死标签)
+- ⏳ §8.3 @产品补 spec 的等待/恢复(依赖 §8.2 关联约定 + Plane 轮询)
+- ⏳ §8.4/§8.10-P4 `looper:auto` 全程 intake→spec→impl 串接(依赖以上 + coordinator 启用)
+
+> §8 这一段是**跨系统 + 需团队决策 + 需真人参与(产品补 spec、人审批 spec)**的程序,无法在一次自主会话里全实现 + 端到端验证。前置见 §6 两个仍开放项。
 
 ## 7. 怎么验证、别踩雷
 
