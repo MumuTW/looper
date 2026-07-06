@@ -1254,6 +1254,16 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	// reliable here.)
 	hasPR := prURL != "" || strings.HasPrefix(strings.TrimSpace(target), "pr:")
 	template, label := feishuLoopStatusStyle(loop.Status, hasPR)
+	// §A: once the worker has DELIVERED (completed) and a PR exists, mirror the PR's
+	// real review-cycle state (👀 待 review / 🔄 CI 检查中 / ✋ 待修改 / ❌ CI 失败 /
+	// ✅ 待合并) from its latest snapshot, refining the generic "待合并" wording so the
+	// title precisely reflects where the PR is. While the agent is still running the
+	// "处理中" status stays; merged/failed terminals are left untouched.
+	if hasPR && feishuLoopAwaitingMerge(loop.Status) {
+		if t, l, ok := g.prCardStyleFromSnapshot(ctx, repo, target, prURL); ok {
+			template, label = t, l
+		}
+	}
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
 		"header":   map[string]any{"template": template, "title": map[string]any{"tag": "plain_text", "content": label}},
@@ -1299,6 +1309,175 @@ func feishuLoopStatusStyle(status string, hasPR bool) (template, label string) {
 	default:
 		return "blue", "🔧 Looper 处理中"
 	}
+}
+
+// feishuLoopAwaitingMerge reports whether a loop has delivered a PR and is now
+// waiting on the review/merge cycle — the window where the anchor card should
+// mirror the PR's real state (§A) instead of the generic "已交付" wording.
+func feishuLoopAwaitingMerge(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "done":
+		return true
+	default:
+		return false
+	}
+}
+
+// prCardState is the review-cycle state a delivered task's PR is in, derived from
+// its latest snapshot so the anchor card mirrors the PR's real status (plan §A).
+type prCardState string
+
+const (
+	prCardStateChecksFailed     prCardState = "checks_failed"
+	prCardStateChangesRequested prCardState = "changes_requested"
+	prCardStateChecksRunning    prCardState = "checks_running"
+	prCardStateApproved         prCardState = "approved"
+	prCardStateReviewPending    prCardState = "review_pending"
+)
+
+type checkRollup int
+
+const (
+	checkNone checkRollup = iota
+	checkRunning
+	checkFailed
+	checkPassed
+)
+
+// classifyChecks rolls a snapshot's ChecksSummary (a comma-joined list of CI
+// conclusions/states) into a single verdict: any failure wins, then anything
+// still running, else all-passed.
+func classifyChecks(summary string) checkRollup {
+	summary = strings.ToLower(strings.TrimSpace(summary))
+	if summary == "" {
+		return checkNone
+	}
+	anyFailed, anyRunning, any := false, false, false
+	for _, state := range strings.Split(summary, ",") {
+		state = strings.TrimSpace(state)
+		if state == "" {
+			continue
+		}
+		any = true
+		switch {
+		case containsAnySubstring(state, "fail", "error", "cancel", "timed_out", "timedout", "action_required", "stale", "startup_failure"):
+			anyFailed = true
+		case containsAnySubstring(state, "pending", "progress", "queued", "waiting", "expected", "requested", "running"):
+			anyRunning = true
+		}
+	}
+	switch {
+	case !any:
+		return checkNone
+	case anyFailed:
+		return checkFailed
+	case anyRunning:
+		return checkRunning
+	default:
+		return checkPassed
+	}
+}
+
+func containsAnySubstring(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// prCardStateFromSnapshot derives the review-cycle state from a snapshot's
+// first-class fields. Precedence mirrors what blocks a merge: failing CI first,
+// then requested changes, then CI still running, then approved (ready to merge),
+// else still awaiting review. Returns ("", false) when there's nothing to show.
+func prCardStateFromSnapshot(reviewState, checksSummary string, unresolved int64) (prCardState, bool) {
+	review := strings.ToUpper(strings.TrimSpace(reviewState))
+	checks := classifyChecks(checksSummary)
+	switch {
+	case checks == checkFailed:
+		return prCardStateChecksFailed, true
+	case review == "CHANGES_REQUESTED":
+		return prCardStateChangesRequested, true
+	case checks == checkRunning:
+		return prCardStateChecksRunning, true
+	case review == "APPROVED":
+		return prCardStateApproved, true
+	default:
+		return prCardStateReviewPending, true
+	}
+}
+
+// prCardStateStyle maps a PR review-cycle state to the card header's colour +
+// label (plan §A's title table). "已合并" is intentionally not produced here — it
+// is a terminal driven by merge detection, not a review snapshot.
+func prCardStateStyle(state prCardState, prNumber string) (template, label string) {
+	suffix := ""
+	if strings.TrimSpace(prNumber) != "" {
+		suffix = " · PR #" + strings.TrimSpace(prNumber)
+	}
+	switch state {
+	case prCardStateChecksFailed:
+		return "red", "❌ CI 失败" + suffix
+	case prCardStateChangesRequested:
+		return "orange", "✋ 待修改" + suffix
+	case prCardStateChecksRunning:
+		return "blue", "🔄 CI 检查中" + suffix
+	case prCardStateApproved:
+		return "turquoise", "✅ 待合并" + suffix
+	default:
+		return "blue", "👀 待 review" + suffix
+	}
+}
+
+// prNumberFromTargetOrURL extracts a PR number from a loop target (pr:owner/repo:N)
+// or, failing that, the trailing number of a PR URL (.../pull/N).
+func prNumberFromTargetOrURL(target, prURL string) int64 {
+	if t := strings.TrimSpace(target); strings.HasPrefix(t, "pr:") {
+		if i := strings.LastIndex(t, ":"); i >= 0 {
+			if n := jsonNumberToInt64(t[i+1:]); n > 0 {
+				return n
+			}
+		}
+	}
+	if n := urlTrailingNumber(prURL); n != "" {
+		return jsonNumberToInt64(n)
+	}
+	return 0
+}
+
+// prCardStyleFromSnapshot resolves the PR-state card style for a delivered loop by
+// reading the latest snapshot of the PR it opened. Best-effort: ("", "", false)
+// when there's no PR number, no snapshot, or the repos aren't wired.
+func (g *Gateway) prCardStyleFromSnapshot(ctx context.Context, repo, target, prURL string) (string, string, bool) {
+	if g.repositories == nil || g.repositories.PullRequestSnapshots == nil {
+		return "", "", false
+	}
+	repo = strings.TrimSpace(repo)
+	prNum := prNumberFromTargetOrURL(target, prURL)
+	if repo == "" || prNum <= 0 {
+		return "", "", false
+	}
+	snap, err := g.repositories.PullRequestSnapshots.GetLatest(ctx, repo, prNum)
+	if err != nil || snap == nil {
+		return "", "", false
+	}
+	review, checks, unresolved := "", "", int64(0)
+	if snap.ReviewState != nil {
+		review = *snap.ReviewState
+	}
+	if snap.ChecksSummary != nil {
+		checks = *snap.ChecksSummary
+	}
+	if snap.UnresolvedThreadCount != nil {
+		unresolved = *snap.UnresolvedThreadCount
+	}
+	state, ok := prCardStateFromSnapshot(review, checks, unresolved)
+	if !ok {
+		return "", "", false
+	}
+	t, l := prCardStateStyle(state, strconv.FormatInt(prNum, 10))
+	return t, l, true
 }
 
 // liveTailEntry is the most recent agent-activity snapshot for one loop.

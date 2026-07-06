@@ -496,6 +496,68 @@ func TestFeishuLoopStatusStyle(t *testing.T) {
 	}
 }
 
+func TestPRCardStateFromSnapshotMapsReviewCycle(t *testing.T) {
+	cases := []struct {
+		name       string
+		review     string
+		checks     string
+		unresolved int64
+		want       prCardState
+	}{
+		{"failing CI wins", "APPROVED", "success, failure", 0, prCardStateChecksFailed},
+		{"changes requested", "CHANGES_REQUESTED", "success", 0, prCardStateChangesRequested},
+		{"CI still running", "REVIEW_REQUIRED", "success, pending", 0, prCardStateChecksRunning},
+		{"approved + green", "APPROVED", "success, success", 0, prCardStateApproved},
+		{"awaiting review", "REVIEW_REQUIRED", "success", 2, prCardStateReviewPending},
+		{"no decision yet", "", "", 0, prCardStateReviewPending},
+		{"in_progress running", "", "in_progress", 0, prCardStateChecksRunning},
+	}
+	for _, tc := range cases {
+		got, ok := prCardStateFromSnapshot(tc.review, tc.checks, tc.unresolved)
+		if !ok || got != tc.want {
+			t.Fatalf("%s: prCardStateFromSnapshot(%q,%q,%d) = %q,%v; want %q", tc.name, tc.review, tc.checks, tc.unresolved, got, ok, tc.want)
+		}
+	}
+}
+
+func TestPRCardStateStyleTitles(t *testing.T) {
+	cases := []struct {
+		state    prCardState
+		template string
+		contains string
+	}{
+		{prCardStateChecksFailed, "red", "CI 失败"},
+		{prCardStateChangesRequested, "orange", "待修改"},
+		{prCardStateChecksRunning, "blue", "CI 检查中"},
+		{prCardStateApproved, "turquoise", "待合并"},
+		{prCardStateReviewPending, "blue", "待 review"},
+	}
+	for _, tc := range cases {
+		gotT, gotL := prCardStateStyle(tc.state, "8")
+		if gotT != tc.template || !strings.Contains(gotL, tc.contains) || !strings.Contains(gotL, "PR #8") {
+			t.Fatalf("prCardStateStyle(%q) = (%q,%q); want template %q label~%q with PR #8", tc.state, gotT, gotL, tc.template, tc.contains)
+		}
+	}
+}
+
+func TestPRNumberFromTargetOrURL(t *testing.T) {
+	cases := []struct {
+		target string
+		prURL  string
+		want   int64
+	}{
+		{"pr:owner/repo:8", "", 8},
+		{"issue:owner/repo:3", "https://github.com/owner/repo/pull/12", 12},
+		{"", "https://github.com/owner/repo/pull/45", 45},
+		{"project:abc", "", 0},
+	}
+	for _, tc := range cases {
+		if got := prNumberFromTargetOrURL(tc.target, tc.prURL); got != tc.want {
+			t.Fatalf("prNumberFromTargetOrURL(%q,%q) = %d, want %d", tc.target, tc.prURL, got, tc.want)
+		}
+	}
+}
+
 func TestLoopIssueNumberReadsBothMetadataShapes(t *testing.T) {
 	cases := []struct {
 		name string

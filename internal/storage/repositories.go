@@ -578,6 +578,24 @@ func (r *LoopsRepository) GetBySeq(ctx context.Context, seq int64) (*LoopRecord,
 	return &record, nil
 }
 
+// GetByTargetID returns the most recently updated loop with the given target id
+// (e.g. pr:owner/repo:8), or nil when none. Used to resolve a PR back to the
+// worker loop that opened it, so a snapshot event can refresh that task's card.
+func (r *LoopsRepository) GetByTargetID(ctx context.Context, targetID string) (*LoopRecord, error) {
+	if strings.TrimSpace(targetID) == "" {
+		return nil, nil
+	}
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM loops WHERE target_id = ? ORDER BY updated_at DESC LIMIT 1`, targetID)
+	record, err := scanLoop(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get loop by target id: %w", err)
+	}
+	return &record, nil
+}
+
 func (r *LoopsRepository) AllocateSeq(ctx context.Context) (int64, error) {
 	var existing int64
 	err := r.q.QueryRowContext(ctx, `SELECT value FROM counters WHERE name = 'loop_seq'`).Scan(&existing)

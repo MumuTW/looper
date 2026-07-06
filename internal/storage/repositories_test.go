@@ -302,6 +302,38 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	}
 }
 
+func TestLoopsGetByTargetIDResolvesPRToWorkerLoop(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	targetID := "pr:owner/repo:8"
+	repo := "owner/repo"
+	prNumber := int64(8)
+	if err := repos.Loops.Upsert(ctx, LoopRecord{
+		ID: "loop_worker", Seq: 1, ProjectID: "project_1", Type: "worker",
+		TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber,
+		Status: "completed", CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:05:00.000Z",
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	got, err := repos.Loops.GetByTargetID(ctx, targetID)
+	if err != nil || got == nil || got.ID != "loop_worker" {
+		t.Fatalf("GetByTargetID(%q) = %v, %v; want loop_worker", targetID, got, err)
+	}
+	if got, err := repos.Loops.GetByTargetID(ctx, "pr:owner/repo:999"); err != nil || got != nil {
+		t.Fatalf("GetByTargetID(missing) = %v, %v; want nil", got, err)
+	}
+	if got, err := repos.Loops.GetByTargetID(ctx, ""); err != nil || got != nil {
+		t.Fatalf("GetByTargetID(\"\") = %v, %v; want nil", got, err)
+	}
+}
+
 func TestFeishuThreadsRootByTaskSharesOneCardAcrossLoops(t *testing.T) {
 	t.Parallel()
 
