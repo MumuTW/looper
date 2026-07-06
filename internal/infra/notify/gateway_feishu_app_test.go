@@ -416,6 +416,11 @@ func TestLiveStatusHelpers(t *testing.T) {
 	if got := feishuPhaseFromTail([]string{"✅ git push -u origin feat/x"}); got != "正在推送分支" {
 		t.Fatalf("feishuPhaseFromTail(push) = %q; want 正在推送分支", got)
 	}
+	// An UNRECOGNISED command must never leak onto the human-scannable anchor as a
+	// raw shell line (P2: e.g. `tmpdir=$(mktemp -d …`) — it becomes a generic phase.
+	if got := feishuPhaseFromTail([]string{"✅ tmpdir=$(mktemp -d /private/tmp/looper.XXXX)"}); got != "正在处理…" || strings.Contains(got, "mktemp") {
+		t.Fatalf("feishuPhaseFromTail(unknown) = %q; want generic phase, no raw command", got)
+	}
 	// feishuAnchorBrief falls back to the phase when no summary is in metadata, and
 	// the live feed card carries the raw feed for the in-thread surface.
 	if brief := feishuAnchorBrief(nil, []string{"✅ gh pr create --fill"}); brief != "🔧 正在开 PR" {
@@ -468,18 +473,25 @@ func TestLiveStatusHelpers(t *testing.T) {
 }
 
 func TestFeishuLoopStatusStyle(t *testing.T) {
-	cases := map[string]struct{ template, contains string }{
-		"awaiting_human": {"orange", "等你定夺"},
-		"completed":      {"green", "已完成"},
-		"failed":         {"red", "需要处理"},
-		"abandoned":      {"red", "需要处理"},
-		"running":        {"blue", "处理中"},
-		"":               {"blue", "处理中"},
+	cases := []struct {
+		status   string
+		hasPR    bool
+		template string
+		contains string
+	}{
+		{"awaiting_human", false, "orange", "等你定夺"},
+		{"completed", true, "turquoise", "待合并"}, // delivered a PR, not merged
+		{"completed", false, "green", "已完成"},    // no PR (e.g. a no-diff run)
+		{"merged", false, "green", "已合并"},
+		{"failed", false, "red", "需要处理"},
+		{"abandoned", false, "red", "需要处理"},
+		{"running", false, "blue", "处理中"},
+		{"", false, "blue", "处理中"},
 	}
-	for status, want := range cases {
-		gotT, gotL := feishuLoopStatusStyle(status)
+	for _, want := range cases {
+		gotT, gotL := feishuLoopStatusStyle(want.status, want.hasPR)
 		if gotT != want.template || !strings.Contains(gotL, want.contains) {
-			t.Fatalf("feishuLoopStatusStyle(%q) = (%q, %q); want template %q label~%q", status, gotT, gotL, want.template, want.contains)
+			t.Fatalf("feishuLoopStatusStyle(%q, %v) = (%q, %q); want template %q label~%q", want.status, want.hasPR, gotT, gotL, want.template, want.contains)
 		}
 	}
 }

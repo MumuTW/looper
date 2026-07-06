@@ -95,6 +95,14 @@ type Gateway struct {
 	// outer anchor card stays a human-scannable brief. Keyed by loop id → message id;
 	// posted on first activity, patched in place thereafter.
 	liveFeeds map[string]string
+	// rootLocks serialises ensureFeishuThreadRoot per loop. Anchor creation is a
+	// check-then-act (look up the root, else POST a new card, then persist); two
+	// concurrent callers for one loop — e.g. the progress ticker and an ask —
+	// would otherwise each POST a duplicate anchor before either persisted. The
+	// per-loop lock lets the first caller claim (post + persist) before the second
+	// re-checks, so exactly one anchor is created.
+	rootMu    sync.Mutex
+	rootLocks map[string]*sync.Mutex
 }
 
 type askCardState struct {
@@ -951,11 +959,31 @@ func (g *Gateway) postFeishuAppMessage(ctx context.Context, token, chatID, rootM
 // thread under, creating it (a plain-text "开始处理" header) on first use. Returns
 // "" when loopID is empty or the root can't be created — callers then post
 // top-level, so threading degrades gracefully rather than dropping messages.
+// lockRoot returns an unlock func for a per-loop mutex, so ensureFeishuThreadRoot
+// runs its check-then-create atomically for a given loop (see rootLocks).
+func (g *Gateway) lockRoot(loopID string) func() {
+	g.rootMu.Lock()
+	if g.rootLocks == nil {
+		g.rootLocks = make(map[string]*sync.Mutex)
+	}
+	lk := g.rootLocks[loopID]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		g.rootLocks[loopID] = lk
+	}
+	g.rootMu.Unlock()
+	lk.Lock()
+	return lk.Unlock
+}
+
 func (g *Gateway) ensureFeishuThreadRoot(ctx context.Context, token, chatID, loopID string) string {
 	loopID = strings.TrimSpace(loopID)
 	if loopID == "" || g.repositories == nil || g.repositories.FeishuThreads == nil {
 		return ""
 	}
+	// Claim before post: serialise this loop's anchor creation so a concurrent
+	// caller can't POST a second card between our RootByLoop check and Upsert.
+	defer g.lockRoot(loopID)()
 	if root, err := g.repositories.FeishuThreads.RootByLoop(ctx, loopID); err == nil && root != "" {
 		return root
 	}
@@ -1106,7 +1134,7 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if !feishuLoopStatusTerminal(loop.Status) {
 		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "💻 本地接管:`looper resume " + strconv.FormatInt(loop.Seq, 10) + "`"}}})
 	}
-	template, label := feishuLoopStatusStyle(loop.Status)
+	template, label := feishuLoopStatusStyle(loop.Status, prURL != "")
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
 		"header":   map[string]any{"template": template, "title": map[string]any{"tag": "plain_text", "content": label}},
@@ -1133,11 +1161,19 @@ func feishuLoopStatusTerminal(status string) bool {
 // feishuLoopStatusStyle maps a loop status to the thread-header card's colour +
 // label, so the anchor card visibly reflects where the task is: processing (blue)
 // → awaiting a human (orange) → done (green) → needs attention (red).
-func feishuLoopStatusStyle(status string) (template, label string) {
+func feishuLoopStatusStyle(status string, hasPR bool) (template, label string) {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "awaiting_human":
 		return "orange", "⏸ Looper 等你定夺"
-	case "completed", "done", "merged":
+	case "merged":
+		return "green", "🎉 已合并"
+	case "completed", "done":
+		// The worker's job ends at OPENING the PR — "completed" means delivered,
+		// NOT merged (review / CI / merge still to come). Only say 已完成 when
+		// there's no PR at all (e.g. a no-diff run).
+		if hasPR {
+			return "turquoise", "✅ 已交付 · 待合并"
+		}
 		return "green", "✅ Looper 已完成"
 	case "failed", "abandoned", "error":
 		return "red", "⚠️ Looper 需要处理"
@@ -1384,10 +1420,10 @@ func feishuPhaseFromTail(tail []string) string {
 	case strings.HasPrefix(lower, "rg ") || strings.HasPrefix(lower, "grep ") || strings.HasPrefix(lower, "ls ") || strings.HasPrefix(lower, "cat ") || strings.HasPrefix(lower, "find ") || strings.Contains(lower, "git status") || strings.Contains(lower, "git log") || strings.Contains(lower, "git diff"):
 		return "正在阅读代码"
 	default:
-		if len(line) > 60 {
-			line = line[:60] + "…"
-		}
-		return line
+		// Never surface a raw shell command on the human-scannable anchor — an
+		// unrecognised command becomes a generic phase; the raw feed lives inside
+		// the thread (feishuLiveFeedCard), not here.
+		return "正在处理…"
 	}
 }
 
