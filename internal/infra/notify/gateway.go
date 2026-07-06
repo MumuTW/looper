@@ -1134,7 +1134,13 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if !feishuLoopStatusTerminal(loop.Status) {
 		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "💻 本地接管:`looper resume " + strconv.FormatInt(loop.Seq, 10) + "`"}}})
 	}
-	template, label := feishuLoopStatusStyle(loop.Status, prURL != "")
+	// hasPR drives the "已交付 · 待合并" vs "已完成" wording. Derive it from a
+	// reliable signal: a completed worker loop's target flips to its PR
+	// (pr:repo:N), and/or the metadata carries a prUrl. (loopWorkerString only
+	// reads $.worker.*, but prUrl is stored at the top level, so it alone is not
+	// reliable here.)
+	hasPR := prURL != "" || strings.HasPrefix(strings.TrimSpace(target), "pr:")
+	template, label := feishuLoopStatusStyle(loop.Status, hasPR)
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
 		"header":   map[string]any{"template": template, "title": map[string]any{"tag": "plain_text", "content": label}},
