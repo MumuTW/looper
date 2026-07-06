@@ -1,164 +1,163 @@
-# PLAN — looper HITL 改造全貌
+# PLAN — looper 自动化研发流程改造
 
-> 状态:草案 · 待拍板。汇总真机 e2e(v0.10.1)+ 共享群试用暴露的问题与由此确定的改造方向。
-> 面向:每人本地部署一套 looper、决策卡发到同一个飞书群的团队场景。
+> 状态:草案 · 待拍板。汇总真机试跑 + 群里试用后暴露的问题,以及定下来的改造方向。给团队 review 用。
+> 背景:looper 每人本地跑一套,任务卡片发到同一个飞书群。
 
-## 1. 背景与动机
+**先约定几个词**(下面反复出现):
+- **HITL**:human-in-the-loop —— agent 拿不准时,发一张卡片到群里问人。
+- **卡片**:looper 为每个任务在飞书群里发的那张卡(标题 + 进度);点开是一个 thread(折叠讨论)。
+- **PR / CI / label**:GitHub 的拉取请求 / 持续集成检查 / 标签。
+- **looper 的 4 个角色**:分别负责 **写方案、写代码、审 PR、修 PR**。
+- **spec-forge**:一个把需求写成方案、再让另一个 agent 逐轮"挑刺拷问"的工具(skill)。
 
-HITL 已随 **v0.10.1** 上线(决策卡、多轮对话、任务 thread、按人 Plane 路由、一键接管)。用真机跑「fresh agent 照 SETUP-PROMPT 从零配 + 冒烟」并把卡片发进共享群后,暴露出一批 **UX 含糊 / 正确性 / 健壮性** 问题。这份 plan 把它们和对应改造一次性理清,作为后续分 PR 实现的依据。
+## 1. 为什么要改
 
-一句话目标:**卡片是「任务」的精准实时镜像,label 是「意图」不随阶段变身,断电能自恢复,只有合并才算完成。**
+HITL 已经上线(v0.10.1)。用一个全新 agent 照文档从零配好、跑了个真任务、把卡片发进群之后,暴露出一批「看着含糊 / 不太对 / 不够稳」的问题。这份文档把它们和对应改法理清,作为分批实现的依据。
 
-## 2. 现状问题清单(真机 e2e 实测)
+一句话目标:**卡片准确反映任务的真实状态;标签只表达「要做什么」、不随进度乱变;笔记本随时关也能自恢复;只有代码真正合并才算完成。**
 
-| # | 现象 | 根因 |
+## 2. 试跑暴露的问题
+
+| # | 现象 | 说明 |
 |---|---|---|
-| P1 | 同一任务**发了 2–3 张 anchor 卡** | planner loop 竞态 11ms 双发;且 planner/worker 是两个 loop 各发一张。`feishu_threads` 无「按任务去重」 |
-| P2 | 「处理中」卡片**露裸命令**(`tmpdir=$(mktemp …`) | 标题由守护进程反推工具流;无里程碑时 fallback 成裸命令 |
-| P3 | 「✅ 已完成」**误导** | worker 的 completed = 只是「开了 PR」,PR 实际 `OPEN/未合并`;下游还有 review/QA/冲突/CI/合并 |
-| P4 | 一个 issue **冒出 2 个 PR** | 默认 planner+worker 都吃 `looper:plan`(且 bundle 误配 worker 也吃 plan)→ 各出一个 PR |
-| P5 | 任务完成后 thread 里**追问不理人** | 终态 loop 直接跳过入站消息(`hitl_github_poll.go:161`) |
-| P6 | onboarding 用 `nohup looperd &` | 裸后台进程,**重启/合盖/登出就没了、崩了不拉起** |
+| P1 | 同一个任务**发了 2–3 张卡** | 两个动作几乎同时抢跑各发一张;而且「写方案」和「写代码」是两段、又各发一张。缺「同一任务只留一张卡」的约束。 |
+| P2 | 「处理中」卡片**露出原始命令行**(像 `tmpdir=$(mktemp …`) | 标题是从工具输出硬猜的;没有里程碑时就退化成显示裸命令。 |
+| P3 | 「✅ 已完成」**其实没完成** | 这里的「完成」只是「开了 PR」,PR 还开着没合并;后面还有 review / QA / 解冲突 / CI / 合并一整条。 |
+| P4 | 一个需求**冒出 2 个 PR** | 默认「写方案」和「写代码」被同一个标签触发,各开了一个 PR(而且配置也配错了)。 |
+| P5 | 任务做完后,**群里再追问它不理人** | 已完成的任务直接忽略后续消息。 |
+| P6 | 启动方式是「挂后台跑」 | 一个裸后台进程,**重启 / 合盖 / 退出登录就没了,崩了也不会自己起来**。 |
 
 ## 3. 改造项
 
-### A. 卡片 = 任务/PR 状态的精准实时镜像
+### A. 卡片 = 任务 / PR 真实状态的实时镜像
 
-**原则**:标题反映**真实状态**,不用 looper 内部那套「处理中/已完成」。**只有「已合并」是绿色终态。**
+**原则**:标题反映**真状态**,不用「处理中 / 已完成」这种含糊说法。**只有「已合并」是绿色终点。**
 
-状态映射(数据来自 `gh pr view`:`state / isDraft / reviewDecision / mergeable / statusCheckRollup / mergedAt`):
+从 GitHub 读 PR 的真实状态,映射成精准标题:
 
 | PR 实况 | 标题 |
 |---|---|
-| draft | 📝 草稿 · PR #N |
+| 草稿 | 📝 草稿 · PR #N |
 | CI 跑测中 | 🔄 CI 检查中 · PR #N |
 | CI 失败 | ❌ CI 失败 · PR #N |
-| 冲突(CONFLICTING) | ⚠️ 冲突待解 · PR #N |
+| 有冲突 | ⚠️ 冲突待解 · PR #N |
 | 待 review | 👀 待 review · PR #N |
-| 请求修改 | ✋ 待修改 · PR #N |
-| 已批准+可合并+绿 | ✅ 待合并 · PR #N |
-| **merged** | 🎉 **已合并** · PR #N ←唯一终态 |
-| closed 未合并 | 🚫 已关闭 · PR #N |
+| 被要求改 | ✋ 待修改 · PR #N |
+| 已批准、可合并、CI 绿 | ✅ 待合并 · PR #N |
+| **已合并** | 🎉 **已合并** · PR #N ← 唯一终点 |
+| 关闭但没合并 | 🚫 已关闭 · PR #N |
 
-**状态怎么来 —— agent 自报 + webhook,不用轮询 issue 关闭(太滞后):**
-- **活跃干活时 = agent 自报**:给 agent 一个 looper 工具/CLI(暴露现成的 `RecordMilestone`,如 `looper milestone "已开 PR,待 review"`),**在 prompt 里写清期望的状态词表**,agent 边干边更新卡片。
-- **空档的外部事件**(人去 review / 合并 / CI 出结果)→ 走 **GitHub webhook 实时接**(looper 本就支持 `webhook`),不 poll issue 关闭。
+**状态从哪来 —— agent 自己报 + GitHub 事件推送,不靠「等需求关闭」(太慢):**
+- **在干活时:agent 自己报**。给 agent 一个更新卡片的命令,在提示词里写清期望它报告的状态(开了 PR 待 review / 解冲突中 / 已交付…),它边干边更新。
+- **它没在跑的空档**(别人去 review、合并、CI 出结果)→ 靠 **GitHub 事件推送(webhook)实时接**,不去反复查。
 
-### B. Thread 绑「任务」,不绑 PR、不绑 loop
+### B. 一个任务一张卡(不是「一个 PR 一张」,也不是「一段流程一张」)
 
-**事实**:一个 issue 可能有多个 PR(planner 的 spec PR + worker 的实现 PR,甚至多个实现 PR)。e2e 里 issue #1 就开了 PR #2 + #3。
+**事实**:一个需求可能对应多个 PR(方案一个、实现一个,甚至多个实现)。
 
-- **一个任务(issue / Plane work-item)= 一个 thread**;planner + 多个 worker + 多个 PR + reviewer/fixer **全汇进这一条**。
-- 卡片头 = **任务级汇总**;正文逐条列每个 PR 的实时状态。
-- 关联现成:worker loop 的 metadata 存了 `IssueNumber` + `prNumber`;reviewer/fixer 可回溯源 issue。
-- **任务完成 = issue 解决 / 名下 PR 全合并**,不是单个 PR。
+- **一个任务 = 一张卡**;写方案、写代码、审、修,以及名下所有 PR,**全汇进这一张**。
+- 卡片头是**任务整体进度**;正文逐条列每个 PR 的状态。
+- **任务算完成 = 需求真的解决(名下 PR 都合并)**,不是某一个 PR 合了就算。
 
 示例(多 PR):
 ```
-🔧 进行中 · #1 · 2 PR
+🔧 进行中 · #1 · 2 个 PR
 ──────────────
-· PR #2 spec  👀 待 review
-· PR #3 impl  ✅ 待合并
+· PR #2 方案  👀 待 review
+· PR #3 实现  ✅ 待合并
 ```
 
-### C. label = 意图(打一次不变);execution_mode = 内部模式(不是 label)
+### C. 标签只表达「要做什么」,打一次不变
 
-**原则**:**label 只在最前面打一次、表达意图**,阶段推进 + 自主程度都是 looper **内部**的事,**不再打第二个 label、也不用人打**;阶段可见性交给卡片。
+**原则**:**标签在最前面打一次、表达意图**;进度推进是 looper 内部的事,**不靠改标签驱动、也不用人再打第二个**;进度让卡片去体现。
 
-| Label(全程不变) | 含义 |
+| 标签(全程不变) | 含义 |
 |---|---|
-| `looper:auto`(新) | 走全自动:spec → 实现,一路到底 |
-| `looper:plan` | 规划 → 停,等人评审 spec(轻量,不走 spec-forge 时) |
-| `looper:worker-ready` | 直接实现(已有现成 spec / 简单活) |
+| `looper:auto`(新) | 全自动:方案 → 实现,一路到底 |
+| `looper:plan` | 只写方案 → 停下,等人评审(轻量,不走 spec-forge 时) |
+| `looper:worker-ready` | 直接实现(已有现成方案 / 简单活) |
 
-- **没有 `execution_mode` 这个概念**:looper 实现时 **HITL 一直在**,agent 卡住/拿不准就发决策卡问人 —— 不需要事先把任务分成 AFK/HITL 档。
-- 该由人做的活,**就不打 looper 标**(交给人),不需要一个 mode 来表达。
-- 整条链在**一个 `looper:auto` 之下跑完**,无第二次打标。「自动」≠「不问」。
-- 修 bundle 误配:worker 触发器应是 `looper:worker-ready`,不是 `looper:plan`。
+- **没有「档位」这回事**:实现时 HITL 一直在,agent 卡住就发卡问人 —— 不需要事先把任务分成「全自动 / 要盯着」两档。
+- 该由人做的活,**就不打 looper 的标签**,直接给人。
+- 顺手修个配置错误:「写代码」应该被 `looper:worker-ready` 触发,之前误配成和「写方案」同一个标签,导致 P4。
 
-### D. product spec 人工写(上游);looper 写 tech spec → 评审 → 实现;全在 Plane,不进代码仓/不走 PR
+### D. 方案文档:产品写 product spec,looper 写 tech spec;评审都在 Plane,不进代码仓
 
-> 团队定调(2026-07-06,陈哲/麻薯讨论):spec **长期不放代码仓库**;**spec review 整套做进 Plane**;spec 以 **Plane Page** 存在。**product spec 由产品同学写(不是 looper);looper 跟进 product spec 写 tech spec、评审、实现。**
+> 团队定调(2026-07-06,陈哲 / 麻薯讨论):方案**长期不放代码仓库**;**评审整套做进 Plane**;方案以 **Plane 文档(Page)** 存在。**product spec(产品方案)由产品同学写(不是 looper);looper 跟进它写 tech spec(技术方案)、评审、实现。**
 
-- **product spec = 人工上游**:产品同学在 Plane 写(what/why,**去黑话、给人看**)。**looper 不写它。**
-- **looper /(spec-forge 的 tech-spec 部分)= 从 product spec 产出 tech spec**:
-  - 读 product spec → 写 **tech spec**(how,Plane Page,给实现看)。
-  - **GRILL** tech spec:遇到 **product spec 没说清、agent 定不了**的点 → **整理成 HITL 卡问产品/人**(HITL 在写 tech spec 阶段就体现价值)。
-  - PUBLISH 成 Plane Page + 置 work item `spec:reviewing`。
-- **tech spec review(agent 辅助,不必纯人工)**:review agent 先审(漏洞/矛盾/风险)→ 整理意见;要人拍板的 **@人 approve**;琐碎可配置自动过。最终签字通常仍归人,审的重活交给 agent。
-- **实现**:approve 后 **worker 读 product spec + tech spec 两份 Page 作为上下文,直接实现**。
-- **没有 execution_mode**:HITL 一直在,卡住就问。
+- **product spec = 产品同学写**(讲清 what / why,给人看、去黑话)。**looper 不写它。**
+- **looper 从 product spec 写出 tech spec**:
+  - 边写边让另一个 agent 挑刺拷问;**产品方案没说清、agent 自己定不了的点 → 整理成卡片问产品 / 人**(HITL 在写方案阶段就用上了)。
+- **技术方案评审(agent 帮着审,不必纯人工)**:一个 agent 先审出漏洞 / 矛盾 / 风险、整理意见;要人拍板的 **@人 approve**;琐碎的可以让 agent 自己过。签字通常还是人,但审的重活交给 agent。
+- **实现**:批准后,「写代码」读 产品方案 + 技术方案,直接实现。
 
-**好处**:①分工清楚(**产品写 what,looper 写 how + 做**);②**评审在 Plane,不落代码仓 / 不悬空 PR** → 根治「已批准不合并的 spec PR」;③looper 自带 planner + 仓内 `SpecPath` 文件那套**弃用**。
+**好处**:①分工清楚(**产品写 what,looper 写 how + 做**);②评审在 Plane、不落代码仓、不留悬着的方案 PR;③looper 自带的「写方案」角色、以及「把方案当仓库文件」那套,弃用。
 
-**技术点 —— worker 怎么读 Plane Page**(⚠️ Pages 原只在内部 app API;你们已 fork+部署把 Pages 暴露到 `/api/v1`,且 `plane` CLI 有 `plane api page get --content`):
-- **(a) worker agent 直接用 `plane api page get`**(Pages 的 html-hydration 坑 CLI 已踩平 → 推荐)
-- **(b) 给 looper 原生 plane provider 加 Page-read**(更集成,但要处理 app-API 怪癖)
-- 无论哪条,**worker 的 spec 输入要从「`Follow spec: <文件路径>`」改成「读 Plane 上的 product+tech spec Page」**。
+**技术方案怎么读**:方案都是 **Plane 文档**。looper 读它有两种做法(待定):(a) 让 agent 用现成的 `plane` 命令行读(推荐,Plane 文档的一些坑这个工具已踩平);(b) 给 looper 自己加读 Plane 文档的能力。
 
-**为什么松耦合、不把 spec-forge 塞进 looper planner**:GRILL 要独立 fresh agent + 真人;两层靠 Plane label 衔接即可。
+**为什么两层分开、不把 spec-forge 塞进 looper**:挑刺拷问要靠一个独立的、没被"作者视角"污染的 agent + 真人;两层用 Plane 标签衔接就够。
 
-**待定**:approve 后谁给 work item 打 looper label —— 人手动 / spec-forge PUBLISH 预置 / approve→label 小 hook。
+**待定**:方案批准后,谁把 looper 的标签打上去(人手动 / 发布时预置 / 一个「批准即打标」的小自动化)。
 
-> 简单活(无需 spec)不走这条:直接 `looper:worker-ready`(或 `looper:auto` 让 looper 自己规划实现,不产出正式 spec)。
+> 简单活(不需要方案)不走这条:直接触发实现。
 
-### E. 恢复 / 本地部署健壮性(笔记本随时关)
+### E. 恢复能力(笔记本随时关也不丢活)
 
-**已有(不用造)**:launchd 托管守护进程(`looper daemon install/start`,`RunAtLoad` 自启 + 保活)、启动恢复管线(标记中断 run / 清孤儿 agent / requeue)、checkpoint 续跑、native session 续跑。
+**已经有的(不用造)**:能装成**开机自启、崩了自动重启的常驻服务**(macOS 走 launchd);每次启动会**自动恢复** —— 把没跑完的活标出来、清掉残留进程、重新排队;而且是**从断点继续**(不从头来),甚至接着原来的 AI 会话跑。
 
 **要改 / 要加固**:
-1. **onboarding 改用 `looper daemon install` + `looper daemon start`**(替掉 `nohup &`)→ 合盖/重启后 launchd 自动拉起 → 恢复管线自动续。**(P6,笔记本场景关键一改)**
-2. **睡眠 ≠ 关机**:合盖是挂起进程(codex 子进程可能死、token/网络过期);醒来后 reaper/reconcile 要能发现并重新驱动 —— 需专门测。
-3. **恢复幂等**:续跑**不得重复开 PR / 重复发卡** —— 与 P1 的 anchor 去重**同源**,合并处理。
-4. **半截被杀**:worktree 有半截改动时 `replay_step` 要能干净叠加 —— 验常见「实现到一半被杀」。
+1. **onboarding 改成装常驻服务**(现在是「挂后台」,重启就没)→ 合盖 / 重启后自动起来、自动续。**(P6,最关键的一改)**
+2. **睡眠 ≠ 关机**:合盖是把进程挂起(子进程可能死、登录态 / 网络过期);醒来后要能发现并重新驱动 —— 需专门测。
+3. **恢复不能重复干**:续跑时不能重复开 PR / 重复发卡 —— 和 P1 的「一个任务一张卡」是同一件事,一起做。
+4. **干到一半被杀**:本地改了一半时,重跑那一步要能干净接上 —— 验一下常见情况。
 
-### F. 完成后追问(P5)
+### F. 任务做完后再追问(P5)
 
-PR 未合并前 thread 一直活,追问可路由(转 fixer/looper 应答)。**合并后**收到追问,三选一(待定):
-- **A** 自动重开/续跑(当新一轮需求或答疑)
-- **B** 至少回一句「本任务已完成,如需继续请在 issue/PR 上说或新建任务」,不冷场
-- **C** 保持静默(现状)
+PR 没合并前,卡片一直活,追问能接住(转给「修 PR」应答)。**合并之后**再追问,三选一(待定):
+- **A** 自动重开 / 续跑(当成新一轮需求或答疑)
+- **B** 至少回一句「本任务已完成,继续请在 issue/PR 上说、或新建任务」,别冷场
+- **C** 保持不理(现状)
 
-### G. 独立 bug 修复
+### G. 几个独立的 bug 修复
 
-- **P1 双发**:`feishu_threads` 改按任务绑定 + 唯一约束 + insert-if-absent → 杜绝竞态双发;planner/worker 复用同一 thread。
-- **P2 裸命令**:标题派生**永不显示裸命令**,PR 前显示友好措辞(「🔧 实现中…」),原始工具流只留 thread 内。
-- **P3/措辞**:被 A 的状态映射吸收(不再有含糊「已完成」)。
+- **P1 双发**:改成「同一任务只留一张卡」(加约束 + 防抢跑);写方案 / 写代码复用同一张卡。
+- **P2 露命令**:标题**永不显示原始命令**;PR 还没开时显示友好措辞(如「🔧 实现中…」),原始工具输出只留在卡片里的讨论中。
+- **P3 措辞**:被 A 的状态映射吸收(不再有含糊的「已完成」)。
 
-## 4. 与 synclo AFK 的收敛
+## 4. 和 synclo AFK 的关系
 
-`looper:auto` = **looper 原生的「全自主执行」触发**,正是让 synclo `afk:go` 那套自建执行器**退役**的前提:AFK 只保留上游(triage / 分解 / 派单),产出改成打 `looper:auto` + assign,**执行整个交给 looper**。桥(`looper-bridge.ts` 建 GitHub issue 那层)也随 looper 原生 Plane provider 退役。**注意:同一 item 别既 afk:go 又 looper:auto,否则两执行器抢着做。**
+`looper:auto` = **looper 自己的「全自主执行」入口**。有了它,synclo 那套 `afk:go` 自建执行器就能**退役**:AFK 只保留前面的「分诊 / 拆解 / 派活」,产出改成打 `looper:auto` + 指派,**执行整个交给 looper**。中间那座「把 Plane 任务转成 GitHub issue」的桥,也随 looper 能直接读 Plane 而退役。**注意:同一个任务别既打 `afk:go` 又打 `looper:auto`,否则两个执行器会抢着做。**
 
-## 5. 分阶段实施(建议 PR 拆分)
+## 5. 分批实现(建议)
 
-1. **PR-1 onboarding 健壮性**(低风险,先上):bundle 启动改 `looper daemon install/start`;关 planner(或改用 auto);修 worker 触发 label。
-2. **PR-2 anchor 去重 + 绑任务 + 去裸命令**(P1/P2 + B 的表结构):`feishu_threads` 迁移 + 按任务键 + 友好措辞。
-3. **PR-3 卡片 = PR 状态镜像**(A):agent 自报工具/CLI + prompt 词表 + webhook 接外部事件 + 状态映射 + 里程碑。
-4. **PR-4 `looper:auto` 全自动档**(C/D):新 label + planner 完成内部交棒 + spec 内联。
-5. **PR-5 恢复加固**(E 2/3/4):睡眠唤醒、幂等、半截续跑。
-6. **PR-6 完成后追问**(F,取决于 A/B/C 决策)。
+1. **PR-1 启动 / 恢复健壮性**(低风险,先上):改成装常驻服务;关掉多余的「写方案」角色(或改用全自动档);修好触发标签的配置。
+2. **PR-2 一个任务一张卡 + 去掉露命令**(P1 / P2)。
+3. **PR-3 卡片 = PR 状态镜像**(A):agent 自报命令 + 提示词状态词表 + 接 GitHub 事件推送 + 状态映射。
+4. **PR-4 `looper:auto` 全自动档**(C / D):新标签 + 写方案完成后内部交给写代码 + 方案存 Plane。
+5. **PR-5 恢复加固**(E 的 2 / 3 / 4):睡眠唤醒、不重复干、半截续跑。
+6. **PR-6 完成后追问**(F,取决于 A / B / C)。
 
-## 6. 待你拍板的决策清单
+## 6. 待拍板的决策
 
-- [ ] **auto 档 label 名**:`looper:auto` / `looper:ship` / `looper:build`?(`looper:go` 别用,撞 afk:go)
-- [ ] **rollout 默认档**:worker-only(关 planner)/ 全 auto / 保留 plan 评审流水线?
-- [x] **spec = Plane Pages(product+tech),评审在 Plane,不进代码仓/不走 PR** ✅(团队已定)
-- [x] **无 execution_mode;HITL 一直在、卡住就问;label 只在最前打一次** ✅
-- [x] **product spec 产品同学写(上游);looper 只写 tech spec + 评审 + 实现** ✅(团队已定)
-- [ ] **简单活是否跳过 tech spec**(直接 `looper:worker-ready`)?
-- [ ] **tech spec review 用 agent 辅助审 + @人 approve** —— 确认?琐碎的允许 agent 自 approve?
-- [ ] **worker 读 Page 方式**:(a) agent 用 `plane api page get`(推荐)/ (b) 给 looper provider 加 Page-read?
-- [ ] **`looper:auto` 触发范围**:一个标从 spec-forge 一路驱动到实现(需 orchestrator 串起 spec-forge→looper),还是 spec 批准后才进 looper?
-- [ ] **「任务完成」判定**:源 issue 关闭 / 名下 PR 全合并 / 两者兼顾?
+- [ ] **全自动档标签名**:`looper:auto` / `looper:ship` / `looper:build`?(`looper:go` 别用,撞 `afk:go`)
+- [ ] **默认怎么配**:只留「写代码」(关「写方案」)/ 全自动 / 保留「先评审方案」?
+- [x] **方案存 Plane 文档(产品 + 技术两份),评审在 Plane,不进代码仓** ✅(已定)
+- [x] **不分档位;HITL 一直在、卡住就问;标签只在最前打一次** ✅
+- [x] **product spec 产品同学写;looper 只写 tech spec + 评审 + 实现** ✅(已定)
+- [ ] **简单活是否跳过技术方案**(直接触发实现)?
+- [ ] **技术方案评审**:agent 帮审 + @人 approve,琐碎的允许 agent 自己过 —— 确认?
+- [ ] **looper 读 Plane 文档的方式**:(a) 用 `plane` 命令行(推荐)/ (b) 给 looper 加能力?
+- [ ] **全自动档触发范围**:一个标从「写方案」一路到「实现」(需要一个调度器把 spec-forge 和 looper 串起来),还是「方案批准后」才进 looper?
+- [ ] **「任务完成」怎么算**:源需求关闭 / 名下 PR 全合并 / 两者兼顾?
 - [ ] **完成后追问**:A / B / C?
-- [ ] **状态刷新**:webhook 为主 + 兜底轮询间隔(如 60s)?
-- [ ] **测试群 chat_id**:给一个独立测试群(不碰「Looper 协作」)供 live 验证。
+- [ ] **状态刷新**:以 GitHub 事件推送为主 + 兜底轮询(如 60 秒)?
+- [ ] **给一个单独测试群**(不碰生产群「Looper 协作」)供真机验证?
 
-## 7. 验证与灰度
+## 7. 怎么验证、别踩雷
 
-- **绝不**再用生产群「Looper 协作」做测试(研发已入群)。飞书 live 验证只在**独立测试群**。
-- 每个 PR:单元测试 + `scripts/verify.sh`(gofmt/vet/test/build)+ 在测试群/scratch 仓过一遍真机。
-- 安全尾巴:轮换泄露过的 Plane key `plane_api_666a…`(每人用自己的)。
+- **绝不**再用生产群「Looper 协作」做测试(研发已入群)。飞书上的真机验证只在**单独的测试群**。
+- 每个 PR:单元测试 + 本地一键校验 + 在测试群 / 临时仓过一遍真机。
+- 安全尾巴:把泄露过的 Plane key 轮换掉(每人用自己的一把)。
 
 ---
 🤖 与 Claude Code 协作整理
