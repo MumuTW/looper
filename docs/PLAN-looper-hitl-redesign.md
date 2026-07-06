@@ -254,8 +254,13 @@ work item
 三样都要建:
 - **配置「产品是谁」**:每个项目配一个**产品负责人**(飞书 open_id;如需在 Plane 操作还要 Plane id)。新配置项(如 `projects[].productOwner`)。
 - **@ + 提示**:在任务卡片的 thread 里发一条 @产品负责人:「这个需求还没产品方案,请补一份并链到 <work item>」。
-- **挂起 + 恢复**:任务进入一个**新的等待态**「等产品方案」(和现在 HITL「等决策卡回复」不同)。⚠️ **恢复触发靠轮询**——looper 没有 Plane webhook,只能**定期查**这个需求有没有补上产品方案页;这依赖 8.2 那个**尚未定义的关联约定**(不定,查不到);还要定**超时 / 催办**策略(等产品几天?)。
+- **挂起 + 恢复**:任务进入一个**新的等待态**「等产品方案」(和现在 HITL「等决策卡回复」不同)。⚠️ **恢复触发靠轮询**——looper 没有 Plane webhook,只能**定期查**这个需求有没有补上产品方案(`plane api link list --work-item` 查有没有 `looper:product-spec` link,见 8.2);还要定**超时 / 催办**策略(等产品几天?)。
 - ⚠️ 这是一种新的「**等外部产物**」的等待,不是「等人回一句」。
+- **⚠️ looper 主动关联(关键,提示词驱动)**:产品/技术**常常不会自己去建 link**,而是**直接把方案甩在 thread 里**——一个 Plane 页链接、一个飞书文档链接、甚至一段方案正文。所以「等产品方案」态下,looper 要**盯 thread 回复**并让 agent 判断「这条是不是在给方案?」:
+  - 是**链接**(Plane 页 / 飞书文档 / 任意 URL)→ 抽出 URL,`plane api link create` 建一条 title=`looper:product-spec` 的 work-item link(**looper 替人关联**)。
+  - 是**方案正文**→ 先 `plane api page create --content` 建成 Plane 页,再建 link。
+  - 判断 = **LLM 提示词**:给 agent 当前在等哪个需求的产品方案 + 这条 thread 回复,让它输出 `{是不是方案, 产品/技术, url?, 正文?}`;拿不准就 HITL 再问一句「这是产品方案吗?我把它关到 <work item> 好吗?」。
+  - 关联成功 → 触发恢复(下一轮轮询/立即查到 link 就往下走)。这样流程**对「人不按规矩」鲁棒**。
 
 ### 8.4 读产品方案 · 写技术方案(全新;底层能力已 spike 通)
 - **读**:把产品方案(Plane 文档)作为上下文读进来(`plane api page get --content`,已 spike 通)。
