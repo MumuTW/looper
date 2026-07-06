@@ -150,6 +150,63 @@ func TestUpsertSpecLinkUpdatesStaleURL(t *testing.T) {
 	}
 }
 
+func TestPageIDFromURL(t *testing.T) {
+	cases := map[string]string{
+		"https://plane.powerformer.net/open-design/projects/p1/pages/abc-123":  "abc-123",
+		"https://plane.powerformer.net/open-design/projects/p1/pages/abc-123/": "abc-123",
+		"https://feishu.cn/docs/some-doc":                                      "", // human dropped a non-Plane link
+		"https://plane.x/pages/id?tab=1":                                       "", // query → not a clean page id
+		"":                                                                     "",
+	}
+	for url, want := range cases {
+		if got := PageIDFromURL(url); got != want {
+			t.Fatalf("PageIDFromURL(%q) = %q, want %q", url, got, want)
+		}
+	}
+}
+
+func TestReadSpecResolvesLinkToPageContent(t *testing.T) {
+	// list links → find tech-spec URL → page get --content
+	f := &fakeRun{stdouts: []string{
+		`{"results":[{"id":"l1","title":"looper:tech-spec","url":"https://plane.x/open-design/projects/p1/pages/pg-9"}]}`,
+		"<h1>Tech</h1>",
+	}}
+	g := newGateway(f)
+	content, found, err := g.ReadSpec(context.Background(), "p1", "wi-1", TechSpecLinkTitle)
+	if err != nil || !found || content != "<h1>Tech</h1>" {
+		t.Fatalf("ReadSpec = %q, %v, %v", content, found, err)
+	}
+	if !argsContain(f.calls[1], "api", "page", "get", "pg-9", "--content") {
+		t.Fatalf("page get args = %v", f.calls[1])
+	}
+}
+
+func TestReadSpecReturnsRawURLForNonPageLink(t *testing.T) {
+	// A human dropped a Feishu doc — no Plane page to read, but the association exists.
+	f := &fakeRun{stdouts: []string{`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://feishu.cn/docs/xyz"}]}`}}
+	g := newGateway(f)
+	content, found, err := g.ReadSpec(context.Background(), "p1", "wi-1", ProductSpecLinkTitle)
+	if err != nil || !found || content != "https://feishu.cn/docs/xyz" {
+		t.Fatalf("ReadSpec(non-page) = %q, %v, %v; want the raw url", content, found, err)
+	}
+	if len(f.calls) != 1 {
+		t.Fatalf("calls = %d, want only the link list (no page get for a non-page link)", len(f.calls))
+	}
+}
+
+func TestWriteTechSpecCreatesPageAndLinks(t *testing.T) {
+	// page create → link list (empty) → link create
+	f := &fakeRun{stdouts: []string{`{"id":"pg-1","name":"Tech"}`, `{"results":[]}`, `{"id":"l-new"}`}}
+	g := newGateway(f)
+	page, err := g.WriteTechSpec(context.Background(), "p1", "wi-1", "Tech", "# spec")
+	if err != nil || page.ID != "pg-1" {
+		t.Fatalf("WriteTechSpec = %+v, %v", page, err)
+	}
+	if len(f.calls) != 3 || !argsContain(f.calls[0], "page", "create") || !argsContain(f.calls[2], "link", "create") {
+		t.Fatalf("calls = %d: %v", len(f.calls), f.calls)
+	}
+}
+
 func TestDecodeLinksToleratesBareArray(t *testing.T) {
 	links, err := decodeLinks(`[{"id":"l1","title":"t","url":"u"}]`)
 	if err != nil || len(links) != 1 || links[0].ID != "l1" {

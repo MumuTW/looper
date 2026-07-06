@@ -30,16 +30,14 @@ func TestGatewayLiveRoundTrip(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	page, err := g.CreatePage(ctx, proj, "LIVE-looper-tech-spec", "# 技术方案\n- gateway 集成冒烟")
+	// §8.4 write path: create the tech-spec page AND associate it in one call.
+	page, err := g.WriteTechSpec(ctx, proj, wi, "LIVE-looper-tech-spec", "# 技术方案\n- gateway 集成冒烟")
 	if err != nil {
-		t.Fatalf("CreatePage error = %v", err)
+		t.Fatalf("WriteTechSpec error = %v", err)
 	}
-	t.Logf("created page %s (%s)", page.ID, page.URL)
+	t.Logf("wrote tech spec page %s (%s)", page.ID, page.URL)
 
-	if err := g.UpsertSpecLink(ctx, proj, wi, TechSpecLinkTitle, page.URL); err != nil {
-		t.Fatalf("UpsertSpecLink error = %v", err)
-	}
-	// Idempotent: a second upsert with the same URL is a no-op (no new link).
+	// Idempotent: re-associating the same URL is a no-op (no duplicate link).
 	if err := g.UpsertSpecLink(ctx, proj, wi, TechSpecLinkTitle, page.URL); err != nil {
 		t.Fatalf("UpsertSpecLink (repeat) error = %v", err)
 	}
@@ -47,9 +45,10 @@ func TestGatewayLiveRoundTrip(t *testing.T) {
 	if err != nil || !found || url != page.URL {
 		t.Fatalf("FindSpecLink = %q, %v, %v; want %q", url, found, err, page.URL)
 	}
-	html, err := g.PageContent(ctx, proj, page.ID)
-	if err != nil || !strings.Contains(html, "技术方案") {
-		t.Fatalf("PageContent = %q (err %v), want the body HTML", html, err)
+	// §8.4 read path: resolve the work item's tech spec (link → page → body).
+	html, found, err := g.ReadSpec(ctx, proj, wi, TechSpecLinkTitle)
+	if err != nil || !found || !strings.Contains(html, "技术方案") {
+		t.Fatalf("ReadSpec = %q (found %v, err %v), want the body HTML", html, found, err)
 	}
 
 	// Cleanup: remove the spike link + page directly via the CLI.

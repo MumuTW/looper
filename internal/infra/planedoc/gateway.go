@@ -212,6 +212,58 @@ func (g *Gateway) UpsertSpecLink(ctx context.Context, projectID, workItemID, tit
 	return nil
 }
 
+// ReadSpec returns the content of the work item's spec page tagged with `title`
+// (ProductSpecLinkTitle / TechSpecLinkTitle), resolving link → page → body. The
+// second return is whether such a spec is associated at all. This is how the worker
+// reads the product / tech spec from Plane instead of a repo file (§8.4).
+func (g *Gateway) ReadSpec(ctx context.Context, projectID, workItemID, title string) (string, bool, error) {
+	url, found, err := g.FindSpecLink(ctx, projectID, workItemID, title)
+	if err != nil || !found {
+		return "", false, err
+	}
+	pageID := PageIDFromURL(url)
+	if pageID == "" {
+		// The link points somewhere that isn't a Plane page we can read (e.g. a
+		// Feishu doc a human dropped). Surface the URL so the caller can still use it.
+		return url, true, nil
+	}
+	content, err := g.PageContent(ctx, projectID, pageID)
+	if err != nil {
+		return "", true, err
+	}
+	return content, true, nil
+}
+
+// WriteTechSpec creates a Plane page for the tech spec and associates it with the
+// work item as its looper:tech-spec link (idempotent). Returns the page. This is
+// looper's "write the tech spec + link it" step (§8.4).
+func (g *Gateway) WriteTechSpec(ctx context.Context, projectID, workItemID, name, bodyMarkdown string) (Page, error) {
+	page, err := g.CreatePage(ctx, projectID, name, bodyMarkdown)
+	if err != nil {
+		return Page{}, err
+	}
+	if err := g.UpsertSpecLink(ctx, projectID, workItemID, TechSpecLinkTitle, page.URL); err != nil {
+		return page, err
+	}
+	return page, nil
+}
+
+// PageIDFromURL extracts a Plane page id from a page URL of the form
+// .../pages/<uuid>[/]. Returns "" when the URL isn't a Plane page link.
+func PageIDFromURL(pageURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(pageURL), "/")
+	marker := "/pages/"
+	i := strings.LastIndex(trimmed, marker)
+	if i < 0 {
+		return ""
+	}
+	id := trimmed[i+len(marker):]
+	if strings.ContainsAny(id, "/?#") {
+		return ""
+	}
+	return id
+}
+
 // pageWebURL constructs a page's human URL from the API base (Plane's page API
 // returns none). Best-effort; the page id is embedded so it round-trips.
 func (g *Gateway) pageWebURL(projectID, pageID string) string {
