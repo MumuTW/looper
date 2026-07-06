@@ -262,5 +262,36 @@ work item
 - **P3**:缺产品方案的 @产品 + 等待 / 恢复 + 产品负责人配置(8.3)。人的拉入。
 - **P4**:`looper:auto` 全自动串联(§C / §D)。
 
+## 9. 评审结论与修正(fresh-agent 对抗评审 + Plane Pages spike)
+
+一个空上下文 agent 对着 looper 代码逐条核对了本 plan,并跑了 P0 Plane Pages spike。**诊断可信,但要开工得按下面改。**
+
+### 9.0 Plane Pages spike —— ✅ 已跑,结果正面(解锁流程图右半边)
+用 `plane` CLI 对真部署(`plane.powerformer.net`)实测:
+- `page create / get --content / update / list / delete` **全通**,正文正确 round-trip,**改内容也生效**(历史「改不生效」坑已修)。
+- work-item `comment create`(`--data {comment_html}`)**通**。
+
+→ **原 BLOCKER 解除**:方案进 Plane **可行**,走 `plane` CLI(§8.4 的 option a)。代价:外部 CLI 依赖 + 每人一把 key(可接受)。
+→ 遗留小问题:page 是**项目级**,create 不直接绑 work item ——「哪份页是这个 work item 的产品方案」需要一个**关联约定**(work-item 描述里链 / 命名 / 专门 link),待定。
+
+### 9.1 事实修正(plan 原文说错的,已核实)
+- **§8.1 分类器不是全新**:coordinator 的 triage **已输出 `kind/bug` vs `kind/feature`**,只是没拿去路由。→ 改成「**复用现有 kind + 接上路由**」;注意 coordinator 默认关,启用要评估影响面。
+- **§C / P4 是配置错、不是代码默认**:默认 planner / worker 标签本就不同。真正要做:**加一条跨角色 trigger-label 重叠校验**(现在 validate 不查,复发无防护)。
+- **§G / FE-3 露裸命令在 brief / phase 回退行,不是标题**:修 phase 回退的 default 分支(匹配不到就吐裸命令),不是标题格式。
+
+### 9.2 领域改造,别当小 bug(DH-3)
+**§B「一个任务一张卡」+ §3.A「卡片镜像 PR」是领域模型改造**:looper **没有跨 loop 的「任务」实体**(loop target 只有 project / PR,planner 和下游 loop 不共享 task id;卡片按 loop 存)。→ **单独设计「任务身份 + task→PR→卡片映射」**,先设计后实现;**从小卡片 bug PR 里拆出去**。
+
+### 9.3 睡眠唤醒是「建」不是「测」(DH-5)
+恢复管线只在**进程启动**跑一次;合盖是挂起不重启 → 醒来孤儿回收 / 锁释放 / requeue 都不重跑。→ 把 **reconcile 改成定时**(poll 循环里检测 wall-clock 跳变 > N 秒 → 触发一次),别依赖重启。
+
+### 9.4 「@人 approve」是新状态机(DH-6)
+reviewer 现在**全自动自己 approve**;`looper:needs-human` 标签定义了但**没接任何代码**。→ §8.6 / 流程图 H 的「@人 approve + 琐碎自过」是**新状态机**,不是配置开关。
+
+### 9.5 分期与范围修正
+- **能立即上的小 PR(PR-1 重述)**:① onboarding 换 launchd ② 单 loop 竞态修(`feishu_threads.loop_id` 加 UNIQUE + upsert-or-get)③ brief 去露命令。**不含「关 planner」**(planner 是要迁移 / 重写成 Plane tech-spec,不是删)。
+- **§8.10 隐藏依赖**:P3(@产品 + 等待 / 恢复)其实**依赖 P2**(自动恢复要读 Plane 页检测 spec 页);spike 已解锁 P2,但 P3 不能真先于 P2。
+- **P0 Plane spike:✅ 完成**(见 9.0)。
+
 ---
 🤖 与 Claude Code 协作整理
