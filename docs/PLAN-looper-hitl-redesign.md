@@ -16,6 +16,32 @@ HITL 已经上线(v0.10.1)。用一个全新 agent 照文档从零配好、跑�
 
 一句话目标:**卡片准确反映任务的真实状态;标签只表达「要做什么」、不随进度乱变;笔记本随时关也能自恢复;只有代码真正合并才算完成。**
 
+## 1.5 目标流程图(北极星)
+
+> 这是我们要 looper 最终跑通的**完整流程**。§3 只是把「已经在跑的那一小段」做对;§8 才是把整张图建起来。评审请对照这张图看 plan 有没有漏、有没有和图冲突。
+
+```mermaid
+flowchart TD
+  A["work item / issue + 打 looper:auto"] --> B{"looper 分类:bug 还是需求?"}
+  B -->|bug| C["复现 + 定位根因"]
+  C --> C2["复杂:写 tech spec 评审 / 简单:直接修"]
+  C2 --> C3["拿不准(是 bug 还是预期?修法选哪个?)→ HITL 问人"]
+  C3 --> M["开 PR"]
+  B -->|需求| D{"有 product spec 吗?"}
+  D -->|无| E["卡片 thread @产品同学 补 product spec"]
+  E --> E2["挂起等待,补好后自动恢复"]
+  E2 --> D
+  D -->|有| F["product spec(产品同学写,上游,去黑话)"]
+  F --> G["looper 读 product spec → 写 tech spec"]
+  G --> G2["grill;product spec 没说清 / 定不了 → HITL @产品/人"]
+  G2 --> H["tech spec review:agent 辅助审 + @人 approve"]
+  H --> I["worker 读 product + tech spec → 实现"]
+  I --> M
+  M --> Z["卡片跟 PR 状态(待 review / CI / 冲突 / 待合并)直到 🎉 已合并"]
+```
+
+**贯穿全程**:HITL 一直在(任何阶段 agent 定不了 → 发卡问人);只有「已合并」算完成;该由人做的活不打 `looper:auto`。
+
 ## 2. 试跑暴露的问题
 
 | # | 现象 | 说明 |
