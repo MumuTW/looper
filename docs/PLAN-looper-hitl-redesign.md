@@ -71,28 +71,25 @@ HITL 已随 **v0.10.1** 上线(决策卡、多轮对话、任务 thread、按人
 | `looper:plan` | 规划 → 停,等人评审 spec(轻量,不走 spec-forge 时) |
 | `looper:worker-ready` | 直接实现(已有现成 spec / 简单活) |
 
-- **`execution_mode`(DECIDE 产出)不是 label**,是**内部模式**,只决定实现时**自主到什么程度**:
-  - **能 AFK** → 全自主实现,只在真卡住时 HITL 问;
-  - **要 HITL 辅助** → 实现,但在关键决策点更主动发决策卡问人;
-  - **纯人工** → 不派 looper,assign 给人(agent 不碰)。
-- 整条链在**一个 `looper:auto` 之下跑完**,`execution_mode` 内部调节,**无第二次打标**。
-- **全程 HITL 照常**:真拿不准仍发决策卡。「自动」≠「不问」。
+- **没有 `execution_mode` 这个概念**:looper 实现时 **HITL 一直在**,agent 卡住/拿不准就发决策卡问人 —— 不需要事先把任务分成 AFK/HITL 档。
+- 该由人做的活,**就不打 looper 标**(交给人),不需要一个 mode 来表达。
+- 整条链在**一个 `looper:auto` 之下跑完**,无第二次打标。「自动」≠「不问」。
 - 修 bundle 误配:worker 触发器应是 `looper:worker-ready`,不是 `looper:plan`。
 
-### D. spec = Plane Pages(product + tech),评审全在 Plane;不进代码仓、不走 PR
+### D. product spec 人工写(上游);looper 写 tech spec → 评审 → 实现;全在 Plane,不进代码仓/不走 PR
 
-> 团队定调(2026-07-06,陈哲/麻薯讨论):spec **长期不放代码仓库**;**spec review 整套做进 Plane**;spec 以 **Plane Page** 存在;**worker 直接拿 work item + product spec + tech spec 开工**。
+> 团队定调(2026-07-06,陈哲/麻薯讨论):spec **长期不放代码仓库**;**spec review 整套做进 Plane**;spec 以 **Plane Page** 存在。**product spec 由产品同学写(不是 looper);looper 跟进 product spec 写 tech spec、评审、实现。**
 
-**分层,不内嵌**:
-- **spec-forge(Agent Skill)= 前端**:
-  - **AUTHOR**:写 **product spec(给人/产品看,强制去黑话、讲人话)+ tech spec(给实现看,可技术)** 两篇。两份是复杂 feature 的默认,简单需求可合成一份。
-  - **GRILL**:独立 fresh agent 对抗拷问;**遇到 agent 自己定不了、要人拍板的点 → 整理成 HITL 卡问人**(HITL 在「想清楚」阶段就体现价值)。
-  - **DECIDE**:产出 `execution_mode`(能 AFK / 要 HITL 辅助 / 纯人工),作为**内部模式**(不是 label)。
-  - **PUBLISH**:成 **Plane Pages** + 置 work item `spec:reviewing`。
-- **spec review(可 agent 辅助,不必纯人工)**:review agent 先审 spec(找漏洞/矛盾/风险)→ 整理意见;干净低风险的可配置自动过,要人拍板的 **@人来 approve**。最终签字通常仍归人,但审的重活交给 agent。
-- **looper = 执行后端**:approve 后 **worker 读 work item + 两篇 spec Page 作为上下文,直接实现**;`execution_mode` 内部调节自主程度。
+- **product spec = 人工上游**:产品同学在 Plane 写(what/why,**去黑话、给人看**)。**looper 不写它。**
+- **looper /(spec-forge 的 tech-spec 部分)= 从 product spec 产出 tech spec**:
+  - 读 product spec → 写 **tech spec**(how,Plane Page,给实现看)。
+  - **GRILL** tech spec:遇到 **product spec 没说清、agent 定不了**的点 → **整理成 HITL 卡问产品/人**(HITL 在写 tech spec 阶段就体现价值)。
+  - PUBLISH 成 Plane Page + 置 work item `spec:reviewing`。
+- **tech spec review(agent 辅助,不必纯人工)**:review agent 先审(漏洞/矛盾/风险)→ 整理意见;要人拍板的 **@人 approve**;琐碎可配置自动过。最终签字通常仍归人,审的重活交给 agent。
+- **实现**:approve 后 **worker 读 product spec + tech spec 两份 Page 作为上下文,直接实现**。
+- **没有 execution_mode**:HITL 一直在,卡住就问。
 
-**好处**:①spec 被 grill 过、质量高;②**评审在 Plane,不是悬空 GitHub PR / 也不落代码仓** → 根治「已批准不合并的 spec PR」;③execution_mode 直接决定 looper 档;④looper 自带 planner + 仓内 `SpecPath` 文件那套**弃用**。
+**好处**:①分工清楚(**产品写 what,looper 写 how + 做**);②**评审在 Plane,不落代码仓 / 不悬空 PR** → 根治「已批准不合并的 spec PR」;③looper 自带 planner + 仓内 `SpecPath` 文件那套**弃用**。
 
 **技术点 —— worker 怎么读 Plane Page**(⚠️ Pages 原只在内部 app API;你们已 fork+部署把 Pages 暴露到 `/api/v1`,且 `plane` CLI 有 `plane api page get --content`):
 - **(a) worker agent 直接用 `plane api page get`**(Pages 的 html-hydration 坑 CLI 已踩平 → 推荐)
@@ -146,9 +143,10 @@ PR 未合并前 thread 一直活,追问可路由(转 fixer/looper 应答)。**�
 - [ ] **auto 档 label 名**:`looper:auto` / `looper:ship` / `looper:build`?(`looper:go` 别用,撞 afk:go)
 - [ ] **rollout 默认档**:worker-only(关 planner)/ 全 auto / 保留 plan 评审流水线?
 - [x] **spec = Plane Pages(product+tech),评审在 Plane,不进代码仓/不走 PR** ✅(团队已定)
-- [x] **execution_mode 不是 label,是内部模式;label 只在最前打一次** ✅
-- [ ] **两份 spec 固定还是弹性**(复杂两份/简单一份)?
-- [ ] **spec review 用 agent 辅助审 + @人 approve** —— 确认?琐碎的允许 agent 自 approve?
+- [x] **无 execution_mode;HITL 一直在、卡住就问;label 只在最前打一次** ✅
+- [x] **product spec 产品同学写(上游);looper 只写 tech spec + 评审 + 实现** ✅(团队已定)
+- [ ] **简单活是否跳过 tech spec**(直接 `looper:worker-ready`)?
+- [ ] **tech spec review 用 agent 辅助审 + @人 approve** —— 确认?琐碎的允许 agent 自 approve?
 - [ ] **worker 读 Page 方式**:(a) agent 用 `plane api page get`(推荐)/ (b) 给 looper provider 加 Page-read?
 - [ ] **`looper:auto` 触发范围**:一个标从 spec-forge 一路驱动到实现(需 orchestrator 串起 spec-forge→looper),还是 spec 批准后才进 looper?
 - [ ] **「任务完成」判定**:源 issue 关闭 / 名下 PR 全合并 / 两者兼顾?
