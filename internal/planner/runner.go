@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	htmlpkg "html"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,7 +33,11 @@ const (
 	stepPrepareWorktree PlannerStep = "prepare-worktree"
 	stepWriteSpec       PlannerStep = "write-spec"
 	stepPublish         PlannerStep = "publish"
-	stepNotify          PlannerStep = "notify"
+	// Plane node H: grill (fresh adversarial pass) → review (independent verdict). Both
+	// are no-ops for GitHub/forgejo projects (their spec is the PR, reviewed there).
+	stepGrill  PlannerStep = "grill"
+	stepReview PlannerStep = "review"
+	stepNotify PlannerStep = "notify"
 
 	discoveryLabel             = "looper:plan"
 	plannerPRDedupeLookupLimit = 1000
@@ -45,7 +50,7 @@ const (
 	defaultIssueLimit   = 30
 )
 
-var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepNotify}
+var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepGrill, stepReview, stepNotify}
 
 type PlannerStep string
 
@@ -426,6 +431,9 @@ type checkpointPublishState struct {
 	// written to a Plane page (node G) and is awaiting page-comment review (node H) —
 	// there is no spec PR. Drives the completion summary + card wording.
 	PlaneSpecReview bool `json:"planeSpecReview,omitempty"`
+	// Grilled / Reviewed track node H's two mandatory agent gates (idempotent resume).
+	Grilled  bool `json:"grilled,omitempty"`
+	Reviewed bool `json:"reviewed,omitempty"`
 }
 
 type checkpointNotify struct {
@@ -804,6 +812,10 @@ func (r *Runner) executeStep(ctx context.Context, step PlannerStep, input stepIn
 		return r.runWriteSpecStep(ctx, input)
 	case stepPublish:
 		return r.runPublishStep(ctx, input)
+	case stepGrill:
+		return r.runGrillStep(ctx, input)
+	case stepReview:
+		return r.runReviewStep(ctx, input)
 	case stepNotify:
 		return r.runNotifyStep(input)
 	default:
@@ -1279,6 +1291,187 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	return checkpoint, nil
 }
 
+// runGrillStep is flowchart node H's first mandatory gate (Plane-only): a fresh
+// adversarial agent interrogates the tech spec on its Plane page, reads the real
+// source behind any claim, and REVISES the page to converge it — anything it genuinely
+// can't decide is left as an open question for a human. No-op for GitHub/forgejo
+// (their spec is the PR, reviewed there) and idempotent on resume.
+func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	if checkpoint.SkipReason != "" {
+		return checkpoint, nil
+	}
+	if r.planeDoc == nil {
+		return checkpoint, nil
+	}
+	gateway, planeProjectID, ok := r.planeDoc(input.Project.ID)
+	if !ok || gateway == nil {
+		return checkpoint, nil
+	}
+	if checkpoint.Publish != nil && checkpoint.Publish.Grilled {
+		return checkpoint, nil
+	}
+	issue, err := requireIssue(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	worktree, err := requireWorktree(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	specURL, found, err := gateway.FindSpecLink(ctx, planeProjectID, planedoc.WorkItemIDFromURL(issue.URL), planedoc.TechSpecLinkTitle)
+	if err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("grill: find spec link: %v", err), kind: FailureRetryableTransient}
+	}
+	if !found {
+		return checkpoint, nil // nothing to grill
+	}
+	r.setNodeHPhase(ctx, input.Loop.ID, "grilling")
+	prompt := buildGrillPrompt(*issue, planeProjectID, planedoc.PageIDFromURL(specURL), specURL)
+	result, err := r.runPlannerAgent(ctx, input, worktree.Path, prompt, "grill")
+	if err != nil {
+		return checkpoint, err
+	}
+	if !strings.EqualFold(result.Status, "completed") {
+		checkpoint.ResumePolicy = "retry_from_timeout_context"
+		return checkpoint, &loopError{message: "grill agent did not complete", kind: FailureRetryableAfterResume}
+	}
+	// Record the grill transcript on the spec page (signed) so the challenge/fix trail
+	// sits next to the spec for the human reviewer.
+	if summary := strings.TrimSpace(result.Summary); summary != "" {
+		body := planedoc.SignComment("<p>🔬 <b>GRILL 拷问结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p>", "grill", r.agentModel)
+		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
+			r.logger.Warn("grill: post transcript failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+		}
+	}
+	if checkpoint.Publish == nil {
+		checkpoint.Publish = &checkpointPublishState{}
+	}
+	checkpoint.Publish.Grilled = true
+	r.setNodeHPhase(ctx, input.Loop.ID, "reviewing")
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	return checkpoint, nil
+}
+
+// runReviewStep is node H's second mandatory gate (Plane-only): an INDEPENDENT reviewer
+// agent (a different pass from the grill) re-reviews the converged spec and posts a
+// verdict, then opens the human-approve gate — marks the card 需要人类审核 spec and lets
+// the reconcile poll the page for a human's approve. Idempotent; no-op for non-Plane.
+func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	if checkpoint.SkipReason != "" {
+		return checkpoint, nil
+	}
+	if r.planeDoc == nil {
+		return checkpoint, nil
+	}
+	gateway, planeProjectID, ok := r.planeDoc(input.Project.ID)
+	if !ok || gateway == nil {
+		return checkpoint, nil
+	}
+	if checkpoint.Publish != nil && checkpoint.Publish.Reviewed {
+		return checkpoint, nil
+	}
+	issue, err := requireIssue(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	worktree, err := requireWorktree(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	specURL, found, err := gateway.FindSpecLink(ctx, planeProjectID, planedoc.WorkItemIDFromURL(issue.URL), planedoc.TechSpecLinkTitle)
+	if err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("review: find spec link: %v", err), kind: FailureRetryableTransient}
+	}
+	if !found {
+		return checkpoint, nil
+	}
+	r.setNodeHPhase(ctx, input.Loop.ID, "reviewing")
+	prompt := buildReviewPrompt(*issue, planeProjectID, planedoc.PageIDFromURL(specURL), specURL)
+	result, err := r.runPlannerAgent(ctx, input, worktree.Path, prompt, "review")
+	if err != nil {
+		return checkpoint, err
+	}
+	if !strings.EqualFold(result.Status, "completed") {
+		checkpoint.ResumePolicy = "retry_from_timeout_context"
+		return checkpoint, &loopError{message: "review agent did not complete", kind: FailureRetryableAfterResume}
+	}
+	if summary := strings.TrimSpace(result.Summary); summary != "" {
+		body := planedoc.SignComment("<p>👀 <b>REVIEW 复核结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p><p>方案已过 grill + review。请人过目,无异议在本页评论 <b>approve / 同意 / 👍</b> 即进入实现。</p>", "reviewer", r.agentModel)
+		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
+			r.logger.Warn("review: post verdict failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+		}
+	}
+	if checkpoint.Publish == nil {
+		checkpoint.Publish = &checkpointPublishState{}
+	}
+	checkpoint.Publish.Reviewed = true
+	// node H converged → open the human-approve gate.
+	r.setNodeHPhase(ctx, input.Loop.ID, "awaiting_human_review")
+	if r.repos != nil && r.repos.Loops != nil {
+		if loop, gErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); gErr == nil && loop != nil {
+			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {
+				_, _ = r.updateLoop(ctx, *loop, func(u *storage.LoopRecord) { u.MetadataJSON = stringPtr(metadataJSON) })
+			}
+		}
+	}
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	return checkpoint, nil
+}
+
+// runPlannerAgent runs one bounded agent pass in the worktree and returns its result —
+// the shared execution path for the grill + review node H gates.
+func (r *Runner) runPlannerAgent(ctx context.Context, input stepInput, worktreePath, prompt, phase string) (AgentResult, error) {
+	if r.agentExecutor == nil {
+		return AgentResult{}, fmt.Errorf("planner agent executor not configured")
+	}
+	executionID := eventlog.NewEventID("agent")
+	metadata := map[string]any{"loopType": "planner", "phase": phase}
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktreePath, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s:%s", phase, input.Loop.ID)})
+	if err != nil {
+		return AgentResult{}, err
+	}
+	return execution.Wait(ctx)
+}
+
+// buildGrillPrompt is the fresh adversarial reviewer's brief (node H GRILL).
+func buildGrillPrompt(issue checkpointIssue, planeProjectID, pageID, specURL string) string {
+	return strings.Join([]string{
+		fmt.Sprintf("You are a FRESH, adversarial technical-spec reviewer for %s#%d — you did NOT write this spec.", issue.Repo, issue.IssueNumber),
+		fmt.Sprintf("The tech spec is a Plane page. Read it: `plane api page get --project %s %s --content`.", planeProjectID, pageID),
+		"Adversarially interrogate it against the REAL codebase in this worktree: open the actual source at any file:line it cites; if a claim can't be verified from real code, flag it '⚠️ 未经源码验证'. Never pretend to have read code you didn't.",
+		"Hunt for: missing/weak acceptance criteria, unhandled edge cases, security/data/migration/concurrency risk, hand-wavy steps, scope creep, and anything a worker couldn't implement unambiguously.",
+		fmt.Sprintf("REVISE the page to resolve what you can — discover the exact update flags with `plane api page update --help`, then update page %s in project %s (keep the existing structure; tighten, don't bloat).", pageID, planeProjectID),
+		"For anything you genuinely cannot decide (a real product ambiguity), do NOT guess — leave it as a clearly-labelled open question in the spec for a human.",
+		"Finish with a concise grill transcript as your final summary: what you challenged, what you fixed on the page, and what remains open. Do NOT open any pull request or touch git remotes.",
+	}, "\n")
+}
+
+// buildReviewPrompt is the independent reviewer's brief (node H REVIEW) — a different
+// pass from the grill, checking the converged spec and issuing a verdict.
+func buildReviewPrompt(issue checkpointIssue, planeProjectID, pageID, specURL string) string {
+	return strings.Join([]string{
+		fmt.Sprintf("You are an INDEPENDENT spec reviewer for %s#%d, reviewing a tech spec that already passed an adversarial grill.", issue.Repo, issue.IssueNumber),
+		fmt.Sprintf("Read the spec: `plane api page get --project %s %s --content`.", planeProjectID, pageID),
+		"Verify against the real codebase in this worktree (open cited source; flag unverified claims). Judge whether a worker could implement it unambiguously and safely.",
+		"Do NOT rewrite the spec — this is a verdict pass. If you find a blocking gap, state it precisely; otherwise confirm it is implementation-ready.",
+		"Finish with a concise verdict as your final summary: READY or the specific blockers. Do NOT open any pull request or touch git remotes.",
+	}, "\n")
+}
+
+// htmlEscape escapes text for safe embedding inside a Plane comment's HTML body.
+func htmlEscape(s string) string { return htmlpkg.EscapeString(s) }
+
+// truncateRunes caps s to n runes, appending an ellipsis when it was cut.
+func truncateRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
+}
+
 // isPlaneProject reports whether the project delegates to Plane (its planeDoc
 // resolver resolves), i.e. the tech spec lives on a Plane page rather than a spec PR.
 func (r *Runner) isPlaneProject(projectID string) bool {
@@ -1335,16 +1528,33 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 		checkpoint.Publish = &checkpointPublishState{}
 	}
 	checkpoint.Publish.PlaneSpecReview = true
-	// Mark the loop so the node H reconcile finds it: poll the spec page for a human
-	// approval, then dispatch the worker. Best-effort + guarded (a test Runner without
-	// a loops repo skips it).
-	if r.repos != nil && r.repos.Loops != nil {
-		if metadataJSON, mErr := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {
-			_, _ = r.updateLoop(ctx, input.Loop, func(u *storage.LoopRecord) { u.MetadataJSON = stringPtr(metadataJSON) })
-		}
-	}
+	// node H begins here: the tech spec is on Plane. The grill step runs next; only
+	// after grill + review converge does the loop open the human-approve gate. Mark the
+	// card so it reads 🔬 方案拷问中 instead of resting on 编写技术方案中.
+	r.setNodeHPhase(ctx, input.Loop.ID, "grilling")
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+// setNodeHPhase records the planner's node H spec-pipeline phase in loop metadata
+// (authoring / grilling / reviewing / awaiting_human_review) so the anchor card names
+// the exact sub-phase. Best-effort + guarded — re-reads the current loop so it merges
+// with markers set by earlier steps rather than clobbering them.
+func (r *Runner) setNodeHPhase(ctx context.Context, loopID, phase string) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	loop, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return
+	}
+	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"nodeHPhase": phase})
+	if err != nil {
+		return
+	}
+	if _, err := r.updateLoop(ctx, *loop, func(u *storage.LoopRecord) { u.MetadataJSON = stringPtr(metadataJSON) }); err != nil && r.logger != nil {
+		r.logger.Warn("planner: set node H phase failed", map[string]any{"loopId": loopID, "phase": phase, "error": err.Error()})
+	}
 }
 
 // publishTechSpecToPlane writes the agent's tech spec to a Plane page and links it
@@ -1790,7 +2000,7 @@ func plannerFailureBoundaryForStep(step PlannerStep) failureclass.Boundary {
 		return failureclass.BoundaryGitHubAPI
 	case stepPrepareWorktree:
 		return failureclass.BoundaryGitRemote
-	case stepWriteSpec:
+	case stepWriteSpec, stepGrill, stepReview:
 		return failureclass.BoundaryModelProvider
 	default:
 		return failureclass.BoundaryUnknown

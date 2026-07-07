@@ -142,3 +142,25 @@ func TestRunPlanePublishStepHoldsWhenNoSpec(t *testing.T) {
 		t.Fatalf("want manual-intervention hold when no spec file, got %v", err)
 	}
 }
+
+// TestGrillReviewNoOpForGitHub: node H's grill/review gates are Plane-only — a project
+// whose planeDoc doesn't resolve passes straight through (no agent run, no marker).
+func TestGrillReviewNoOpForGitHub(t *testing.T) {
+	rGH := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return nil, "", false }}
+	in := stepInput{
+		Project: storage.ProjectRecord{ID: "gh-proj"},
+		Checkpoint: plannerCheckpoint{
+			Issue:    &checkpointIssue{Repo: "o/r", IssueNumber: 9, URL: "https://github.com/o/r/issues/9"},
+			Worktree: &checkpointWorktree{Path: "/tmp/x"},
+		},
+	}
+	for _, step := range []func(context.Context, stepInput) (plannerCheckpoint, error){rGH.runGrillStep, rGH.runReviewStep} {
+		cp, err := step(context.Background(), in)
+		if err != nil {
+			t.Fatalf("github no-op step error = %v", err)
+		}
+		if cp.Publish != nil && (cp.Publish.Grilled || cp.Publish.Reviewed) {
+			t.Fatalf("github project must not grill/review: %+v", cp.Publish)
+		}
+	}
+}
