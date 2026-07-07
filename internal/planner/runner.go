@@ -1364,7 +1364,7 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 			r.logger.Warn("grill: post transcript failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
 		// node H condition #2: surface the grill transcript in the Feishu thread too.
-		r.postNodeHThreadNote(ctx, input, "🔬 GRILL 拷问结论:\n"+truncateRunes(summary, 1200))
+		r.postNodeHThreadNote(ctx, input, "🔬 GRILL 拷问结论:\n"+truncateRunes(summary, 1200), false)
 	}
 	if checkpoint.Publish == nil {
 		checkpoint.Publish = &checkpointPublishState{}
@@ -1440,7 +1440,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 			r.logger.Warn("review: retire looper:plan failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
 	}
-	r.postNodeHThreadNote(ctx, input, "🙋 方案已过 GRILL 拷问 + 独立 REVIEW,请你审批 —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现:"+specURL)
+	r.postNodeHThreadNote(ctx, input, "🙋 方案已过 GRILL 拷问 + 独立 REVIEW,请你审批 —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现:"+specURL, true)
 	if r.repos != nil && r.repos.Loops != nil {
 		if loop, gErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); gErr == nil && loop != nil {
 			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {
@@ -1507,7 +1507,9 @@ func cleanAgentSummary(s string) string {
 	cleaned = strings.ReplaceAll(cleaned, "Reading additional input from stdin...", " ")
 	cleaned = strings.TrimSpace(strings.Join(strings.Fields(cleaned), " "))
 	if cleaned == "" {
-		return strings.TrimSpace(s)
+		// The whole summary was log noise (e.g. a codex sandbox error) — post a
+		// placeholder, never the raw logs.
+		return "(本轮 agent 未产出可展示的结论)"
 	}
 	return cleaned
 }
@@ -1592,7 +1594,7 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 	checkpoint.Publish.PlaneSpecReview = true
 	// node H condition #2: surface the spec DRAFT in the Feishu thread + @product owner
 	// (FYI) — so a human sees it as review begins, before grill/review run.
-	r.postNodeHThreadNote(ctx, input, "📋 技术方案初稿已出炉:"+specURL+"\n即将进入 fresh agent 拷问(GRILL)+ 独立复核(REVIEW),收敛后请你在方案页 approve。")
+	r.postNodeHThreadNote(ctx, input, "📋 技术方案初稿已出炉:"+specURL+"\n即将进入 fresh agent 拷问(GRILL)+ 独立复核(REVIEW),收敛后请你在方案页 approve。", false)
 	// node H begins here: the tech spec is on Plane. The grill step runs next; only
 	// after grill + review converge does the loop open the human-approve gate. Mark the
 	// card so it reads 🔬 方案拷问中 instead of resting on 编写技术方案中.
@@ -1605,12 +1607,14 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 // @-mentioning the project's product owner so a human sees the spec draft / grill
 // transcript in the thread (goal condition #2). Best-effort — a missing transport or
 // owner just skips the ping.
-func (r *Runner) postNodeHThreadNote(ctx context.Context, input stepInput, text string) {
+func (r *Runner) postNodeHThreadNote(ctx context.Context, input stepInput, text string, mention bool) {
 	if r.postThreadNote == nil {
 		return
 	}
+	// Only @-mention on the ACTIONABLE post (please approve); the draft FYI and grill
+	// transcript are informational and shouldn't ping a human every time.
 	var mentions []string
-	if r.projectRoleConfig != nil {
+	if mention && r.projectRoleConfig != nil {
 		if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
 			mentions = []string{openID}
 		}
