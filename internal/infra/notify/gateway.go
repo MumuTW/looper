@@ -1806,8 +1806,13 @@ func (g *Gateway) PostThreadNote(ctx context.Context, loopID, text string, menti
 	if err != nil {
 		return err
 	}
-	_, err = g.postFeishuAppMessage(ctx, token, chatID, root, "text", string(raw))
-	return err
+	if _, err := g.postFeishuAppMessage(ctx, token, chatID, root, "text", string(raw)); err != nil {
+		return err
+	}
+	// Refresh the anchor card so its phase title tracks the loop — a node H post lands
+	// right after a phase change (e.g. →需要人类审核 spec), so the header shouldn't lag.
+	g.updateFeishuThreadHeader(ctx, token, loopID)
+	return nil
 }
 
 // patchFeishuAppCard updates an already-sent interactive card in place.
