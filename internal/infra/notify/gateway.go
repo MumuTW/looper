@@ -1260,7 +1260,7 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	// reliable here.)
 	hasPR := prURL != "" || strings.HasPrefix(strings.TrimSpace(target), "pr:")
 	awaitingProductSpec := loopAwaitingProductSpec(loop.MetadataJSON)
-	template, label := feishuLoopFlowchartStyle(loop.Type, loop.Status, hasPR, awaitingProductSpec)
+	template, label := feishuLoopFlowchartStyle(loop.Type, loop.Status, hasPR, awaitingProductSpec, loopNodeHPhase(loop.MetadataJSON))
 	// §A: once the WORKER delivers its impl PR, mirror that PR's real review-cycle
 	// state (👀 待 review / 🔄 CI 检查中 / ✋ 待修改 / ❌ CI 失败 / ✅ 待合并 / 🎉 已合并)
 	// from its latest snapshot so the header tracks the PR through to merge (node Z).
@@ -1310,6 +1310,21 @@ func loopAwaitingProductSpec(metadataJSON *string) bool {
 	return b
 }
 
+// loopNodeHPhase reads the planner's node H spec-pipeline phase from metadata
+// (authoring / grilling / reviewing / awaiting_human_review), so the card header can
+// name the exact sub-phase. Empty when unset (pre-node-H or non-Plane).
+func loopNodeHPhase(metadataJSON *string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return ""
+	}
+	s, _ := meta["nodeHPhase"].(string)
+	return strings.TrimSpace(s)
+}
+
 // feishuLoopFlowchartStyle maps a loop's ROLE + status to the anchor card's colour +
 // title, so one glance at the header says WHERE in the flow the task sits — not a
 // generic "处理中". The roles are the flowchart lanes: coordinator=分诊,
@@ -1318,22 +1333,41 @@ func loopAwaitingProductSpec(metadataJSON *string) bool {
 // (product-spec vs generic); otherwise the running label is the role's lane. A
 // planner that COMPLETED has written its tech spec to Plane and now awaits node H
 // review (👀 方案评审中), never a merge.
-func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpec bool) (template, label string) {
+func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpec bool, nodeHPhase string) (template, label string) {
 	role := strings.ToLower(strings.TrimSpace(loopType))
-	switch strings.ToLower(strings.TrimSpace(status)) {
+	st := strings.ToLower(strings.TrimSpace(status))
+	// Terminals win first.
+	switch st {
 	case "merged":
 		return "green", "🎉 已合并"
 	case "failed", "abandoned", "error":
 		return "red", "⚠️ Looper 需要处理"
-	case "awaiting_human":
-		if awaitingProductSpec {
-			return "orange", "⏸ 等待产品方案"
+	}
+	// node E hold: product-spec wait (before AUTHOR).
+	if awaitingProductSpec {
+		return "orange", "⏸ 等待产品方案"
+	}
+	// node H sub-phases (planner spec pipeline): author → grill → review → 需要人类审核.
+	// The phase marker names exactly where in the spec pipeline the task sits, so the
+	// header stops resting on a generic "编写技术方案中" through grill + review.
+	if role == "planner" {
+		switch strings.ToLower(strings.TrimSpace(nodeHPhase)) {
+		case "grilling":
+			return "blue", "🔬 方案拷问中"
+		case "reviewing":
+			return "blue", "👀 spec 评审中"
+		case "awaiting_human_review":
+			return "orange", "🙋 需要人类审核 spec"
 		}
+	}
+	// Generic HITL ask (e.g. grill uncertainty asking a human).
+	if st == "awaiting_human" {
 		return "orange", "⏸ Looper 等你定夺"
-	case "completed", "done":
+	}
+	if st == "completed" || st == "done" {
 		if role == "planner" {
-			// Tech spec written to Plane → awaiting node H review + human approve.
-			return "blue", "👀 方案评审中"
+			// AUTHOR+GRILL+REVIEW converged, spec on Plane → awaiting a human's approve.
+			return "orange", "🙋 需要人类审核 spec"
 		}
 		// worker / fixer / generic: completed means the impl PR is delivered.
 		if hasPR {
@@ -1341,10 +1375,7 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 		}
 		return "green", "✅ Looper 已完成"
 	}
-	// running / queued / paused — the label is the role's flowchart lane.
-	if awaitingProductSpec {
-		return "orange", "⏸ 等待产品方案"
-	}
+	// running / queued — the label is the role's flowchart lane.
 	switch role {
 	case "coordinator":
 		return "blue", "🧭 分诊中"
