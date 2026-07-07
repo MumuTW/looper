@@ -429,8 +429,9 @@ func TestLiveStatusHelpers(t *testing.T) {
 	if _, ok := feishuLiveFeedCard(nil, 0); ok {
 		t.Fatalf("feishuLiveFeedCard(empty) should not render")
 	}
-	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || !strings.Contains(card, "实时进度同步") {
-		t.Fatalf("feishuLiveFeedCard missing header: %q", card)
+	// Header-less now — the body leads with 🔧 实时进度, so no separate title.
+	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || strings.Contains(card, "\"header\"") || !strings.Contains(card, "🔧 实时进度") {
+		t.Fatalf("feishuLiveFeedCard: want header-less card with 🔧 实时进度 body, got %q", card)
 	}
 	// Milestone narrative renders "HH:MM · text".
 	ml := feishuMilestoneList([]loops.Milestone{{At: "2026-07-05T10:30:00.000Z", Text: "已定夺:中文"}, {At: "2026-07-05T10:50:00.000Z", Text: "🔀 已开 PR #9"}})
