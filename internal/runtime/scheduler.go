@@ -666,6 +666,16 @@ func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input
 	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
 }
 
+func (a plannerGitHubAdapter) ClosePullRequest(ctx context.Context, input planner.ClosePullRequestInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		return err // forgejo delegate: nothing to close on the github side
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+}
+
 type plannerGitAdapter struct {
 	gateway *gitinfra.Gateway
 	stamper disclosure.Stamper

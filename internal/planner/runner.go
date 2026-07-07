@@ -9,6 +9,7 @@ import (
 	htmlpkg "html"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -179,6 +180,15 @@ type GitHubGateway interface {
 	UpdatePullRequestBody(context.Context, UpdatePullRequestBodyInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
+	ClosePullRequest(context.Context, ClosePullRequestInput) error
+}
+
+// ClosePullRequestInput closes a pull request (used to retire a stray PR an agent
+// opened on a Plane project, where the spec lives on a Plane page not a PR).
+type ClosePullRequestInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
 }
 
 type CreateWorktreeInput struct {
@@ -1054,6 +1064,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")
 		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel)
+		if r.isPlaneProject(input.Project.ID) {
+			// On a Plane project the spec lives on a Plane page, never a PR. Some agents
+			// still reflexively run `gh pr create`; forbid it explicitly (looper closes a
+			// stray one anyway, but the ask avoids the noise).
+			prompt += "\n\nCRITICAL — This is a Plane project: the spec will be published to a Plane page by looper, NOT as a pull request. Write ONLY the spec file in the worktree. Do NOT run `gh pr create`, do NOT `git push`, do NOT open or modify any pull request. Any PR you open will be closed as a mistake."
+		}
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
@@ -1342,7 +1358,7 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 	}
 	// Record the grill transcript on the spec page (signed) so the challenge/fix trail
 	// sits next to the spec for the human reviewer.
-	if summary := strings.TrimSpace(result.Summary); summary != "" {
+	if summary := cleanAgentSummary(result.Summary); summary != "" {
 		body := planedoc.SignComment("<p>🔬 <b>GRILL 拷问结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p>", "grill", r.agentModel)
 		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
 			r.logger.Warn("grill: post transcript failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
@@ -1403,7 +1419,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
 		return checkpoint, &loopError{message: "review agent did not complete", kind: FailureRetryableAfterResume}
 	}
-	if summary := strings.TrimSpace(result.Summary); summary != "" {
+	if summary := cleanAgentSummary(result.Summary); summary != "" {
 		body := planedoc.SignComment("<p>👀 <b>REVIEW 复核结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p><p>方案已过 grill + review。请人过目,无异议在本页评论 <b>approve / 同意 / 👍</b> 即进入实现。</p>", "reviewer", r.agentModel)
 		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
 			r.logger.Warn("review: post verdict failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
@@ -1417,6 +1433,13 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 	// thread ONCE: review is done, please approve. This review-end ping IS the
 	// notification — no timer / periodic nudge.
 	r.setNodeHPhase(ctx, input.Loop.ID, "awaiting_human_review")
+	// Retire the planner trigger so the planner won't re-discover this item while it
+	// awaits approval — the label lifecycle is plan → (approval) → worker-ready.
+	if workItemID := planedoc.WorkItemIDFromURL(issue.URL); workItemID != "" {
+		if err := gateway.RemoveWorkItemLabel(ctx, planeProjectID, workItemID, discoveryLabel); err != nil && r.logger != nil {
+			r.logger.Warn("review: retire looper:plan failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+		}
+	}
 	r.postNodeHThreadNote(ctx, input, "🙋 方案已过 GRILL 拷问 + 独立 REVIEW,请你审批 —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现:"+specURL)
 	if r.repos != nil && r.repos.Loops != nil {
 		if loop, gErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); gErr == nil && loop != nil {
@@ -1472,6 +1495,23 @@ func buildReviewPrompt(issue checkpointIssue, planeProjectID, pageID, specURL st
 // htmlEscape escapes text for safe embedding inside a Plane comment's HTML body.
 func htmlEscape(s string) string { return htmlpkg.EscapeString(s) }
 
+// codexLogNoise matches codex runtime log lines (timestamp + level) that sometimes
+// leak into an agent's summary.
+var codexLogNoise = regexp.MustCompile(`(?i)\d{4}-\d{2}-\d{2}T[\d:.]+Z?\s+(?:ERROR|INFO|WARN|DEBUG|TRACE)\s+[^\n]*`)
+
+// cleanAgentSummary strips codex log noise (timestamped ERROR/INFO router lines, the
+// stdin prompt) from an agent summary so a grill/review transcript reads as prose, not
+// machine logs. Falls back to the raw text if filtering would empty it.
+func cleanAgentSummary(s string) string {
+	cleaned := codexLogNoise.ReplaceAllString(s, " ")
+	cleaned = strings.ReplaceAll(cleaned, "Reading additional input from stdin...", " ")
+	cleaned = strings.TrimSpace(strings.Join(strings.Fields(cleaned), " "))
+	if cleaned == "" {
+		return strings.TrimSpace(s)
+	}
+	return cleaned
+}
+
 // truncateRunes caps s to n runes, appending an ellipsis when it was cut.
 func truncateRunes(s string, n int) string {
 	runes := []rune(s)
@@ -1523,6 +1563,19 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 	}
 	if !found {
 		return checkpoint, &loopError{message: "planner produced no tech spec to publish to Plane (agent wrote no spec file)", kind: FailureManualIntervention}
+	}
+	// Retire any PR an agent opened on this branch despite instructions — on a Plane
+	// project the spec is the page, not a PR, so a planner-branch PR is a stray.
+	if r.github != nil {
+		if stray, sErr := r.findOpenPullRequestForBranch(ctx, issue.Repo, worktree.Branch, worktree.BaseBranch, input.Project.RepoPath); sErr == nil && stray != nil && stray.Number > 0 {
+			if err := r.github.ClosePullRequest(ctx, ClosePullRequestInput{Repo: issue.Repo, PRNumber: stray.Number, CWD: input.Project.RepoPath}); err != nil {
+				if r.logger != nil {
+					r.logger.Warn("plane publish: close stray agent PR failed (continuing)", map[string]any{"repo": issue.Repo, "pr": stray.Number, "error": err.Error()})
+				}
+			} else if r.logger != nil {
+				r.logger.Info("plane publish: closed stray agent-opened PR", map[string]any{"repo": issue.Repo, "pr": stray.Number})
+			}
+		}
 	}
 	// Leave a neutral [looper] status note on the spec page — the tech-spec draft has
 	// landed and is entering review (node H). The GRILL + human-approve (via a Feishu

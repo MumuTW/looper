@@ -1228,6 +1228,7 @@ type fakeGitHubGateway struct {
 	updatePRBodyCalls  []UpdatePullRequestBodyInput
 	addLabelCalls      []PullRequestLabelsInput
 	addReviewerCalls   []PullRequestReviewersInput
+	closedPRs          []int64
 	addAssigneeCalls   []IssueAssigneesInput
 	addAssigneeErr     error
 	login              string
@@ -1306,6 +1307,11 @@ func (f *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRe
 
 func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input PullRequestReviewersInput) error {
 	f.addReviewerCalls = append(f.addReviewerCalls, input)
+	return nil
+}
+
+func (f *fakeGitHubGateway) ClosePullRequest(_ context.Context, input ClosePullRequestInput) error {
+	f.closedPRs = append(f.closedPRs, input.PRNumber)
 	return nil
 }
 

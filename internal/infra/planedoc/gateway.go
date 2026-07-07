@@ -473,6 +473,53 @@ func (g *Gateway) AddWorkItemLabel(ctx context.Context, projectID, workItemID, l
 	return nil
 }
 
+// RemoveWorkItemLabel detaches a label (by name) from a work item, preserving the
+// rest — how node H retires looper:plan once the spec is done, so the planner does not
+// re-discover the item. Idempotent: a no-op when the project lacks the label or the
+// work item doesn't carry it.
+func (g *Gateway) RemoveWorkItemLabel(ctx context.Context, projectID, workItemID, labelName string) error {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(workItemID) == "" || strings.TrimSpace(labelName) == "" {
+		return fmt.Errorf("planedoc: RemoveWorkItemLabel requires project id, work item id, and label name")
+	}
+	listArgs := append([]string{"api", "label", "list", "--project", projectID, "--all", "--json"}, g.globalArgs()...)
+	res, err := g.runPlane(ctx, "", listArgs...)
+	if err != nil {
+		return fmt.Errorf("planedoc: list labels: %w", err)
+	}
+	labelID := ""
+	for _, l := range decodeLabelList(res.Stdout) {
+		if strings.EqualFold(strings.TrimSpace(l.Name), strings.TrimSpace(labelName)) {
+			labelID = l.ID
+			break
+		}
+	}
+	if labelID == "" {
+		return nil // project doesn't have the label → nothing on the item to remove
+	}
+	current, err := g.workItemLabelIDs(ctx, projectID, workItemID)
+	if err != nil {
+		return err
+	}
+	next := make([]string, 0, len(current))
+	found := false
+	for _, id := range current {
+		if id == labelID {
+			found = true
+			continue
+		}
+		next = append(next, id)
+	}
+	if !found {
+		return nil // item doesn't carry it
+	}
+	data := fmt.Sprintf(`{"labels":%s}`, jsonStringSlice(next))
+	args := append([]string{"api", "work-item", "update", "--project", projectID, workItemID, "--data", data}, g.globalArgs()...)
+	if _, err := g.runPlane(ctx, "", args...); err != nil {
+		return fmt.Errorf("planedoc: remove work item label: %w", err)
+	}
+	return nil
+}
+
 // resolveOrCreateLabel returns the UUID of the project label named `name`, creating it
 // if the project doesn't have one (case-insensitive match on the name).
 func (g *Gateway) resolveOrCreateLabel(ctx context.Context, projectID, name string) (string, error) {
