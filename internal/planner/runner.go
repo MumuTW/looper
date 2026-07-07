@@ -1197,6 +1197,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	if pr == nil || pr.Number == 0 {
 		return checkpoint, &loopError{message: "Planner publish requires a pull request number", kind: FailureRetryableAfterResume}
 	}
+	// Flowchart node G: publish the tech spec to Plane as soon as the PR exists, before
+	// the label/reviewer steps (so it lands even if those retry). Best-effort + idempotent.
+	if err := r.publishTechSpecToPlane(ctx, input, *issue, *worktree); err != nil && r.logger != nil {
+		r.logger.Warn("planner: publish tech spec to Plane failed", map[string]any{"projectId": input.Project.ID, "error": err.Error()})
+	}
 	if !stringInSlice(specpr.ReviewingLabel, checkpoint.Publish.LabelsAdded) {
 		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -1220,13 +1225,6 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
-	}
-	// Flowchart node G: on a Plane project, also publish the tech spec as a Plane page
-	// and link it to the work item (looper:tech-spec). Best-effort + idempotent — the
-	// GitHub spec PR above stays the review surface for now; Plane review (node H) and
-	// dropping the repo spec PR come next.
-	if err := r.publishTechSpecToPlane(ctx, input, *issue, *worktree); err != nil && r.logger != nil {
-		r.logger.Warn("planner: publish tech spec to Plane failed", map[string]any{"projectId": input.Project.ID, "error": err.Error()})
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
