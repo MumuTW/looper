@@ -1315,12 +1315,19 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 	// Verify it actually landed: the agent must have written a spec file. Without the
 	// tech-spec link there is nothing to review and — unlike the GitHub path — no PR
 	// to fall back to, so hold for a human rather than silently completing empty.
-	_, found, err := gateway.FindSpecLink(ctx, planeProjectID, workItemID, planedoc.TechSpecLinkTitle)
+	specURL, found, err := gateway.FindSpecLink(ctx, planeProjectID, workItemID, planedoc.TechSpecLinkTitle)
 	if err != nil {
 		return checkpoint, &loopError{message: fmt.Sprintf("verify tech spec link: %v", err), kind: FailureRetryableTransient}
 	}
 	if !found {
 		return checkpoint, &loopError{message: "planner produced no tech spec to publish to Plane (agent wrote no spec file)", kind: FailureManualIntervention}
+	}
+	// node H: open the review on the spec page — a [looper]-marked comment prompting a
+	// human to reply approve/同意/👍. Idempotent + best-effort; the tech-spec link is the
+	// real discovery signal, so a failed comment must not wedge the planner.
+	reviewHTML := "<p>" + planedoc.LooperCommentMarker + " 技术方案已写好,请评审 👀 —— 看没问题回复 <b>approve</b> / <b>同意</b> / 👍 即进入实现;有意见直接在本页评论,我会跟进。</p>"
+	if _, err := gateway.PostSpecReviewComment(ctx, planeProjectID, specURL, reviewHTML); err != nil && r.logger != nil {
+		r.logger.Warn("planner: open spec review comment failed (continuing)", map[string]any{"projectId": input.Project.ID, "page": specURL, "error": err.Error()})
 	}
 	if checkpoint.Publish == nil {
 		checkpoint.Publish = &checkpointPublishState{}

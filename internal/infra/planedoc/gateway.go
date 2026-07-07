@@ -384,6 +384,46 @@ func (g *Gateway) ListPageComments(ctx context.Context, projectID, pageID string
 	return decodePageComments(result.Stdout)
 }
 
+// PostSpecReviewComment opens node H on a spec page: it posts a [looper]-marked
+// review comment, idempotently — if the page already carries a [looper] comment it
+// no-ops, so a planner rerun doesn't duplicate the review request. commentHTML must
+// carry LooperCommentMarker. Returns whether it posted.
+func (g *Gateway) PostSpecReviewComment(ctx context.Context, projectID, pageURL, commentHTML string) (bool, error) {
+	pageID := PageIDFromURL(pageURL)
+	if pageID == "" {
+		return false, fmt.Errorf("planedoc: PostSpecReviewComment cannot resolve page id from %q", pageURL)
+	}
+	existing, err := g.ListPageComments(ctx, projectID, pageID)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range existing {
+		if strings.Contains(c.CommentStripped, LooperCommentMarker) || strings.Contains(c.CommentHTML, LooperCommentMarker) {
+			return false, nil // review already opened
+		}
+	}
+	if _, err := g.CreatePageComment(ctx, projectID, pageID, commentHTML); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// SpecApprovedOnPage reports whether a human has approved the tech spec on the page
+// at pageURL (node H gate) — resolves the page, lists its comments, and runs
+// DetectSpecApproval. Returns the approver's display name.
+func (g *Gateway) SpecApprovedOnPage(ctx context.Context, projectID, pageURL string) (bool, string, error) {
+	pageID := PageIDFromURL(pageURL)
+	if pageID == "" {
+		return false, "", fmt.Errorf("planedoc: SpecApprovedOnPage cannot resolve page id from %q", pageURL)
+	}
+	comments, err := g.ListPageComments(ctx, projectID, pageID)
+	if err != nil {
+		return false, "", err
+	}
+	approved, by := DetectSpecApproval(comments)
+	return approved, by, nil
+}
+
 // SpecKind is which spec a dropped document is — decides the link title tag.
 type SpecKind string
 
@@ -491,6 +531,38 @@ func decodeLinks(stdout string) ([]Link, error) {
 		return nil, fmt.Errorf("planedoc: decode links: %w", err)
 	}
 	return bare, nil
+}
+
+// LooperCommentMarker prefixes every page comment looper itself posts (its node H
+// assist-review), so approval detection can exclude looper's own comments and only
+// count a human's reply as the approve gate.
+const LooperCommentMarker = "[looper]"
+
+// specApproveTokens are the phrases a human's reply may use to approve a tech spec.
+// Matched case-insensitively against the comment's stripped text.
+var specApproveTokens = []string{"approve", "lgtm", "同意", "通过", "批准", "👍", "ok 了", "可以了", "没问题"}
+
+// DetectSpecApproval reports whether a HUMAN has approved the tech spec in these page
+// comments — the node H gate. A comment carrying LooperCommentMarker is looper's own
+// (its assist-review or status notes) and never counts; any other comment whose text
+// matches an approve token does. Returns the approver's display name for the record.
+func DetectSpecApproval(comments []PageComment) (approved bool, by string) {
+	for _, c := range comments {
+		text := strings.TrimSpace(c.CommentStripped)
+		if text == "" {
+			text = strings.TrimSpace(c.CommentHTML)
+		}
+		if text == "" || strings.Contains(text, LooperCommentMarker) {
+			continue // empty, or looper's own comment — not a human approval
+		}
+		low := strings.ToLower(text)
+		for _, tok := range specApproveTokens {
+			if strings.Contains(low, strings.ToLower(tok)) {
+				return true, strings.TrimSpace(c.DisplayName)
+			}
+		}
+	}
+	return false, ""
 }
 
 // decodePageComments unwraps either a bare array or a {results:[...]} envelope, the

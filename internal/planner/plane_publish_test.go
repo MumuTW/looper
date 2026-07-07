@@ -90,13 +90,15 @@ func TestRunPlanePublishStepWritesSpecNoPR(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "specs", "s.md"), []byte("# Tech Spec\n验收: e2e"), 0o644)
 
 	// publishTechSpecToPlane: find(empty)→page create→upsert list(empty)→link create;
-	// then runPlanePublishStep's verify find → now returns the tech-spec link.
+	// verify find → tech-spec link; then node H review-open: list comments(empty)→create.
 	gw, _ := scriptedGateway(
 		`{"results":[]}`,
 		`{"id":"pg-1","name":"Tech Spec: 登录"}`,
 		`{"results":[]}`,
 		`{"id":"l-new"}`,
 		`{"results":[{"id":"l-new","title":"looper:tech-spec","url":"https://plane.x/pages/pg-1"}]}`,
+		`{"results":[]}`,
+		`{"id":"c-review","comment_html":"<p>[looper] ...</p>","comment_stripped":"[looper] ..."}`,
 	)
 	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj", true }}
 	in := stepInput{

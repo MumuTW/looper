@@ -321,3 +321,32 @@ func TestDecodeLinksToleratesBareArray(t *testing.T) {
 		t.Fatalf("decodeLinks(empty) = %v, %v", links, err)
 	}
 }
+
+func TestDetectSpecApproval(t *testing.T) {
+	looper := PageComment{ID: "1", CommentStripped: "[looper] node H 辅助审:第2节缺验收标准", DisplayName: "mashu"}
+	approveTokens := []struct{ text, tok string }{
+		{"approve", "approve"}, {"LGTM 可以合", "lgtm"}, {"同意这个方案", "同意"},
+		{"通过", "通过"}, {"👍", "👍"}, {"我觉得没问题", "没问题"},
+	}
+	for _, tc := range approveTokens {
+		human := PageComment{ID: "2", CommentStripped: tc.text, DisplayName: "杨瑾龙"}
+		ok, by := DetectSpecApproval([]PageComment{looper, human})
+		if !ok || by != "杨瑾龙" {
+			t.Fatalf("approve %q (tok %q): ok=%v by=%q, want approved by 杨瑾龙", tc.text, tc.tok, ok, by)
+		}
+	}
+	// looper's own comment carrying an approve-ish word must NOT count as approval.
+	looperSelfApprove := PageComment{ID: "3", CommentStripped: "[looper] 我approve了自己的方案", DisplayName: "mashu"}
+	if ok, _ := DetectSpecApproval([]PageComment{looperSelfApprove}); ok {
+		t.Fatalf("looper's own [looper] comment must not self-approve")
+	}
+	// A plain discussion comment with no approve token → not approved.
+	discuss := PageComment{ID: "4", CommentStripped: "这里的边界还要再想想", DisplayName: "chaoxiaoche"}
+	if ok, _ := DetectSpecApproval([]PageComment{looper, discuss}); ok {
+		t.Fatalf("a non-approve human comment must not approve")
+	}
+	// No comments → not approved.
+	if ok, _ := DetectSpecApproval(nil); ok {
+		t.Fatalf("empty comments must not approve")
+	}
+}
