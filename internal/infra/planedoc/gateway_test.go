@@ -2,6 +2,7 @@ package planedoc
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -241,6 +242,59 @@ func TestAssociateDroppedSpecRejectsEmptyAndUnknownKind(t *testing.T) {
 	if _, err := g.AssociateDroppedSpec(context.Background(), "p1", "wi-1", SpecKind("bogus"), "https://x", "", ""); err == nil {
 		t.Fatal("want error for unknown spec kind")
 	}
+}
+
+func TestDecideIntakeAndHasProductSpec(t *testing.T) {
+	if DecideIntake(true) != IntakeProceed {
+		t.Fatal("with a product spec → proceed")
+	}
+	if DecideIntake(false) != IntakeRequestProduct {
+		t.Fatal("no product spec → request from product")
+	}
+	// HasProductSpec finds the product-spec link.
+	f := &fakeRun{stdouts: []string{`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://x/pages/p1"}]}`}}
+	g := newGateway(f)
+	present, url, err := g.HasProductSpec(context.Background(), "p1", "wi-1")
+	if err != nil || !present || url != "https://x/pages/p1" {
+		t.Fatalf("HasProductSpec = %v, %q, %v", present, url, err)
+	}
+	// none → absent
+	f2 := &fakeRun{stdouts: []string{`{"results":[]}`}}
+	if present, _, _ := newGateway(f2).HasProductSpec(context.Background(), "p1", "wi-1"); present {
+		t.Fatal("HasProductSpec = true, want false for a work item with no product-spec link")
+	}
+}
+
+func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
+	f := &fakeRun{stdouts: []string{`{"id":"c1"}`}}
+	g := newGateway(f)
+	if err := g.RequestProductSpec(context.Background(), "p1", "wi-1", "@产品<x>", "登录 & 注册"); err != nil {
+		t.Fatalf("RequestProductSpec error = %v", err)
+	}
+	args := f.calls[0]
+	if !argsContain(args, "api", "comment", "create") || !argPairPresent(args, "--work-item", "wi-1") {
+		t.Fatalf("comment args = %v", args)
+	}
+	// The --data value is valid JSON whose decoded comment_html has the mention/name
+	// HTML-escaped (so a "<x>" injection can't become raw markup).
+	var data struct {
+		CommentHTML string `json:"comment_html"`
+	}
+	if err := json.Unmarshal([]byte(argValue(args, "--data")), &data); err != nil {
+		t.Fatalf("--data not valid JSON: %v", err)
+	}
+	if !strings.Contains(data.CommentHTML, "&lt;x&gt;") || !strings.Contains(data.CommentHTML, "&amp;") {
+		t.Fatalf("comment_html not escaped: %q", data.CommentHTML)
+	}
+}
+
+func argValue(args []string, flag string) string {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 func TestDecodeLinksToleratesBareArray(t *testing.T) {

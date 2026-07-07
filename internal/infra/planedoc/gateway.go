@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	htmlpkg "html"
 	"strings"
 	"time"
 
@@ -262,6 +263,58 @@ func PageIDFromURL(pageURL string) string {
 		return ""
 	}
 	return id
+}
+
+// IntakeAction is what a looper:auto feature work item needs next at the intake
+// gate (plan §8.0 / flowchart node D): proceed to the tech-spec pipeline, or ask
+// the product owner to supply a product spec first and wait.
+type IntakeAction string
+
+const (
+	IntakeProceed        IntakeAction = "proceed"         // product spec present → planner can write the tech spec
+	IntakeRequestProduct IntakeAction = "request_product" // no product spec → @product + wait
+)
+
+// DecideIntake maps "does this feature have a product spec?" to the gate action.
+func DecideIntake(hasProductSpec bool) IntakeAction {
+	if hasProductSpec {
+		return IntakeProceed
+	}
+	return IntakeRequestProduct
+}
+
+// HasProductSpec reports whether the work item already has a product spec linked
+// (flowchart node D). Returns the spec URL too.
+func (g *Gateway) HasProductSpec(ctx context.Context, projectID, workItemID string) (bool, string, error) {
+	url, found, err := g.FindSpecLink(ctx, projectID, workItemID, ProductSpecLinkTitle)
+	return found, url, err
+}
+
+// CommentOnWorkItem posts an HTML comment on a Plane work item.
+func (g *Gateway) CommentOnWorkItem(ctx context.Context, projectID, workItemID, commentHTML string) error {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(workItemID) == "" || strings.TrimSpace(commentHTML) == "" {
+		return fmt.Errorf("planedoc: CommentOnWorkItem requires project id, work item id, and html")
+	}
+	data := fmt.Sprintf(`{"comment_html":%s}`, jsonString(commentHTML))
+	args := []string{"api", "comment", "create", "--project", projectID, "--work-item", workItemID, "--data", data}
+	args = append(args, g.globalArgs()...)
+	if _, err := g.runPlane(ctx, "", args...); err != nil {
+		return fmt.Errorf("planedoc: comment on work item: %w", err)
+	}
+	return nil
+}
+
+// RequestProductSpec asks the product owner (by an already-rendered mention/name)
+// to supply a product spec, as a comment on the work item (flowchart node E, Plane
+// side — the task-card @-mention in Feishu is a separate surface). The comment
+// tells them looper will auto-associate whatever spec link/text they reply with.
+func (g *Gateway) RequestProductSpec(ctx context.Context, projectID, workItemID, ownerMention, workItemName string) error {
+	html := fmt.Sprintf(
+		"<p>%s 这个需求「%s」还没有 product spec。请补一份 —— 直接把方案页链接或正文发在这里,looper 会自动把它关联到本 work item 并继续。</p>",
+		htmlpkg.EscapeString(strings.TrimSpace(ownerMention)),
+		htmlpkg.EscapeString(strings.TrimSpace(workItemName)),
+	)
+	return g.CommentOnWorkItem(ctx, projectID, workItemID, html)
 }
 
 // SpecKind is which spec a dropped document is — decides the link title tag.
