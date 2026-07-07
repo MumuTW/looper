@@ -1221,8 +1221,63 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
 	}
+	// Flowchart node G: on a Plane project, also publish the tech spec as a Plane page
+	// and link it to the work item (looper:tech-spec). Best-effort + idempotent — the
+	// GitHub spec PR above stays the review surface for now; Plane review (node H) and
+	// dropping the repo spec PR come next.
+	if err := r.publishTechSpecToPlane(ctx, input, *issue, *worktree); err != nil && r.logger != nil {
+		r.logger.Warn("planner: publish tech spec to Plane failed", map[string]any{"projectId": input.Project.ID, "error": err.Error()})
+	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+// publishTechSpecToPlane writes the agent's tech spec to a Plane page and links it
+// to the work item (node G). No-op for github/forgejo projects, when the work item
+// can't be resolved, or when a tech-spec page is already linked (idempotent).
+func (r *Runner) publishTechSpecToPlane(ctx context.Context, input stepInput, issue checkpointIssue, worktree checkpointWorktree) error {
+	if r.planeDoc == nil {
+		return nil
+	}
+	gateway, planeProjectID, ok := r.planeDoc(input.Project.ID)
+	if !ok || gateway == nil {
+		return nil
+	}
+	workItemID := planedoc.WorkItemIDFromURL(issue.URL)
+	if workItemID == "" {
+		return nil
+	}
+	if _, found, err := gateway.FindSpecLink(ctx, planeProjectID, workItemID, planedoc.TechSpecLinkTitle); err != nil {
+		return err
+	} else if found {
+		return nil // already published
+	}
+	specPath := firstNonEmpty(worktree.SpecPath, issue.SpecPath)
+	content, err := readPlannerSpecFile(worktree.Path, specPath)
+	if err != nil || strings.TrimSpace(content) == "" {
+		return err // nothing to publish (agent wrote no spec file) — leave it to the GitHub PR
+	}
+	_, err = gateway.WriteTechSpec(ctx, planeProjectID, workItemID, "Tech Spec: "+issue.Title, content)
+	return err
+}
+
+// readPlannerSpecFile reads the spec markdown the agent wrote in the worktree.
+func readPlannerSpecFile(worktreePath, specPath string) (string, error) {
+	if strings.TrimSpace(specPath) == "" {
+		return "", nil
+	}
+	resolved := specPath
+	if !filepath.IsAbs(specPath) {
+		resolved = filepath.Join(worktreePath, specPath)
+	}
+	content, err := os.ReadFile(resolved)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return string(content), nil
 }
 
 func plannerWorktreeRoot(project storage.ProjectRecord) (string, error) {
