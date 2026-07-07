@@ -1173,6 +1173,8 @@ func (r *Runtime) runWakeReconcile(ctx context.Context, reason string) {
 	if err != nil && logger != nil {
 		logger.Warn("wake reconcile: stale-run reconcile failed", map[string]any{"error": err.Error(), "reason": reason})
 	}
+	// Resume planner loops whose product spec was supplied while they were held (E2).
+	r.reconcileAwaitingProductSpec(ctx)
 	if logger != nil && (released > 0 || stale.InterruptedRuns > 0 || stale.LoopsRequeued > 0) {
 		logger.Info("wake reconcile recovered work", map[string]any{"reason": reason, "locksReleased": released, "runsInterrupted": stale.InterruptedRuns, "loopsRequeued": stale.LoopsRequeued})
 	}
