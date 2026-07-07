@@ -23,6 +23,7 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	"github.com/nexu-io/looper/internal/infra/planedoc"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
@@ -2096,6 +2097,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		AgentModel:         cfg.Agent.Model,
 		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
 		AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
+		PlaneDoc:           func(projectID string) (*planedoc.Gateway, string, bool) { return planeDocForProject(&cfg, projectID) },
 		DiscoveryPolicy: planner.DiscoveryPolicy{
 			AutoDiscovery:              cfg.Roles.Planner.AutoDiscovery,
 			Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),

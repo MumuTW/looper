@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
@@ -298,7 +299,15 @@ type Options struct {
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
 	DiscoveryPolicy         DiscoveryPolicy
+	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
+	// project whose task source is Plane (§8 flowchart). nil / (…,false) → the
+	// project keeps the repo-file spec path (github/forgejo). Set for plane projects.
+	PlaneDoc PlaneDocResolver
 }
+
+// PlaneDocResolver returns a project's Plane spec-document gateway + Plane project
+// UUID, or ok=false for non-Plane projects.
+type PlaneDocResolver func(projectID string) (*planedoc.Gateway, string, bool)
 
 type DiscoveryPolicy struct {
 	AutoDiscovery              bool
@@ -329,6 +338,7 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	discoveryPolicy         DiscoveryPolicy
+	planeDoc                PlaneDocResolver
 }
 
 type DiscoveryInput struct {
@@ -484,7 +494,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -876,10 +886,50 @@ func (input stepInput) CheckpointIssueLogin() string {
 	return input.Checkpoint.Issue.CurrentUserLogin
 }
 
+// productSpecGate implements flowchart node D/E for a Plane-provider feature: check
+// whether the work item has a product spec; if not, ask product on the work item and
+// return a hold (FailureManualIntervention) so the planner doesn't write a tech spec
+// without one. A no-op for github/forgejo projects, non-features, or when the work
+// item / spec status can't be resolved (fail open — don't wedge non-Plane flows).
+func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoint plannerCheckpoint) *loopError {
+	if r.planeDoc == nil || checkpoint.Issue == nil {
+		return nil
+	}
+	gateway, planeProjectID, ok := r.planeDoc(input.Project.ID)
+	if !ok || gateway == nil {
+		return nil
+	}
+	issue := checkpoint.Issue
+	if !stringInSlice("kind/feature", issue.Labels) {
+		return nil // bugs / refactors / perf don't need a product spec
+	}
+	workItemID := planedoc.WorkItemIDFromURL(issue.URL)
+	if workItemID == "" {
+		return nil
+	}
+	present, _, err := gateway.HasProductSpec(ctx, planeProjectID, workItemID)
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("check product spec on work item: %v", err), kind: FailureRetryableTransient}
+	}
+	if present {
+		return nil // has a product spec → proceed to write the tech spec
+	}
+	if err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", issue.Title); err != nil && r.logger != nil {
+		r.logger.Warn("planner: request product spec failed", map[string]any{"projectId": input.Project.ID, "workItem": workItemID, "error": err.Error()})
+	}
+	return &loopError{message: "awaiting product spec — asked product to supply one on the work item", kind: FailureManualIntervention}
+}
+
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
+	}
+	// Flowchart node D/E: on a Plane project, a feature can't be planned until it has
+	// a product spec. If missing, ask product on the work item and hold (no worktree,
+	// no tech spec) until it's supplied.
+	if gateErr := r.productSpecGate(ctx, input, checkpoint); gateErr != nil {
+		return checkpoint, gateErr
 	}
 	projectMetadata := parseJSONObject(input.Project.MetadataJSON)
 	worktreeRoot := stringFromAnyDefault(projectMetadata["worktreeRoot"])

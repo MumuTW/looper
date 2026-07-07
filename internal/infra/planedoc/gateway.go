@@ -374,6 +374,24 @@ func (g *Gateway) AssociateDroppedSpec(ctx context.Context, projectID, workItemI
 	}
 }
 
+// WorkItemIDFromURL extracts a Plane work-item UUID from an issue/work-item URL of
+// the form .../issues/<uuid> or .../work-items/<uuid>. This is how the planner /
+// worker get the work-item UUID (which the link/comment/spec ops need) from the
+// loop's issue URL, without an extra API round-trip. Returns "" when the URL isn't
+// a Plane work-item URL.
+func WorkItemIDFromURL(workItemURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(workItemURL), "/")
+	for _, marker := range []string{"/issues/", "/work-items/"} {
+		if i := strings.LastIndex(trimmed, marker); i >= 0 {
+			id := trimmed[i+len(marker):]
+			if id != "" && !strings.ContainsAny(id, "/?#") {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
 // pageWebURL constructs a page's human URL from the API base (Plane's page API
 // returns none). Best-effort; the page id is embedded so it round-trips.
 func (g *Gateway) pageWebURL(projectID, pageID string) string {

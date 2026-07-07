@@ -166,6 +166,21 @@ func TestPageIDFromURL(t *testing.T) {
 	}
 }
 
+func TestWorkItemIDFromURL(t *testing.T) {
+	cases := map[string]string{
+		"https://plane.powerformer.net/open-design/projects/p1/issues/wi-uuid-9":      "wi-uuid-9",
+		"https://plane.powerformer.net/open-design/projects/p1/work-items/wi-uuid-9/": "wi-uuid-9",
+		"https://github.com/owner/repo/issues/42":                                     "42", // generic /issues/ still parses trailing id
+		"https://plane.x/projects/p1":                                                 "",
+		"":                                                                            "",
+	}
+	for url, want := range cases {
+		if got := WorkItemIDFromURL(url); got != want {
+			t.Fatalf("WorkItemIDFromURL(%q) = %q, want %q", url, got, want)
+		}
+	}
+}
+
 func TestReadSpecResolvesLinkToPageContent(t *testing.T) {
 	// list links → find tech-spec URL → page get --content
 	f := &fakeRun{stdouts: []string{
