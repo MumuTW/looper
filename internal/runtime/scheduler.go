@@ -2196,9 +2196,10 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		},
 	})
 	workerRunner = worker.New(worker.Options{
-		DB:     coordinator.DB(),
-		Repos:  repos,
-		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
+		DB:       coordinator.DB(),
+		Repos:    repos,
+		PlaneDoc: func(projectID string) (*planedoc.Gateway, string, bool) { return planeDocForProject(&cfg, projectID) },
+		GitHub:   workerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 		},

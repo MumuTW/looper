@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
@@ -425,6 +426,36 @@ type RunCompletedInput struct {
 
 type RunCompletedFunc func(context.Context, RunCompletedInput) error
 
+// PlaneDocResolver returns a project's Plane spec-document gateway + Plane project
+// UUID, or ok=false for non-Plane projects.
+type PlaneDocResolver func(projectID string) (*planedoc.Gateway, string, bool)
+
+// planeSpecBlock returns the product + tech spec (from the work item's linked Plane
+// pages) as a prompt block, or "" for github/forgejo projects, unresolvable work
+// items, or when no spec is linked. Best-effort — a Plane hiccup returns "" so the
+// worker still runs against the repo-file spec (flowchart node I, additive).
+func (r *Runner) planeSpecBlock(ctx context.Context, projectID, issueURL string) string {
+	if r.planeDoc == nil {
+		return ""
+	}
+	gateway, planeProjectID, ok := r.planeDoc(projectID)
+	if !ok || gateway == nil {
+		return ""
+	}
+	workItemID := planedoc.WorkItemIDFromURL(issueURL)
+	if workItemID == "" {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if product, found, err := gateway.ReadSpec(ctx, planeProjectID, workItemID, planedoc.ProductSpecLinkTitle); err == nil && found && strings.TrimSpace(product) != "" {
+		parts = append(parts, "Product spec (from Plane):\n"+product)
+	}
+	if tech, found, err := gateway.ReadSpec(ctx, planeProjectID, workItemID, planedoc.TechSpecLinkTitle); err == nil && found && strings.TrimSpace(tech) != "" {
+		parts = append(parts, "Tech spec (from Plane):\n"+tech)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 type Options struct {
 	DB                              *sql.DB
 	Repos                           *storage.Repositories
@@ -454,6 +485,10 @@ type Options struct {
 	DiscoveryPolicy                 DiscoveryPolicy
 	OnQueueItemEnqueued             func()
 	Network                         NetworkStatusGateway
+	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
+	// project whose task source is Plane, so the worker can read the product/tech
+	// spec from Plane pages (flowchart node I). nil / (…,false) → repo-file spec path.
+	PlaneDoc PlaneDocResolver
 	// HITLEnabled gates the mid-run human-in-the-loop feature. When false (the
 	// default) none of the HITL code paths run and the worker behaves exactly as
 	// before. HITLNotify, when set, sends the ask-card to the human channel.
@@ -544,6 +579,7 @@ type Runner struct {
 	discoveryPolicy         DiscoveryPolicy
 	onQueueItemEnqueued     func()
 	network                 NetworkStatusGateway
+	planeDoc                PlaneDocResolver
 	hitlEnabled             bool
 	hitlNotify              HITLNotifyFunc
 	hitlAnswerTransport     string
@@ -811,6 +847,7 @@ func New(options Options) *Runner {
 		discoveryPolicy:         policy,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 		network:                 options.Network,
+		planeDoc:                options.PlaneDoc,
 		hitlEnabled:             options.HITLEnabled,
 		hitlNotify:              options.HITLNotify,
 		hitlAnswerTransport:     options.HITLAnswerTransport,
@@ -1681,6 +1718,12 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, r.agentRuntime, r.agentModel)
 		if err != nil {
 			return checkpoint, err
+		}
+		// Flowchart node I: on a Plane project, read the product + tech spec from Plane
+		// pages (linked to the work item) and add them to the prompt, so the worker
+		// implements against the Plane specs rather than only the repo file.
+		if planeSpec := r.planeSpecBlock(ctx, input.Project.ID, work.IssueURL); planeSpec != "" {
+			prompt += "\n\n" + planeSpec
 		}
 		// HITL (gated): let the agent pause to ask a human, and on resume feed the
 		// human's answer back into the same agent session.
