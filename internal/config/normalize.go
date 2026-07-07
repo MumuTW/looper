@@ -1313,6 +1313,9 @@ func mergeReviewerSpecReviewConfig(config *ReviewerSpecReviewConfig, partial Par
 	if partial.ReviewingLabel != nil {
 		config.ReviewingLabel = *partial.ReviewingLabel
 	}
+	if partial.RequireHumanApproval != nil {
+		config.RequireHumanApproval = *partial.RequireHumanApproval
+	}
 }
 
 func mergeFixerRoleTriggersConfig(config *FixerRoleTriggersConfig, partial PartialFixerRoleTriggersConfig) {

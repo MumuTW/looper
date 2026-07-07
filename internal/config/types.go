@@ -466,6 +466,11 @@ type ReviewerRoleTriggersConfig struct {
 type ReviewerSpecReviewConfig struct {
 	IncludeReviewingLabel bool   `json:"includeReviewingLabel"`
 	ReviewingLabel        string `json:"reviewingLabel"`
+	// RequireHumanApproval gates the spec-ready transition on a human APPROVE review
+	// (plan §8.6): when true, a clean automated spec review does NOT self-approve to
+	// spec-ready — the reviewer adds looper:needs-human and holds until a person
+	// approves the spec PR. Default false keeps today's auto-approve behaviour.
+	RequireHumanApproval bool `json:"requireHumanApproval"`
 }
 
 type ReviewerRoleDiscoveryConfig struct {
@@ -965,6 +970,7 @@ type PartialReviewerRoleTriggersConfig struct {
 type PartialReviewerSpecReviewConfig struct {
 	IncludeReviewingLabel *bool   `json:"includeReviewingLabel,omitempty"`
 	ReviewingLabel        *string `json:"reviewingLabel,omitempty"`
+	RequireHumanApproval  *bool   `json:"requireHumanApproval,omitempty"`
 }
 
 type PartialReviewerRoleDiscoveryConfig struct {
