@@ -1413,12 +1413,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 		checkpoint.Publish = &checkpointPublishState{}
 	}
 	checkpoint.Publish.Reviewed = true
-	// node H converged → open the human-approve gate. Stamp the time so the reconcile
-	// can send a follow-up nudge if a human doesn't approve for a while (goal #5).
+	// node H converged → open the human-approve gate and @-mention the owner in the
+	// thread ONCE: review is done, please approve. This review-end ping IS the
+	// notification — no timer / periodic nudge.
 	r.setNodeHPhase(ctx, input.Loop.ID, "awaiting_human_review")
+	r.postNodeHThreadNote(ctx, input, "🙋 方案已过 GRILL 拷问 + 独立 REVIEW,请你审批 —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现:"+specURL)
 	if r.repos != nil && r.repos.Loops != nil {
 		if loop, gErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); gErr == nil && loop != nil {
-			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true, "awaitingSpecApprovalSince": r.nowISO()}); mErr == nil {
+			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {
 				_, _ = r.updateLoop(ctx, *loop, func(u *storage.LoopRecord) { u.MetadataJSON = stringPtr(metadataJSON) })
 			}
 		}

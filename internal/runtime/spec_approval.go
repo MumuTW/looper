@@ -4,13 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"html"
-	"os"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -85,12 +81,7 @@ func (r *Runtime) reconcileSpecApproval(ctx context.Context) {
 			continue
 		}
 		approved, by, err := gateway.SpecApprovedOnPage(ctx, planeProjectID, specURL)
-		if err != nil {
-			continue
-		}
-		if !approved {
-			// goal #5: if a human hasn't approved for a while, nudge them in the thread.
-			r.maybeNudgeSpecApproval(ctx, repositories, cfg, loop, specURL, now)
+		if err != nil || !approved {
 			continue
 		}
 		// node H → I: approved. Stamp worker-ready so the worker discovers the item,
@@ -115,85 +106,6 @@ func (r *Runtime) reconcileSpecApproval(ctx context.Context) {
 			logger.Info("spec approved — dispatched worker", map[string]any{"loopId": loop.ID, "workItem": workItemID, "approvedBy": by})
 		}
 	}
-}
-
-// specApprovalNudgeThreshold is how long a spec may sit awaiting a human's approval
-// before the reconcile nudges them. Default 15m; override via LOOPER_SPEC_NUDGE_MINUTES
-// (e.g. for tests).
-func specApprovalNudgeThreshold() time.Duration {
-	if v := strings.TrimSpace(os.Getenv("LOOPER_SPEC_NUDGE_MINUTES")); v != "" {
-		if m, err := strconv.Atoi(v); err == nil && m >= 0 {
-			return time.Duration(m) * time.Minute
-		}
-	}
-	return 15 * time.Minute
-}
-
-// loopSpecApprovalNudgeState reads when the loop entered the human-approve wait and
-// whether it has already been nudged.
-func loopSpecApprovalNudgeState(metadataJSON *string) (since string, nudged bool) {
-	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
-		return "", false
-	}
-	var meta map[string]any
-	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
-		return "", false
-	}
-	since, _ = meta["awaitingSpecApprovalSince"].(string)
-	nudged, _ = meta["awaitingSpecNudged"].(bool)
-	return strings.TrimSpace(since), nudged
-}
-
-// maybeNudgeSpecApproval posts a ONE-TIME follow-up nudge into the loop's Feishu thread,
-// @-mentioning the product owner, when a tech spec has awaited a human's approval longer
-// than the nudge threshold (goal #5). Idempotent via the awaitingSpecNudged flag.
-func (r *Runtime) maybeNudgeSpecApproval(ctx context.Context, repositories *storage.Repositories, cfg config.Config, loop storage.LoopRecord, specURL string, now func() time.Time) {
-	since, nudged := loopSpecApprovalNudgeState(loop.MetadataJSON)
-	if nudged || since == "" {
-		return
-	}
-	sinceT, err := time.Parse(time.RFC3339, since)
-	if err != nil {
-		if sinceT, err = time.Parse("2006-01-02T15:04:05.000Z07:00", since); err != nil {
-			return
-		}
-	}
-	if now().UTC().Sub(sinceT.UTC()) < specApprovalNudgeThreshold() {
-		return // not been waiting long enough yet
-	}
-	gw := notify.NewGateway(notify.Options{Config: cfg.Notifications, Repositories: repositories, Now: now})
-	var mentions []string
-	if owner := strings.TrimSpace(config.ProjectProductOwner(cfg, loop.ProjectID).FeishuOpenID); owner != "" {
-		mentions = []string{owner}
-	}
-	text := "🙋 这个方案已过 grill + review,在等你 approve —— 看没问题在方案页评论 approve / 同意 / 👍 即进入实现:" + specURL
-	if err := gw.PostThreadNote(ctx, loop.ID, text, mentions); err != nil {
-		return
-	}
-	_ = markSpecApprovalNudged(ctx, repositories, loop.ID, formatJavaScriptISOString(now().UTC()))
-}
-
-// markSpecApprovalNudged flips the loop's awaitingSpecNudged flag so the follow-up is
-// sent exactly once.
-func markSpecApprovalNudged(ctx context.Context, repos *storage.Repositories, loopID, nowISO string) error {
-	loop, err := repos.Loops.GetByID(ctx, loopID)
-	if err != nil || loop == nil {
-		return err
-	}
-	meta := map[string]any{}
-	if loop.MetadataJSON != nil && strings.TrimSpace(*loop.MetadataJSON) != "" {
-		_ = json.Unmarshal([]byte(*loop.MetadataJSON), &meta)
-	}
-	meta["awaitingSpecNudged"] = true
-	encoded, err := json.Marshal(meta)
-	if err != nil {
-		return err
-	}
-	updated := *loop
-	s := string(encoded)
-	updated.MetadataJSON = &s
-	updated.UpdatedAt = nowISO
-	return repos.Loops.Upsert(ctx, updated)
 }
 
 // markSpecApprovalDispatched flips the loop's specApprovedDispatched metadata flag so
