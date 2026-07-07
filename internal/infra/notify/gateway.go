@@ -1759,6 +1759,46 @@ func (g *Gateway) PostTaskClosedFollowup(ctx context.Context, loopID string) err
 	return err
 }
 
+// PostThreadNote posts a plain-text reply into a loop's Feishu thread, optionally
+// @-mentioning open_ids — node H's thread touchpoints: the spec-draft FYI after AUTHOR
+// and the grill transcript after GRILL. No-op unless the app transport is configured
+// or the loop has no thread root yet.
+func (g *Gateway) PostThreadNote(ctx context.Context, loopID, text string, mentionOpenIDs []string) error {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" || strings.TrimSpace(text) == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+		return nil
+	}
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	if appID == "" || appSecret == "" {
+		return nil
+	}
+	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return err
+	}
+	root := g.threadRootForLoop(ctx, loopID)
+	chatID := strings.TrimSpace(cfg.ChatID)
+	if strings.TrimSpace(root) == "" || chatID == "" {
+		return nil
+	}
+	// Feishu text messages @-mention with <at user_id="ou_..."></at> (double-quoted,
+	// distinct from the card lark_md form).
+	mention := ""
+	for _, id := range mentionOpenIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			mention += `<at user_id="` + id + `"></at> `
+		}
+	}
+	raw, err := json.Marshal(map[string]string{"text": mention + strings.TrimSpace(text)})
+	if err != nil {
+		return err
+	}
+	_, err = g.postFeishuAppMessage(ctx, token, chatID, root, "text", string(raw))
+	return err
+}
+
 // patchFeishuAppCard updates an already-sent interactive card in place.
 func (g *Gateway) patchFeishuAppCard(ctx context.Context, token, messageID, content string) error {
 	apiURL := feishuAPIBase + "/open-apis/im/v1/messages/" + strings.TrimSpace(messageID)

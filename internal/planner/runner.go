@@ -303,7 +303,10 @@ type Options struct {
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
-	DiscoveryPolicy         DiscoveryPolicy
+	// PostThreadNote posts a plain-text reply into a loop's Feishu thread (node H
+	// touchpoints: spec-draft FYI, grill transcript), optionally @-mentioning open_ids.
+	PostThreadNote  func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
+	DiscoveryPolicy DiscoveryPolicy
 	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
 	// project whose task source is Plane (§8 flowchart). nil / (…,false) → the
 	// project keeps the repo-file spec path (github/forgejo). Set for plane projects.
@@ -342,6 +345,7 @@ type Runner struct {
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
+	postThreadNote          func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
 	discoveryPolicy         DiscoveryPolicy
 	planeDoc                PlaneDocResolver
 }
@@ -506,7 +510,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -1343,6 +1347,8 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
 			r.logger.Warn("grill: post transcript failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
+		// node H condition #2: surface the grill transcript in the Feishu thread too.
+		r.postNodeHThreadNote(ctx, input, "🔬 GRILL 拷问结论:\n"+truncateRunes(summary, 1200))
 	}
 	if checkpoint.Publish == nil {
 		checkpoint.Publish = &checkpointPublishState{}
@@ -1528,12 +1534,34 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 		checkpoint.Publish = &checkpointPublishState{}
 	}
 	checkpoint.Publish.PlaneSpecReview = true
+	// node H condition #2: surface the spec DRAFT in the Feishu thread + @product owner
+	// (FYI) — so a human sees it as review begins, before grill/review run.
+	r.postNodeHThreadNote(ctx, input, "📋 技术方案初稿已出炉:"+specURL+"\n即将进入 fresh agent 拷问(GRILL)+ 独立复核(REVIEW),收敛后请你在方案页 approve。")
 	// node H begins here: the tech spec is on Plane. The grill step runs next; only
 	// after grill + review converge does the loop open the human-approve gate. Mark the
 	// card so it reads 🔬 方案拷问中 instead of resting on 编写技术方案中.
 	r.setNodeHPhase(ctx, input.Loop.ID, "grilling")
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+// postNodeHThreadNote posts a node H touchpoint into the loop's Feishu thread,
+// @-mentioning the project's product owner so a human sees the spec draft / grill
+// transcript in the thread (goal condition #2). Best-effort — a missing transport or
+// owner just skips the ping.
+func (r *Runner) postNodeHThreadNote(ctx context.Context, input stepInput, text string) {
+	if r.postThreadNote == nil {
+		return
+	}
+	var mentions []string
+	if r.projectRoleConfig != nil {
+		if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
+			mentions = []string{openID}
+		}
+	}
+	if err := r.postThreadNote(ctx, input.Loop.ID, text, mentions); err != nil && r.logger != nil {
+		r.logger.Warn("planner: post node H thread note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+	}
 }
 
 // setNodeHPhase records the planner's node H spec-pipeline phase in loop metadata
