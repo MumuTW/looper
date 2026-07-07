@@ -335,10 +335,22 @@ func TestDetectSpecApproval(t *testing.T) {
 			t.Fatalf("approve %q (tok %q): ok=%v by=%q, want approved by 杨瑾龙", tc.text, tc.tok, ok, by)
 		}
 	}
-	// looper's own comment carrying an approve-ish word must NOT count as approval.
+	// looper's own comment carrying an approve-ish word must NOT count as approval —
+	// via the legacy [looper] marker OR the signature footer (even when looper's Plane
+	// account is the same display name as a human, e.g. mashu).
 	looperSelfApprove := PageComment{ID: "3", CommentStripped: "[looper] 我approve了自己的方案", DisplayName: "mashu"}
 	if ok, _ := DetectSpecApproval([]PageComment{looperSelfApprove}); ok {
 		t.Fatalf("looper's own [looper] comment must not self-approve")
+	}
+	signedSelfApprove := PageComment{ID: "5", CommentStripped: "方案没问题,同意 🔁 " + LooperSignatureMark + " · runner=reviewer · An autonomous AI dev team for your GitHub repos.", DisplayName: "mashu"}
+	if ok, _ := DetectSpecApproval([]PageComment{signedSelfApprove}); ok {
+		t.Fatalf("a signed (Powered by Looper) comment must not count as human approval")
+	}
+	// A signed status comment + a genuine unsigned human approve → approved by the human.
+	signedNote := PageComment{ID: "6", CommentStripped: "技术方案初稿已写到本页 🔁 " + LooperSignatureMark, DisplayName: "mashu"}
+	humanApprove := PageComment{ID: "7", CommentStripped: "看过了,同意", DisplayName: "杨瑾龙"}
+	if ok, by := DetectSpecApproval([]PageComment{signedNote, humanApprove}); !ok || by != "杨瑾龙" {
+		t.Fatalf("unsigned human approve alongside a signed note must approve; got ok=%v by=%q", ok, by)
 	}
 	// A plain discussion comment with no approve token → not approved.
 	discuss := PageComment{ID: "4", CommentStripped: "这里的边界还要再想想", DisplayName: "chaoxiaoche"}

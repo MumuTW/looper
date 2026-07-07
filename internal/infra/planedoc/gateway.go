@@ -398,8 +398,8 @@ func (g *Gateway) PostSpecReviewComment(ctx context.Context, projectID, pageURL,
 		return false, err
 	}
 	for _, c := range existing {
-		if strings.Contains(c.CommentStripped, LooperCommentMarker) || strings.Contains(c.CommentHTML, LooperCommentMarker) {
-			return false, nil // review already opened
+		if commentIsLoopers(c) {
+			return false, nil // review already opened (looper already commented)
 		}
 	}
 	if _, err := g.CreatePageComment(ctx, projectID, pageID, commentHTML); err != nil {
@@ -667,14 +667,48 @@ func decodeLinks(stdout string) ([]Link, error) {
 	return bare, nil
 }
 
-// LooperCommentMarker prefixes every page comment looper itself posts (its node H
-// assist-review), so approval detection can exclude looper's own comments and only
-// count a human's reply as the approve gate.
+// LooperCommentMarker is a legacy machine marker on looper's own comments; kept for
+// backward-compatible detection. New comments carry the visible signature footer below.
 const LooperCommentMarker = "[looper]"
+
+// LooperSignatureMark is the stable substring inside the signature footer looper
+// appends to every page comment it posts. It is both visible branding and the
+// machine signal that a comment is looper's own — DetectSpecApproval treats any
+// comment carrying it as NOT a human approval, closing the self-approve hole even
+// when looper's Plane account is the same person as a human reviewer.
+const LooperSignatureMark = "Powered by Looper"
+
+// SignComment appends looper's signature footer to a page-comment body so the comment
+// is both visibly branded ("🔁 Powered by Looper · runner=… · agent=… · An autonomous
+// AI dev team for your GitHub repos.") and machine-distinguishable from a human reply.
+// runner/agent add context (e.g. "reviewer"/"codex"); either may be empty.
+func SignComment(bodyHTML, runner, agent string) string {
+	parts := []string{"🔁 " + LooperSignatureMark}
+	if r := strings.TrimSpace(runner); r != "" {
+		parts = append(parts, "runner="+r)
+	}
+	if a := strings.TrimSpace(agent); a != "" {
+		parts = append(parts, "agent="+a)
+	}
+	parts = append(parts, "An autonomous AI dev team for your GitHub repos.")
+	return bodyHTML + "<p><i>" + htmlpkg.EscapeString(strings.Join(parts, " · ")) + "</i></p>"
+}
 
 // specApproveTokens are the phrases a human's reply may use to approve a tech spec.
 // Matched case-insensitively against the comment's stripped text.
 var specApproveTokens = []string{"approve", "lgtm", "同意", "通过", "批准", "👍", "ok 了", "可以了", "没问题"}
+
+// commentIsLoopers reports whether a page comment was posted by looper itself — it
+// carries the signature footer or the legacy marker (in either the stripped text or
+// the raw HTML).
+func commentIsLoopers(c PageComment) bool {
+	for _, s := range []string{c.CommentStripped, c.CommentHTML} {
+		if strings.Contains(s, LooperSignatureMark) || strings.Contains(s, LooperCommentMarker) {
+			return true
+		}
+	}
+	return false
+}
 
 // DetectSpecApproval reports whether a HUMAN has approved the tech spec in these page
 // comments — the node H gate. A comment carrying LooperCommentMarker is looper's own
@@ -686,8 +720,8 @@ func DetectSpecApproval(comments []PageComment) (approved bool, by string) {
 		if text == "" {
 			text = strings.TrimSpace(c.CommentHTML)
 		}
-		if text == "" || strings.Contains(text, LooperCommentMarker) {
-			continue // empty, or looper's own comment — not a human approval
+		if text == "" || commentIsLoopers(c) {
+			continue // empty, or looper's own (signed) comment — not a human approval
 		}
 		low := strings.ToLower(text)
 		for _, tok := range specApproveTokens {

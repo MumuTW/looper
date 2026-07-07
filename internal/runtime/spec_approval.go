@@ -92,7 +92,7 @@ func (r *Runtime) reconcileSpecApproval(ctx context.Context) {
 			}
 			continue
 		}
-		audit := "<p>" + planedoc.LooperCommentMarker + " ✅ 已由 " + html.EscapeString(strings.TrimSpace(by)) + " 批准,进入实现(node I)。</p>"
+		audit := planedoc.SignComment("<p>✅ 已由 "+html.EscapeString(strings.TrimSpace(by))+" 批准,进入实现(node I)。</p>", "reviewer", "")
 		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, audit); err != nil && logger != nil {
 			logger.Warn("spec approval: audit comment failed (continuing)", map[string]any{"loopId": loop.ID, "error": err.Error()})
 		}

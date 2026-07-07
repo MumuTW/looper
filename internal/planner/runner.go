@@ -1327,7 +1327,7 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 	// card, not a page reply) is a later stage; this note is only an audit breadcrumb,
 	// not an approve invitation. Idempotent + best-effort — a failed note must not wedge
 	// the planner (the tech-spec link is the real discovery signal).
-	noteHTML := "<p>" + planedoc.LooperCommentMarker + " 技术方案初稿已写到本页,进入评审(node H)。</p>"
+	noteHTML := planedoc.SignComment("<p>技术方案初稿已写到本页,进入评审(node H)。人看过没问题在本页评论 approve / 同意 / 👍 即进入实现。</p>", "planner", strings.TrimSpace(r.agentModel))
 	if _, err := gateway.PostSpecReviewComment(ctx, planeProjectID, specURL, noteHTML); err != nil && r.logger != nil {
 		r.logger.Warn("planner: post spec status note failed (continuing)", map[string]any{"projectId": input.Project.ID, "page": specURL, "error": err.Error()})
 	}
