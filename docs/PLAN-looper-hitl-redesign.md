@@ -206,14 +206,20 @@ PR 没合并前,卡片一直活,追问能接住(转给「修 PR」应答)。**�
 - ✅ §C/§D `looper:auto` label + dispatch 每-issue 自主 opt-in(coordinator 默认关=零生产风险)
 - ✅ §8.3 productOwner 配置(杨瑾龙 open_id)+ 校验(基础;@产品补 spec 的检测/等待/恢复依赖 §8.2)
 
-**未实现(§8 流水线,「大头」;有硬前置):**
-- ⏳ §8.1 kind 路由消费 + bug 模式(reproduce→定位→修 提示词):需给 worker 喂 kind + 启用 coordinator
-- ⏳ §8.2 Plane 方案读写:需 **Plane-Go 集成**(现 `internal/forge/plane.go` 无 page 方法,plane 是独立 CLI)。page↔work-item 关联约定**已定+实测**(原生 link,见 §6/§8.2)
-- ⏳ §8.5/§8.6 grill + Plane 评审 **@人 approve 新状态机**(reviewer 现自批,`looper:needs-human` 是死标签)
-- ⏳ §8.3 @产品补 spec 的等待/恢复(依赖 §8.2 关联约定 + Plane 轮询)
-- ⏳ §8.4/§8.10-P4 `looper:auto` 全程 intake→spec→impl 串接(依赖以上 + coordinator 启用)
+**§8 能力层已建 + 已验(2026-07-07):**
+- ✅ §8.2 Plane 方案读写底座 `internal/infra/planedoc`:shell 到 `plane` CLI 做 page 建/读 + work-item link 建/查/改。**真机 round-trip 验过**(PLANE_LIVE_E2E)。page↔work-item = 原生 link(title 打 `looper:product-spec`/`looper:tech-spec`)
+- ✅ §8.4 读写方案:`ReadSpec`(link→page→正文)/`WriteTechSpec`(建页+关联)/`PageIDFromURL`,真机验
+- ✅ §8.3 主动关联:`AssociateDroppedSpec`(URL 直接 link;正文先建页再 link)—— 「人甩 thread 里 looper 替他关联」的动作层(单测)
+- ✅ §8.6 @人 approve gate:`specReview.requireHumanApproval`(默认关=零变化);开则 clean 自动评审不自批→打 `looper:needs-human` 挂起,等人 APPROVE(bot 自批被降级成 COMMENT,故任何 APPROVED 必是人)才放行(单测真值表)
+- ✅ §8.3 productOwner 配置(杨瑾龙 open_id)
 
-> §8 这一段是**跨系统 + 需团队决策 + 需真人参与(产品补 spec、人审批 spec)**的程序,无法在一次自主会话里全实现 + 端到端验证。前置见 §6 两个仍开放项。
+**未做 = runtime 接线层(需 Plane-provider looper 部署 + 真人参与才能建+端到端验):**
+- ⏳ §8.4 worker/planner **运行时**调 planedoc(worker 真的从 Plane 页读方案、planner 把方案写进 Plane)—— 要把 planedoc gateway 注进 worker/planner + 穿 Plane project/work-item id;e2e 需配一个 Plane-provider looper 项目
+- ⏳ §8.3 缺 spec 的**等待态 + @产品 + 轮询恢复**接进 loop 生命周期;判断「thread 这条是不是方案」的 LLM 提示词
+- ⏳ §8.5 grill(spec-forge 集成)
+- ⏳ §8.1 kind 路由 + bug 模式、§8.4-P4 全程串接 —— 依赖 coordinator(分诊,用户暂缓)
+
+> 能力层(Plane 读写/关联/人审 gate)是 §8 里**跨系统、最难、最需实测**的部分,已建 + 真机验。剩下的是把它们接进 worker/planner/reviewer 的运行时 + 缺-spec 等待态 —— 这层要**一个配了 Plane provider 的 looper 部署 + 真人审批**才能建全并端到端验,不是一次自主会话能补的最后一环。
 
 ## 7. 怎么验证、别踩雷
 
