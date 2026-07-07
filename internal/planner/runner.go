@@ -1213,13 +1213,23 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	}
 	pendingReviewers := make([]string, 0)
 	for _, reviewer := range issue.RequestedReviewers {
+		// A Plane assignee is a UUID, not a GitHub login — never request it as a
+		// GitHub reviewer (it would 422). Skip UUID-shaped values.
+		if looksLikeUUID(reviewer) {
+			continue
+		}
 		if !stringInSlice(reviewer, checkpoint.Publish.ReviewersAdded) {
 			pendingReviewers = append(pendingReviewers, reviewer)
 		}
 	}
 	if len(pendingReviewers) > 0 {
+		// Best-effort: requesting a reviewer can legitimately fail (e.g. a Plane
+		// assignee is a UUID, not a GitHub collaborator) and must NOT wedge the spec
+		// PR by retrying forever. Log and move on — the PR is opened and reviewable.
 		if err := r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: issue.Repo, PRNumber: pr.Number, Reviewers: pendingReviewers, CWD: input.Project.RepoPath}); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			if r.logger != nil {
+				r.logger.Warn("planner: request reviewers failed (continuing)", map[string]any{"repo": issue.Repo, "pr": pr.Number, "reviewers": pendingReviewers, "error": err.Error()})
+			}
 		}
 		checkpoint.Publish.ReviewersAdded = append(checkpoint.Publish.ReviewersAdded, pendingReviewers...)
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
@@ -2014,6 +2024,28 @@ func labelsMatch(labels []string, required []string, mode config.LabelMode) bool
 	}
 	for _, label := range required {
 		if !specpr.HasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikeUUID reports whether s is shaped like a UUID (8-4-4-4-12 hex) — used to
+// skip Plane assignee ids, which are UUIDs and must not be requested as GitHub
+// reviewers (that would 422 and, before this, wedge the run on retry).
+func looksLikeUUID(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
 			return false
 		}
 	}
