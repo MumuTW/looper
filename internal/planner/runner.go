@@ -1335,6 +1335,14 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 		checkpoint.Publish = &checkpointPublishState{}
 	}
 	checkpoint.Publish.PlaneSpecReview = true
+	// Mark the loop so the node H reconcile finds it: poll the spec page for a human
+	// approval, then dispatch the worker. Best-effort + guarded (a test Runner without
+	// a loops repo skips it).
+	if r.repos != nil && r.repos.Loops != nil {
+		if metadataJSON, mErr := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {
+			_, _ = r.updateLoop(ctx, input.Loop, func(u *storage.LoopRecord) { u.MetadataJSON = stringPtr(metadataJSON) })
+		}
+	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }

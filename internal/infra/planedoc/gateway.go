@@ -408,6 +408,18 @@ func (g *Gateway) PostSpecReviewComment(ctx context.Context, projectID, pageURL,
 	return true, nil
 }
 
+// CommentOnPageURL posts an HTML comment on the page at pageURL (resolving its id) —
+// node H audit notes such as "✅ approved by X". Always posts (no idempotency check),
+// unlike PostSpecReviewComment.
+func (g *Gateway) CommentOnPageURL(ctx context.Context, projectID, pageURL, commentHTML string) error {
+	pageID := PageIDFromURL(pageURL)
+	if pageID == "" {
+		return fmt.Errorf("planedoc: CommentOnPageURL cannot resolve page id from %q", pageURL)
+	}
+	_, err := g.CreatePageComment(ctx, projectID, pageID, commentHTML)
+	return err
+}
+
 // SpecApprovedOnPage reports whether a human has approved the tech spec on the page
 // at pageURL (node H gate) — resolves the page, lists its comments, and runs
 // DetectSpecApproval. Returns the approver's display name.
@@ -422,6 +434,128 @@ func (g *Gateway) SpecApprovedOnPage(ctx context.Context, projectID, pageURL str
 	}
 	approved, by := DetectSpecApproval(comments)
 	return approved, by, nil
+}
+
+// projectLabel is a Plane project label (id + name), used to resolve a label name to
+// the UUID a work item's label set stores.
+type projectLabel struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// AddWorkItemLabel adds a label (by name) to a work item — how node H dispatches the
+// worker: on approval it stamps looper:worker-ready so the worker discovers the item
+// (node I). The label is created if the project lacks it; existing labels are
+// preserved. Idempotent: a no-op when the work item already carries the label.
+func (g *Gateway) AddWorkItemLabel(ctx context.Context, projectID, workItemID, labelName string) error {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(workItemID) == "" || strings.TrimSpace(labelName) == "" {
+		return fmt.Errorf("planedoc: AddWorkItemLabel requires project id, work item id, and label name")
+	}
+	labelID, err := g.resolveOrCreateLabel(ctx, projectID, labelName)
+	if err != nil {
+		return err
+	}
+	current, err := g.workItemLabelIDs(ctx, projectID, workItemID)
+	if err != nil {
+		return err
+	}
+	for _, id := range current {
+		if id == labelID {
+			return nil // already labelled
+		}
+	}
+	updated := append(append([]string{}, current...), labelID)
+	data := fmt.Sprintf(`{"labels":%s}`, jsonStringSlice(updated))
+	args := append([]string{"api", "work-item", "update", "--project", projectID, workItemID, "--data", data}, g.globalArgs()...)
+	if _, err := g.runPlane(ctx, "", args...); err != nil {
+		return fmt.Errorf("planedoc: add work item label: %w", err)
+	}
+	return nil
+}
+
+// resolveOrCreateLabel returns the UUID of the project label named `name`, creating it
+// if the project doesn't have one (case-insensitive match on the name).
+func (g *Gateway) resolveOrCreateLabel(ctx context.Context, projectID, name string) (string, error) {
+	listArgs := append([]string{"api", "label", "list", "--project", projectID, "--all", "--json"}, g.globalArgs()...)
+	res, err := g.runPlane(ctx, "", listArgs...)
+	if err != nil {
+		return "", fmt.Errorf("planedoc: list labels: %w", err)
+	}
+	for _, l := range decodeLabelList(res.Stdout) {
+		if strings.EqualFold(strings.TrimSpace(l.Name), strings.TrimSpace(name)) {
+			return l.ID, nil
+		}
+	}
+	createArgs := append([]string{"api", "label", "create", "--project", projectID, "--name", name, "--json"}, g.globalArgs()...)
+	cres, err := g.runPlane(ctx, "", createArgs...)
+	if err != nil {
+		return "", fmt.Errorf("planedoc: create label: %w", err)
+	}
+	var created projectLabel
+	if err := json.Unmarshal([]byte(strings.TrimSpace(cres.Stdout)), &created); err != nil || created.ID == "" {
+		return "", fmt.Errorf("planedoc: decode created label %q: %w", name, err)
+	}
+	return created.ID, nil
+}
+
+// workItemLabelIDs returns a work item's current label UUIDs. The API returns `labels`
+// as an array of UUID strings (the shape the update endpoint takes); an array of {id}
+// objects is tolerated defensively.
+func (g *Gateway) workItemLabelIDs(ctx context.Context, projectID, workItemID string) ([]string, error) {
+	args := append([]string{"api", "work-item", "get", "--project", projectID, workItemID, "--json"}, g.globalArgs()...)
+	res, err := g.runPlane(ctx, "", args...)
+	if err != nil {
+		return nil, fmt.Errorf("planedoc: get work item: %w", err)
+	}
+	var wi struct {
+		Labels json.RawMessage `json:"labels"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(res.Stdout)), &wi); err != nil {
+		return nil, fmt.Errorf("planedoc: decode work item: %w", err)
+	}
+	if len(wi.Labels) == 0 {
+		return nil, nil
+	}
+	var ids []string
+	if err := json.Unmarshal(wi.Labels, &ids); err == nil {
+		return ids, nil
+	}
+	var objs []projectLabel
+	if err := json.Unmarshal(wi.Labels, &objs); err == nil {
+		for _, o := range objs {
+			if strings.TrimSpace(o.ID) != "" {
+				ids = append(ids, o.ID)
+			}
+		}
+		return ids, nil
+	}
+	return nil, nil
+}
+
+// decodeLabelList unwraps a bare array or {results:[...]} envelope of project labels.
+func decodeLabelList(stdout string) []projectLabel {
+	stdout = strings.TrimSpace(stdout)
+	if stdout == "" {
+		return nil
+	}
+	var envelope struct {
+		Results []projectLabel `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err == nil && envelope.Results != nil {
+		return envelope.Results
+	}
+	var bare []projectLabel
+	_ = json.Unmarshal([]byte(stdout), &bare)
+	return bare
+}
+
+// jsonStringSlice JSON-encodes a string slice for a --data body ("[]" on error).
+func jsonStringSlice(s []string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
 }
 
 // SpecKind is which spec a dropped document is — decides the link title tag.

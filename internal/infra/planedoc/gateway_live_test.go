@@ -2,6 +2,7 @@ package planedoc
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -113,6 +114,53 @@ func TestGatewayLivePageComments(t *testing.T) {
 		t.Fatalf("ListPageComments (%d) did not include the posted comment %s", len(comments), created.ID)
 	}
 	t.Logf("listed %d page comment(s), found the posted one", len(comments))
+}
+
+// TestGatewayLiveAddWorkItemLabel exercises node H's worker-dispatch primitive against
+// the real deployment: create a work item → add looper:worker-ready → verify it's on
+// the item → idempotent re-add → clean up. Skipped unless PLANE_LIVE_E2E=1.
+func TestGatewayLiveAddWorkItemLabel(t *testing.T) {
+	if os.Getenv("PLANE_LIVE_E2E") != "1" || os.Getenv("PLANE_API_KEY") == "" {
+		t.Skip("set PLANE_LIVE_E2E=1 + PLANE_API_KEY to run the live add-label test")
+	}
+	proj := envOr("PLANE_TEST_PROJECT", "db35f0e7-5004-4632-ba84-074164c95491")
+	g := New(Options{
+		APIBaseURL: envOr("PLANE_API_BASE_URL", "https://plane.powerformer.net/api/v1"),
+		APIKey:     os.Getenv("PLANE_API_KEY"),
+		Workspace:  envOr("PLANE_WORKSPACE_SLUG", "open-design"),
+	})
+	ctx := context.Background()
+
+	created, err := g.runPlane(ctx, "", append([]string{"api", "work-item", "create", "--project", proj, "--name", "LIVE-add-label-probe", "--json"}, g.globalArgs()...)...)
+	if err != nil {
+		t.Fatalf("create work item: %v", err)
+	}
+	var wi struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(created.Stdout)), &wi); err != nil || wi.ID == "" {
+		t.Fatalf("decode work item: %v (%q)", err, created.Stdout)
+	}
+	defer func() {
+		_, _ = g.runPlane(ctx, "", append([]string{"api", "work-item", "delete", "--project", proj, wi.ID}, g.globalArgs()...)...)
+	}()
+
+	if err := g.AddWorkItemLabel(ctx, proj, wi.ID, "looper:worker-ready"); err != nil {
+		t.Fatalf("AddWorkItemLabel: %v", err)
+	}
+	ids, err := g.workItemLabelIDs(ctx, proj, wi.ID)
+	if err != nil || len(ids) == 0 {
+		t.Fatalf("workItemLabelIDs = %v, %v; want the added label", ids, err)
+	}
+	// Idempotent re-add is a no-op (label set unchanged).
+	if err := g.AddWorkItemLabel(ctx, proj, wi.ID, "looper:worker-ready"); err != nil {
+		t.Fatalf("AddWorkItemLabel (repeat): %v", err)
+	}
+	ids2, _ := g.workItemLabelIDs(ctx, proj, wi.ID)
+	if len(ids2) != len(ids) {
+		t.Fatalf("re-add changed the label set: %v → %v", ids, ids2)
+	}
+	t.Logf("added looper:worker-ready to work item %s (labels=%v)", wi.ID, ids)
 }
 
 func envOr(key, fallback string) string {

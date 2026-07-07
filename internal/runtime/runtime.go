@@ -1175,6 +1175,8 @@ func (r *Runtime) runWakeReconcile(ctx context.Context, reason string) {
 	}
 	// Resume planner loops whose product spec was supplied while they were held (E2).
 	r.reconcileAwaitingProductSpec(ctx)
+	// Dispatch the worker for tech specs a human approved on the Plane page (node H→I).
+	r.reconcileSpecApproval(ctx)
 	if logger != nil && (released > 0 || stale.InterruptedRuns > 0 || stale.LoopsRequeued > 0) {
 		logger.Info("wake reconcile recovered work", map[string]any{"reason": reason, "locksReleased": released, "runsInterrupted": stale.InterruptedRuns, "loopsRequeued": stale.LoopsRequeued})
 	}
