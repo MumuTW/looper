@@ -1322,12 +1322,14 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 	if !found {
 		return checkpoint, &loopError{message: "planner produced no tech spec to publish to Plane (agent wrote no spec file)", kind: FailureManualIntervention}
 	}
-	// node H: open the review on the spec page — a [looper]-marked comment prompting a
-	// human to reply approve/同意/👍. Idempotent + best-effort; the tech-spec link is the
-	// real discovery signal, so a failed comment must not wedge the planner.
-	reviewHTML := "<p>" + planedoc.LooperCommentMarker + " 技术方案已写好,请评审 👀 —— 看没问题回复 <b>approve</b> / <b>同意</b> / 👍 即进入实现;有意见直接在本页评论,我会跟进。</p>"
-	if _, err := gateway.PostSpecReviewComment(ctx, planeProjectID, specURL, reviewHTML); err != nil && r.logger != nil {
-		r.logger.Warn("planner: open spec review comment failed (continuing)", map[string]any{"projectId": input.Project.ID, "page": specURL, "error": err.Error()})
+	// Leave a neutral [looper] status note on the spec page — the tech-spec draft has
+	// landed and is entering review (node H). The GRILL + human-approve (via a Feishu
+	// card, not a page reply) is a later stage; this note is only an audit breadcrumb,
+	// not an approve invitation. Idempotent + best-effort — a failed note must not wedge
+	// the planner (the tech-spec link is the real discovery signal).
+	noteHTML := "<p>" + planedoc.LooperCommentMarker + " 技术方案初稿已写到本页,进入评审(node H)。</p>"
+	if _, err := gateway.PostSpecReviewComment(ctx, planeProjectID, specURL, noteHTML); err != nil && r.logger != nil {
+		r.logger.Warn("planner: post spec status note failed (continuing)", map[string]any{"projectId": input.Project.ID, "page": specURL, "error": err.Error()})
 	}
 	if checkpoint.Publish == nil {
 		checkpoint.Publish = &checkpointPublishState{}
