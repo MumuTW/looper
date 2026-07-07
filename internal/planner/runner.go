@@ -1413,11 +1413,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 		checkpoint.Publish = &checkpointPublishState{}
 	}
 	checkpoint.Publish.Reviewed = true
-	// node H converged → open the human-approve gate.
+	// node H converged → open the human-approve gate. Stamp the time so the reconcile
+	// can send a follow-up nudge if a human doesn't approve for a while (goal #5).
 	r.setNodeHPhase(ctx, input.Loop.ID, "awaiting_human_review")
 	if r.repos != nil && r.repos.Loops != nil {
 		if loop, gErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); gErr == nil && loop != nil {
-			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {
+			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true, "awaitingSpecApprovalSince": r.nowISO()}); mErr == nil {
 				_, _ = r.updateLoop(ctx, *loop, func(u *storage.LoopRecord) { u.MetadataJSON = stringPtr(metadataJSON) })
 			}
 		}
