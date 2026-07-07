@@ -620,3 +620,25 @@ func cardText(t *testing.T, card []byte) string {
 	}
 	return strings.Join(parts, "\n")
 }
+
+func TestPRMergeStateFromSnapshot(t *testing.T) {
+	merged := `{"detail":{"State":"MERGED"},"diff":"..."}`
+	if s := prMergeStateFromSnapshot(&merged); s != "MERGED" {
+		t.Fatalf("merged = %q, want MERGED", s)
+	}
+	mergedAt := `{"detail":{"State":"OPEN","MergedAt":"2026-07-07T00:00:00Z"}}`
+	if s := prMergeStateFromSnapshot(&mergedAt); s != "MERGED" {
+		t.Fatalf("mergedAt = %q, want MERGED", s)
+	}
+	closed := `{"detail":{"State":"CLOSED"}}`
+	if s := prMergeStateFromSnapshot(&closed); s != "CLOSED" {
+		t.Fatalf("closed = %q, want CLOSED", s)
+	}
+	open := `{"detail":{"State":"OPEN"}}`
+	if s := prMergeStateFromSnapshot(&open); s != "OPEN" {
+		t.Fatalf("open = %q, want OPEN", s)
+	}
+	if s := prMergeStateFromSnapshot(nil); s != "" {
+		t.Fatalf("nil = %q, want empty", s)
+	}
+}

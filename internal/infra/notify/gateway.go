@@ -1478,12 +1478,49 @@ func (g *Gateway) prCardStyleFromSnapshot(ctx context.Context, repo, target, prU
 	if snap.UnresolvedThreadCount != nil {
 		unresolved = *snap.UnresolvedThreadCount
 	}
+	// Node Z terminal: if the PR has merged (or closed) — read from the snapshot's
+	// captured PR detail — the card reaches its final state instead of resting at
+	// "待合并". 🎉 已合并 is the only green terminal.
+	prNumStr := strconv.FormatInt(prNum, 10)
+	switch prMergeStateFromSnapshot(snap.PayloadJSON) {
+	case "MERGED":
+		return "green", "🎉 已合并 · PR #" + prNumStr, true
+	case "CLOSED":
+		return "red", "🚫 已关闭 · PR #" + prNumStr, true
+	}
 	state, ok := prCardStateFromSnapshot(review, checks, unresolved)
 	if !ok {
 		return "", "", false
 	}
-	t, l := prCardStateStyle(state, strconv.FormatInt(prNum, 10))
+	t, l := prCardStateStyle(state, prNumStr)
 	return t, l, true
+}
+
+// prMergeStateFromSnapshot extracts the PR's lifecycle state ("MERGED" / "CLOSED" /
+// "OPEN") from a snapshot's captured detail payload, or "" when unavailable. A merged
+// PR reports state OPEN with mergedAt set on some providers, so both are checked.
+func prMergeStateFromSnapshot(payloadJSON *string) string {
+	if payloadJSON == nil || strings.TrimSpace(*payloadJSON) == "" {
+		return ""
+	}
+	var payload struct {
+		Detail struct {
+			State    string `json:"State"`
+			MergedAt string `json:"MergedAt"`
+			ClosedAt string `json:"ClosedAt"`
+		} `json:"detail"`
+	}
+	if err := json.Unmarshal([]byte(*payloadJSON), &payload); err != nil {
+		return ""
+	}
+	state := strings.ToUpper(strings.TrimSpace(payload.Detail.State))
+	if state == "MERGED" || strings.TrimSpace(payload.Detail.MergedAt) != "" {
+		return "MERGED"
+	}
+	if state == "CLOSED" || (state != "OPEN" && strings.TrimSpace(payload.Detail.ClosedAt) != "") {
+		return "CLOSED"
+	}
+	return state
 }
 
 // liveTailEntry is the most recent agent-activity snapshot for one loop.
