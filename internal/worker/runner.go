@@ -640,6 +640,7 @@ type workerInput struct {
 	Branch               string   `json:"branch,omitempty"`
 	HeadSHA              string   `json:"headSha,omitempty"`
 	AutoDiscovered       bool     `json:"autoDiscovered,omitempty"`
+	Labels               []string `json:"labels,omitempty"`
 	RoutedClaimMatchMode string   `json:"routedClaimMatchMode,omitempty"`
 	Reviewers            []string `json:"reviewers,omitempty"`
 }
@@ -2161,7 +2162,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	projectMetadata := parseJSONObject(project.MetadataJSON)
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Labels: stringSliceFromAny(source["labels"]), Reviewers: stringSliceFromAny(source["reviewers"])}
 	if work.IssueNumber == 0 && loop.TargetType == "issue" {
 		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
 	}
@@ -2646,7 +2647,7 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	}
 	nowISO := r.nowISO()
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "discoveryFingerprint": fingerprint})
+	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "labels": issue.Labels, "discoveryFingerprint": fingerprint})
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := targetID
 	projectID := project.ID
@@ -3347,6 +3348,11 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 	}
 	if work.Prompt != "" {
 		parts = append(parts, "User prompt:\n"+work.Prompt)
+	}
+	// Flowchart node C: a bug is worked reproduce → locate root cause → fix, not
+	// spec-driven. Steer the agent to that method when the issue is triaged kind/bug.
+	if hasLabel(work.Labels, "kind/bug") {
+		parts = append(parts, "This is a BUG. Work it in this order: (1) REPRODUCE it — write or run a failing test / concrete steps that show the wrong behaviour; (2) locate the ROOT CAUSE, not just the symptom; (3) fix the root cause and prove the reproduction now passes. Do not patch symptoms or skip the reproduction step.")
 	}
 	parts = append(parts, fmt.Sprintf("Repository: %s", work.Repo), fmt.Sprintf("Base branch: %s", work.BaseBranch))
 	if work.ExecutionMode == "push-existing" && work.SpecPath != "" {
