@@ -2024,6 +2024,10 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			payload.Title = "Looper Worker Opened a PR"
 			payload.Body = fmt.Sprintf("PR #%d is ready: %s", input.PullRequestNumber, runtimeFirstNonEmpty(input.PullRequestURL, input.Summary))
 			payload.DedupeKey = fmt.Sprintf("runtime.worker.pr_ready:%s", input.RunID)
+			// The requested work is delivered — @-mention the owner so it isn't missed.
+			if openID := strings.TrimSpace(config.ProjectProductOwner(cfg, input.ProjectID).FeishuOpenID); openID != "" {
+				payload.MentionOpenIds = []string{openID}
+			}
 		default:
 			payload.Level = "success"
 			payload.Title = "Looper Worker Completed"

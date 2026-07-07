@@ -64,6 +64,9 @@ type SystemNotificationPayload struct {
 	EntityType string
 	EntityID   string
 	DedupeKey  string
+	// MentionOpenIds @-mentions these Feishu open_ids in the thread message — set only
+	// for milestones a human should see (e.g. the impl PR is ready), not routine updates.
+	MentionOpenIds []string
 }
 
 type Gateway struct {
@@ -507,7 +510,15 @@ func feishuNotificationText(payload SystemNotificationPayload) string {
 	if len(lines) == 0 {
 		return "Looper update"
 	}
-	return strings.Join(lines, "\n")
+	body := strings.Join(lines, "\n")
+	// Feishu text @-mention: <at user_id="ou_..."></at> (distinct from the card form).
+	mention := ""
+	for _, id := range payload.MentionOpenIds {
+		if id = strings.TrimSpace(id); id != "" {
+			mention += `<at user_id="` + id + `"></at> `
+		}
+	}
+	return mention + body
 }
 
 // HITLAskCard is a mid-run human-in-the-loop question rendered as an interactive
@@ -1939,9 +1950,10 @@ func feishuLiveFeedCard(tail []string, elapsedSec int64) (string, bool) {
 		note = "⏱ " + humanizeElapsedSeconds(elapsedSec) + " · 实时更新中"
 	}
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": note}}})
+	// No header — the body already leads with "🔧 实时进度"; a separate "实时进度同步"
+	// title just repeats it. Feishu renders a header-less card fine.
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
-		"header":   map[string]any{"template": "wathet", "title": map[string]any{"tag": "plain_text", "content": "⚙️ 实时进度同步"}},
 		"elements": elements,
 	}
 	raw, err := json.Marshal(cardObj)
