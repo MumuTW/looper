@@ -45,11 +45,20 @@ func TestProductSpecGateLive(t *testing.T) {
 	if gateErr == nil || gateErr.kind != FailureManualIntervention {
 		t.Fatalf("gate = %v, want a manual-intervention hold (feature without product spec)", gateErr)
 	}
-	t.Logf("gate held: %s", gateErr.message)
+	t.Logf("gate held (no product spec): %s", gateErr.message)
 
-	// Verify a @product comment landed, then clean it up.
-	// (Comment listing/cleanup is via the CLI; a residual test comment is harmless.)
-	t.Log("posted a @product comment on the work item (manual cleanup ok)")
+	// Now link a product spec and verify the gate PROCEEDS (node D pass path).
+	page, err := gw.CreatePage(ctx, planeProject, "LIVE product spec", "# Product spec\n验收: e2e")
+	if err != nil {
+		t.Fatalf("CreatePage error = %v", err)
+	}
+	if err := gw.UpsertSpecLink(ctx, planeProject, workItem, planedoc.ProductSpecLinkTitle, page.URL); err != nil {
+		t.Fatalf("UpsertSpecLink error = %v", err)
+	}
+	if gateErr := r.productSpecGate(ctx, in, cp); gateErr != nil {
+		t.Fatalf("gate = %v, want nil (product spec present → proceed)", gateErr)
+	}
+	t.Logf("gate proceeded once product spec was linked (page %s) — clean up externally", page.ID)
 }
 
 func envOr(key, fallback string) string {
