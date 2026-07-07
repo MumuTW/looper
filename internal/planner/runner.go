@@ -1347,7 +1347,8 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 		return checkpoint, nil // nothing to grill
 	}
 	r.setNodeHPhase(ctx, input.Loop.ID, "grilling")
-	prompt := buildGrillPrompt(*issue, planeProjectID, planedoc.PageIDFromURL(specURL), specURL)
+	specPath := firstNonEmpty(worktree.SpecPath, issue.SpecPath)
+	prompt := buildGrillPrompt(*issue, specPath)
 	result, err := r.runPlannerAgent(ctx, input, worktree.Path, prompt, "grill")
 	if err != nil {
 		return checkpoint, err
@@ -1355,6 +1356,13 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 	if !strings.EqualFold(result.Status, "completed") {
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
 		return checkpoint, &loopError{message: "grill agent did not complete", kind: FailureRetryableAfterResume}
+	}
+	// The grill revised the spec FILE in the worktree (sandbox-safe); re-publish it to
+	// the Plane page so the page reflects the converged spec.
+	if revised, rErr := readPlannerSpecFile(worktree.Path, specPath); rErr == nil && strings.TrimSpace(revised) != "" {
+		if err := gateway.UpdatePageContent(ctx, planeProjectID, planedoc.PageIDFromURL(specURL), revised); err != nil && r.logger != nil {
+			r.logger.Warn("grill: re-publish revised spec to Plane failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+		}
 	}
 	// Record the grill transcript on the spec page (signed) so the challenge/fix trail
 	// sits next to the spec for the human reviewer.
@@ -1410,7 +1418,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 		return checkpoint, nil
 	}
 	r.setNodeHPhase(ctx, input.Loop.ID, "reviewing")
-	prompt := buildReviewPrompt(*issue, planeProjectID, planedoc.PageIDFromURL(specURL), specURL)
+	prompt := buildReviewPrompt(*issue, firstNonEmpty(worktree.SpecPath, issue.SpecPath))
 	result, err := r.runPlannerAgent(ctx, input, worktree.Path, prompt, "review")
 	if err != nil {
 		return checkpoint, err
@@ -1467,28 +1475,30 @@ func (r *Runner) runPlannerAgent(ctx context.Context, input stepInput, worktreeP
 	return execution.Wait(ctx)
 }
 
-// buildGrillPrompt is the fresh adversarial reviewer's brief (node H GRILL).
-func buildGrillPrompt(issue checkpointIssue, planeProjectID, pageID, specURL string) string {
+// buildGrillPrompt is the fresh adversarial reviewer's brief (node H GRILL). It revises
+// the spec FILE in the worktree — never Plane or anything outside the project (the codex
+// sandbox blocks external writes); looper re-publishes the revised file to Plane after.
+func buildGrillPrompt(issue checkpointIssue, specFilePath string) string {
 	return strings.Join([]string{
 		fmt.Sprintf("You are a FRESH, adversarial technical-spec reviewer for %s#%d — you did NOT write this spec.", issue.Repo, issue.IssueNumber),
-		fmt.Sprintf("The tech spec is a Plane page. Read it: `plane api page get --project %s %s --content`.", planeProjectID, pageID),
+		fmt.Sprintf("The tech spec is the file `%s` in this worktree. Read it.", specFilePath),
 		"Adversarially interrogate it against the REAL codebase in this worktree: open the actual source at any file:line it cites; if a claim can't be verified from real code, flag it '⚠️ 未经源码验证'. Never pretend to have read code you didn't.",
 		"Hunt for: missing/weak acceptance criteria, unhandled edge cases, security/data/migration/concurrency risk, hand-wavy steps, scope creep, and anything a worker couldn't implement unambiguously.",
-		fmt.Sprintf("REVISE the page to resolve what you can — discover the exact update flags with `plane api page update --help`, then update page %s in project %s (keep the existing structure; tighten, don't bloat).", pageID, planeProjectID),
-		"For anything you genuinely cannot decide (a real product ambiguity), do NOT guess — leave it as a clearly-labelled open question in the spec for a human.",
-		"Finish with a concise grill transcript as your final summary: what you challenged, what you fixed on the page, and what remains open. Do NOT open any pull request or touch git remotes.",
+		fmt.Sprintf("REVISE the spec file `%s` IN PLACE to resolve what you can (keep the structure; tighten, don't bloat). Edit ONLY that file — do NOT write anything outside this worktree, do NOT run `plane`/`gh`, do NOT push or open a pull request. looper publishes the file to Plane for you.", specFilePath),
+		"For anything you genuinely cannot decide (a real product ambiguity), do NOT guess — leave it as a clearly-labelled open question in the spec.",
+		"Finish with a concise grill transcript as your final summary: what you challenged, what you fixed in the file, and what remains open.",
 	}, "\n")
 }
 
 // buildReviewPrompt is the independent reviewer's brief (node H REVIEW) — a different
-// pass from the grill, checking the converged spec and issuing a verdict.
-func buildReviewPrompt(issue checkpointIssue, planeProjectID, pageID, specURL string) string {
+// pass from the grill, reading the converged spec file and issuing a verdict (no writes).
+func buildReviewPrompt(issue checkpointIssue, specFilePath string) string {
 	return strings.Join([]string{
 		fmt.Sprintf("You are an INDEPENDENT spec reviewer for %s#%d, reviewing a tech spec that already passed an adversarial grill.", issue.Repo, issue.IssueNumber),
-		fmt.Sprintf("Read the spec: `plane api page get --project %s %s --content`.", planeProjectID, pageID),
+		fmt.Sprintf("Read the spec file `%s` in this worktree.", specFilePath),
 		"Verify against the real codebase in this worktree (open cited source; flag unverified claims). Judge whether a worker could implement it unambiguously and safely.",
-		"Do NOT rewrite the spec — this is a verdict pass. If you find a blocking gap, state it precisely; otherwise confirm it is implementation-ready.",
-		"Finish with a concise verdict as your final summary: READY or the specific blockers. Do NOT open any pull request or touch git remotes.",
+		"This is a READ-ONLY verdict pass: do NOT edit any file, do NOT run `plane`/`gh`, do NOT push or open a pull request. If you find a blocking gap, state it precisely; otherwise confirm it is implementation-ready.",
+		"Finish with a concise verdict as your final summary: READY or the specific blockers.",
 	}, "\n")
 }
 

@@ -147,6 +147,21 @@ func (g *Gateway) PageContent(ctx context.Context, projectID, pageID string) (st
 	return strings.TrimRight(result.Stdout, "\n"), nil
 }
 
+// UpdatePageContent replaces a Plane page's body with bodyMarkdown (converted to HTML
+// server-side) — how looper re-publishes a spec the grill agent revised in the worktree
+// (the agent can't write to Plane directly under the codex sandbox).
+func (g *Gateway) UpdatePageContent(ctx context.Context, projectID, pageID, bodyMarkdown string) error {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(pageID) == "" {
+		return fmt.Errorf("planedoc: UpdatePageContent requires project id and page id")
+	}
+	args := []string{"api", "page", "update", "--project", projectID, pageID, "--body", bodyMarkdown, "--format", "md"}
+	args = append(args, g.globalArgs()...)
+	if _, err := g.runPlane(ctx, "", args...); err != nil {
+		return fmt.Errorf("planedoc: update page content: %w", err)
+	}
+	return nil
+}
+
 // ListWorkItemLinks returns a work item's native links.
 func (g *Gateway) ListWorkItemLinks(ctx context.Context, projectID, workItemID string) ([]Link, error) {
 	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(workItemID) == "" {
