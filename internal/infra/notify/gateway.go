@@ -1218,6 +1218,9 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if repo != "" {
 		parts = append(parts, repo)
 	}
+	if label := loopTriggerLabelHint(loop.Type); label != "" {
+		parts = append(parts, "🏷 "+label)
+	}
 	if trigger != "" {
 		parts = append(parts, "由 @"+strings.TrimPrefix(trigger, "@")+" 提出")
 	}
@@ -1302,6 +1305,22 @@ func feishuLoopStatusTerminal(status string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// loopTriggerLabelHint names the label that started a loop, by role — so the card
+// shows WHY this task is running: planner=looper:plan, worker=looper:worker-ready,
+// coordinator=looper:auto. Reviewer/fixer are PR-driven (no source label) → "".
+func loopTriggerLabelHint(loopType string) string {
+	switch strings.ToLower(strings.TrimSpace(loopType)) {
+	case "planner":
+		return "looper:plan"
+	case "worker":
+		return "looper:worker-ready"
+	case "coordinator":
+		return "looper:auto"
+	default:
+		return ""
 	}
 }
 
