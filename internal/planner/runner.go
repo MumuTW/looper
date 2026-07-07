@@ -422,6 +422,10 @@ type checkpointPublishState struct {
 	PullRequest    *checkpointPullRequest `json:"pullRequest,omitempty"`
 	LabelsAdded    []string               `json:"labelsAdded,omitempty"`
 	ReviewersAdded []string               `json:"reviewersAdded,omitempty"`
+	// PlaneSpecReview marks the Plane-provider publish path: the tech spec was
+	// written to a Plane page (node G) and is awaiting page-comment review (node H) —
+	// there is no spec PR. Drives the completion summary + card wording.
+	PlaneSpecReview bool `json:"planeSpecReview,omitempty"`
 }
 
 type checkpointNotify struct {
@@ -753,7 +757,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if summary == "" {
 		issue := checkpoint.Issue
 		if issue != nil {
-			summary = fmt.Sprintf("Opened spec PR for %s#%d", issue.Repo, issue.IssueNumber)
+			if checkpoint.Publish != nil && checkpoint.Publish.PlaneSpecReview {
+				summary = fmt.Sprintf("Wrote tech spec to Plane for %s#%d — awaiting review (node H)", issue.Repo, issue.IssueNumber)
+			} else {
+				summary = fmt.Sprintf("Opened spec PR for %s#%d", issue.Repo, issue.IssueNumber)
+			}
 		} else {
 			summary = "Completed planner run"
 		}
@@ -1104,6 +1112,14 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
+	// Plane provider: the tech spec lives on a Plane page (nodes G/H) and is reviewed
+	// there via page comments — there is NO GitHub spec PR, and nothing is pushed. Take
+	// the Plane-only publish path before the push/PR machinery below.
+	if r.planeDoc != nil {
+		if gw, planeProjectID, ok := r.planeDoc(input.Project.ID); ok && gw != nil {
+			return r.runPlanePublishStep(ctx, input, gw, planeProjectID)
+		}
+	}
 	if !r.allowAutoPush {
 		message := fmt.Sprintf("Auto push disabled; manual publish required for planner %s", input.Loop.ID)
 		checkpoint.SkipReason = message
@@ -1259,6 +1275,57 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
 	}
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	return checkpoint, nil
+}
+
+// isPlaneProject reports whether the project delegates to Plane (its planeDoc
+// resolver resolves), i.e. the tech spec lives on a Plane page rather than a spec PR.
+func (r *Runner) isPlaneProject(projectID string) bool {
+	if r.planeDoc == nil {
+		return false
+	}
+	_, _, ok := r.planeDoc(projectID)
+	return ok
+}
+
+// runPlanePublishStep is the Plane-provider publish path (flowchart §需求 side): the
+// tech spec is written to a Plane page (node G) and reviewed there via page comments
+// (node H) — there is NO GitHub spec PR and nothing is pushed. It publishes the
+// agent's spec, verifies it landed (no PR fallback exists on Plane), and completes;
+// opening the implementation PR is the worker's job after the spec is approved.
+func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gateway *planedoc.Gateway, planeProjectID string) (plannerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	issue, err := requireIssue(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	worktree, err := requireWorktree(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	workItemID := planedoc.WorkItemIDFromURL(issue.URL)
+	if workItemID == "" {
+		return checkpoint, &loopError{message: "Plane publish: cannot resolve work item id from " + issue.URL, kind: FailureManualIntervention}
+	}
+	// node G: write the tech spec to a Plane page + link it (idempotent).
+	if err := r.publishTechSpecToPlane(ctx, input, *issue, *worktree); err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("publish tech spec to Plane: %v", err), kind: FailureRetryableTransient}
+	}
+	// Verify it actually landed: the agent must have written a spec file. Without the
+	// tech-spec link there is nothing to review and — unlike the GitHub path — no PR
+	// to fall back to, so hold for a human rather than silently completing empty.
+	_, found, err := gateway.FindSpecLink(ctx, planeProjectID, workItemID, planedoc.TechSpecLinkTitle)
+	if err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("verify tech spec link: %v", err), kind: FailureRetryableTransient}
+	}
+	if !found {
+		return checkpoint, &loopError{message: "planner produced no tech spec to publish to Plane (agent wrote no spec file)", kind: FailureManualIntervention}
+	}
+	if checkpoint.Publish == nil {
+		checkpoint.Publish = &checkpointPublishState{}
+	}
+	checkpoint.Publish.PlaneSpecReview = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }

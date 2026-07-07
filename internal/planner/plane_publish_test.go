@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -77,5 +78,65 @@ func TestPublishTechSpecToPlaneIdempotentAndNonPlane(t *testing.T) {
 	rGH := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return nil, "", false }}
 	if err := rGH.publishTechSpecToPlane(context.Background(), in, issue, wt); err != nil {
 		t.Fatalf("github error = %v", err)
+	}
+}
+
+// TestRunPlanePublishStepWritesSpecNoPR: the Plane-provider publish path writes the
+// tech spec to Plane (node G), verifies it landed, marks PlaneSpecReview, and opens
+// NO pull request — the impl PR is the worker's job after review (node H).
+func TestRunPlanePublishStepWritesSpecNoPR(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "specs"), 0o755)
+	os.WriteFile(filepath.Join(dir, "specs", "s.md"), []byte("# Tech Spec\n验收: e2e"), 0o644)
+
+	// publishTechSpecToPlane: find(empty)→page create→upsert list(empty)→link create;
+	// then runPlanePublishStep's verify find → now returns the tech-spec link.
+	gw, _ := scriptedGateway(
+		`{"results":[]}`,
+		`{"id":"pg-1","name":"Tech Spec: 登录"}`,
+		`{"results":[]}`,
+		`{"id":"l-new"}`,
+		`{"results":[{"id":"l-new","title":"looper:tech-spec","url":"https://plane.x/pages/pg-1"}]}`,
+	)
+	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj", true }}
+	in := stepInput{
+		Project: storage.ProjectRecord{ID: "proj-1"},
+		Checkpoint: plannerCheckpoint{
+			Issue:    &checkpointIssue{Title: "登录", Repo: "o/r", IssueNumber: 9, URL: "https://plane.x/w/projects/pp/issues/wi-9", SpecPath: "specs/s.md"},
+			Worktree: &checkpointWorktree{Path: dir, SpecPath: "specs/s.md"},
+		},
+	}
+	cp, err := r.runPlanePublishStep(context.Background(), in, gw, "plane-proj")
+	if err != nil {
+		t.Fatalf("runPlanePublishStep error = %v", err)
+	}
+	if cp.Publish == nil || !cp.Publish.PlaneSpecReview {
+		t.Fatalf("PlaneSpecReview not set: %+v", cp.Publish)
+	}
+	if cp.Publish.PullRequest != nil {
+		t.Fatalf("Plane path must not open a PR, got %+v", cp.Publish.PullRequest)
+	}
+}
+
+// TestRunPlanePublishStepHoldsWhenNoSpec: if the agent wrote no spec file there is
+// nothing to review and no PR fallback on Plane — hold for a human rather than
+// completing empty.
+func TestRunPlanePublishStepHoldsWhenNoSpec(t *testing.T) {
+	dir := t.TempDir() // no spec file written
+	// publishTechSpecToPlane: find(empty) → read spec(empty) → returns nil (one call);
+	// then runPlanePublishStep verify find → still empty.
+	gw, _ := scriptedGateway(`{"results":[]}`, `{"results":[]}`)
+	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj", true }}
+	in := stepInput{
+		Project: storage.ProjectRecord{ID: "proj-1"},
+		Checkpoint: plannerCheckpoint{
+			Issue:    &checkpointIssue{Title: "登录", Repo: "o/r", IssueNumber: 9, URL: "https://plane.x/w/projects/pp/issues/wi-9", SpecPath: "specs/missing.md"},
+			Worktree: &checkpointWorktree{Path: dir, SpecPath: "specs/missing.md"},
+		},
+	}
+	_, err := r.runPlanePublishStep(context.Background(), in, gw, "plane-proj")
+	var le *loopError
+	if !errors.As(err, &le) || le.kind != FailureManualIntervention {
+		t.Fatalf("want manual-intervention hold when no spec file, got %v", err)
 	}
 }
