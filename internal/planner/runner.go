@@ -912,12 +912,35 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 		return &loopError{message: fmt.Sprintf("check product spec on work item: %v", err), kind: FailureRetryableTransient}
 	}
 	if present {
+		// A resumed planner passes here once product supplied the spec (node E2) —
+		// clear the hold marker so the card leaves "⏸ 等待产品方案".
+		r.setAwaitingProductSpecMarker(ctx, input.Loop, false)
 		return nil // has a product spec → proceed to write the tech spec
 	}
 	if err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", issue.Title); err != nil && r.logger != nil {
 		r.logger.Warn("planner: request product spec failed", map[string]any{"projectId": input.Project.ID, "workItem": workItemID, "error": err.Error()})
 	}
+	// Mark the hold reason so the anchor card reads "⏸ 等待产品方案" (node E) rather
+	// than the generic "⏸ 等你定夺" — the header alone tells you what's blocking.
+	r.setAwaitingProductSpecMarker(ctx, input.Loop, true)
 	return &loopError{message: "awaiting product spec — asked product to supply one on the work item", kind: FailureManualIntervention}
+}
+
+// setAwaitingProductSpecMarker records (or clears) the "awaiting product spec" hold
+// flag in the loop metadata, so the anchor card can distinguish node E's product-spec
+// wait from a generic HITL ask. Best-effort + guarded: a Runner without a loops repo
+// (e.g. a unit/live test wiring only planeDoc) silently skips it.
+func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.LoopRecord, waiting bool) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingProductSpec": waiting})
+	if err != nil {
+		return
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil && r.logger != nil {
+		r.logger.Warn("planner: mark awaiting product spec failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+	}
 }
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {

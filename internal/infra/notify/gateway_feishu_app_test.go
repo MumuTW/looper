@@ -472,26 +472,40 @@ func TestLiveStatusHelpers(t *testing.T) {
 	}
 }
 
-func TestFeishuLoopStatusStyle(t *testing.T) {
+func TestFeishuLoopFlowchartStyle(t *testing.T) {
 	cases := []struct {
-		status   string
-		hasPR    bool
-		template string
-		contains string
+		name         string
+		loopType     string
+		status       string
+		hasPR        bool
+		awaitingSpec bool
+		template     string
+		contains     string
 	}{
-		{"awaiting_human", false, "orange", "等你定夺"},
-		{"completed", true, "turquoise", "待合并"}, // delivered a PR, not merged
-		{"completed", false, "green", "已完成"},    // no PR (e.g. a no-diff run)
-		{"merged", false, "green", "已合并"},
-		{"failed", false, "red", "需要处理"},
-		{"abandoned", false, "red", "需要处理"},
-		{"running", false, "blue", "处理中"},
-		{"", false, "blue", "处理中"},
+		// Running lanes — the header names the flowchart node by role.
+		{"coordinator triages", "coordinator", "running", false, false, "blue", "分诊中"},
+		{"planner writes tech spec", "planner", "running", false, false, "blue", "编写技术方案中"},
+		{"worker implements", "worker", "running", false, false, "blue", "实现中"},
+		{"reviewer reviews", "reviewer", "running", false, false, "blue", "评审中"},
+		{"fixer fixes", "fixer", "running", false, false, "blue", "修复中"},
+		{"unknown role falls back", "", "running", false, false, "blue", "处理中"},
+		// node E hold: product-spec wait is distinct from a generic HITL ask.
+		{"planner awaits product spec", "planner", "awaiting_human", false, true, "orange", "等待产品方案"},
+		{"generic HITL ask", "worker", "awaiting_human", false, false, "orange", "等你定夺"},
+		{"awaiting spec while running", "planner", "running", false, true, "orange", "等待产品方案"},
+		// node H: a completed planner wrote its tech spec to Plane, now under review.
+		{"planner completed → spec review", "planner", "completed", false, false, "blue", "方案评审中"},
+		// Worker delivery + terminals.
+		{"worker delivered a PR", "worker", "completed", true, false, "turquoise", "待合并"},
+		{"worker completed no PR", "worker", "completed", false, false, "green", "已完成"},
+		{"merged terminal", "worker", "merged", false, false, "green", "已合并"},
+		{"failed terminal", "worker", "failed", false, false, "red", "需要处理"},
+		{"abandoned terminal", "planner", "abandoned", false, false, "red", "需要处理"},
 	}
 	for _, want := range cases {
-		gotT, gotL := feishuLoopStatusStyle(want.status, want.hasPR)
+		gotT, gotL := feishuLoopFlowchartStyle(want.loopType, want.status, want.hasPR, want.awaitingSpec)
 		if gotT != want.template || !strings.Contains(gotL, want.contains) {
-			t.Fatalf("feishuLoopStatusStyle(%q, %v) = (%q, %q); want template %q label~%q", want.status, want.hasPR, gotT, gotL, want.template, want.contains)
+			t.Fatalf("%s: feishuLoopFlowchartStyle(%q,%q,%v,%v) = (%q,%q); want template %q label~%q", want.name, want.loopType, want.status, want.hasPR, want.awaitingSpec, gotT, gotL, want.template, want.contains)
 		}
 	}
 }

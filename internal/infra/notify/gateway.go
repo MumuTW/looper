@@ -1259,13 +1259,14 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	// reads $.worker.*, but prUrl is stored at the top level, so it alone is not
 	// reliable here.)
 	hasPR := prURL != "" || strings.HasPrefix(strings.TrimSpace(target), "pr:")
-	template, label := feishuLoopStatusStyle(loop.Status, hasPR)
-	// §A: once the worker has DELIVERED (completed) and a PR exists, mirror the PR's
-	// real review-cycle state (👀 待 review / 🔄 CI 检查中 / ✋ 待修改 / ❌ CI 失败 /
-	// ✅ 待合并) from its latest snapshot, refining the generic "待合并" wording so the
-	// title precisely reflects where the PR is. While the agent is still running the
-	// "处理中" status stays; merged/failed terminals are left untouched.
-	if hasPR && feishuLoopAwaitingMerge(loop.Status) {
+	awaitingProductSpec := loopAwaitingProductSpec(loop.MetadataJSON)
+	template, label := feishuLoopFlowchartStyle(loop.Type, loop.Status, hasPR, awaitingProductSpec)
+	// §A: once the WORKER delivers its impl PR, mirror that PR's real review-cycle
+	// state (👀 待 review / 🔄 CI 检查中 / ✋ 待修改 / ❌ CI 失败 / ✅ 待合并 / 🎉 已合并)
+	// from its latest snapshot so the header tracks the PR through to merge (node Z).
+	// Planner tech specs live on Plane pages (no spec PR) — their 方案评审中 comes from
+	// the role label above, not a PR snapshot. Merged/failed terminals are untouched.
+	if hasPR && feishuLoopAwaitingMerge(loop.Status) && !strings.EqualFold(strings.TrimSpace(loop.Type), "planner") {
 		if t, l, ok := g.prCardStyleFromSnapshot(ctx, repo, target, prURL); ok {
 			template, label = t, l
 		}
@@ -1293,25 +1294,68 @@ func feishuLoopStatusTerminal(status string) bool {
 	}
 }
 
-// feishuLoopStatusStyle maps a loop status to the thread-header card's colour +
-// label, so the anchor card visibly reflects where the task is: processing (blue)
-// → awaiting a human (orange) → done (green) → needs attention (red).
-func feishuLoopStatusStyle(status string, hasPR bool) (template, label string) {
+// loopAwaitingProductSpec reports whether a held loop is waiting specifically for a
+// product spec (flowchart node E) — the planner sets this metadata flag when its
+// product-spec gate holds, so the card can say "⏸ 等待产品方案" instead of the generic
+// "⏸ 等你定夺". Any other hold (ambiguity ask, bug HITL) leaves it false.
+func loopAwaitingProductSpec(metadataJSON *string) bool {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return false
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return false
+	}
+	b, _ := meta["awaitingProductSpec"].(bool)
+	return b
+}
+
+// feishuLoopFlowchartStyle maps a loop's ROLE + status to the anchor card's colour +
+// title, so one glance at the header says WHERE in the flow the task sits — not a
+// generic "处理中". The roles are the flowchart lanes: coordinator=分诊,
+// planner=写技术方案(spec on a Plane page, reviewed there — no spec PR),
+// reviewer=评审, worker=实现. Terminals win first; a held loop shows the human-wait
+// (product-spec vs generic); otherwise the running label is the role's lane. A
+// planner that COMPLETED has written its tech spec to Plane and now awaits node H
+// review (👀 方案评审中), never a merge.
+func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpec bool) (template, label string) {
+	role := strings.ToLower(strings.TrimSpace(loopType))
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "awaiting_human":
-		return "orange", "⏸ Looper 等你定夺"
 	case "merged":
 		return "green", "🎉 已合并"
+	case "failed", "abandoned", "error":
+		return "red", "⚠️ Looper 需要处理"
+	case "awaiting_human":
+		if awaitingProductSpec {
+			return "orange", "⏸ 等待产品方案"
+		}
+		return "orange", "⏸ Looper 等你定夺"
 	case "completed", "done":
-		// The worker's job ends at OPENING the PR — "completed" means delivered,
-		// NOT merged (review / CI / merge still to come). Only say 已完成 when
-		// there's no PR at all (e.g. a no-diff run).
+		if role == "planner" {
+			// Tech spec written to Plane → awaiting node H review + human approve.
+			return "blue", "👀 方案评审中"
+		}
+		// worker / fixer / generic: completed means the impl PR is delivered.
 		if hasPR {
 			return "turquoise", "✅ 已交付 · 待合并"
 		}
 		return "green", "✅ Looper 已完成"
-	case "failed", "abandoned", "error":
-		return "red", "⚠️ Looper 需要处理"
+	}
+	// running / queued / paused — the label is the role's flowchart lane.
+	if awaitingProductSpec {
+		return "orange", "⏸ 等待产品方案"
+	}
+	switch role {
+	case "coordinator":
+		return "blue", "🧭 分诊中"
+	case "planner":
+		return "blue", "📝 编写技术方案中"
+	case "worker":
+		return "blue", "🔨 实现中"
+	case "reviewer":
+		return "blue", "👀 评审中"
+	case "fixer":
+		return "blue", "🔧 修复中"
 	default:
 		return "blue", "🔧 Looper 处理中"
 	}
