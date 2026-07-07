@@ -61,6 +61,60 @@ func TestGatewayLiveRoundTrip(t *testing.T) {
 	_, _ = g.runPlane(ctx, "", append([]string{"api", "page", "delete", "--project", proj, page.ID}, g.globalArgs()...)...)
 }
 
+// TestGatewayLivePageComments exercises node H's review surface against the real
+// deployment (powerformer/plane PR #11 page comments, reached via the request escape
+// hatch): create a page → post a comment → list it back → clean up. Skipped unless
+// PLANE_LIVE_E2E=1.
+func TestGatewayLivePageComments(t *testing.T) {
+	if os.Getenv("PLANE_LIVE_E2E") != "1" {
+		t.Skip("set PLANE_LIVE_E2E=1 (and PLANE_API_KEY) to run the live page-comment test")
+	}
+	key := os.Getenv("PLANE_API_KEY")
+	if key == "" {
+		t.Skip("PLANE_API_KEY not set")
+	}
+	proj := envOr("PLANE_TEST_PROJECT", "db35f0e7-5004-4632-ba84-074164c95491")
+	g := New(Options{
+		APIBaseURL: envOr("PLANE_API_BASE_URL", "https://plane.powerformer.net/api/v1"),
+		APIKey:     key,
+		Workspace:  envOr("PLANE_WORKSPACE_SLUG", "open-design"),
+	})
+	ctx := context.Background()
+
+	page, err := g.CreatePage(ctx, proj, "LIVE-node-H-page-comments", "# tech spec\n验收: e2e")
+	if err != nil {
+		t.Fatalf("CreatePage error = %v", err)
+	}
+	defer func() {
+		_, _ = g.runPlane(ctx, "", append([]string{"api", "page", "delete", "--project", proj, page.ID}, g.globalArgs()...)...)
+	}()
+
+	body := "<p>[looper] node H 辅助审:第2节验收标准缺失,请补。</p>"
+	created, err := g.CreatePageComment(ctx, proj, page.ID, body)
+	if err != nil {
+		t.Fatalf("CreatePageComment error = %v", err)
+	}
+	if !strings.Contains(created.CommentStripped, "验收标准缺失") {
+		t.Fatalf("created comment = %q, want the posted text", created.CommentStripped)
+	}
+	t.Logf("posted page comment %s by %s", created.ID, created.DisplayName)
+
+	comments, err := g.ListPageComments(ctx, proj, page.ID)
+	if err != nil {
+		t.Fatalf("ListPageComments error = %v", err)
+	}
+	found := false
+	for _, c := range comments {
+		if c.ID == created.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ListPageComments (%d) did not include the posted comment %s", len(comments), created.ID)
+	}
+	t.Logf("listed %d page comment(s), found the posted one", len(comments))
+}
+
 func envOr(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v

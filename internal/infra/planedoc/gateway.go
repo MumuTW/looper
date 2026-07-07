@@ -317,6 +317,73 @@ func (g *Gateway) RequestProductSpec(ctx context.Context, projectID, workItemID,
 	return g.CommentOnWorkItem(ctx, projectID, workItemID, html)
 }
 
+// PageComment is a Notion-style comment on a Plane page (powerformer/plane PR #11,
+// exposed on the public /api/v1). node H uses it as the tech-spec review surface: the
+// reviewer posts its assist-review as a page comment, and a human's approve reply is
+// polled here. Reached through the `plane api request` escape hatch until the CLI
+// grows a typed `page comment` subcommand.
+type PageComment struct {
+	ID              string `json:"id"`
+	CommentHTML     string `json:"comment_html"`
+	CommentStripped string `json:"comment_stripped"`
+	DisplayName     string `json:"display_name"`
+	Actor           string `json:"actor"`
+	ExternalID      string `json:"external_id"`
+	CreatedAt       string `json:"created_at"`
+	ResolvedAt      string `json:"resolved_at"`
+}
+
+// pageCommentsPath builds the /api/v1-relative page-comments collection path. The
+// workspace slug must be embedded literally (the request escape hatch takes a raw
+// path), so it's required here even though globalArgs also passes --workspace.
+func (g *Gateway) pageCommentsPath(projectID, pageID string) (string, error) {
+	ws := strings.TrimSpace(g.workspace)
+	if ws == "" || strings.TrimSpace(projectID) == "" || strings.TrimSpace(pageID) == "" {
+		return "", fmt.Errorf("planedoc: page comments require workspace, project id, and page id")
+	}
+	return fmt.Sprintf("workspaces/%s/projects/%s/pages/%s/comments/", ws, projectID, pageID), nil
+}
+
+// CreatePageComment posts an HTML comment on a Plane page — the reviewer's node H
+// assist-review, or an automated status note. Returns the created comment.
+func (g *Gateway) CreatePageComment(ctx context.Context, projectID, pageID, commentHTML string) (PageComment, error) {
+	if strings.TrimSpace(commentHTML) == "" {
+		return PageComment{}, fmt.Errorf("planedoc: CreatePageComment requires html")
+	}
+	path, err := g.pageCommentsPath(projectID, pageID)
+	if err != nil {
+		return PageComment{}, err
+	}
+	data := fmt.Sprintf(`{"comment_html":%s}`, jsonString(commentHTML))
+	args := []string{"api", "request", path, "--method", "POST", "--data", data}
+	args = append(args, g.globalArgs()...)
+	result, err := g.runPlane(ctx, "", args...)
+	if err != nil {
+		return PageComment{}, fmt.Errorf("planedoc: create page comment: %w", err)
+	}
+	var pc PageComment
+	if err := json.Unmarshal([]byte(strings.TrimSpace(result.Stdout)), &pc); err != nil {
+		return PageComment{}, fmt.Errorf("planedoc: decode page comment: %w", err)
+	}
+	return pc, nil
+}
+
+// ListPageComments returns a page's comments, newest-first as Plane orders them. node
+// H polls this for a human's approve reply (the gate before dispatching the worker).
+func (g *Gateway) ListPageComments(ctx context.Context, projectID, pageID string) ([]PageComment, error) {
+	path, err := g.pageCommentsPath(projectID, pageID)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"api", "request", path, "--method", "GET"}
+	args = append(args, g.globalArgs()...)
+	result, err := g.runPlane(ctx, "", args...)
+	if err != nil {
+		return nil, fmt.Errorf("planedoc: list page comments: %w", err)
+	}
+	return decodePageComments(result.Stdout)
+}
+
 // SpecKind is which spec a dropped document is — decides the link title tag.
 type SpecKind string
 
@@ -422,6 +489,26 @@ func decodeLinks(stdout string) ([]Link, error) {
 	var bare []Link
 	if err := json.Unmarshal([]byte(stdout), &bare); err != nil {
 		return nil, fmt.Errorf("planedoc: decode links: %w", err)
+	}
+	return bare, nil
+}
+
+// decodePageComments unwraps either a bare array or a {results:[...]} envelope, the
+// two shapes the Plane page-comments endpoint returns through the request escape hatch.
+func decodePageComments(stdout string) ([]PageComment, error) {
+	stdout = strings.TrimSpace(stdout)
+	if stdout == "" {
+		return nil, nil
+	}
+	var envelope struct {
+		Results []PageComment `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err == nil && envelope.Results != nil {
+		return envelope.Results, nil
+	}
+	var bare []PageComment
+	if err := json.Unmarshal([]byte(stdout), &bare); err != nil {
+		return nil, fmt.Errorf("planedoc: decode page comments: %w", err)
 	}
 	return bare, nil
 }
