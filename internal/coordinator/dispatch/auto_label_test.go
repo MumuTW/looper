@@ -62,3 +62,40 @@ func TestAutoLabelStillRespectsTriageAndHold(t *testing.T) {
 		t.Fatalf("held looper:auto = %#v, want no-op", a)
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }
+
+func TestProductSpecGateHoldsFeatureWithoutSpec(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := testConfig()
+	cfg.RequireProductSpecForPlan = true
+	base := Issue{Number: 1, Labels: []string{AutoLabel, "triaged", DispatchPlan, KindFeature}, TriagedAt: now.Add(-time.Minute)}
+
+	// feature + no product spec → request it, don't dispatch to planner
+	noSpec := base
+	noSpec.HasProductSpec = boolPtr(false)
+	if a := Decide(noSpec, cfg, now, nil); !a.RequestProductSpec || len(a.TriggerLabels) != 0 {
+		t.Fatalf("no-spec feature = %#v, want RequestProductSpec + no dispatch", a)
+	}
+	// feature + has product spec → dispatch to planner as normal
+	withSpec := base
+	withSpec.HasProductSpec = boolPtr(true)
+	if a := Decide(withSpec, cfg, now, nil); a.RequestProductSpec || len(a.TriggerLabels) != 1 || a.TriggerLabels[0] != "looper:plan" {
+		t.Fatalf("spec'd feature = %#v, want planner dispatch", a)
+	}
+	// gate off → dispatch even without a spec (today's behaviour)
+	off := testConfig()
+	if a := Decide(noSpec, off, now, nil); a.RequestProductSpec || len(a.TriggerLabels) != 1 {
+		t.Fatalf("gate off = %#v, want planner dispatch", a)
+	}
+	// a BUG heading to a tech spec (dispatch/plan) is exempt — no product spec needed
+	bug := Issue{Number: 1, Labels: []string{AutoLabel, "triaged", DispatchPlan, KindBug}, TriagedAt: now.Add(-time.Minute), HasProductSpec: boolPtr(false)}
+	if a := Decide(bug, cfg, now, nil); a.RequestProductSpec {
+		t.Fatalf("bug = %#v, want no product-spec gate (bugs don't need one)", a)
+	}
+	// unknown spec status (nil) → gate no-ops, dispatch
+	unknown := base
+	if a := Decide(unknown, cfg, now, nil); a.RequestProductSpec {
+		t.Fatalf("unknown spec status = %#v, want no hold", a)
+	}
+}
