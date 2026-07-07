@@ -3408,10 +3408,12 @@ func buildAgentPullRequestInstruction(work workerInput, providerKind config.Prov
 		"When the implementation is ready and validation passes, create the pull request yourself using the configured provider tooling.",
 		"Before creating a PR, check whether one already exists for the current branch and avoid duplicates.",
 		"Write a concise, accurate PR title and a structured body that explains the actual changes and why they were made.",
+		"Open the pull request READY FOR REVIEW, not as a draft: the spec was already reviewed and human-approved before you were dispatched, so reviewers must be able to pick this PR up immediately. A draft PR is skipped by review automation and stalls the flow.",
 		fmt.Sprintf("Target base branch: %s.", work.BaseBranch),
 	}
 	if providerKind == config.ProviderKindGitHub {
 		parts[0] = "When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself."
+		parts[3] = "Open the pull request READY FOR REVIEW, not as a draft: the spec was already reviewed and human-approved before you were dispatched, so reviewers must be able to pick this PR up immediately. Do NOT pass `--draft` to `gh pr create`; if a draft already exists for this branch, mark it ready with `gh pr ready`."
 	}
 	if work.IssueNumber > 0 {
 		parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
