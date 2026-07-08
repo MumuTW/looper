@@ -388,6 +388,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 		}
 		validateProductOwner(project.ProductOwner, prefix+".productOwner", &issues)
+		validateFeishuActor(project.QA, prefix+".qa", &issues)
+		validateFeishuActor(project.Owner, prefix+".owner", &issues)
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
 		}
@@ -1092,6 +1094,25 @@ func validateProductOwner(owner *ProductOwnerConfig, path string, issues *[]Vali
 		return
 	}
 	openID := owner.FeishuOpenID
+	if openID == "" {
+		return
+	}
+	if strings.TrimSpace(openID) != openID {
+		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must not contain leading or trailing whitespace"})
+		return
+	}
+	if !strings.HasPrefix(openID, "ou_") {
+		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must be a Feishu open_id (starts with ou_)"})
+	}
+}
+
+// validateFeishuActor checks an optional per-project @-mention actor (QA / owner):
+// when set, the Feishu open_id must be trimmed and shaped like an open_id (ou_…).
+func validateFeishuActor(actor *FeishuActorConfig, path string, issues *[]ValidationIssue) {
+	if actor == nil {
+		return
+	}
+	openID := actor.FeishuOpenID
 	if openID == "" {
 		return
 	}

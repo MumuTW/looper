@@ -3,13 +3,16 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -138,8 +141,16 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 	marker.LastSignal = signal
 	marker.Phase = shepherdPhaseFor(pr)
 	marker.HeadSHA = pr.HeadSHA
+	// Milestone thread note + @-mention on entering a report-worthy phase, BEFORE we
+	// persist — so LastReportedPhase is saved and the next pass doesn't double-post.
+	r.reportShepherdPhase(ctx, &marker, loop, prNumber, prValidated(pr))
 	if newMeta, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
 		r.persistLoopMetadata(ctx, repositories, loop.ID, newMeta, nowISO)
+		// The folded signal changed (past the guard above), so the phase may have
+		// advanced (👀 评审中 → 🔧 修复中 → ✅ 待合并). Refresh the anchor card now: a
+		// passively-shepherded PR runs no scheduler pass, so nothing else would move
+		// the card off the worker's "🔨 实现中".
+		r.refreshShepherdCard(ctx, loop.ID)
 	}
 	if shepherdActionable(pr) {
 		if marker.PassCount >= shepherdMaxPasses {
@@ -222,7 +233,11 @@ func latestReviewMarker(pr githubinfra.PullRequestDetail) string {
 // but includes latestReviewMarker so a new review round wakes a pass even at the
 // same head with the same aggregate decision.
 func foldShepherdSignal(pr githubinfra.PullRequestDetail) string {
-	return fmt.Sprintf("%s|%s|%s|%v|%s|%s", strings.ToUpper(pr.State), strings.ToUpper(pr.ReviewDecision), shepherdCIPhase(pr), pr.HasConflicts, pr.HeadSHA, latestReviewMarker(pr))
+	// needs-validation/validated are in the tuple so a QA-gate label change (maintainer
+	// adds needs-validation, QA adds validated) wakes the reconcile to re-evaluate the
+	// phase and re-report — otherwise a validation that lands at the same head/decision
+	// would be missed.
+	return fmt.Sprintf("%s|%s|%s|%v|%s|%s|%v|%v", strings.ToUpper(pr.State), strings.ToUpper(pr.ReviewDecision), shepherdCIPhase(pr), pr.HasConflicts, pr.HeadSHA, latestReviewMarker(pr), prNeedsValidation(pr), prValidated(pr))
 }
 
 // changesRequestedOnCurrentHead reports whether a reviewer has a CHANGES_REQUESTED
@@ -272,6 +287,25 @@ func approvedOnCurrentHead(pr githubinfra.PullRequestDetail) bool {
 	return false
 }
 
+// prHasLabel reports whether the PR carries the given label (case-insensitive).
+func prHasLabel(pr githubinfra.PullRequestDetail, label string) bool {
+	for _, l := range pr.Labels {
+		if strings.EqualFold(strings.TrimSpace(l), label) {
+			return true
+		}
+	}
+	return false
+}
+
+// prNeedsValidation / prValidated read the QA validation-gate labels a maintainer
+// bot manages on the PR: `needs-validation` (runtime change needs QA sign-off) and
+// `validated` (QA passed). The shepherd holds at awaiting_validation while
+// needs-validation is present and validated is not.
+func prNeedsValidation(pr githubinfra.PullRequestDetail) bool {
+	return prHasLabel(pr, "needs-validation")
+}
+func prValidated(pr githubinfra.PullRequestDetail) bool { return prHasLabel(pr, "validated") }
+
 // shepherdActionable reports whether the agent has something to do THIS wake:
 // changes requested AT THE CURRENT HEAD, failing CI, or a conflict. Approved (or
 // a fix already pushed and awaiting the reviewer's re-review) is NOT actionable —
@@ -296,6 +330,12 @@ func shepherdPhaseFor(pr githubinfra.PullRequestDetail) string {
 		return "fixing"
 	}
 	if approvedOnCurrentHead(pr) && !changesRequestedOnCurrentHead(pr) && shepherdCIPhase(pr) == "passed" && !pr.HasConflicts {
+		// Approved + green + clean. Hold at awaiting_validation (→ @QA) while the PR
+		// still needs QA sign-off; only once validated (or it never needed it) is it
+		// awaiting_merge (→ @owner). The bot never merges; a human does.
+		if prNeedsValidation(pr) && !prValidated(pr) {
+			return "awaiting_validation"
+		}
 		return "awaiting_merge"
 	}
 	return "reviewing"
@@ -344,6 +384,13 @@ func (r *Runtime) terminateShepherd(ctx context.Context, repos *storage.Reposito
 	if err := repos.Loops.Upsert(ctx, updated); err != nil {
 		return
 	}
+	// A human merged (or closed) the PR — advance the anchor card to its terminal
+	// state (✅ 已合并) instead of leaving it frozen mid-shepherd, and post a closing
+	// milestone note so the thread reads end-to-end.
+	r.refreshShepherdCard(ctx, loop.ID)
+	if strings.EqualFold(strings.TrimSpace(outcome), "merged") {
+		r.postShepherdThreadNote(ctx, loop.ID, fmt.Sprintf("🎉 PR #%d 已合并。", prNumber), nil)
+	}
 	if repos.Locks != nil {
 		_ = repos.Locks.Release(ctx, fmt.Sprintf("pr:%s:%d", repo, prNumber))
 	}
@@ -362,6 +409,97 @@ func (r *Runtime) persistLoopMetadata(ctx context.Context, repos *storage.Reposi
 	updated.MetadataJSON = &metadataJSON
 	updated.UpdatedAt = nowISO
 	_ = repos.Loops.Upsert(ctx, updated)
+}
+
+// refreshShepherdCard re-renders a shepherded loop's Feishu anchor card so it
+// reflects the loop's CURRENT shepherd phase (👀 评审中 / 🔧 修复中 / ✅ 待合并, or ✅
+// 已合并 on terminate). The scheduler only refreshes the anchor on a run start/finish;
+// a passively-shepherded PR (waiting on a human review or merge) runs no pass, so
+// without this the card would freeze at the worker's "🔨 实现中". App-mode only
+// (RefreshThreadHeader no-ops otherwise). The gateway is built on demand — this is
+// called only when a phase actually changes, which is rare.
+func (r *Runtime) refreshShepherdCard(ctx context.Context, loopID string) {
+	if strings.TrimSpace(loopID) == "" {
+		return
+	}
+	if gw, ok := r.shepherdNotifyGateway(); ok {
+		gw.RefreshThreadHeader(ctx, loopID, nil, 0)
+	}
+}
+
+// postShepherdThreadNote posts a milestone note into the loop's Feishu thread,
+// @-mentioning the given open_ids (resolved per-project from config, never hardcoded).
+// App-mode only; best-effort.
+func (r *Runtime) postShepherdThreadNote(ctx context.Context, loopID, text string, mentionOpenIDs []string) {
+	if strings.TrimSpace(loopID) == "" || strings.TrimSpace(text) == "" {
+		return
+	}
+	if gw, ok := r.shepherdNotifyGateway(); ok {
+		_ = gw.PostThreadNote(ctx, loopID, text, mentionOpenIDs)
+	}
+}
+
+// shepherdNotifyGateway builds a notify gateway for the shepherd's card refreshes and
+// milestone thread notes. Returns (nil,false) unless notifications are in app mode.
+// Built on demand — the shepherd only notifies on a phase change, which is rare.
+func (r *Runtime) shepherdNotifyGateway() (*notify.Gateway, bool) {
+	r.mu.RLock()
+	cfg := r.config
+	repos := r.services.Repositories
+	now := r.now
+	r.mu.RUnlock()
+	if repos == nil || !strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+		return nil, false
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return notify.NewGateway(notify.Options{
+		Config:        cfg.Notifications,
+		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
+		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		Repositories:  repos,
+		Now:           now,
+	}), true
+}
+
+// reportShepherdPhase posts a milestone thread note when the loop ENTERS a
+// report-worthy phase, exactly once per phase (deduped via marker.LastReportedPhase):
+//   - awaiting_validation → @QA (needs QA sign-off)
+//   - awaiting_merge      → @owner (ready to merge; the bot never merges)
+//
+// reviewing / fixing don't post — the anchor card + the worker's own thread feed
+// already carry those. The mention open_ids come from per-project config.
+func (r *Runtime) reportShepherdPhase(ctx context.Context, marker *loops.Shepherd, loop storage.LoopRecord, prNumber int64, validated bool) {
+	phase := marker.Phase
+	if phase == "" || phase == marker.LastReportedPhase {
+		return
+	}
+	r.mu.RLock()
+	cfg := r.config
+	r.mu.RUnlock()
+	var text string
+	var mentions []string
+	switch phase {
+	case "awaiting_validation":
+		text = fmt.Sprintf("🧪 PR #%d 已批准 + CI 全绿 + 无冲突,但带 `needs-validation` —— 请验收(通过后在 PR 上打 `validated` 标签)。", prNumber)
+		if qa := strings.TrimSpace(config.ProjectQA(cfg, loop.ProjectID)); qa != "" {
+			mentions = []string{qa}
+		}
+	case "awaiting_merge":
+		suffix := ""
+		if validated {
+			suffix = " + 已通过验收"
+		}
+		text = fmt.Sprintf("✅ PR #%d 已就绪(批准 + CI 全绿 + 无冲突%s)—— 可以合并了。bot 不会自己合,等你点。", prNumber, suffix)
+		if owner := strings.TrimSpace(config.ProjectOwner(cfg, loop.ProjectID)); owner != "" {
+			mentions = []string{owner}
+		}
+	default:
+		return
+	}
+	r.postShepherdThreadNote(ctx, loop.ID, text, mentions)
+	marker.LastReportedPhase = phase
 }
 
 // enqueueShepherdPass wakes ONE shepherd pass: a worker queue item bound to the

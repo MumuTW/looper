@@ -75,6 +75,43 @@ func TestShepherdActionableAndPhase(t *testing.T) {
 	}
 }
 
+// The QA validation gate: approved + green + clean holds at awaiting_validation
+// (→ @QA) while `needs-validation` is present and `validated` is not; once validated
+// (or the PR never needed it) it's awaiting_merge (→ @owner). The bot never merges.
+func TestShepherdValidationGate(t *testing.T) {
+	green := []map[string]any{check("COMPLETED", "SUCCESS")}
+	base := githubinfra.PullRequestDetail{
+		State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "h", Checks: green,
+		Reviews: []map[string]any{{"state": "APPROVED", "commit": map[string]any{"oid": "h"}}},
+	}
+	// needs-validation, not validated → awaiting_validation, NOT actionable (bot waits for QA)
+	needsVal := base
+	needsVal.Labels = []string{"size/M", "needs-validation"}
+	if got := shepherdPhaseFor(needsVal); got != "awaiting_validation" {
+		t.Fatalf("needs-validation (unvalidated) phase = %q, want awaiting_validation", got)
+	}
+	if shepherdActionable(needsVal) {
+		t.Fatal("awaiting_validation must NOT be actionable — the bot waits for QA, never merges")
+	}
+	// + validated → awaiting_merge
+	validated := base
+	validated.Labels = []string{"needs-validation", "validated"}
+	if got := shepherdPhaseFor(validated); got != "awaiting_merge" {
+		t.Fatalf("needs-validation + validated phase = %q, want awaiting_merge", got)
+	}
+	// no needs-validation label at all → straight to awaiting_merge (no QA gate)
+	noVal := base
+	noVal.Labels = []string{"size/M"}
+	if got := shepherdPhaseFor(noVal); got != "awaiting_merge" {
+		t.Fatalf("no needs-validation phase = %q, want awaiting_merge", got)
+	}
+	// the QA-gate labels are in the wake signal, so a `validated` landing at the same
+	// head/decision still wakes the reconcile to re-evaluate + re-report.
+	if foldShepherdSignal(needsVal) == foldShepherdSignal(validated) {
+		t.Fatal("adding `validated` must change the folded signal (else QA sign-off is missed)")
+	}
+}
+
 // The wake key must NOT include updatedAt (or any field the agent's own
 // comments/pushes bump gratuitously) beyond headSHA, else a fix would
 // self-retrigger forever. Two PRs differing only in updatedAt fold to the same

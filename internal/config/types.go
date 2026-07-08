@@ -582,6 +582,14 @@ type ProjectRefConfig struct {
 	Webhook      ProjectWebhookConfig `json:"webhook,omitempty"`
 	Roles        *PartialRoleConfigs  `json:"roles,omitempty"`
 	ProductOwner *ProductOwnerConfig  `json:"productOwner,omitempty"`
+	// QA is the project's QA validator — @-mentioned in the task thread when a PR the
+	// shepherd is driving carries `needs-validation` and hasn't been `validated` yet.
+	// Project-level (unified across every deploy of this project).
+	QA *FeishuActorConfig `json:"qa,omitempty"`
+	// Owner is this looper deploy's owner — @-mentioned to merge once a PR is approved,
+	// green, conflict-free and (if it needed validation) validated. Per-deploy: each
+	// teammate running looper on their own machine configures their own open_id here.
+	Owner *FeishuActorConfig `json:"owner,omitempty"`
 }
 
 // ProductOwnerConfig names the person who owns the product spec for a project — who
@@ -593,6 +601,14 @@ type ProductOwnerConfig struct {
 	// PlaneID is the product owner's Plane member UUID, for operations that act on
 	// their behalf in Plane. Optional.
 	PlaneID string `json:"planeId,omitempty"`
+}
+
+// FeishuActorConfig names a person by their Feishu open_id for @-mentions in a
+// project's task threads. Used for the QA validator and the deploy's looper owner —
+// resolved per-project from config so no open_id is ever hardcoded in the source.
+type FeishuActorConfig struct {
+	// FeishuOpenID is the actor's Feishu open_id (ou_...).
+	FeishuOpenID string `json:"feishuOpenId,omitempty"`
 }
 
 type ProjectWebhookConfig struct {
@@ -613,6 +629,8 @@ type PartialProjectRefConfig struct {
 	Instructions map[string]string            `json:"instructions,omitempty"`
 	Roles        *PartialRoleConfigs          `json:"roles,omitempty"`
 	ProductOwner *ProductOwnerConfig          `json:"productOwner,omitempty"`
+	QA           *FeishuActorConfig           `json:"qa,omitempty"`
+	Owner        *FeishuActorConfig           `json:"owner,omitempty"`
 }
 
 type PartialProjectNetworkConfig struct {

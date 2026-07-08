@@ -1205,6 +1205,14 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if loop.Repo != nil {
 		repo = strings.TrimSpace(*loop.Repo)
 	}
+	// Fallback: a shepherded (or restart-resumed) worker records its PR in
+	// loop.PRNumber + target pr:repo:N even when $.worker.prUrl wasn't persisted to the
+	// metadata. Derive the link so a human sees the PR to review straight from the card
+	// while it sits at 👀 评审中 — otherwise the card names the task but hides the
+	// deliverable under review.
+	if prURL == "" && loop.PRNumber != nil && *loop.PRNumber > 0 && repo != "" {
+		prURL = fmt.Sprintf("https://github.com/%s/pull/%d", repo, *loop.PRNumber)
+	}
 	title := loopTitleFromMetadata(loop.MetadataJSON)
 
 	parts := make([]string, 0, 3)
@@ -1280,7 +1288,10 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	// from its latest snapshot so the header tracks the PR through to merge (node Z).
 	// Planner tech specs live on Plane pages (no spec PR) — their 方案评审中 comes from
 	// the role label above, not a PR snapshot. Merged/failed terminals are untouched.
-	if hasPR && feishuLoopAwaitingMerge(loop.Status) && !strings.EqualFold(strings.TrimSpace(loop.Type), "planner") {
+	// Shepherding loops are EXCLUDED: the shepherd's own phase (computed from the live
+	// PR, and the only one that knows the 🧪 待验收 QA gate) is authoritative there —
+	// the coarser snapshot must not override 待验收 back to 待合并.
+	if hasPR && feishuLoopAwaitingMerge(loop.Status) && !strings.EqualFold(strings.TrimSpace(loop.Type), "planner") && !strings.EqualFold(strings.TrimSpace(loop.Status), "shepherding") {
 		if t, l, ok := g.prCardStyleFromSnapshot(ctx, repo, target, prURL); ok {
 			template, label = t, l
 		}
@@ -1400,6 +1411,8 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 		switch strings.ToLower(strings.TrimSpace(shepherdPhase)) {
 		case "fixing":
 			return "blue", "🔧 修复中"
+		case "awaiting_validation":
+			return "orange", "🧪 待验收(QA)"
 		case "awaiting_merge":
 			return "turquoise", "✅ 待合并(等人合并)"
 		default:

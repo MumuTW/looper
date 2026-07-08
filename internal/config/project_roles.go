@@ -36,6 +36,28 @@ func ProjectProductOwner(cfg Config, projectID string) ProductOwnerConfig {
 	return *project.ProductOwner
 }
 
+// ProjectQA resolves a project's QA validator open_id — who the shepherd @-mentions
+// when a PR carries `needs-validation` and isn't `validated` yet. Project-level.
+// Unknown ids / unset config return an empty open_id (no one to ping).
+func ProjectQA(cfg Config, projectID string) string {
+	project := findConfiguredProject(cfg.Projects, projectID)
+	if project == nil || project.QA == nil {
+		return ""
+	}
+	return project.QA.FeishuOpenID
+}
+
+// ProjectOwner resolves this deploy's looper owner open_id — who the shepherd
+// @-mentions to merge once a PR is approved, green, clean and (if needed) validated.
+// Per-deploy config. Unknown ids / unset config return an empty open_id.
+func ProjectOwner(cfg Config, projectID string) string {
+	project := findConfiguredProject(cfg.Projects, projectID)
+	if project == nil || project.Owner == nil {
+		return ""
+	}
+	return project.Owner.FeishuOpenID
+}
+
 func ProjectRoleAutoDiscoveryEnabled(cfg Config, projectID, role string) bool {
 	roles := ProjectRoleConfigs(cfg, projectID)
 	switch role {

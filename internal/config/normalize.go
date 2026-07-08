@@ -1473,6 +1473,8 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			Instructions: cloneStringMap(project.Instructions),
 			Roles:        clonePartialRoleConfigs(project.Roles),
 			ProductOwner: cloneProductOwner(project.ProductOwner),
+			QA:           cloneFeishuActor(project.QA),
+			Owner:        cloneFeishuActor(project.Owner),
 		}
 	}
 	return cloned
@@ -1483,6 +1485,14 @@ func cloneProductOwner(owner *ProductOwnerConfig) *ProductOwnerConfig {
 		return nil
 	}
 	cloned := *owner
+	return &cloned
+}
+
+func cloneFeishuActor(actor *FeishuActorConfig) *FeishuActorConfig {
+	if actor == nil {
+		return nil
+	}
+	cloned := *actor
 	return &cloned
 }
 
@@ -1565,6 +1575,8 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 			cloned[index].Webhook.Mode = *project.Webhook.Mode
 		}
 		cloned[index].ProductOwner = cloneProductOwner(project.ProductOwner)
+		cloned[index].QA = cloneFeishuActor(project.QA)
+		cloned[index].Owner = cloneFeishuActor(project.Owner)
 
 		if project.BaseBranch != nil {
 			cloned[index].BaseBranch = stringPtr(*project.BaseBranch)

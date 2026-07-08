@@ -954,10 +954,33 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 	if err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", issue.Title); err != nil && r.logger != nil {
 		r.logger.Warn("planner: request product spec failed", map[string]any{"projectId": input.Project.ID, "workItem": workItemID, "error": err.Error()})
 	}
+	// Also @-mention the product owner in the Feishu thread — not only the Plane
+	// comment — so they see the ask where they actually watch. The open_id comes from
+	// per-project config (ProjectProductOwner), never hardcoded. Best-effort.
+	r.requestProductSpecInThread(ctx, input, issue.Title)
 	// Mark the hold reason so the anchor card reads "⏸ 等待产品方案" (node E) rather
 	// than the generic "⏸ 等你定夺" — the header alone tells you what's blocking.
 	r.setAwaitingProductSpecMarker(ctx, input.Loop, true)
 	return &loopError{message: "awaiting product spec — asked product to supply one on the work item", kind: FailureManualIntervention}
+}
+
+// requestProductSpecInThread @-mentions the project's product owner in the loop's
+// Feishu thread to ask for a missing product spec (node E) — the thread mirror of the
+// Plane comment RequestProductSpec posts, so the ask reaches them where they watch.
+// The open_id is resolved per-project from config (never hardcoded); a missing
+// transport or an unset owner just skips the ping. Best-effort.
+func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput, workItemTitle string) {
+	if r.postThreadNote == nil || r.projectRoleConfig == nil {
+		return
+	}
+	var mentions []string
+	if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
+		mentions = []string{openID}
+	}
+	note := fmt.Sprintf("⏸ 需求「%s」还没有产品 spec —— 请补一份:把方案页链接或正文直接发在本 thread,looper 会自动关联并继续。", strings.TrimSpace(workItemTitle))
+	if err := r.postThreadNote(ctx, input.Loop.ID, note, mentions); err != nil && r.logger != nil {
+		r.logger.Warn("planner: post product-spec request note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+	}
 }
 
 // setAwaitingProductSpecMarker records (or clears) the "awaiting product spec" hold

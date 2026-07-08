@@ -14,7 +14,8 @@ type Shepherd struct {
 	// Active gates the whole flow. While true (and the loop has a PR checkpoint)
 	// the resolver routes every run to stepShepherd. Cleared on terminal.
 	Active bool `json:"active"`
-	// Phase drives the card title: reviewing | fixing | awaiting_merge.
+	// Phase drives the card title: reviewing | fixing | awaiting_validation |
+	// awaiting_merge.
 	Phase string `json:"phase,omitempty"`
 	// PassCount is the global stop-ask cap counter (only agent-waking passes).
 	PassCount int `json:"passCount,omitempty"`
@@ -31,6 +32,10 @@ type Shepherd struct {
 	HeadSHA string `json:"headSha,omitempty"`
 	// Outcome is the terminal reason once done: "merged" or "abandoned".
 	Outcome string `json:"outcome,omitempty"`
+	// LastReportedPhase is the last phase a thread milestone note was posted for, so
+	// entering a phase (e.g. awaiting_validation → @QA, awaiting_merge → @owner)
+	// reports exactly once and re-reports only when the phase genuinely changes.
+	LastReportedPhase string `json:"lastReportedPhase,omitempty"`
 }
 
 // ReadShepherd returns the shepherd marker, if present.
