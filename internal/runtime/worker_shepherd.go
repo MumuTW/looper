@@ -17,6 +17,13 @@ import (
 // refreshes it every tick (tick << TTL) so a same-account fixer keeps skipping.
 const shepherdReconcileLockTTL = 20 * time.Minute
 
+// shepherdReconcileInterval is the dedicated shepherd poll cadence. looper has no
+// per-PR-event webhook seam, so a worker loop driving its PR to merge polls on
+// this cadence (well under the lock TTL) to pick up a re-review / CI change /
+// conflict / a human's merge promptly — independent of the slower 5-min
+// wake-reconcile.
+const shepherdReconcileInterval = 60 * time.Second
+
 // reconcileWorkerShepherd drives a worker loop that is shepherding its own impl
 // PR toward merge. Polling (looper has no per-PR-event webhook seam): for each
 // loop in status "shepherding" it refreshes the coordination lock, reads live PR

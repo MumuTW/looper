@@ -870,6 +870,21 @@ func (r *Runtime) startSchedulerLoop() {
 		taskTracker.Go(func() {
 			r.runSchedulerClaimLoop(schedulerCtx, stopCh, claimWakeCh)
 		})
+		// Dedicated shepherd poll: drive worker loops shepherding their PR to merge
+		// on a prompt cadence (no per-PR webhook seam), so a re-review / CI change /
+		// merge is picked up in ~60s rather than the slower wake-reconcile.
+		taskTracker.Go(func() {
+			ticker := time.NewTicker(shepherdReconcileInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopCh:
+					return
+				case <-ticker.C:
+					r.reconcileWorkerShepherd(schedulerCtx)
+				}
+			}
+		})
 	}
 
 	go func() {
