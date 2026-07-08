@@ -3360,6 +3360,13 @@ func validateWorkerResumeCheckpoint(startStep WorkerStep, checkpoint workerCheck
 }
 
 func asWorkerStep(value string) WorkerStep {
+	// stepShepherd is a valid worker step but deliberately off workerStepSequence
+	// (so the normal impl flow stays inert); recognize it explicitly, else a
+	// resumed shepherd run whose prior pass completed "shepherd" fails
+	// createRunContext with "unknown worker last completed step".
+	if value == string(stepShepherd) {
+		return stepShepherd
+	}
 	for _, candidate := range workerStepSequence {
 		if string(candidate) == value {
 			return candidate

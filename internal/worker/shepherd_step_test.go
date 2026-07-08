@@ -32,6 +32,11 @@ func TestStepShepherdIsTerminalSelfRepeating(t *testing.T) {
 	if got := nextWorkerStep(stepShepherd); got != "" {
 		t.Fatalf("nextWorkerStep(stepShepherd) = %q, want \"\"", got)
 	}
+	// asWorkerStep must recognize shepherd (off-sequence) so a resumed shepherd
+	// run whose prior pass completed "shepherd" does not fail createRunContext.
+	if got := asWorkerStep("shepherd"); got != stepShepherd {
+		t.Fatalf("asWorkerStep(shepherd) = %q, want stepShepherd", got)
+	}
 	// the normal flow's last step still resolves without shepherd tacked on
 	if got := stepsFrom(stepOpenPR); len(got) != 1 || got[0] != stepOpenPR {
 		t.Fatalf("stepsFrom(open-pr) = %v, want [open-pr] (shepherd not appended)", got)
