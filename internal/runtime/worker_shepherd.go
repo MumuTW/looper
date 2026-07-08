@@ -250,6 +250,28 @@ func changesRequestedOnCurrentHead(pr githubinfra.PullRequestDetail) bool {
 	return false
 }
 
+// approvedOnCurrentHead reports whether a reviewer APPROVED the current head.
+// Like changesRequestedOnCurrentHead, this beats the aggregate reviewDecision: a
+// stale CHANGES_REQUESTED from a reviewer who only saw an OLD head keeps the
+// aggregate at CHANGES_REQUESTED even after fresh approvals of the current head,
+// which would otherwise wedge the card at "reviewing" forever.
+func approvedOnCurrentHead(pr githubinfra.PullRequestDetail) bool {
+	head := strings.TrimSpace(pr.HeadSHA)
+	if head == "" {
+		return false
+	}
+	for _, review := range pr.Reviews {
+		if !strings.EqualFold(strings.TrimSpace(stringFromAny(review["state"])), "APPROVED") {
+			continue
+		}
+		commit, _ := review["commit"].(map[string]any)
+		if commit != nil && strings.TrimSpace(stringFromAny(commit["oid"])) == head {
+			return true
+		}
+	}
+	return false
+}
+
 // shepherdActionable reports whether the agent has something to do THIS wake:
 // changes requested AT THE CURRENT HEAD, failing CI, or a conflict. Approved (or
 // a fix already pushed and awaiting the reviewer's re-review) is NOT actionable —
@@ -264,12 +286,16 @@ func shepherdActionable(pr githubinfra.PullRequestDetail) bool {
 	return changesRequestedOnCurrentHead(pr)
 }
 
-// shepherdPhaseFor maps PR state to the card phase.
+// shepherdPhaseFor maps PR state to the card phase. awaiting_merge keys on the
+// CURRENT head's review state (approved here + no outstanding change request
+// here), not the aggregate reviewDecision — a stale CHANGES_REQUESTED on an old
+// head must not block "待合并" once the current head is approved and green. The
+// bot never merges; a human does.
 func shepherdPhaseFor(pr githubinfra.PullRequestDetail) string {
 	if shepherdActionable(pr) {
 		return "fixing"
 	}
-	if strings.EqualFold(strings.TrimSpace(pr.ReviewDecision), "APPROVED") && shepherdCIPhase(pr) == "passed" && !pr.HasConflicts {
+	if approvedOnCurrentHead(pr) && !changesRequestedOnCurrentHead(pr) && shepherdCIPhase(pr) == "passed" && !pr.HasConflicts {
 		return "awaiting_merge"
 	}
 	return "reviewing"

@@ -63,8 +63,10 @@ func TestShepherdActionableAndPhase(t *testing.T) {
 	if !shepherdActionable(failing) {
 		t.Fatalf("failing CI should be actionable")
 	}
-	// approved + green + clean → NOT actionable (bot waits for human merge), phase awaiting_merge
-	ready := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "APPROVED", Checks: green}
+	// approved AT THE CURRENT HEAD + green + clean → NOT actionable (bot waits for
+	// a human to merge), phase awaiting_merge
+	ready := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "hr", Checks: green,
+		Reviews: []map[string]any{{"state": "APPROVED", "commit": map[string]any{"oid": "hr"}}}}
 	if shepherdActionable(ready) {
 		t.Fatalf("approved+green+clean must NOT be actionable — the bot never merges, it waits for a human")
 	}
@@ -110,5 +112,27 @@ func TestSignalCatchesNewReviewRound(t *testing.T) {
 	}
 	if !shepherdActionable(round2) {
 		t.Fatal("CHANGES_REQUESTED at the current head must be actionable")
+	}
+}
+
+// A stale CHANGES_REQUESTED on an OLD head must NOT block awaiting_merge once the
+// CURRENT head is approved + green (the live-e2e case: two colleagues approved
+// b8653748 while nettee's old CHANGES_REQUESTED kept the aggregate at
+// CHANGES_REQUESTED). The bot then shows 待合并 and waits for a human to merge.
+func TestAwaitingMergeIgnoresStaleAggregateDecision(t *testing.T) {
+	green := []map[string]any{check("COMPLETED", "SUCCESS")}
+	pr := githubinfra.PullRequestDetail{
+		State: "OPEN", ReviewDecision: "CHANGES_REQUESTED", HeadSHA: "cur", Checks: green,
+		Reviews: []map[string]any{
+			{"state": "CHANGES_REQUESTED", "commit": map[string]any{"oid": "old"}}, // stale, old head
+			{"state": "APPROVED", "commit": map[string]any{"oid": "cur"}},          // fresh approval of current head
+			{"state": "APPROVED", "commit": map[string]any{"oid": "cur"}},
+		},
+	}
+	if shepherdActionable(pr) {
+		t.Fatal("approved current head with no change-request-here must NOT be actionable")
+	}
+	if got := shepherdPhaseFor(pr); got != "awaiting_merge" {
+		t.Fatalf("phase = %q, want awaiting_merge (stale aggregate CHANGES_REQUESTED must not wedge it)", got)
 	}
 }
