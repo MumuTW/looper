@@ -1177,6 +1177,10 @@ func (r *Runtime) runWakeReconcile(ctx context.Context, reason string) {
 	r.reconcileAwaitingProductSpec(ctx)
 	// Dispatch the worker for tech specs a human approved on the Plane page (node H→I).
 	r.reconcileSpecApproval(ctx)
+	// Drive worker loops shepherding their impl PR toward merge (looper:auto): wake
+	// a pass on an actionable PR change, terminate once a human merges. Polling
+	// cadence (no per-PR webhook seam) — best-effort.
+	r.reconcileWorkerShepherd(ctx)
 	if logger != nil && (released > 0 || stale.InterruptedRuns > 0 || stale.LoopsRequeued > 0) {
 		logger.Info("wake reconcile recovered work", map[string]any{"reason": reason, "locksReleased": released, "runsInterrupted": stale.InterruptedRuns, "loopsRequeued": stale.LoopsRequeued})
 	}
