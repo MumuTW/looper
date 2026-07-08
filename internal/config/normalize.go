@@ -95,7 +95,7 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 		providers := cloneProviderConfigs(*normalized.Providers)
 		partials := make([]PartialProviderConfig, len(providers))
 		for i, provider := range providers {
-			partials[i] = PartialProviderConfig{ID: provider.ID, Kind: &provider.Kind, BaseURL: &provider.BaseURL, GHPath: provider.GHPath, TokenEnv: provider.TokenEnv}
+			partials[i] = PartialProviderConfig{ID: provider.ID, Kind: &provider.Kind, BaseURL: &provider.BaseURL, GHPath: provider.GHPath, TokenEnv: provider.TokenEnv, Workspace: provider.Workspace, ProjectID: provider.ProjectID}
 		}
 		normalized.Providers = &partials
 	}
@@ -304,6 +304,43 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeInstructionsConfig(&config.Instructions, *partial.Instructions)
 	}
 
+	if partial.HITL != nil {
+		if partial.HITL.Enabled != nil {
+			config.HITL.Enabled = *partial.HITL.Enabled
+		}
+		if partial.HITL.AnswerTransport != nil {
+			config.HITL.AnswerTransport = strings.TrimSpace(*partial.HITL.AnswerTransport)
+		}
+		if gh := partial.HITL.GitHub; gh != nil {
+			if config.HITL.GitHub == nil {
+				config.HITL.GitHub = &HITLGitHubConfig{}
+			}
+			if gh.AwaitingLabel != nil {
+				config.HITL.GitHub.AwaitingLabel = strings.TrimSpace(*gh.AwaitingLabel)
+			}
+			if gh.MentionLogins != nil {
+				config.HITL.GitHub.MentionLogins = append([]string(nil), (*gh.MentionLogins)...)
+			}
+			if gh.AnswerAuthors != nil {
+				config.HITL.GitHub.AnswerAuthors = append([]string(nil), (*gh.AnswerAuthors)...)
+			}
+		}
+		if fs := partial.HITL.Feishu; fs != nil {
+			if config.HITL.Feishu == nil {
+				config.HITL.Feishu = &HITLFeishuConfig{}
+			}
+			if fs.Inbound != nil {
+				config.HITL.Feishu.Inbound = strings.TrimSpace(*fs.Inbound)
+			}
+			if fs.EventInboxURLEnv != nil {
+				config.HITL.Feishu.EventInboxURLEnv = strings.TrimSpace(*fs.EventInboxURLEnv)
+			}
+			if fs.EventInboxTokenEnv != nil {
+				config.HITL.Feishu.EventInboxTokenEnv = strings.TrimSpace(*fs.EventInboxTokenEnv)
+			}
+		}
+	}
+
 	if partial.Roles != nil {
 		mergeRoleConfigs(&config.Roles, *partial.Roles)
 	}
@@ -419,6 +456,12 @@ func normalizeProviderConfig(provider *ProviderConfig) {
 	}
 	if provider.TokenEnv != nil {
 		provider.TokenEnv = stringPtr(strings.TrimSpace(*provider.TokenEnv))
+	}
+	if provider.Workspace != nil {
+		provider.Workspace = stringPtr(strings.TrimSpace(*provider.Workspace))
+	}
+	if provider.ProjectID != nil {
+		provider.ProjectID = stringPtr(strings.TrimSpace(*provider.ProjectID))
 	}
 }
 
@@ -633,6 +676,62 @@ func mergeNotificationConfig(config *NotificationConfig, partial PartialNotifica
 
 	if partial.Osascript != nil {
 		mergeOsascriptNotificationConfig(&config.Osascript, *partial.Osascript)
+	}
+
+	if partial.Webhook != nil {
+		mergeWebhookNotificationConfig(&config.Webhook, *partial.Webhook)
+	}
+}
+
+func mergeWebhookNotificationConfig(config *WebhookNotificationConfig, partial PartialWebhookNotificationConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+
+	if partial.URLEnv != nil {
+		config.URLEnv = *partial.URLEnv
+	}
+
+	if partial.Format != nil {
+		config.Format = *partial.Format
+	}
+
+	if partial.Levels != nil {
+		config.Levels = cloneSoundLevels(*partial.Levels)
+	}
+
+	if partial.ThrottleWindowSeconds != nil {
+		config.ThrottleWindowSeconds = *partial.ThrottleWindowSeconds
+	}
+
+	if partial.Mode != nil {
+		config.Mode = strings.TrimSpace(*partial.Mode)
+	}
+
+	if partial.AppIDEnv != nil {
+		config.AppIDEnv = strings.TrimSpace(*partial.AppIDEnv)
+	}
+
+	if partial.AppSecretEnv != nil {
+		config.AppSecretEnv = strings.TrimSpace(*partial.AppSecretEnv)
+	}
+
+	if partial.ChatID != nil {
+		config.ChatID = strings.TrimSpace(*partial.ChatID)
+	}
+
+	if partial.VerificationTokenEnv != nil {
+		config.VerificationTokenEnv = strings.TrimSpace(*partial.VerificationTokenEnv)
+	}
+
+	if partial.MentionOpenIds != nil {
+		ids := make([]string, 0, len(*partial.MentionOpenIds))
+		for _, id := range *partial.MentionOpenIds {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				ids = append(ids, trimmed)
+			}
+		}
+		config.MentionOpenIds = ids
 	}
 }
 
@@ -1175,6 +1274,9 @@ func mergeIssueRoleTriggersConfig(config *IssueRoleTriggersConfig, partial Parti
 	if partial.RequireAssigneeCurrentUser != nil {
 		config.RequireAssigneeCurrentUser = *partial.RequireAssigneeCurrentUser
 	}
+	if partial.PlaneAssigneeID != nil {
+		config.PlaneAssigneeID = *partial.PlaneAssigneeID
+	}
 }
 
 func mergePullRequestRoleTriggersConfig(config *PullRequestRoleTriggersConfig, partial PartialPullRequestRoleTriggersConfig) {
@@ -1314,6 +1416,14 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 		defaults := *partial.Defaults
 		cloned.Defaults = &defaults
 	}
+	if partial.HITL != nil {
+		hitl := *partial.HITL
+		if partial.HITL.Enabled != nil {
+			enabled := *partial.HITL.Enabled
+			hitl.Enabled = &enabled
+		}
+		cloned.HITL = &hitl
+	}
 	if partial.LegacyReviewer != nil {
 		cloned.LegacyReviewer = clonePartialReviewerConfig(partial.LegacyReviewer)
 	}
@@ -1332,6 +1442,8 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 			providers[i].BaseURL = cloneStringPtr(providers[i].BaseURL)
 			providers[i].GHPath = cloneStringPtr(providers[i].GHPath)
 			providers[i].TokenEnv = cloneStringPtr(providers[i].TokenEnv)
+			providers[i].Workspace = cloneStringPtr(providers[i].Workspace)
+			providers[i].ProjectID = cloneStringPtr(providers[i].ProjectID)
 		}
 		cloned.Providers = &providers
 	}
@@ -1472,10 +1584,12 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 			kind = *provider.Kind
 		}
 		cloned[index] = ProviderConfig{
-			ID:       strings.TrimSpace(provider.ID),
-			Kind:     kind,
-			GHPath:   cloneStringPtr(provider.GHPath),
-			TokenEnv: cloneStringPtr(provider.TokenEnv),
+			ID:        strings.TrimSpace(provider.ID),
+			Kind:      kind,
+			GHPath:    cloneStringPtr(provider.GHPath),
+			TokenEnv:  cloneStringPtr(provider.TokenEnv),
+			Workspace: cloneStringPtr(provider.Workspace),
+			ProjectID: cloneStringPtr(provider.ProjectID),
 		}
 		if provider.BaseURL != nil {
 			cloned[index].BaseURL = normalizeBaseURL(*provider.BaseURL)

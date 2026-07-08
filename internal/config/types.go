@@ -177,6 +177,10 @@ type ProviderKind string
 const (
 	ProviderKindGitHub  ProviderKind = "github"
 	ProviderKindForgejo ProviderKind = "forgejo"
+	// ProviderKindPlane is a task-source provider: issues (work-items) are read
+	// from a Plane project, while pull requests / diffs / reviews are delegated
+	// to the project's GitHub code repo. See internal/forge/plane.go.
+	ProviderKindPlane ProviderKind = "plane"
 )
 
 type ProviderConfig struct {
@@ -185,6 +189,10 @@ type ProviderConfig struct {
 	BaseURL  string       `json:"baseUrl,omitempty"`
 	GHPath   *string      `json:"ghPath,omitempty"`
 	TokenEnv *string      `json:"tokenEnv,omitempty"`
+	// Workspace and ProjectID identify the Plane project a plane provider reads
+	// its work-items from. Ignored for github/forgejo providers.
+	Workspace *string `json:"workspace,omitempty"`
+	ProjectID *string `json:"projectId,omitempty"`
 }
 
 type AgentConfig struct {
@@ -219,6 +227,7 @@ type AgentTimeoutConfig struct {
 type NotificationConfig struct {
 	InApp     bool                        `json:"inApp"`
 	Osascript OsascriptNotificationConfig `json:"osascript"`
+	Webhook   WebhookNotificationConfig   `json:"webhook"`
 }
 
 type DisclosureConfig struct {
@@ -249,6 +258,31 @@ type OsascriptNotificationConfig struct {
 	Enabled               bool                     `json:"enabled"`
 	SoundForLevels        []NotificationSoundLevel `json:"soundForLevels"`
 	ThrottleWindowSeconds int                      `json:"throttleWindowSeconds"`
+}
+
+type WebhookNotificationConfig struct {
+	Enabled               bool                     `json:"enabled"`
+	URLEnv                string                   `json:"urlEnv"`
+	Format                string                   `json:"format"`
+	Levels                []NotificationSoundLevel `json:"levels"`
+	ThrottleWindowSeconds int                      `json:"throttleWindowSeconds"`
+	// Mode selects the delivery transport: "webhook" (default; an incoming-webhook
+	// POST to URLEnv) or "app" (a Feishu app bot that posts an interactive card to
+	// ChatID via the IM API). App mode reads the app id/secret from AppIDEnv and
+	// AppSecretEnv — env var NAMES, never the secret values.
+	Mode         string `json:"mode,omitempty"`
+	AppIDEnv     string `json:"appIdEnv,omitempty"`
+	AppSecretEnv string `json:"appSecretEnv,omitempty"`
+	ChatID       string `json:"chatId,omitempty"`
+	// VerificationTokenEnv names the env var holding the Feishu app Verification
+	// Token. It gates the inbound HITL card-action callback (/hitl/feishu): the
+	// callback's envelope token must match, proving the request came from Feishu.
+	// A NAME, never the secret value — looper is open source.
+	VerificationTokenEnv string `json:"verificationTokenEnv,omitempty"`
+	// MentionOpenIds are Feishu open_ids to @-mention on messages that need a human
+	// (the mid-run ask, and failures), so follow-up items aren't missed in a busy
+	// group. Plain user ids, not secrets.
+	MentionOpenIds []string `json:"mentionOpenIds,omitempty"`
 }
 
 type LoggingConfig struct {
@@ -404,6 +438,13 @@ type IssueRoleTriggersConfig struct {
 	Labels                     []string  `json:"labels"`
 	LabelMode                  LabelMode `json:"labelMode"`
 	RequireAssigneeCurrentUser bool      `json:"requireAssigneeCurrentUser"`
+	// PlaneAssigneeID scopes discovery on a Plane task-source project to
+	// work-items assigned to this Plane member UUID. Plane assignees are UUIDs
+	// (not GitHub logins), so RequireAssigneeCurrentUser can't route them; set
+	// this per person instead so each looper only picks up its owner's items.
+	// Empty = label-only discovery (every watching looper sees every item).
+	// Ignored for non-Plane providers.
+	PlaneAssigneeID string `json:"planeAssigneeId,omitempty"`
 }
 
 type PullRequestRoleTriggersConfig struct {
@@ -562,11 +603,13 @@ type PartialProjectWebhookConfig struct {
 }
 
 type PartialProviderConfig struct {
-	ID       string        `json:"id"`
-	Kind     *ProviderKind `json:"kind,omitempty"`
-	BaseURL  *string       `json:"baseUrl,omitempty"`
-	GHPath   *string       `json:"ghPath,omitempty"`
-	TokenEnv *string       `json:"tokenEnv,omitempty"`
+	ID        string        `json:"id"`
+	Kind      *ProviderKind `json:"kind,omitempty"`
+	BaseURL   *string       `json:"baseUrl,omitempty"`
+	GHPath    *string       `json:"ghPath,omitempty"`
+	TokenEnv  *string       `json:"tokenEnv,omitempty"`
+	Workspace *string       `json:"workspace,omitempty"`
+	ProjectID *string       `json:"projectId,omitempty"`
 }
 
 type Config struct {
@@ -584,9 +627,53 @@ type Config struct {
 	Package       PackageConfig      `json:"package"`
 	Defaults      DefaultsConfig     `json:"defaults"`
 	Instructions  InstructionsConfig `json:"instructions"`
+	HITL          HITLConfig         `json:"hitl"`
 	Roles         RoleConfigs        `json:"roles"`
 	Providers     []ProviderConfig   `json:"providers,omitempty"`
 	Projects      []ProjectRefConfig `json:"projects"`
+}
+
+// HITLConfig gates the mid-run human-in-the-loop feature: when Enabled, agents
+// may pause mid-run to ask a human (by writing .looper/ask.json), the loop
+// suspends as awaiting_human, an ask-card is sent via the app-bot notifier, and
+// POST /api/v1/loops/{seq}/respond resumes the same agent session with the
+// answer. When Disabled (the default) every HITL code path is skipped and
+// runners behave exactly as before. It reuses the app-bot credentials in
+// notifications.webhook (appIdEnv/appSecretEnv/chatId) for send + listen.
+type HITLConfig struct {
+	Enabled bool `json:"enabled"`
+	// AnswerTransport selects how a mid-run question is delivered and how the
+	// human's answer comes back: "github" (PR comment, the zero-infra default),
+	// "feishu" (a team that lives in Feishu; needs the feishu transport), or
+	// "respond" (only the /respond API). Empty defaults to "github".
+	AnswerTransport string            `json:"answerTransport,omitempty"`
+	GitHub          *HITLGitHubConfig `json:"github,omitempty"`
+	Feishu          *HITLFeishuConfig `json:"feishu,omitempty"`
+}
+
+// HITLFeishuConfig tunes the Feishu HITL transport (answers come back via the
+// shared-app Cloudflare event inbox that the looper polls).
+type HITLFeishuConfig struct {
+	// Inbound selects how the answer reaches this looper: "cf-inbox" (poll the
+	// shared Cloudflare inbox) is the supported mode.
+	Inbound string `json:"inbound,omitempty"`
+	// EventInboxURLEnv names the env var holding the inbox poll URL
+	// (https://…/events). EventInboxTokenEnv names the env var holding the shared
+	// bearer token. Env var NAMES, never the values.
+	EventInboxURLEnv   string `json:"eventInboxUrlEnv,omitempty"`
+	EventInboxTokenEnv string `json:"eventInboxTokenEnv,omitempty"`
+}
+
+// HITLGitHubConfig tunes the GitHub PR-comment HITL transport.
+type HITLGitHubConfig struct {
+	// AwaitingLabel marks a PR whose loop is waiting on a human. Empty defaults to
+	// "looper:awaiting-human".
+	AwaitingLabel string `json:"awaitingLabel,omitempty"`
+	// MentionLogins are GitHub logins to /cc on an ask so a human is notified.
+	MentionLogins []string `json:"mentionLogins,omitempty"`
+	// AnswerAuthors, when non-empty, restricts who may answer to these logins.
+	// Empty means any non-bot commenter.
+	AnswerAuthors []string `json:"answerAuthors,omitempty"`
 }
 
 type PartialServerConfig struct {
@@ -652,6 +739,7 @@ type PartialAgentTimeoutConfig struct {
 type PartialNotificationConfig struct {
 	InApp     *bool                               `json:"inApp,omitempty"`
 	Osascript *PartialOsascriptNotificationConfig `json:"osascript,omitempty"`
+	Webhook   *PartialWebhookNotificationConfig   `json:"webhook,omitempty"`
 }
 
 type PartialDisclosureConfig struct {
@@ -673,6 +761,20 @@ type PartialOsascriptNotificationConfig struct {
 	Enabled               *bool                     `json:"enabled,omitempty"`
 	SoundForLevels        *[]NotificationSoundLevel `json:"soundForLevels,omitempty"`
 	ThrottleWindowSeconds *int                      `json:"throttleWindowSeconds,omitempty"`
+}
+
+type PartialWebhookNotificationConfig struct {
+	Enabled               *bool                     `json:"enabled,omitempty"`
+	URLEnv                *string                   `json:"urlEnv,omitempty"`
+	Format                *string                   `json:"format,omitempty"`
+	Levels                *[]NotificationSoundLevel `json:"levels,omitempty"`
+	ThrottleWindowSeconds *int                      `json:"throttleWindowSeconds,omitempty"`
+	Mode                  *string                   `json:"mode,omitempty"`
+	AppIDEnv              *string                   `json:"appIdEnv,omitempty"`
+	AppSecretEnv          *string                   `json:"appSecretEnv,omitempty"`
+	ChatID                *string                   `json:"chatId,omitempty"`
+	VerificationTokenEnv  *string                   `json:"verificationTokenEnv,omitempty"`
+	MentionOpenIds        *[]string                 `json:"mentionOpenIds,omitempty"`
 }
 
 type PartialLoggingConfig struct {
@@ -804,10 +906,30 @@ type PartialInstructionsConfig struct {
 	MaxBytes *int  `json:"maxBytes,omitempty"`
 }
 
+type PartialHITLConfig struct {
+	Enabled         *bool                    `json:"enabled,omitempty"`
+	AnswerTransport *string                  `json:"answerTransport,omitempty"`
+	GitHub          *PartialHITLGitHubConfig `json:"github,omitempty"`
+	Feishu          *PartialHITLFeishuConfig `json:"feishu,omitempty"`
+}
+
+type PartialHITLGitHubConfig struct {
+	AwaitingLabel *string   `json:"awaitingLabel,omitempty"`
+	MentionLogins *[]string `json:"mentionLogins,omitempty"`
+	AnswerAuthors *[]string `json:"answerAuthors,omitempty"`
+}
+
+type PartialHITLFeishuConfig struct {
+	Inbound            *string `json:"inbound,omitempty"`
+	EventInboxURLEnv   *string `json:"eventInboxUrlEnv,omitempty"`
+	EventInboxTokenEnv *string `json:"eventInboxTokenEnv,omitempty"`
+}
+
 type PartialIssueRoleTriggersConfig struct {
 	Labels                     *[]string  `json:"labels,omitempty"`
 	LabelMode                  *LabelMode `json:"labelMode,omitempty"`
 	RequireAssigneeCurrentUser *bool      `json:"requireAssigneeCurrentUser,omitempty"`
+	PlaneAssigneeID            *string    `json:"planeAssigneeId,omitempty"`
 }
 
 type PartialPullRequestRoleTriggersConfig struct {
@@ -946,6 +1068,7 @@ type PartialConfig struct {
 	Defaults       *PartialDefaultsConfig     `json:"defaults,omitempty"`
 	LegacyReviewer *PartialReviewerConfig     `json:"reviewer,omitempty"`
 	Instructions   *PartialInstructionsConfig `json:"instructions,omitempty"`
+	HITL           *PartialHITLConfig         `json:"hitl,omitempty"`
 	Roles          *PartialRoleConfigs        `json:"roles,omitempty"`
 	Providers      *[]PartialProviderConfig   `json:"providers,omitempty"`
 	Projects       *[]PartialProjectRefConfig `json:"projects,omitempty"`

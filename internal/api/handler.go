@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -58,18 +60,32 @@ type activeRunExecutionVerifier interface {
 }
 
 type Context struct {
-	Config               config.Config
-	Runtime              RuntimeState
-	WebhookForwarder     webhookforward.Forwarder
-	ProjectsService      projectService
-	Now                  func() time.Time
-	RecoverySummary      func() any
-	ReconcileStaleRuns   func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
-	StopLoop             func(context.Context, string, string) (any, error)
-	CloseLoop            func(context.Context, string, string) (any, error)
-	StopAll              func(context.Context, string) (any, error)
+	Config             config.Config
+	Runtime            RuntimeState
+	WebhookForwarder   webhookforward.Forwarder
+	ProjectsService    projectService
+	Now                func() time.Time
+	RecoverySummary    func() any
+	ReconcileStaleRuns func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
+	StopLoop           func(context.Context, string, string) (any, error)
+	CloseLoop          func(context.Context, string, string) (any, error)
+	StopAll            func(context.Context, string) (any, error)
+	// TakeoverLoop parks a loop for interactive human takeover: stops the daemon's
+	// in-flight run (session id preserved on disk) and transitions the loop to
+	// human_takeover, returning what a human needs to resume the exact session.
+	TakeoverLoop         func(context.Context, string, string) (TakeoverResult, error)
 	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
+}
+
+// TakeoverResult is what a takeover yields: the native session id + worktree +
+// vendor of the loop's last run, so the caller can hand a human the exact resume
+// command.
+type TakeoverResult struct {
+	LoopID       string
+	Vendor       string
+	SessionID    string
+	WorktreePath string
 }
 
 type Handler struct {
@@ -320,6 +336,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.writeSuccess(w, requestID, payload)
+		return
+	}
+
+	if path == apiBasePath+"/hitl/feishu" {
+		h.handleFeishuCardActionRoute(w, r, requestID)
 		return
 	}
 
@@ -3055,6 +3076,21 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
 		return h.retryLoop(r.Context(), r, loop.ID)
+	case "respond":
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		return h.respondToLoop(r.Context(), r, loop.ID)
+	case "takeover":
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		return h.takeoverLoop(r.Context(), loop.ID)
+	case "handback":
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		return h.handbackLoop(r.Context(), r, loop.ID)
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
@@ -4336,6 +4372,350 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 	}
 
 	return serializeLoop(updated), nil
+}
+
+type takeoverLoopResponse struct {
+	LoopID        string `json:"loopId"`
+	Vendor        string `json:"vendor,omitempty"`
+	SessionID     string `json:"sessionId,omitempty"`
+	WorktreePath  string `json:"worktreePath,omitempty"`
+	Supported     bool   `json:"supported"`
+	ResumeCommand string `json:"resumeCommand,omitempty"`
+	Message       string `json:"message,omitempty"`
+}
+
+// takeoverLoop parks a loop for interactive human takeover and returns the exact
+// command a human runs to resume the loop's agent session (same native session id,
+// in the loop's worktree). The daemon's in-flight run is already stopped by the
+// wired TakeoverLoop closure; here we only shape the response + resume command.
+func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoopResponse, error) {
+	if h.context.TakeoverLoop == nil {
+		return takeoverLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusServiceUnavailable, message: "Takeover is not available on this daemon"}
+	}
+	result, err := h.context.TakeoverLoop(ctx, loopID, "Taken over by a human via looper resume")
+	if err != nil {
+		return takeoverLoopResponse{}, err
+	}
+	resp := takeoverLoopResponse{
+		LoopID:       result.LoopID,
+		Vendor:       result.Vendor,
+		SessionID:    result.SessionID,
+		WorktreePath: result.WorktreePath,
+	}
+	vendor := config.AgentVendor(strings.TrimSpace(result.Vendor))
+	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: h.context.Config.Agent.Params}, result.WorktreePath, result.SessionID)
+	resp.Supported = ok
+	if ok {
+		resp.ResumeCommand = cmdLine
+	} else {
+		resp.Message = "Interactive takeover needs a captured session id and a supported agent (codex/claude); the loop is parked in human_takeover — hand it back with `looper handback` to resume the daemon."
+	}
+	return resp, nil
+}
+
+// handbackLoop re-arms a taken-over loop so the daemon resumes it. It stamps the
+// loop with the native session id the human drove (so the next worker run resumes
+// THAT session and sees their turns), clears any queue item that survived the
+// takeover race, then re-arms via the shared retry path.
+func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID string) (any, error) {
+	services := h.context.Runtime.Services()
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (struct{}, error) {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if loop == nil {
+			return struct{}{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
+			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
+			if werr == nil {
+				loop.MetadataJSON = &meta
+				loop.UpdatedAt = nowISO
+				if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+					return struct{}{}, err
+				}
+			}
+		}
+		reason := "Cleared for takeover handback"
+		if _, err := repos.Queue.CancelByLoop(ctx, loopID, nowISO, &reason); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return h.retryLoop(ctx, r, loopID)
+}
+
+type respondLoopRequest struct {
+	Answer string `json:"answer"`
+}
+
+// respondToLoop delivers a human's answer to a loop suspended mid-run as
+// awaiting_human: it validates the loop is awaiting a human, stores the answer
+// on the loop's HITL metadata, and transitions the loop back to running (which
+// requeues it and triggers a scheduler tick) so the next run resumes the same
+// agent session with the answer. This is the testable core of the HITL bridge.
+func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID string) (loopResponse, error) {
+	var body respondLoopRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid respond request: %v", err)}
+		}
+	}
+	return h.deliverHumanAnswer(ctx, loopID, body.Answer)
+}
+
+// deliverHumanAnswer is the shared core of the HITL respond path: it validates
+// the loop is awaiting_human, stores the answer on the loop's HITL metadata, and
+// transitions the loop back to running (requeue + scheduler tick). Both the
+// /respond API endpoint and the Feishu card-action receiver call it.
+func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnswer string) (loopResponse, error) {
+	answer := strings.TrimSpace(rawAnswer)
+	if answer == "" {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "respond requires a non-empty answer"}
+	}
+
+	services := h.context.Runtime.Services()
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if loop == nil {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
+		}
+		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		ask.Answer = answer
+		ask.Status = "answered"
+		ask.AnsweredAt = nowISO
+		metadataJSON, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		updated := *loop
+		updated.MetadataJSON = stringPtrOrNil(metadataJSON)
+		updated.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		return updated, nil
+	})
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return loopResponse{}, typed
+		}
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)
+	// so the next claim resumes the run with the stored answer.
+	return h.mutateLoopStatus(ctx, loopID, domain.LoopStatusRunning)
+}
+
+type feishuCardActionEnvelope struct {
+	Type      string `json:"type"`
+	Challenge string `json:"challenge"`
+	// Token is the Feishu app Verification Token, echoed by Feishu in every event
+	// and card-action callback. It is the shared secret that proves the request
+	// originated from Feishu rather than an arbitrary client. (v1 card-action /
+	// url_verification carry it at top level; v2 events carry it in header.token.)
+	Token  string `json:"token"`
+	Action struct {
+		Tag   string          `json:"tag"`
+		Value json.RawMessage `json:"value"`
+	} `json:"action"`
+	// v2 event envelope, used for im.message.receive_v1 (a human typing a free-text
+	// reply in the ask thread).
+	Header struct {
+		EventType string `json:"event_type"`
+		Token     string `json:"token"`
+	} `json:"header"`
+	Event struct {
+		Message struct {
+			MessageID   string `json:"message_id"`
+			RootID      string `json:"root_id"`
+			ThreadID    string `json:"thread_id"`
+			ChatID      string `json:"chat_id"`
+			MessageType string `json:"message_type"`
+			Content     string `json:"content"`
+		} `json:"message"`
+		Sender struct {
+			SenderType string `json:"sender_type"`
+			SenderID   struct {
+				OpenID string `json:"open_id"`
+			} `json:"sender_id"`
+		} `json:"sender"`
+	} `json:"event"`
+}
+
+// handleFeishuCardActionRoute is the thin Feishu listener (receive side of the
+// app-bot integration whose send side ships in the notifier). It receives a
+// card-action callback when a human clicks an option button on an ask-card, maps
+// the button value {loopSeq, answer} to the awaiting loop, and calls the shared
+// respond logic in-process. It also answers Feishu's url_verification challenge.
+// The whole route is gated by hitl.enabled.
+//
+// Transport choice: this uses the card-action WEBHOOK RECEIVER over looper's
+// existing HTTP server rather than the larksuite long-connection WS SDK, to
+// avoid a heavy new dependency. Point the Feishu app's event/card-callback URL
+// at <daemon>/api/v1/hitl/feishu. Typed free-text replies (message events) are a
+// documented future extension; button clicks are handled today.
+func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Request, requestID string) {
+	if r.Method != http.MethodPost {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: "Feishu card-action route requires POST"})
+		return
+	}
+	var raw []byte
+	if r.Body != nil {
+		defer r.Body.Close()
+		raw, _ = io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	}
+	var envelope feishuCardActionEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "invalid Feishu callback body"})
+		return
+	}
+	// Resolve the configured Feishu Verification Token (a shared secret Feishu
+	// echoes in every callback). This is the ONLY origin check on this route, and
+	// it is independent of authMode because Feishu's servers cannot send a looper
+	// Bearer token.
+	expectedToken := ""
+	if envName := strings.TrimSpace(h.context.Config.Notifications.Webhook.VerificationTokenEnv); envName != "" {
+		expectedToken = strings.TrimSpace(os.Getenv(envName))
+	}
+	// v1 card-action / url_verification carry the token at the top level; v2 events
+	// carry it in header.token.
+	presentedToken := strings.TrimSpace(envelope.Token)
+	if presentedToken == "" {
+		presentedToken = strings.TrimSpace(envelope.Header.Token)
+	}
+	tokenMatches := expectedToken != "" && subtle.ConstantTimeCompare([]byte(presentedToken), []byte(expectedToken)) == 1
+
+	// Feishu URL-verification handshake: echo the challenge verbatim. When a token
+	// is configured, require it to match even for the handshake.
+	if envelope.Type == "url_verification" {
+		if expectedToken != "" && !tokenMatches {
+			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
+		return
+	}
+	if !h.context.Config.HITL.Enabled {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "hitl.enabled is false"})
+		return
+	}
+	// A card action delivers human-authored text into an agent's coding session, so
+	// it MUST be authenticated. Fail closed: require a configured, matching
+	// verification token — otherwise any client that can reach this route could
+	// inject arbitrary answers into any awaiting_human loop.
+	if expectedToken == "" {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "Feishu card-action callback requires notifications.webhook.verificationTokenEnv to be configured"})
+		return
+	}
+	if !tokenMatches {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
+		return
+	}
+	// A human typing a free-text reply in the ask thread arrives as a message event
+	// rather than a card action — route it to the free-text handler.
+	if envelope.Header.EventType == "im.message.receive_v1" {
+		h.handleFeishuThreadReply(w, r, requestID, envelope)
+		return
+	}
+	var value struct {
+		LoopSeq string `json:"loopSeq"`
+		Answer  string `json:"answer"`
+	}
+	if len(envelope.Action.Value) > 0 {
+		_ = json.Unmarshal(envelope.Action.Value, &value)
+	}
+	loopSeq := strings.TrimSpace(value.LoopSeq)
+	answer := strings.TrimSpace(value.Answer)
+	if loopSeq == "" || answer == "" {
+		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "card action must carry value.loopSeq and value.answer"})
+		return
+	}
+	loop, err := h.resolveLoop(r.Context(), loopSeq)
+	if err != nil {
+		var typed apiError
+		if !asAPIError(err, &typed) {
+			typed = internalServerError(err)
+		}
+		h.writeError(w, requestID, typed)
+		return
+	}
+	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer); err != nil {
+		var typed apiError
+		if !asAPIError(err, &typed) {
+			typed = internalServerError(err)
+		}
+		h.writeError(w, requestID, typed)
+		return
+	}
+	h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": true})
+}
+
+// handleFeishuThreadReply consumes a human's free-text reply typed in an ask
+// thread (a Feishu im.message.receive_v1 event). It reverse-maps the thread root
+// to the loop that asked and delivers the typed text as the answer — the lossless,
+// type-anything counterpart to clicking an option button. Ordinary thread chatter
+// (no matching awaiting_human loop) is ignored with 200 so Feishu stops retrying.
+func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request, requestID string, envelope feishuCardActionEnvelope) {
+	msg := envelope.Event.Message
+	if msg.MessageType != "text" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "non-text message"})
+		return
+	}
+	rootID := strings.TrimSpace(msg.RootID)
+	if rootID == "" {
+		rootID = strings.TrimSpace(msg.ThreadID)
+	}
+	if rootID == "" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "not a thread reply"})
+		return
+	}
+	var textContent struct {
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal([]byte(msg.Content), &textContent)
+	answer := strings.TrimSpace(textContent.Text)
+	if answer == "" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "empty text"})
+		return
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.FeishuThreads == nil {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "thread mapping unavailable"})
+		return
+	}
+	loopID, err := services.Repositories.FeishuThreads.LoopByRoot(r.Context(), rootID)
+	if err != nil || strings.TrimSpace(loopID) == "" {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "no loop for thread"})
+		return
+	}
+	// deliverHumanAnswer only accepts an awaiting_human loop, so this naturally
+	// drops the bot's own thread posts, replies after the loop resumed, and any
+	// duplicate Feishu retries.
+	if _, err := h.deliverHumanAnswer(r.Context(), loopID, answer); err != nil {
+		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop not awaiting a human"})
+		return
+	}
+	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": true})
 }
 
 func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string) (retryLoopResponse, error) {
