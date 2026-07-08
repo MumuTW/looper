@@ -510,7 +510,7 @@ func TestFeishuLoopFlowchartStyle(t *testing.T) {
 		{"abandoned terminal", "planner", "abandoned", false, false, "", "red", "需要处理"},
 	}
 	for _, want := range cases {
-		gotT, gotL := feishuLoopFlowchartStyle(want.loopType, want.status, want.hasPR, want.awaitingSpec, want.nodeHPhase)
+		gotT, gotL := feishuLoopFlowchartStyle(want.loopType, want.status, want.hasPR, want.awaitingSpec, want.nodeHPhase, "")
 		if gotT != want.template || !strings.Contains(gotL, want.contains) {
 			t.Fatalf("%s: feishuLoopFlowchartStyle(%q,%q,%v,%v,%q) = (%q,%q); want template %q label~%q", want.name, want.loopType, want.status, want.hasPR, want.awaitingSpec, want.nodeHPhase, gotT, gotL, want.template, want.contains)
 		}
@@ -661,5 +661,37 @@ func TestPRMergeStateFromSnapshot(t *testing.T) {
 	}
 	if s := prMergeStateFromSnapshot(nil); s != "" {
 		t.Fatalf("nil = %q, want empty", s)
+	}
+}
+
+// A worker loop shepherding its impl PR animates the card through the PR-driving
+// lane; the "ready" state reads 待合并 (a human merges — the bot never does), and
+// 🎉已合并 comes only from the terminal "merged" outcome, never from shepherding.
+func TestFeishuLoopFlowchartStyleShepherding(t *testing.T) {
+	cases := []struct {
+		phase    string
+		template string
+		contains string
+	}{
+		{"reviewing", "blue", "评审中"},
+		{"fixing", "blue", "修复中"},
+		{"awaiting_merge", "turquoise", "待合并"},
+		{"", "blue", "评审中"},
+	}
+	for _, c := range cases {
+		gotT, gotL := feishuLoopFlowchartStyle("worker", "shepherding", true, false, "", c.phase)
+		if gotT != c.template || !strings.Contains(gotL, c.contains) {
+			t.Fatalf("shepherd phase %q = (%q,%q); want template %q label~%q", c.phase, gotT, gotL, c.template, c.contains)
+		}
+		if strings.Contains(gotL, "已合并") {
+			t.Fatalf("shepherding must never show 已合并 (only terminal merged does): phase %q → %q", c.phase, gotL)
+		}
+	}
+	// merged terminal wins regardless of shepherd phase
+	if _, label := feishuLoopFlowchartStyle("worker", "merged", true, false, "", "fixing"); !strings.Contains(label, "已合并") {
+		t.Fatalf("merged terminal must show 已合并, got %q", label)
+	}
+	if !feishuLoopAwaitingMerge("shepherding") {
+		t.Fatal("feishuLoopAwaitingMerge(shepherding) = false, want true (card should mirror PR state)")
 	}
 }

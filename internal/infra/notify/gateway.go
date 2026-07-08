@@ -1274,7 +1274,7 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	// reliable here.)
 	hasPR := prURL != "" || strings.HasPrefix(strings.TrimSpace(target), "pr:")
 	awaitingProductSpec := loopAwaitingProductSpec(loop.MetadataJSON)
-	template, label := feishuLoopFlowchartStyle(loop.Type, loop.Status, hasPR, awaitingProductSpec, loopNodeHPhase(loop.MetadataJSON))
+	template, label := feishuLoopFlowchartStyle(loop.Type, loop.Status, hasPR, awaitingProductSpec, loopNodeHPhase(loop.MetadataJSON), loopShepherdPhase(loop.MetadataJSON))
 	// §A: once the WORKER delivers its impl PR, mirror that PR's real review-cycle
 	// state (👀 待 review / 🔄 CI 检查中 / ✋ 待修改 / ❌ CI 失败 / ✅ 待合并 / 🎉 已合并)
 	// from its latest snapshot so the header tracks the PR through to merge (node Z).
@@ -1355,6 +1355,25 @@ func loopNodeHPhase(metadataJSON *string) string {
 	return strings.TrimSpace(s)
 }
 
+// loopShepherdPhase reads $.shepherd.phase (reviewing|fixing|awaiting_merge) for a
+// worker loop driving its impl PR to merge, so the card header animates through
+// the PR-shepherding lane.
+func loopShepherdPhase(metadataJSON *string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return ""
+	}
+	shepherd, ok := meta["shepherd"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := shepherd["phase"].(string)
+	return strings.TrimSpace(s)
+}
+
 // feishuLoopFlowchartStyle maps a loop's ROLE + status to the anchor card's colour +
 // title, so one glance at the header says WHERE in the flow the task sits — not a
 // generic "处理中". The roles are the flowchart lanes: coordinator=分诊,
@@ -1363,7 +1382,7 @@ func loopNodeHPhase(metadataJSON *string) string {
 // (product-spec vs generic); otherwise the running label is the role's lane. A
 // planner that COMPLETED has written its tech spec to Plane and now awaits node H
 // review (👀 方案评审中), never a merge.
-func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpec bool, nodeHPhase string) (template, label string) {
+func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpec bool, nodeHPhase, shepherdPhase string) (template, label string) {
 	role := strings.ToLower(strings.TrimSpace(loopType))
 	st := strings.ToLower(strings.TrimSpace(status))
 	// Terminals win first.
@@ -1372,6 +1391,20 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 		return "green", "🎉 已合并"
 	case "failed", "abandoned", "error":
 		return "red", "⚠️ Looper 需要处理"
+	}
+	// Worker shepherding its own impl PR to merge (looper:auto): the sub-phase
+	// animates the header through the PR-driving lane. The bot never merges — a
+	// human does — so the ready state reads "待合并" (waiting for a human), and
+	// 🎉已合并 comes only from the terminal "merged" outcome above.
+	if st == "shepherding" {
+		switch strings.ToLower(strings.TrimSpace(shepherdPhase)) {
+		case "fixing":
+			return "blue", "🔧 修复中"
+		case "awaiting_merge":
+			return "turquoise", "✅ 待合并(等人合并)"
+		default:
+			return "blue", "👀 评审中"
+		}
 	}
 	// node E hold: product-spec wait (before AUTHOR).
 	if awaitingProductSpec {
@@ -1427,7 +1460,7 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 // mirror the PR's real state (§A) instead of the generic "已交付" wording.
 func feishuLoopAwaitingMerge(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "completed", "done":
+	case "completed", "done", "shepherding":
 		return true
 	default:
 		return false
