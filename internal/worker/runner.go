@@ -1090,7 +1090,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	checkpoint := resumedRun.Checkpoint
 	claimedLockKey := ""
 	acquiredClaimedLock := false
-	if resumedRun.StartStep != stepPrepareWork {
+	// A shepherd pass manages its own pr:<repo>:<n> lock under a stable
+	// shepherd:<loopID> owner (held across passes, not per-pass). It must NOT take
+	// the normal per-pass claim-lock path: checkpoint.ClaimedLockKey was retargeted
+	// to pr:<repo>:<n> after open-pr, so reacquiring it under this queue item id
+	// would collide with the shepherd owner and fail every pass ("lock already
+	// held"), and the defer would release the shepherd's coordination lock.
+	if resumedRun.StartStep != stepPrepareWork && resumedRun.StartStep != stepShepherd {
 		claimedLockKey = checkpoint.ClaimedLockKey
 	}
 	if claimedLockKey != "" {
@@ -1223,6 +1229,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 	}
 
+	// A shepherd pass does not "complete" the loop between passes: it parks back
+	// into shepherding for the reconciler to re-wake on the next PR signal, unless
+	// the PR reached a terminal outcome (merged/closed) which runShepherdStep
+	// stamps into $.shepherd.outcome. (Inert until $.shepherd.active is set, since
+	// only a marked loop is ever routed to stepShepherd.)
+	if resumedRun.StartStep == stepShepherd {
+		return r.finishShepherdPass(ctx, project, loop, run, queueItem, checkpoint)
+	}
 	summary := r.buildSuccessSummary(*loop, checkpoint)
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
@@ -1311,6 +1325,67 @@ func (r *Runner) runShepherdStep(_ context.Context, input stepInput) (workerChec
 	return input.Checkpoint, nil
 }
 
+// shepherdPRLockKey is the coordination lock a shepherding loop holds so a
+// same-account fixer's discovery (which checks this lock) skips the PR.
+func shepherdPRLockKey(checkpoint workerCheckpoint) string {
+	if checkpoint.Work == nil || checkpoint.PullRequest == nil || checkpoint.Work.Repo == "" || checkpoint.PullRequest.Number <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("pr:%s:%d", checkpoint.Work.Repo, checkpoint.PullRequest.Number)
+}
+
+// finishShepherdPass closes out one shepherd pass. Unless runShepherdStep stamped
+// a terminal outcome into $.shepherd.outcome (PR merged/closed), the loop parks
+// back into shepherding — the reconciler re-wakes it on the next PR signal — with
+// no "delivered" notification (the card animates via the shepherd phase). On a
+// terminal outcome the loop reaches completed, the marker is cleared, the
+// coordination lock is released, and the completion is notified once.
+func (r *Runner) finishShepherdPass(ctx context.Context, project *storage.ProjectRecord, loop *storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint) (ProcessResult, error) {
+	summary := r.buildSuccessSummary(*loop, checkpoint)
+	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
+		return ProcessResult{}, err
+	}
+	prNumber := pullRequestNumber(checkpoint.PullRequest)
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	// Re-read fresh metadata: runShepherdStep persists the marker (phase/outcome)
+	// via updateLoop mid-pass, so the in-scope loop record here is stale.
+	meta := loop.MetadataJSON
+	if fresh, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
+		meta = fresh.MetadataJSON
+	}
+	marker, _ := loops.ReadShepherd(meta)
+	if marker.Outcome != "" {
+		marker.Active = false
+		newMeta, err := loops.WriteShepherd(meta, marker)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			updated.Status = "completed"
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+			updated.MetadataJSON = &newMeta
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		if key := shepherdPRLockKey(checkpoint); key != "" {
+			_ = r.repos.Locks.Release(context.Background(), key)
+		}
+		r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "success", Summary: summary, PullRequestNumber: prNumber}, nil
+	}
+	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		updated.Status = "shepherding"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "success", Summary: summary, PullRequestNumber: prNumber}, nil
+}
+
 func (r *Runner) reacquireClaimedLock(ctx context.Context, claimedLockKey string, owner string) (bool, error) {
 	nowISO := r.nowISO()
 	reason := "worker-run-resume"
@@ -1337,6 +1412,13 @@ func (r *Runner) reacquireClaimedLock(ctx context.Context, claimedLockKey string
 }
 
 func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint *workerCheckpoint, claimedLockKey *string) (ProcessResult, bool, error) {
+	// A shepherding loop is EXPECTED to see its source issue closed (a merge
+	// closes the issue) while the PR is still live — that is not obsolescence, it
+	// is the goal. Never abort a shepherd here: doing so would release the
+	// shepherd's own pr:<repo>:<n> coordination lock and hand the PR to a fixer.
+	if loops.ShepherdActive(loop.MetadataJSON) {
+		return ProcessResult{}, false, nil
+	}
 	if checkpoint == nil || checkpoint.Work == nil || checkpoint.Work.ExecutionMode != "create-pr" || checkpoint.Work.IssueNumber <= 0 || r.github == nil {
 		return ProcessResult{}, false, nil
 	}
@@ -2280,7 +2362,16 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	startStep := stepPrepareWork
 	resumedCheckpoint := checkpoint
-	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
+	// DURABLE-MARKER CONTROL: once the impl PR is open and $.shepherd.active is
+	// set, EVERY run drives that PR to merge via stepShepherd — regardless of
+	// loop.Status (the failure/HITL/human-message paths may transiently move it to
+	// queued/paused/running) and regardless of the failed/interrupted resume gate.
+	// The full checkpoint (PullRequest/Work/Lifecycle/Worktree) is carried
+	// forward. This is the source of control truth; loop.Status is display only.
+	shepherdRun := loops.ShepherdActive(loop.MetadataJSON) && checkpoint.PullRequest != nil
+	if shepherdRun {
+		startStep = stepShepherd
+	} else if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
 		if restartFromDiscover {
 			startStep = stepPrepareWork
 			resumedCheckpoint = workerCheckpoint{ResumePolicy: loops.ResumePolicyReplayStep}
@@ -2291,7 +2382,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			startStep = next
 		}
 	}
-	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork
+	resumed := shepherdRun || (latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork)
 	nowISO := r.nowISO()
 	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
