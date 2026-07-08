@@ -83,3 +83,25 @@ func TestFoldShepherdSignalIgnoresUpdatedAt(t *testing.T) {
 		t.Fatal("a new head must change the signal")
 	}
 }
+
+// A new review round (reviewer submits again) must change the wake signal even at
+// the same head with the same aggregate decision — else the shepherd never wakes
+// to address the re-review (the live-e2e bug). The agent's own thread replies are
+// NOT top-level reviews, so they don't move latestReviewMarker.
+func TestSignalCatchesNewReviewRound(t *testing.T) {
+	base := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "CHANGES_REQUESTED", HeadSHA: "sha1",
+		Checks:  []map[string]any{check("COMPLETED", "SUCCESS")},
+		Reviews: []map[string]any{{"state": "CHANGES_REQUESTED", "submittedAt": "2026-07-08T00:00:00Z"}},
+	}
+	round2 := base
+	round2.Reviews = []map[string]any{
+		{"state": "CHANGES_REQUESTED", "submittedAt": "2026-07-08T00:00:00Z"},
+		{"state": "CHANGES_REQUESTED", "submittedAt": "2026-07-08T09:00:00Z"}, // nettee re-reviewed at the same head
+	}
+	if foldShepherdSignal(base) == foldShepherdSignal(round2) {
+		t.Fatal("a new review round at the same head/decision must change the signal (else re-review is missed)")
+	}
+	if !shepherdActionable(round2) {
+		t.Fatal("CHANGES_REQUESTED must stay actionable")
+	}
+}

@@ -67,7 +67,10 @@ func (r *Runtime) reconcileWorkerShepherd(ctx context.Context) {
 		}
 		r.refreshShepherdLock(ctx, repositories, loop.ID, repo, prNumber, now)
 
-		pr, err := gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+		// ViewPullRequestForReviewer (not ViewPullRequest) so the detail carries
+		// reviews + statusCheckRollup — the plain view uses metadata-only fields
+		// and would leave Checks/Reviews empty, blinding CI and review-round detection.
+		pr, err := gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 		if err != nil {
 			continue
 		}
@@ -137,10 +140,31 @@ func shepherdCIPhase(pr githubinfra.PullRequestDetail) string {
 	}
 }
 
-// foldShepherdSignal is the wake key: stable semantic fields only (NO updatedAt,
-// which the agent's own comments bump — that would self-retrigger forever).
+// latestReviewMarker is the newest top-level review timestamp (across all
+// reviewers). It changes when a reviewer submits a NEW review round — even when
+// the aggregate reviewDecision stays CHANGES_REQUESTED and the head is unchanged
+// — but NOT on the agent's own thread replies (those are review comments, not
+// top-level reviews) or pushes, so it catches re-reviews without self-retrigger.
+func latestReviewMarker(pr githubinfra.PullRequestDetail) string {
+	last := ""
+	for _, review := range pr.Reviews {
+		at := stringFromAny(review["submittedAt"])
+		if at == "" {
+			at = stringFromAny(review["updatedAt"])
+		}
+		if at > last {
+			last = at
+		}
+	}
+	return last
+}
+
+// foldShepherdSignal is the wake key: stable semantic fields only. It deliberately
+// omits pr.UpdatedAt (the agent's own comments bump it → self-retrigger forever)
+// but includes latestReviewMarker so a new review round wakes a pass even at the
+// same head with the same aggregate decision.
 func foldShepherdSignal(pr githubinfra.PullRequestDetail) string {
-	return fmt.Sprintf("%s|%s|%s|%v|%s", strings.ToUpper(pr.State), strings.ToUpper(pr.ReviewDecision), shepherdCIPhase(pr), pr.HasConflicts, pr.HeadSHA)
+	return fmt.Sprintf("%s|%s|%s|%v|%s|%s", strings.ToUpper(pr.State), strings.ToUpper(pr.ReviewDecision), shepherdCIPhase(pr), pr.HasConflicts, pr.HeadSHA, latestReviewMarker(pr))
 }
 
 // shepherdActionable reports whether the agent has something to do THIS wake:
