@@ -31,6 +31,10 @@ const (
 	// feishuLoginShutdownTimeout bounds the graceful shutdown of the local callback
 	// server once we have the code (or are aborting).
 	feishuLoginShutdownTimeout = 2 * time.Second
+	// defaultFeishuLoginPort is the fixed loopback port the OAuth callback listens on.
+	// It must match a whitelisted redirect URI in the Feishu app; the teammate
+	// registers http://127.0.0.1:<this>/callback once. Overridable with --port.
+	defaultFeishuLoginPort = "53682"
 )
 
 // login runs the Feishu authorization-code flow to capture the machine-runner's
@@ -72,14 +76,21 @@ func (r *commandRuntime) login(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Bind an ephemeral loopback port for the OAuth redirect target. Feishu posts the
-	// authorization code here, which keeps the secret exchange on this machine only.
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return fmt.Errorf("start feishu login callback server: %w", err)
+	// Bind a FIXED loopback port for the OAuth redirect target. Feishu matches the
+	// redirect_uri by host:port against the whitelist (a random port fails with error
+	// 20029), so the port must be stable and whitelisted exactly as
+	// http://127.0.0.1:<port>/callback in the developer console. Overridable with
+	// --port when the default is already in use. The code exchange still stays on this
+	// machine only.
+	port := strings.TrimSpace(getStringFlag(cmd, "port"))
+	if port == "" {
+		port = defaultFeishuLoginPort
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+	listener, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		return fmt.Errorf("start feishu login callback server on 127.0.0.1:%s (already in use? pass --port): %w", port, err)
+	}
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%s/callback", port)
 
 	state, err := randomFeishuLoginState()
 	if err != nil {
