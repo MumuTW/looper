@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/loops"
@@ -77,5 +78,26 @@ func TestCreateRunContextForcesShepherdViaMarker(t *testing.T) {
 	}
 	if rc.Checkpoint.PullRequest == nil || rc.Checkpoint.PullRequest.Number != 101 {
 		t.Fatalf("shepherd run lost the PR checkpoint: %#v", rc.Checkpoint.PullRequest)
+	}
+}
+
+// The shepherd prompt MUST forbid the bot from ever merging or self-approving —
+// the final merge is a human colleague's action. This is a hard product rule
+// (feedback_bot_never_merges_human_merges), guarded here so a prompt edit can't
+// silently reintroduce a self-merge.
+func TestBuildShepherdPromptForbidsMergeAndSelfApprove(t *testing.T) {
+	p := buildShepherdPrompt(workerInput{Repo: "acme/looper"}, 101, false)
+	for _, must := range []string{"NEVER merge", "gh pr merge", "auto", "NEVER submit an approving review", "human"} {
+		if !strings.Contains(p, must) {
+			t.Fatalf("shepherd prompt missing guardrail %q:\n%s", must, p)
+		}
+	}
+	// sanity: it references the actual PR
+	if !strings.Contains(p, "acme/looper#101") {
+		t.Fatalf("shepherd prompt does not reference the PR: %s", p)
+	}
+	// session-lost path tells the agent to rebuild from the diff
+	if !strings.Contains(buildShepherdPrompt(workerInput{Repo: "a/b"}, 1, true), "could not be recovered") {
+		t.Fatal("session-lost prompt missing rebuild-from-diff instruction")
 	}
 }

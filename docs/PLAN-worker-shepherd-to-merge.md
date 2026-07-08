@@ -12,7 +12,7 @@ Branch: `feat/looper-auto-flowchart-runtime`. Status: v3 已按两轮对抗评�
 1. **绝不改 `internal/fixer/`、`internal/reviewer/`**(同事在用+升级冲突)。复用只经:包级稳定接口(`reviewer/automerge.Decide`)、共享 `internal/infra/github` gateway 纯加法、提示词(pr-autopilot recipe)。协调 fixer **靠它 discovery 已有的查锁(`hasActivePRLock`),不动它**。
 2. 无 per-PR 常驻进程;codex 每事件一趟即退。
 3. 崩溃/重启可恢复(状态全在 DB)。
-4. **绝不自审自批**:只 fix + 独立 reviewer(nettee)在**当前 head 上** approve + green 才 auto-merge。永不 SubmitReview。
+4. **绝不自审自批,更绝不自己合并**(用户 2026-07-08 拍板):bot 只 fix + 盯,把 PR 盯到"可合并"(approve+green+无冲突+线程清)就**停在那等同事人工合并**。**永不 SubmitReview,永不 EnableAutoMerge / gh pr merge / enqueue**。合并这一步永远是人的动作;bot 检测到 MERGED 才置终态。
 5. 对同事 looper(nettee)评审保守:默认照改;file:line 核实幻影才回 "cannot reproduce";绝不轻易 dismiss;拿不准 stop-and-ask。
 
 ---
@@ -73,13 +73,12 @@ Branch: `feat/looper-auto-flowchart-runtime`. Status: v3 已按两轮对抗评�
 - 挂起=`awaiting_human`;人答复走 `deliverHITLAnswerToLoop`(`hitl_github_poll.go:208`)设 `running`——**但有持久标记 3.1,下一趟解析器仍回 stepShepherd,自愈**,不需要它显式拨回 shepherding。
 - 自由消息(`enqueueHumanMessageToLoop` `:175`)翻 `queued`——同样被标记自愈。
 
-## 7. auto-merge(M6,自建 gate + 当前 head 的独立批准)
-- 复用 `reviewer/automerge.Decide`(`automerge.go:49`,包级,仅 import config)判仓库能力 + 共享 `EnableAutoMerge`(`gateway.go:1601`,`gh pr merge --auto --<strategy> --match-head-commit <HeadSHA>`)。**不碰 reviewer。**
-- **自建 review-state gate(shepherd 侧)**,全用共享 gateway PR-view 字段(reviewDecision/mergeStateStatus/reviews[author,state,commit]/headRefOid/isDraft,`gateway.go:35-37/699-738`)+ `GetBranchProtection.RequiredChecks`(`gateway.go:1314`):
-  1. **配置的 reviewer(nettee)有一条 `state==APPROVED` 且其 commit == 当前 `headRefOid` 的 review**(不是聚合 `reviewDecision`——否则我们 push 后它仍 APPROVED,会合一个 nettee 没审过的头,违反铁律 4)。
-  2. **仅 required check** 全 green(非 required 红不阻塞、不 spin)。
-  3. mergeable == MERGEABLE、非 draft、未解决线程==0。
-  - 全满足 → `automerge.Decide` OK → `EnableAutoMerge`(head=nettee 审过的头)。任何 agent push 后 → re-request nettee,只在它**重新 approve 的头**上开。**永不 SubmitReview。**
+## 7. 盯到"可合并"就停(用户更正:bot 不合并,等同事)
+- **删掉整个 auto-merge**:不 `EnableAutoMerge`、不 `gh pr merge`、不 enqueue、不 SubmitReview。原 Stage F 的"接口扩展 + 自建合并 gate + `automerge.Decide`"**全部去掉**。
+- bot 的职责止于"把 PR 盯到健康、可合并":修评审/CI/冲突、re-request reviewer、保持无冲突。
+- **可合并态(reviewDecision==APPROVED + required-green + mergeable + 线程清)→ 卡片相位置 `✅ 待合并(等同事合并)`,继续盯,什么都不合。**
+- **合并由同事人工完成**。bot 每趟检测 PR `state`:`MERGED` → 终态 `completed`+outcome=merged、卡片 🎉已合并、释锁、停;`CLOSED`(未合)→ completed+abandoned。
+- 判"可合并态"只为**卡片相位 + 决定不再唤 agent**,不为合并——所以只需轻量读 `reviewDecision/mergeStateStatus/state` + CI 状态,**不需要**扩 worker 接口去拿 reviews[commit]/required-check 那套精细字段(那是为合并 gate 的,已删)。
 
 ## 8. looper:auto trigger 溯源(major,per-PR 钉死)
 - worker 完成时手里没有"我在 looper:auto 链"的存量信号(`loopTriggerLabelHint` 是按角色推的)。**方案**:worker 开 PR 后 gating 时,用 `work.IssueNumber` **现读 issue 的 label**(Plane/GitHub 都有 label API),命中 `looper:auto` 才置 `$.shepherd.active`;否则今天的 `completed` 不变。

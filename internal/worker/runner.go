@@ -1321,8 +1321,133 @@ func (r *Runner) executeStep(ctx context.Context, step WorkerStep, input stepInp
 // nothing sets `$.shepherd.active` yet, so the start-step resolver never routes
 // here and this returns the checkpoint unchanged. The real sweep lands in a
 // later stage.
-func (r *Runner) runShepherdStep(_ context.Context, input stepInput) (workerCheckpoint, error) {
-	return input.Checkpoint, nil
+// shepherdLockTTL is deliberately long so the pr:<repo>:<n> coordination lock
+// survives idle time between passes; the reconciler refreshes it every tick
+// (tick << TTL) and each pass refreshes it too, so a same-account fixer's
+// discovery keeps skipping the PR.
+const shepherdLockTTL = 20 * time.Minute
+
+func shepherdLockOwner(loopID string) string { return "shepherd:" + loopID }
+
+// holdShepherdLock acquires (if free/expired) or refreshes (if already ours) the
+// PR coordination lock under the stable shepherd:<loopID> owner. Best-effort:
+// losing the lock does not fail the pass (worst case a same-account fixer could
+// briefly contend), so we only log.
+func (r *Runner) holdShepherdLock(ctx context.Context, loopID string, checkpoint workerCheckpoint) {
+	key := shepherdPRLockKey(checkpoint)
+	if key == "" || r.repos == nil || r.repos.Locks == nil {
+		return
+	}
+	owner := shepherdLockOwner(loopID)
+	reason := "shepherd"
+	nowISO := r.nowISO()
+	expiresAt := eventlog.FormatJavaScriptISOString(r.now().Add(shepherdLockTTL))
+	if refreshed, err := r.repos.Locks.Refresh(ctx, storage.LockRecord{Key: key, Owner: owner, Reason: &reason, ExpiresAt: expiresAt, UpdatedAt: nowISO}); err == nil && refreshed {
+		return
+	}
+	if _, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: key, Owner: owner, Reason: &reason, ExpiresAt: expiresAt, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil && r.logger != nil {
+		r.logger.Warn("shepherd lock hold failed", map[string]any{"loopId": loopID, "lockKey": key, "error": err.Error()})
+	}
+}
+
+// runShepherdStep runs one shepherd sweep for a worker loop driving its own impl
+// PR toward merge under looper:auto. It resumes the WORKER's own agent session
+// (so the code author's context is retained) and hands it the pr-autopilot
+// recipe to fix reviews/CI/conflicts via gh+git. It NEVER merges and NEVER
+// approves — a human colleague performs the final merge; the reconciler detects
+// MERGED and terminates. finishShepherdStep (the completion tail) parks the loop
+// back into shepherding for the next reconciler wake.
+func (r *Runner) runShepherdStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	if checkpoint.PullRequest == nil || checkpoint.Work == nil {
+		// Defensive: a shepherd run must carry a PR checkpoint. Without one there
+		// is nothing to drive — leave the marker for a human/reconciler to inspect.
+		return checkpoint, nil
+	}
+	r.holdShepherdLock(ctx, input.Loop.ID, checkpoint)
+
+	worktree, err := requireWorktree(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	worktree, err = r.ensureWorkerWorktreeUsable(ctx, input, &checkpoint, *checkpoint.Work, worktree)
+	if err != nil {
+		return checkpoint, err
+	}
+
+	sessionID := r.latestNativeSessionID(ctx, input.Loop.ID)
+	sessionLost := strings.TrimSpace(sessionID) == ""
+	if sessionLost {
+		r.stampShepherd(ctx, &input.Loop, func(s *loops.Shepherd) { s.SessionLost = true })
+	}
+	prompt := buildShepherdPrompt(*checkpoint.Work, checkpoint.PullRequest.Number, sessionLost)
+
+	r.stampShepherd(ctx, &input.Loop, func(s *loops.Shepherd) {
+		s.Phase = "fixing"
+		s.PassCount++
+	})
+
+	executionID := eventlog.NewEventID("agent")
+	metadata := map[string]any{"loopType": "worker", "step": "shepherd", "repo": checkpoint.Work.Repo, "prNumber": checkpoint.PullRequest.Number}
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: prompt, NativeSessionID: sessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("shepherd:%s:%d", input.Loop.ID, checkpoint.PullRequest.Number)})
+	if err != nil {
+		return checkpoint, err
+	}
+	if _, err := execution.Wait(ctx); err != nil {
+		return checkpoint, err
+	}
+	// The agent committed+pushed any fix itself. The tail parks the loop back into
+	// shepherding; the reconciler re-wakes on the next PR signal change and
+	// detects MERGED (by a human) to terminate. Nothing is merged here.
+	return checkpoint, nil
+}
+
+// stampShepherd merges a mutation into the loop's $.shepherd marker and persists
+// it. Best-effort: a failed stamp only degrades card phase/cap accuracy.
+func (r *Runner) stampShepherd(ctx context.Context, loop *storage.LoopRecord, mutate func(*loops.Shepherd)) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	s, _ := loops.ReadShepherd(fresh.MetadataJSON)
+	mutate(&s)
+	newMeta, err := loops.WriteShepherd(fresh.MetadataJSON, s)
+	if err != nil {
+		return
+	}
+	if _, err := r.updateLoop(ctx, *fresh, func(updated *storage.LoopRecord) {
+		updated.MetadataJSON = &newMeta
+	}); err == nil {
+		loop.MetadataJSON = &newMeta
+	}
+}
+
+// buildShepherdPrompt embeds the pr-autopilot sweep (pure gh+git, run by the
+// resumed author session) with the hard guardrails: never merge, never approve,
+// be conservative about a peer reviewer's change requests.
+func buildShepherdPrompt(work workerInput, prNumber int64, sessionLost bool) string {
+	repo := work.Repo
+	parts := []string{
+		fmt.Sprintf("You previously authored the implementation PR %s#%d. Keep driving it toward a clean merge — but a human colleague performs the final merge, not you.", repo, prNumber),
+	}
+	if sessionLost {
+		parts = append(parts, "NOTE: your previous session context could not be recovered. Rebuild your understanding from the PR diff and review threads before acting; do not assume prior memory.")
+	}
+	parts = append(parts,
+		"Run ONE sweep now, then stop:",
+		fmt.Sprintf("1. Snapshot live state (never act on stale data): `gh pr view %d -R %s --json state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,latestReviews`. If state==MERGED or CLOSED, stop and report — you are done.", prNumber, repo),
+		"2. Unresolved review threads (GraphQL, since gh pr view can't see resolution): for each, OPEN the file at file:line and VERIFY the claim against current source before acting. Real defect → make the scoped fix, commit, push, reply on the thread, resolve it. Phantom (cannot reproduce) → reply with evidence and resolve. The reviewer is a peer teammate: be conservative — default to implementing the requested change; only decline (with a concise written reason) when you are confident it is wrong or out of scope; when in doubt, ask a human via `.looper/ask.json`.",
+		"3. Failing CI: `gh pr checks` + `gh run view <id> --log-failed`; reproduce with the repo's own scoped validation, fix, commit, push. A non-required check failing does not block — note it, don't spin.",
+		"4. Merge conflicts (mergeable==CONFLICTING): merge the base into this worktree, resolve, run the relevant checks, push. NEVER force-push, never rewrite others' commits, never delete the base branch.",
+		"5. After ANY push, re-request the reviewer(s) so they re-review the new head: `gh pr edit "+fmt.Sprintf("%d", prNumber)+" -R "+repo+" --add-reviewer <login>`.",
+		"HARD RULES (never violate): NEVER merge this PR — do NOT run `gh pr merge`, do NOT enable auto-merge (`--auto`), do NOT enqueue to a merge queue. NEVER submit an approving review of your own PR. NEVER use --admin to bypass a check. The final merge is a human colleague's action; your job ends at a healthy, review-ready, green, conflict-free PR.",
+		"When approved + all required checks green + mergeable + every thread resolved, there is nothing left to do: report that the PR is ready for a human to merge, and stop.",
+		"Commit with a fresh subject summarizing this round's repair; push the current branch; do not open a new PR.",
+	)
+	return strings.Join(parts, "\n\n")
 }
 
 // shepherdPRLockKey is the coordination lock a shepherding loop holds so a
