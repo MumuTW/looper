@@ -268,7 +268,9 @@ func (s *candidateState) block(reason string) {
 
 func protectsLoopStatus(status string) bool {
 	switch status {
-	case "idle", "queued", "running", "waiting", "paused", "failed", "interrupted":
+	// shepherding is a live worker loop parked between PR-driving passes; its
+	// worktree must survive so the next pass can push a fix from it.
+	case "idle", "queued", "running", "waiting", "paused", "failed", "interrupted", "shepherding":
 		return true
 	default:
 		return false

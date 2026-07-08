@@ -41,6 +41,12 @@ const (
 	stepExecute         WorkerStep = "execute"
 	stepValidate        WorkerStep = "validate"
 	stepOpenPR          WorkerStep = "open-pr"
+	// stepShepherd is the self-repeating terminal step: once the impl PR is open
+	// under looper:auto, each reconciler-woken pass runs one shepherd sweep (watch
+	// → fix → enable auto-merge) resuming the worker's own session. It is last in
+	// workerStepSequence so nextWorkerStep(stepShepherd)=="" (one pass per enqueue);
+	// the start-step resolver forces it via the durable `$.shepherd.active` marker.
+	stepShepherd WorkerStep = "shepherd"
 
 	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
 	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
@@ -67,6 +73,11 @@ var (
 	workerStructuredResultMessagePattern = regexp.MustCompile(`^Worker completed without a valid structured result \(parse status: ([a-z_]+)\)\. See Looper logs for details\.$`)
 )
 
+// workerStepSequence is the linear impl flow and deliberately ENDS at stepOpenPR
+// so a normal worker run stops there exactly as before. stepShepherd is NOT part
+// of this sequence — it is reached only when the start-step resolver forces it
+// (via the durable `$.shepherd.active` marker), and stepsFrom/nextWorkerStep
+// special-case it so it runs as a standalone self-repeating pass.
 var workerStepSequence = []WorkerStep{
 	stepPrepareWork,
 	stepPrepareWorktree,
@@ -931,7 +942,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "human_takeover" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" || loopResult.record.Status == "awaiting_human" {
+		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "human_takeover" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" || loopResult.record.Status == "awaiting_human" || loopResult.record.Status == "shepherding" {
 			result.Skipped++
 			continue
 		}
@@ -1283,9 +1294,21 @@ func (r *Runner) executeStep(ctx context.Context, step WorkerStep, input stepInp
 		return r.runValidateStep(ctx, input)
 	case stepOpenPR:
 		return r.runOpenPRStep(ctx, input)
+	case stepShepherd:
+		return r.runShepherdStep(ctx, input)
 	default:
 		return input.Checkpoint, fmt.Errorf("unsupported worker step: %s", step)
 	}
+}
+
+// runShepherdStep runs one shepherd sweep for a worker loop that has opened its
+// impl PR under looper:auto (watch CI/reviews/conflicts → fix → enable
+// auto-merge, resuming the worker's own session). Stage A: inert no-op park —
+// nothing sets `$.shepherd.active` yet, so the start-step resolver never routes
+// here and this returns the checkpoint unchanged. The real sweep lands in a
+// later stage.
+func (r *Runner) runShepherdStep(_ context.Context, input stepInput) (workerCheckpoint, error) {
+	return input.Checkpoint, nil
 }
 
 func (r *Runner) reacquireClaimedLock(ctx context.Context, claimedLockKey string, owner string) (bool, error) {
@@ -2601,7 +2624,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	}
 	for _, existing := range existingLoops {
 		if workerLoopTracksIssue(existing, project.ID, repo, issue.Number) {
-			pausedOrCompleted := existing.Status == "paused" || existing.Status == "human_takeover" || existing.Status == "completed" || existing.Status == "awaiting_human"
+			pausedOrCompleted := existing.Status == "paused" || existing.Status == "human_takeover" || existing.Status == "completed" || existing.Status == "awaiting_human" || existing.Status == "shepherding"
 			prLinked := existing.TargetType == "pull_request" || derefInt64(existing.PRNumber) > 0
 			if prLinked {
 				return loopUpsertResult{record: existing, skipEnqueue: true}, nil
@@ -3010,6 +3033,10 @@ func workerFailureKind(kind failureclass.Kind) QueueFailureKind {
 func (r *Runner) nowISO() string { return eventlog.FormatJavaScriptISOString(r.now()) }
 
 func stepsFrom(start WorkerStep) []WorkerStep {
+	// stepShepherd is off the linear sequence: one standalone pass per enqueue.
+	if start == stepShepherd {
+		return []WorkerStep{stepShepherd}
+	}
 	startIndex := 0
 	for i, step := range workerStepSequence {
 		if step == start {

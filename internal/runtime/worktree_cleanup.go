@@ -453,8 +453,9 @@ func worktreeCleanupActiveLoopStatus(status string) bool {
 	switch status {
 	// human_takeover keeps the worktree pinned: a human is (or is about to be)
 	// driving the loop's agent session inside it — reclaiming it would pull the
-	// working tree out from under them.
-	case "idle", "queued", "running", "paused", "waiting", "human_takeover":
+	// working tree out from under them. shepherding keeps it pinned so the next
+	// PR-driving pass can push a fix from the same worktree.
+	case "idle", "queued", "running", "paused", "waiting", "human_takeover", "shepherding":
 		return true
 	default:
 		return false
