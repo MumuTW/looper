@@ -71,7 +71,7 @@ func TestCreatePageBuildsArgsAndParsesID(t *testing.T) {
 	if !argsContain(args, "api", "page", "create", "--json") ||
 		!argPairPresent(args, "--project", "proj-1") ||
 		!argPairPresent(args, "--name", "Tech Spec") ||
-		!argPairPresent(args, "--body", "# Body\n- x") ||
+		!argsContain(args, "--body=# Body\n- x") ||
 		!argPairPresent(args, "--api-key", "secret-key") ||
 		!argPairPresent(args, "--workspace", "open-design") {
 		t.Fatalf("create args = %v, missing expected flags", args)
