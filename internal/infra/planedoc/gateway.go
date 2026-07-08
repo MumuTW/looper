@@ -114,7 +114,10 @@ func (g *Gateway) CreatePage(ctx context.Context, projectID, name, bodyMarkdown 
 	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(name) == "" {
 		return Page{}, fmt.Errorf("planedoc: CreatePage requires project id and name")
 	}
-	args := []string{"api", "page", "create", "--project", projectID, "--name", name, "--body", bodyMarkdown, "--format", "md", "--json"}
+	// Attached form (--body=VALUE) so a body that begins with YAML front matter
+	// ("---") is taken as the flag value, not parsed as a stray flag/positional by
+	// the CLI's clap parser (which otherwise rejects it: "unexpected argument '---'").
+	args := []string{"api", "page", "create", "--project", projectID, "--name", name, "--body=" + bodyMarkdown, "--format", "md", "--json"}
 	args = append(args, g.globalArgs()...)
 	result, err := g.runPlane(ctx, "", args...)
 	if err != nil {
@@ -154,7 +157,9 @@ func (g *Gateway) UpdatePageContent(ctx context.Context, projectID, pageID, body
 	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(pageID) == "" {
 		return fmt.Errorf("planedoc: UpdatePageContent requires project id and page id")
 	}
-	args := []string{"api", "page", "update", "--project", projectID, pageID, "--body", bodyMarkdown, "--format", "md"}
+	// Attached form (--body=VALUE) — see CreatePage: a body starting with "---"
+	// front matter must not be misparsed as a flag by the CLI.
+	args := []string{"api", "page", "update", "--project", projectID, pageID, "--body=" + bodyMarkdown, "--format", "md"}
 	args = append(args, g.globalArgs()...)
 	if _, err := g.runPlane(ctx, "", args...); err != nil {
 		return fmt.Errorf("planedoc: update page content: %w", err)
