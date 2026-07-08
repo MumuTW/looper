@@ -2834,6 +2834,15 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 			return checkpoint, nil
 		}
+		if r.commentOnlyPublishForProject(input.Project.ID) {
+			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
+				return checkpoint, err
+			}
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
+		}
 		if r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove {
 			found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
 			if err != nil {
@@ -2855,15 +2864,6 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 				return checkpoint, err
 			}
 			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
-				return checkpoint, err
-			}
-			return checkpoint, nil
-		}
-		if r.commentOnlyPublishForProject(input.Project.ID) {
-			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
-				return checkpoint, err
-			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil

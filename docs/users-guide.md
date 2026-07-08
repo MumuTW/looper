@@ -1,6 +1,6 @@
 # Looper Quick User Guide
 
-This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support is currently limited to planner, worker, and summary-comment reviewer/fixer flows.
+This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, summary-comment reviewer flows, and the manual/direct native-review-comment fixer path.
 
 ## 1. Prerequisites
 
@@ -97,8 +97,8 @@ Forgejo MVP role support:
 
 - Planner and Worker are supported over the Forgejo REST API.
 - Reviewer is supported through a top-level Reviewer Summary PR comment. The machine-readable summary is the authority for Forgejo Fixer input.
-- Fixer is supported through a no-resolve summary protocol: it consumes open items from the Reviewer Summary and publishes a top-level Fixer Summary PR comment. Reviewer closes, reopens, or supersedes items on the next review round.
-- Coordinator, auto-merge, native reviews, review requests, review-thread resolution, routed network mode, and webhook modes are GitHub-only for now.
+- Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and manual/direct `looper fix` runs also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
+- Coordinator, auto-merge, native Forgejo reviewer publishing, review requests, routed network mode, and webhook modes are GitHub-only for now.
 - A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
 ## 4. Recommended flow
@@ -266,7 +266,7 @@ For the default review-requested path, Looper asks GitHub for PRs requested from
 
 For spec PRs, `looper:spec-reviewing` marks the review phase, but it does not by itself authorize other users' Looper instances to run. Request review from the intended GitHub user to trigger that user's automatic reviewer.
 
-For Forgejo projects, reviewer auto-discovery uses labels instead of review requests. The provider profile defaults normal PR discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Forgejo reviewer publishes a top-level Reviewer Summary comment and does not create native `APPROVE` or `REQUEST_CHANGES` reviews. Forgejo fixer consumes only `open` items from that Reviewer Summary and publishes a Fixer Summary comment; it does not resolve native review threads.
+For Forgejo projects, reviewer auto-discovery uses labels instead of review requests. The provider profile defaults normal PR discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Forgejo reviewer publishes a top-level Reviewer Summary comment and does not create native `APPROVE` or `REQUEST_CHANGES` reviews. Forgejo fixer still consumes `open` Reviewer Summary items and publishes a Fixer Summary comment, but manual/direct `looper fix` runs also read unresolved native Forgejo PR review comments by default and may resolve those native comments after validation, push, and post-push verification.
 
 ### What happens after reviewer finishes
 
@@ -328,6 +328,15 @@ Fixer will:
 - run validation
 - push back to the same PR branch
 - after validation and push succeed, try to resolve only the review threads that were both verified by Looper and explicitly confirmed by the fixer agent
+
+For Forgejo projects, the manual/direct fixer path is slightly different:
+
+- reviewer-summary items still come from the top-level Reviewer Summary comment
+- native Forgejo PR review comments are also read by default
+- native comments authored by the current Looper user are ignored
+- if a native comment response omits the `resolver` field, Looper stops with an unsupported-capability/manual-intervention error instead of silently downgrading
+- native comments are resolved only when the fixer agent reports them as `fixed`, validation passes, a push actually happened, and a post-push re-read shows the same unresolved comment fingerprint
+- `declined`, `deferred`, changed, deleted, already-resolved, or otherwise unmatched native comments stay unresolved
 
 If the PR is still in the spec review phase and the review becomes clean, fixer can also move the labels from:
 

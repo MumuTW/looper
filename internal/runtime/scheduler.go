@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -764,6 +765,19 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 }
 
 func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (reviewer.ReviewMarkerResult, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return reviewer.ReviewMarkerResult{}, err
+		}
+		comments, err := client.ListIssueComments(ctx, input.PRNumber)
+		if err != nil {
+			return reviewer.ReviewMarkerResult{}, err
+		}
+		return findForgejoReviewMarker(comments, input), nil
+	}
+	if a.gateway == nil {
+		return reviewer.ReviewMarkerResult{}, fmt.Errorf("github gateway is not configured")
+	}
 	allowedReviewEvents := make([]string, 0, len(input.AllowedReviewEvents))
 	for _, event := range input.AllowedReviewEvents {
 		allowedReviewEvents = append(allowedReviewEvents, string(event))
@@ -773,6 +787,125 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 		return reviewer.ReviewMarkerResult{}, err
 	}
 	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin, Body: marker.Body, InlineCommentBodies: append([]string(nil), marker.InlineCommentBodies...)}, nil
+}
+
+var runtimeReviewMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
+
+func findForgejoReviewMarker(comments []forge.Comment, input reviewer.VerifyReviewMarkerInput) reviewer.ReviewMarkerResult {
+	expectedAuthor := strings.ToLower(strings.TrimSpace(input.AuthorLogin))
+	var newest reviewer.ReviewMarkerResult
+	for _, comment := range comments {
+		body := strings.TrimSpace(comment.Body)
+		if body == "" {
+			continue
+		}
+		parsedMarker, ok := findRuntimeReviewIdempotencyMarker(body, input.Marker)
+		if !ok {
+			continue
+		}
+		author := strings.TrimSpace(comment.User.Login)
+		if expectedAuthor != "" && strings.ToLower(author) != expectedAuthor {
+			continue
+		}
+		if !forgejoReviewMarkerAllowed(parsedMarker.Outcome, input.AllowedReviewEvents, input.AllowCleanComment) {
+			continue
+		}
+		newest = reviewer.ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: reviewer.ReviewEventComment, AuthorLogin: author, Body: comment.Body}
+	}
+	return newest
+}
+
+type runtimeReviewIdempotencyMarker struct {
+	ID      string
+	Head    string
+	Outcome string
+}
+
+func findRuntimeReviewIdempotencyMarker(body string, marker string) (runtimeReviewIdempotencyMarker, bool) {
+	marker = strings.TrimSpace(marker)
+	for _, parsedMarker := range parseRuntimeReviewIdempotencyMarkers(body) {
+		if marker == "" || parsedMarker.matches(marker) {
+			return parsedMarker, true
+		}
+	}
+	return runtimeReviewIdempotencyMarker{}, false
+}
+
+func parseRuntimeReviewIdempotencyMarkers(body string) []runtimeReviewIdempotencyMarker {
+	matches := runtimeReviewMarkerRE.FindAllStringSubmatch(body, -1)
+	markers := make([]runtimeReviewIdempotencyMarker, 0, len(matches))
+	for _, match := range matches {
+		if len(match) != 2 {
+			continue
+		}
+		fields := parseRuntimeReviewMarkerFields(match[1])
+		parsedMarker := runtimeReviewIdempotencyMarker{ID: fields["id"], Head: fields["head"], Outcome: fields["outcome"]}
+		if parsedMarker.ID == "" || parsedMarker.Head == "" || !runtimeValidReviewMarkerOutcome(parsedMarker.Outcome) {
+			continue
+		}
+		markers = append(markers, parsedMarker)
+	}
+	return markers
+}
+
+func parseRuntimeReviewMarkerFields(segment string) map[string]string {
+	fields := map[string]string{}
+	for _, field := range strings.Fields(segment) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		fields[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+	}
+	return fields
+}
+
+func (m runtimeReviewIdempotencyMarker) matches(marker string) bool {
+	fields := parseRuntimeReviewMarkerFields(strings.TrimPrefix(marker, "looper:review"))
+	if id := fields["id"]; id != "" && id != m.ID {
+		return false
+	}
+	if idPrefix := fields["id_prefix"]; idPrefix != "" && !strings.HasPrefix(m.ID, idPrefix) {
+		return false
+	}
+	if head := fields["head"]; head != "" && head != m.Head {
+		return false
+	}
+	if outcome := fields["outcome"]; outcome != "" && outcome != m.Outcome {
+		return false
+	}
+	return strings.HasPrefix(marker, "looper:review") || strings.Contains(marker, "id=") || strings.Contains(marker, "head=") || strings.Contains(marker, "outcome=")
+}
+
+func runtimeValidReviewMarkerOutcome(outcome string) bool {
+	switch outcome {
+	case "clean", "non_blocking", "blocking", "actionable":
+		return true
+	default:
+		return false
+	}
+}
+
+func forgejoReviewMarkerAllowed(outcome string, allowed []reviewer.ReviewEvent, allowCleanComment bool) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean":
+		if allowCleanComment {
+			return true
+		}
+		for _, event := range allowed {
+			if event == reviewer.ReviewEventComment {
+				return true
+			}
+		}
+		return false
+	case "blocking", "non_blocking", "actionable":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input reviewer.IssueCommentInput) (reviewer.IssueCommentResult, error) {
@@ -884,6 +1017,15 @@ func (a reviewerGitHubAdapter) RemoveIssueLabels(ctx context.Context, input gith
 }
 
 func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input reviewer.ListReviewThreadsInput) ([]reviewer.ReviewThread, error) {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return []reviewer.ReviewThread{}, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
 	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
 	if err != nil {
 		return nil, err
@@ -900,11 +1042,23 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 }
 
 func (a reviewerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input reviewer.AddReviewThreadReplyInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	body := a.stamper.ReviewComment(input.Body, "reviewer")
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input reviewer.ResolveReviewThreadInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
@@ -1126,6 +1280,45 @@ func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer
 		return fmt.Errorf("forgejo fixer does not support native review thread resolution")
 	}
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input fixer.ListNativeReviewCommentsInput) ([]fixer.NativeReviewComment, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		comments, err := client.ListPullRequestReviewComments(ctx, input.PRNumber)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]fixer.NativeReviewComment, 0, len(comments))
+		for _, comment := range comments {
+			out = append(out, fixer.NativeReviewComment{
+				ProviderCommentID:   comment.ID,
+				Body:                comment.Body,
+				URL:                 comment.HTMLURL,
+				Path:                comment.Path,
+				DiffHunk:            comment.DiffHunk,
+				ObservedFingerprint: fixer.NativeReviewCommentFingerprint(comment.ID, comment.UpdatedAt),
+				ResolverPresent:     comment.Resolver.Present,
+				IsResolved:          comment.Resolver.Value != nil,
+				Author:              comment.User.Login,
+				UpdatedAt:           comment.UpdatedAt,
+			})
+		}
+		return out, nil
+	}
+	return nil, nil
+}
+
+func (a fixerGitHubAdapter) ResolveNativeReviewComment(ctx context.Context, input fixer.ResolveNativeReviewCommentInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.ResolvePullRequestReviewComment(ctx, input.PRNumber, input.ProviderCommentID)
+	}
+	return fmt.Errorf("github fixer does not support native review comment resolution")
 }
 
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {

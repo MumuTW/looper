@@ -207,6 +207,45 @@ type Comment struct {
 	User      Identity
 }
 
+type PullRequestReviewComment struct {
+	ID                  int64
+	Body                string
+	HTMLURL             string
+	UpdatedAt           string
+	User                Identity
+	Path                string
+	CommitID            string
+	OriginalCommitID    string
+	Position            int
+	OriginalPosition    int
+	DiffHunk            string
+	PullRequestReviewID int64
+	Resolver            ForgejoReviewCommentResolverField
+}
+
+type ForgejoReviewCommentResolverField struct {
+	Present bool
+	Value   *Identity
+}
+
+type ForgejoHTTPError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Message    string
+}
+
+func (err *ForgejoHTTPError) Error() string {
+	return fmt.Sprintf("forgejo API %s %s returned HTTP %d: %s", err.Method, err.Path, err.StatusCode, err.Message)
+}
+
+func (err *ForgejoHTTPError) HTTPStatusCode() int {
+	if err == nil {
+		return 0
+	}
+	return err.StatusCode
+}
+
 func (forgejo *ForgejoClient) ListOpenIssues(ctx context.Context, input ListIssuesInput) ([]Issue, error) {
 	if strings.TrimSpace(input.State) == "" {
 		input.State = "open"
@@ -370,6 +409,28 @@ func (forgejo *ForgejoClient) UpdateIssueComment(ctx context.Context, input Upda
 	return convertComment(output), nil
 }
 
+func (forgejo *ForgejoClient) ListPullRequestReviewComments(ctx context.Context, number int64) ([]PullRequestReviewComment, error) {
+	var reviews []forgejoPullRequestReview
+	if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "reviews"), nil, 0, &reviews); err != nil {
+		return nil, err
+	}
+	comments := make([]PullRequestReviewComment, 0)
+	for _, review := range reviews {
+		var output []forgejoPullRequestReviewComment
+		if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "reviews", strconv.FormatInt(review.ID, 10), "comments"), nil, 0, &output); err != nil {
+			return nil, err
+		}
+		for _, comment := range output {
+			comments = append(comments, convertPullRequestReviewComment(comment))
+		}
+	}
+	return comments, nil
+}
+
+func (forgejo *ForgejoClient) ResolvePullRequestReviewComment(ctx context.Context, number int64, commentID int64) error {
+	return forgejo.do(ctx, http.MethodPost, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "comments", strconv.FormatInt(commentID, 10), "resolve"), nil, nil, nil)
+}
+
 func parseForgejoBaseURL(value string) (*url.URL, error) {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
@@ -495,7 +556,7 @@ func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path str
 		return rawResponse{}, fmt.Errorf("forgejo API %s %s response exceeds %d bytes", method, path, maxForgejoResponseBodyBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return rawResponse{}, fmt.Errorf("forgejo API %s %s returned HTTP %d: %s", method, path, response.StatusCode, sanitizeForgejoErrorBody(responseBody, forgejo.token))
+		return rawResponse{}, &ForgejoHTTPError{Method: method, Path: path, StatusCode: response.StatusCode, Message: sanitizeForgejoErrorBody(responseBody, forgejo.token)}
 	}
 	return rawResponse{body: responseBody, header: response.Header.Clone()}, nil
 }
@@ -597,6 +658,45 @@ type forgejoComment struct {
 	User      forgejoUser `json:"user"`
 }
 
+type forgejoResolverField struct {
+	Present bool
+	Value   *forgejoUser
+}
+
+func (field *forgejoResolverField) UnmarshalJSON(data []byte) error {
+	field.Present = true
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		field.Value = nil
+		return nil
+	}
+	var user forgejoUser
+	if err := json.Unmarshal(data, &user); err != nil {
+		return err
+	}
+	field.Value = &user
+	return nil
+}
+
+type forgejoPullRequestReviewComment struct {
+	ID                  int64                `json:"id"`
+	Body                string               `json:"body"`
+	HTMLURL             string               `json:"html_url"`
+	UpdatedAt           string               `json:"updated_at"`
+	User                forgejoUser          `json:"user"`
+	Path                string               `json:"path"`
+	CommitID            string               `json:"commit_id"`
+	OriginalCommitID    string               `json:"original_commit_id"`
+	Position            int                  `json:"position"`
+	OriginalPosition    int                  `json:"original_position"`
+	DiffHunk            string               `json:"diff_hunk"`
+	PullRequestReviewID int64                `json:"pull_request_review_id"`
+	Resolver            forgejoResolverField `json:"resolver"`
+}
+
+type forgejoPullRequestReview struct {
+	ID int64 `json:"id"`
+}
+
 func convertIssue(input forgejoIssue) Issue {
 	return Issue{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees)}
 }
@@ -607,6 +707,29 @@ func convertPullRequest(input forgejoPullRequest) PullRequest {
 
 func convertComment(input forgejoComment) Comment {
 	return Comment{ID: input.ID, Body: input.Body, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User)}
+}
+
+func convertPullRequestReviewComment(input forgejoPullRequestReviewComment) PullRequestReviewComment {
+	comment := PullRequestReviewComment{
+		ID:                  input.ID,
+		Body:                input.Body,
+		HTMLURL:             input.HTMLURL,
+		UpdatedAt:           input.UpdatedAt,
+		User:                convertUser(input.User),
+		Path:                input.Path,
+		CommitID:            input.CommitID,
+		OriginalCommitID:    input.OriginalCommitID,
+		Position:            input.Position,
+		OriginalPosition:    input.OriginalPosition,
+		DiffHunk:            input.DiffHunk,
+		PullRequestReviewID: input.PullRequestReviewID,
+		Resolver:            ForgejoReviewCommentResolverField{Present: input.Resolver.Present},
+	}
+	if input.Resolver.Value != nil {
+		resolver := convertUser(*input.Resolver.Value)
+		comment.Resolver.Value = &resolver
+	}
+	return comment
 }
 
 func convertUser(input forgejoUser) Identity { return Identity{Login: input.Login, ID: input.ID} }

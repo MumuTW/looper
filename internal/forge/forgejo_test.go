@@ -3,10 +3,12 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -355,6 +357,222 @@ func TestForgejoPullRequestDiffRejectsOversizedResponses(t *testing.T) {
 	_, err = client.PullRequestDiff(context.Background(), 9)
 	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
 		t.Fatalf("PullRequestDiff() error = %v, want oversized response failure", err)
+	}
+}
+
+func TestForgejoListPullRequestReviewCommentsContract(t *testing.T) {
+	t.Parallel()
+
+	var requests []recordedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests = append(requests, recordedRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Auth: r.Header.Get("Authorization"), Body: string(body)})
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		switch r.URL.Path {
+		case "/api/v1/repos/acme/looper/pulls/42/reviews":
+			switch r.URL.Query().Get("page") {
+			case "1":
+				w.Header().Set("X-Total-Pages", "2")
+				writeJSON(t, w, http.StatusOK, []map[string]any{{"id": 201}})
+			case "2":
+				writeJSON(t, w, http.StatusOK, []map[string]any{{"id": 202}, {"id": 203}})
+			default:
+				t.Fatalf("unexpected reviews page %q", r.URL.Query().Get("page"))
+			}
+		case "/api/v1/repos/acme/looper/pulls/42/reviews/201/comments":
+			writeJSON(t, w, http.StatusOK, []map[string]any{{
+				"id": 101, "body": "resolver absent", "path": "app.go", "commit_id": "head1", "original_commit_id": "base1",
+				"position": 4, "original_position": 4, "diff_hunk": "@@ -1 +1 @@", "html_url": "https://example.test/comments/101",
+				"pull_request_review_id": 201, "updated_at": "2026-07-07T01:00:00Z", "user": map[string]any{"id": 1, "login": "octo"},
+			}})
+		case "/api/v1/repos/acme/looper/pulls/42/reviews/202/comments":
+			writeJSON(t, w, http.StatusOK, []map[string]any{{
+				"id": 102, "body": "resolver null", "path": "app.go", "commit_id": "head2", "original_commit_id": "base2",
+				"position": 8, "original_position": 7, "diff_hunk": "@@ -2 +2 @@", "html_url": "https://example.test/comments/102",
+				"pull_request_review_id": 202, "updated_at": "2026-07-07T02:00:00Z", "user": map[string]any{"id": 2, "login": "marge"}, "resolver": nil,
+			}})
+		case "/api/v1/repos/acme/looper/pulls/42/reviews/203/comments":
+			writeJSON(t, w, http.StatusOK, []map[string]any{{
+				"id": 103, "body": "resolver object", "path": "app.go", "commit_id": "head3", "original_commit_id": "base3",
+				"position": 9, "original_position": 9, "diff_hunk": "@@ -3 +3 @@", "html_url": "https://example.test/comments/103",
+				"pull_request_review_id": 203, "updated_at": "2026-07-07T03:00:00Z", "user": map[string]any{"id": 3, "login": "lisa"}, "resolver": map[string]any{"id": 9, "login": "ralph"},
+			}})
+		default:
+			t.Fatalf("unexpected request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer server.Close()
+
+	client := newForgejoTestClient(t, server.URL)
+	comments, err := client.ListPullRequestReviewComments(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ListPullRequestReviewComments() error = %v", err)
+	}
+	if len(comments) != 3 {
+		t.Fatalf("len(comments) = %d, want 3", len(comments))
+	}
+	if comments[0].Resolver.Present {
+		t.Fatalf("comments[0].Resolver = %#v, want absent resolver", comments[0].Resolver)
+	}
+	if !comments[1].Resolver.Present || comments[1].Resolver.Value != nil {
+		t.Fatalf("comments[1].Resolver = %#v, want explicit null resolver", comments[1].Resolver)
+	}
+	if !comments[2].Resolver.Present || comments[2].Resolver.Value == nil || comments[2].Resolver.Value.Login != "ralph" {
+		t.Fatalf("comments[2].Resolver = %#v, want resolver object", comments[2].Resolver)
+	}
+	if comments[2].PullRequestReviewID != 203 || comments[2].OriginalPosition != 9 {
+		t.Fatalf("comments[2] = %#v, want decoded review comment fields", comments[2])
+	}
+	if len(requests) != 5 {
+		t.Fatalf("requests = %#v, want review pagination plus per-review comment fetches", requests)
+	}
+}
+
+func TestForgejoListPullRequestReviewCommentsEmptyList(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls/42/reviews" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		writeJSON(t, w, http.StatusOK, []map[string]any{})
+	}))
+	defer server.Close()
+
+	client := newForgejoTestClient(t, server.URL)
+	comments, err := client.ListPullRequestReviewComments(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ListPullRequestReviewComments() error = %v", err)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %#v, want empty list", comments)
+	}
+}
+
+func TestForgejoResolvePullRequestReviewCommentContract(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/repos/acme/looper/pulls/42/comments/101/resolve" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := newForgejoTestClient(t, server.URL)
+	if err := client.ResolvePullRequestReviewComment(context.Background(), 42, 101); err != nil {
+		t.Fatalf("ResolvePullRequestReviewComment() error = %v", err)
+	}
+}
+
+func TestForgejoResolvePullRequestReviewCommentClassifiesHTTPStatusErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed} {
+		status := status
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(http.StatusText(status)))
+			}))
+			defer server.Close()
+
+			client := newForgejoTestClient(t, server.URL)
+			err := client.ResolvePullRequestReviewComment(context.Background(), 42, 101)
+			if err == nil {
+				t.Fatal("ResolvePullRequestReviewComment() error = nil, want HTTP error")
+			}
+			var httpErr *ForgejoHTTPError
+			if !errors.As(err, &httpErr) {
+				t.Fatalf("error type = %T, want *ForgejoHTTPError", err)
+			}
+			if httpErr.StatusCode != status {
+				t.Fatalf("StatusCode = %d, want %d", httpErr.StatusCode, status)
+			}
+		})
+	}
+}
+
+func TestForgejoResolvePullRequestReviewCommentSanitizesErrors(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("token super-secret rejected"))
+	}))
+	defer server.Close()
+
+	client := newForgejoTestClient(t, server.URL)
+	err := client.ResolvePullRequestReviewComment(context.Background(), 42, 101)
+	if err == nil || strings.Contains(err.Error(), "super-secret") || !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("sanitized error = %v, want redacted token", err)
+	}
+}
+
+func TestForgejoResolverFieldDecodingDistinguishesAbsentNullAndObject(t *testing.T) {
+	t.Parallel()
+
+	var absent forgejoPullRequestReviewComment
+	if err := json.Unmarshal([]byte(`{"id":1}`), &absent); err != nil {
+		t.Fatalf("unmarshal absent resolver: %v", err)
+	}
+	if absent.Resolver.Present {
+		t.Fatalf("absent resolver = %#v, want not present", absent.Resolver)
+	}
+
+	var explicitNull forgejoPullRequestReviewComment
+	if err := json.Unmarshal([]byte(`{"id":2,"resolver":null}`), &explicitNull); err != nil {
+		t.Fatalf("unmarshal null resolver: %v", err)
+	}
+	if !explicitNull.Resolver.Present || explicitNull.Resolver.Value != nil {
+		t.Fatalf("null resolver = %#v, want present nil", explicitNull.Resolver)
+	}
+
+	var object forgejoPullRequestReviewComment
+	if err := json.Unmarshal([]byte(`{"id":3,"resolver":{"id":9,"login":"ralph"}}`), &object); err != nil {
+		t.Fatalf("unmarshal object resolver: %v", err)
+	}
+	if !object.Resolver.Present || object.Resolver.Value == nil || object.Resolver.Value.Login != "ralph" {
+		t.Fatalf("object resolver = %#v, want present user", object.Resolver)
+	}
+}
+
+func newForgejoTestClient(tb testing.TB, baseURL string) *ForgejoClient {
+	tb.Helper()
+	client, err := NewForgejoClient(RepositoryRef{ProviderID: "fj", Kind: ProviderKindForgejo, BaseURL: baseURL, Repo: "acme/looper"}, "super-secret")
+	if err != nil {
+		tb.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	return client
+}
+
+func TestForgejoHTTPErrorStatusCodeMethod(t *testing.T) {
+	t.Parallel()
+	var nilErr *ForgejoHTTPError
+	if nilErr.HTTPStatusCode() != 0 {
+		t.Fatalf("nil HTTPStatusCode() = %d, want 0", nilErr.HTTPStatusCode())
+	}
+	if (&ForgejoHTTPError{StatusCode: http.StatusNotFound}).HTTPStatusCode() != http.StatusNotFound {
+		t.Fatal("HTTPStatusCode() did not return status code")
+	}
+}
+
+func TestForgejoAPIURLPreservesReviewCommentResolvePathEscaping(t *testing.T) {
+	t.Parallel()
+	client := newForgejoTestClient(t, "https://forgejo.example.test/root")
+	apiURL, err := client.apiURL(client.repoPath("pulls", "42", "comments", "101", "resolve"))
+	if err != nil {
+		t.Fatalf("apiURL() error = %v", err)
+	}
+	if got, want := apiURL.Path, "/root/api/v1/repos/acme/looper/pulls/42/comments/101/resolve"; got != want {
+		t.Fatalf("apiURL.Path = %q, want %q", got, want)
+	}
+	if _, err := url.Parse(apiURL.String()); err != nil {
+		t.Fatalf("apiURL string parse error = %v", err)
 	}
 }
 
