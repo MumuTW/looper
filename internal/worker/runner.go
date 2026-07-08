@@ -484,18 +484,22 @@ type Options struct {
 	ValidationRunner                ValidationRunner
 	AllowAutoCommit                 bool
 	AllowAutoPush                   bool
-	OpenPRStrategy                  config.OpenPRStrategy
-	Disclosure                      *config.DisclosureConfig
-	AgentRuntime                    string
-	CustomInstructions              *config.Config
-	AgentModel                      *string
-	RetryBaseDelay                  time.Duration
-	RetryMaxAttempts                int64
-	OnAgentExecutionStarted         AgentExecutionStartedFunc
-	OnRunCompleted                  RunCompletedFunc
-	DiscoveryPolicy                 DiscoveryPolicy
-	OnQueueItemEnqueued             func()
-	Network                         NetworkStatusGateway
+	// ShepherdEnabled opts a worker into shepherding its own impl PR to merge
+	// after open-pr (looper:auto flow). Off by default; the loop still needs the
+	// looper:auto label on its issue to actually enter shepherding.
+	ShepherdEnabled         bool
+	OpenPRStrategy          config.OpenPRStrategy
+	Disclosure              *config.DisclosureConfig
+	AgentRuntime            string
+	CustomInstructions      *config.Config
+	AgentModel              *string
+	RetryBaseDelay          time.Duration
+	RetryMaxAttempts        int64
+	OnAgentExecutionStarted AgentExecutionStartedFunc
+	OnRunCompleted          RunCompletedFunc
+	DiscoveryPolicy         DiscoveryPolicy
+	OnQueueItemEnqueued     func()
+	Network                 NetworkStatusGateway
 	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
 	// project whose task source is Plane, so the worker can read the product/tech
 	// spec from Plane pages (flowchart node I). nil / (…,false) → repo-file spec path.
@@ -575,6 +579,7 @@ type Runner struct {
 	validationRunner        ValidationRunner
 	allowAutoCommit         bool
 	allowAutoPush           bool
+	shepherdEnabled         bool
 	githubCLIAvailable      bool
 	githubCLICheck          func(context.Context, string, string) bool
 	openPRStrategy          config.OpenPRStrategy
@@ -844,6 +849,7 @@ func New(options Options) *Runner {
 		validationRunner:        options.ValidationRunner,
 		allowAutoCommit:         options.AllowAutoCommit,
 		allowAutoPush:           options.AllowAutoPush,
+		shepherdEnabled:         options.ShepherdEnabled,
 		githubCLIAvailable:      githubCLIAvailable,
 		githubCLICheck:          options.GitHubCLIAutoPROpeningAvailable,
 		openPRStrategy:          strategy,
@@ -1237,6 +1243,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if resumedRun.StartStep == stepShepherd {
 		return r.finishShepherdPass(ctx, project, loop, run, queueItem, checkpoint)
 	}
+	// First entry into shepherding: a normal impl run just opened the PR under
+	// looper:auto (and shepherding is opted in). Instead of completing, mark the
+	// loop shepherding so the reconciler drives the PR toward merge — a human
+	// colleague performs the final merge, the bot only fixes + watches.
+	if r.shepherdEnabled && checkpoint.SkipReason == "" && checkpoint.PullRequest != nil && r.issueHasLooperAuto(ctx, *project, checkpoint) {
+		return r.enterShepherding(ctx, project, loop, run, queueItem, checkpoint)
+	}
 	summary := r.buildSuccessSummary(*loop, checkpoint)
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
@@ -1448,6 +1461,62 @@ func buildShepherdPrompt(work workerInput, prNumber int64, sessionLost bool) str
 		"Commit with a fresh subject summarizing this round's repair; push the current branch; do not open a new PR.",
 	)
 	return strings.Join(parts, "\n\n")
+}
+
+// looperAutoLabel is the persistent opt-in label the user applies to run the full
+// looper:auto flowchart; its presence on the source issue at open-pr time is what
+// gates a worker into shepherding its own PR to merge.
+const looperAutoLabel = "looper:auto"
+
+// issueHasLooperAuto reports whether the loop's source issue still carries the
+// looper:auto label (never removed by the pipeline), read live at open-pr time.
+func (r *Runner) issueHasLooperAuto(ctx context.Context, project storage.ProjectRecord, checkpoint workerCheckpoint) bool {
+	if r.github == nil || checkpoint.Work == nil || checkpoint.Work.IssueNumber <= 0 {
+		return false
+	}
+	issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: issueLookupRepo(*checkpoint.Work), IssueNumber: checkpoint.Work.IssueNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false
+	}
+	return hasLabel(issue.Labels, looperAutoLabel)
+}
+
+// enterShepherding transitions a just-opened impl PR loop into the shepherding
+// steady state: it sets the durable $.shepherd.active marker (source of control
+// truth), moves the loop to status shepherding (not completed), and acquires the
+// pr coordination lock so a same-account fixer skips the PR. The reconciler then
+// drives the PR toward merge; a human performs the final merge.
+func (r *Runner) enterShepherding(ctx context.Context, project *storage.ProjectRecord, loop *storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint) (ProcessResult, error) {
+	summary := r.buildSuccessSummary(*loop, checkpoint)
+	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
+		return ProcessResult{}, err
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	marker, _ := loops.ReadShepherd(loop.MetadataJSON)
+	marker.Active = true
+	if strings.TrimSpace(marker.Phase) == "" {
+		marker.Phase = "reviewing"
+	}
+	newMeta, err := loops.WriteShepherd(loop.MetadataJSON, marker)
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		updated.Status = "shepherding"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+		updated.MetadataJSON = &newMeta
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	loop.MetadataJSON = &newMeta
+	r.holdShepherdLock(ctx, loop.ID, checkpoint)
+	if r.logger != nil {
+		r.logger.Info("worker entered shepherding — driving PR to merge (human merges)", map[string]any{"loopId": loop.ID, "repo": checkpoint.Work.Repo, "prNumber": pullRequestNumber(checkpoint.PullRequest)})
+	}
+	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "success", Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
 }
 
 // shepherdPRLockKey is the coordination lock a shepherding loop holds so a

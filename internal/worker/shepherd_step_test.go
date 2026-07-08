@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -100,4 +101,42 @@ func TestBuildShepherdPromptForbidsMergeAndSelfApprove(t *testing.T) {
 	if !strings.Contains(buildShepherdPrompt(workerInput{Repo: "a/b"}, 1, true), "could not be recovered") {
 		t.Fatal("session-lost prompt missing rebuild-from-diff instruction")
 	}
+}
+
+// Stage E (gating, integration): with ShepherdEnabled and the issue carrying
+// looper:auto, a completed create-pr flow enters the shepherding steady state
+// (marker active, status shepherding) instead of completing — so the reconciler
+// drives the PR to merge. Default-off / no-label paths are covered by the
+// unchanged create-pr flow tests staying "completed".
+func TestProcessClaimedItemEntersShepherdingUnderLooperAuto(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, issueDetail: IssueDetail{Number: 27, Title: "t", State: "open", Labels: []string{"looper:auto"}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, ShepherdEnabled: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
+	}
+	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	if loop.Status != "shepherding" {
+		t.Fatalf("loop status = %q, want shepherding (looper:auto + ShepherdEnabled must not complete)", loop.Status)
+	}
+	if !loops.ShepherdActive(loop.MetadataJSON) {
+		t.Fatalf("$.shepherd.active not set: %v", derefStr(loop.MetadataJSON))
+	}
+}
+
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
