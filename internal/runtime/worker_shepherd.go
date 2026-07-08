@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -61,54 +62,93 @@ func (r *Runtime) reconcileWorkerShepherd(ctx context.Context) {
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	for _, loop := range shepherding {
-		if !strings.EqualFold(strings.TrimSpace(loop.Type), "worker") {
-			continue
-		}
-		marker, ok := loops.ReadShepherd(loop.MetadataJSON)
-		if !ok || !marker.Active {
-			continue
-		}
-		repo := strings.TrimSpace(derefString(loop.Repo))
-		if repo == "" || loop.PRNumber == nil || *loop.PRNumber <= 0 {
-			continue
-		}
-		prNumber := *loop.PRNumber
-		cwd := ""
-		if proj, perr := repositories.Projects.GetByID(ctx, loop.ProjectID); perr == nil && proj != nil {
-			cwd = proj.RepoPath
-		}
-		r.refreshShepherdLock(ctx, repositories, loop.ID, repo, prNumber, now)
+		r.reconcileOneShepherdLoop(ctx, repositories, gateway, now, loop, nowISO, logger)
+	}
+}
 
-		// ViewPullRequestForReviewer (not ViewPullRequest) so the detail carries
-		// reviews + statusCheckRollup — the plain view uses metadata-only fields
-		// and would leave Checks/Reviews empty, blinding CI and review-round detection.
-		pr, err := gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-		if err != nil {
+// ReconcilePullRequest reconciles the worker loop shepherding a specific PR right
+// away — the event-driven path (a webhook PR event fires this instead of waiting
+// for the 60s poll). A no-op when no loop is shepherding that PR.
+func (r *Runtime) ReconcilePullRequest(ctx context.Context, projectID, repo string, prNumber int64) error {
+	r.mu.RLock()
+	repositories := r.services.Repositories
+	now := r.now
+	logger := r.logger
+	gateway := r.githubGateway
+	r.mu.RUnlock()
+	if repositories == nil || repositories.Loops == nil || repositories.Queue == nil || gateway == nil || prNumber <= 0 {
+		return nil
+	}
+	if now == nil {
+		now = time.Now
+	}
+	shepherding, err := repositories.Loops.ListByStatuses(ctx, []string{"shepherding"})
+	if err != nil {
+		return nil
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	for _, loop := range shepherding {
+		if loop.PRNumber == nil || *loop.PRNumber != prNumber {
 			continue
 		}
-		if outcome := shepherdTerminalOutcome(pr); outcome != "" {
-			r.terminateShepherd(ctx, repositories, loop, repo, prNumber, outcome, nowISO, logger)
+		if !strings.EqualFold(strings.TrimSpace(derefString(loop.Repo)), strings.TrimSpace(repo)) {
 			continue
 		}
-		signal := foldShepherdSignal(pr)
-		if signal == marker.LastSignal {
-			continue
-		}
-		marker.LastSignal = signal
-		marker.Phase = shepherdPhaseFor(pr)
-		marker.HeadSHA = pr.HeadSHA
-		if newMeta, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
-			r.persistLoopMetadata(ctx, repositories, loop.ID, newMeta, nowISO)
-		}
-		if shepherdActionable(pr) {
-			if marker.PassCount >= shepherdMaxPasses {
-				if logger != nil {
-					logger.Info("shepherd: pass cap reached — leaving PR for a human", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "passCount": marker.PassCount})
-				}
-				continue
+		r.reconcileOneShepherdLoop(ctx, repositories, gateway, now, loop, nowISO, logger)
+	}
+	return nil
+}
+
+// reconcileOneShepherdLoop is the per-loop shepherd reconcile shared by the 60s
+// poll and the event-driven ReconcilePullRequest.
+func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *storage.Repositories, gateway *githubinfra.Gateway, now func() time.Time, loop storage.LoopRecord, nowISO string, logger bootstrap.Logger) {
+	if !strings.EqualFold(strings.TrimSpace(loop.Type), "worker") {
+		return
+	}
+	marker, ok := loops.ReadShepherd(loop.MetadataJSON)
+	if !ok || !marker.Active {
+		return
+	}
+	repo := strings.TrimSpace(derefString(loop.Repo))
+	if repo == "" || loop.PRNumber == nil || *loop.PRNumber <= 0 {
+		return
+	}
+	prNumber := *loop.PRNumber
+	cwd := ""
+	if proj, perr := repositories.Projects.GetByID(ctx, loop.ProjectID); perr == nil && proj != nil {
+		cwd = proj.RepoPath
+	}
+	r.refreshShepherdLock(ctx, repositories, loop.ID, repo, prNumber, now)
+
+	// ViewPullRequestForReviewer (not ViewPullRequest) so the detail carries
+	// reviews + statusCheckRollup — the plain view uses metadata-only fields
+	// and would leave Checks/Reviews empty, blinding CI and review-round detection.
+	pr, err := gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return
+	}
+	if outcome := shepherdTerminalOutcome(pr); outcome != "" {
+		r.terminateShepherd(ctx, repositories, loop, repo, prNumber, outcome, nowISO, logger)
+		return
+	}
+	signal := foldShepherdSignal(pr)
+	if signal == marker.LastSignal {
+		return
+	}
+	marker.LastSignal = signal
+	marker.Phase = shepherdPhaseFor(pr)
+	marker.HeadSHA = pr.HeadSHA
+	if newMeta, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
+		r.persistLoopMetadata(ctx, repositories, loop.ID, newMeta, nowISO)
+	}
+	if shepherdActionable(pr) {
+		if marker.PassCount >= shepherdMaxPasses {
+			if logger != nil {
+				logger.Info("shepherd: pass cap reached — leaving PR for a human", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "passCount": marker.PassCount})
 			}
-			r.enqueueShepherdPass(ctx, repositories, loop, repo, prNumber, nowISO, logger)
+			return
 		}
+		r.enqueueShepherdPass(ctx, repositories, loop, repo, prNumber, nowISO, logger)
 	}
 }
 
