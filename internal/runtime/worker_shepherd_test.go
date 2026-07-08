@@ -41,10 +41,17 @@ func TestShepherdCIPhase(t *testing.T) {
 
 func TestShepherdActionableAndPhase(t *testing.T) {
 	green := []map[string]any{check("COMPLETED", "SUCCESS")}
-	// changes requested → fix
-	cr := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "CHANGES_REQUESTED", Checks: green}
+	// changes requested AT THE CURRENT HEAD → fix
+	cr := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "CHANGES_REQUESTED", HeadSHA: "h1", Checks: green,
+		Reviews: []map[string]any{{"state": "CHANGES_REQUESTED", "commit": map[string]any{"oid": "h1"}}}}
 	if !shepherdActionable(cr) || shepherdPhaseFor(cr) != "fixing" {
-		t.Fatalf("CHANGES_REQUESTED should be actionable/fixing")
+		t.Fatalf("CHANGES_REQUESTED on current head should be actionable/fixing")
+	}
+	// changes requested on an OLD head (we already pushed a fix, awaiting re-review) → NOT actionable
+	stale := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "CHANGES_REQUESTED", HeadSHA: "h2", Checks: green,
+		Reviews: []map[string]any{{"state": "CHANGES_REQUESTED", "commit": map[string]any{"oid": "h1"}}, {"state": "COMMENTED", "commit": map[string]any{"oid": "h2"}}}}
+	if shepherdActionable(stale) {
+		t.Fatalf("CHANGES_REQUESTED on an OLD head must NOT be actionable — we already responded, awaiting re-review (stops the spin)")
 	}
 	// conflict → fix
 	conflict := githubinfra.PullRequestDetail{State: "OPEN", ReviewDecision: "APPROVED", HasConflicts: true, Checks: green}
@@ -95,13 +102,13 @@ func TestSignalCatchesNewReviewRound(t *testing.T) {
 	}
 	round2 := base
 	round2.Reviews = []map[string]any{
-		{"state": "CHANGES_REQUESTED", "submittedAt": "2026-07-08T00:00:00Z"},
-		{"state": "CHANGES_REQUESTED", "submittedAt": "2026-07-08T09:00:00Z"}, // nettee re-reviewed at the same head
+		{"state": "CHANGES_REQUESTED", "submittedAt": "2026-07-08T00:00:00Z", "commit": map[string]any{"oid": "sha1"}},
+		{"state": "CHANGES_REQUESTED", "submittedAt": "2026-07-08T09:00:00Z", "commit": map[string]any{"oid": "sha1"}}, // nettee re-reviewed at the SAME head
 	}
 	if foldShepherdSignal(base) == foldShepherdSignal(round2) {
 		t.Fatal("a new review round at the same head/decision must change the signal (else re-review is missed)")
 	}
 	if !shepherdActionable(round2) {
-		t.Fatal("CHANGES_REQUESTED must stay actionable")
+		t.Fatal("CHANGES_REQUESTED at the current head must be actionable")
 	}
 }

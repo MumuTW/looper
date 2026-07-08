@@ -24,6 +24,11 @@ const shepherdReconcileLockTTL = 20 * time.Minute
 // wake-reconcile.
 const shepherdReconcileInterval = 60 * time.Second
 
+// shepherdMaxPasses caps how many agent passes one PR may consume before the
+// shepherd stops waking and leaves it for a human — a backstop against a flapping
+// PR burning agent quota. Counts only agent-waking passes.
+const shepherdMaxPasses = 25
+
 // reconcileWorkerShepherd drives a worker loop that is shepherding its own impl
 // PR toward merge. Polling (looper has no per-PR-event webhook seam): for each
 // loop in status "shepherding" it refreshes the coordination lock, reads live PR
@@ -96,6 +101,12 @@ func (r *Runtime) reconcileWorkerShepherd(ctx context.Context) {
 			r.persistLoopMetadata(ctx, repositories, loop.ID, newMeta, nowISO)
 		}
 		if shepherdActionable(pr) {
+			if marker.PassCount >= shepherdMaxPasses {
+				if logger != nil {
+					logger.Info("shepherd: pass cap reached — leaving PR for a human", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "passCount": marker.PassCount})
+				}
+				continue
+			}
 			r.enqueueShepherdPass(ctx, repositories, loop, repo, prNumber, nowISO, logger)
 		}
 	}
@@ -174,9 +185,35 @@ func foldShepherdSignal(pr githubinfra.PullRequestDetail) string {
 	return fmt.Sprintf("%s|%s|%s|%v|%s|%s", strings.ToUpper(pr.State), strings.ToUpper(pr.ReviewDecision), shepherdCIPhase(pr), pr.HasConflicts, pr.HeadSHA, latestReviewMarker(pr))
 }
 
+// changesRequestedOnCurrentHead reports whether a reviewer has a CHANGES_REQUESTED
+// review whose commit IS the current head. This — not the aggregate
+// reviewDecision — is the actionable review signal: a CHANGES_REQUESTED sticks in
+// reviewDecision until the reviewer approves, so after we push a fix the reviewer
+// hasn't re-reviewed yet, reviewDecision stays CHANGES_REQUESTED but there is
+// nothing new to do (we already responded and are WAITING for the re-review).
+// Keying on "changes requested AT the current head" stops the wasteful spin of
+// re-fixing a stale review round.
+func changesRequestedOnCurrentHead(pr githubinfra.PullRequestDetail) bool {
+	head := strings.TrimSpace(pr.HeadSHA)
+	if head == "" {
+		return false
+	}
+	for _, review := range pr.Reviews {
+		if !strings.EqualFold(strings.TrimSpace(stringFromAny(review["state"])), "CHANGES_REQUESTED") {
+			continue
+		}
+		commit, _ := review["commit"].(map[string]any)
+		if commit != nil && strings.TrimSpace(stringFromAny(commit["oid"])) == head {
+			return true
+		}
+	}
+	return false
+}
+
 // shepherdActionable reports whether the agent has something to do THIS wake:
-// changes requested, failing CI, or a conflict. Approved+green+clean is NOT
-// actionable — the bot waits for a human to merge.
+// changes requested AT THE CURRENT HEAD, failing CI, or a conflict. Approved (or
+// a fix already pushed and awaiting the reviewer's re-review) is NOT actionable —
+// the bot waits; it never merges.
 func shepherdActionable(pr githubinfra.PullRequestDetail) bool {
 	if pr.HasConflicts {
 		return true
@@ -184,7 +221,7 @@ func shepherdActionable(pr githubinfra.PullRequestDetail) bool {
 	if shepherdCIPhase(pr) == "failed" {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(pr.ReviewDecision), "CHANGES_REQUESTED")
+	return changesRequestedOnCurrentHead(pr)
 }
 
 // shepherdPhaseFor maps PR state to the card phase.
