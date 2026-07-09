@@ -16,6 +16,10 @@ func TestCleanAgentSummaryRejectsBareNumber(t *testing.T) {
 		{"padded number", "  42  ", placeholder},
 		{"decimal + percent", "3.14%", placeholder},
 		{"empty", "", placeholder},
+		{"ansi reset with esc", "\x1b[0m", placeholder},
+		{"csi residue esc stripped", "[0m", placeholder},
+		{"multiple csi fragments", "[2K[1G[0m", placeholder},
+		{"prose after stripping ansi kept", "\x1b[0mTightened the acceptance criteria.\x1b[0m", "Tightened the acceptance criteria."},
 		{"real transcript kept", "Challenged the CI claim, tightened the acceptance criteria, one open question remains.", "Challenged the CI claim, tightened the acceptance criteria, one open question remains."},
 		{"number inside prose kept", "Reduced the diff to 42 lines and verified runs.ts:199.", "Reduced the diff to 42 lines and verified runs.ts:199."},
 	}

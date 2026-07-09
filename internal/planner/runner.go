@@ -1538,18 +1538,30 @@ var codexLogNoise = regexp.MustCompile(`(?i)\d{4}-\d{2}-\d{2}T[\d:.]+Z?\s+(?:ERR
 // never a real grill/review conclusion, so we replace it with a placeholder.
 var bareNumberSummary = regexp.MustCompile(`^[\d.,%\s]+$`)
 
+// ansiEscape matches a full ANSI/CSI escape sequence (ESC + [ ... + final byte),
+// e.g. "\x1b[0m" (reset), "\x1b[2K" (erase line). These leak into a summary when the
+// fallback grabs a terminal-styled log line.
+var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
+
+// csiResidueOnly matches a summary that is NOTHING but CSI residue whose ESC byte was
+// already stripped upstream (so it renders as visible junk like "[0m" / "[2K[1G").
+// Whole-string only, so legitimate prose containing a bracket is never touched.
+var csiResidueOnly = regexp.MustCompile(`^(?:\[[0-9;?]*[a-zA-Z])+$`)
+
 // cleanAgentSummary strips codex log noise (timestamped ERROR/INFO router lines, the
-// stdin prompt) from an agent summary so a grill/review transcript reads as prose, not
-// machine logs. Falls back to the raw text if filtering would empty it.
+// stdin prompt) and terminal control codes from an agent summary so a grill/review
+// transcript reads as prose, not machine logs. Falls back to a placeholder if
+// filtering would leave nothing meaningful.
 func cleanAgentSummary(s string) string {
-	cleaned := codexLogNoise.ReplaceAllString(s, " ")
+	cleaned := ansiEscape.ReplaceAllString(s, " ")
+	cleaned = codexLogNoise.ReplaceAllString(cleaned, " ")
 	cleaned = strings.ReplaceAll(cleaned, "Reading additional input from stdin...", " ")
 	cleaned = strings.TrimSpace(strings.Join(strings.Fields(cleaned), " "))
-	if cleaned == "" || bareNumberSummary.MatchString(cleaned) {
-		// Empty (all log noise) OR a bare number — the latter is a stray count (a
-		// token/byte total) that leaked in as the agent's last log line when it emitted
-		// no __LOOPER_RESULT__ summary. Neither is a conclusion; post a placeholder,
-		// never the raw logs or a naked number.
+	if cleaned == "" || bareNumberSummary.MatchString(cleaned) || csiResidueOnly.MatchString(cleaned) {
+		// Empty (all log noise), a bare number (a stray token/byte count), or nothing
+		// but terminal control residue (e.g. "[0m") — all happen when the agent emits
+		// no __LOOPER_RESULT__ summary and the fallback grabs its last log line. None is
+		// a conclusion; post a placeholder, never the raw logs / a naked number / a code.
 		return "(本轮 agent 未产出可展示的结论)"
 	}
 	return cleaned
