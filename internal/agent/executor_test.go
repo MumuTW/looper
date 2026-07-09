@@ -82,8 +82,8 @@ func TestResolveSpawnOpenCodeDoesNotDuplicateRunSubcommand(t *testing.T) {
 	if command != "opencode" {
 		t.Fatalf("opencode command = %q, want opencode", command)
 	}
-	if strings.Join(args, " ") != "--model gpt-5 --profile test run --dir /tmp/looper-worktree hello" {
-		t.Fatalf("opencode args = %#v, want single run subcommand preserved with --dir", args)
+	if strings.Join(args, " ") != "--model gpt-5 --profile test run --dir /tmp/looper-worktree --format json hello" {
+		t.Fatalf("opencode args = %#v, want single run subcommand preserved with --dir + --format json", args)
 	}
 }
 
@@ -97,7 +97,7 @@ func TestResolveSpawnWithNativeResumeVendorArgs(t *testing.T) {
 	}{
 		{name: "claude", vendor: config.AgentVendorClaudeCode, want: "--resume session-123 --print hello --dangerously-skip-permissions"},
 		{name: "codex", vendor: config.AgentVendorCodex, want: "exec resume session-123 hello"},
-		{name: "opencode", vendor: config.AgentVendorOpenCode, want: "run --dir /tmp/looper-worktree --session session-123 hello"},
+		{name: "opencode", vendor: config.AgentVendorOpenCode, want: "run --dir /tmp/looper-worktree --format json --session session-123 hello"},
 		{name: "cursor", vendor: config.AgentVendorCursorCLI, want: "--resume session-123 --print hello"},
 	}
 	for _, tc := range cases {
@@ -135,7 +135,7 @@ func TestResolveSpawnWithNativeResumeDoesNotDuplicateEqualsFlags(t *testing.T) {
 		Model:  &model,
 		Params: map[string]any{"args": []any{"run", "--model=gpt-4", "--session=existing", "--prompt=from-args"}},
 	}, "/tmp/looper-worktree", "hello", "session-123", true)
-	if got, want := strings.Join(args, " "), "run --dir /tmp/looper-worktree --model=gpt-4 --session=existing --prompt=from-args"; got != want {
+	if got, want := strings.Join(args, " "), "run --dir /tmp/looper-worktree --model=gpt-4 --session=existing --prompt=from-args --format json"; got != want {
 		t.Fatalf("args = %q, want %q", got, want)
 	}
 }

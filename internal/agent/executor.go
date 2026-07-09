@@ -548,6 +548,17 @@ func (x *execution) run(ctx context.Context) {
 		if tr.threadID != "" {
 			x.nativeSessionID = tr.threadID
 		}
+	} else if x.openCodeJSONMode() {
+		// opencode --format json: stdout is JSONL. The completion marker + assistant
+		// text live inside `text` events (part.text, not a bare stdout line), and the
+		// session id is stamped on every event — read both from the parsed stream
+		// instead of raw stdout.
+		tr := newOpenCodeJSONLTranslator()
+		tr.ingestAll(stdout)
+		completion = parseCompletion(tr.combinedText(), stderr)
+		if tr.sessionID != "" {
+			x.nativeSessionID = tr.sessionID
+		}
 	}
 	if status != "completed" {
 		completion = completionParse{ParseStatus: "missing"}
@@ -857,7 +868,16 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	// late). Text-mode ids can stream in across chunks, so re-extract each time; the
 	// codex --json thread id arrives whole in a thread.started line, so capture it
 	// once (only when text extraction found nothing and it's not already known).
-	if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
+	if x.openCodeJSONMode() {
+		// opencode --format json stamps the session id on every event; capture the
+		// first via a precise ses_ regex (authoritative for this vendor rather than
+		// the generic substring scan below).
+		if strings.TrimSpace(x.nativeSessionID) == "" {
+			if sessionID := extractOpenCodeSessionID(stdout); sessionID != "" {
+				x.nativeSessionID = sessionID
+			}
+		}
+	} else if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
 		x.nativeSessionID = nativeSessionID
 	} else if x.jsonMode() && strings.TrimSpace(x.nativeSessionID) == "" {
 		if threadID := extractCodexThreadID(stdout); threadID != "" {
@@ -892,10 +912,15 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 		elapsed = 0
 	}
 	var tail []string
-	if x.jsonMode() {
+	switch {
+	case x.jsonMode():
 		// Structured codex tool-call feed ("✅ <cmd>") parsed from the JSONL stream.
 		tail = codexToolTail(stdout, liveProgressTailLines)
-	} else {
+	case x.openCodeJSONMode():
+		// Structured opencode feed (tool calls + text snippets) parsed from JSONL, so
+		// the card shows human activity rather than raw JSON events.
+		tail = openCodeActivityTail(stdout, liveProgressTailLines)
+	default:
 		// Combine streams; the last N lines skew toward whichever is actively writing.
 		tail = lastNonEmptyLines(stdout+"\n"+stderr, liveProgressTailLines)
 	}
@@ -911,6 +936,16 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 // jsonMode reports whether this run is a codex `--json` run (structured events).
 func (x *execution) jsonMode() bool {
 	return x.executor != nil && x.executor.config.LiveToolEvents && x.executor.config.Vendor == config.AgentVendorCodex
+}
+
+// openCodeJSONMode reports whether this run is an opencode `run --format json` run.
+// Unlike codex's jsonMode (env-gated via LiveToolEvents), opencode ALWAYS runs with
+// --format json — it's the only output mode that exposes the session id, which
+// native resume needs — so structured-JSON handling is on for every opencode run,
+// independent of LiveToolEvents. Safe because resolveOpenCodeArgs and
+// resolveNativeResumeArgs unconditionally add --format json for this vendor.
+func (x *execution) openCodeJSONMode() bool {
+	return x.executor != nil && x.executor.config.Vendor == config.AgentVendorOpenCode
 }
 
 // codexToolTail renders the last n command executions from a codex JSONL blob.
@@ -1033,7 +1068,12 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	pid := int64(pidOrZero(x.process.Process))
 	parseStatus := result.ParseStatus
 	completionSignal := emptyToNil(result.CompletionSignal)
-	if extractedNativeSessionID := extractNativeSessionID(embeddedStdout, embeddedStderr); extractedNativeSessionID != "" {
+	if x.openCodeJSONMode() {
+		// opencode json mode: prefer the precise ses_ regex over the generic scan.
+		if id := extractOpenCodeSessionID(embeddedStdout); id != "" {
+			nativeSessionID = id
+		}
+	} else if extractedNativeSessionID := extractNativeSessionID(embeddedStdout, embeddedStderr); extractedNativeSessionID != "" {
 		nativeSessionID = extractedNativeSessionID
 	}
 	if nativeResumeMode == "native_resume" && status == "failed" {
@@ -1352,6 +1392,7 @@ func resolveOpenCodeArgs(cfg ExecutorConfig, args []string, workingDirectory str
 	if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--dir"}) {
 		resolved = appendDirFlag(resolved, workingDirectory)
 	}
+	resolved = appendOpenCodeFormatJSON(resolved)
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
 	if hasAnyFlag(withModel, []string{"-p", "--prompt", "-f", "--file"}) {
 		return withModel
@@ -1399,6 +1440,7 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args [
 		if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--dir"}) {
 			resolved = appendDirFlag(resolved, workingDirectory)
 		}
+		resolved = appendOpenCodeFormatJSON(resolved)
 		if !hasAnyFlag(resolved, []string{"--session", "--continue"}) {
 			resolved = append(resolved, "--session", sessionID)
 		}
@@ -1463,6 +1505,18 @@ func envMapToSlice(env map[string]string) []string {
 		resolved = append(resolved, key+"="+env[key])
 	}
 	return resolved
+}
+
+// appendOpenCodeFormatJSON forces `--format json` onto an opencode invocation
+// (idempotent). It's the ONLY output mode that emits the session id — stamped on
+// every JSONL event — which native resume needs to reuse the same session across
+// passes; the default text output hides it. Honours a caller-supplied --format so
+// an explicit override in agent.params.args isn't duplicated.
+func appendOpenCodeFormatJSON(args []string) []string {
+	if hasAnyFlag(args, []string{"--format"}) {
+		return args
+	}
+	return append(args, "--format", "json")
 }
 
 func appendDirFlag(args []string, workingDirectory string) []string {
