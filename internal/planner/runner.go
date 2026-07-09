@@ -1532,6 +1532,12 @@ func htmlEscape(s string) string { return htmlpkg.EscapeString(s) }
 // leak into an agent's summary.
 var codexLogNoise = regexp.MustCompile(`(?i)\d{4}-\d{2}-\d{2}T[\d:.]+Z?\s+(?:ERROR|INFO|WARN|DEBUG|TRACE)\s+[^\n]*`)
 
+// bareNumberSummary matches a summary that is ONLY digits + separators (e.g. a stray
+// token/byte count like "105,940"). That happens when an agent emits no
+// __LOOPER_RESULT__ summary and the fallback grabs its last log line — a naked number,
+// never a real grill/review conclusion, so we replace it with a placeholder.
+var bareNumberSummary = regexp.MustCompile(`^[\d.,%\s]+$`)
+
 // cleanAgentSummary strips codex log noise (timestamped ERROR/INFO router lines, the
 // stdin prompt) from an agent summary so a grill/review transcript reads as prose, not
 // machine logs. Falls back to the raw text if filtering would empty it.
@@ -1539,9 +1545,11 @@ func cleanAgentSummary(s string) string {
 	cleaned := codexLogNoise.ReplaceAllString(s, " ")
 	cleaned = strings.ReplaceAll(cleaned, "Reading additional input from stdin...", " ")
 	cleaned = strings.TrimSpace(strings.Join(strings.Fields(cleaned), " "))
-	if cleaned == "" {
-		// The whole summary was log noise (e.g. a codex sandbox error) — post a
-		// placeholder, never the raw logs.
+	if cleaned == "" || bareNumberSummary.MatchString(cleaned) {
+		// Empty (all log noise) OR a bare number — the latter is a stray count (a
+		// token/byte total) that leaked in as the agent's last log line when it emitted
+		// no __LOOPER_RESULT__ summary. Neither is a conclusion; post a placeholder,
+		// never the raw logs or a naked number.
 		return "(本轮 agent 未产出可展示的结论)"
 	}
 	return cleaned
