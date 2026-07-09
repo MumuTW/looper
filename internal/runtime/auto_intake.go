@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"os"
@@ -13,8 +14,10 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/coordinator/triage"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/infra/planedoc"
+	"github.com/nexu-io/looper/internal/loops"
 )
 
 // Plane auto-intake labels. A colleague applies ONLY looper:auto; this reconciler
@@ -212,7 +215,14 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 		return
 	}
 
-	// Fresh looper:auto item — classify once (flowchart node A/B).
+	// Fresh looper:auto item — classify once (flowchart node A/B). Open the shared
+	// task thread NOW (before classifying) via a card-anchor coordinator loop, so the
+	// whole run (classify → spec → worker → shepherd) lives on ONE Feishu thread and
+	// the classification isn't a black box: 🧭 分类中 → its verdict + reasoning →
+	// 实现中 (the worker joins the same task-keyed anchor).
+	coordLoopID := r.createIntakeAnchor(ctx, project, item, logger)
+	defer r.completeIntakeAnchor(ctx, coordLoopID)
+
 	comments := intakeComments(ctx, client, item.Number)
 	decision := triage.Decide(ctx, llm, triage.Input{
 		Issue: triage.Issue{
@@ -231,10 +241,9 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	present, _, _ := gateway.HasProductSpec(ctx, planeProjectID, workItemID)
 	route := decideAutoIntakeRoute(decision, present)
 
-	// Surface the classification + reasoning to the group BEFORE routing to a stage,
-	// so the decision (e.g. "simple bug → implement directly, no tech spec") isn't a
-	// silent black box and a human has a window to object — the flowchart's HITL leaf.
-	r.announceIntakeClassification(ctx, item, decision, route)
+	// Post the verdict + reasoning into the shared task thread BEFORE routing, so
+	// "why simple bug / why no spec" is transparent and interruptible (HITL).
+	r.postIntakeReasoning(ctx, coordLoopID, decision, route)
 
 	// Stamp the LLM's audit labels (kind/*, complexity/*, dispatch/*) so the
 	// classification is visible on the item, mirroring the GitHub coordinator.
@@ -297,10 +306,46 @@ func (r *Runtime) logIntake(logger bootstrap.Logger, projectID string, number in
 	}
 }
 
-// announceIntakeClassification posts the classifier's verdict + reasoning to the
-// Feishu group before the item is routed to a stage, so "why simple bug / why no
-// spec" is transparent and interruptible (HITL) rather than a black box. Best-effort.
-func (r *Runtime) announceIntakeClassification(ctx context.Context, item forge.Issue, decision triage.Decision, route intakeRoute) {
+// createIntakeAnchor opens the shared task thread at the classification stage by
+// creating a card-anchor coordinator loop (no queue item → the scheduler never runs
+// it) and rendering its 🧭 分类中 header. Every downstream loop (planner, worker,
+// shepherd) for this work item collapses onto the SAME anchor by task_key
+// (issue:repo:<seq>), so classify → spec → worker → merge is ONE Feishu thread.
+// Returns the coordinator loop id, or "" when notifications are off / creation fails.
+func (r *Runtime) createIntakeAnchor(ctx context.Context, project config.ProjectRefConfig, item forge.Issue, logger bootstrap.Logger) string {
+	gw, ok := r.shepherdNotifyGateway()
+	if !ok || r.services.Loops == nil {
+		return ""
+	}
+	meta, err := json.Marshal(map[string]any{"issueNumber": item.Number, "issueUrl": item.HTMLURL, "title": strings.TrimSpace(item.Title)})
+	if err != nil {
+		return ""
+	}
+	metaStr := string(meta)
+	loop, err := r.services.Loops.Create(ctx, loops.CreateInput{
+		ProjectID:    project.ID,
+		Type:         domain.LoopTypeCoordinator,
+		Target:       domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, ProjectID: project.ID, Repo: project.Repo, IssueNumber: item.Number},
+		Status:       domain.LoopStatusRunning,
+		MetadataJSON: &metaStr,
+	})
+	if err != nil {
+		if logger != nil {
+			logger.Warn("auto-intake: create anchor loop failed", map[string]any{"projectId": project.ID, "item": item.Number, "error": err.Error()})
+		}
+		return ""
+	}
+	gw.RefreshThreadHeader(ctx, loop.ID, nil, 0) // posts the 🧭 分类中 anchor card (looper:auto)
+	_ = gw.PostThreadNote(ctx, loop.ID, "🤖 已接手,正在分类…", nil)
+	return loop.ID
+}
+
+// postIntakeReasoning posts the classifier's verdict + reasoning into the shared task
+// thread. Best-effort; a no-op when the anchor wasn't created or the route is a skip.
+func (r *Runtime) postIntakeReasoning(ctx context.Context, coordLoopID string, decision triage.Decision, route intakeRoute) {
+	if coordLoopID == "" {
+		return
+	}
 	routeText := map[intakeRoute]string{
 		intakeRouteToPlan:        "写技术方案(planner)→ 评审 → 实现",
 		intakeRouteToImplement:   "直接实现(worker),不写 spec",
@@ -309,31 +354,35 @@ func (r *Runtime) announceIntakeClassification(ctx context.Context, item forge.I
 		intakeMarkOutOfScope:     "超出范围,已标记",
 	}[route]
 	if routeText == "" {
-		return // skip / no valid decision — nothing meaningful to announce
+		return
 	}
 	gw, ok := r.shepherdNotifyGateway()
 	if !ok {
 		return
 	}
-	kind := ""
+	kind := "(未分类)"
 	for _, l := range decision.ApplyLabels {
 		if strings.HasPrefix(strings.TrimSpace(l), "kind/") {
 			kind = strings.TrimSpace(l)
 			break
 		}
 	}
-	text := fmt.Sprintf("🧭 looper 已接手 #%d《%s》\n分类:%s → %s", item.Number, strings.TrimSpace(item.Title), firstNonEmptyStr(kind, "(未分类)"), routeText)
+	text := fmt.Sprintf("🧭 分类:%s → %s", kind, routeText)
 	if reason := strings.TrimSpace(decision.CommentBody); reason != "" {
 		text += "\n理由:" + reason
 	}
-	_ = gw.AnnounceToGroup(ctx, text)
+	_ = gw.PostThreadNote(ctx, coordLoopID, text, nil)
 }
 
-func firstNonEmptyStr(a, b string) string {
-	if strings.TrimSpace(a) != "" {
-		return a
+// completeIntakeAnchor retires the card-anchor coordinator loop once routing is done
+// (the downstream planner/worker loop takes over the same anchor). It does NOT refresh
+// the card, so the header stays on its last phase until the downstream loop re-renders
+// it. Best-effort.
+func (r *Runtime) completeIntakeAnchor(ctx context.Context, coordLoopID string) {
+	if coordLoopID == "" || r.services.Loops == nil {
+		return
 	}
-	return b
+	_, _ = r.services.Loops.TransitionStatus(ctx, coordLoopID, loops.TransitionInput{Status: domain.LoopStatusCompleted})
 }
 
 func intakeComments(ctx context.Context, client *forge.PlaneClient, number int64) []triage.Comment {

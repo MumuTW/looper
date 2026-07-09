@@ -9,6 +9,12 @@ const (
 	LoopTypeReviewer LoopType = "reviewer"
 	LoopTypeWorker   LoopType = "worker"
 	LoopTypeFixer    LoopType = "fixer"
+	// LoopTypeCoordinator is a card-anchor-only loop the auto-intake creates at the
+	// classification stage so the whole looper:auto run (classify → spec → worker →
+	// shepherd) collapses onto ONE task-keyed Feishu thread. It carries no queue item,
+	// so the scheduler never runs it — it exists purely to own the anchor + hold the
+	// classification reasoning before any planner/worker loop exists.
+	LoopTypeCoordinator LoopType = "coordinator"
 )
 
 var LoopTypes = []LoopType{
@@ -16,6 +22,7 @@ var LoopTypes = []LoopType{
 	LoopTypeReviewer,
 	LoopTypeWorker,
 	LoopTypeFixer,
+	LoopTypeCoordinator,
 }
 
 type LoopTargetType string
@@ -150,7 +157,7 @@ func AssertKnownLoopType(loopType LoopType) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("loop.type must be one of: %s, %s, %s, %s", LoopTypePlanner, LoopTypeReviewer, LoopTypeWorker, LoopTypeFixer)
+	return fmt.Errorf("loop.type must be one of: %s, %s, %s, %s, %s", LoopTypePlanner, LoopTypeReviewer, LoopTypeWorker, LoopTypeFixer, LoopTypeCoordinator)
 }
 
 func AssertKnownLoopStatus(status LoopStatus) error {
@@ -211,6 +218,10 @@ func AssertLoopTypeMatchesTarget(loopType LoopType, target LoopTarget) error {
 	case LoopTypeReviewer, LoopTypeFixer:
 		if target.TargetType != LoopTargetTypePullRequest {
 			return fmt.Errorf("%s loops must target a pull request", loopType)
+		}
+	case LoopTypeCoordinator:
+		if target.TargetType != LoopTargetTypeIssue {
+			return fmt.Errorf("coordinator loops must target an issue")
 		}
 	}
 	return nil
