@@ -1407,8 +1407,12 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 	// animates the header through the PR-driving lane. The bot never merges — a
 	// human does — so the ready state reads "待合并" (waiting for a human), and
 	// 🎉已合并 comes only from the terminal "merged" outcome above.
-	if st == "shepherding" {
-		switch strings.ToLower(strings.TrimSpace(shepherdPhase)) {
+	// A shepherd loop shows its phase both while PARKED (status shepherding) AND while
+	// actively running a fix pass (status running) — otherwise the card drops back to
+	// the generic "🔨 实现中" mid-fix. shepherdPhase is only set once shepherding began,
+	// so a plain worker run (no shepherd marker) still falls through to 实现中 below.
+	if sp := strings.ToLower(strings.TrimSpace(shepherdPhase)); st == "shepherding" || (st == "running" && sp != "") {
+		switch sp {
 		case "fixing":
 			return "blue", "🔧 修复中"
 		case "awaiting_validation":

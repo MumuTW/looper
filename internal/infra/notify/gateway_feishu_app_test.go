@@ -691,6 +691,18 @@ func TestFeishuLoopFlowchartStyleShepherding(t *testing.T) {
 	if _, label := feishuLoopFlowchartStyle("worker", "merged", true, false, "", "fixing"); !strings.Contains(label, "已合并") {
 		t.Fatalf("merged terminal must show 已合并, got %q", label)
 	}
+	// During a shepherd FIX pass the loop status is "running", not "shepherding" — the
+	// card must still show the shepherd phase, not drop back to the generic 实现中.
+	if _, label := feishuLoopFlowchartStyle("worker", "running", true, false, "", "fixing"); !strings.Contains(label, "修复中") {
+		t.Fatalf("running shepherd fix pass must show 修复中, got %q", label)
+	}
+	if _, label := feishuLoopFlowchartStyle("worker", "running", true, false, "", "awaiting_validation"); !strings.Contains(label, "待验收") {
+		t.Fatalf("running shepherd (awaiting_validation) must show 待验收, got %q", label)
+	}
+	// A plain worker run with no shepherd marker still reads 实现中.
+	if _, label := feishuLoopFlowchartStyle("worker", "running", false, false, "", ""); !strings.Contains(label, "实现中") {
+		t.Fatalf("plain worker run must show 实现中, got %q", label)
+	}
 	if !feishuLoopAwaitingMerge("shepherding") {
 		t.Fatal("feishuLoopAwaitingMerge(shepherding) = false, want true (card should mirror PR state)")
 	}
