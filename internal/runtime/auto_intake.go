@@ -140,11 +140,16 @@ func (r *Runtime) reconcileAutoIntake(ctx context.Context) {
 		time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
 		time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
 	)
+	plane := 0
 	for _, project := range cfg.Projects {
 		if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindPlane {
 			continue
 		}
+		plane++
 		r.reconcileAutoIntakeProject(ctx, &cfg, project, llm, logger, now)
+	}
+	if logger != nil {
+		logger.Info("auto-intake: tick", map[string]any{"planeProjects": plane, "totalProjects": len(cfg.Projects)})
 	}
 }
 
@@ -170,6 +175,9 @@ func (r *Runtime) reconcileAutoIntakeProject(ctx context.Context, cfg *config.Co
 			logger.Warn("auto-intake: list looper:auto items failed", map[string]any{"projectId": project.ID, "error": err.Error()})
 		}
 		return
+	}
+	if logger != nil {
+		logger.Info("auto-intake: listed items", map[string]any{"projectId": project.ID, "planeProjectId": planeProjectID, "count": len(items)})
 	}
 	for _, item := range items {
 		r.reconcileAutoIntakeItem(ctx, gateway, client, planeProjectID, project, item, llm, logger, now)
@@ -253,7 +261,13 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 		_ = gateway.CommentOnWorkItem(ctx, planeProjectID, workItemID, intakeComment(decision, "超出范围,已标记"))
 		r.logIntake(logger, project.ID, item.Number, "out-of-scope")
 	default:
-		// NoOp / classification unavailable — leave the item untouched for a retry.
+		// intakeSkip: the classifier produced no valid decision (e.g. a
+		// non-conforming answer that failed schema validation). Stamp needs-human so
+		// a person can classify it by hand AND so we don't re-run the LLM on this
+		// item every tick — matching the flowchart's "拿不准 → HITL 问人" leaf.
+		_ = gateway.AddWorkItemLabel(ctx, planeProjectID, workItemID, intakeNeedsHumanLabel)
+		_ = gateway.CommentOnWorkItem(ctx, planeProjectID, workItemID, "<p>🧭 looper 无法自动分类这条(分类器未产出有效结论),已转人工。请补充 kind/dispatch 或直接打 looper:plan / looper:worker-ready。</p>")
+		r.logIntake(logger, project.ID, item.Number, "skip → needs-human")
 	}
 }
 

@@ -223,11 +223,38 @@ func (t *openCodeJSONLTranslator) combinedText() string {
 	return strings.Join(parts, "\n")
 }
 
+// assistantText returns ONLY the assistant's text parts (in order), without any
+// tool output. Used when the caller needs the agent's own answer verbatim (e.g. an
+// LLM-as-a-function call whose whole reply is a JSON object), not the marker-hunting
+// combinedText which mixes in tool echoes.
+func (t *openCodeJSONLTranslator) assistantText() string {
+	return strings.Join(t.textFrags, "\n")
+}
+
 // ingestAll folds an entire JSONL blob (the full stdout) line by line.
 func (t *openCodeJSONLTranslator) ingestAll(blob string) {
 	for _, line := range strings.Split(blob, "\n") {
 		t.ingestLine(line)
 	}
+}
+
+// OpenCodeAssistantText extracts the assistant's reply from an opencode `--format
+// json` stdout blob. In json mode the reply lives inside `text` events, so the raw
+// blob is not itself the answer — an LLM-as-a-function caller (triage classifier,
+// etc.) that json.Unmarshals stdout would fail. Returns (text, true) when the blob
+// is opencode JSONL, ("", false) otherwise so callers fall back to raw stdout for
+// vendors that print their answer plainly (codex).
+func OpenCodeAssistantText(stdout string) (string, bool) {
+	if !openCodeSessionIDRe.MatchString(stdout) {
+		return "", false
+	}
+	tr := newOpenCodeJSONLTranslator()
+	tr.ingestAll(stdout)
+	text := strings.TrimSpace(tr.assistantText())
+	if text == "" {
+		return "", false
+	}
+	return text, true
 }
 
 // openCodeSessionIDRe matches the session id opencode stamps on every JSONL event,
