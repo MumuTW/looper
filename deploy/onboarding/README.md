@@ -6,7 +6,11 @@ with the Feishu HITL integration for them.
 ## Distributor (you, who has the shared secrets)
 1. Make sure the shared Feishu app + [Cloudflare inbox worker](../feishu-inbox-worker/README.md)
    are deployed, and you have a filled `hitl.env` (from
-   [`deploy/hitl.env.example`](../hitl.env.example)).
+   [`deploy/hitl.env.example`](../hitl.env.example)). One-time, app-level: whitelist
+   `http://127.0.0.1:53682/callback` as a redirect URL in the shared Feishu app's
+   security settings, so every teammate's `looper login` can capture their open_id
+   (else it fails with `20029 重定向 URL 有误`). Also decide the team-wide
+   `productOwner` + `qa` open_ids and give them to teammates for the config template.
 2. Build the bundle:
    ```sh
    deploy/onboarding/build-bundle.sh /path/to/your/hitl.env

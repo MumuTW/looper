@@ -67,6 +67,15 @@
       "name": "My Repo (GitHub)",
       "repo": "OWNER/REPO",
       "repoPath": "/ABSOLUTE/PATH/TO/LOCAL/CLONE",
+      "productOwner": {
+        "feishuOpenId": "REPLACE_WITH_PRODUCT_OWNER_ou_xxx"
+      },
+      "qa": {
+        "feishuOpenId": "REPLACE_WITH_QA_ou_xxx"
+      },
+      "owner": {
+        "feishuOpenId": "FILLED_BY_looper_login_ou_xxx"
+      },
       "roles": {
         "planner": {
           "autoDiscovery": false
