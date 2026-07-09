@@ -1188,6 +1188,10 @@ func (r *Runtime) runWakeReconcile(ctx context.Context, reason string) {
 	if err != nil && logger != nil {
 		logger.Warn("wake reconcile: stale-run reconcile failed", map[string]any{"error": err.Error(), "reason": reason})
 	}
+	// Classify + route freshly-labelled looper:auto Plane items into the pipeline
+	// (flowchart top: bug/feature → product-spec gate → looper:plan / worker-ready).
+	// Env-gated (LOOPER_PLANE_AUTO_INTAKE=1); a no-op otherwise.
+	r.reconcileAutoIntake(ctx)
 	// Resume planner loops whose product spec was supplied while they were held (E2).
 	r.reconcileAwaitingProductSpec(ctx)
 	// Dispatch the worker for tech specs a human approved on the Plane page (node H→I).
