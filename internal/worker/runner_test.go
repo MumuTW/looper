@@ -1145,6 +1145,43 @@ func TestBuildPullRequestBodyUsesBareClosingReferenceForSameRepo(t *testing.T) {
 	}
 }
 
+func TestBuildPullRequestBodyOmitsGitHubClosingForPlaneSource(t *testing.T) {
+	t.Parallel()
+	// Plane work items carry their tracker sequence id in IssueNumber; a GitHub
+	// "Closes #<planeSeq>" would point at a non-existent/unrelated GitHub issue.
+	planeURL := "https://plane.powerformer.net/open-design/projects/49832a02-3158-4faf-bf2f-d0e39c40c7e6/issues/2d282842-6fdb-41e5-babd-fc433f16a00b"
+	body := buildPullRequestBody(workerInput{Repo: "nexu-io/open-design", IssueNumber: 1328, IssueURL: planeURL}, &checkpointPlan{Items: []string{"Add one-line intro to SECURITY.md"}}, nil)
+	if strings.Contains(body, "Closes ") {
+		t.Fatalf("body = %q, want no GitHub closing reference for a Plane-sourced item", body)
+	}
+	if strings.Contains(body, "Issue: #1328") {
+		t.Fatalf("body = %q, want no GitHub #N issue reference for a Plane-sourced item", body)
+	}
+	if !strings.Contains(body, "Issue URL: "+planeURL) {
+		t.Fatalf("body = %q, want the Plane page URL as the tracker-agnostic reference", body)
+	}
+}
+
+func TestIssueIsNonGitHub(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"", false},
+		{"https://github.com/nexu-io/looper/issues/27", false},
+		{"https://ghe.example.com/nexu-io/looper/issues/27", false}, // GitHub Enterprise — still GitHub
+		{"https://plane.powerformer.net/open-design/browse/OPEND-1328", true},
+		{"https://plane.powerformer.net/open-design/projects/49832a02/issues/2d282842", true},
+		{"https://gitlab.com/nexu-io/looper/-/issues/27", true},
+	}
+	for _, tc := range cases {
+		if got := issueIsNonGitHub(tc.url); got != tc.want {
+			t.Fatalf("issueIsNonGitHub(%q) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
 func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
 	t.Parallel()
 	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27}, IssueDetail{Number: 27, Title: "Issue title", URL: "https://github.com/nexu-io/looper/issues/27"})

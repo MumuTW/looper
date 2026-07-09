@@ -3816,7 +3816,14 @@ func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *che
 	if execution != nil && execution.Summary != "" {
 		lines = append(lines, "", "## Agent Summary", execution.Summary)
 	}
-	if work.IssueNumber > 0 {
+	// A GitHub "Issue: #N" / "Closes #N" reference is only valid when the source issue
+	// actually lives on GitHub. Plane (and other external-tracker) work items carry
+	// their tracker's sequence id in IssueNumber — emitting "Closes #<planeSeq>" points
+	// at a non-existent GitHub issue (and would try to auto-close a stranger's #N on
+	// merge). Detect via the issue URL host; the "Issue URL:" line below is the correct,
+	// tracker-agnostic reference for those.
+	githubIssue := work.IssueNumber > 0 && !issueIsNonGitHub(work.IssueURL)
+	if githubIssue {
 		lines = append(lines, "", "Issue: "+formatIssueReference(firstNonEmpty(work.IssueRepo, work.Repo), work.IssueNumber))
 	}
 	if work.IssueURL != "" {
@@ -3828,10 +3835,23 @@ func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *che
 	if work.Prompt != "" {
 		lines = append(lines, "", fmt.Sprintf("Prompt: %s", work.Prompt))
 	}
-	if work.IssueNumber > 0 {
+	if githubIssue {
 		lines = append(lines, "", "Closes "+formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// issueIsNonGitHub reports whether a source issue lives outside GitHub (e.g. a Plane
+// work item), inferred from its URL. An empty URL is treated as GitHub (the same-repo
+// discovery flow that carries no explicit URL), preserving existing behavior. A present
+// URL is GitHub only when it has the canonical /<owner>/<repo>/issues/<number> shape —
+// which holds for github.com and GitHub Enterprise, but not for Plane's
+// /projects/<uuid>/issues/<uuid> (or /browse/OPEND-N) URLs — so a Plane-sourced item
+// suppresses GitHub-only "#N" / "Closes #N" references that would otherwise point at a
+// non-existent GitHub issue.
+func issueIsNonGitHub(issueURL string) bool {
+	u := strings.TrimSpace(issueURL)
+	return u != "" && issueRepoFromURL(u) == ""
 }
 
 func hydrateWorkerInputFromIssue(work workerInput, issue IssueDetail) workerInput {
