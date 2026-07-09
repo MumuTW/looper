@@ -1900,6 +1900,35 @@ func (g *Gateway) PostThreadNote(ctx context.Context, loopID, text string, menti
 	return nil
 }
 
+// AnnounceToGroup posts a standalone message to the configured group chat, NOT
+// threaded under any loop's anchor. The auto-intake uses it to surface its
+// classification + reasoning BEFORE any loop/thread exists — so the decision (e.g.
+// "simple bug → implement directly, no tech spec") is visible in the group and a
+// human can object BEFORE the worker starts, instead of the classification being a
+// silent black box. App-mode only; best-effort (never blocks the pipeline).
+func (g *Gateway) AnnounceToGroup(ctx context.Context, text string) error {
+	if strings.TrimSpace(text) == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+		return nil
+	}
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	chatID := strings.TrimSpace(cfg.ChatID)
+	if appID == "" || appSecret == "" || chatID == "" {
+		return nil
+	}
+	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(map[string]string{"text": strings.TrimSpace(text)})
+	if err != nil {
+		return err
+	}
+	_, err = g.postFeishuAppMessage(ctx, token, chatID, "", "text", string(raw))
+	return err
+}
+
 // patchFeishuAppCard updates an already-sent interactive card in place.
 func (g *Gateway) patchFeishuAppCard(ctx context.Context, token, messageID, content string) error {
 	apiURL := feishuAPIBase + "/open-apis/im/v1/messages/" + strings.TrimSpace(messageID)

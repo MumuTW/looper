@@ -231,6 +231,11 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	present, _, _ := gateway.HasProductSpec(ctx, planeProjectID, workItemID)
 	route := decideAutoIntakeRoute(decision, present)
 
+	// Surface the classification + reasoning to the group BEFORE routing to a stage,
+	// so the decision (e.g. "simple bug → implement directly, no tech spec") isn't a
+	// silent black box and a human has a window to object — the flowchart's HITL leaf.
+	r.announceIntakeClassification(ctx, item, decision, route)
+
 	// Stamp the LLM's audit labels (kind/*, complexity/*, dispatch/*) so the
 	// classification is visible on the item, mirroring the GitHub coordinator.
 	if len(decision.ApplyLabels) > 0 {
@@ -290,6 +295,45 @@ func (r *Runtime) logIntake(logger bootstrap.Logger, projectID string, number in
 	if logger != nil {
 		logger.Info("auto-intake", map[string]any{"projectId": projectID, "item": number, "outcome": outcome})
 	}
+}
+
+// announceIntakeClassification posts the classifier's verdict + reasoning to the
+// Feishu group before the item is routed to a stage, so "why simple bug / why no
+// spec" is transparent and interruptible (HITL) rather than a black box. Best-effort.
+func (r *Runtime) announceIntakeClassification(ctx context.Context, item forge.Issue, decision triage.Decision, route intakeRoute) {
+	routeText := map[intakeRoute]string{
+		intakeRouteToPlan:        "写技术方案(planner)→ 评审 → 实现",
+		intakeRouteToImplement:   "直接实现(worker),不写 spec",
+		intakeHoldForProductSpec: "缺 product spec,@产品补齐后再走",
+		intakeHoldUnclear:        "拿不准,转人工确认",
+		intakeMarkOutOfScope:     "超出范围,已标记",
+	}[route]
+	if routeText == "" {
+		return // skip / no valid decision — nothing meaningful to announce
+	}
+	gw, ok := r.shepherdNotifyGateway()
+	if !ok {
+		return
+	}
+	kind := ""
+	for _, l := range decision.ApplyLabels {
+		if strings.HasPrefix(strings.TrimSpace(l), "kind/") {
+			kind = strings.TrimSpace(l)
+			break
+		}
+	}
+	text := fmt.Sprintf("🧭 looper 已接手 #%d《%s》\n分类:%s → %s", item.Number, strings.TrimSpace(item.Title), firstNonEmptyStr(kind, "(未分类)"), routeText)
+	if reason := strings.TrimSpace(decision.CommentBody); reason != "" {
+		text += "\n理由:" + reason
+	}
+	_ = gw.AnnounceToGroup(ctx, text)
+}
+
+func firstNonEmptyStr(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
 }
 
 func intakeComments(ctx context.Context, client *forge.PlaneClient, number int64) []triage.Comment {
