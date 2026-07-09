@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -741,6 +742,52 @@ func TestParseCompletionIgnoresTemplatePlaceholder(t *testing.T) {
 	parsed := parseCompletion(CompletionMarkerPrefix+`{"summary":"<one-sentence summary>"}`+"\nreal work\n", "")
 	if parsed.ParseStatus != "missing" || parsed.Summary != "" {
 		t.Fatalf("parseCompletion() = %#v, want template placeholder ignored", parsed)
+	}
+}
+
+func TestParseCompletionBackfillsLifecycleFromEarlierMarker(t *testing.T) {
+	t.Parallel()
+
+	// opencode/grok emits the full marker via a tool echo (earlier in the stream)
+	// but only a summary in its final assistant text (later). parseCompletion scans
+	// bottom-up and hits the summary-only marker first; it must backfill the dropped
+	// git_pr_lifecycle from the earlier echo so the worker can adopt the PR.
+	echoMarker := CompletionMarkerPrefix + `{"summary":"Implemented #1244","git_pr_lifecycle":{"branch":"looper/1244-x","baseBranch":"main","commitShas":["77ba2d3"],"pushed":true,"prNumber":5339,"prUrl":"https://github.com/nexu-io/open-design/pull/5339","prAdopted":false,"actions":{"commit":"agent","push":"agent","pr":"agent"}}}`
+	finalText := CompletionMarkerPrefix + `{"summary":"Implemented #1244: allowlist error guidance"}`
+	stdout := "some tool output\n" + echoMarker + "\nmore chatter\n" + finalText + "\n"
+
+	parsed := parseCompletion(stdout, "")
+	if parsed.ParseStatus != "parsed" {
+		t.Fatalf("ParseStatus = %q, want parsed", parsed.ParseStatus)
+	}
+	// Latest summary wins.
+	if parsed.Summary != "Implemented #1244: allowlist error guidance" {
+		t.Fatalf("Summary = %q, want the final summary", parsed.Summary)
+	}
+	// Lifecycle is backfilled from the earlier echo marker.
+	if parsed.Lifecycle == nil {
+		t.Fatal("Lifecycle = nil, want backfilled from earlier marker")
+	}
+	if parsed.Lifecycle.PRNumber != 5339 {
+		t.Fatalf("Lifecycle.PRNumber = %d, want 5339", parsed.Lifecycle.PRNumber)
+	}
+	if parsed.Lifecycle.Actions.PR != lifecycle.ActionSourceAgent {
+		t.Fatalf("Lifecycle.Actions.PR = %q, want %q", parsed.Lifecycle.Actions.PR, lifecycle.ActionSourceAgent)
+	}
+}
+
+func TestParseCompletionKeepsSingleCompleteMarkerUnchanged(t *testing.T) {
+	t.Parallel()
+
+	// codex emits one complete marker; the first (bottom-up) match already carries
+	// lifecycle, so parseCompletion returns it immediately with no scanning changes.
+	marker := CompletionMarkerPrefix + `{"summary":"done","git_pr_lifecycle":{"prNumber":42,"actions":{"pr":"agent"}}}`
+	parsed := parseCompletion("work\n"+marker+"\n", "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "done" {
+		t.Fatalf("parseCompletion() = %#v, want single complete marker parsed", parsed)
+	}
+	if parsed.Lifecycle == nil || parsed.Lifecycle.PRNumber != 42 {
+		t.Fatalf("Lifecycle = %#v, want PRNumber 42", parsed.Lifecycle)
 	}
 }
 

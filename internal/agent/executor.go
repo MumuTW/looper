@@ -1809,34 +1809,86 @@ func tickerChan(ticker *time.Ticker) <-chan time.Time {
 func parseCompletion(stdout, stderr string) completionParse {
 	raw := stdout + "\n" + stderr
 	lines := strings.Split(raw, "\n")
+	// The latest (bottom-up first) real marker owns the summary + parse status.
+	// Some agents emit a rich marker via a tool echo AND a summary-only marker as
+	// their final text (e.g. opencode/grok: the echo carries git_pr_lifecycle, the
+	// final message drops it). The summary-only one lands here first, so when it is
+	// missing structured evidence keep scanning earlier markers and backfill only
+	// the fields it dropped — never overwriting the latest summary. For an agent
+	// that emits one complete marker (codex), the first match already carries
+	// lifecycle and returns immediately: behaviour is unchanged.
+	var primary *completionParse
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, CompletionMarkerPrefix) {
-			payload := strings.TrimPrefix(line, CompletionMarkerPrefix)
-			var parsed map[string]any
-			if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-				return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
-			}
-			result := completionParse{
-				ParseStatus:      "parsed",
-				CompletionSignal: CompletionMarkerPrefix,
-				Artifacts:        asStringSlice(parsed["artifacts"]),
-				ChangedFiles:     asStringSlice(parsed["changedFiles"]),
-				Commits:          asStringSlice(parsed["commits"]),
-			}
-			if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
-				result.Lifecycle = state
-			}
-			if summary, ok := parsed["summary"].(string); ok {
-				result.Summary = summary
-			}
-			if isTemplateCompletion(result, parsed) {
+		if !strings.HasPrefix(line, CompletionMarkerPrefix) {
+			continue
+		}
+		payload := strings.TrimPrefix(line, CompletionMarkerPrefix)
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+			if primary != nil {
+				// A later marker already stood in; a malformed earlier echo is just
+				// noise — don't fail the whole parse over it.
 				continue
 			}
-			return result
+			return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
+		}
+		result := completionParse{
+			ParseStatus:      "parsed",
+			CompletionSignal: CompletionMarkerPrefix,
+			Artifacts:        asStringSlice(parsed["artifacts"]),
+			ChangedFiles:     asStringSlice(parsed["changedFiles"]),
+			Commits:          asStringSlice(parsed["commits"]),
+		}
+		if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
+			result.Lifecycle = state
+		}
+		if summary, ok := parsed["summary"].(string); ok {
+			result.Summary = summary
+		}
+		if isTemplateCompletion(result, parsed) {
+			continue
+		}
+		if primary == nil {
+			captured := result
+			primary = &captured
+			if completionLifecyclePopulated(primary.Lifecycle) {
+				return *primary
+			}
+			continue
+		}
+		if !completionLifecyclePopulated(primary.Lifecycle) && completionLifecyclePopulated(result.Lifecycle) {
+			primary.Lifecycle = result.Lifecycle
+		}
+		if len(primary.Commits) == 0 {
+			primary.Commits = result.Commits
+		}
+		if len(primary.ChangedFiles) == 0 {
+			primary.ChangedFiles = result.ChangedFiles
+		}
+		if len(primary.Artifacts) == 0 {
+			primary.Artifacts = result.Artifacts
+		}
+		if completionLifecyclePopulated(primary.Lifecycle) {
+			return *primary
 		}
 	}
+	if primary != nil {
+		return *primary
+	}
 	return completionParse{ParseStatus: "missing"}
+}
+
+// completionLifecyclePopulated reports whether a parsed marker's git_pr_lifecycle
+// carries real evidence (a PR, commits, or a branch) rather than being absent or
+// an empty object. It gates the backfill in parseCompletion so a summary-only
+// final marker adopts the structured lifecycle an earlier echo marker reported.
+func completionLifecyclePopulated(s *lifecycle.State) bool {
+	if s == nil {
+		return false
+	}
+	return s.PRNumber > 0 || strings.TrimSpace(s.PRURL) != "" || len(s.CommitSHAs) > 0 ||
+		strings.TrimSpace(s.AgentBranch) != "" || strings.TrimSpace(s.Branch) != ""
 }
 
 func isTemplateCompletion(result completionParse, parsed map[string]any) bool {
