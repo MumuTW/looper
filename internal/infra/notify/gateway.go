@@ -1747,6 +1747,19 @@ func (g *Gateway) updateLiveFeedComment(ctx context.Context, token, loopID strin
 		msgID = g.liveFeeds[loopID]
 	}
 	g.liveMu.Unlock()
+	// Fall back to the persisted id so a daemon restart patches the same feed card
+	// in place instead of orphaning it and posting a fresh one.
+	if msgID == "" && g.repositories.FeishuLiveFeeds != nil {
+		if persisted, err := g.repositories.FeishuLiveFeeds.MessageByLoop(ctx, loopID); err == nil && persisted != "" {
+			msgID = persisted
+			g.liveMu.Lock()
+			if g.liveFeeds == nil {
+				g.liveFeeds = map[string]string{}
+			}
+			g.liveFeeds[loopID] = persisted
+			g.liveMu.Unlock()
+		}
+	}
 	if msgID != "" {
 		_ = g.patchFeishuAppCard(ctx, token, msgID, cardJSON)
 		return
@@ -1765,6 +1778,9 @@ func (g *Gateway) updateLiveFeedComment(ctx context.Context, token, loopID strin
 	}
 	g.liveFeeds[loopID] = newID
 	g.liveMu.Unlock()
+	if g.repositories.FeishuLiveFeeds != nil {
+		_ = g.repositories.FeishuLiveFeeds.Set(ctx, loopID, newID, eventlog.FormatJavaScriptISOString(g.now()))
+	}
 }
 
 // liveTailFor returns the retained live activity snapshot for a loop.

@@ -334,6 +334,35 @@ func TestLoopsGetByTargetIDResolvesPRToWorkerLoop(t *testing.T) {
 	}
 }
 
+func TestFeishuLiveFeedsSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	// No feed posted yet → empty, not an error.
+	if got, err := repos.FeishuLiveFeeds.MessageByLoop(ctx, "loop_1"); err != nil || got != "" {
+		t.Fatalf("MessageByLoop(unknown) = %q, %v; want \"\", nil", got, err)
+	}
+	// First feed card for the loop is remembered.
+	if err := repos.FeishuLiveFeeds.Set(ctx, "loop_1", "om_feed_1", "2026-04-11T12:00:00.000Z"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	// A "restart" (fresh repositories over the same DB) still resolves the same id.
+	fresh := NewRepositories(coordinator.DB())
+	if got, err := fresh.FeishuLiveFeeds.MessageByLoop(ctx, "loop_1"); err != nil || got != "om_feed_1" {
+		t.Fatalf("MessageByLoop() after restart = %q, %v; want om_feed_1", got, err)
+	}
+	// Re-posting (e.g. after the message was recreated) replaces the id in place.
+	if err := repos.FeishuLiveFeeds.Set(ctx, "loop_1", "om_feed_2", "2026-04-11T12:05:00.000Z"); err != nil {
+		t.Fatalf("Set(replace) error = %v", err)
+	}
+	if got, _ := repos.FeishuLiveFeeds.MessageByLoop(ctx, "loop_1"); got != "om_feed_2" {
+		t.Fatalf("MessageByLoop() after replace = %q; want om_feed_2", got)
+	}
+}
+
 func TestFeishuThreadsRootByTaskSharesOneCardAcrossLoops(t *testing.T) {
 	t.Parallel()
 

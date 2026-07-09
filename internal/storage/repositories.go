@@ -32,6 +32,7 @@ type Repositories struct {
 	WebhookForwarders    *WebhookForwardersRepository
 	WebhookTunnelHooks   *WebhookTunnelHooksRepository
 	FeishuThreads        *FeishuThreadsRepository
+	FeishuLiveFeeds      *FeishuLiveFeedsRepository
 }
 
 func NewRepositories(q sqliteQuerier) *Repositories {
@@ -49,6 +50,7 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		WebhookForwarders:    &WebhookForwardersRepository{q: q},
 		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
 		FeishuThreads:        &FeishuThreadsRepository{q: q},
+		FeishuLiveFeeds:      &FeishuLiveFeedsRepository{q: q},
 	}
 }
 
@@ -389,6 +391,38 @@ func (r *FeishuThreadsRepository) RootByLoop(ctx context.Context, loopID string)
 		return "", fmt.Errorf("feishu thread root by loop: %w", err)
 	}
 	return rootMessageID, nil
+}
+
+// FeishuLiveFeedsRepository persists each loop's live-progress feed message id so
+// the in-place patch survives a daemon restart, instead of orphaning the old card
+// and posting a fresh one on the next progress tick.
+type FeishuLiveFeedsRepository struct{ q sqliteQuerier }
+
+// Set records (or replaces) the live-feed message id for a loop.
+func (r *FeishuLiveFeedsRepository) Set(ctx context.Context, loopID, messageID, createdAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO feishu_live_feeds (loop_id, message_id, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(loop_id) DO UPDATE SET message_id=excluded.message_id
+	`, loopID, messageID, createdAt)
+	if err != nil {
+		return fmt.Errorf("upsert feishu live feed: %w", err)
+	}
+	return nil
+}
+
+// MessageByLoop returns the persisted live-feed message id for a loop, or "" when
+// none has been posted yet (or the loop is unknown).
+func (r *FeishuLiveFeedsRepository) MessageByLoop(ctx context.Context, loopID string) (string, error) {
+	var messageID string
+	err := r.q.QueryRowContext(ctx, `SELECT message_id FROM feishu_live_feeds WHERE loop_id = ?`, loopID).Scan(&messageID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("feishu live feed by loop: %w", err)
+	}
+	return messageID, nil
 }
 
 // LoopByRoot returns the loop id a thread root belongs to, or "" when unknown.
