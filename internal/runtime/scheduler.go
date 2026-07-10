@@ -2226,7 +2226,8 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		AllowAutoPush:   cfg.Defaults.AllowAutoPush,
 		// Opt-in (default off): under looper:auto, keep the worker loop shepherding
 		// its own impl PR to merge. Gated additionally by the looper:auto label.
-		ShepherdEnabled: os.Getenv("LOOPER_WORKER_SHEPHERD") == "1",
+		// Enabled by config (defaults.workerShepherd) or the env override.
+		ShepherdEnabled: cfg.Defaults.WorkerShepherd || os.Getenv("LOOPER_WORKER_SHEPHERD") == "1",
 		OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
 		DiscoveryPolicy: worker.DiscoveryPolicy{
 			AutoDiscovery:              cfg.Roles.Worker.AutoDiscovery,

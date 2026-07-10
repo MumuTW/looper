@@ -893,6 +893,10 @@ func mergeDefaultsConfig(config *DefaultsConfig, partial PartialDefaultsConfig) 
 		config.AllowAutoPush = *partial.AllowAutoPush
 	}
 
+	if partial.WorkerShepherd != nil {
+		config.WorkerShepherd = *partial.WorkerShepherd
+	}
+
 	if partial.AllowAutoApprove != nil {
 		config.AllowAutoApprove = *partial.AllowAutoApprove
 	}

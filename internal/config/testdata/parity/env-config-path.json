@@ -81,7 +81,8 @@
           "allowAutoMerge": true,
           "allowRiskyFixes": true,
           "openPrStrategy": "first_commit",
-          "addSnapshotMode": "async"
+          "addSnapshotMode": "async",
+          "workerShepherd": false
         },
         "projects": [
           {
@@ -231,7 +232,8 @@
         "allowRiskyFixes": true,
         "fixAllPullRequests": false,
         "openPrStrategy": "first_commit",
-        "addSnapshotMode": "async"
+        "addSnapshotMode": "async",
+        "workerShepherd": false
       },
       "roles": {
         "coordinator": {

@@ -210,7 +210,8 @@
         "allowRiskyFixes": false,
         "fixAllPullRequests": false,
         "openPrStrategy": "all_done",
-        "addSnapshotMode": "async"
+        "addSnapshotMode": "async",
+        "workerShepherd": false
       },
       "roles": {
         "coordinator": {

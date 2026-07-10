@@ -373,6 +373,10 @@ type DefaultsConfig struct {
 	FixAllPullRequests bool            `json:"fixAllPullRequests"`
 	OpenPRStrategy     OpenPRStrategy  `json:"openPrStrategy"`
 	AddSnapshotMode    AddSnapshotMode `json:"addSnapshotMode"`
+	// WorkerShepherd opts workers into shepherding their own impl PR toward merge after
+	// open-pr (still gated per-issue by the looper:auto label). Off by default; also
+	// enabled by the LOOPER_WORKER_SHEPHERD=1 env override.
+	WorkerShepherd bool `json:"workerShepherd"`
 }
 
 type ReviewerLoopConfig struct {
@@ -876,6 +880,7 @@ type PartialDefaultsConfig struct {
 	FixAllPullRequests *bool            `json:"fixAllPullRequests,omitempty"`
 	OpenPRStrategy     *OpenPRStrategy  `json:"openPrStrategy,omitempty"`
 	AddSnapshotMode    *AddSnapshotMode `json:"addSnapshotMode,omitempty"`
+	WorkerShepherd     *bool            `json:"workerShepherd,omitempty"`
 }
 
 type PartialReviewerLoopConfig struct {
