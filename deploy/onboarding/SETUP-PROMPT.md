@@ -16,14 +16,15 @@ You are helping me set up and start **looper** — a daemon that runs an autonom
    - `looperd` and `looper` are on PATH (if not, ask me for the path / how to install or build them).
    - My coding-agent binary (`codex` or `claude`) is installed and **logged in / authorized** (run it once to confirm it works).
    - The GitHub repo I want looper to work on is already cloned locally.
-2. **Collect my settings** (ask me, don't guess):
+2. **Collect my settings** (ask me, don't guess). First open `config.hitl.example.json` and see which fields are still `REPLACE_...` placeholders — the distributor may have **pre-filled** some (typically the Feishu **group chat id** and the `productOwner` / `qa` open_ids). Whatever is already filled, **leave it as-is**; only collect what's still a placeholder:
    - GitHub repo (`owner/repo`) plus the **absolute path** of its local clone.
-   - My Feishu **group chat id** (`oc_...`).
+   - My Feishu **group chat id** (`oc_...`) — only if it's still a placeholder.
+   - The `productOwner` and `qa` open_ids (**team-wide**; only if still placeholders — otherwise the distributor already set them).
    - **You don't need to hunt for my own open_id** — step 5 grabs it automatically via `looper login` (a quick browser authorization; it writes it into `owner` and `mentionOpenIds` in the config).
-   - The `productOwner` and `qa` open_ids (**team-wide**, the distributor gives you these — the product owner's / QA's `ou_...`; the template leaves `REPLACE_...` placeholders for them).
    - The absolute path of my coding-agent binary, and whether I use `codex` or `opencode` (see "Backend" below).
    - Where looper keeps its data/logs (default `~/.looper`).
-3. **Write my config**: copy `config.hitl.example.json` to `~/.looper/config.json` and replace every `REPLACE_...` / `/ABSOLUTE/...` / `OWNER/REPO` / `FILLED_BY_looper_login_...` placeholder with the values above (leave the `owner` one for now — `looper login` fills it in the next step). When done, **show me the final config** to confirm (it holds no secrets, so it's safe to display).
+   - If the group chat id is pre-filled to a **shared** team group, make sure I'm actually a member of it (otherwise I won't see the cards or get @-mentioned).
+3. **Write my config**: copy `config.hitl.example.json` to `~/.looper/config.json` and replace every **remaining** `REPLACE_...` / `/ABSOLUTE/...` / `OWNER/REPO` / `FILLED_BY_looper_login_...` placeholder with the values above — do not touch fields the distributor already filled (leave the `owner` one for now — `looper login` fills it in the next step). When done, **show me the final config** to confirm (it holds no secrets, so it's safe to display).
    - **Backend**: the template defaults to `codex` (`-c model=gpt-5.4 …`). If I use `opencode`, change `agent.vendor` to `opencode`, point `command` at the opencode binary, set `model` to `openai/gpt-5.4`, and replace `args` with `["--pure","--dangerously-skip-permissions"]` (codex's `-c/-s` flags mean different things in opencode — don't mix them up).
 4. **Load the shared secrets**: `source` the `hitl.env` in this bundle. **Do not** print the secret values, and **do not** copy them into the config file (the config only references variable names).
 5. **Log into Feishu to get my open_id** (automatic; `source hitl.env` first so the app credentials are in the shell):
