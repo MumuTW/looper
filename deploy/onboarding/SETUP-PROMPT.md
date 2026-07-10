@@ -20,7 +20,7 @@ You are helping me set up and start **looper** — a daemon that runs an autonom
    - GitHub repo (`owner/repo`) plus the **absolute path** of its local clone.
    - My Feishu **group chat id** (`oc_...`) — only if it's still a placeholder.
    - The `productOwner` and `qa` open_ids (**team-wide**; only if still placeholders — otherwise the distributor already set them).
-   - **You don't need to hunt for my own open_id** — step 5 grabs it automatically via `looper login` (a quick browser authorization; it writes it into `owner` and `mentionOpenIds` in the config).
+   - **You don't need to hunt for my own open_id** — step 5 grabs it automatically via `looper login` (a quick browser authorization; it writes it into the project `owner`, and prints it so you can also set `notifications.webhook.mentionOpenIds`).
    - The absolute path of my coding-agent binary, and whether I use `codex` or `opencode` (see "Backend" below).
    - Where looper keeps its data/logs (default `~/.looper`).
    - If the group chat id is pre-filled to a **shared** team group, make sure I'm actually a member of it (otherwise I won't see the cards or get @-mentioned).
@@ -30,8 +30,9 @@ You are helping me set up and start **looper** — a daemon that runs an autonom
 5. **Log into Feishu to get my open_id** (automatic; `source hitl.env` first so the app credentials are in the shell):
    ```sh
    source <bundle-path>/hitl.env                  # app_id/secret etc. enter this shell
-   looper login --config ~/.looper/config.json    # opens a browser authorization; auto-writes my open_id into owner + mentionOpenIds
+   looper login --config ~/.looper/config.json    # browser authorization; writes my open_id into projects[].owner and prints it
    ```
+   `looper login` writes only the project `owner.feishuOpenId`. Take the open_id it prints and also put it in `notifications.webhook.mentionOpenIds` (replace the `REPLACE_WITH_YOUR_OPEN_ID_ou_xxx` placeholder) so decision cards actually @-mention me. Then show me the final config to confirm.
    (Prerequisite: the shared Feishu app already has `http://127.0.0.1:53682/callback` in its "redirect URL allowlist" — that's a **one-time, app-level** setup the distributor does, not your concern; if you hit `20029 redirect URL is invalid`, ask the distributor to add it.)
 6. **Install it as a resident service and start it** (so it auto-restarts on sleep/wake, reboot, or crash — don't run it bare with `nohup`):
    ```sh
