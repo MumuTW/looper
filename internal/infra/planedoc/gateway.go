@@ -440,20 +440,32 @@ func (g *Gateway) CommentOnPageURL(ctx context.Context, projectID, pageURL, comm
 	return err
 }
 
-// SpecApprovedOnPage reports whether a human has approved the tech spec on the page
-// at pageURL (node H gate) — resolves the page, lists its comments, and runs
-// DetectSpecApproval. Returns the approver's display name.
-func (g *Gateway) SpecApprovedOnPage(ctx context.Context, projectID, pageURL string) (bool, string, error) {
+// ListHumanSpecComments resolves the spec page at pageURL and returns the human
+// comments on it (node H gate) — every comment that is not looper's own signed note
+// and carries some text. Whether any of these is a real, unconditional approval is
+// judged by the LLM at the runtime layer (comments are passed through verbatim), not
+// by keyword matching here.
+func (g *Gateway) ListHumanSpecComments(ctx context.Context, projectID, pageURL string) ([]PageComment, error) {
 	pageID := PageIDFromURL(pageURL)
 	if pageID == "" {
-		return false, "", fmt.Errorf("planedoc: SpecApprovedOnPage cannot resolve page id from %q", pageURL)
+		return nil, fmt.Errorf("planedoc: ListHumanSpecComments cannot resolve page id from %q", pageURL)
 	}
 	comments, err := g.ListPageComments(ctx, projectID, pageID)
 	if err != nil {
-		return false, "", err
+		return nil, err
 	}
-	approved, by := DetectSpecApproval(comments)
-	return approved, by, nil
+	human := make([]PageComment, 0, len(comments))
+	for _, c := range comments {
+		text := strings.TrimSpace(c.CommentStripped)
+		if text == "" {
+			text = strings.TrimSpace(c.CommentHTML)
+		}
+		if text == "" || commentIsLoopers(c) {
+			continue // empty, or looper's own (signed) comment — not a human reply
+		}
+		human = append(human, c)
+	}
+	return human, nil
 }
 
 // projectLabel is a Plane project label (id + name), used to resolve a label name to
@@ -761,10 +773,6 @@ func SignComment(bodyHTML, runner, agent string) string {
 	return bodyHTML + "<p><i>" + htmlpkg.EscapeString(strings.Join(parts, " · ")) + "</i></p>"
 }
 
-// specApproveTokens are the phrases a human's reply may use to approve a tech spec.
-// Matched case-insensitively against the comment's stripped text.
-var specApproveTokens = []string{"approve", "lgtm", "同意", "通过", "批准", "👍", "ok 了", "可以了", "没问题"}
-
 // commentIsLoopers reports whether a page comment was posted by looper itself — it
 // carries the signature footer or the legacy marker (in either the stripped text or
 // the raw HTML).
@@ -775,29 +783,6 @@ func commentIsLoopers(c PageComment) bool {
 		}
 	}
 	return false
-}
-
-// DetectSpecApproval reports whether a HUMAN has approved the tech spec in these page
-// comments — the node H gate. A comment carrying LooperCommentMarker is looper's own
-// (its assist-review or status notes) and never counts; any other comment whose text
-// matches an approve token does. Returns the approver's display name for the record.
-func DetectSpecApproval(comments []PageComment) (approved bool, by string) {
-	for _, c := range comments {
-		text := strings.TrimSpace(c.CommentStripped)
-		if text == "" {
-			text = strings.TrimSpace(c.CommentHTML)
-		}
-		if text == "" || commentIsLoopers(c) {
-			continue // empty, or looper's own (signed) comment — not a human approval
-		}
-		low := strings.ToLower(text)
-		for _, tok := range specApproveTokens {
-			if strings.Contains(low, strings.ToLower(tok)) {
-				return true, strings.TrimSpace(c.DisplayName)
-			}
-		}
-	}
-	return false, ""
 }
 
 // decodePageComments unwraps either a bare array or a {results:[...]} envelope, the

@@ -17,7 +17,7 @@ func TestLoopSpecApprovalState(t *testing.T) {
 		{"issueURL alt casing", strPtr(`{"awaitingSpecApproval":true,"issueURL":"u2"}`), true, false, "u2"},
 	}
 	for _, tc := range cases {
-		a, d, u := loopSpecApprovalState(tc.meta)
+		a, d, u, _ := loopSpecApprovalState(tc.meta)
 		if a != tc.wantAwaiting || d != tc.wantDispatched || u != tc.wantIssueURL {
 			t.Fatalf("%s: got (%v,%v,%q); want (%v,%v,%q)", tc.name, a, d, u, tc.wantAwaiting, tc.wantDispatched, tc.wantIssueURL)
 		}
