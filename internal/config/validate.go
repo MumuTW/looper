@@ -249,7 +249,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	validateCoordinatorRoleConfig(config.Roles.Coordinator, "roles.coordinator", &issues)
 	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
-	validateNoIssueRoleTriggerLabelOverlap(config.Roles.Planner, config.Roles.Worker, &issues)
+	validateNoIssueRoleTriggerLabelOverlap(config.Roles.Planner, config.Roles.Worker, "", &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
 	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
@@ -377,6 +377,14 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
 		effectiveProjectRoles := ProjectRoleConfigs(config, project.ID)
+		// A project override can put the worker back on the planner label with
+		// requireAssigneeCurrentUser, recreating the double-dispatch the global guard
+		// prevents. Re-run the overlap check on the effective roles when this project
+		// actually overrides planner/worker (a plain project inherits the global roles
+		// already checked above, so skip it to avoid re-reporting a global overlap).
+		if project.Roles != nil && (project.Roles.Planner != nil || project.Roles.Worker != nil) {
+			validateNoIssueRoleTriggerLabelOverlap(effectiveProjectRoles.Planner, effectiveProjectRoles.Worker, prefix+".", &issues)
+		}
 		for _, roleInstruction := range roleInstructions(effectiveProjectRoles) {
 			if !projectRoleInstructionsConfigured(project.Roles, roleInstruction.role) {
 				continue
@@ -1060,7 +1068,11 @@ func validateDistinctLabels(labels []labelPathValue, issues *[]ValidationIssue) 
 // single-label lifecycle, where the planner and worker share one label on purpose
 // and route by assignee UUID rather than the current GitHub user — signalled by
 // RequireAssigneeCurrentUser being false on both roles (see applyPlaneBootstrapPlan).
-func validateNoIssueRoleTriggerLabelOverlap(planner PlannerRoleConfig, worker WorkerRoleConfig, issues *[]ValidationIssue) {
+// validateNoIssueRoleTriggerLabelOverlap flags a planner/worker trigger-label
+// overlap that would let one issue fire both roles. pathPrefix is "" for the global
+// roles and "projects[i]." for a project's effective (merged) roles, so a project
+// override that recreates the overlap is reported at a project-scoped path.
+func validateNoIssueRoleTriggerLabelOverlap(planner PlannerRoleConfig, worker WorkerRoleConfig, pathPrefix string, issues *[]ValidationIssue) {
 	// Plane lifecycle: both roles keyed off one label, routed by assignee UUID, not
 	// the GitHub current-user filter. That shared label is intended, not a bug.
 	if !planner.Triggers.RequireAssigneeCurrentUser && !worker.Triggers.RequireAssigneeCurrentUser {
@@ -1079,8 +1091,8 @@ func validateNoIssueRoleTriggerLabelOverlap(planner PlannerRoleConfig, worker Wo
 		}
 		if _, ok := plannerLabels[trimmed]; ok {
 			*issues = append(*issues, ValidationIssue{
-				Path:    fmt.Sprintf("roles.worker.triggers.labels[%d]", index),
-				Message: fmt.Sprintf("overlaps roles.planner.triggers.labels: %q would trigger both the planner and the worker for one issue", trimmed),
+				Path:    fmt.Sprintf("%sroles.worker.triggers.labels[%d]", pathPrefix, index),
+				Message: fmt.Sprintf("overlaps %sroles.planner.triggers.labels: %q would trigger both the planner and the worker for one issue", pathPrefix, trimmed),
 			})
 		}
 	}

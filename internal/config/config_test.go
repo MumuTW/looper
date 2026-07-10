@@ -2928,6 +2928,34 @@ func TestValidateRejectsPlannerWorkerTriggerLabelOverlap(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsPlannerWorkerTriggerLabelOverlapInProjectOverride(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	// Global roles do NOT overlap (planner=looper:plan, worker=looper:worker-ready), so
+	// the global guard passes. A PROJECT override then puts the worker back on the
+	// planner label while assignee routing stays on (inherited) — recreating the
+	// double-dispatch the guard prevents, but only in this project's effective roles.
+	cfg.Projects = append(cfg.Projects, ProjectRefConfig{
+		ID:       "overlap",
+		Name:     "Overlap",
+		Repo:     "acme/looper",
+		RepoPath: t.TempDir(),
+		Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{
+			Triggers: &PartialIssueRoleTriggersConfig{Labels: &[]string{"looper:plan"}},
+		}},
+	})
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want project-scoped overlap failure")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "projects[0].roles.worker.triggers.labels") ||
+		!strings.Contains(msg, "overlaps projects[0].roles.planner.triggers.labels") {
+		t.Fatalf("ValidateWithOptions() error = %v, want project-scoped planner/worker overlap path", err)
+	}
+}
+
 func TestValidateAllowsSharedTriggerLabelForPlaneAssigneeRouting(t *testing.T) {
 	cfg, err := DefaultConfig(t.TempDir())
 	if err != nil {
