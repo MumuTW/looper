@@ -3025,7 +3025,7 @@ func TestHandlerCreateLoopRejectsUnsupportedLoopType(t *testing.T) {
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	errMap := body["error"].(map[string]any)
 	assertEqual(t, errMap["code"], "VALIDATION_FAILED")
-	assertEqual(t, errMap["message"], "loop.type must be one of: planner, reviewer, worker, fixer")
+	assertEqual(t, errMap["message"], "loop.type must be one of: planner, reviewer, worker, fixer, coordinator")
 
 	loops, err := fixture.runtime.Services().Repositories.Loops.List(context.Background())
 	if err != nil {
