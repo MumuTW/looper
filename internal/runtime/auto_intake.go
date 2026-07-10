@@ -42,6 +42,12 @@ const (
 	autoIntakeEnvVar = "LOOPER_PLANE_AUTO_INTAKE"
 )
 
+// maxAutoIntakeClassificationsPerTick bounds how many FRESH looper:auto items are
+// classified (one agent run each) per reconcile tick, so a burst of newly-labelled
+// items drains over several ticks instead of running classifications back-to-back and
+// blocking the tick loop. Already-routed/held items are cheap and never counted.
+const maxAutoIntakeClassificationsPerTick = 3
+
 // intakeRoute is the next action for a looper:auto item after classification.
 type intakeRoute int
 
@@ -172,7 +178,16 @@ func (r *Runtime) reconcileAutoIntakeProject(ctx context.Context, cfg *config.Co
 		}
 		return
 	}
-	items, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: []string{autoLabel}})
+	// Partition by assignee, the SAME key the worker discovers on (planeAssigneeId), so
+	// when several people run looper on one Plane project each daemon only classifies
+	// its OWN assigned looper:auto items — no duplicate classification, no racing to
+	// stamp labels/threads, no N× agent burn. Empty means "classify everything", which
+	// is only safe for a single-tenant deploy, so warn.
+	assignee := strings.TrimSpace(config.ProjectRoleConfigs(*cfg, project.ID).Worker.Triggers.PlaneAssigneeID)
+	if assignee == "" && logger != nil {
+		logger.Warn("auto-intake: no roles.worker.triggers.planeAssigneeId set — classifying ALL looper:auto items; unsafe when multiple people run looper on the same project", map[string]any{"projectId": project.ID})
+	}
+	items, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: []string{autoLabel}, Assignee: assignee})
 	if err != nil {
 		if logger != nil {
 			logger.Warn("auto-intake: list looper:auto items failed", map[string]any{"projectId": project.ID, "error": err.Error()})
@@ -180,14 +195,16 @@ func (r *Runtime) reconcileAutoIntakeProject(ctx context.Context, cfg *config.Co
 		return
 	}
 	if logger != nil {
-		logger.Info("auto-intake: listed items", map[string]any{"projectId": project.ID, "planeProjectId": planeProjectID, "count": len(items)})
+		logger.Info("auto-intake: listed items", map[string]any{"projectId": project.ID, "planeProjectId": planeProjectID, "count": len(items), "assignee": assignee})
 	}
+	// Bound fresh classifications this tick; leftovers drain on the next one.
+	classifyBudget := maxAutoIntakeClassificationsPerTick
 	for _, item := range items {
-		r.reconcileAutoIntakeItem(ctx, gateway, client, planeProjectID, project, item, llm, logger, now)
+		r.reconcileAutoIntakeItem(ctx, gateway, client, planeProjectID, project, item, llm, logger, now, &classifyBudget)
 	}
 }
 
-func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc.Gateway, client *forge.PlaneClient, planeProjectID string, project config.ProjectRefConfig, item forge.Issue, llm triage.LLM, logger bootstrap.Logger, now func() time.Time) {
+func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc.Gateway, client *forge.PlaneClient, planeProjectID string, project config.ProjectRefConfig, item forge.Issue, llm triage.LLM, logger bootstrap.Logger, now func() time.Time, classifyBudget *int) {
 	names := labelNames(item.Labels)
 	// Already routed into the pipeline — nothing to do.
 	if labelsContainFold(names, planTriggerLabel) || labelsContainFold(names, workerReadyLabel) {
@@ -213,6 +230,19 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 		_ = gateway.RemoveWorkItemLabel(ctx, planeProjectID, workItemID, intakeAwaitingProductLabel)
 		r.routeIntake(ctx, gateway, planeProjectID, workItemID, planTriggerLabel, "<p>✅ product spec 已补齐,进入技术方案(planner)。</p>", logger, project.ID, item.Number)
 		return
+	}
+
+	// Per-tick classification cap: a fresh item beyond this tick's budget waits for the
+	// next tick, so a burst of freshly-labelled items can't run an unbounded number of
+	// classification agents back-to-back and stall the reconcile loop.
+	if classifyBudget != nil {
+		if *classifyBudget <= 0 {
+			if logger != nil {
+				logger.Info("auto-intake: per-tick classification cap reached — deferring item to next tick", map[string]any{"projectId": project.ID, "item": item.Number})
+			}
+			return
+		}
+		*classifyBudget--
 	}
 
 	// Fresh looper:auto item — classify once (flowchart node A/B). Open the shared

@@ -98,6 +98,41 @@ func TestPlaneListOpenIssuesMapsAndFiltersByLabel(t *testing.T) {
 	}
 }
 
+func TestPlaneListOpenIssuesFiltersByAssignee(t *testing.T) {
+	t.Parallel()
+	server, _ := planeTestServer(t)
+	client := newPlaneTestClient(t, server)
+
+	// Filtering by an assignee returns only work items assigned to that user — the
+	// partition key auto-intake uses so each person's looper classifies only its own.
+	mine, err := client.ListOpenIssues(context.Background(), ListIssuesInput{Assignee: "user-uuid-1"})
+	if err != nil {
+		t.Fatalf("ListOpenIssues(assignee) error = %v", err)
+	}
+	if len(mine) == 0 {
+		t.Fatal("ListOpenIssues(assignee=user-uuid-1) returned 0, want the assigned item(s)")
+	}
+	for _, is := range mine {
+		found := false
+		for _, a := range is.Assignees {
+			if a.Login == "user-uuid-1" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("issue #%d assignees = %+v, want to include user-uuid-1", is.Number, is.Assignees)
+		}
+	}
+	// An assignee nobody is assigned to yields nothing.
+	none, err := client.ListOpenIssues(context.Background(), ListIssuesInput{Assignee: "nobody-uuid"})
+	if err != nil {
+		t.Fatalf("ListOpenIssues(assignee=nobody) error = %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("ListOpenIssues(assignee=nobody-uuid) returned %d, want 0", len(none))
+	}
+}
+
 func TestPlaneViewIssueResolvesBySequenceID(t *testing.T) {
 	t.Parallel()
 	server, _ := planeTestServer(t)
