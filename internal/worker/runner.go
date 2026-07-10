@@ -3735,7 +3735,18 @@ func buildAgentPullRequestInstruction(work workerInput, providerKind config.Prov
 		parts[3] = "Open the pull request READY FOR REVIEW, not as a draft: the spec was already reviewed and human-approved before you were dispatched, so reviewers must be able to pick this PR up immediately. Do NOT pass `--draft` to `gh pr create`; if a draft already exists for this branch, mark it ready with `gh pr ready`."
 	}
 	if work.IssueNumber > 0 {
-		parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
+		if issueIsNonGitHub(work.IssueURL) {
+			// The task comes from an external tracker (e.g. a Plane work item) whose id is
+			// NOT a GitHub issue number — a "Closes #<n>" would auto-close an unrelated
+			// GitHub issue on merge. Steer the agent away from it and give the real ref.
+			ref := strings.TrimSpace(work.IssueURL)
+			if ref == "" {
+				ref = strings.TrimSpace(work.Title)
+			}
+			parts = append(parts, fmt.Sprintf("This task comes from an external tracker, not a GitHub issue: %s. Do NOT add a `Closes #<n>` / `Fixes #<n>` line — that number is not a GitHub issue. Reference the source by its URL instead.", ref))
+		} else {
+			parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
+		}
 	}
 	if work.ExecutionMode == "push-existing" {
 		parts = append(parts, "If the existing PR title still has the planner/spec-generated `Spec: ...` format after implementation is pushed, rename it to an implementation-oriented title; preserve human-edited titles.")

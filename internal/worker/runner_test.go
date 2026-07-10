@@ -1205,6 +1205,25 @@ func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
 	}
 }
 
+func TestBuildAgentPullRequestInstructionOmitsClosesForPlaneSource(t *testing.T) {
+	t.Parallel()
+	// The agent opens the PR itself; the instruction must not tell it to write
+	// "Closes #<planeSeq>" — that number is not a GitHub issue and would auto-close a
+	// stranger's #N on merge (seen on looper-hitl-e2e PR #27 "Closes #1373").
+	planeURL := "https://plane.powerformer.net/open-design/projects/49832a02/issues/2d282842"
+	work := workerInput{Repo: "lefarcen/looper-hitl-e2e", IssueNumber: 1373, IssueURL: planeURL, Title: "Add AUTO-B.md note"}
+	instr := buildAgentPullRequestInstruction(work, config.ProviderKindPlane)
+	if strings.Contains(instr, "Include `Closes") {
+		t.Fatalf("instruction = %q, want no positive Closes instruction for a Plane-sourced item", instr)
+	}
+	if !strings.Contains(instr, "Do NOT add a `Closes") {
+		t.Fatalf("instruction = %q, want an explicit no-Closes note", instr)
+	}
+	if !strings.Contains(instr, planeURL) {
+		t.Fatalf("instruction = %q, want the Plane URL as the reference", instr)
+	}
+}
+
 func TestHydrateWorkerInputFromIssueUsesSourceIssueURLWhenIssueURLMissing(t *testing.T) {
 	t.Parallel()
 	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27, IssueURL: "https://github.com/nexu-io/looper/issues/27"}, IssueDetail{Number: 27, Title: "Issue title"})
