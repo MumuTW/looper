@@ -214,6 +214,16 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	if labelsContainFold(names, intakeOutOfScopeLabel) || labelsContainFold(names, intakeNeedsHumanLabel) {
 		return
 	}
+	// Already in the pipeline: a coordinator/planner/worker loop for this item exists.
+	// looper:auto is a durable peer trigger that stays on the item for its whole life,
+	// so once a routing label is retired mid-flight (e.g. the planner drops looper:plan
+	// while the spec awaits human approval) the item would otherwise look "fresh" and
+	// get re-classified, clobbering the in-flight work. The loop is the source of truth.
+	if repos := r.services.Repositories; repos != nil && repos.Loops != nil {
+		if existing, err := repos.Loops.GetByTargetID(ctx, fmt.Sprintf("issue:%s:%d", project.Repo, item.Number)); err == nil && existing != nil {
+			return
+		}
+	}
 	workItemID := planedoc.WorkItemIDFromURL(item.HTMLURL)
 	if workItemID == "" {
 		return
