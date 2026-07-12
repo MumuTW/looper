@@ -167,6 +167,55 @@ func TestPlaneCurrentUserIdentity(t *testing.T) {
 	}
 }
 
+func TestStripHTMLTagsPreservesImages(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "img with src and alt becomes markdown",
+			in:   `<p>See <img src="https://plane.test/a.png" alt="the bug"> here</p>`,
+			want: "See\n![the bug](https://plane.test/a.png)\n here",
+		},
+		{
+			name: "img without alt keeps the url",
+			in:   `<img src="https://plane.test/b.jpg">`,
+			want: "![](https://plane.test/b.jpg)",
+		},
+		{
+			name: "single-quoted attrs and reversed order",
+			in:   `<img alt='shot' src='https://plane.test/c.png'/>`,
+			want: "![shot](https://plane.test/c.png)",
+		},
+		{
+			name: "escaped ampersands in url are unescaped",
+			in:   `<img src="https://plane.test/d.png?a=1&amp;b=2">`,
+			want: "![](https://plane.test/d.png?a=1&b=2)",
+		},
+		{
+			name: "img with no src is dropped",
+			in:   `before<img alt="broken">after`,
+			want: "beforeafter",
+		},
+		{
+			name: "plain text still strips other tags",
+			in:   `<p>Hello <b>world</b></p>`,
+			want: "Hello world",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := stripHTMLTags(tc.in); got != tc.want {
+				t.Fatalf("stripHTMLTags(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPlaneCapabilitiesAndKind(t *testing.T) {
 	t.Parallel()
 	server, _ := planeTestServer(t)

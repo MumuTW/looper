@@ -574,16 +574,41 @@ var (
 	planeAPIVersionSuffix = regexp.MustCompile(`/api/v\d+/?$`)
 	planeHTMLTagPattern   = regexp.MustCompile(`</?[A-Za-z][^>]*>`)
 	planeBlockCloseTag    = regexp.MustCompile(`(?i)</(p|div|br|li|h[1-6]|tr)\s*>`)
+	planeImgTag           = regexp.MustCompile(`(?i)<img\b[^>]*>`)
+	planeAttrSrc          = regexp.MustCompile(`(?i)\bsrc\s*=\s*("[^"]*"|'[^']*')`)
+	planeAttrAlt          = regexp.MustCompile(`(?i)\balt\s*=\s*("[^"]*"|'[^']*')`)
 )
 
+// htmlAttrValue extracts the (quote-stripped) value of the first attribute the
+// regex matches inside an HTML tag, or "" if the attribute is absent.
+func htmlAttrValue(re *regexp.Regexp, tag string) string {
+	m := re.FindStringSubmatch(tag)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.Trim(m[1], `"'`)
+}
+
 // stripHTMLTags converts Plane's description_html / comment_html into plain text:
+// <img> tags are preserved as Markdown image references (![alt](src)) so the
+// image URL and alt text survive for a downstream agent to fetch/inspect,
 // block-closing tags become newlines, all other tags are dropped, and HTML
 // entities are unescaped. It is intentionally conservative (no sanitizer dep).
 func stripHTMLTags(input string) string {
 	if strings.TrimSpace(input) == "" {
 		return ""
 	}
-	text := planeBlockCloseTag.ReplaceAllString(input, "\n")
+	// Preserve inline images before the generic tag-strip below discards them.
+	// Without this, <img> is dropped whole and the agent goes blind to any
+	// screenshot or diagram embedded in a Plane description/comment.
+	text := planeImgTag.ReplaceAllStringFunc(input, func(tag string) string {
+		src := htmlAttrValue(planeAttrSrc, tag)
+		if strings.TrimSpace(src) == "" {
+			return ""
+		}
+		return "\n![" + htmlAttrValue(planeAttrAlt, tag) + "](" + src + ")\n"
+	})
+	text = planeBlockCloseTag.ReplaceAllString(text, "\n")
 	text = planeHTMLTagPattern.ReplaceAllString(text, "")
 	text = html.UnescapeString(text)
 	// Collapse runs of 3+ newlines to at most 2 and trim surrounding whitespace.
