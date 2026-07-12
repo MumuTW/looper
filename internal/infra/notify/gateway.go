@@ -112,11 +112,25 @@ type Gateway struct {
 	// silent drop and not a spammed one.
 	closedFollowupMu sync.Mutex
 	closedFollowup   map[string]struct{}
+	// intakeOutcomes overrides a loop's anchor header with the classification's
+	// routing outcome. The coordinator (looper:auto) anchor never re-renders itself
+	// — completeIntakeAnchor delegated that to the downstream planner/worker loop,
+	// which never runs for a parked item — so its "🧭 分类中" header would freeze.
+	// FinalizeIntakeAnchor records the terminal/bridge label here (keyed by the
+	// coordinator loop id) so the shared task card retires to a meaningful state.
+	intakeMu       sync.Mutex
+	intakeOutcomes map[string]anchorOutcomeStyle
 }
 
 type askCardState struct {
 	msgID string
 	card  HITLAskCard
+}
+
+// anchorOutcomeStyle is a header colour+label override for a retired anchor card.
+type anchorOutcomeStyle struct {
+	template string
+	label    string
 }
 
 func NewGateway(options Options) *Gateway {
@@ -1296,6 +1310,12 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 			template, label = t, l
 		}
 	}
+	// A retired looper:auto anchor (parked or routed) wins over the generic
+	// role/status label, so the shared task card retires to its real outcome
+	// instead of freezing on "🧭 分类中". Set only for the coordinator loop id.
+	if style, ok := g.anchorOutcomeOverride(loopID); ok {
+		template, label = style.template, style.label
+	}
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
 		"header":   map[string]any{"template": template, "title": map[string]any{"tag": "plain_text", "content": label}},
@@ -1721,6 +1741,60 @@ func (g *Gateway) RefreshThreadHeader(ctx context.Context, loopID string, tail [
 	// Anchor (topic root) → human brief; live tool feed → its own reply in-thread.
 	g.updateFeishuThreadHeader(ctx, token, loopID)
 	g.updateLiveFeedComment(ctx, token, loopID, tail, elapsedSec)
+}
+
+// FinalizeIntakeAnchor retires a looper:auto classification's shared task anchor to
+// a header that reflects the routing OUTCOME, then re-renders it. Without this the
+// coordinator anchor freezes on "🧭 分类中": completeIntakeAnchor never refreshes it
+// and, for a parked item (needs-human / out-of-scope / awaiting-product), no
+// downstream loop ever runs to take the anchor over. For a routed item the label is
+// a bridge the planner/worker overwrites with its own phase once it renders. outcome
+// is one of routed_plan | routed_worker | hold_product | needs_human | out_of_scope;
+// an unknown outcome just refreshes to the loop's real status. App-mode + best-effort.
+func (g *Gateway) FinalizeIntakeAnchor(ctx context.Context, loopID, outcome string) {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" {
+		return
+	}
+	if style, ok := intakeOutcomeStyle(outcome); ok {
+		g.intakeMu.Lock()
+		if g.intakeOutcomes == nil {
+			g.intakeOutcomes = map[string]anchorOutcomeStyle{}
+		}
+		g.intakeOutcomes[loopID] = style
+		g.intakeMu.Unlock()
+	}
+	g.RefreshThreadHeader(ctx, loopID, nil, 0)
+}
+
+// intakeOutcomeStyle maps a routing outcome to the anchor header colour + label.
+func intakeOutcomeStyle(outcome string) (anchorOutcomeStyle, bool) {
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "routed_plan":
+		return anchorOutcomeStyle{"blue", "➡️ 已派发 · 写技术方案"}, true
+	case "routed_worker":
+		return anchorOutcomeStyle{"blue", "➡️ 已派发 · 待实现"}, true
+	case "hold_product":
+		return anchorOutcomeStyle{"orange", "⏸ 等待产品方案"}, true
+	case "needs_human":
+		return anchorOutcomeStyle{"orange", "🙋 转人工确认"}, true
+	case "out_of_scope":
+		return anchorOutcomeStyle{"grey", "🚫 超出范围(已标记)"}, true
+	default:
+		return anchorOutcomeStyle{}, false
+	}
+}
+
+// anchorOutcomeOverride returns the retired-anchor header override for a loop, if
+// FinalizeIntakeAnchor recorded one.
+func (g *Gateway) anchorOutcomeOverride(loopID string) (anchorOutcomeStyle, bool) {
+	g.intakeMu.Lock()
+	defer g.intakeMu.Unlock()
+	if g.intakeOutcomes == nil {
+		return anchorOutcomeStyle{}, false
+	}
+	style, ok := g.intakeOutcomes[strings.TrimSpace(loopID)]
+	return style, ok
 }
 
 // updateLiveFeedComment posts (first time) or patches (thereafter) the raw

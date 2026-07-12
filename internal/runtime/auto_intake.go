@@ -261,7 +261,11 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	// the classification isn't a black box: 🧭 分类中 → its verdict + reasoning →
 	// 实现中 (the worker joins the same task-keyed anchor).
 	coordLoopID := r.createIntakeAnchor(ctx, project, item, logger)
-	defer r.completeIntakeAnchor(ctx, coordLoopID)
+	// route is resolved below; the defer captures its final value so the shared task
+	// anchor retires to the routing outcome (parked → 转人工/超范围/等产品方案;
+	// routed → a bridge the downstream loop overwrites) instead of freezing on 分类中.
+	route := intakeSkip
+	defer func() { r.completeIntakeAnchor(ctx, coordLoopID, route) }()
 
 	comments := intakeComments(ctx, client, item.Number)
 	decision := triage.Decide(ctx, llm, triage.Input{
@@ -279,7 +283,7 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	})
 
 	present, _, _ := gateway.HasProductSpec(ctx, planeProjectID, workItemID)
-	route := decideAutoIntakeRoute(decision, present)
+	route = decideAutoIntakeRoute(decision, present)
 
 	// Post the verdict + reasoning into the shared task thread BEFORE routing, so
 	// "why simple bug / why no spec" is transparent and interruptible (HITL).
@@ -415,14 +419,36 @@ func (r *Runtime) postIntakeReasoning(ctx context.Context, coordLoopID string, d
 }
 
 // completeIntakeAnchor retires the card-anchor coordinator loop once routing is done
-// (the downstream planner/worker loop takes over the same anchor). It does NOT refresh
-// the card, so the header stays on its last phase until the downstream loop re-renders
-// it. Best-effort.
-func (r *Runtime) completeIntakeAnchor(ctx context.Context, coordLoopID string) {
+// and repaints the shared task anchor to the routing OUTCOME. A parked item (needs
+// human / out-of-scope / awaiting product) has no downstream loop to take the anchor
+// over, so without this repaint its header would freeze on "🧭 分类中"; a routed item
+// gets a bridge label the planner/worker overwrites once it renders. Best-effort.
+func (r *Runtime) completeIntakeAnchor(ctx context.Context, coordLoopID string, route intakeRoute) {
 	if coordLoopID == "" || r.services.Loops == nil {
 		return
 	}
 	_, _ = r.services.Loops.TransitionStatus(ctx, coordLoopID, loops.TransitionInput{Status: domain.LoopStatusCompleted})
+	if gw, ok := r.shepherdNotifyGateway(); ok {
+		gw.FinalizeIntakeAnchor(ctx, coordLoopID, intakeOutcomeKey(route))
+	}
+}
+
+// intakeOutcomeKey names the anchor outcome for a routing decision (see
+// notify.FinalizeIntakeAnchor), so a retired looper:auto anchor shows where the task
+// went instead of freezing on 分类中.
+func intakeOutcomeKey(route intakeRoute) string {
+	switch route {
+	case intakeRouteToPlan:
+		return "routed_plan"
+	case intakeRouteToImplement:
+		return "routed_worker"
+	case intakeHoldForProductSpec:
+		return "hold_product"
+	case intakeMarkOutOfScope:
+		return "out_of_scope"
+	default: // intakeHoldUnclear, intakeSkip
+		return "needs_human"
+	}
 }
 
 func intakeComments(ctx context.Context, client *forge.PlaneClient, number int64) []triage.Comment {

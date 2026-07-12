@@ -517,6 +517,57 @@ func TestFeishuLoopFlowchartStyle(t *testing.T) {
 	}
 }
 
+func TestIntakeOutcomeStyle(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		outcome  string
+		ok       bool
+		template string
+		contains string
+	}{
+		{"routed_plan", true, "blue", "写技术方案"},
+		{"routed_worker", true, "blue", "待实现"},
+		{"hold_product", true, "orange", "等待产品方案"},
+		{"needs_human", true, "orange", "转人工"},
+		{"out_of_scope", true, "grey", "超出范围"},
+		{"OUT_OF_SCOPE", true, "grey", "超出范围"}, // case-insensitive
+		{"unknown", false, "", ""},
+		{"", false, "", ""},
+	}
+	for _, tc := range cases {
+		got, ok := intakeOutcomeStyle(tc.outcome)
+		if ok != tc.ok {
+			t.Fatalf("intakeOutcomeStyle(%q) ok = %v, want %v", tc.outcome, ok, tc.ok)
+		}
+		if !tc.ok {
+			continue
+		}
+		if got.template != tc.template || !strings.Contains(got.label, tc.contains) {
+			t.Fatalf("intakeOutcomeStyle(%q) = (%q,%q); want template %q label~%q", tc.outcome, got.template, got.label, tc.template, tc.contains)
+		}
+	}
+}
+
+func TestAnchorOutcomeOverrideRoundTrip(t *testing.T) {
+	t.Parallel()
+	g := &Gateway{}
+	if _, ok := g.anchorOutcomeOverride("loop-x"); ok {
+		t.Fatal("no override should exist before FinalizeIntakeAnchor")
+	}
+	// FinalizeIntakeAnchor with app-bot unconfigured still records the override (the
+	// RefreshThreadHeader tail no-ops), so the next render picks it up.
+	g.FinalizeIntakeAnchor(context.Background(), "loop-x", "needs_human")
+	style, ok := g.anchorOutcomeOverride("loop-x")
+	if !ok || !strings.Contains(style.label, "转人工") {
+		t.Fatalf("anchorOutcomeOverride(loop-x) = (%+v,%v); want the 转人工 override", style, ok)
+	}
+	// An unknown outcome records nothing (falls through to the loop's real status).
+	g.FinalizeIntakeAnchor(context.Background(), "loop-y", "mystery")
+	if _, ok := g.anchorOutcomeOverride("loop-y"); ok {
+		t.Fatal("an unknown outcome must not record an override")
+	}
+}
+
 func TestPRCardStateFromSnapshotMapsReviewCycle(t *testing.T) {
 	cases := []struct {
 		name       string

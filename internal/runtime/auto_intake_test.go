@@ -88,6 +88,26 @@ func TestLabelsContainFold(t *testing.T) {
 	}
 }
 
+func TestIntakeOutcomeKey(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		route intakeRoute
+		want  string
+	}{
+		{intakeRouteToPlan, "routed_plan"},
+		{intakeRouteToImplement, "routed_worker"},
+		{intakeHoldForProductSpec, "hold_product"},
+		{intakeMarkOutOfScope, "out_of_scope"},
+		{intakeHoldUnclear, "needs_human"},
+		{intakeSkip, "needs_human"},
+	}
+	for _, tc := range cases {
+		if got := intakeOutcomeKey(tc.route); got != tc.want {
+			t.Fatalf("intakeOutcomeKey(%d) = %q, want %q", tc.route, got, tc.want)
+		}
+	}
+}
+
 func TestAutoIntakeEnabledGate(t *testing.T) {
 	t.Setenv(autoIntakeEnvVar, "")
 	if autoIntakeEnabled() {
