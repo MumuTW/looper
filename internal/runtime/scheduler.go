@@ -2132,6 +2132,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
 		PostThreadNote: notificationGateway.PostThreadNote,
+		PostThreadCard: notificationGateway.PostThreadDecisionCard,
 	})
 	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
 		Repos:   repos,

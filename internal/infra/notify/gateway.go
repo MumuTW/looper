@@ -2041,6 +2041,56 @@ func (g *Gateway) PostThreadNote(ctx context.Context, loopID, text string, menti
 	return nil
 }
 
+// PostThreadDecisionCard posts a node-H product-decision ask into a loop's Feishu
+// thread as a header-LESS interactive card, so the product-language body keeps its
+// structure — bold sub-headers, blank lines between sections, one option per line —
+// instead of collapsing into a flat wall of text (a plain "text" message renders no
+// markdown). The card has no title bar on purpose: it should read as a threaded note,
+// not a banner. @-mentions the product owner via the card <at id=..> form. No-op unless
+// the app transport is configured and the loop already has a thread root.
+func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body string, mentionOpenIDs []string) error {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" || strings.TrimSpace(body) == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+		return nil
+	}
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	if appID == "" || appSecret == "" {
+		return nil
+	}
+	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return err
+	}
+	root := g.threadRootForLoop(ctx, loopID)
+	chatID := strings.TrimSpace(cfg.ChatID)
+	if strings.TrimSpace(root) == "" || chatID == "" {
+		return nil
+	}
+	lead := "🙋 这个需求有个地方需要你来拍板 —— 直接在本 thread 回复你的选择就行,我会据此更新方案。"
+	if mention := feishuMentionMarkup(mentionOpenIDs); mention != "" {
+		lead = mention + " " + lead
+	}
+	card := map[string]any{
+		"config": map[string]any{"wide_screen_mode": true},
+		"elements": []any{
+			larkDiv(lead),
+			map[string]any{"tag": "hr"},
+			larkDiv(strings.TrimSpace(body)),
+		},
+	}
+	cardJSON, err := json.Marshal(card)
+	if err != nil {
+		return err
+	}
+	if _, err := g.postFeishuAppMessage(ctx, token, chatID, root, "interactive", string(cardJSON)); err != nil {
+		return err
+	}
+	g.updateFeishuThreadHeader(ctx, token, loopID)
+	return nil
+}
+
 // patchFeishuAppCard updates an already-sent interactive card in place.
 func (g *Gateway) patchFeishuAppCard(ctx context.Context, token, messageID, content string) error {
 	apiURL := feishuAPIBase + "/open-apis/im/v1/messages/" + strings.TrimSpace(messageID)

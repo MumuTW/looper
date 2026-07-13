@@ -322,7 +322,12 @@ type Options struct {
 	OnQueueItemEnqueued     func()
 	// PostThreadNote posts a plain-text reply into a loop's Feishu thread (node H
 	// touchpoints: spec-draft FYI, grill transcript), optionally @-mentioning open_ids.
-	PostThreadNote  func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
+	PostThreadNote func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
+	// PostThreadCard posts a header-less interactive card into a loop's Feishu thread —
+	// used for the node-H product-decision ask so the product-language body renders with
+	// structure (bold sub-headers, line breaks) instead of a flat text wall. Falls back
+	// to PostThreadNote when unset (e.g. tests).
+	PostThreadCard  func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
 	DiscoveryPolicy DiscoveryPolicy
 	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
 	// project whose task source is Plane (§8 flowchart). nil / (…,false) → the
@@ -363,6 +368,7 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	postThreadNote          func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
+	postThreadCard          func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
 	discoveryPolicy         DiscoveryPolicy
 	planeDoc                PlaneDocResolver
 }
@@ -527,7 +533,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, postThreadCard: options.PostThreadCard, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -1014,7 +1020,7 @@ func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.
 // resolved per-project from config (never hardcoded); a missing transport just skips
 // and an unset owner posts without a mention. Best-effort.
 func (r *Runner) requestProductDecisionInThread(ctx context.Context, input stepInput, productAsk string) {
-	if r.postThreadNote == nil {
+	if r.postThreadCard == nil && r.postThreadNote == nil {
 		return
 	}
 	var mentions []string
@@ -1022,6 +1028,16 @@ func (r *Runner) requestProductDecisionInThread(ctx context.Context, input stepI
 		if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
 			mentions = []string{openID}
 		}
+	}
+	// Prefer a header-less lark_md card so the product-language body keeps its structure
+	// (bold sub-headers, blank lines, one option per line); a plain "text" message would
+	// render none of it and collapse to a wall. Fall back to a text note only when the
+	// card path isn't wired (e.g. tests).
+	if r.postThreadCard != nil {
+		if err := r.postThreadCard(ctx, input.Loop.ID, strings.TrimSpace(productAsk), mentions); err != nil && r.logger != nil {
+			r.logger.Warn("planner: post product-decision card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+		}
+		return
 	}
 	note := "🙋 这个需求有个地方需要你来拍板 —— 直接在本 thread 回复你的选择就行,我会据此更新方案:\n\n" + strings.TrimSpace(productAsk)
 	if err := r.postThreadNote(ctx, input.Loop.ID, note, mentions); err != nil && r.logger != nil {
@@ -1099,10 +1115,23 @@ As you write the spec, sort every open question into PRODUCT vs TECHNICAL.
 - TECHNICAL (which library, how to structure the code, a data shape, error handling, an internal name, anything a competent engineer can just pick): DECIDE it yourself, note it in the spec, and do NOT escalate.
 - PRODUCT: a decision only the product owner can make — it changes what the user sees or can do, the product's scope/behavior, or hinges on business intent, a user-facing tradeoff, or an unstated requirement.
 
-ONLY when at least one real PRODUCT decision genuinely needs the product owner to choose, ALSO emit a "productAsk" field in your final __LOOPER_RESULT__ line: ONE message written FOR the product owner, in the product owner's own language (match the language of the issue/thread), structured EXACTLY as three parts:
-  ① 背景: which user/customer asked for what, and why it matters — one or two sentences.
-  ② 现状: what is already decided or known, so they don't re-litigate it.
-  ③ 问题 + 选项 + 建议: for each product decision, ask it in plain words, give 2–3 plain-language options, and state your recommendation.
+ONLY when at least one real PRODUCT decision genuinely needs the product owner to choose, ALSO emit a "productAsk" field in your final __LOOPER_RESULT__ line: ONE message written FOR the product owner, in the product owner's own language (match the language of the issue/thread).
+
+FORMATTING — this message is shown as a Feishu card, so it MUST be structured, never one long paragraph. Use lark-markdown: **bold** for every sub-header and for the recommended option; a BLANK LINE between sections; and put each option on ITS OWN line. Do NOT use "#" headers (use **bold** instead). Lay it out EXACTLY like this (keep the bold sub-headers verbatim):
+
+**背景**
+<one or two sentences: which user/customer asked for what, and why it matters>
+
+**现状**
+<what is already decided or known, so they don't re-litigate it — one short paragraph>
+
+**需要你拍板**
+<for EACH product decision, a block shaped like:>
+**问题一:<the question in plain words>**
+- 选项A:<plain-language option>
+- 选项B:<plain-language option>
+- 建议:**<your pick>** —— <one short line of why>
+<blank line, then 问题二 the same way if there is a second decision>
 
 Hard rules for productAsk:
   - Write like a product manager briefing a business stakeholder, NOT like an engineer. Someone who cannot read code must be able to decide from it alone.
@@ -1110,8 +1139,8 @@ Hard rules for productAsk:
   - Put everything needed to decide INSIDE the message. Do NOT include a spec link or tell them to go read the spec.
   - If there is NO product decision (only technical questions, which you resolved yourself), set productAsk to "" — never invent one.
 
-Your final marker line then carries the extra field:
-__LOOPER_RESULT__={"summary":"<one-sentence summary>","productAsk":"<the product-language message, or empty>"}`
+The productAsk value is a JSON string, so encode the line breaks as \n (a blank line between sections is \n\n). Your final marker line carries the extra field:
+__LOOPER_RESULT__={"summary":"<one-sentence summary>","productAsk":"<the product-language message with \n line breaks, or empty>"}`
 
 func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
 	checkpoint := input.Checkpoint
