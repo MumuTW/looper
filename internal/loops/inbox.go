@@ -52,6 +52,36 @@ func ClearHumanInbox(metadataJSON *string) (string, error) {
 	return marshalWithHumanInbox(metadataJSON, nil)
 }
 
+// RemoveHumanMessages drops exactly the given messages (matched by At+Text) from the
+// queued human messages, preserving any others — crucially, any that arrived AFTER the
+// drained set was read (e.g. a message a human sent WHILE the agent was mid-run). Those
+// must stay queued for a follow-up turn instead of being silently eaten when the run
+// that never saw them clears the inbox. Duplicates are matched one-for-one.
+func RemoveHumanMessages(metadataJSON *string, drained []HumanMessage) (string, error) {
+	current := ReadHumanInbox(metadataJSON)
+	if len(drained) == 0 || len(current) == 0 {
+		return marshalWithHumanInbox(metadataJSON, current)
+	}
+	remove := make(map[string]int, len(drained))
+	for _, m := range drained {
+		remove[humanMessageKey(m)]++
+	}
+	kept := make([]HumanMessage, 0, len(current))
+	for _, m := range current {
+		k := humanMessageKey(m)
+		if remove[k] > 0 {
+			remove[k]--
+			continue
+		}
+		kept = append(kept, m)
+	}
+	return marshalWithHumanInbox(metadataJSON, kept)
+}
+
+func humanMessageKey(m HumanMessage) string {
+	return m.At + "\x00" + m.Text
+}
+
 const closedTaskAckMetadataKey = "hitlClosedTaskAckAt"
 
 // ClosedTaskAckSent reports whether the one-time "this task is done, continue on

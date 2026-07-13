@@ -30,3 +30,26 @@ func TestHumanInboxAppendReadClearCap(t *testing.T) {
 		t.Fatal("inbox not cleared")
 	}
 }
+
+func TestRemoveHumanMessagesPreservesMidRunArrivals(t *testing.T) {
+	base := `{"worker":{"title":"x"}}`
+	// The agent read (and answered) this one at the start of its turn.
+	drainedFeed, _ := AppendHumanMessage(&base, HumanMessage{At: "t1", Text: "read at start"})
+	drained := ReadHumanInbox(&drainedFeed)
+	// While the agent was mid-run, the human sent another message — never fed to it.
+	withMidRun, _ := AppendHumanMessage(&drainedFeed, HumanMessage{At: "t2", Text: "arrived mid-run"})
+
+	got, err := RemoveHumanMessages(&withMidRun, drained)
+	if err != nil {
+		t.Fatalf("RemoveHumanMessages error = %v", err)
+	}
+	remaining := ReadHumanInbox(&got)
+	if len(remaining) != 1 || remaining[0].Text != "arrived mid-run" {
+		t.Fatalf("remaining = %+v, want only the mid-run arrival preserved (not eaten)", remaining)
+	}
+	// Removing an empty drained set is a no-op (never wipes the inbox).
+	noop, _ := RemoveHumanMessages(&withMidRun, nil)
+	if len(ReadHumanInbox(&noop)) != 2 {
+		t.Fatalf("empty drained should preserve all messages")
+	}
+}

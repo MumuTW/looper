@@ -1204,7 +1204,9 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		// the agent starts normally.
 		nativeResumePrompt := ""
 		nativeSessionID := ""
+		var drainedInbox []loops.HumanMessage
 		if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
+			drainedInbox = inbox
 			var msgs strings.Builder
 			msgs.WriteString("While this spec was awaiting review, the human sent these messages in the task thread:")
 			for _, m := range inbox {
@@ -1250,9 +1252,10 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
 		productAsk = strings.TrimSpace(result.ProductAsk)
-		// The turn consumed any queued human messages (fed above) — clear the inbox so
-		// they aren't re-injected on a later run. No-op when the inbox was empty.
-		r.clearHumanInbox(ctx, &input.Loop)
+		// Clear ONLY the messages this turn actually consumed (fed above). A message that
+		// arrived mid-run — after the inbox was read — was never seen by the agent, so it
+		// stays queued for a follow-up turn instead of being silently eaten here.
+		r.clearHumanInbox(ctx, &input.Loop, drainedInbox)
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -2091,10 +2094,12 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) strin
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
-// clearHumanInbox drops the loop's drained human messages after a successful
-// write-spec turn so they are not re-injected on a later run. No-op when empty.
-func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) {
-	if r.repos == nil || r.repos.Loops == nil {
+// clearHumanInbox drops ONLY the messages that were actually fed to this write-spec
+// turn (drained), so they are not re-injected on a later run. Messages that arrived
+// WHILE the agent was mid-run (never read by it) are preserved for a follow-up turn
+// rather than silently eaten. No-op when nothing was drained or the inbox is empty.
+func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord, drained []loops.HumanMessage) {
+	if r.repos == nil || r.repos.Loops == nil || len(drained) == 0 {
 		return
 	}
 	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
@@ -2104,7 +2109,7 @@ func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) 
 	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
 		return
 	}
-	meta, werr := loops.ClearHumanInbox(fresh.MetadataJSON)
+	meta, werr := loops.RemoveHumanMessages(fresh.MetadataJSON, drained)
 	if werr != nil {
 		return
 	}
