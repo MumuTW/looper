@@ -1972,3 +1972,34 @@ func openMigratedCoordinatorForRepositories(t *testing.T) *SQLiteCoordinator {
 
 	return coordinator
 }
+
+func TestCountersRepositoryGetSetMaxIsMonotonic(t *testing.T) {
+	t.Parallel()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	const cur = "feishu_inbox_cursor"
+
+	if v, err := repos.Counters.Get(ctx, cur); err != nil || v != 0 {
+		t.Fatalf("Get(unset) = %d, %v; want 0, nil", v, err)
+	}
+	if err := repos.Counters.SetMax(ctx, cur, 42); err != nil {
+		t.Fatalf("SetMax(42) error = %v", err)
+	}
+	if v, _ := repos.Counters.Get(ctx, cur); v != 42 {
+		t.Fatalf("Get() = %d, want 42", v)
+	}
+	// A restart re-reading an OLD maxID must never rewind the persisted cursor.
+	if err := repos.Counters.SetMax(ctx, cur, 30); err != nil {
+		t.Fatalf("SetMax(30) error = %v", err)
+	}
+	if v, _ := repos.Counters.Get(ctx, cur); v != 42 {
+		t.Fatalf("Get() after backward SetMax = %d, want 42 (monotonic)", v)
+	}
+	if err := repos.Counters.SetMax(ctx, cur, 100); err != nil {
+		t.Fatalf("SetMax(100) error = %v", err)
+	}
+	if v, _ := repos.Counters.Get(ctx, cur); v != 100 {
+		t.Fatalf("Get() = %d, want 100", v)
+	}
+}

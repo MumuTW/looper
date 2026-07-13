@@ -33,6 +33,7 @@ type Repositories struct {
 	WebhookTunnelHooks   *WebhookTunnelHooksRepository
 	FeishuThreads        *FeishuThreadsRepository
 	FeishuLiveFeeds      *FeishuLiveFeedsRepository
+	Counters             *CountersRepository
 }
 
 func NewRepositories(q sqliteQuerier) *Repositories {
@@ -51,7 +52,41 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
 		FeishuThreads:        &FeishuThreadsRepository{q: q},
 		FeishuLiveFeeds:      &FeishuLiveFeedsRepository{q: q},
+		Counters:             &CountersRepository{q: q},
 	}
+}
+
+// CountersRepository reads/advances the shared monotonic counters table (name→value).
+// Used for the Feishu inbox poll cursor so it SURVIVES a daemon restart instead of
+// resetting to 0 and re-reading old inbox events (which re-enqueued stale human
+// messages and re-fired one-shot acks).
+type CountersRepository struct{ q sqliteQuerier }
+
+// Get returns the counter's value, or 0 when it has never been set.
+func (r *CountersRepository) Get(ctx context.Context, name string) (int64, error) {
+	var v int64
+	err := r.q.QueryRowContext(ctx, `SELECT value FROM counters WHERE name = ?`, name).Scan(&v)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("get counter %s: %w", name, err)
+	}
+	return v, nil
+}
+
+// SetMax advances the counter to value, never moving it backward (monotonic) — safe for
+// a cursor that must only ever increase, even under concurrent writers.
+func (r *CountersRepository) SetMax(ctx context.Context, name string, value int64) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO counters (name, value) VALUES (?, ?)
+		ON CONFLICT(name) DO UPDATE SET value =
+			CASE WHEN excluded.value > counters.value THEN excluded.value ELSE counters.value END
+	`, name, value)
+	if err != nil {
+		return fmt.Errorf("set counter %s: %w", name, err)
+	}
+	return nil
 }
 
 type ProjectRecord struct {

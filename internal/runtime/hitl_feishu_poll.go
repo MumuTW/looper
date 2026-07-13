@@ -10,7 +10,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -119,14 +118,11 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 	return delivered, maxID
 }
 
-// feishuInboxCursor tracks the last inbox event id this daemon has consumed. In
-// memory is sufficient: on restart it re-reads from 0, and every delivery side effect
-// is idempotent — answers dedupe on the loop's inbox, and the one-shot closed-task ack
-// is guarded by a persisted per-loop marker (see enqueueHumanMessageToLoop).
-var feishuInboxCursor struct {
-	mu sync.Mutex
-	v  int64
-}
+// feishuInboxCursorCounter names the persisted counter (counters table) tracking the
+// last inbox event id this looper has consumed. Persisted — NOT in-memory — so a daemon
+// restart does not reset it to 0 and re-read old events (which re-enqueued stale human
+// messages, re-triggering spurious follow-up turns, and previously re-fired acks).
+const feishuInboxCursorCounter = "feishu_inbox_cursor"
 
 var feishuInboxHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
@@ -150,9 +146,10 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 		return
 	}
 
-	feishuInboxCursor.mu.Lock()
-	since := feishuInboxCursor.v
-	feishuInboxCursor.mu.Unlock()
+	var since int64
+	if input.Repos.Counters != nil {
+		since, _ = input.Repos.Counters.Get(ctx, feishuInboxCursorCounter)
+	}
 
 	events, err := fetchFeishuInboxEvents(ctx, inboxURL, token, since)
 	if err != nil {
@@ -212,12 +209,10 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 	}
 
 	delivered, maxID := pollFeishuHITLInboxOnce(ctx, events, deps)
-	if maxID > 0 {
-		feishuInboxCursor.mu.Lock()
-		if maxID > feishuInboxCursor.v {
-			feishuInboxCursor.v = maxID
+	if maxID > 0 && input.Repos.Counters != nil {
+		if err := input.Repos.Counters.SetMax(ctx, feishuInboxCursorCounter, maxID); err != nil && input.Logger != nil {
+			input.Logger.Warn("hitl feishu poll: persist cursor failed", map[string]any{"error": err.Error()})
 		}
-		feishuInboxCursor.mu.Unlock()
 	}
 	if delivered > 0 && input.Logger != nil {
 		input.Logger.Info("hitl feishu: delivered human answers", map[string]any{"count": delivered})
