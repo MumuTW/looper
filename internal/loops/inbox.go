@@ -52,6 +52,32 @@ func ClearHumanInbox(metadataJSON *string) (string, error) {
 	return marshalWithHumanInbox(metadataJSON, nil)
 }
 
+const closedTaskAckMetadataKey = "hitlClosedTaskAckAt"
+
+// ClosedTaskAckSent reports whether the one-time "this task is done, continue on
+// the issue/PR" HITL ack has already been posted to this loop's thread. The marker
+// lives in loop metadata so the ack fires at most once per loop even across daemon
+// restarts — the in-memory inbox cursor resets on restart and re-reads old events,
+// which would otherwise re-fire the ack every time (and a human replying again to a
+// finished thread should not re-trigger it either).
+func ClosedTaskAckSent(metadataJSON *string) bool {
+	meta := parseMetadataObject(metadataJSON)
+	s, _ := meta[closedTaskAckMetadataKey].(string)
+	return s != ""
+}
+
+// MarkClosedTaskAckSent records that the closed-task HITL ack was posted at the
+// given timestamp, preserving all other metadata keys.
+func MarkClosedTaskAckSent(metadataJSON *string, at string) (string, error) {
+	meta := parseMetadataObject(metadataJSON)
+	meta[closedTaskAckMetadataKey] = at
+	out, err := json.Marshal(meta)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
 func marshalWithHumanInbox(metadataJSON *string, msgs []HumanMessage) (string, error) {
 	meta := parseMetadataObject(metadataJSON)
 	if len(msgs) == 0 {

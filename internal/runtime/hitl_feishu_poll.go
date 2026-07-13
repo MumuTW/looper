@@ -120,7 +120,9 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 }
 
 // feishuInboxCursor tracks the last inbox event id this daemon has consumed. In
-// memory is sufficient: on restart it re-reads from 0 and delivery is idempotent.
+// memory is sufficient: on restart it re-reads from 0, and every delivery side effect
+// is idempotent — answers dedupe on the loop's inbox, and the one-shot closed-task ack
+// is guarded by a persisted per-loop marker (see enqueueHumanMessageToLoop).
 var feishuInboxCursor struct {
 	mu sync.Mutex
 	v  int64

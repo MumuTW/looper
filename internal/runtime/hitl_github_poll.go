@@ -196,6 +196,17 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	if loopFinishedForFollowup(loop.Status) && !loopSafelyReactivatable(ctx, repos, loop) {
 		// A finished task we cannot safely resume: record the message, but ask the
 		// caller to post the honest closed-task ack rather than force a full re-run.
+		// Post that ack at most ONCE per loop — a persisted marker keeps it idempotent
+		// so a daemon restart (which resets the in-memory inbox cursor and re-reads old
+		// events) or a human replying again to a finished thread does not re-fire it.
+		// The message itself is always recorded regardless.
+		if loops.ClosedTaskAckSent(loop.MetadataJSON) {
+			return false, repos.Loops.Upsert(ctx, updated)
+		}
+		if m2, aerr := loops.MarkClosedTaskAckSent(&meta, nowISO); aerr == nil {
+			meta = m2
+			updated.MetadataJSON = &meta
+		}
 		return true, repos.Loops.Upsert(ctx, updated)
 	}
 
