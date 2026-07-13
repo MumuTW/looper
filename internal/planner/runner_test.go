@@ -1494,13 +1494,15 @@ func TestCreateRunContextFollowupResumesCompletedPlannerLoopWithHumanMessage(t *
 	if !resumed.Resumed || resumed.StartStep != stepWriteSpec {
 		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want a resumed write-spec follow-up (never discover-issues)", resumed.Resumed, resumed.StartStep)
 	}
-	// write-spec re-runs the agent; node-H gate flags reset so the updated spec
-	// re-flows through publish/grill/review. Issue + worktree preserved.
+	// write-spec re-runs the agent (respond in the SAME session so the MAIN looper
+	// answers, not the fresh grill critic); Grilled/Reviewed are PRESERVED so a follow-up
+	// does NOT auto-re-run the minutes-long grill/review passes or re-post their notes
+	// (强操控: respond, then hand the wheel back to the human). Issue + worktree preserved.
 	if resumed.Checkpoint.WriteSpec != nil {
 		t.Fatalf("WriteSpec = %#v, want cleared so the write-spec agent runs again", resumed.Checkpoint.WriteSpec)
 	}
-	if resumed.Checkpoint.Publish == nil || resumed.Checkpoint.Publish.Grilled || resumed.Checkpoint.Publish.Reviewed {
-		t.Fatalf("Publish = %#v, want Grilled/Reviewed reset (re-grill/re-review the revised spec)", resumed.Checkpoint.Publish)
+	if resumed.Checkpoint.Publish == nil || !resumed.Checkpoint.Publish.Grilled || !resumed.Checkpoint.Publish.Reviewed {
+		t.Fatalf("Publish = %#v, want Grilled/Reviewed PRESERVED (a follow-up must not auto-re-grill/review)", resumed.Checkpoint.Publish)
 	}
 	if resumed.Checkpoint.Issue == nil || resumed.Checkpoint.Worktree == nil {
 		t.Fatalf("checkpoint = %#v, want preserved issue + worktree", resumed.Checkpoint)

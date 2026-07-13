@@ -1540,7 +1540,7 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 			r.logger.Warn("grill: post transcript failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
 		// node H condition #2: surface the grill transcript in the Feishu thread too.
-		r.postNodeHThreadNote(ctx, input, "🔬 GRILL 拷问结论:\n"+truncateRunes(summary, 1200), false)
+		r.postNodeHThreadNote(ctx, input, "grillTranscript", "🔬 GRILL 拷问结论:\n"+truncateRunes(summary, 1200), false)
 	}
 	if checkpoint.Publish == nil {
 		checkpoint.Publish = &checkpointPublishState{}
@@ -1616,7 +1616,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 			r.logger.Warn("review: retire looper:plan failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
 	}
-	r.postNodeHThreadNote(ctx, input, "🙋 方案已过 GRILL 拷问 + 独立 REVIEW,请你审批 —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现:"+specURL, true)
+	r.postNodeHThreadNote(ctx, input, "approvalRequest", "🙋 方案已过 GRILL 拷问 + 独立 REVIEW,请你审批 —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现:"+specURL, true)
 	if r.repos != nil && r.repos.Loops != nil {
 		if loop, gErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); gErr == nil && loop != nil {
 			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {
@@ -1792,7 +1792,7 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 	checkpoint.Publish.PlaneSpecReview = true
 	// node H condition #2: surface the spec DRAFT in the Feishu thread + @product owner
 	// (FYI) — so a human sees it as review begins, before grill/review run.
-	r.postNodeHThreadNote(ctx, input, "📋 技术方案初稿已出炉:"+specURL+"\n即将进入 fresh agent 拷问(GRILL)+ 独立复核(REVIEW),收敛后请你在方案页 approve。", false)
+	r.postNodeHThreadNote(ctx, input, "specDraftFYI", "📋 技术方案初稿已出炉:"+specURL+"\n即将进入 fresh agent 拷问(GRILL)+ 独立复核(REVIEW),收敛后请你在方案页 approve。", false)
 	// node H begins here: the tech spec is on Plane. The grill step runs next; only
 	// after grill + review converge does the loop open the human-approve gate. Mark the
 	// card so it reads 🔬 方案拷问中 instead of resting on 编写技术方案中.
@@ -1805,8 +1805,14 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 // @-mentioning the project's product owner so a human sees the spec draft / grill
 // transcript in the thread (goal condition #2). Best-effort — a missing transport or
 // owner just skips the ping.
-func (r *Runner) postNodeHThreadNote(ctx context.Context, input stepInput, text string, mention bool) {
+func (r *Runner) postNodeHThreadNote(ctx context.Context, input stepInput, dedupKey, text string, mention bool) {
 	if r.postThreadNote == nil {
+		return
+	}
+	// Post each node-H thread note at most ONCE per loop. A follow-up resume re-enters
+	// the pipeline (线程永远可追问); without this the draft-FYI / grill / approval notes
+	// would re-post and spam the thread on every re-run. dedupKey "" opts out.
+	if r.nodeHNotePosted(ctx, input.Loop.ID, dedupKey) {
 		return
 	}
 	// Only @-mention on the ACTIONABLE post (please approve); the draft FYI and grill
@@ -1817,8 +1823,74 @@ func (r *Runner) postNodeHThreadNote(ctx context.Context, input stepInput, text 
 			mentions = []string{openID}
 		}
 	}
-	if err := r.postThreadNote(ctx, input.Loop.ID, text, mentions); err != nil && r.logger != nil {
-		r.logger.Warn("planner: post node H thread note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+	if err := r.postThreadNote(ctx, input.Loop.ID, text, mentions); err != nil {
+		if r.logger != nil {
+			r.logger.Warn("planner: post node H thread note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+		}
+		return
+	}
+	r.markNodeHNotePosted(ctx, input.Loop.ID, dedupKey)
+}
+
+// nodeHNotesPostedSet reads the set of node-H note keys already posted for a loop from
+// its metadata (`nodeHNotesPosted` string list).
+func nodeHNotesPostedSet(metadataJSON *string) map[string]bool {
+	out := map[string]bool{}
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return out
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return out
+	}
+	raw, ok := meta["nodeHNotesPosted"].([]any)
+	if !ok {
+		return out
+	}
+	for _, v := range raw {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			out[s] = true
+		}
+	}
+	return out
+}
+
+// nodeHNotePosted reports whether the node-H note keyed by dedupKey was already posted
+// for this loop. dedupKey "" is never deduped; a read error reports "not posted" so the
+// note still goes out rather than being silently dropped.
+func (r *Runner) nodeHNotePosted(ctx context.Context, loopID, dedupKey string) bool {
+	if strings.TrimSpace(dedupKey) == "" || r.repos == nil || r.repos.Loops == nil {
+		return false
+	}
+	loop, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return false
+	}
+	return nodeHNotesPostedSet(loop.MetadataJSON)[dedupKey]
+}
+
+// markNodeHNotePosted records that the node-H note keyed by dedupKey has been posted for
+// this loop, re-reading + merging so it doesn't clobber markers set by earlier steps.
+func (r *Runner) markNodeHNotePosted(ctx context.Context, loopID, dedupKey string) {
+	if strings.TrimSpace(dedupKey) == "" || r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	loop, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return
+	}
+	posted := nodeHNotesPostedSet(loop.MetadataJSON)
+	posted[dedupKey] = true
+	keys := make([]string, 0, len(posted))
+	for k := range posted {
+		keys = append(keys, k)
+	}
+	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"nodeHNotesPosted": keys})
+	if err != nil {
+		return
+	}
+	if _, err := r.updateLoop(ctx, *loop, func(u *storage.LoopRecord) { u.MetadataJSON = stringPtr(metadataJSON) }); err != nil && r.logger != nil {
+		r.logger.Warn("planner: mark node H note posted failed", map[string]any{"loopId": loopID, "key": dedupKey, "error": err.Error()})
 	}
 }
 
@@ -2079,17 +2151,15 @@ func (r *Runner) shouldFollowupResume(ctx context.Context, loop storage.LoopReco
 }
 
 // rewindPlannerCheckpointForFollowup rewinds a completed planner checkpoint so a
-// follow-up turn re-authors the spec (write-spec re-runs the agent, native-resuming
-// the session with the human message) and the updated spec re-flows through the
-// node-H gates. Preserves everything needed to resume: issue, worktree, lock,
-// lifecycle, and the Plane publish reference — only the "already done" flags are
-// cleared.
+// follow-up turn re-enters write-spec (re-runs the agent, native-resuming the SAME
+// session with the human message so the MAIN looper — not the fresh grill critic —
+// answers). It does NOT clear Grilled/Reviewed: a follow-up is "respond then hand the
+// wheel back to the human" (强操控), so it must NOT auto-re-run the minutes-long
+// grill/review passes or re-post their thread notes on every question. The revised
+// spec re-settles at the human approval gate; the human drives any re-validation.
+// Preserves everything needed to resume: issue, worktree, lock, lifecycle, publish ref.
 func rewindPlannerCheckpointForFollowup(checkpoint plannerCheckpoint) plannerCheckpoint {
 	checkpoint.WriteSpec = nil
-	if checkpoint.Publish != nil {
-		checkpoint.Publish.Grilled = false
-		checkpoint.Publish.Reviewed = false
-	}
 	checkpoint.SkipReason = ""
 	return checkpoint
 }
