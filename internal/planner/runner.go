@@ -1254,6 +1254,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 				}
 			}
 			msgs.WriteString("\nRead them in context and update the spec accordingly — incorporate a product decision, answer a follow-up, or tighten an open question. Do NOT rewrite the spec from scratch: revise the existing spec file incrementally to reflect their input.")
+			msgs.WriteString("\n\nThen DECIDE whether you can proceed or still need them, and LEAN TOWARD ASKING rather than silently continuing (强操控 — the human is driving). Unless they clearly gave the go-ahead (e.g. \"继续\" / \"go ahead\", or they answered the pending decision), put your reply to them in the productAsk field: briefly state how you understood/answered them, then explicitly ask \"可以继续吗?\" so they know the ball is in their court. In THIS follow-up turn the productAsk IS your conversational reply to them (an answer + a can-I-continue check, or the surfaced decision) — not necessarily a formal product decision, so the usual \"no decision → empty\" rule does not apply here. Only when they have clearly told you to proceed, set productAsk to \"\" so the spec moves on to review.")
 			nativeResumePrompt = msgs.String()
 			prompt += "\n\n" + nativeResumePrompt
 			nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID)
