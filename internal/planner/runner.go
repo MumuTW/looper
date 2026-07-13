@@ -2135,7 +2135,10 @@ func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) 
 // which only reactivates planner loops that have a captured session); a completed
 // loop is otherwise never re-dispatched.
 func (r *Runner) shouldFollowupResume(ctx context.Context, loop storage.LoopRecord, latestRun *storage.RunRecord, checkpoint plannerCheckpoint) bool {
-	if latestRun == nil || latestRun.Status != "success" {
+	// "success" = a finished loop the human is following up on; "interrupted" = the
+	// human's mid-run @bot killed the active agent (强操控) — either way, answer them from
+	// the main write-spec session. A genuinely "failed" run still retries normally.
+	if latestRun == nil || (latestRun.Status != "success" && latestRun.Status != "interrupted") {
 		return false
 	}
 	if len(loops.ReadHumanInbox(loop.MetadataJSON)) == 0 {
@@ -2175,11 +2178,14 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		check = parseCheckpoint(latestRun.CheckpointJSON)
 		lastCompleted = asPlannerStep(derefString(latestRun.LastCompletedStep))
 	}
-	shouldResume := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
-	// FOLLOW-UP RESUME (线程永远可追问): a finished planner loop got a new human message
-	// — resume the SAME session at write-spec for ONE incremental turn (see
-	// shouldFollowupResume). Never re-discovers/re-plans from scratch.
-	followupResume := !shouldResume && r.shouldFollowupResume(ctx, loop, latestRun, check)
+	// FOLLOW-UP RESUME (线程永远可追问): a planner loop got a new human message — resume
+	// the SAME session at write-spec so the MAIN looper answers (never the fresh grill
+	// critic), for ONE incremental turn (see shouldFollowupResume). This takes PRECEDENCE
+	// over shouldResume: when a run was interrupted BY the human's message (强操控 mid-run
+	// @bot kills the active agent → interrupted), we must answer them from the main
+	// session, not silently resume the interrupted grill/review step.
+	followupResume := r.shouldFollowupResume(ctx, loop, latestRun, check)
+	shouldResume := !followupResume && latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
 	startStep := stepDiscoverIssues
 	switch {
 	case followupResume:
