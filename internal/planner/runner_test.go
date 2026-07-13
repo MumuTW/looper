@@ -1475,6 +1475,48 @@ func setupCompletedPlannerLoop(t *testing.T, fixture *runnerFixture, loopID stri
 	}
 }
 
+// C1 强操控: a run INTERRUPTED by a human's mid-run @bot (not a clean success) must,
+// with a pending message, resume the MAIN write-spec session — never silently resume the
+// interrupted grill/review step (which would let the fresh grill critic answer).
+func TestCreateRunContextInterruptedRunWithHumanMessageResumesMainSession(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	loopID := "loop_planner_interrupted"
+	projectID := "project_1"
+	target := "issue:acme/looper:42"
+	meta, _ := loops.AppendHumanMessage(nil, loops.HumanMessage{At: fixture.nowISO(), Text: "背景清晰吗?"})
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 43, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &meta, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_" + loopID, ProjectID: &projectID, LoopID: &loopID, Vendor: "claude", Status: "killed", NativeSessionID: stringPtr("sess_1"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	// Interrupted mid-grill: write-spec is done, grill/review not yet.
+	checkpointJSON := mustMarshalJSON(plannerCheckpoint{
+		Issue:          &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md", URL: "https://plane/x/42"},
+		ClaimedLockKey: "issue:acme/looper:42",
+		Worktree:       &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "looper/plan", BaseBranch: "main", SpecPath: "specs/42.md"},
+		WriteSpec:      &checkpointWriteSpec{Status: "completed", GitReconciled: true},
+		Publish:        &checkpointPublishState{PlaneSpecReview: true, Grilled: false, Reviewed: false},
+	})
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_" + loopID, LoopID: loopID, Status: "interrupted", LastCompletedStep: stringPtr(string(stepWriteSpec)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	resumed, err := runner.createRunContext(ctx, *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepWriteSpec {
+		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want followup-resume at write-spec (main session answers), not the interrupted step", resumed.Resumed, resumed.StartStep)
+	}
+}
+
 func TestCreateRunContextFollowupResumesCompletedPlannerLoopWithHumanMessage(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

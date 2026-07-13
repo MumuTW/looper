@@ -125,7 +125,18 @@ type Result struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 	PID                          int
+	// Interrupted is true when the agent was deliberately killed to hand the wheel back
+	// to a human mid-run (强操控: a thread @bot arrived while it was running), NOT a
+	// timeout or a crash. The caller resumes the SAME session to answer them rather than
+	// retrying/failing the step.
+	Interrupted bool
 }
+
+// HITLInterruptKillReason is the kill reason the HITL poll passes to
+// ActiveExecutionRegistry.Kill when a human's mid-run message should interrupt the
+// running agent. The executor stamps Result.Interrupted from it, so a deliberate human
+// interrupt is told apart from a timeout / orphan-reaper kill (which stay failures).
+const HITLInterruptKillReason = "hitl-interrupt"
 
 type completionParse struct {
 	ParseStatus      string
@@ -374,6 +385,11 @@ type execution struct {
 
 	killCh chan string
 	doneCh chan execOutcome
+
+	// hitlInterrupted is set when this execution was killed via HITLInterruptKillReason
+	// (a human's mid-run @bot), so the Result it produces is marked Interrupted and the
+	// caller resumes the same session to answer them instead of failing/retrying.
+	hitlInterrupted bool
 }
 
 func (x *execution) Wait(ctx context.Context) (Result, error) {
@@ -517,6 +533,9 @@ func (x *execution) run(ctx context.Context) {
 		case reason := <-x.killCh:
 			killed = true
 			killReason = reason
+			if reason == HITLInterruptKillReason {
+				x.hitlInterrupted = true
+			}
 			x.setStatus("killed")
 			terminateSignal()
 		case <-ctx.Done():
@@ -628,6 +647,7 @@ func (x *execution) run(ctx context.Context) {
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               lastProgressAt,
 		PID:                          pidOrZero(x.process.Process),
+		Interrupted:                  x.hitlInterrupted,
 	}
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
 		if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
@@ -804,6 +824,9 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		case reason := <-x.killCh:
 			killed = true
 			killReason = reason
+			if reason == HITLInterruptKillReason {
+				x.hitlInterrupted = true
+			}
 			terminate()
 		case <-ctx.Done():
 			killed = true
@@ -878,6 +901,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
 		PID:                          pidOrZero(cmd.Process),
+		Interrupted:                  x.hitlInterrupted,
 	}, errorMessage, true
 }
 

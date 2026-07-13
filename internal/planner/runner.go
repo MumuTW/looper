@@ -62,7 +62,18 @@ const (
 	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
 	FailureNonRetryable         QueueFailureKind = "non_retryable"
 	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	// FailureHITLInterrupt marks a step whose agent was deliberately killed to answer a
+	// human's mid-run @bot (强操控). It is NOT a real failure: the run completes as
+	// "interrupted" and is re-dispatched immediately so follow-up-resume answers them
+	// from the MAIN session, without counting against the retry cap.
+	FailureHITLInterrupt QueueFailureKind = "hitl_interrupt"
 )
+
+// plannerInterruptError signals that the step's agent was killed by a human mid-run
+// @bot (result.Interrupted). handled specially in the run loop (interrupted, not failed).
+func plannerInterruptError() *loopError {
+	return &loopError{message: "agent interrupted by a human mid-run message", kind: FailureHITLInterrupt}
+}
 
 type IssueSummary struct {
 	Number    int64
@@ -278,6 +289,10 @@ type AgentResult struct {
 	ConfiguredMaxRuntimeSeconds  int64
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
+	// Interrupted is true when the agent was killed by a human's mid-run @bot (强操控),
+	// so the step returns an interrupt (not a failure) and the run re-dispatches to
+	// answer them from the same session.
+	Interrupted bool
 }
 
 type AgentExecution interface {
@@ -747,6 +762,29 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			failure := r.classifyFailureWithBoundary(err, plannerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+			if failure.kind == FailureHITLInterrupt {
+				// 强操控: a human's mid-run @bot killed the agent. Complete the run as
+				// "interrupted" (NOT failed) and re-dispatch it IMMEDIATELY (no backoff,
+				// attempts unchanged so it never hits the retry cap) so follow-up-resume
+				// answers them from the MAIN write-spec session.
+				latest.ResumePolicy = "advance_from_checkpoint"
+				if _, err := r.completeRun(ctx, run, "interrupted", failure.message, "", latest); err != nil {
+					return ProcessResult{}, err
+				}
+				r.appendEvent(ctx, eventInput{eventType: "run.interrupted", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "currentStep": derefString(run.CurrentStep)}})
+				nowISO := r.nowISO()
+				if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: nowISO, Attempts: queueItem.Attempts, ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: nowISO}); err != nil {
+					return ProcessResult{}, err
+				}
+				if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+					updated.LastRunAt = stringPtr(nowISO)
+					updated.Status = "queued"
+					updated.NextRunAt = stringPtr(nowISO)
+				}); err != nil {
+					return ProcessResult{}, err
+				}
+				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "interrupted", Summary: failure.message, FailureKind: failure.kind}, nil
+			}
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
@@ -1238,6 +1276,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, err
 		}
 		if !strings.EqualFold(result.Status, "completed") {
+			if result.Interrupted {
+				// A human's mid-run @bot killed this agent (强操控) — not a failure. Return
+				// the interrupt signal so the run completes "interrupted" and re-dispatches
+				// to answer them from the MAIN session (issue/worktree preserved).
+				return checkpoint, plannerInterruptError()
+			}
 			checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
 			checkpoint.ResumePolicy = "retry_from_timeout_context"
 			if err := r.persistCheckpoint(ctx, input.Run.ID, stepWriteSpec, checkpoint); err != nil {
@@ -1525,6 +1569,9 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 		return checkpoint, err
 	}
 	if !strings.EqualFold(result.Status, "completed") {
+		if result.Interrupted {
+			return checkpoint, plannerInterruptError() // 强操控: answer the human from the main session
+		}
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
 		return checkpoint, &loopError{message: "grill agent did not complete", kind: FailureRetryableAfterResume}
 	}
@@ -1595,6 +1642,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 		return checkpoint, err
 	}
 	if !strings.EqualFold(result.Status, "completed") {
+		if result.Interrupted {
+			return checkpoint, plannerInterruptError() // 强操控: answer the human from the main session
+		}
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
 		return checkpoint, &loopError{message: "review agent did not complete", kind: FailureRetryableAfterResume}
 	}

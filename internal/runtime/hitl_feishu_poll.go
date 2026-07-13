@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -118,6 +119,34 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 	return delivered, maxID
 }
 
+// interruptRunningLoopAgent kills a loop's currently-running agent so a human's mid-run
+// @bot is answered immediately (强操控 C1), instead of queued until the step finishes.
+// The kill uses agent.HITLInterruptKillReason, which the planner turns into an
+// "interrupted" run that re-dispatches to answer from the MAIN write-spec session. No-op
+// when the loop has no running agent or the registry/repos aren't wired.
+func interruptRunningLoopAgent(ctx contextType, input defaultSchedulerTickInput, loopID string) {
+	if input.ActiveExecutions == nil || input.Repos == nil || input.Repos.AgentExecutions == nil {
+		return
+	}
+	exec, err := input.Repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+	if err != nil || exec == nil {
+		return
+	}
+	switch exec.Status {
+	case "running", "started", "in_progress":
+	default:
+		return // no live agent to interrupt
+	}
+	runID := ""
+	if exec.RunID != nil {
+		runID = *exec.RunID
+	}
+	killed, err := input.ActiveExecutions.Kill(loopID, runID, exec.ID, agent.HITLInterruptKillReason)
+	if err == nil && killed && input.Logger != nil {
+		input.Logger.Info("hitl: interrupted running agent for a mid-run human message", map[string]any{"loopId": loopID})
+	}
+}
+
 // feishuInboxCursorCounter names the persisted counter (counters table) tracking the
 // last inbox event id this looper has consumed. Persisted — NOT in-memory — so a daemon
 // restart does not reset it to 0 and re-read old events (which re-enqueued stale human
@@ -189,6 +218,10 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return nil
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
+			// 强操控 (C1): if the loop's agent is running, interrupt it NOW so the human's
+			// mid-run message is answered from the main session immediately, instead of
+			// sitting in the inbox until the current step happens to finish.
+			interruptRunningLoopAgent(ctx, input, loopID)
 			ackClosed, err := enqueueHumanMessageToLoop(ctx, input.Repos, nowISO, loopID, text)
 			if err != nil {
 				return err

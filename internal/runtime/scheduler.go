@@ -78,6 +78,7 @@ type schedulerAsyncRunner interface {
 
 type defaultSchedulerTickInput struct {
 	Repos                    *storage.Repositories
+	ActiveExecutions         *ActiveExecutionRegistry
 	GitHubGateway            *githubinfra.Gateway
 	Logger                   bootstrap.Logger
 	Now                      func() time.Time
@@ -726,7 +727,7 @@ func (a plannerAgentExecutionAdapter) Wait(ctx context.Context) (planner.AgentRe
 	if err != nil {
 		return planner.AgentResult{}, err
 	}
-	return planner.AgentResult{Status: result.Status, Summary: result.Summary, ProductAsk: result.ProductAsk, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+	return planner.AgentResult{Status: result.Status, Summary: result.Summary, ProductAsk: result.ProductAsk, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, Interrupted: result.Interrupted}, nil
 }
 
 type reviewerGitHubAdapter struct {
@@ -2281,6 +2282,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		}
 		return defaultSchedulerTickInput{
 			Repos:                    services.Repositories,
+			ActiveExecutions:         activeExecutions,
 			GitHubGateway:            githubGateway,
 			Logger:                   logger,
 			Now:                      now,
