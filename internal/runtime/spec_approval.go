@@ -142,6 +142,11 @@ func (r *Runtime) reconcileSpecApproval(ctx context.Context) {
 			}
 			continue
 		}
+		// Reflect the dispatch in Plane's own state column (node I): Todo → In Progress.
+		// Best-effort — a failure here must never block the worker-ready handoff.
+		if err := gateway.SetWorkItemState(ctx, planeProjectID, workItemID, "In Progress"); err != nil && logger != nil {
+			logger.Warn("spec approval: set In Progress state failed (continuing)", map[string]any{"loopId": loop.ID, "error": err.Error()})
+		}
 		reasonHTML := ""
 		if reason := strings.TrimSpace(verdict.Reason); reason != "" {
 			reasonHTML = "<br><i>looper 判定:" + html.EscapeString(reason) + "</i>"

@@ -322,6 +322,46 @@ func TestDecodeLinksToleratesBareArray(t *testing.T) {
 	}
 }
 
+func TestSetWorkItemStateResolvesNameToIDAndPatches(t *testing.T) {
+	// GET states (envelope shape) then PATCH the issue with the resolved state id.
+	// Name match is case-insensitive ("in progress" → "In Progress").
+	f := &fakeRun{stdouts: []string{
+		`{"results":[{"id":"st-todo","name":"Todo"},{"id":"st-prog","name":"In Progress"},{"id":"st-review","name":"In Review"}]}`,
+		`{}`,
+	}}
+	g := newGateway(f)
+	if err := g.SetWorkItemState(context.Background(), "proj-1", "wi-1", "in progress"); err != nil {
+		t.Fatalf("SetWorkItemState error = %v", err)
+	}
+	if len(f.calls) != 2 {
+		t.Fatalf("calls = %d, want list states + patch", len(f.calls))
+	}
+	get := f.calls[0]
+	if !argsContain(get, "api", "request", "workspaces/open-design/projects/proj-1/states/") ||
+		!argPairPresent(get, "--method", "GET") {
+		t.Fatalf("get states args = %v", get)
+	}
+	patch := f.calls[1]
+	if !argsContain(patch, "api", "request", "workspaces/open-design/projects/proj-1/issues/wi-1/") ||
+		!argPairPresent(patch, "--method", "PATCH") ||
+		!argsContain(patch, `"state":"st-prog"`) {
+		t.Fatalf("patch args = %v", patch)
+	}
+}
+
+func TestSetWorkItemStateToleratesBareArrayAndErrorsOnUnknownState(t *testing.T) {
+	// States returned as a bare array (not enveloped); the requested state is absent →
+	// error, and NO PATCH is issued (the caller best-effort skips on the error).
+	f := &fakeRun{stdouts: []string{`[{"id":"st-todo","name":"Todo"}]`}}
+	g := newGateway(f)
+	if err := g.SetWorkItemState(context.Background(), "proj-1", "wi-1", "Done"); err == nil {
+		t.Fatal("SetWorkItemState error = nil, want error for missing state")
+	}
+	if len(f.calls) != 1 {
+		t.Fatalf("calls = %d, want only the states list (no PATCH on unresolved state)", len(f.calls))
+	}
+}
+
 func TestCommentIsLoopers(t *testing.T) {
 	// looper's own comments — carried by the legacy [looper] marker OR the signature
 	// footer — are excluded from the human comments ListHumanSpecComments hands to the

@@ -552,6 +552,59 @@ func (g *Gateway) RemoveWorkItemLabel(ctx context.Context, projectID, workItemID
 	return nil
 }
 
+// SetWorkItemState moves a work item to the project workflow state named stateName
+// (e.g. "In Progress" on dispatch, "In Review" when the worker opens a PR, "Done" on
+// merge), resolving the name to its state UUID first. This mirrors the label-driven
+// pipeline in Plane's own state column, which otherwise stays pinned at Todo. Reached
+// through the `plane api request` escape hatch (the CLI has no typed `state` subcommand).
+// Case-insensitive on the state name; errors when the project has no matching state so
+// the caller can best-effort skip. Idempotent + harmless: re-PATCHing the same state
+// is a no-op on Plane's side.
+func (g *Gateway) SetWorkItemState(ctx context.Context, projectID, workItemID, stateName string) error {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(workItemID) == "" || strings.TrimSpace(stateName) == "" {
+		return fmt.Errorf("planedoc: SetWorkItemState requires project id, work item id, and state name")
+	}
+	ws := strings.TrimSpace(g.workspace)
+	if ws == "" {
+		return fmt.Errorf("planedoc: SetWorkItemState requires a workspace")
+	}
+	stateID, err := g.resolveStateID(ctx, projectID, stateName)
+	if err != nil {
+		return err
+	}
+	data := fmt.Sprintf(`{"state":%s}`, jsonString(stateID))
+	path := fmt.Sprintf("workspaces/%s/projects/%s/issues/%s/", ws, projectID, workItemID)
+	args := []string{"api", "request", path, "--method", "PATCH", "--data", data}
+	args = append(args, g.globalArgs()...)
+	if _, err := g.runPlane(ctx, "", args...); err != nil {
+		return fmt.Errorf("planedoc: set work item state: %w", err)
+	}
+	return nil
+}
+
+// resolveStateID returns the UUID of the project workflow state named stateName
+// (case-insensitive), listing the project's states through the request escape hatch.
+// Errors when the project has no such state.
+func (g *Gateway) resolveStateID(ctx context.Context, projectID, stateName string) (string, error) {
+	ws := strings.TrimSpace(g.workspace)
+	if ws == "" || strings.TrimSpace(projectID) == "" {
+		return "", fmt.Errorf("planedoc: resolveStateID requires workspace and project id")
+	}
+	path := fmt.Sprintf("workspaces/%s/projects/%s/states/", ws, projectID)
+	args := []string{"api", "request", path, "--method", "GET"}
+	args = append(args, g.globalArgs()...)
+	result, err := g.runPlane(ctx, "", args...)
+	if err != nil {
+		return "", fmt.Errorf("planedoc: list states: %w", err)
+	}
+	for _, s := range decodeStates(result.Stdout) {
+		if strings.EqualFold(strings.TrimSpace(s.Name), strings.TrimSpace(stateName)) {
+			return s.ID, nil
+		}
+	}
+	return "", fmt.Errorf("planedoc: project %s has no state named %q", projectID, stateName)
+}
+
 // resolveOrCreateLabel returns the UUID of the project label named `name`, creating it
 // if the project doesn't have one (case-insensitive match on the name).
 func (g *Gateway) resolveOrCreateLabel(ctx context.Context, projectID, name string) (string, error) {
@@ -609,6 +662,31 @@ func (g *Gateway) workItemLabelIDs(ctx context.Context, projectID, workItemID st
 		return ids, nil
 	}
 	return nil, nil
+}
+
+// workItemState is a Plane project workflow state (id + name), used to resolve a
+// state name (e.g. "In Progress") to the UUID the work-item update endpoint takes.
+type workItemState struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// decodeStates unwraps a bare array or {results:[...]} envelope of project states —
+// the two shapes the states endpoint returns through the request escape hatch.
+func decodeStates(stdout string) []workItemState {
+	stdout = strings.TrimSpace(stdout)
+	if stdout == "" {
+		return nil
+	}
+	var envelope struct {
+		Results []workItemState `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err == nil && envelope.Results != nil {
+		return envelope.Results
+	}
+	var bare []workItemState
+	_ = json.Unmarshal([]byte(stdout), &bare)
+	return bare
 }
 
 // decodeLabelList unwraps a bare array or {results:[...]} envelope of project labels.

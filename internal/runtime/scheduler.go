@@ -2028,6 +2028,9 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			if openID := strings.TrimSpace(config.ProjectProductOwner(cfg, input.ProjectID).FeishuOpenID); openID != "" {
 				payload.MentionOpenIds = []string{openID}
 			}
+			// Reflect the PR in Plane's own state column: In Progress → In Review. Plane
+			// projects only; best-effort (a failure must never disturb the notification).
+			setPlaneWorkItemState(ctx, &cfg, repos, logger, input.ProjectID, input.LoopID, "In Review")
 		default:
 			payload.Level = "success"
 			payload.Title = "Looper Worker Completed"

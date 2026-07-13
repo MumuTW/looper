@@ -390,6 +390,14 @@ func (r *Runtime) terminateShepherd(ctx context.Context, repos *storage.Reposito
 	r.refreshShepherdCard(ctx, loop.ID)
 	if strings.EqualFold(strings.TrimSpace(outcome), "merged") {
 		r.postShepherdThreadNote(ctx, loop.ID, fmt.Sprintf("🎉 PR #%d 已合并。", prNumber), nil)
+		// Reflect the merge in Plane's own state column: In Review → Done. Plane projects
+		// only; best-effort (a failure must never disturb the terminate/merge flow).
+		r.mu.RLock()
+		cfg := r.config
+		stateRepos := r.services.Repositories
+		stateLogger := r.logger
+		r.mu.RUnlock()
+		setPlaneWorkItemState(ctx, &cfg, stateRepos, stateLogger, loop.ProjectID, loop.ID, "Done")
 	}
 	if repos.Locks != nil {
 		_ = repos.Locks.Release(ctx, fmt.Sprintf("pr:%s:%d", repo, prNumber))
