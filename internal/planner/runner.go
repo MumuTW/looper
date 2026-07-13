@@ -268,6 +268,7 @@ type AgentRunInput struct {
 type AgentResult struct {
 	Status                       string
 	Summary                      string
+	ProductAsk                   string
 	Stdout                       string
 	Stderr                       string
 	Commits                      []string
@@ -1006,6 +1007,45 @@ func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.
 	}
 }
 
+// requestProductDecisionInThread posts the agent's product-language question
+// (productAsk, node H) into the loop's Feishu thread, @-mentioning the project's
+// product owner so they see it where they watch. The message is already written in
+// product language by the agent; this only frames + @-tags it. The open_id is
+// resolved per-project from config (never hardcoded); a missing transport just skips
+// and an unset owner posts without a mention. Best-effort.
+func (r *Runner) requestProductDecisionInThread(ctx context.Context, input stepInput, productAsk string) {
+	if r.postThreadNote == nil {
+		return
+	}
+	var mentions []string
+	if r.projectRoleConfig != nil {
+		if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
+			mentions = []string{openID}
+		}
+	}
+	note := "🙋 这个需求有个地方需要你来拍板 —— 直接在本 thread 回复你的选择就行,我会据此更新方案:\n\n" + strings.TrimSpace(productAsk)
+	if err := r.postThreadNote(ctx, input.Loop.ID, note, mentions); err != nil && r.logger != nil {
+		r.logger.Warn("planner: post product-decision request note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+	}
+}
+
+// setAwaitingProductAnswerMarker records (or clears) the "awaiting product answer"
+// hold flag in the loop metadata (node H product-decision gate), distinct from the
+// node-E "awaiting product spec" wait and the owner "awaiting spec approval" gate.
+// Best-effort + guarded like setAwaitingProductSpecMarker.
+func (r *Runner) setAwaitingProductAnswerMarker(ctx context.Context, loop storage.LoopRecord, waiting bool) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingProductAnswer": waiting})
+	if err != nil {
+		return
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil && r.logger != nil {
+		r.logger.Warn("planner: mark awaiting product answer failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+	}
+}
+
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.SkipReason != "" {
@@ -1049,12 +1089,37 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (p
 	return checkpoint, nil
 }
 
+// plannerProductAskInstruction tells the planner agent to escalate — in product
+// language — the open questions in a spec that only the product owner can decide,
+// via a `productAsk` field in its completion marker. Technical open questions are
+// the agent's own to decide and must NOT be escalated. Kept Plane-node-H-scoped
+// (added only for Plane projects) since that is where a human product owner reviews.
+const plannerProductAskInstruction = `PRODUCT DECISION ESCALATION (only when the spec has a real product question):
+As you write the spec, sort every open question into PRODUCT vs TECHNICAL.
+- TECHNICAL (which library, how to structure the code, a data shape, error handling, an internal name, anything a competent engineer can just pick): DECIDE it yourself, note it in the spec, and do NOT escalate.
+- PRODUCT: a decision only the product owner can make — it changes what the user sees or can do, the product's scope/behavior, or hinges on business intent, a user-facing tradeoff, or an unstated requirement.
+
+ONLY when at least one real PRODUCT decision genuinely needs the product owner to choose, ALSO emit a "productAsk" field in your final __LOOPER_RESULT__ line: ONE message written FOR the product owner, in the product owner's own language (match the language of the issue/thread), structured EXACTLY as three parts:
+  ① 背景: which user/customer asked for what, and why it matters — one or two sentences.
+  ② 现状: what is already decided or known, so they don't re-litigate it.
+  ③ 问题 + 选项 + 建议: for each product decision, ask it in plain words, give 2–3 plain-language options, and state your recommendation.
+
+Hard rules for productAsk:
+  - Write like a product manager briefing a business stakeholder, NOT like an engineer. Someone who cannot read code must be able to decide from it alone.
+  - NO engineering jargon of ANY kind: no API/endpoint/route, component/module/package/library names, field/column/schema names, CSS/z-index, file paths, or function names. Translate every technical thing into what the user actually experiences. (e.g. "read from the brand endpoint" → "where a brand's info is pulled from"; "the design-system package" → "the brand kit they imported".)
+  - Put everything needed to decide INSIDE the message. Do NOT include a spec link or tell them to go read the spec.
+  - If there is NO product decision (only technical questions, which you resolved yourself), set productAsk to "" — never invent one.
+
+Your final marker line then carries the extra field:
+__LOOPER_RESULT__={"summary":"<one-sentence summary>","productAsk":"<the product-language message, or empty>"}`
+
 func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
 	writeSpecCompleted := checkpoint.WriteSpec != nil && strings.EqualFold(checkpoint.WriteSpec.Status, "completed")
+	productAsk := ""
 	issue, err := requireIssue(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -1098,6 +1163,9 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			// still reflexively run `gh pr create`; forbid it explicitly (looper closes a
 			// stray one anyway, but the ask avoids the noise).
 			prompt += "\n\nCRITICAL — This is a Plane project: the spec will be published to a Plane page by looper, NOT as a pull request. Write ONLY the spec file in the worktree. Do NOT run `gh pr create`, do NOT `git push`, do NOT open or modify any pull request. Any PR you open will be closed as a mistake."
+			// Node H: let the agent escalate genuine product decisions to the product
+			// owner in product language (via the productAsk marker field).
+			prompt += "\n\n" + plannerProductAskInstruction
 		}
 		// Follow-up resume (线程永远可追问): drain any human thread messages queued while
 		// the spec awaited review, and native-resume the SAME planner session so the
@@ -1152,6 +1220,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
+		productAsk = strings.TrimSpace(result.ProductAsk)
 		// The turn consumed any queued human messages (fed above) — clear the inbox so
 		// they aren't re-injected on a later run. No-op when the inbox was empty.
 		r.clearHumanInbox(ctx, &input.Loop)
@@ -1190,6 +1259,22 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	checkpoint.WriteSpec.GitReconciled = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	// Node H product-decision hold: the spec turn surfaced a real product question
+	// only the owner can answer. Ask them in the thread (product language) and HOLD
+	// before the owner-approval gate — publish/grill/review don't run yet. The run
+	// still completes (skipReason), so the loop reaches "completed" and a thread reply
+	// reactivates it via the follow-up resume, which re-runs write-spec with the
+	// answer; once no product question remains the flow proceeds to owner approval. On
+	// a fresh first run or a resume that RESOLVED the question, productAsk is empty and
+	// any prior hold marker is cleared so the loop advances normally.
+	if productAsk != "" && r.isPlaneProject(input.Project.ID) {
+		r.requestProductDecisionInThread(ctx, input, productAsk)
+		r.setAwaitingProductAnswerMarker(ctx, input.Loop, true)
+		r.setNodeHPhase(ctx, input.Loop.ID, "awaiting_product_answer")
+		checkpoint.SkipReason = "awaiting product decision — asked the product owner in the thread"
+		return checkpoint, nil
+	}
+	r.setAwaitingProductAnswerMarker(ctx, input.Loop, false)
 	return checkpoint, nil
 }
 

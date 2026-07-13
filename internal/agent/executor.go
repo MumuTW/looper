@@ -109,6 +109,7 @@ type RunInput struct {
 type Result struct {
 	Status                       string
 	Summary                      string
+	ProductAsk                   string
 	Stdout                       string
 	Stderr                       string
 	ParseStatus                  string
@@ -130,10 +131,15 @@ type completionParse struct {
 	ParseStatus      string
 	CompletionSignal string
 	Summary          string
-	Artifacts        []string
-	ChangedFiles     []string
-	Commits          []string
-	Lifecycle        *lifecycle.State
+	// ProductAsk is an optional product-language message the agent emits in its
+	// completion marker (`{"summary":…,"productAsk":…}`) when a spec has a real
+	// product decision only a human product owner can make. Empty for the common
+	// case; only the planner is instructed to ever populate it.
+	ProductAsk   string
+	Artifacts    []string
+	ChangedFiles []string
+	Commits      []string
+	Lifecycle    *lifecycle.State
 }
 
 type Execution interface {
@@ -592,6 +598,7 @@ func (x *execution) run(ctx context.Context) {
 	result := Result{
 		Status:                       status,
 		Summary:                      completion.Summary,
+		ProductAsk:                   completion.ProductAsk,
 		Stdout:                       stdout,
 		Stderr:                       stderr,
 		ParseStatus:                  completion.ParseStatus,
@@ -1905,6 +1912,9 @@ func parseCompletion(stdout, stderr string) completionParse {
 		if summary, ok := parsed["summary"].(string); ok {
 			result.Summary = summary
 		}
+		if productAsk, ok := parsed["productAsk"].(string); ok {
+			result.ProductAsk = productAsk
+		}
 		if isTemplateCompletion(result, parsed) {
 			continue
 		}
@@ -1927,6 +1937,9 @@ func parseCompletion(stdout, stderr string) completionParse {
 		}
 		if len(primary.Artifacts) == 0 {
 			primary.Artifacts = result.Artifacts
+		}
+		if strings.TrimSpace(primary.ProductAsk) == "" && strings.TrimSpace(result.ProductAsk) != "" {
+			primary.ProductAsk = result.ProductAsk
 		}
 		if completionLifecyclePopulated(primary.Lifecycle) {
 			return *primary

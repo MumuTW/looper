@@ -791,6 +791,27 @@ func TestParseCompletionKeepsSingleCompleteMarkerUnchanged(t *testing.T) {
 	}
 }
 
+func TestParseCompletionExtractsProductAsk(t *testing.T) {
+	t.Parallel()
+
+	// Planner node H: the marker carries an optional productAsk field — a product-
+	// language question for the owner — alongside the summary.
+	marker := CompletionMarkerPrefix + `{"summary":"wrote spec","productAsk":"① 背景:客户想导出品牌包。② 现状:导出格式已定。③ 问题:先支持哪种?A 图片 B PDF,建议 A。"}`
+	parsed := parseCompletion("some work\n"+marker+"\n", "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "wrote spec" {
+		t.Fatalf("parseCompletion() = %#v, want parsed with summary", parsed)
+	}
+	if !strings.Contains(parsed.ProductAsk, "① 背景") || !strings.Contains(parsed.ProductAsk, "建议 A") {
+		t.Fatalf("ProductAsk = %q, want the product-language message", parsed.ProductAsk)
+	}
+
+	// A marker WITHOUT productAsk → empty (the common case; workers never emit it).
+	plain := parseCompletion("x\n"+CompletionMarkerPrefix+`{"summary":"done"}`+"\n", "")
+	if plain.ParseStatus != "parsed" || plain.ProductAsk != "" {
+		t.Fatalf("plain = %#v, want parsed with empty ProductAsk", plain)
+	}
+}
+
 func TestReadPersistedExecutionLogReadsTailToPreserveCompletionMarker(t *testing.T) {
 	t.Parallel()
 

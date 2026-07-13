@@ -1530,3 +1530,57 @@ func TestCreateRunContextDoesNotFollowupResumePlannerWithoutNativeSession(t *tes
 		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want NO follow-up resume (fresh discover-issues)", resumed.Resumed, resumed.StartStep)
 	}
 }
+
+func TestSetAwaitingProductAnswerMarker(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	r := &Runner{repos: fixture.repos, now: fixture.now, logger: fixture.logger}
+	ctx := context.Background()
+	loopID := "loop_product_answer"
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 7, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() error = %v, loop = %v", err, loop)
+	}
+
+	r.setAwaitingProductAnswerMarker(ctx, *loop, true)
+	after, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	if v, _ := parseJSONObject(after.MetadataJSON)["awaitingProductAnswer"].(bool); !v {
+		t.Fatalf("awaitingProductAnswer = false, want true; meta=%q", derefString(after.MetadataJSON))
+	}
+
+	r.setAwaitingProductAnswerMarker(ctx, *after, false)
+	cleared, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	if v, _ := parseJSONObject(cleared.MetadataJSON)["awaitingProductAnswer"].(bool); v {
+		t.Fatalf("awaitingProductAnswer = true after clear, want false; meta=%q", derefString(cleared.MetadataJSON))
+	}
+}
+
+func TestRequestProductDecisionInThreadMentionsProductOwner(t *testing.T) {
+	t.Parallel()
+	var gotLoopID, gotText string
+	var gotMentions []string
+	roleCfg := &config.Config{Projects: []config.ProjectRefConfig{{ID: "project_1", ProductOwner: &config.ProductOwnerConfig{FeishuOpenID: "ou_sunqingyu"}}}}
+	r := &Runner{
+		logger:            &testLogger{},
+		projectRoleConfig: roleCfg,
+		postThreadNote: func(_ context.Context, loopID, text string, mentions []string) error {
+			gotLoopID, gotText, gotMentions = loopID, text, mentions
+			return nil
+		},
+	}
+	in := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Loop: storage.LoopRecord{ID: "loop_x"}}
+	r.requestProductDecisionInThread(context.Background(), in, "① 背景:客户 A 要导出。\n③ 问题:先做 A 还是 B?建议 A。")
+
+	if gotLoopID != "loop_x" {
+		t.Fatalf("loopID = %q, want loop_x", gotLoopID)
+	}
+	if !strings.Contains(gotText, "① 背景") || !strings.Contains(gotText, "建议 A") {
+		t.Fatalf("text = %q, want the productAsk embedded", gotText)
+	}
+	if len(gotMentions) != 1 || gotMentions[0] != "ou_sunqingyu" {
+		t.Fatalf("mentions = %v, want [ou_sunqingyu] (@ product owner)", gotMentions)
+	}
+}
