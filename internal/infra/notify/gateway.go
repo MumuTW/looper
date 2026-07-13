@@ -2084,11 +2084,71 @@ func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body strin
 	if err != nil {
 		return err
 	}
-	if _, err := g.postFeishuAppMessage(ctx, token, chatID, root, "interactive", string(cardJSON)); err != nil {
+	// A follow-up (线程永远可追问) revises the ask — UPDATE the existing 拍板 card in place
+	// so the thread shows ONE evolving card, not a fresh duplicate on every question. Fall
+	// back to a new post when there's no prior card or the patch fails (e.g. it aged out).
+	if prior := g.loopMetaString(ctx, loopID, decisionCardMsgIDKey); prior != "" {
+		if err := g.patchFeishuAppCard(ctx, token, prior, string(cardJSON)); err == nil {
+			g.updateFeishuThreadHeader(ctx, token, loopID)
+			return nil
+		}
+	}
+	msgID, err := g.postFeishuAppMessage(ctx, token, chatID, root, "interactive", string(cardJSON))
+	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(msgID) != "" {
+		g.setLoopMetaString(ctx, loopID, decisionCardMsgIDKey, msgID)
 	}
 	g.updateFeishuThreadHeader(ctx, token, loopID)
 	return nil
+}
+
+// decisionCardMsgIDKey stores the node-H 拍板 card's message id in loop metadata so a
+// follow-up revision patches that card in place instead of posting a duplicate.
+const decisionCardMsgIDKey = "productAskCardMsgId"
+
+// loopMetaString reads a top-level string field from a loop's metadata; "" when absent
+// or unreadable.
+func (g *Gateway) loopMetaString(ctx context.Context, loopID, key string) string {
+	if g.repositories == nil || g.repositories.Loops == nil {
+		return ""
+	}
+	loop, err := g.repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil || loop.MetadataJSON == nil {
+		return ""
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(*loop.MetadataJSON), &meta); err != nil {
+		return ""
+	}
+	s, _ := meta[key].(string)
+	return strings.TrimSpace(s)
+}
+
+// setLoopMetaString stores a top-level string field in a loop's metadata, preserving
+// other keys. Best-effort, re-reading fresh to minimize clobbering concurrent writers.
+func (g *Gateway) setLoopMetaString(ctx context.Context, loopID, key, value string) {
+	if g.repositories == nil || g.repositories.Loops == nil {
+		return
+	}
+	loop, err := g.repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return
+	}
+	meta := map[string]any{}
+	if loop.MetadataJSON != nil && strings.TrimSpace(*loop.MetadataJSON) != "" {
+		_ = json.Unmarshal([]byte(*loop.MetadataJSON), &meta)
+	}
+	meta[key] = value
+	encoded, err := json.Marshal(meta)
+	if err != nil {
+		return
+	}
+	s := string(encoded)
+	loop.MetadataJSON = &s
+	loop.UpdatedAt = eventlog.FormatJavaScriptISOString(g.now().UTC())
+	_ = g.repositories.Loops.Upsert(ctx, *loop)
 }
 
 // patchFeishuAppCard updates an already-sent interactive card in place.
