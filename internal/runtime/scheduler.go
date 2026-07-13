@@ -711,7 +711,10 @@ func (a plannerGitAdapter) Push(ctx context.Context, input planner.PushInput) er
 	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
 
-type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type plannerAgentExecutorAdapter struct {
+	executor *agent.ConfiguredExecutor
+	registry *ActiveExecutionRegistry
+}
 type plannerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
@@ -719,6 +722,16 @@ func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.Ag
 	if err != nil {
 		return nil, err
 	}
+	// Register the live execution so a human's mid-run @bot can interrupt it (C1). The
+	// goroutine unregisters once it finishes (Wait is idempotent — the runner also Waits).
+	unregister := func() {}
+	if a.registry != nil {
+		unregister = a.registry.Register(input.LoopID, input.RunID, input.ExecutionID, execution)
+	}
+	go func() {
+		_, _ = execution.Wait(context.Background())
+		unregister()
+	}()
 	return plannerAgentExecutionAdapter{execution: execution}, nil
 }
 
@@ -2109,7 +2122,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		Repos:              repos,
 		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:                plannerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor},
+		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
 		Logger:             logger,
 		Now:                now,
 		AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
