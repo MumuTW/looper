@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1438,5 +1439,94 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 	}
 	if persisted == nil || persisted.Status != "terminated" {
 		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
+	}
+}
+
+// setupCompletedPlannerLoop seeds a finished (status "completed") planner loop with
+// a pending human thread message and a "success" run whose checkpoint carries a
+// completed write-spec + node-H gate flags. Returns the loop id. withSession seeds a
+// captured native agent session (the gate for a safe follow-up resume).
+func setupCompletedPlannerLoop(t *testing.T, fixture *runnerFixture, loopID string, withSession bool) {
+	t.Helper()
+	ctx := context.Background()
+	projectID := "project_1"
+	target := "issue:acme/looper:42"
+	meta, err := loops.AppendHumanMessage(nil, loops.HumanMessage{At: fixture.nowISO(), Text: "产品答案:导出优先 PDF"})
+	if err != nil {
+		t.Fatalf("AppendHumanMessage() error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 42, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "completed", MetadataJSON: &meta, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if withSession {
+		if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_planner_" + loopID, ProjectID: &projectID, LoopID: &loopID, Vendor: "opencode", Status: "completed", NativeSessionID: stringPtr("sess_planner_1"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+			t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+		}
+	}
+	checkpointJSON := mustMarshalJSON(plannerCheckpoint{
+		Issue:          &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md", URL: "https://plane/x/42"},
+		ClaimedLockKey: "issue:acme/looper:42",
+		Worktree:       &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "looper/plan", BaseBranch: "main", SpecPath: "specs/42.md"},
+		WriteSpec:      &checkpointWriteSpec{Status: "completed", GitReconciled: true},
+		Publish:        &checkpointPublishState{PlaneSpecReview: true, Grilled: true, Reviewed: true},
+	})
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_planner_ok_" + loopID, LoopID: loopID, Status: "success", LastCompletedStep: stringPtr(string(stepNotify)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+}
+
+func TestCreateRunContextFollowupResumesCompletedPlannerLoopWithHumanMessage(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	setupCompletedPlannerLoop(t, fixture, "loop_planner_followup", true)
+
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_planner_followup")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() error = %v, loop = %v", err, loop)
+	}
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	// Resume the SAME session at write-spec (incremental spec revision), NOT
+	// discover-issues (a full re-plan).
+	if !resumed.Resumed || resumed.StartStep != stepWriteSpec {
+		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want a resumed write-spec follow-up (never discover-issues)", resumed.Resumed, resumed.StartStep)
+	}
+	// write-spec re-runs the agent; node-H gate flags reset so the updated spec
+	// re-flows through publish/grill/review. Issue + worktree preserved.
+	if resumed.Checkpoint.WriteSpec != nil {
+		t.Fatalf("WriteSpec = %#v, want cleared so the write-spec agent runs again", resumed.Checkpoint.WriteSpec)
+	}
+	if resumed.Checkpoint.Publish == nil || resumed.Checkpoint.Publish.Grilled || resumed.Checkpoint.Publish.Reviewed {
+		t.Fatalf("Publish = %#v, want Grilled/Reviewed reset (re-grill/re-review the revised spec)", resumed.Checkpoint.Publish)
+	}
+	if resumed.Checkpoint.Issue == nil || resumed.Checkpoint.Worktree == nil {
+		t.Fatalf("checkpoint = %#v, want preserved issue + worktree", resumed.Checkpoint)
+	}
+	if resumed.Run.LastCompletedStep == nil || *resumed.Run.LastCompletedStep != string(stepPrepareWorktree) {
+		t.Fatalf("run.LastCompletedStep = %#v, want prepare-worktree", resumed.Run.LastCompletedStep)
+	}
+}
+
+func TestCreateRunContextDoesNotFollowupResumePlannerWithoutNativeSession(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	setupCompletedPlannerLoop(t, fixture, "loop_planner_nosession", false) // no captured session
+
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_planner_nosession")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() error = %v, loop = %v", err, loop)
+	}
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	// Without a native session, native resume is impossible — the follow-up bridge
+	// must refuse (a completed run is not otherwise resumed), so no re-plan is forced.
+	if resumed.Resumed || resumed.StartStep != stepDiscoverIssues {
+		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want NO follow-up resume (fresh discover-issues)", resumed.Resumed, resumed.StartStep)
 	}
 }

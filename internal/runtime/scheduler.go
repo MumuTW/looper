@@ -714,7 +714,7 @@ type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type plannerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
 	if err != nil {
 		return nil, err
 	}
@@ -2077,6 +2077,10 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			// Env-gated (not a config field yet) so it stays zero-risk to the schema
 			// / parity fixtures until the codex --json path is proven end-to-end.
 			LiveToolEvents: strings.EqualFold(strings.TrimSpace(os.Getenv("LOOPER_CODEX_JSON_EVENTS")), "1"),
+			// Env-gated claude-code stream-json mode: unlocks native session capture
+			// (plain --print never emits a session id) for the worker/planner follow-up
+			// resume. Off by default → the existing plain-text path is unchanged.
+			ClaudeJSONEvents: strings.EqualFold(strings.TrimSpace(os.Getenv("LOOPER_CLAUDE_JSON_EVENTS")), "1"),
 		},
 		Repos:  repos,
 		LogDir: cfg.Daemon.LogDir,

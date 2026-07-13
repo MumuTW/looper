@@ -40,28 +40,19 @@ type feishuHITLPollDeps struct {
 	loopBySeq func(ctx contextType, seq int64) string
 	// deliverAnswer feeds a button-click decision into the shared HITL core.
 	deliverAnswer func(ctx contextType, loopID, answer string) error
-	// enqueueMessage queues a free-text thread reply for the loop (conversational /
-	// anytime), to be drained on the loop's next turn rather than treated as a final
-	// answer.
+	// enqueueMessage delivers a free-text thread reply to the loop (conversational /
+	// anytime). It records the message and either reactivates the loop (so the agent
+	// resumes to answer / continue — even a finished task, 线程永远可追问) or, when the
+	// task cannot be safely resumed, posts the honest closed-task ack. It never
+	// silently drops the reply.
 	enqueueMessage func(ctx contextType, loopID, text string) error
-	// loopDone reports whether a loop has finished its work (completed / merged), so
-	// a further thread reply is a post-completion follow-up rather than a live turn.
-	loopDone func(ctx contextType, loopID string) bool
-	// notifyClosed posts the one "task is done, continue on the issue/PR" reply for a
-	// finished loop (§F option B). Best-effort.
-	notifyClosed func(ctx contextType, loopID string) error
-	logWarn      func(msg string, fields map[string]any)
+	logWarn        func(msg string, fields map[string]any)
 }
 
-// pollFeishuHITLInboxOnce delivers the answers among a batch of inbox events that
-// belong to this looper's awaiting loops, self-selecting by thread root (typed
-// replies) or loop seq (card-action clicks). Returns the highest event id seen so
-// the caller can advance its cursor. Idempotent: an event whose loop is no longer
-// awaiting is a no-op in deliverAnswer.
 // loopFinishedForFollowup reports whether a loop has finished its work such that a
 // further thread reply is a post-completion follow-up (§F). Only the "done well"
-// states qualify — failed/abandoned loops may still be retried or acted on, so
-// they keep queuing messages.
+// states qualify — failed/abandoned loops may still be retried or acted on through
+// other paths, so they are handled separately.
 func loopFinishedForFollowup(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "completed", "done", "merged":
@@ -71,6 +62,11 @@ func loopFinishedForFollowup(status string) bool {
 	}
 }
 
+// pollFeishuHITLInboxOnce delivers the answers among a batch of inbox events that
+// belong to this looper's awaiting loops, self-selecting by thread root (typed
+// replies) or loop seq (card-action clicks). Returns the highest event id seen so
+// the caller can advance its cursor. Idempotent: an event whose loop is no longer
+// awaiting is a no-op in deliverAnswer.
 func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps feishuHITLPollDeps) (delivered int, maxID int64) {
 	for _, e := range events {
 		if e.ID > maxID {
@@ -81,26 +77,19 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 		var deliver func(contextType, string, string) error
 		switch strings.TrimSpace(e.Kind) {
 		case "message":
-			// A typed thread reply is conversational: queue it (question / new
+			// A typed thread reply is conversational: deliver it (question / new
 			// instruction / an answer the agent will interpret), don't force it to
-			// resolve the ask.
+			// resolve the ask. It is ALWAYS deliverable — even to a finished
+			// (completed / merged) task (线程永远可追问): enqueueMessage records it and
+			// either reactivates the loop so the agent resumes to answer / continue,
+			// or, when the task cannot be safely resumed, posts the honest closed-task
+			// ack. It is never silently dropped.
 			text := strings.TrimSpace(e.Text)
 			root := strings.TrimSpace(e.RootID)
 			if text == "" || root == "" || deps.loopByRoot == nil || deps.enqueueMessage == nil {
 				continue
 			}
 			loopID = deps.loopByRoot(ctx, root)
-			// §F option B (P5): the task already finished — a further reply gets one
-			// honest ack instead of being silently queued to a loop that never runs
-			// again.
-			if strings.TrimSpace(loopID) != "" && deps.loopDone != nil && deps.loopDone(ctx, loopID) {
-				if deps.notifyClosed != nil {
-					if err := deps.notifyClosed(ctx, loopID); err != nil && deps.logWarn != nil {
-						deps.logWarn("hitl feishu poll: closed-task followup failed", map[string]any{"loopId": loopID, "error": err.Error()})
-					}
-				}
-				continue
-			}
 			value = text
 			deliver = deps.enqueueMessage
 		case "card_action":
@@ -201,20 +190,19 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return nil
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
-			return enqueueHumanMessageToLoop(ctx, input.Repos, nowISO, loopID, text)
-		},
-		loopDone: func(ctx contextType, loopID string) bool {
-			loop, err := input.Repos.Loops.GetByID(ctx, loopID)
-			if err != nil || loop == nil {
-				return false
+			ackClosed, err := enqueueHumanMessageToLoop(ctx, input.Repos, nowISO, loopID, text)
+			if err != nil {
+				return err
 			}
-			return loopFinishedForFollowup(loop.Status)
-		},
-		notifyClosed: func(ctx contextType, loopID string) error {
-			if input.PostTaskClosedFollowup == nil {
-				return nil
+			// The message landed on a finished task that could not be reactivated —
+			// post the one honest "task is done, continue on the issue/PR" ack (§F
+			// option B). Best-effort: the message is already recorded regardless.
+			if ackClosed && input.PostTaskClosedFollowup != nil {
+				if ackErr := input.PostTaskClosedFollowup(ctx, loopID); ackErr != nil && input.Logger != nil {
+					input.Logger.Warn("hitl feishu poll: closed-task followup failed", map[string]any{"loopId": loopID, "error": ackErr.Error()})
+				}
 			}
-			return input.PostTaskClosedFollowup(ctx, loopID)
+			return nil
 		},
 	}
 	if input.Logger != nil {

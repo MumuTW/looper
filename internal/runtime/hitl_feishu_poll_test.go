@@ -44,27 +44,26 @@ func TestPollFeishuHITLInboxOnce(t *testing.T) {
 	}
 }
 
-func TestPollFeishuHITLInboxOnceAcksFinishedTaskInsteadOfQueuing(t *testing.T) {
-	// om_root_done -> loop-done (a finished task); om_root_live -> loop-live (still running).
+func TestPollFeishuHITLInboxOnceDeliversFinishedTaskFollowupToEnqueue(t *testing.T) {
+	// 线程永远可追问: a reply to a finished task is no longer dropped at the poll — it is
+	// always routed to enqueueMessage, which records it and decides whether to
+	// reactivate the loop or post the honest closed-task ack.
 	rootToLoop := map[string]string{"om_root_done": "loop-done", "om_root_live": "loop-live"}
-	done := map[string]bool{"loop-done": true}
-	var enqueued, acked []string
+	var enqueued []string
 	deps := feishuHITLPollDeps{
 		loopByRoot:     func(_ contextType, root string) string { return rootToLoop[root] },
 		enqueueMessage: func(_ contextType, loopID, text string) error { enqueued = append(enqueued, loopID); return nil },
-		loopDone:       func(_ contextType, loopID string) bool { return done[loopID] },
-		notifyClosed:   func(_ contextType, loopID string) error { acked = append(acked, loopID); return nil },
 	}
 	events := []feishuInboxEvent{
-		{ID: 20, Kind: "message", RootID: "om_root_done", Text: "还能再改改吗?"}, // finished -> ack once, don't queue
-		{ID: 21, Kind: "message", RootID: "om_root_live", Text: "用 redis"}, // live -> queue as normal
+		{ID: 20, Kind: "message", RootID: "om_root_done", Text: "还能再改改吗?"}, // finished -> still delivered to enqueue
+		{ID: 21, Kind: "message", RootID: "om_root_live", Text: "用 redis"}, // live -> delivered to enqueue
 	}
-	pollFeishuHITLInboxOnce(context.Background(), events, deps)
-	if len(acked) != 1 || acked[0] != "loop-done" {
-		t.Fatalf("acked = %v, want [loop-done]", acked)
+	n, _ := pollFeishuHITLInboxOnce(context.Background(), events, deps)
+	if n != 2 {
+		t.Fatalf("handled = %d, want 2", n)
 	}
-	if len(enqueued) != 1 || enqueued[0] != "loop-live" {
-		t.Fatalf("enqueued = %v, want only the live loop [loop-live]", enqueued)
+	if len(enqueued) != 2 || enqueued[0] != "loop-done" || enqueued[1] != "loop-live" {
+		t.Fatalf("enqueued = %v, want both [loop-done loop-live] routed to enqueueMessage", enqueued)
 	}
 }
 

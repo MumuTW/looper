@@ -247,16 +247,22 @@ type GitGateway interface {
 }
 
 type AgentRunInput struct {
-	ExecutionID      string
-	ProjectID        string
-	LoopID           string
-	RunID            string
-	Prompt           string
-	WorkingDirectory string
-	Timeout          time.Duration
-	HeartbeatTimeout time.Duration
-	Metadata         map[string]any
-	IdempotencyKey   string
+	ExecutionID string
+	ProjectID   string
+	LoopID      string
+	RunID       string
+	Prompt      string
+	// NativeResumePrompt + NativeSessionID drive native agent-session resume: when a
+	// finished planner loop is reactivated for a follow-up turn (线程永远可追问), the
+	// write-spec step resumes the SAME planner session so it retains the full
+	// spec-authoring history and revises the spec incrementally rather than replanning.
+	NativeResumePrompt string
+	NativeSessionID    string
+	WorkingDirectory   string
+	Timeout            time.Duration
+	HeartbeatTimeout   time.Duration
+	Metadata           map[string]any
+	IdempotencyKey     string
 }
 
 type AgentResult struct {
@@ -1093,11 +1099,33 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			// stray one anyway, but the ask avoids the noise).
 			prompt += "\n\nCRITICAL — This is a Plane project: the spec will be published to a Plane page by looper, NOT as a pull request. Write ONLY the spec file in the worktree. Do NOT run `gh pr create`, do NOT `git push`, do NOT open or modify any pull request. Any PR you open will be closed as a mistake."
 		}
+		// Follow-up resume (线程永远可追问): drain any human thread messages queued while
+		// the spec awaited review, and native-resume the SAME planner session so the
+		// agent keeps its full spec-authoring history and revises the spec incrementally
+		// (incorporating a product decision / answering a follow-up) — never replanning
+		// from scratch. On a fresh first run the inbox is empty, so this is a no-op and
+		// the agent starts normally.
+		nativeResumePrompt := ""
+		nativeSessionID := ""
+		if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
+			var msgs strings.Builder
+			msgs.WriteString("While this spec was awaiting review, the human sent these messages in the task thread:")
+			for _, m := range inbox {
+				if t := strings.TrimSpace(m.Text); t != "" {
+					msgs.WriteString("\n- ")
+					msgs.WriteString(t)
+				}
+			}
+			msgs.WriteString("\nRead them in context and update the spec accordingly — incorporate a product decision, answer a follow-up, or tighten an open question. Do NOT rewrite the spec from scratch: revise the existing spec file incrementally to reflect their input.")
+			nativeResumePrompt = msgs.String()
+			prompt += "\n\n" + nativeResumePrompt
+			nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID)
+		}
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1124,6 +1152,9 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
+		// The turn consumed any queued human messages (fed above) — clear the inbox so
+		// they aren't re-injected on a later run. No-op when the inbox was empty.
+		r.clearHumanInbox(ctx, &input.Loop)
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -1859,6 +1890,96 @@ func (r *Runner) runNotifyStep(input stepInput) (plannerCheckpoint, error) {
 	return checkpoint, nil
 }
 
+// latestNativeSessionID returns the loop's most recent captured agent session id, so
+// a follow-up write-spec turn can native-resume the SAME session and keep the full
+// spec-authoring conversation. Empty when none is recorded (e.g. a vendor that did
+// not emit a session id) — the follow-up gate then refuses to reactivate.
+func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) string {
+	if r.repos == nil || r.repos.AgentExecutions == nil {
+		return ""
+	}
+	execution, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+	if err != nil || execution == nil || execution.NativeSessionID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*execution.NativeSessionID)
+}
+
+// clearHumanInbox drops the loop's drained human messages after a successful
+// write-spec turn so they are not re-injected on a later run. No-op when empty.
+func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
+		return
+	}
+	meta, werr := loops.ClearHumanInbox(fresh.MetadataJSON)
+	if werr != nil {
+		return
+	}
+	fresh.MetadataJSON = &meta
+	fresh.UpdatedAt = r.nowISO()
+	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
+		loop.MetadataJSON = &meta
+	}
+}
+
+// shouldFollowupResume reports whether a finished planner loop that just received a
+// new human thread message can be safely reactivated for a single incremental
+// follow-up turn (线程永远可追问). When true, createRunContext resumes at stepWriteSpec
+// with the spec-authoring + node-H gate flags rewound so the write-spec step
+// native-resumes the SAME planner session, drains the queued message, and revises
+// the spec incrementally — then re-publishes/re-grills/re-reviews the updated spec
+// (all idempotent). It NEVER re-discovers or re-plans from scratch.
+//
+// Strict guard so the "re-plan the whole thing" path can never be taken:
+//   - the prior run must have completed successfully ("success"); and
+//   - the loop must carry at least one pending human message; and
+//   - the checkpoint must carry the issue + a worktree + a completed write-spec; and
+//   - a native agent session id must be captured. Without a session, native resume
+//     is impossible and write-spec would author a fresh spec — so we refuse and let
+//     the caller fall back to the honest closed-task ack instead.
+//
+// Only ever reachable via the follow-up reactivation path (enqueueHumanMessageToLoop,
+// which only reactivates planner loops that have a captured session); a completed
+// loop is otherwise never re-dispatched.
+func (r *Runner) shouldFollowupResume(ctx context.Context, loop storage.LoopRecord, latestRun *storage.RunRecord, checkpoint plannerCheckpoint) bool {
+	if latestRun == nil || latestRun.Status != "success" {
+		return false
+	}
+	if len(loops.ReadHumanInbox(loop.MetadataJSON)) == 0 {
+		return false
+	}
+	if checkpoint.Issue == nil || checkpoint.Worktree == nil {
+		return false
+	}
+	if checkpoint.WriteSpec == nil || !strings.EqualFold(checkpoint.WriteSpec.Status, "completed") {
+		return false
+	}
+	return strings.TrimSpace(r.latestNativeSessionID(ctx, loop.ID)) != ""
+}
+
+// rewindPlannerCheckpointForFollowup rewinds a completed planner checkpoint so a
+// follow-up turn re-authors the spec (write-spec re-runs the agent, native-resuming
+// the session with the human message) and the updated spec re-flows through the
+// node-H gates. Preserves everything needed to resume: issue, worktree, lock,
+// lifecycle, and the Plane publish reference — only the "already done" flags are
+// cleared.
+func rewindPlannerCheckpointForFollowup(checkpoint plannerCheckpoint) plannerCheckpoint {
+	checkpoint.WriteSpec = nil
+	if checkpoint.Publish != nil {
+		checkpoint.Publish.Grilled = false
+		checkpoint.Publish.Reviewed = false
+	}
+	checkpoint.SkipReason = ""
+	return checkpoint
+}
+
 func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) (resumedRunContext, error) {
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
@@ -1871,21 +1992,35 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		lastCompleted = asPlannerStep(derefString(latestRun.LastCompletedStep))
 	}
 	shouldResume := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
+	// FOLLOW-UP RESUME (线程永远可追问): a finished planner loop got a new human message
+	// — resume the SAME session at write-spec for ONE incremental turn (see
+	// shouldFollowupResume). Never re-discovers/re-plans from scratch.
+	followupResume := !shouldResume && r.shouldFollowupResume(ctx, loop, latestRun, check)
 	startStep := stepDiscoverIssues
-	if shouldResume {
+	switch {
+	case followupResume:
+		startStep = stepWriteSpec
+	case shouldResume:
 		if next := nextPlannerStep(lastCompleted); next != "" {
 			startStep = next
 		}
 	}
-	resumed := shouldResume && startStep != stepDiscoverIssues
+	resumed := followupResume || (shouldResume && startStep != stepDiscoverIssues)
 	initialCheckpoint := plannerCheckpoint{ResumePolicy: "replay_step"}
-	if resumed {
+	if followupResume {
+		initialCheckpoint = rewindPlannerCheckpointForFollowup(check)
+		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
+	} else if resumed {
 		initialCheckpoint = check
 		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
 	}
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
-	if resumed && lastCompleted != "" {
+	if followupResume {
+		if prev := previousPlannerStep(startStep); prev != "" {
+			run.LastCompletedStep = stringPtr(string(prev))
+		}
+	} else if resumed && lastCompleted != "" {
 		run.LastCompletedStep = stringPtr(string(lastCompleted))
 	}
 	encoded := mustMarshalJSON(initialCheckpoint)
@@ -2178,6 +2313,15 @@ func nextPlannerStep(step PlannerStep) PlannerStep {
 	for i, candidate := range plannerStepSequence {
 		if candidate == step && i+1 < len(plannerStepSequence) {
 			return plannerStepSequence[i+1]
+		}
+	}
+	return ""
+}
+
+func previousPlannerStep(step PlannerStep) PlannerStep {
+	for i, candidate := range plannerStepSequence {
+		if candidate == step && i > 0 {
+			return plannerStepSequence[i-1]
 		}
 	}
 	return ""

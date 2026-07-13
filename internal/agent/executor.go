@@ -58,6 +58,13 @@ type ExecutorConfig struct {
 	// affects the codex vendor; the result + session are read from the JSONL. Off
 	// by default (env-gated) so it can't disturb the text-mode path until proven.
 	LiveToolEvents bool
+	// ClaudeJSONEvents runs claude-code with `--output-format stream-json --verbose`
+	// and parses its JSONL event stream so its native session id can be captured
+	// (unlocking native resume; plain `--print` never emits one) and a structured
+	// tool feed shown. Only affects the claude-code vendor; the result + session are
+	// read from the JSONL. Off by default (env-gated) so it can't disturb the
+	// text-mode path until proven.
+	ClaudeJSONEvents bool
 }
 
 type ExecutorOptions struct {
@@ -559,6 +566,17 @@ func (x *execution) run(ctx context.Context) {
 		if tr.sessionID != "" {
 			x.nativeSessionID = tr.sessionID
 		}
+	} else if x.claudeJSONMode() {
+		// claude --output-format stream-json: stdout is JSONL. The completion marker +
+		// final message live inside the `result` event's `result` field (not a bare
+		// stdout line), and the session id is stamped on every event — read both from
+		// the parsed stream instead of raw stdout.
+		tr := newClaudeJSONLTranslator()
+		tr.ingestAll(stdout)
+		completion = parseCompletion(tr.combinedText(), stderr)
+		if tr.sessionID != "" {
+			x.nativeSessionID = tr.sessionID
+		}
 	}
 	if status != "completed" {
 		completion = completionParse{ParseStatus: "missing"}
@@ -877,6 +895,14 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 				x.nativeSessionID = sessionID
 			}
 		}
+	} else if x.claudeJSONMode() {
+		// claude stream-json stamps the session id (a UUID) on every event; capture
+		// the first via a precise regex so a live takeover / resume has it.
+		if strings.TrimSpace(x.nativeSessionID) == "" {
+			if sessionID := extractClaudeSessionID(stdout); sessionID != "" {
+				x.nativeSessionID = sessionID
+			}
+		}
 	} else if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
 		x.nativeSessionID = nativeSessionID
 	} else if x.jsonMode() && strings.TrimSpace(x.nativeSessionID) == "" {
@@ -920,6 +946,10 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 		// Structured opencode feed (tool calls + text snippets) parsed from JSONL, so
 		// the card shows human activity rather than raw JSON events.
 		tail = openCodeActivityTail(stdout, liveProgressTailLines)
+	case x.claudeJSONMode():
+		// Structured claude feed (tool_use calls + text snippets) parsed from JSONL, so
+		// the card shows human activity rather than raw JSON events.
+		tail = claudeActivityTail(stdout, liveProgressTailLines)
 	default:
 		// Combine streams; the last N lines skew toward whichever is actively writing.
 		tail = lastNonEmptyLines(stdout+"\n"+stderr, liveProgressTailLines)
@@ -946,6 +976,15 @@ func (x *execution) jsonMode() bool {
 // resolveNativeResumeArgs unconditionally add --format json for this vendor.
 func (x *execution) openCodeJSONMode() bool {
 	return x.executor != nil && x.executor.config.Vendor == config.AgentVendorOpenCode
+}
+
+// claudeJSONMode reports whether this run is a claude-code `--output-format
+// stream-json` run. Env-gated (via ClaudeJSONEvents) so it stays zero-risk to the
+// existing plain-text `--print` path until proven; when on, resolveClaudeArgs and
+// resolveNativeResumeArgs add `--output-format stream-json --verbose` so stdout is
+// JSONL for both a fresh run and a resumed one.
+func (x *execution) claudeJSONMode() bool {
+	return x.executor != nil && x.executor.config.ClaudeJSONEvents && x.executor.config.Vendor == config.AgentVendorClaudeCode
 }
 
 // codexToolTail renders the last n command executions from a codex JSONL blob.
@@ -1366,6 +1405,23 @@ func resolveClaudeArgs(cfg ExecutorConfig, args []string, prompt string) []strin
 	if !hasAnyFlag(resolved, []string{"--dangerously-skip-permissions"}) {
 		resolved = append(resolved, "--dangerously-skip-permissions")
 	}
+	return appendClaudeStreamJSON(cfg, resolved)
+}
+
+// appendClaudeStreamJSON adds `--output-format stream-json --verbose` when the
+// ClaudeJSONEvents flag is on (stream-json REQUIRES --verbose), so stdout is JSONL
+// and the native session id can be captured. No-op when the flag is off (plain
+// `--print` text mode, unchanged) or the flags are already present.
+func appendClaudeStreamJSON(cfg ExecutorConfig, resolved []string) []string {
+	if !cfg.ClaudeJSONEvents {
+		return resolved
+	}
+	if !hasAnyFlag(resolved, []string{"--output-format"}) {
+		resolved = append(resolved, "--output-format", "stream-json")
+	}
+	if !hasAnyFlag(resolved, []string{"--verbose"}) {
+		resolved = append(resolved, "--verbose")
+	}
 	return resolved
 }
 
@@ -1421,7 +1477,10 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args [
 		if !hasAnyFlag(resolved, []string{"--dangerously-skip-permissions"}) {
 			resolved = append(resolved, "--dangerously-skip-permissions")
 		}
-		return resolved
+		// Keep the resumed run on the same JSONL contract as a fresh one so its stdout
+		// parses (and its session id re-captures); otherwise claudeJSONMode would try to
+		// parse plain text and lose the completion marker.
+		return appendClaudeStreamJSON(cfg, resolved)
 	case config.AgentVendorCodex:
 		resolved := removeFirstArg(args, "exec")
 		resolved = removeFirstArg(resolved, "resume")

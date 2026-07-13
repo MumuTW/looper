@@ -2563,9 +2563,21 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	// The full checkpoint (PullRequest/Work/Lifecycle/Worktree) is carried
 	// forward. This is the source of control truth; loop.Status is display only.
 	shepherdRun := loops.ShepherdActive(loop.MetadataJSON) && checkpoint.PullRequest != nil
-	if shepherdRun {
+	// FOLLOW-UP RESUME (线程永远可追问): a finished worker loop that just received a
+	// new human thread message is reactivated for ONE incremental turn — resume the
+	// SAME agent session (so the code author's full history is retained), drain the
+	// queued message in the execute step, and reuse the existing PR. It NEVER
+	// re-implements from scratch and NEVER opens a duplicate PR. It mirrors the
+	// awaiting_human execute-replay and is heavily guarded (see shouldFollowupResume)
+	// so the dangerous "re-do the whole task" path can never be taken.
+	followupResume := !shepherdRun && r.shouldFollowupResume(ctx, loop, latestRun, checkpoint)
+	switch {
+	case shepherdRun:
 		startStep = stepShepherd
-	} else if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
+	case followupResume:
+		startStep = stepExecute
+		resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
+	case latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "":
 		if restartFromDiscover {
 			startStep = stepPrepareWork
 			resumedCheckpoint = workerCheckpoint{ResumePolicy: loops.ResumePolicyReplayStep}
@@ -2576,19 +2588,20 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			startStep = next
 		}
 	}
-	resumed := shepherdRun || (latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork)
+	resumed := shepherdRun || followupResume || (latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork)
 	nowISO := r.nowISO()
 	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if resumed {
-		if restartFromDiscover {
+		switch {
+		case restartFromDiscover:
 			run.LastCompletedStep = nil
-		} else if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
+		case followupResume || shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint):
 			if prev := previousWorkerStep(startStep); prev != "" {
 				value := string(prev)
 				run.LastCompletedStep = &value
 			}
-		} else if lastCompletedStep != "" {
+		case lastCompletedStep != "":
 			value := string(lastCompletedStep)
 			run.LastCompletedStep = &value
 		}
@@ -2601,6 +2614,47 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: parsedCheckpoint, Resumed: resumed}, nil
+}
+
+// shouldFollowupResume reports whether a finished worker loop that just received a
+// new human thread message can be safely reactivated for a single incremental
+// follow-up turn (线程永远可追问). When true, createRunContext resumes at stepExecute
+// with the execution checkpoint rewound so the execute step native-resumes the
+// SAME agent session, drains the queued human message, and reuses the existing PR
+// (open-pr is idempotent) rather than re-implementing or opening a duplicate.
+//
+// It is deliberately strict so the "re-do the whole task" path is never taken:
+//   - the prior run must have completed successfully ("success"); and
+//   - the loop must carry at least one pending human message; and
+//   - the checkpoint must carry a completed execution + a worktree to resume into; and
+//   - a native agent session id must be captured. Without a session, native resume
+//     is impossible and the execute step would restart from the original
+//     implement-this-issue prompt (a full re-run) — so we refuse and let the caller
+//     fall back to the honest closed-task ack instead.
+//
+// This branch is only ever reachable via the follow-up reactivation path
+// (enqueueHumanMessageToLoop), which itself only reactivates worker loops that have
+// a captured session; a completed loop is otherwise never re-dispatched.
+func (r *Runner) shouldFollowupResume(ctx context.Context, loop storage.LoopRecord, latestRun *storage.RunRecord, checkpoint workerCheckpoint) bool {
+	if latestRun == nil || latestRun.Status != "success" {
+		return false
+	}
+	if len(loops.ReadHumanInbox(loop.MetadataJSON)) == 0 {
+		return false
+	}
+	if checkpoint.Worktree == nil {
+		return false
+	}
+	// The prior run must carry a completed, well-parsed execution to resume from —
+	// mirrors runExecuteStep's executionCompleted gate. (validateCompletedExecution-
+	// Checkpoint returns nil for a nil execution, so the presence check is required.)
+	if checkpoint.Execution == nil || checkpoint.Execution.Status != "completed" {
+		return false
+	}
+	if validateCompletedExecutionCheckpoint(checkpoint.Execution) != nil {
+		return false
+	}
+	return strings.TrimSpace(r.latestNativeSessionID(ctx, loop.ID)) != ""
 }
 
 func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, step WorkerStep, checkpoint workerCheckpoint) (storage.RunRecord, error) {
