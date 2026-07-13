@@ -502,18 +502,24 @@ func TestFeishuLoopFlowchartStyle(t *testing.T) {
 		{"awaiting spec while running", "planner", "running", false, true, "", "orange", "等待产品方案"},
 		// node H: a completed planner (no phase marker) awaits a human's approve.
 		{"planner completed → needs human review", "planner", "completed", false, false, "", "orange", "需要人类审核 spec"},
-		// Worker delivery + terminals.
-		{"worker delivered a PR", "worker", "completed", true, false, "", "turquoise", "待合并"},
+		// Worker delivery + terminals. An OPEN PR is NOT delivered — a just-opened impl
+		// PR defaults to 待 review (never the old "已交付 · 待合并"); the real state is
+		// layered on from the PR snapshot (§A). 已交付 is reserved for a MERGED PR.
+		{"worker delivered a PR", "worker", "completed", true, false, "", "blue", "待 review"},
 		{"worker completed no PR", "worker", "completed", false, false, "", "green", "已完成"},
 		{"merged terminal", "worker", "merged", false, false, "", "green", "已合并"},
 		{"failed terminal", "worker", "failed", false, false, "", "red", "需要处理"},
 		{"abandoned terminal", "planner", "abandoned", false, false, "", "red", "需要处理"},
 	}
 	for _, want := range cases {
-		gotT, gotL := feishuLoopFlowchartStyle(want.loopType, want.status, want.hasPR, want.awaitingSpec, want.nodeHPhase, "")
+		gotT, gotL := feishuLoopFlowchartStyle(want.loopType, want.status, want.hasPR, want.awaitingSpec, want.nodeHPhase, "", 0)
 		if gotT != want.template || !strings.Contains(gotL, want.contains) {
 			t.Fatalf("%s: feishuLoopFlowchartStyle(%q,%q,%v,%v,%q) = (%q,%q); want template %q label~%q", want.name, want.loopType, want.status, want.hasPR, want.awaitingSpec, want.nodeHPhase, gotT, gotL, want.template, want.contains)
 		}
+	}
+	// A just-opened impl PR must never say 已交付, and carries its PR number when known.
+	if tpl, label := feishuLoopFlowchartStyle("worker", "completed", true, false, "", "", 907); tpl != "blue" || !strings.Contains(label, "待 review") || !strings.Contains(label, "PR #907") || strings.Contains(label, "已交付") {
+		t.Fatalf("delivered worker PR = (%q,%q); want blue 待 review · PR #907, never 已交付", tpl, label)
 	}
 }
 
@@ -573,21 +579,30 @@ func TestPRCardStateFromSnapshotMapsReviewCycle(t *testing.T) {
 		name       string
 		review     string
 		checks     string
+		labels     []string
 		unresolved int64
 		want       prCardState
 	}{
-		{"failing CI wins", "APPROVED", "success, failure", 0, prCardStateChecksFailed},
-		{"changes requested", "CHANGES_REQUESTED", "success", 0, prCardStateChangesRequested},
-		{"CI still running", "REVIEW_REQUIRED", "success, pending", 0, prCardStateChecksRunning},
-		{"approved + green", "APPROVED", "success, success", 0, prCardStateApproved},
-		{"awaiting review", "REVIEW_REQUIRED", "success", 2, prCardStateReviewPending},
-		{"no decision yet", "", "", 0, prCardStateReviewPending},
-		{"in_progress running", "", "in_progress", 0, prCardStateChecksRunning},
+		{"failing CI wins", "APPROVED", "success, failure", nil, 0, prCardStateChecksFailed},
+		{"changes requested", "CHANGES_REQUESTED", "success", nil, 0, prCardStateChangesRequested},
+		{"CI still running", "REVIEW_REQUIRED", "success, pending", nil, 0, prCardStateChecksRunning},
+		{"approved + green", "APPROVED", "success, success", nil, 0, prCardStateApproved},
+		{"awaiting review", "REVIEW_REQUIRED", "success", nil, 2, prCardStateReviewPending},
+		{"no decision yet", "", "", nil, 0, prCardStateReviewPending},
+		{"in_progress running", "", "in_progress", nil, 0, prCardStateChecksRunning},
+		// QA validation gate: APPROVED splits on the needs-validation / validated labels.
+		{"approved + needs-validation → awaiting QA", "APPROVED", "success", []string{"needs-validation"}, 0, prCardStateAwaitingValidation},
+		{"approved + validated → validated", "APPROVED", "success", []string{"validated"}, 0, prCardStateValidated},
+		{"approved + validated wins over needs-validation", "APPROVED", "success", []string{"needs-validation", "validated"}, 0, prCardStateValidated},
+		{"approved + no gate label → plain approved", "APPROVED", "success", []string{"enhancement"}, 0, prCardStateApproved},
+		{"needs-validation label is case-insensitive", "APPROVED", "success", []string{"Needs-Validation"}, 0, prCardStateAwaitingValidation},
+		// Failing CI still wins even when the QA labels are present.
+		{"failing CI beats needs-validation", "APPROVED", "failure", []string{"needs-validation"}, 0, prCardStateChecksFailed},
 	}
 	for _, tc := range cases {
-		got, ok := prCardStateFromSnapshot(tc.review, tc.checks, tc.unresolved)
+		got, ok := prCardStateFromSnapshot(tc.review, tc.checks, tc.labels, tc.unresolved)
 		if !ok || got != tc.want {
-			t.Fatalf("%s: prCardStateFromSnapshot(%q,%q,%d) = %q,%v; want %q", tc.name, tc.review, tc.checks, tc.unresolved, got, ok, tc.want)
+			t.Fatalf("%s: prCardStateFromSnapshot(%q,%q,%v,%d) = %q,%v; want %q", tc.name, tc.review, tc.checks, tc.labels, tc.unresolved, got, ok, tc.want)
 		}
 	}
 }
@@ -601,6 +616,8 @@ func TestPRCardStateStyleTitles(t *testing.T) {
 		{prCardStateChecksFailed, "red", "CI 失败"},
 		{prCardStateChangesRequested, "orange", "待修改"},
 		{prCardStateChecksRunning, "blue", "CI 检查中"},
+		{prCardStateAwaitingValidation, "orange", "待 QA 验收"},
+		{prCardStateValidated, "turquoise", "验收通过"},
 		{prCardStateApproved, "turquoise", "待合并"},
 		{prCardStateReviewPending, "blue", "待 review"},
 	}
@@ -715,6 +732,33 @@ func TestPRMergeStateFromSnapshot(t *testing.T) {
 	}
 }
 
+// prLabelsFromSnapshot reads the PR labels the QA gate keys on out of a snapshot's
+// captured detail payload — the same {"detail":{"Labels":[...]}} shape both
+// github.CapturePullRequestSnapshot and github.SnapshotFromDetail marshal (the
+// PullRequestDetail struct has no json tags, so the field stays capitalized).
+func TestPRLabelsFromSnapshot(t *testing.T) {
+	withLabels := `{"detail":{"State":"OPEN","ReviewDecision":"APPROVED","Labels":["needs-validation","enhancement"]},"diff":"..."}`
+	got := prLabelsFromSnapshot(&withLabels)
+	if len(got) != 2 || got[0] != "needs-validation" || got[1] != "enhancement" {
+		t.Fatalf("prLabelsFromSnapshot = %v, want [needs-validation enhancement]", got)
+	}
+	// End-to-end through the state mapper: APPROVED + needs-validation → 🧪 待 QA 验收.
+	if state, ok := prCardStateFromSnapshot("APPROVED", "success", prLabelsFromSnapshot(&withLabels), 0); !ok || state != prCardStateAwaitingValidation {
+		t.Fatalf("APPROVED + needs-validation snapshot → %q,%v; want awaiting_validation", state, ok)
+	}
+	noLabels := `{"detail":{"State":"OPEN"}}`
+	if got := prLabelsFromSnapshot(&noLabels); got != nil {
+		t.Fatalf("no Labels field → %v, want nil", got)
+	}
+	if got := prLabelsFromSnapshot(nil); got != nil {
+		t.Fatalf("nil payload → %v, want nil", got)
+	}
+	garbage := `not json`
+	if got := prLabelsFromSnapshot(&garbage); got != nil {
+		t.Fatalf("garbage payload → %v, want nil", got)
+	}
+}
+
 // A worker loop shepherding its impl PR animates the card through the PR-driving
 // lane; the "ready" state reads 待合并 (a human merges — the bot never does), and
 // 🎉已合并 comes only from the terminal "merged" outcome, never from shepherding.
@@ -730,7 +774,7 @@ func TestFeishuLoopFlowchartStyleShepherding(t *testing.T) {
 		{"", "blue", "评审中"},
 	}
 	for _, c := range cases {
-		gotT, gotL := feishuLoopFlowchartStyle("worker", "shepherding", true, false, "", c.phase)
+		gotT, gotL := feishuLoopFlowchartStyle("worker", "shepherding", true, false, "", c.phase, 0)
 		if gotT != c.template || !strings.Contains(gotL, c.contains) {
 			t.Fatalf("shepherd phase %q = (%q,%q); want template %q label~%q", c.phase, gotT, gotL, c.template, c.contains)
 		}
@@ -739,19 +783,19 @@ func TestFeishuLoopFlowchartStyleShepherding(t *testing.T) {
 		}
 	}
 	// merged terminal wins regardless of shepherd phase
-	if _, label := feishuLoopFlowchartStyle("worker", "merged", true, false, "", "fixing"); !strings.Contains(label, "已合并") {
+	if _, label := feishuLoopFlowchartStyle("worker", "merged", true, false, "", "fixing", 0); !strings.Contains(label, "已合并") {
 		t.Fatalf("merged terminal must show 已合并, got %q", label)
 	}
 	// During a shepherd FIX pass the loop status is "running", not "shepherding" — the
 	// card must still show the shepherd phase, not drop back to the generic 实现中.
-	if _, label := feishuLoopFlowchartStyle("worker", "running", true, false, "", "fixing"); !strings.Contains(label, "修复中") {
+	if _, label := feishuLoopFlowchartStyle("worker", "running", true, false, "", "fixing", 0); !strings.Contains(label, "修复中") {
 		t.Fatalf("running shepherd fix pass must show 修复中, got %q", label)
 	}
-	if _, label := feishuLoopFlowchartStyle("worker", "running", true, false, "", "awaiting_validation"); !strings.Contains(label, "待验收") {
+	if _, label := feishuLoopFlowchartStyle("worker", "running", true, false, "", "awaiting_validation", 0); !strings.Contains(label, "待验收") {
 		t.Fatalf("running shepherd (awaiting_validation) must show 待验收, got %q", label)
 	}
 	// A plain worker run with no shepherd marker still reads 实现中.
-	if _, label := feishuLoopFlowchartStyle("worker", "running", false, false, "", ""); !strings.Contains(label, "实现中") {
+	if _, label := feishuLoopFlowchartStyle("worker", "running", false, false, "", "", 0); !strings.Contains(label, "实现中") {
 		t.Fatalf("plain worker run must show 实现中, got %q", label)
 	}
 	if !feishuLoopAwaitingMerge("shepherding") {

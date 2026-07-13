@@ -1295,8 +1295,9 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	// reads $.worker.*, but prUrl is stored at the top level, so it alone is not
 	// reliable here.)
 	hasPR := prURL != "" || strings.HasPrefix(strings.TrimSpace(target), "pr:")
+	prNum := prNumberFromTargetOrURL(target, prURL)
 	awaitingProductSpec := loopAwaitingProductSpec(loop.MetadataJSON)
-	template, label := feishuLoopFlowchartStyle(loop.Type, loop.Status, hasPR, awaitingProductSpec, loopNodeHPhase(loop.MetadataJSON), loopShepherdPhase(loop.MetadataJSON))
+	template, label := feishuLoopFlowchartStyle(loop.Type, loop.Status, hasPR, awaitingProductSpec, loopNodeHPhase(loop.MetadataJSON), loopShepherdPhase(loop.MetadataJSON), prNum)
 	// §A: once the WORKER delivers its impl PR, mirror that PR's real review-cycle
 	// state (👀 待 review / 🔄 CI 检查中 / ✋ 待修改 / ❌ CI 失败 / ✅ 待合并 / 🎉 已合并)
 	// from its latest snapshot so the header tracks the PR through to merge (node Z).
@@ -1413,7 +1414,7 @@ func loopShepherdPhase(metadataJSON *string) string {
 // (product-spec vs generic); otherwise the running label is the role's lane. A
 // planner that COMPLETED has written its tech spec to Plane and now awaits node H
 // review (👀 方案评审中), never a merge.
-func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpec bool, nodeHPhase, shepherdPhase string) (template, label string) {
+func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpec bool, nodeHPhase, shepherdPhase string, prNumber int64) (template, label string) {
 	role := strings.ToLower(strings.TrimSpace(loopType))
 	st := strings.ToLower(strings.TrimSpace(status))
 	// Terminals win first.
@@ -1456,6 +1457,11 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 			return "blue", "🔬 方案拷问中"
 		case "reviewing":
 			return "blue", "👀 spec 评审中"
+		case "awaiting_product_answer":
+			// node H product-decision hold: the spec surfaced a product question and
+			// @-mentioned the product owner; it waits for their thread reply, not the
+			// owner's approval. Distinct from 需要人类审核 spec so the card is honest.
+			return "orange", "🙋 等待产品拍板"
 		case "awaiting_human_review":
 			return "orange", "🙋 需要人类审核 spec"
 		}
@@ -1469,9 +1475,13 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 			// AUTHOR+GRILL+REVIEW converged, spec on Plane → awaiting a human's approve.
 			return "orange", "🙋 需要人类审核 spec"
 		}
-		// worker / fixer / generic: completed means the impl PR is delivered.
+		// worker / fixer / generic: the impl PR is OPEN — it is NOT delivered. "已交付"
+		// is reserved for a MERGED PR (🎉 已合并, driven by the snapshot terminal in §A);
+		// an unmerged PR must never claim delivery. Default a just-opened PR to 待 review;
+		// its real review-cycle state (approved / 待 QA / merged …) is layered on top from
+		// the PR snapshot by the §A override at the call site.
 		if hasPR {
-			return "turquoise", "✅ 已交付 · 待合并"
+			return "blue", "👀 待 review" + prNumberSuffix(prNumber)
 		}
 		return "green", "✅ Looper 已完成"
 	}
@@ -1509,11 +1519,13 @@ func feishuLoopAwaitingMerge(status string) bool {
 type prCardState string
 
 const (
-	prCardStateChecksFailed     prCardState = "checks_failed"
-	prCardStateChangesRequested prCardState = "changes_requested"
-	prCardStateChecksRunning    prCardState = "checks_running"
-	prCardStateApproved         prCardState = "approved"
-	prCardStateReviewPending    prCardState = "review_pending"
+	prCardStateChecksFailed       prCardState = "checks_failed"
+	prCardStateChangesRequested   prCardState = "changes_requested"
+	prCardStateChecksRunning      prCardState = "checks_running"
+	prCardStateAwaitingValidation prCardState = "awaiting_validation"
+	prCardStateValidated          prCardState = "validated"
+	prCardStateApproved           prCardState = "approved"
+	prCardStateReviewPending      prCardState = "review_pending"
 )
 
 type checkRollup int
@@ -1570,9 +1582,12 @@ func containsAnySubstring(s string, subs ...string) bool {
 
 // prCardStateFromSnapshot derives the review-cycle state from a snapshot's
 // first-class fields. Precedence mirrors what blocks a merge: failing CI first,
-// then requested changes, then CI still running, then approved (ready to merge),
-// else still awaiting review. Returns ("", false) when there's nothing to show.
-func prCardStateFromSnapshot(reviewState, checksSummary string, unresolved int64) (prCardState, bool) {
+// then requested changes, then CI still running, then approved. Once APPROVED, the
+// QA validation-gate labels split the "ready" state: a PR carrying `needs-validation`
+// (and not yet `validated`) is awaiting QA (🧪 待 QA 验收); a `validated` PR (or one
+// whose needs-validation was cleared) is 验收通过 · 待合并; an APPROVED PR that never
+// needed validation is plain 待合并. Returns ("", false) when there's nothing to show.
+func prCardStateFromSnapshot(reviewState, checksSummary string, labels []string, unresolved int64) (prCardState, bool) {
 	review := strings.ToUpper(strings.TrimSpace(reviewState))
 	checks := classifyChecks(checksSummary)
 	switch {
@@ -1583,10 +1598,30 @@ func prCardStateFromSnapshot(reviewState, checksSummary string, unresolved int64
 	case checks == checkRunning:
 		return prCardStateChecksRunning, true
 	case review == "APPROVED":
-		return prCardStateApproved, true
+		// validated wins over needs-validation (QA signed off even if the maintainer's
+		// needs-validation label lingers); needs-validation alone means still awaiting QA.
+		switch {
+		case labelsContain(labels, "validated"):
+			return prCardStateValidated, true
+		case labelsContain(labels, "needs-validation"):
+			return prCardStateAwaitingValidation, true
+		default:
+			return prCardStateApproved, true
+		}
 	default:
 		return prCardStateReviewPending, true
 	}
+}
+
+// labelsContain reports whether labels holds target (case-insensitive, trimmed).
+func labelsContain(labels []string, target string) bool {
+	target = strings.ToLower(strings.TrimSpace(target))
+	for _, l := range labels {
+		if strings.ToLower(strings.TrimSpace(l)) == target {
+			return true
+		}
+	}
+	return false
 }
 
 // prCardStateStyle maps a PR review-cycle state to the card header's colour +
@@ -1604,11 +1639,24 @@ func prCardStateStyle(state prCardState, prNumber string) (template, label strin
 		return "orange", "✋ 待修改" + suffix
 	case prCardStateChecksRunning:
 		return "blue", "🔄 CI 检查中" + suffix
+	case prCardStateAwaitingValidation:
+		return "orange", "🧪 待 QA 验收" + suffix
+	case prCardStateValidated:
+		return "turquoise", "✅ 验收通过 · 待合并" + suffix
 	case prCardStateApproved:
 		return "turquoise", "✅ 待合并" + suffix
 	default:
 		return "blue", "👀 待 review" + suffix
 	}
+}
+
+// prNumberSuffix renders the " · PR #N" tail a card label carries when a PR number
+// is known, or "" when it isn't.
+func prNumberSuffix(prNumber int64) string {
+	if prNumber > 0 {
+		return " · PR #" + strconv.FormatInt(prNumber, 10)
+	}
+	return ""
 }
 
 // prNumberFromTargetOrURL extracts a PR number from a loop target (pr:owner/repo:N)
@@ -1653,6 +1701,7 @@ func (g *Gateway) prCardStyleFromSnapshot(ctx context.Context, repo, target, prU
 	if snap.UnresolvedThreadCount != nil {
 		unresolved = *snap.UnresolvedThreadCount
 	}
+	labels := prLabelsFromSnapshot(snap.PayloadJSON)
 	// Node Z terminal: if the PR has merged (or closed) — read from the snapshot's
 	// captured PR detail — the card reaches its final state instead of resting at
 	// "待合并". 🎉 已合并 is the only green terminal.
@@ -1663,12 +1712,30 @@ func (g *Gateway) prCardStyleFromSnapshot(ctx context.Context, repo, target, prU
 	case "CLOSED":
 		return "red", "🚫 已关闭 · PR #" + prNumStr, true
 	}
-	state, ok := prCardStateFromSnapshot(review, checks, unresolved)
+	state, ok := prCardStateFromSnapshot(review, checks, labels, unresolved)
 	if !ok {
 		return "", "", false
 	}
 	t, l := prCardStateStyle(state, prNumStr)
 	return t, l, true
+}
+
+// prLabelsFromSnapshot extracts the PR's labels from a snapshot's captured detail
+// payload ({"detail": {"Labels": [...]}}), or nil when unavailable. The QA gate
+// (needs-validation / validated) lives on these labels — see prCardStateFromSnapshot.
+func prLabelsFromSnapshot(payloadJSON *string) []string {
+	if payloadJSON == nil || strings.TrimSpace(*payloadJSON) == "" {
+		return nil
+	}
+	var payload struct {
+		Detail struct {
+			Labels []string `json:"Labels"`
+		} `json:"detail"`
+	}
+	if err := json.Unmarshal([]byte(*payloadJSON), &payload); err != nil {
+		return nil
+	}
+	return payload.Detail.Labels
 }
 
 // prMergeStateFromSnapshot extracts the PR's lifecycle state ("MERGED" / "CLOSED" /

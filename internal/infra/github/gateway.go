@@ -2732,6 +2732,45 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	}, nil
 }
 
+// SnapshotFromDetail builds a PR snapshot record from a PR detail the caller has
+// ALREADY fetched, so a caller holding the live PR in hand (e.g. the worker
+// shepherd's reconcile) can persist a snapshot WITHOUT a second view+diff fetch.
+// The diff is intentionally omitted — this snapshot feeds the anchor card's
+// review-cycle state (labels / reviewDecision / checks / merge state via the
+// captured detail), not a reviewer's diff analysis. The payload mirrors
+// CapturePullRequestSnapshot's shape ({"detail": <PullRequestDetail>}) so the same
+// readers (prMergeStateFromSnapshot, label extraction) work unchanged. capturedAt
+// defaults to now when empty.
+func (g *Gateway) SnapshotFromDetail(detail PullRequestDetail, projectID, repo string, prNumber int64, capturedAt string) (storage.PullRequestSnapshotRecord, error) {
+	capturedAt = strings.TrimSpace(capturedAt)
+	if capturedAt == "" {
+		capturedAt = g.now().UTC().Format(javaScriptISOStringLayout)
+	}
+	payload, err := json.Marshal(map[string]any{"detail": detail})
+	if err != nil {
+		return storage.PullRequestSnapshotRecord{}, fmt.Errorf("marshal pull request snapshot payload: %w", err)
+	}
+	unresolvedCount := int64(countUnresolvedThreads(detail.Comments))
+	return storage.PullRequestSnapshotRecord{
+		ID:                    randomID(),
+		ProjectID:             projectID,
+		Repo:                  repo,
+		PRNumber:              prNumber,
+		HeadSHA:               valueOr(detail.HeadSHA, "unknown"),
+		BaseSHA:               stringPtrIfNotEmpty(detail.BaseSHA),
+		Title:                 stringPtrIfNotEmpty(detail.Title),
+		Body:                  stringPtrIfNotEmpty(detail.Body),
+		Author:                stringPtrIfNotEmpty(detail.Author),
+		DiffRef:               stringPtr(fmt.Sprintf("gh:pr-detail:%s:%d", repo, prNumber)),
+		ChecksSummary:         stringPtrIfNotEmpty(summarizeChecks(detail.Checks)),
+		UnresolvedThreadCount: &unresolvedCount,
+		ReviewState:           stringPtrIfNotEmpty(detail.ReviewDecision),
+		PayloadJSON:           stringPtr(string(payload)),
+		CapturedAt:            capturedAt,
+		CreatedAt:             capturedAt,
+	}, nil
+}
+
 type reviewThreadNode struct {
 	ID         string
 	IsResolved bool

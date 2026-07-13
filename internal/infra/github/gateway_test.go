@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -1927,6 +1928,57 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 	}
 	if snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncated":true`) || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncationReason":"github_too_large"`) {
 		t.Fatalf("PayloadJSON = %v, want truncated marker", snapshot.PayloadJSON)
+	}
+}
+
+// SnapshotFromDetail builds a snapshot from an ALREADY-fetched PR detail (no gh
+// call, no diff), lifting the review-cycle first-class fields and marshaling the
+// detail into the {"detail":{...}} payload the anchor card's readers expect —
+// crucially preserving Labels (the QA gate) and the merge-state fields.
+func TestGatewaySnapshotFromDetail(t *testing.T) {
+	t.Parallel()
+	gateway := New(Options{GHPath: "gh"})
+	detail := PullRequestDetail{
+		Number:         907,
+		Title:          "Add the thing",
+		State:          "OPEN",
+		ReviewDecision: "APPROVED",
+		Labels:         []string{"needs-validation", "enhancement"},
+		HeadSHA:        "abc123",
+		Author:         "octocat",
+		Checks:         []map[string]any{{"conclusion": "SUCCESS"}},
+	}
+	snapshot, err := gateway.SnapshotFromDetail(detail, "project_1", "acme/looper", 907, "2026-07-13T00:00:00.000Z")
+	if err != nil {
+		t.Fatalf("SnapshotFromDetail() error = %v", err)
+	}
+	if snapshot.PRNumber != 907 || snapshot.ProjectID != "project_1" || snapshot.Repo != "acme/looper" {
+		t.Fatalf("snapshot identity = %d/%q/%q, want 907/project_1/acme/looper", snapshot.PRNumber, snapshot.ProjectID, snapshot.Repo)
+	}
+	if snapshot.ReviewState == nil || *snapshot.ReviewState != "APPROVED" {
+		t.Fatalf("ReviewState = %v, want APPROVED", snapshot.ReviewState)
+	}
+	if snapshot.ChecksSummary == nil || *snapshot.ChecksSummary != "SUCCESS" {
+		t.Fatalf("ChecksSummary = %v, want SUCCESS", snapshot.ChecksSummary)
+	}
+	if snapshot.HeadSHA != "abc123" || snapshot.CapturedAt != "2026-07-13T00:00:00.000Z" {
+		t.Fatalf("HeadSHA/CapturedAt = %q/%q", snapshot.HeadSHA, snapshot.CapturedAt)
+	}
+	// Payload must carry the capitalized Labels + State the notify readers parse.
+	if snapshot.PayloadJSON == nil {
+		t.Fatal("PayloadJSON is nil")
+	}
+	var payload struct {
+		Detail struct {
+			State  string   `json:"State"`
+			Labels []string `json:"Labels"`
+		} `json:"detail"`
+	}
+	if err := json.Unmarshal([]byte(*snapshot.PayloadJSON), &payload); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if payload.Detail.State != "OPEN" || len(payload.Detail.Labels) != 2 || payload.Detail.Labels[0] != "needs-validation" {
+		t.Fatalf("payload detail = %+v, want State OPEN + [needs-validation enhancement]", payload.Detail)
 	}
 }
 

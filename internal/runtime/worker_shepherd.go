@@ -131,6 +131,10 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		return
 	}
 	if outcome := shepherdTerminalOutcome(pr); outcome != "" {
+		// Persist the terminal (merged/closed) snapshot BEFORE flipping the loop to
+		// completed, so the anchor card's §A path resolves 🎉 已合并 / 🚫 已关闭 from real
+		// data — a deploy with reviewer/fixer off otherwise never writes a snapshot.
+		r.captureShepherdSnapshot(ctx, repositories, gateway, loop, repo, prNumber, pr, nowISO)
 		r.terminateShepherd(ctx, repositories, loop, repo, prNumber, outcome, nowISO, logger)
 		return
 	}
@@ -138,6 +142,11 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 	if signal == marker.LastSignal {
 		return
 	}
+	// The folded PR signal changed → persist a fresh snapshot (best-effort, only on a
+	// real change, so low-frequency) so the PR-state card mapping (§A: labels /
+	// reviewDecision / checks / merge state) has data even though reviewer/fixer are
+	// off. No extra gh call — reuses the detail already fetched this tick.
+	r.captureShepherdSnapshot(ctx, repositories, gateway, loop, repo, prNumber, pr, nowISO)
 	marker.LastSignal = signal
 	marker.Phase = shepherdPhaseFor(pr)
 	marker.HeadSHA = pr.HeadSHA
@@ -161,6 +170,24 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		}
 		r.enqueueShepherdPass(ctx, repositories, loop, repo, prNumber, nowISO, logger)
 	}
+}
+
+// captureShepherdSnapshot persists a PullRequestSnapshot from the PR detail the
+// shepherd already fetched this reconcile, so the Feishu anchor card's PR-state
+// path (§A in notify) has real review-cycle data. Without this, a deploy running
+// with reviewer/fixer OFF never writes pull_request_snapshots and every delivered
+// PR card falls back to a coarse default. Best-effort: any failure is swallowed so
+// it can never disturb the shepherd's reconcile. No extra gh call — the diff is
+// intentionally omitted (SnapshotFromDetail).
+func (r *Runtime) captureShepherdSnapshot(ctx context.Context, repos *storage.Repositories, gateway *githubinfra.Gateway, loop storage.LoopRecord, repo string, prNumber int64, pr githubinfra.PullRequestDetail, capturedAt string) {
+	if repos == nil || repos.PullRequestSnapshots == nil || gateway == nil || prNumber <= 0 {
+		return
+	}
+	record, err := gateway.SnapshotFromDetail(pr, loop.ProjectID, repo, prNumber, capturedAt)
+	if err != nil {
+		return
+	}
+	_ = repos.PullRequestSnapshots.Upsert(ctx, record)
 }
 
 func stringFromAny(v any) string {
