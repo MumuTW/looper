@@ -551,6 +551,13 @@ func (x *execution) run(ctx context.Context) {
 		}
 	}
 	completion := parseCompletion(stdout, stderr)
+	// nativeFinalText holds the agent's clean final message, reconstructed from a JSONL
+	// stream (codex/opencode/claude). When the agent emits no __LOOPER_RESULT__ marker
+	// (e.g. the grill/review sub-agents just write prose), the Summary fallback below
+	// MUST use this — not summarizeLogs(stdout): in a JSONL mode the last raw stdout line
+	// is a `{"type":"result",…}` event object, so summarizeLogs would surface that raw
+	// JSON as the "summary" (a grill transcript posted as a wall of escaped JSON).
+	nativeFinalText := ""
 	if x.jsonMode() {
 		// codex --json: stdout is JSONL. The completion marker + final message live
 		// inside agent_message / command-output events, and the session is the
@@ -561,6 +568,7 @@ func (x *execution) run(ctx context.Context) {
 		if tr.threadID != "" {
 			x.nativeSessionID = tr.threadID
 		}
+		nativeFinalText = tr.combinedText()
 	} else if x.openCodeJSONMode() {
 		// opencode --format json: stdout is JSONL. The completion marker + assistant
 		// text live inside `text` events (part.text, not a bare stdout line), and the
@@ -572,6 +580,7 @@ func (x *execution) run(ctx context.Context) {
 		if tr.sessionID != "" {
 			x.nativeSessionID = tr.sessionID
 		}
+		nativeFinalText = tr.assistantText()
 	} else if x.claudeJSONMode() {
 		// claude --output-format stream-json: stdout is JSONL. The completion marker +
 		// final message live inside the `result` event's `result` field (not a bare
@@ -583,6 +592,7 @@ func (x *execution) run(ctx context.Context) {
 		if tr.sessionID != "" {
 			x.nativeSessionID = tr.sessionID
 		}
+		nativeFinalText = tr.assistantText()
 	}
 	if status != "completed" {
 		completion = completionParse{ParseStatus: "missing"}
@@ -590,7 +600,11 @@ func (x *execution) run(ctx context.Context) {
 	if completion.Summary == "" {
 		completion.Summary = errorMessage
 		if completion.Summary == "" {
-			completion.Summary = summarizeLogs(stdout, stderr)
+			if fromStream := strings.TrimSpace(nativeFinalText); fromStream != "" {
+				completion.Summary = fromStream
+			} else {
+				completion.Summary = summarizeLogs(stdout, stderr)
+			}
 		}
 	}
 	endedAtISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
