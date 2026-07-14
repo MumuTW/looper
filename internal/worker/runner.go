@@ -1501,7 +1501,7 @@ func (r *Runner) runShepherdStep(ctx context.Context, input stepInput) (workerCh
 					msgs.WriteString(t)
 				}
 			}
-			msgs.WriteString("\nRead them against this PR and respond: if it is a question or feedback (e.g. \"this was already fixed by another PR\", \"is this redundant?\", \"please close this\"), investigate and reply by writing .looper/ask.json with your answer. Act on what they say — e.g. if the PR is genuinely redundant/superseded, state that clearly (a human still performs any close/merge). Do NOT ignore these messages.")
+			msgs.WriteString("\nIMPORTANT: these are ONLY the thread messages that @-mentioned you — the @ is a TRIGGER, not the whole conversation. You are NOT seeing the full thread, and earlier replies (possibly from other people, possibly with screenshots) may already answer this. Before you ask the human anything, EXHAUST every context you CAN access: read this PR's description + ALL its comments + reviews + review threads + linked issues + git history (git log, related/earlier merged PRs) + the actual code and diff. The answer (e.g. 'is #N redundant?', 'was this already fixed?') is usually resolvable from those. Only write .looper/ask.json if it is GENUINELY unresolved after checking everything accessible. If your investigation resolves it, act on the conclusion (and leave a PR comment stating what you found) and keep driving — do NOT bounce an already-answerable question back to the human. Do NOT ignore these messages.")
 			prompt += msgs.String()
 		}
 	}
@@ -2194,7 +2194,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 						msgs.WriteString(t)
 					}
 				}
-				msgs.WriteString("\nRead them in context and respond appropriately: if a message answers a question you asked, proceed using it; if it is a follow-up question or a new instruction, address it — and if you still need a human decision, ask again (write .looper/ask.json) with your response to what they said. Do not ignore these messages.")
+				msgs.WriteString("\nThese are ONLY the thread messages that @-mentioned you — the @ is a TRIGGER, not the whole conversation; earlier replies (possibly from other people, possibly with screenshots) may already answer this. Read them in context and respond appropriately: if a message answers a question you asked, proceed using it; if it is a follow-up question or a new instruction, address it. Before you ask the human anything, EXHAUST every context you can access first — the issue/PR + its comments + reviews + linked items + git history + the code — because the answer is usually already there. Only ask again (write .looper/ask.json, with your response to what they said) if it is GENUINELY unresolved after checking everything accessible. Do not ignore these messages.")
 				prompt += "\n\n" + msgs.String()
 				if nativeSessionID == "" {
 					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID)
