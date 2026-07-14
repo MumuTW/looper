@@ -35,6 +35,20 @@ func loopIssueURLAndSpecPR(metadataJSON *string) (issueURL string, hasSpecPR boo
 	} else if s, ok := meta["issueURL"].(string); ok {
 		issueURL = strings.TrimSpace(s)
 	}
+	// Worker loops carry only prUrl at the top level and nest the originating
+	// work-item URL under worker.issueUrl. Planner loops record it top-level (above).
+	// Without this fallback, setPlaneWorkItemState reads "" for every worker loop →
+	// WorkItemIDFromURL("") == "" → the Plane state never advances to In Review / Done
+	// for a worker-opened PR (the item stays Backlog/Todo forever).
+	if issueURL == "" {
+		if w, ok := meta["worker"].(map[string]any); ok {
+			if s, ok := w["issueUrl"].(string); ok {
+				issueURL = strings.TrimSpace(s)
+			} else if s, ok := w["issueURL"].(string); ok {
+				issueURL = strings.TrimSpace(s)
+			}
+		}
+	}
 	if s, ok := meta["prUrl"].(string); ok && strings.TrimSpace(s) != "" {
 		hasSpecPR = true
 	}
