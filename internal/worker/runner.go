@@ -1331,11 +1331,16 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if resumedRun.StartStep == stepShepherd {
 		return r.finishShepherdPass(ctx, project, loop, run, queueItem, checkpoint)
 	}
-	// First entry into shepherding: a normal impl run just opened the PR under
-	// looper:auto (and shepherding is opted in). Instead of completing, mark the
-	// loop shepherding so the reconciler drives the PR toward merge — a human
-	// colleague performs the final merge, the bot only fixes + watches.
-	if r.shepherdEnabled && checkpoint.SkipReason == "" && checkpoint.PullRequest != nil && r.issueHasLooperAuto(ctx, *project, checkpoint) {
+	// First entry into shepherding: a normal impl run just opened the PR (and
+	// shepherding is opted in via config). Instead of completing, mark the loop
+	// shepherding so the reconciler drives the PR toward merge — a human colleague
+	// performs the final merge, the bot only fixes + watches. Gated by config
+	// (shepherdEnabled) ALONE: any worker-opened PR shepherds, whether the item was
+	// dispatched via looper:auto (auto-intake) or looper:worker-ready (manual/plan).
+	// The old per-issue looper:auto activation gate (stage E) stranded worker-ready
+	// PRs as completed-while-open, so a late review round landed with no shepherding
+	// loop watching and the bot never followed up.
+	if r.shepherdEnabled && checkpoint.SkipReason == "" && checkpoint.PullRequest != nil {
 		return r.enterShepherding(ctx, project, loop, run, queueItem, checkpoint)
 	}
 	summary := r.buildSuccessSummary(*loop, checkpoint)
@@ -1589,24 +1594,6 @@ func buildShepherdPrompt(work workerInput, prNumber int64, sessionLost bool) str
 		"Commit with a fresh subject summarizing this round's repair; push the current branch; do not open a new PR.",
 	)
 	return strings.Join(parts, "\n\n")
-}
-
-// looperAutoLabel is the persistent opt-in label the user applies to run the full
-// looper:auto flowchart; its presence on the source issue at open-pr time is what
-// gates a worker into shepherding its own PR to merge.
-const looperAutoLabel = "looper:auto"
-
-// issueHasLooperAuto reports whether the loop's source issue still carries the
-// looper:auto label (never removed by the pipeline), read live at open-pr time.
-func (r *Runner) issueHasLooperAuto(ctx context.Context, project storage.ProjectRecord, checkpoint workerCheckpoint) bool {
-	if r.github == nil || checkpoint.Work == nil || checkpoint.Work.IssueNumber <= 0 {
-		return false
-	}
-	issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: issueLookupRepo(*checkpoint.Work), IssueNumber: checkpoint.Work.IssueNumber, CWD: project.RepoPath})
-	if err != nil {
-		return false
-	}
-	return hasLabel(issue.Labels, looperAutoLabel)
 }
 
 // enterShepherding transitions a just-opened impl PR loop into the shepherding
