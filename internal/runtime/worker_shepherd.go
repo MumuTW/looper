@@ -168,7 +168,14 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		// the card off the worker's "🔨 实现中".
 		r.refreshShepherdCard(ctx, loop.ID)
 	}
-	if shepherdActionable(pr) {
+	// Enqueue a pass for the actionable cases (conflict / failed CI / changes requested
+	// at head) OR when a peer left a COMMENTED review at the current head — the latter
+	// is not "actionable" for the card phase (a COMMENTED review never clears, so it
+	// must NOT wedge shepherdPhaseFor at 修复中 / block 待合并), but it does carry
+	// feedback the pass should read + address or answer. We only reach here past the
+	// LastSignal guard, i.e. on a genuinely new signal (new review round included), so
+	// this fires once per round, not every tick.
+	if shepherdActionable(pr) || commentedOnCurrentHead(pr) {
 		if marker.PassCount >= shepherdMaxPasses {
 			if logger != nil {
 				logger.Info("shepherd: pass cap reached — leaving PR for a human", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "passCount": marker.PassCount})
@@ -289,6 +296,32 @@ func changesRequestedOnCurrentHead(pr githubinfra.PullRequestDetail) bool {
 	}
 	for _, review := range pr.Reviews {
 		if !strings.EqualFold(strings.TrimSpace(stringFromAny(review["state"])), "CHANGES_REQUESTED") {
+			continue
+		}
+		commit, _ := review["commit"].(map[string]any)
+		if commit != nil && strings.TrimSpace(stringFromAny(commit["oid"])) == head {
+			return true
+		}
+	}
+	return false
+}
+
+// commentedOnCurrentHead reports whether a reviewer left a COMMENTED review whose
+// commit IS the current head. A COMMENTED review is not a formal CHANGES_REQUESTED,
+// but it routinely carries real feedback (a non-blocking concern the author agreed
+// to, an inline suggestion) that must not be silently ignored — the shepherd should
+// read the review threads and address or answer them. Keyed on the current head like
+// changesRequestedOnCurrentHead so a stale COMMENTED round on an old head does not
+// re-trigger; combined with foldShepherdSignal's LastSignal dedup (a given review
+// round is folded in once) and the fact that a pushed fix moves the head off this
+// review, this cannot spin.
+func commentedOnCurrentHead(pr githubinfra.PullRequestDetail) bool {
+	head := strings.TrimSpace(pr.HeadSHA)
+	if head == "" {
+		return false
+	}
+	for _, review := range pr.Reviews {
+		if !strings.EqualFold(strings.TrimSpace(stringFromAny(review["state"])), "COMMENTED") {
 			continue
 		}
 		commit, _ := review["commit"].(map[string]any)
