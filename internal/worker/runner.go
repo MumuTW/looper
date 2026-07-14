@@ -467,6 +467,87 @@ func (r *Runner) planeSpecBlock(ctx context.Context, projectID, issueURL string)
 	return strings.Join(parts, "\n\n")
 }
 
+// attachmentImageExts are the image types looper materializes into the worktree for
+// the coding agent to view. Anything else in an attachment dir is ignored.
+var attachmentImageExts = map[string]struct{}{
+	".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".webp": {},
+}
+
+// resolveAttachmentsRoot returns the directory under which per-work-item screenshot
+// folders live (keyed by Plane work-item UUID). Falls back to <looper-home>/attachments.
+func resolveAttachmentsRoot(configured string) string {
+	if trimmed := strings.TrimSpace(configured); trimmed != "" {
+		return trimmed
+	}
+	home, err := config.DefaultLooperHome()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return filepath.Join(home, "attachments")
+}
+
+// attachTaskScreenshots copies any screenshots co-located with this work item into
+// the agent's worktree and returns a prompt block telling the (vision-capable) coding
+// agent to Read them. Convention: image files dropped at
+// <attachmentsRoot>/<plane-work-item-uuid>/ are copied to ./.looper-attachments/ in
+// the worktree. This is the deterministic channel for a locally-running looper because
+// Plane sanitizes inline <img> data/external srcs out of a work item's description and
+// its own asset URLs need auth. Best-effort: any error (no dir, no images, copy
+// failure) returns "" so the worker runs normally against text alone.
+func (r *Runner) attachTaskScreenshots(work workerInput, worktreeDir string) string {
+	if r == nil || strings.TrimSpace(r.attachmentsRoot) == "" || strings.TrimSpace(worktreeDir) == "" {
+		return ""
+	}
+	workItemID := planedoc.WorkItemIDFromURL(work.IssueURL)
+	if workItemID == "" {
+		return ""
+	}
+	srcDir := filepath.Join(r.attachmentsRoot, workItemID)
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return ""
+	}
+	rels := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if _, ok := attachmentImageExts[strings.ToLower(filepath.Ext(name))]; !ok {
+			continue
+		}
+		if err := copyRegularFile(filepath.Join(srcDir, name), filepath.Join(worktreeDir, ".looper-attachments", name)); err != nil {
+			continue
+		}
+		rels = append(rels, "./.looper-attachments/"+name)
+	}
+	if len(rels) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Screenshots for this task have been saved into the working directory. The bug/behaviour is shown in these images — you MUST use the Read tool to view EACH one before implementing, because key details are visual and are not fully described in text:\n")
+	for _, rel := range rels {
+		b.WriteString("- ")
+		b.WriteString(rel)
+		b.WriteString("\n")
+	}
+	b.WriteString("These files are reference material only — do NOT git add or commit the .looper-attachments/ directory.")
+	return b.String()
+}
+
+// copyRegularFile copies src to dest (creating dest's parent dir, overwriting dest).
+// Sized for small screenshot files, so it reads the whole file into memory.
+func copyRegularFile(src, dest string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(dest, data, 0o644)
+}
+
 type Options struct {
 	DB                              *sql.DB
 	Repos                           *storage.Repositories
@@ -504,6 +585,11 @@ type Options struct {
 	// project whose task source is Plane, so the worker can read the product/tech
 	// spec from Plane pages (flowchart node I). nil / (…,false) → repo-file spec path.
 	PlaneDoc PlaneDocResolver
+	// AttachmentsRoot is the directory under which per-work-item screenshot folders
+	// live (keyed by Plane work-item UUID). Empty → <looper-home>/attachments. Images
+	// dropped at <AttachmentsRoot>/<work-item-uuid>/ are copied into the agent's
+	// worktree so the vision-capable coding agent can Read the bug screenshots.
+	AttachmentsRoot string
 	// HITLEnabled gates the mid-run human-in-the-loop feature. When false (the
 	// default) none of the HITL code paths run and the worker behaves exactly as
 	// before. HITLNotify, when set, sends the ask-card to the human channel.
@@ -596,6 +682,7 @@ type Runner struct {
 	onQueueItemEnqueued     func()
 	network                 NetworkStatusGateway
 	planeDoc                PlaneDocResolver
+	attachmentsRoot         string
 	hitlEnabled             bool
 	hitlNotify              HITLNotifyFunc
 	hitlAnswerTransport     string
@@ -866,6 +953,7 @@ func New(options Options) *Runner {
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 		network:                 options.Network,
 		planeDoc:                options.PlaneDoc,
+		attachmentsRoot:         resolveAttachmentsRoot(options.AttachmentsRoot),
 		hitlEnabled:             options.HITLEnabled,
 		hitlNotify:              options.HITLNotify,
 		hitlAnswerTransport:     options.HITLAnswerTransport,
@@ -2024,6 +2112,13 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// implements against the Plane specs rather than only the repo file.
 		if planeSpec := r.planeSpecBlock(ctx, input.Project.ID, work.IssueURL); planeSpec != "" {
 			prompt += "\n\n" + planeSpec
+		}
+		// Materialize any screenshots co-located with this work item into the worktree
+		// so the vision-capable coding agent can Read them. Plane strips inline images
+		// from a work item's description, so a local drop-dir keyed by the work-item
+		// UUID is how a bug's screenshots reach the agent.
+		if shots := r.attachTaskScreenshots(work, worktree.Path); shots != "" {
+			prompt += "\n\n" + shots
 		}
 		// HITL (gated): let the agent pause to ask a human, and on resume feed the
 		// human's answer back into the same agent session.
