@@ -214,14 +214,24 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	if labelsContainFold(names, intakeOutOfScopeLabel) || labelsContainFold(names, intakeNeedsHumanLabel) {
 		return
 	}
-	// Already in the pipeline: a coordinator/planner/worker loop for this item exists.
-	// looper:auto is a durable peer trigger that stays on the item for its whole life,
-	// so once a routing label is retired mid-flight (e.g. the planner drops looper:plan
-	// while the spec awaits human approval) the item would otherwise look "fresh" and
-	// get re-classified, clobbering the in-flight work. The loop is the source of truth.
+	// Already in the pipeline: an ACTIVE coordinator/planner/worker loop for this item
+	// exists. looper:auto is a durable peer trigger that stays on the item for its whole
+	// life, so once a routing label is retired mid-flight (e.g. the planner drops
+	// looper:plan while the spec awaits human approval) the item would otherwise look
+	// "fresh" and get re-classified, clobbering the in-flight work. The loop is the
+	// source of truth — but ONLY a live loop means genuinely in-flight. A TERMINAL loop
+	// (completed/terminated/failed/stopped) is dead; a stale dead loop must NOT block
+	// re-classification forever, or a re-opened item (its needs-human label cleared to
+	// retry) can never be picked up again. GetByTargetID returns the most-recent loop, so
+	// a live loop (if any) wins over an older dead one.
 	if repos := r.services.Repositories; repos != nil && repos.Loops != nil {
 		if existing, err := repos.Loops.GetByTargetID(ctx, fmt.Sprintf("issue:%s:%d", project.Repo, item.Number)); err == nil && existing != nil {
-			return
+			switch domain.LoopStatus(strings.TrimSpace(existing.Status)) {
+			case domain.LoopStatusCompleted, domain.LoopStatusTerminated, domain.LoopStatusFailed, domain.LoopStatusStopped:
+				// dead loop — fall through and allow a fresh re-classification below
+			default:
+				return // live loop → genuinely in-flight, don't clobber
+			}
 		}
 	}
 	workItemID := planedoc.WorkItemIDFromURL(item.HTMLURL)
