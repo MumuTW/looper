@@ -1483,6 +1483,29 @@ func (r *Runner) runShepherdStep(ctx context.Context, input stepInput) (workerCh
 	}
 	prompt := buildShepherdPrompt(*checkpoint.Work, checkpoint.PullRequest.Number, sessionLost)
 
+	// HITL (gated): fold any human thread messages posted WHILE shepherding into this
+	// pass, so a thread @-mention during shepherding is actually read + answered. It was
+	// previously dropped — the shepherd path never drained the inbox, so Looper looked
+	// unresponsive to reviewers who @-mentioned it on an in-flight PR. The agent replies
+	// by writing .looper/ask.json, detected after the turn (posts to the thread + parks
+	// for the human).
+	drainedHuman := false
+	if r.hitlEnabled {
+		if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
+			drainedHuman = true
+			var msgs strings.Builder
+			msgs.WriteString("\n\nWhile you were shepherding this PR toward merge, the human posted these messages in the task thread:")
+			for _, m := range inbox {
+				if t := strings.TrimSpace(m.Text); t != "" {
+					msgs.WriteString("\n- ")
+					msgs.WriteString(t)
+				}
+			}
+			msgs.WriteString("\nRead them against this PR and respond: if it is a question or feedback (e.g. \"this was already fixed by another PR\", \"is this redundant?\", \"please close this\"), investigate and reply by writing .looper/ask.json with your answer. Act on what they say — e.g. if the PR is genuinely redundant/superseded, state that clearly (a human still performs any close/merge). Do NOT ignore these messages.")
+			prompt += msgs.String()
+		}
+	}
+
 	r.stampShepherd(ctx, &input.Loop, func(s *loops.Shepherd) {
 		s.Phase = "fixing"
 		s.PassCount++
@@ -1494,8 +1517,25 @@ func (r *Runner) runShepherdStep(ctx context.Context, input stepInput) (workerCh
 	if err != nil {
 		return checkpoint, err
 	}
-	if _, err := execution.Wait(ctx); err != nil {
+	result, err := execution.Wait(ctx)
+	if err != nil {
 		return checkpoint, err
+	}
+	// HITL (gated): only when this pass folded in a human thread message — if the agent
+	// replied by writing .looper/ask.json, surface it. detectHumanAsk posts the reply to
+	// the thread and returns a typed awaiting-human suspension; the loop parks until the
+	// human answers, then resumes another shepherd pass via the durable
+	// $.shepherd.active marker. Clear the drained inbox either way so it is not
+	// re-injected on the next pass.
+	if r.hitlEnabled && drainedHuman && result.Status == "completed" {
+		awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, executionID)
+		if awaitErr != nil {
+			return checkpoint, awaitErr
+		}
+		r.clearHumanInbox(ctx, &input.Loop)
+		if awaiting != nil {
+			return checkpoint, awaiting
+		}
 	}
 	// The agent committed+pushed any fix itself. The tail parks the loop back into
 	// shepherding; the reconciler re-wakes on the next PR signal change and
