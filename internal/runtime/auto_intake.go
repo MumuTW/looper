@@ -214,24 +214,19 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	if labelsContainFold(names, intakeOutOfScopeLabel) || labelsContainFold(names, intakeNeedsHumanLabel) {
 		return
 	}
-	// Already in the pipeline: an ACTIVE coordinator/planner/worker loop for this item
-	// exists. looper:auto is a durable peer trigger that stays on the item for its whole
-	// life, so once a routing label is retired mid-flight (e.g. the planner drops
-	// looper:plan while the spec awaits human approval) the item would otherwise look
-	// "fresh" and get re-classified, clobbering the in-flight work. The loop is the
-	// source of truth — but ONLY a live loop means genuinely in-flight. A TERMINAL loop
-	// (completed/terminated/failed/stopped) is dead; a stale dead loop must NOT block
-	// re-classification forever, or a re-opened item (its needs-human label cleared to
-	// retry) can never be picked up again. GetByTargetID returns the most-recent loop, so
-	// a live loop (if any) wins over an older dead one.
+	// Already in the pipeline: a coordinator/planner/worker loop for this item exists.
+	// looper:auto is a durable peer trigger that stays on the item for its whole life,
+	// so once a routing label is retired mid-flight (e.g. the planner drops looper:plan
+	// while the spec awaits human approval, or a completed planner leaves only looper:auto)
+	// the item would otherwise look "fresh" and get re-classified, clobbering the in-flight
+	// or already-approved work. The loop is the source of truth: ANY existing loop (live OR
+	// terminal) means this item already went through triage once, so we do NOT re-classify.
+	// (A genuine retry of a needs-human dead-end is an EXPLICIT operation that retires the
+	// stale loop first — never an implicit "the loop is terminal so re-run it", which also
+	// re-did items whose planner spec was already written and human-approved.)
 	if repos := r.services.Repositories; repos != nil && repos.Loops != nil {
 		if existing, err := repos.Loops.GetByTargetID(ctx, fmt.Sprintf("issue:%s:%d", project.Repo, item.Number)); err == nil && existing != nil {
-			switch domain.LoopStatus(strings.TrimSpace(existing.Status)) {
-			case domain.LoopStatusCompleted, domain.LoopStatusTerminated, domain.LoopStatusFailed, domain.LoopStatusStopped:
-				// dead loop — fall through and allow a fresh re-classification below
-			default:
-				return // live loop → genuinely in-flight, don't clobber
-			}
+			return
 		}
 	}
 	workItemID := planedoc.WorkItemIDFromURL(item.HTMLURL)
