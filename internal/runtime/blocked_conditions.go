@@ -103,6 +103,10 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 			ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 			return ok && strings.EqualFold(strings.TrimSpace(ask.Status), "answered") && strings.TrimSpace(ask.Answer) != "", nil
 		},
+		loopcondition.InfraRecovered: func(ctx context.Context, loop storage.LoopRecord, condition loopcondition.Record) (bool, error) {
+			projectID := loop.ProjectID
+			return recoverableInfraConditionCleared(ctx, cfg, repositories, &projectID, condition.Fingerprint)
+		},
 	}
 }
 

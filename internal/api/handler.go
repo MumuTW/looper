@@ -650,9 +650,15 @@ func (h *Handler) writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 type healthResponse struct {
-	Healthy   bool          `json:"healthy"`
-	StartedAt *string       `json:"startedAt,omitempty"`
-	Storage   storageHealth `json:"storage"`
+	Healthy   bool            `json:"healthy"`
+	StartedAt *string         `json:"startedAt,omitempty"`
+	Storage   storageHealth   `json:"storage"`
+	Scheduler schedulerHealth `json:"scheduler"`
+}
+
+type schedulerHealth struct {
+	Healthy      bool  `json:"healthy"`
+	BlockedInfra int64 `json:"blockedInfra"`
 }
 
 type storageHealth struct {
@@ -680,9 +686,22 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 	}
 
 	startedAt := h.startedAtISO()
+	blockedInfra := int64(0)
+	schedulerHealthy := true
+	services := h.context.Runtime.Services()
+	if services.Repositories != nil && services.Repositories.Queue != nil {
+		count, countErr := services.Repositories.Queue.CountBlockedInfra(ctx)
+		if countErr != nil {
+			schedulerHealthy = false
+		} else {
+			blockedInfra = count
+			schedulerHealthy = count == 0
+		}
+	}
+	healthy := state.OK && schedulerHealthy
 
 	return healthResponse{
-		Healthy:   state.OK,
+		Healthy:   healthy,
 		StartedAt: startedAt,
 		Storage: storageHealth{
 			OK:          state.OK,
@@ -696,6 +715,7 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 				PendingCount:      len(state.PendingMigrationIDs),
 			},
 		},
+		Scheduler: schedulerHealth{Healthy: schedulerHealthy, BlockedInfra: blockedInfra},
 	}, nil
 }
 
@@ -776,6 +796,7 @@ type statusStorage struct {
 
 type statusScheduler struct {
 	Healthy        bool `json:"healthy"`
+	BlockedInfra   int  `json:"blockedInfra"`
 	QueuedItems    int  `json:"queuedItems"`
 	RunningItems   int  `json:"runningItems"`
 	CompletedItems int  `json:"completedItems"`
@@ -996,6 +1017,10 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	if err != nil {
 		return statusResponse{}, err
 	}
+	blockedInfra, err := services.Repositories.Queue.CountBlockedInfra(ctx)
+	if err != nil {
+		return statusResponse{}, err
+	}
 
 	loopCounts := countLoops(loopCountsByType)
 
@@ -1028,7 +1053,8 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Healthy:           storageState.OK,
 		},
 		Scheduler: statusScheduler{
-			Healthy:        true,
+			Healthy:        blockedInfra == 0,
+			BlockedInfra:   int(blockedInfra),
 			QueuedItems:    int(queueCounts["queued"]),
 			RunningItems:   int(queueCounts["running"]),
 			CompletedItems: int(queueCounts["completed"]),

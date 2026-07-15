@@ -153,6 +153,7 @@ type SchedulerConfig struct {
 	MaxConcurrentRuns        int `json:"maxConcurrentRuns"`
 	RetryMaxAttempts         int `json:"retryMaxAttempts"`
 	RetryBaseDelayMS         int `json:"retryBaseDelayMs"`
+	InfraRetryBudgetSeconds  int `json:"infraRetryBudgetSeconds"`
 	SlowLaneWarnThresholdMS  int `json:"slowLaneWarnThresholdMs"`
 	DiscoveryCacheTTLSeconds int `json:"discoveryCacheTtlSeconds"`
 }
@@ -757,6 +758,7 @@ type PartialSchedulerConfig struct {
 	MaxConcurrentRuns        *int `json:"maxConcurrentRuns,omitempty"`
 	RetryMaxAttempts         *int `json:"retryMaxAttempts,omitempty"`
 	RetryBaseDelayMS         *int `json:"retryBaseDelayMs,omitempty"`
+	InfraRetryBudgetSeconds  *int `json:"infraRetryBudgetSeconds,omitempty"`
 	SlowLaneWarnThresholdMS  *int `json:"slowLaneWarnThresholdMs,omitempty"`
 	DiscoveryCacheTTLSeconds *int `json:"discoveryCacheTtlSeconds,omitempty"`
 }

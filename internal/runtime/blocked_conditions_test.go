@@ -34,6 +34,7 @@ func TestBlockedConditionRegistryContainsEveryNamedCondition(t *testing.T) {
 		loopcondition.CISettled,
 		loopcondition.ReviewUpdated,
 		loopcondition.HumanAnswered,
+		loopcondition.InfraRecovered,
 	} {
 		if registry[kind] == nil {
 			t.Fatalf("registry[%q] is nil", kind)

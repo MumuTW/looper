@@ -1560,6 +1560,20 @@ func (r *QueueRepository) CountByLoopIDAndStatus(ctx context.Context, loopID, st
 	return count, nil
 }
 
+func (r *QueueRepository) CountBlockedInfra(ctx context.Context) (int64, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM queue_items
+		WHERE status IN ('failed', 'manual_intervention')
+			AND last_error_kind = 'recoverable_infra'
+	`)
+	var count int64
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count infrastructure-blocked queue items: %w", err)
+	}
+	return count, nil
+}
+
 func (r *QueueRepository) FindActiveByDedupe(ctx context.Context, dedupeKey string) (*QueueItemRecord, error) {
 	row := r.q.QueryRowContext(ctx, `
 		SELECT * FROM queue_items

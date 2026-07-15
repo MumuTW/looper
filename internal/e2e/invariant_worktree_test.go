@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/e2e/harness"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -135,6 +136,91 @@ func TestInvariantWorkerRecoversAfterAgentExecutableReappears(t *testing.T) {
 		t.Fatalf("second run status = %s, want success after infrastructure recovery (error=%q)", second.Status, stringValue(second.ErrorMessage))
 	}
 	proc.Stop(context.Background())
+}
+
+func TestInvariantInfraRetryBudgetBlocksWithoutRespawningAgent(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	home := harness.NewTempHome(t)
+	repo := harness.CreateSeededRepo(t, "git")
+	port := harness.MustFreePort(t)
+	fakeAgent := harness.NewFakeAgent(t, bins)
+	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{}})
+	vendor, _, agentEnv := fakeAgent.AgentConfig("write-file", "git", fakeGH.Path)
+	missingAgent := filepath.Join(home.Root, "missing-tools", "fake-agent")
+	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{
+		Port:              port,
+		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},
+		EnableOsascript:   true,
+		AgentVendor:       vendor,
+		AgentCommand:      missingAgent,
+		AgentEnv:          agentEnv,
+		Projects:          writeProjectConfig(repo, home),
+		DisableDisclosure: true,
+	})
+	cfg.Scheduler.RetryBaseDelayMS = 100
+	cfg.Scheduler.InfraRetryBudgetSeconds = 1
+	cfg.Defaults.OpenPRStrategy = "manual"
+	harness.WriteConfig(t, home.ConfigPath, cfg, nil)
+	proc := harness.StartLooperd(t, bins, home, home.ConfigPath, fakeGH.EnvMap(), cfg.Server.Host, cfg.Server.Port)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := proc.WaitForReady(ctx); err != nil {
+		t.Fatalf("wait for ready: %v", err)
+	}
+	client := newAPIClient(proc.BaseURL())
+	var created struct {
+		ID string `json:"id"`
+	}
+	client.post(t, "/api/v1/workers", map[string]any{"projectId": "project_1", "prompt": "do not respawn while infrastructure is absent", "repo": "acme/looper", "baseBranch": "main"}, &created)
+	first := waitForRunTerminal(t, client, created.ID, 30*time.Second)
+	if first.Status != "failed" {
+		t.Fatalf("first run status = %s, want failed", first.Status)
+	}
+	_, repositories := openRepos(t, home.DBPath)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		items, err := repositories.Queue.List(context.Background())
+		if err != nil {
+			t.Fatalf("Queue.List() error = %v", err)
+		}
+		for i := range items {
+			if items[i].LoopID == nil || *items[i].LoopID != created.ID || items[i].Status != "manual_intervention" {
+				continue
+			}
+			if items[i].LastErrorKind == nil || *items[i].LastErrorKind != "recoverable_infra" {
+				t.Fatalf("blocked queue = %#v", items[i])
+			}
+			loop, err := repositories.Loops.GetByID(context.Background(), created.ID)
+			if err != nil || loop == nil || loop.Status != "paused" {
+				t.Fatalf("blocked loop = %#v, %v", loop, err)
+			}
+			condition, ok := loopcondition.Read(loop.MetadataJSON)
+			if !ok || condition.Kind != loopcondition.InfraRecovered {
+				t.Fatalf("blocked condition = %#v, %v", condition, ok)
+			}
+			var runs runsListResponse
+			client.get(t, "/api/v1/runs?loopId="+created.ID, &runs)
+			if len(runs.Items) != 1 {
+				t.Fatalf("run count = %d, want 1; cheap gate must not respawn the role/agent", len(runs.Items))
+			}
+			var health struct {
+				Healthy   bool `json:"healthy"`
+				Scheduler struct {
+					Healthy      bool  `json:"healthy"`
+					BlockedInfra int64 `json:"blockedInfra"`
+				} `json:"scheduler"`
+			}
+			client.get(t, "/api/v1/healthz", &health)
+			if health.Healthy || health.Scheduler.Healthy || health.Scheduler.BlockedInfra != 1 {
+				t.Fatalf("health = %#v, want explicit infrastructure degradation", health)
+			}
+			proc.Stop(context.Background())
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	proc.Stop(context.Background())
+	t.Fatal("recoverable infrastructure retry did not escalate after wall-clock budget")
 }
 
 func TestInvariantWorkerCommitStaysOffUserBranch(t *testing.T) {

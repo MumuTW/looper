@@ -78,6 +78,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			MaxConcurrentRuns:        3,
 			RetryMaxAttempts:         -1,
 			RetryBaseDelayMS:         5000,
+			InfraRetryBudgetSeconds:  3600,
 			SlowLaneWarnThresholdMS:  5000,
 			DiscoveryCacheTTLSeconds: 30,
 		},

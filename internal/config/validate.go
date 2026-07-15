@@ -87,6 +87,10 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "scheduler.retryBaseDelayMs", Message: "must be a positive integer"})
 	}
 
+	if config.Scheduler.InfraRetryBudgetSeconds < 0 {
+		issues = append(issues, ValidationIssue{Path: "scheduler.infraRetryBudgetSeconds", Message: "must be an integer >= 0"})
+	}
+
 	if config.Scheduler.SlowLaneWarnThresholdMS < 1 {
 		issues = append(issues, ValidationIssue{Path: "scheduler.slowLaneWarnThresholdMs", Message: "must be a positive integer"})
 	}

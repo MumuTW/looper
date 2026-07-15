@@ -2861,6 +2861,14 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		handled, err := gateRecoverableInfraRetry(ctx, item, input)
+		if err != nil {
+			errList = append(errList, err)
+			continue
+		}
+		if handled {
+			continue
+		}
 
 		// A loop parked for human takeover (or paused) must never be run, even if a
 		// queue item survived a race with the parking and got claimed. Release the

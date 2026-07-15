@@ -11,11 +11,12 @@ const metadataKey = "blockedCondition"
 type Kind string
 
 const (
-	ProductSpec   Kind = "product_spec"
-	DiskRecovered Kind = "disk_recovered"
-	CISettled     Kind = "ci_settled"
-	ReviewUpdated Kind = "review_updated"
-	HumanAnswered Kind = "human_answered"
+	ProductSpec    Kind = "product_spec"
+	DiskRecovered  Kind = "disk_recovered"
+	CISettled      Kind = "ci_settled"
+	ReviewUpdated  Kind = "review_updated"
+	HumanAnswered  Kind = "human_answered"
+	InfraRecovered Kind = "infra_recovered"
 )
 
 type Record struct {
@@ -26,7 +27,7 @@ type Record struct {
 
 func (r Record) Valid() bool {
 	switch r.Kind {
-	case ProductSpec, DiskRecovered, CISettled, ReviewUpdated, HumanAnswered:
+	case ProductSpec, DiskRecovered, CISettled, ReviewUpdated, HumanAnswered, InfraRecovered:
 		return true
 	default:
 		return false

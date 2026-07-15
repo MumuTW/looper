@@ -34,6 +34,7 @@
         "maxConcurrentRuns": 3,
         "retryMaxAttempts": -1,
         "retryBaseDelayMs": 5000,
+        "infraRetryBudgetSeconds": 3600,
         "slowLaneWarnThresholdMs": 5000,
         "discoveryCacheTtlSeconds": 30
       },
