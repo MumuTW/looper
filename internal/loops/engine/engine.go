@@ -37,6 +37,13 @@ func (f *Failure) Error() string {
 	return f.Err.Error()
 }
 
+func (f *Failure) Unwrap() error {
+	if f == nil {
+		return nil
+	}
+	return f.Err
+}
+
 type Plugin[C any] interface {
 	Steps() []string
 	ExecuteStep(context.Context, string, C) (StepResult[C], error)

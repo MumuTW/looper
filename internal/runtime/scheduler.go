@@ -2871,7 +2871,9 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			continue
 		}
 		item := item
-		processFn := withLifecycleLease(item, input, process)
+		processFn := withLifecycleLease(item, input, func(ctx context.Context) error {
+			return runQueueRolePlugin(ctx, item.Type, process)
+		})
 
 		if input.AsyncRunner != nil {
 			input.AsyncRunner.Go(func() {
@@ -2891,6 +2893,39 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		return nil
 	}
 	return errors.Join(errList...)
+}
+
+type queueRoleCheckpoint struct{}
+
+type queueRolePlugin struct {
+	role    string
+	process func(context.Context) error
+}
+
+func (p queueRolePlugin) Steps() []string                        { return []string{p.role + ".reconcile"} }
+func (p queueRolePlugin) BoundaryFor(string) loopengine.Boundary { return loopengine.Boundary(p.role) }
+func (p queueRolePlugin) ExecuteStep(ctx context.Context, _ string, checkpoint queueRoleCheckpoint) (loopengine.StepResult[queueRoleCheckpoint], error) {
+	return loopengine.StepResult[queueRoleCheckpoint]{Checkpoint: checkpoint}, p.process(ctx)
+}
+func (p queueRolePlugin) Classify(err error, boundary loopengine.Boundary) *loopengine.Failure {
+	return &loopengine.Failure{Class: "role_failure", Boundary: boundary, Err: err}
+}
+
+type queueRoleStore struct{}
+
+func (queueRoleStore) Load(context.Context) (queueRoleCheckpoint, string, error) {
+	return queueRoleCheckpoint{}, "", nil
+}
+func (queueRoleStore) StepStarted(context.Context, string, queueRoleCheckpoint) error   { return nil }
+func (queueRoleStore) StepCompleted(context.Context, string, queueRoleCheckpoint) error { return nil }
+func (queueRoleStore) Blocked(context.Context, string, queueRoleCheckpoint, loopengine.Blocked) error {
+	return nil
+}
+func (queueRoleStore) Done(context.Context, queueRoleCheckpoint) error { return nil }
+
+func runQueueRolePlugin(ctx context.Context, role string, process func(context.Context) error) error {
+	_, err := (loopengine.Engine[queueRoleCheckpoint]{Plugin: queueRolePlugin{role: role, process: process}, Store: queueRoleStore{}}).Run(ctx)
+	return err
 }
 
 func withLifecycleLease(item storage.QueueItemRecord, input defaultSchedulerTickInput, process func(context.Context) error) func(context.Context) error {
