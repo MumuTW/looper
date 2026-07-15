@@ -33,8 +33,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0020_feishu_live_feeds",
-              "latestAppliedId": "0020_feishu_live_feeds",
+              "latestAvailableId": "0021_queue_recoverable_infra",
+              "latestAppliedId": "0021_queue_recoverable_infra",
               "pendingCount": 0
             }
           }
@@ -80,7 +80,7 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0020_feishu_live_feeds",
+            "schemaVersion": "0021_queue_recoverable_infra",
             "pendingMigrations": [],
             "healthy": true
           },

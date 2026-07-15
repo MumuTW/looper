@@ -63,6 +63,80 @@ func TestInvariantWorkerUsesIsolatedWorktreeAndLeavesUserRepoClean(t *testing.T)
 	proc.Stop(context.Background())
 }
 
+func TestInvariantWorkerRecoversAfterAgentExecutableReappears(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	home := harness.NewTempHome(t)
+	repo := harness.CreateSeededRepo(t, "git")
+	port := harness.MustFreePort(t)
+	fakeAgent := harness.NewFakeAgent(t, bins)
+	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{}})
+	vendor, _, agentEnv := fakeAgent.AgentConfig("write-file", "git", fakeGH.Path)
+	missingAgent := filepath.Join(home.Root, "recovered-tools", "fake-agent")
+	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{
+		Port:              port,
+		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},
+		EnableOsascript:   true,
+		AgentVendor:       vendor,
+		AgentCommand:      missingAgent,
+		AgentEnv:          agentEnv,
+		Projects:          writeProjectConfig(repo, home),
+		DisableDisclosure: true,
+	})
+	cfg.Scheduler.PollIntervalSeconds = 10
+	cfg.Defaults.OpenPRStrategy = "manual"
+	harness.WriteConfig(t, home.ConfigPath, cfg, nil)
+	proc := harness.StartLooperd(t, bins, home, home.ConfigPath, fakeGH.EnvMap(), cfg.Server.Host, cfg.Server.Port)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := proc.WaitForReady(ctx); err != nil {
+		t.Fatalf("wait for ready: %v", err)
+	}
+	client := newAPIClient(proc.BaseURL())
+	var created struct {
+		ID string `json:"id"`
+	}
+	client.post(t, "/api/v1/workers", map[string]any{"projectId": "project_1", "prompt": "recover after the executable returns", "repo": "acme/looper", "baseBranch": "main"}, &created)
+	first := waitForRunTerminal(t, client, created.ID, 30*time.Second)
+	if first.Status != "failed" || first.ErrorMessage == nil || !strings.Contains(*first.ErrorMessage, "no such file or directory") {
+		t.Fatalf("first run = %#v, want missing-executable failure", first)
+	}
+	_, repos := openRepos(t, home.DBPath)
+	items, err := repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	var retry *storage.QueueItemRecord
+	for i := range items {
+		if items[i].LoopID != nil && *items[i].LoopID == created.ID {
+			retry = &items[i]
+			break
+		}
+	}
+	if retry == nil || retry.Status != "queued" || retry.LastErrorKind == nil || *retry.LastErrorKind != "recoverable_infra" {
+		t.Fatalf("queue after missing executable = %#v, want queued recoverable_infra", retry)
+	}
+	loop := loadSingleLoop(t, client, created.ID)
+	if loop.Status != "queued" {
+		t.Fatalf("loop status after recoverable fault = %q, want queued", loop.Status)
+	}
+
+	binary, err := os.ReadFile(fakeAgent.Path)
+	if err != nil {
+		t.Fatalf("read fake agent: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(missingAgent), 0o755); err != nil {
+		t.Fatalf("mkdir recovered tool dir: %v", err)
+	}
+	if err := os.WriteFile(missingAgent, binary, 0o755); err != nil {
+		t.Fatalf("restore fake agent: %v", err)
+	}
+	second := waitForNewTerminalRun(t, client, created.ID, map[string]struct{}{first.ID: {}}, 40*time.Second)
+	if second.Status != "success" {
+		t.Fatalf("second run status = %s, want success after infrastructure recovery (error=%q)", second.Status, stringValue(second.ErrorMessage))
+	}
+	proc.Stop(context.Background())
+}
+
 func TestInvariantWorkerCommitStaysOffUserBranch(t *testing.T) {
 	bins := harness.MustBinaries(t)
 	home := harness.NewTempHome(t)

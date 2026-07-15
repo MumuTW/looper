@@ -2314,8 +2314,8 @@ const scheduledQueueOrderBy = `
 		qi.priority ASC, qi.available_at ASC, qi.created_at ASC
 `
 
-const longTermRetryPredicateLiteral = `qi.attempts >= 5 AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'non_retryable')`
-const longTermRetryPredicateParam = `qi.attempts >= ? AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'non_retryable')`
+const longTermRetryPredicateLiteral = `qi.attempts >= 5 AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'recoverable_infra', 'non_retryable')`
+const longTermRetryPredicateParam = `qi.attempts >= ? AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'recoverable_infra', 'non_retryable')`
 
 const scheduledQueueQuery = scheduledQueueBaseQuery + scheduledQueueOrderBy
 
