@@ -139,6 +139,60 @@ func TestProcessClaimedItemEntersShepherdingUnderLooperAuto(t *testing.T) {
 	}
 }
 
+func TestInterruptedOpenPRAdoptsExistingPRBeforeRecoveringWorktree(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	branch := buildWorkerBranchName(workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: 27}, "loop_worker_1")
+	missingWorktree := filepath.Join(t.TempDir(), "deleted-worktree")
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:       &workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: 27},
+		Worktree:   &checkpointWorktree{ID: "wt_deleted", Path: missingWorktree, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+		Execution:  &checkpointExecution{Status: "completed", ParseStatus: "parsed", Summary: "implemented"},
+		Validation: &ValidationResult{Passed: true, Summary: "passed"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_interrupted_open_pr", LoopID: "loop_worker_1", Status: "failed", CurrentStep: stringPtr(string(stepOpenPR)), LastCompletedStep: stringPtr(string(stepValidate)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	git := &fakeGitGateway{}
+	github := &fakeGitHubGateway{
+		openPRs:     []PullRequestSummary{{Number: 201, URL: "https://example/pr/201", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}},
+		prDetail:    PullRequestDetail{Number: 201, URL: "https://example/pr/201", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Body: "## Summary\n\nExisting PR"},
+		issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "OPEN"},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, ShepherdEnabled: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 201 {
+		t.Fatalf("result = %#v, want adopted PR 201", result)
+	}
+	if len(git.restoreCalls) != 0 || len(git.createCalls) != 0 || len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 {
+		t.Fatalf("restore/create-worktree/push/create-pr = %d/%d/%d/%d, want 0/0/0/0", len(git.restoreCalls), len(git.createCalls), len(git.pushCalls), len(github.createPRCalls))
+	}
+
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	if loop.Status != "shepherding" || loop.PRNumber == nil || *loop.PRNumber != 201 || !loops.ShepherdActive(loop.MetadataJSON) {
+		t.Fatalf("loop = %#v, want durable PR 201 in shepherding", loop)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue item", queue, err)
+	}
+	if queue.PRNumber == nil || *queue.PRNumber != 201 || queue.TargetID != "pr:acme/looper:201" {
+		t.Fatalf("queue = %#v, want retargeted PR 201", queue)
+	}
+}
+
 func derefStr(s *string) string {
 	if s == nil {
 		return ""

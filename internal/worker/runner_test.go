@@ -1854,11 +1854,15 @@ func TestPersistPullRequestReferenceRollsBackLoopWhenQueueUpdateFails(t *testing
 	}
 }
 
-func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) {
+func TestProcessClaimedItemResumesByAdoptingPRAfterAmbiguousCreateFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
-	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, createPRErrors: []error{fmt.Errorf("temporary create pr failure")}}
+	branch := buildWorkerBranchName(workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: 27}, "loop_worker_1")
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{
+		createPRErrors:  []error{fmt.Errorf("a pull request for branch %q into branch main already exists", branch)},
+		openPRResponses: [][]PullRequestSummary{{}, {}, {{Number: 101, URL: "https://example/pr/101", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}},
+	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
 	started := make([]AgentExecutionStartedInput, 0, 1)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, OnAgentExecutionStarted: func(_ context.Context, input AgentExecutionStartedInput) error {
@@ -1898,11 +1902,35 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	if len(git.createCalls) != 1 {
 		t.Fatalf("len(git.createCalls) = %d, want 1 (worktree should not rerun)", len(git.createCalls))
 	}
-	if len(github.createPRCalls) != 2 {
-		t.Fatalf("len(github.createPRCalls) = %d, want 2", len(github.createPRCalls))
+	if len(github.createPRCalls) != 1 {
+		t.Fatalf("len(github.createPRCalls) = %d, want 1 (resume must adopt the remotely-created PR)", len(github.createPRCalls))
 	}
 	if len(github.createIssueCommentCalls) != 1 {
 		t.Fatalf("len(github.createIssueCommentCalls) = %d, want 1 running marker across resume", len(github.createIssueCommentCalls))
+	}
+}
+
+func TestProcessClaimedItemDoesNotCreatePRWhenExistingPRLookupFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{listOpenPRErrors: []error{errors.New("github list unavailable")}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !strings.Contains(result.Summary, "could not verify") {
+		t.Fatalf("result = %#v, want retryable lookup failure", result)
+	}
+	if len(github.createPRCalls) != 0 {
+		t.Fatalf("len(github.createPRCalls) = %d, want 0 when PR existence is unknown", len(github.createPRCalls))
 	}
 }
 
@@ -3889,6 +3917,7 @@ type fakeGitHubGateway struct {
 	listIssueCalls          []ListOpenIssuesInput
 	openPRs                 []PullRequestSummary
 	openPRResponses         [][]PullRequestSummary
+	listOpenPRErrors        []error
 	openPRIndex             int
 	prDetail                PullRequestDetail
 	prDetailResponses       []PullRequestDetail
@@ -3938,9 +3967,13 @@ func (f *fakeGitHubGateway) ListOpenIssues(_ context.Context, input ListOpenIssu
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
-	if f.openPRIndex < len(f.openPRResponses) {
-		result := append([]PullRequestSummary(nil), f.openPRResponses[f.openPRIndex]...)
-		f.openPRIndex++
+	index := f.openPRIndex
+	f.openPRIndex++
+	if index < len(f.listOpenPRErrors) && f.listOpenPRErrors[index] != nil {
+		return nil, f.listOpenPRErrors[index]
+	}
+	if index < len(f.openPRResponses) {
+		result := append([]PullRequestSummary(nil), f.openPRResponses[index]...)
 		return result, nil
 	}
 	return append([]PullRequestSummary(nil), f.openPRs...), nil

@@ -2390,6 +2390,21 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = failure.resumePolicy
 		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
 	}
+	// PR existence is authoritative in GitHub, while the local worktree is only a
+	// recreatable cache. Reconcile the durable PR reference before touching that
+	// cache: a previous attempt may have opened the PR and then died before the
+	// open-pr step checkpoint was committed. Persisting the reference first makes
+	// the rest of this step restart-safe and lets the caller enter shepherding
+	// without recreating or pushing a worktree merely to rediscover the same PR.
+	if work.ExecutionMode == "create-pr" && r.openPRStrategy != config.OpenPRStrategyManual && checkpoint.PullRequest == nil && input.Loop.PRNumber == nil {
+		adopted, adoptErr := r.adoptOpenPullRequestBeforeWorktree(ctx, input, &checkpoint, work)
+		if adoptErr != nil {
+			return checkpoint, adoptErr
+		}
+		if adopted {
+			return checkpoint, nil
+		}
+	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -2515,30 +2530,10 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
 	}
-	aliases := buildWorkerBranchAliases(work, input.Loop.ID)
+	aliases := workerPullRequestBranchCandidates(work, input.Loop.ID, checkpoint)
 	worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
 	if rootErr != nil {
 		return checkpoint, rootErr
-	}
-	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
-		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(existing.HeadRefName, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
-			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
-				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-			}
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-		}
-		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-		}
-		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
-			return checkpoint, err
-		}
-		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
-		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
-		checkpoint.ResumePolicy = "advance_from_checkpoint"
-		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
-		return checkpoint, nil
 	}
 	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 		if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
@@ -2555,16 +2550,21 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
-	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
+	existing, findErr := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath)
+	if findErr != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("Worker could not verify whether branch %s already has an open pull request: %v", worktree.Branch, findErr), kind: FailureRetryableAfterResume}
+	}
+	if existing != nil {
+		pr := checkpointPullPR{Number: existing.Number, URL: existing.URL}
+		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
+			return checkpoint, err
+		}
+		checkpoint.PullRequest = &pr
+		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
 		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
-			return checkpoint, err
-		}
-		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
-		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
@@ -2576,13 +2576,13 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if created.Number <= 0 {
 		return checkpoint, &loopError{message: "Worker create-pr requires a pull request number", kind: FailureRetryableAfterResume}
 	}
-	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
 	pr := checkpointPullPR{Number: created.Number, URL: created.URL}
 	if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
 		return checkpoint, err
 	}
 	checkpoint.PullRequest = &pr
 	checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, created.Number, created.URL, true, false)
+	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 	return checkpoint, nil
@@ -2984,6 +2984,50 @@ func containsAnyValidationHint(message string, hints []string) bool {
 		}
 	}
 	return false
+}
+
+func (r *Runner) adoptOpenPullRequestBeforeWorktree(ctx context.Context, input stepInput, checkpoint *workerCheckpoint, work workerInput) (bool, error) {
+	if checkpoint == nil {
+		return false, nil
+	}
+	branches := workerPullRequestBranchCandidates(work, input.Loop.ID, *checkpoint)
+	branch := firstNonEmpty(branches...)
+	existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, branches, work.BaseBranch, input.Project.RepoPath)
+	if err != nil {
+		return false, &loopError{message: fmt.Sprintf("Worker could not verify whether branch %s already has an open pull request: %v", branch, err), kind: FailureRetryableAfterResume}
+	}
+	if existing == nil {
+		return false, nil
+	}
+
+	pr := checkpointPullPR{Number: existing.Number, URL: existing.URL}
+	// This loop+queue transaction is intentionally the first local side effect
+	// after GitHub proves the PR exists. If the process dies below, the next run
+	// resumes from this durable reference instead of attempting another PR create.
+	if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
+		return false, err
+	}
+	checkpoint.PullRequest = &pr
+	checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, branch), work.BaseBranch, existing.Number, existing.URL, true, true)
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
+	if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
+		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	r.syncIssueClaim(ctx, input, checkpoint, issueClaimStatusPRLinked, "")
+	return true, nil
+}
+
+func workerPullRequestBranchCandidates(work workerInput, loopID string, checkpoint workerCheckpoint) []string {
+	branches := buildWorkerBranchAliases(work, loopID)
+	branches = appendUniqueStrings(branches, work.Branch)
+	if checkpoint.Worktree != nil {
+		branches = appendUniqueStrings(branches, checkpoint.Worktree.Branch)
+	}
+	if checkpoint.Lifecycle != nil {
+		branches = appendUniqueStrings(branches, checkpoint.Lifecycle.ActiveBranch, checkpoint.Lifecycle.Branch, checkpoint.Lifecycle.PlannedBranch, checkpoint.Lifecycle.AgentBranch)
+	}
+	return branches
 }
 
 func (r *Runner) findOpenPullRequestForBranch(ctx context.Context, repo string, branches []string, baseBranch, cwd string) (*PullRequestSummary, error) {
