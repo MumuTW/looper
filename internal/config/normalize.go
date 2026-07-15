@@ -839,6 +839,25 @@ func mergeDaemonConfig(config *DaemonConfig, partial PartialDaemonConfig) {
 	if partial.WorktreeCleanup != nil {
 		mergeWorktreeCleanupConfig(&config.WorktreeCleanup, *partial.WorktreeCleanup)
 	}
+
+	if partial.DiskBackpressure != nil {
+		mergeDiskBackpressureConfig(&config.DiskBackpressure, *partial.DiskBackpressure)
+	}
+}
+
+func mergeDiskBackpressureConfig(config *DiskBackpressureConfig, partial PartialDiskBackpressureConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.Path != nil {
+		config.Path = *partial.Path
+	}
+	if partial.HighWatermarkPercent != nil {
+		config.HighWatermarkPercent = *partial.HighWatermarkPercent
+	}
+	if partial.HardStopPercent != nil {
+		config.HardStopPercent = *partial.HardStopPercent
+	}
 }
 
 func mergeWorktreeCleanupConfig(config *WorktreeCleanupConfig, partial PartialWorktreeCleanupConfig) {

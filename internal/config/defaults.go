@@ -155,6 +155,17 @@ func DefaultConfig(cwd string) (Config, error) {
 				IncludeOrphans: true,
 				DryRun:         false,
 			},
+			DiskBackpressure: DiskBackpressureConfig{
+				// The other half of worktree disk management: cleanup reclaims,
+				// backpressure refuses to start work that would fill the disk. At
+				// 85% capacity stop claiming NEW runs (in-flight loops keep going);
+				// at 93% it's an emergency and we say so loudly. Path empty =>
+				// scheduler stats the worktree root.
+				Enabled:              true,
+				Path:                 "",
+				HighWatermarkPercent: 85,
+				HardStopPercent:      93,
+			},
 		},
 		Package: PackageConfig{
 			Distribution:               "github-release",

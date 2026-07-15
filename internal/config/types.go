@@ -310,15 +310,16 @@ const (
 )
 
 type DaemonConfig struct {
-	Mode                   DaemonMode            `json:"mode"`
-	RestartPolicy          DaemonRestartPolicy   `json:"restartPolicy"`
-	RestartThrottleSeconds int                   `json:"restartThrottleSeconds"`
-	PlistPath              *string               `json:"plistPath,omitempty"`
-	LogDir                 string                `json:"logDir"`
-	ShutdownTimeoutMS      int                   `json:"shutdownTimeoutMs"`
-	WorkingDirectory       string                `json:"workingDirectory"`
-	Environment            map[string]string     `json:"environment"`
-	WorktreeCleanup        WorktreeCleanupConfig `json:"worktreeCleanup"`
+	Mode                   DaemonMode             `json:"mode"`
+	RestartPolicy          DaemonRestartPolicy    `json:"restartPolicy"`
+	RestartThrottleSeconds int                    `json:"restartThrottleSeconds"`
+	PlistPath              *string                `json:"plistPath,omitempty"`
+	LogDir                 string                 `json:"logDir"`
+	ShutdownTimeoutMS      int                    `json:"shutdownTimeoutMs"`
+	WorkingDirectory       string                 `json:"workingDirectory"`
+	Environment            map[string]string      `json:"environment"`
+	WorktreeCleanup        WorktreeCleanupConfig  `json:"worktreeCleanup"`
+	DiskBackpressure       DiskBackpressureConfig `json:"diskBackpressure"`
 }
 
 type WorktreeCleanupConfig struct {
@@ -328,6 +329,24 @@ type WorktreeCleanupConfig struct {
 	MaxPerTick     int    `json:"maxPerTick"`
 	IncludeOrphans bool   `json:"includeOrphans"`
 	DryRun         bool   `json:"dryRun"`
+}
+
+// DiskBackpressureConfig throttles the scheduler off the disk backing the
+// worktrees. WorktreeCleanup reclaims space after the fact; this is the other
+// half — it refuses to START new runs once the volume is near full, so the
+// daemon never spends an agent turn (and a multi-GB worktree) on work destined
+// to fail with ENOSPC. Both thresholds clamp new claims to zero; HardStop only
+// differs in that it logs at error severity (a disk emergency, not a warning).
+type DiskBackpressureConfig struct {
+	Enabled bool `json:"enabled"`
+	// Path is the directory whose volume is watched. Empty = the default
+	// worktree root. Any path on the same volume yields identical numbers.
+	Path string `json:"path,omitempty"`
+	// HighWatermarkPercent is the df capacity at/above which new claims pause.
+	HighWatermarkPercent float64 `json:"highWatermarkPercent"`
+	// HardStopPercent is the capacity at/above which the pause is treated as an
+	// emergency (error-level signal). Must be >= HighWatermarkPercent.
+	HardStopPercent float64 `json:"hardStopPercent"`
 }
 
 type PackageConfig struct {
@@ -835,15 +854,16 @@ type PartialToolPathsConfig struct {
 }
 
 type PartialDaemonConfig struct {
-	Mode                   *DaemonMode                   `json:"mode,omitempty"`
-	RestartPolicy          *DaemonRestartPolicy          `json:"restartPolicy,omitempty"`
-	RestartThrottleSeconds *int                          `json:"restartThrottleSeconds,omitempty"`
-	PlistPath              *string                       `json:"plistPath,omitempty"`
-	LogDir                 *string                       `json:"logDir,omitempty"`
-	ShutdownTimeoutMS      *int                          `json:"shutdownTimeoutMs,omitempty"`
-	WorkingDirectory       *string                       `json:"workingDirectory,omitempty"`
-	Environment            map[string]string             `json:"environment,omitempty"`
-	WorktreeCleanup        *PartialWorktreeCleanupConfig `json:"worktreeCleanup,omitempty"`
+	Mode                   *DaemonMode                    `json:"mode,omitempty"`
+	RestartPolicy          *DaemonRestartPolicy           `json:"restartPolicy,omitempty"`
+	RestartThrottleSeconds *int                           `json:"restartThrottleSeconds,omitempty"`
+	PlistPath              *string                        `json:"plistPath,omitempty"`
+	LogDir                 *string                        `json:"logDir,omitempty"`
+	ShutdownTimeoutMS      *int                           `json:"shutdownTimeoutMs,omitempty"`
+	WorkingDirectory       *string                        `json:"workingDirectory,omitempty"`
+	Environment            map[string]string              `json:"environment,omitempty"`
+	WorktreeCleanup        *PartialWorktreeCleanupConfig  `json:"worktreeCleanup,omitempty"`
+	DiskBackpressure       *PartialDiskBackpressureConfig `json:"diskBackpressure,omitempty"`
 }
 
 type PartialWorktreeCleanupConfig struct {
@@ -853,6 +873,13 @@ type PartialWorktreeCleanupConfig struct {
 	MaxPerTick     *int    `json:"maxPerTick,omitempty"`
 	IncludeOrphans *bool   `json:"includeOrphans,omitempty"`
 	DryRun         *bool   `json:"dryRun,omitempty"`
+}
+
+type PartialDiskBackpressureConfig struct {
+	Enabled              *bool    `json:"enabled,omitempty"`
+	Path                 *string  `json:"path,omitempty"`
+	HighWatermarkPercent *float64 `json:"highWatermarkPercent,omitempty"`
+	HardStopPercent      *float64 `json:"hardStopPercent,omitempty"`
 }
 
 type PartialPackageConfig struct {

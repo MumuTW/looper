@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/infra/disk"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
@@ -2647,6 +2649,14 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 			return 0, 0, err
 		}
 	}
+	// Disk-aware backpressure (P0-A2): even with free run slots, do not START
+	// new work when the volume backing the worktrees is near full — a fresh
+	// multi-GB worktree on a full disk fails mid-run with ENOSPC / "no such
+	// file" and strands the loop. In-flight loops (already "running") are
+	// untouched; only new claims pause until cleanup reclaims space.
+	if availableSlots > 0 {
+		availableSlots = diskBackpressureClamp(availableSlots, input.Config, input.Logger)
+	}
 	claimedItems := make([]storage.QueueItemRecord, 0)
 	if availableSlots > 0 && input.Repos != nil && input.Repos.Queue != nil {
 		claimedItems, err = claimAndRunScheduledQueueItems(ctx, availableSlots, input)
@@ -2714,6 +2724,69 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 		return 0, nil
 	}
 	return available, nil
+}
+
+// diskUsageStat is the seam through which the scheduler reads filesystem
+// capacity; tests override it to simulate a full disk deterministically.
+var diskUsageStat = disk.Stat
+
+// diskBackpressureClamp reduces the runs the scheduler may START this phase to
+// zero when the volume backing the worktrees is at/above the configured
+// capacity. It governs NEW claims only; loops already running keep going. It
+// fails OPEN: if backpressure is disabled, the platform lacks statfs, or the
+// disk cannot be read, the original slot count is returned unchanged — a disk
+// we cannot measure must never wedge the whole scheduler.
+func diskBackpressureClamp(availableSlots int, cfg *config.Config, logger bootstrap.Logger) int {
+	if availableSlots <= 0 || cfg == nil {
+		return availableSlots
+	}
+	bp := cfg.Daemon.DiskBackpressure
+	if !bp.Enabled {
+		return availableSlots
+	}
+
+	path := strings.TrimSpace(bp.Path)
+	if path == "" {
+		root, err := config.DefaultWorktreeRoot()
+		if err != nil {
+			// No path to watch — fail open rather than block all work.
+			return availableSlots
+		}
+		path = root
+	}
+
+	usage, err := diskUsageStat(path)
+	if err != nil {
+		// Unsupported platform or a transient stat error: never block work on a
+		// disk we cannot read. Debug-log so it stays discoverable.
+		if logger != nil {
+			logger.Debug("disk backpressure: capacity check unavailable, allowing claims", map[string]any{"path": path, "error": err.Error()})
+		}
+		return availableSlots
+	}
+
+	high := bp.HighWatermarkPercent
+	if high <= 0 || usage.UsedPercent < high {
+		return availableSlots
+	}
+
+	hard := bp.HardStopPercent
+	fields := map[string]any{
+		"path":          usage.Path,
+		"usedPercent":   math.Round(usage.UsedPercent*10) / 10,
+		"availGiB":      math.Round(float64(usage.AvailBytes)/(1<<30)*100) / 100,
+		"highWatermark": high,
+		"hardStop":      hard,
+		"blockedSlots":  availableSlots,
+	}
+	if logger != nil {
+		if hard > 0 && usage.UsedPercent >= hard {
+			logger.Error("disk backpressure: hard stop — refusing to claim new runs (disk emergency)", fields)
+		} else {
+			logger.Warn("disk backpressure: above high watermark — pausing new run claims", fields)
+		}
+	}
+	return 0
 }
 
 func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) ([]storage.QueueItemRecord, error) {

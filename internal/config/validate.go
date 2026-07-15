@@ -174,6 +174,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
 	validateWorktreeCleanupConfig(config.Daemon.WorktreeCleanup, "daemon.worktreeCleanup", &issues)
+	validateDiskBackpressureConfig(config.Daemon.DiskBackpressure, "daemon.diskBackpressure", &issues)
 
 	if strings.TrimSpace(config.Package.Distribution) == "" {
 		issues = append(issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})
@@ -552,6 +553,21 @@ func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, is
 	}
 	if config.MaxPerTick < 1 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxPerTick", Message: "must be a positive integer"})
+	}
+}
+
+func validateDiskBackpressureConfig(config DiskBackpressureConfig, path string, issues *[]ValidationIssue) {
+	if !config.Enabled {
+		return
+	}
+	if config.HighWatermarkPercent <= 0 || config.HighWatermarkPercent > 100 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".highWatermarkPercent", Message: "must be a percentage in (0, 100]"})
+	}
+	if config.HardStopPercent <= 0 || config.HardStopPercent > 100 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".hardStopPercent", Message: "must be a percentage in (0, 100]"})
+	}
+	if config.HardStopPercent > 0 && config.HighWatermarkPercent > 0 && config.HardStopPercent < config.HighWatermarkPercent {
+		*issues = append(*issues, ValidationIssue{Path: path + ".hardStopPercent", Message: "must be >= highWatermarkPercent"})
 	}
 }
 

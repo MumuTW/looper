@@ -3401,20 +3401,33 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	if !config.Daemon.WorktreeCleanup.Enabled {
 		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.Enabled = false, want true")
 	}
-	if config.Daemon.WorktreeCleanup.Interval != "24h" {
-		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.Interval = %q, want %q", config.Daemon.WorktreeCleanup.Interval, "24h")
+	if config.Daemon.WorktreeCleanup.Interval != "1h" {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.Interval = %q, want %q", config.Daemon.WorktreeCleanup.Interval, "1h")
 	}
-	if config.Daemon.WorktreeCleanup.RetentionDays != 7 {
-		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.RetentionDays = %d, want 7", config.Daemon.WorktreeCleanup.RetentionDays)
+	if config.Daemon.WorktreeCleanup.RetentionDays != 1 {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.RetentionDays = %d, want 1", config.Daemon.WorktreeCleanup.RetentionDays)
 	}
-	if config.Daemon.WorktreeCleanup.MaxPerTick != 10 {
-		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.MaxPerTick = %d, want 10", config.Daemon.WorktreeCleanup.MaxPerTick)
+	if config.Daemon.WorktreeCleanup.MaxPerTick != 50 {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.MaxPerTick = %d, want 50", config.Daemon.WorktreeCleanup.MaxPerTick)
 	}
-	if config.Daemon.WorktreeCleanup.IncludeOrphans {
-		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = true, want false")
+	if !config.Daemon.WorktreeCleanup.IncludeOrphans {
+		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = false, want true")
 	}
 	if config.Daemon.WorktreeCleanup.DryRun {
 		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.DryRun = true, want false")
+	}
+
+	if !config.Daemon.DiskBackpressure.Enabled {
+		t.Fatal("DefaultConfig().Daemon.DiskBackpressure.Enabled = false, want true")
+	}
+	if config.Daemon.DiskBackpressure.Path != "" {
+		t.Fatalf("DefaultConfig().Daemon.DiskBackpressure.Path = %q, want empty", config.Daemon.DiskBackpressure.Path)
+	}
+	if config.Daemon.DiskBackpressure.HighWatermarkPercent != 85 {
+		t.Fatalf("DefaultConfig().Daemon.DiskBackpressure.HighWatermarkPercent = %v, want 85", config.Daemon.DiskBackpressure.HighWatermarkPercent)
+	}
+	if config.Daemon.DiskBackpressure.HardStopPercent != 93 {
+		t.Fatalf("DefaultConfig().Daemon.DiskBackpressure.HardStopPercent = %v, want 93", config.Daemon.DiskBackpressure.HardStopPercent)
 	}
 
 	if config.Defaults.OpenPRStrategy != OpenPRStrategyAllDone {
@@ -3454,7 +3467,7 @@ func TestNormalizeMergesPartialWorktreeCleanupConfig(t *testing.T) {
 	if cfg.Daemon.WorktreeCleanup.RetentionDays != 14 {
 		t.Fatalf("Normalize().Daemon.WorktreeCleanup.RetentionDays = %d, want 14", cfg.Daemon.WorktreeCleanup.RetentionDays)
 	}
-	if cfg.Daemon.WorktreeCleanup.Interval != "24h" || cfg.Daemon.WorktreeCleanup.MaxPerTick != 10 || cfg.Daemon.WorktreeCleanup.DryRun {
+	if cfg.Daemon.WorktreeCleanup.Interval != "1h" || cfg.Daemon.WorktreeCleanup.MaxPerTick != 50 || cfg.Daemon.WorktreeCleanup.DryRun {
 		t.Fatalf("Normalize().Daemon.WorktreeCleanup = %#v, want unspecified defaults preserved", cfg.Daemon.WorktreeCleanup)
 	}
 }
