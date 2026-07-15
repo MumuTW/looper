@@ -26,6 +26,9 @@ keeps running the current binary off `feat/looper-auto-flowchart-runtime`.
 - [ ] A2. Disk-aware backpressure: `statfs(worktreeRoot)`; scheduler claim-eligibility gate "don't start new runs above high-watermark (85%)"; hard-stop (93%) refuses claims + emits health signal.
 - [ ] A3. Reclaim-on-rest: on a loop reaching rest with branch pushed, evict its worktree; stop the GC protecting paused/failed (service.go:269). Unify the two protected-status sets (service.go:269 vs runtime/worktree_cleanup.go:452).
 
+### P0.5 — worker resume is PR-aware  [kills the "PR already exists" re-run death]
+- [ ] A4. On open-PR, persist `prNumber` into the loop IMMEDIATELY (710's loop had `prNumber:None` despite PR 5469 existing → on resume it re-tried open-PR and died "a pull request for this branch already exists"). On resume, if the branch already has an open PR, ADOPT it (transition to shepherding that PR) instead of failing. Surfaced 2026-07-15 when recreate-from-branch (A1) let 710/787 resume — they'd already opened PRs 5469/5543 days ago. Operationally hot-fixed by hand-flipping those two loops to shepherding; the code must do it.
+
 ### P1 — failure taxonomy + blocked-condition reconciler  (1-2 wks)  [kills #2, hardens #1/#3]
 - [ ] B1. Add `RecoverableInfra` class in failureclass; map missing/stale worktree, ENOSPC, "no such file", fork/exec-under-pressure here → runtime self-heals + resumes (not manual/blind-transient).
 - [ ] B2. Generalize `reconcileAwaitingProductSpec` (awaiting_product_spec.go:63) into a condition-reconciler registry: {product-spec, disk-recovered, ci-settled, review-updated, human-answered}. `paused` may only rest on a named, self-clearing condition or true `dead`.
