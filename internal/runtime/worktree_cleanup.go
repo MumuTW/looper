@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreecleanup"
@@ -406,7 +407,7 @@ func worktreeCleanupCandidateActive(ctx context.Context, repos *storage.Reposito
 		return false, err
 	}
 	for _, loop := range loops {
-		if loop.ProjectID != candidate.ProjectID || !worktreeCleanupActiveLoopStatus(loop.Status) {
+		if loop.ProjectID != candidate.ProjectID || !domain.StatusPinsWorktree(domain.LoopStatus(loop.Status)) {
 			continue
 		}
 		if jsonContainsWorktree(loop.MetadataJSON, candidate) {
@@ -447,19 +448,6 @@ func worktreeCleanupCandidateActiveQueue(ctx context.Context, repos *storage.Rep
 		}
 	}
 	return false, nil
-}
-
-func worktreeCleanupActiveLoopStatus(status string) bool {
-	switch status {
-	// human_takeover keeps the worktree pinned: a human is (or is about to be)
-	// driving the loop's agent session inside it — reclaiming it would pull the
-	// working tree out from under them. shepherding keeps it pinned so the next
-	// PR-driving pass can push a fix from the same worktree.
-	case "idle", "queued", "running", "paused", "waiting", "human_takeover", "shepherding":
-		return true
-	default:
-		return false
-	}
 }
 
 func jsonContainsWorktree(raw *string, candidate storage.WorktreeRecord) bool {

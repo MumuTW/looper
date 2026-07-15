@@ -68,6 +68,39 @@ const (
 	LoopStatusShepherding LoopStatus = "shepherding"
 )
 
+// StatusPinsWorktree reports whether a loop in this status holds a live claim on
+// its worktree checkout, so worktree GC must NOT reclaim it. This is the single
+// source of truth for both worktree-cleanup gates (the planner in
+// internal/worktreecleanup and the runtime executor guard), which had drifted
+// apart — one protected failed/interrupted, the other human_takeover — and
+// between them pinned every resting worktree, leaking the disk (RC3).
+//
+// Only statuses where an agent or human is actively using the checkout, or is
+// imminently about to, pin it:
+//   - running: the daemon's agent is executing inside it.
+//   - queued: the loop is about to be claimed and run.
+//   - shepherding: the worker keeps driving its PR from the same worktree.
+//   - human_takeover: a human is driving the agent session inside it; deleting
+//     it would pull the working tree out from under them (the worktree is
+//     explicitly preserved for this status).
+//
+// Every other status is RESTING (paused, waiting, failed, interrupted,
+// awaiting_human, idle) or TERMINAL (completed, terminated, stopped). For those
+// the branch is the source of truth — its commits are durable — so the worktree
+// is a disposable cache the daemon recreates on resume (worker:
+// recoverWorkerWorktree from the branch; reviewer/fixer: a fresh CreateWorktree
+// each pass). GC may reclaim them; the retention grace still shields a
+// recently-used worktree, so a human resuming a just-paused loop keeps any
+// uncommitted increment.
+func StatusPinsWorktree(status LoopStatus) bool {
+	switch status {
+	case LoopStatusRunning, LoopStatusQueued, LoopStatusShepherding, LoopStatusHumanTakeover:
+		return true
+	default:
+		return false
+	}
+}
+
 type RunStatus string
 
 const (
