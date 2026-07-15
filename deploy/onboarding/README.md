@@ -1,11 +1,10 @@
 # looper HITL onboarding bundle
 
 A one-shot package that lets a teammate's coding agent configure and start looper
-with the Feishu HITL integration for them.
+with Plane/GitHub HITL and one-way Feishu notifications.
 
 ## Distributor (you, who has the shared secrets)
-1. Make sure the shared Feishu app + [Cloudflare inbox worker](../feishu-inbox-worker/README.md)
-   are deployed, and you have a filled `hitl.env` (from
+1. Make sure the shared Feishu app can send messages and you have a filled `hitl.env` (from
    [`deploy/hitl.env.example`](../hitl.env.example)). One-time, app-level: whitelist
    `http://127.0.0.1:53682/callback` as a redirect URL in the shared Feishu app's
    security settings, so every teammate's `looper login` can capture their open_id
@@ -16,7 +15,7 @@ with the Feishu HITL integration for them.
    deploy/onboarding/build-bundle.sh /path/to/your/hitl.env
    # → looper-hitl-onboarding.zip
    ```
-3. Send the zip **privately** (it contains the shared secrets). An internal chat
+3. Send the zip **privately** (it contains the app secrets). An internal chat
    or a private link is fine; don't put it in a public repo.
 
 ## Recipient (the teammate)

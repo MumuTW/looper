@@ -89,10 +89,6 @@ type Gateway struct {
 	// final card still shows the last activity.
 	liveMu    sync.Mutex
 	liveTails map[string]liveTailEntry
-	// askCards remembers each loop's live ask card (message id + the card it was
-	// built from) so the card can be patched to its resolved "✅ 已选:X" state when
-	// the answer arrives — keeping the full brief for review.
-	askCards map[string]askCardState
 	// liveFeeds remembers each loop's live-progress comment (a reply threaded under
 	// the anchor). The raw tool-call feed lives HERE — inside the thread — so the
 	// outer anchor card stays a human-scannable brief. Keyed by loop id → message id;
@@ -106,12 +102,6 @@ type Gateway struct {
 	// re-checks, so exactly one anchor is created.
 	rootMu    sync.Mutex
 	rootLocks map[string]*sync.Mutex
-	// closedFollowup remembers which finished tasks already got the one "task is
-	// done, continue on the issue/PR or open a new one" reply (§F option B), so a
-	// stream of follow-up messages in the thread gets a single honest ack, not a
-	// silent drop and not a spammed one.
-	closedFollowupMu sync.Mutex
-	closedFollowup   map[string]struct{}
 	// intakeOutcomes overrides a loop's anchor header with the classification's
 	// routing outcome. The coordinator (looper:auto) anchor never re-renders itself
 	// — completeIntakeAnchor delegated that to the downstream planner/worker loop,
@@ -120,11 +110,6 @@ type Gateway struct {
 	// coordinator loop id) so the shared task card retires to a meaningful state.
 	intakeMu       sync.Mutex
 	intakeOutcomes map[string]anchorOutcomeStyle
-}
-
-type askCardState struct {
-	msgID string
-	card  HITLAskCard
 }
 
 // anchorOutcomeStyle is a header colour+label override for a retired anchor card.
@@ -537,7 +522,7 @@ func feishuNotificationText(payload SystemNotificationPayload) string {
 
 // HITLAskCard is a mid-run human-in-the-loop question rendered as an interactive
 // Feishu card with one button per option. Each button's value carries the loop
-// seq + the chosen answer so a card-action callback identifies the loop + reply.
+// source-of-truth action details for the human receiving the notification.
 type HITLAskCard struct {
 	ProjectID      string
 	LoopID         string
@@ -617,60 +602,8 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, card.LoopID)
 	// The loop is awaiting_human now — turn the anchor card orange "等你定夺".
 	g.updateFeishuThreadHeader(ctx, token, card.LoopID)
-	msgID, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON))
-	if err != nil {
-		return err
-	}
-	// Remember the card so MarkAskAnswered can patch it in place on delivery.
-	if strings.TrimSpace(msgID) != "" && strings.TrimSpace(card.LoopID) != "" {
-		g.liveMu.Lock()
-		if g.askCards == nil {
-			g.askCards = map[string]askCardState{}
-		}
-		g.askCards[card.LoopID] = askCardState{msgID: msgID, card: card}
-		g.liveMu.Unlock()
-	}
-	return nil
-}
-
-// MarkAskAnswered patches a loop's ask card to its resolved "✅ 已选:X" state,
-// keeping the question + research + consequences intact. Best-effort; a no-op if
-// no ask card is remembered for the loop or the app-bot isn't configured.
-func (g *Gateway) MarkAskAnswered(ctx context.Context, loopID, answer string) {
-	loopID = strings.TrimSpace(loopID)
-	answer = strings.TrimSpace(answer)
-	if loopID == "" || answer == "" {
-		return
-	}
-	// Always log the decision to the loop's story (+ refresh the anchor), even if
-	// this process no longer holds the ask card to patch.
-	g.RecordMilestone(ctx, loopID, "🧑‍⚖️ 已定夺:"+answer)
-	g.liveMu.Lock()
-	st, ok := g.askCards[loopID]
-	g.liveMu.Unlock()
-	if !ok || strings.TrimSpace(st.msgID) == "" {
-		return
-	}
-	st.card.AnsweredWith = answer
-	cardJSON, err := buildFeishuAskCard(st.card)
-	if err != nil {
-		return
-	}
-	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
-		return
-	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
-	if err != nil {
-		return
-	}
-	if err := g.patchFeishuAppCard(ctx, token, st.msgID, string(cardJSON)); err == nil {
-		g.liveMu.Lock()
-		delete(g.askCards, loopID)
-		g.liveMu.Unlock()
-	}
+	_, err = g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON))
+	return err
 }
 
 // RecordMilestone appends one human-scannable milestone to a loop's story
@@ -1051,7 +984,7 @@ func (g *Gateway) ensureFeishuThreadRoot(ctx context.Context, token, chatID, loo
 		return ""
 	}
 	// Persisted (not just in-memory) so the inbound callback can reverse-map a
-	// thread reply back to this loop, and so it survives a daemon restart.
+	// later outbound updates back to this loop, and so it survives a daemon restart.
 	_ = g.repositories.FeishuThreads.Upsert(ctx, msgID, loopID, taskKey, chatID, eventlog.FormatJavaScriptISOString(g.now()))
 	return msgID
 }
@@ -1459,7 +1392,7 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 			return "blue", "👀 spec 评审中"
 		case "awaiting_product_answer":
 			// node H product-decision hold: the spec surfaced a product question and
-			// @-mentioned the product owner; it waits for their thread reply, not the
+			// @-mentioned the product owner; it waits for their Plane answer, not the
 			// owner's approval. Distinct from 需要人类审核 spec so the card is honest.
 			return "orange", "🙋 等待产品拍板"
 		case "awaiting_human_review":
@@ -1951,49 +1884,6 @@ func (g *Gateway) updateFeishuThreadHeader(ctx context.Context, token, loopID st
 		return
 	}
 	_ = g.patchFeishuAppCard(ctx, token, root, cardJSON)
-}
-
-// PostTaskClosedFollowup posts a single honest reply in a finished task's thread
-// when a human keeps talking to it (§F option B / P5): rather than silently
-// swallowing the message on a loop that will never run again, it says the task is
-// done and where to continue. At most once per loop. App-mode + best-effort.
-func (g *Gateway) PostTaskClosedFollowup(ctx context.Context, loopID string) error {
-	loopID = strings.TrimSpace(loopID)
-	if loopID == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
-		return nil
-	}
-	g.closedFollowupMu.Lock()
-	if g.closedFollowup == nil {
-		g.closedFollowup = map[string]struct{}{}
-	}
-	if _, done := g.closedFollowup[loopID]; done {
-		g.closedFollowupMu.Unlock()
-		return nil
-	}
-	g.closedFollowup[loopID] = struct{}{}
-	g.closedFollowupMu.Unlock()
-
-	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
-		return nil
-	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
-	if err != nil {
-		return err
-	}
-	root := g.threadRootForLoop(ctx, loopID)
-	chatID := strings.TrimSpace(cfg.ChatID)
-	if strings.TrimSpace(root) == "" || chatID == "" {
-		return nil
-	}
-	raw, err := json.Marshal(map[string]string{"text": "✅ 本任务已完成。如需继续,请在对应的 issue / PR 上留言,或新建一个任务 —— 这个话题不再自动接管了。"})
-	if err != nil {
-		return err
-	}
-	_, err = g.postFeishuAppMessage(ctx, token, chatID, root, "text", string(raw))
-	return err
 }
 
 // PostThreadNote posts a plain-text reply into a loop's Feishu thread, optionally

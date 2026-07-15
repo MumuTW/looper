@@ -377,7 +377,7 @@ type FeishuThreadsRepository struct{ q sqliteQuerier }
 // taskKey is the stable task identity (issue:repo:N) the anchor is shared under;
 // "" means the loop has no source issue and is keyed per-loop. On a repeat call
 // for an existing root (a new loop joining the same task's card) loop_id is
-// refreshed so a thread reply routes to the currently-active loop.
+// refreshed so outbound updates stay associated with the currently-active loop.
 func (r *FeishuThreadsRepository) Upsert(ctx context.Context, rootMessageID, loopID, taskKey, chatID, createdAt string) error {
 	var taskKeyArg any
 	if strings.TrimSpace(taskKey) != "" {
@@ -458,19 +458,6 @@ func (r *FeishuLiveFeedsRepository) MessageByLoop(ctx context.Context, loopID st
 		return "", fmt.Errorf("feishu live feed by loop: %w", err)
 	}
 	return messageID, nil
-}
-
-// LoopByRoot returns the loop id a thread root belongs to, or "" when unknown.
-func (r *FeishuThreadsRepository) LoopByRoot(ctx context.Context, rootMessageID string) (string, error) {
-	var loopID string
-	err := r.q.QueryRowContext(ctx, `SELECT loop_id FROM feishu_threads WHERE root_message_id = ?`, rootMessageID).Scan(&loopID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil
-		}
-		return "", fmt.Errorf("feishu thread loop by root: %w", err)
-	}
-	return loopID, nil
 }
 
 type EventsRepository struct{ q sqliteQuerier }

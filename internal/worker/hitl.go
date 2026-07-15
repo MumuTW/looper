@@ -145,30 +145,6 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) strin
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
-// clearHumanInbox drops the loop's drained human messages after a successful turn
-// so they are not re-injected on a later run. No-op when the inbox is empty.
-func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) {
-	if r.repos == nil || r.repos.Loops == nil {
-		return
-	}
-	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil || fresh == nil {
-		return
-	}
-	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
-		return
-	}
-	meta, werr := loops.ClearHumanInbox(fresh.MetadataJSON)
-	if werr != nil {
-		return
-	}
-	fresh.MetadataJSON = &meta
-	fresh.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
-		loop.MetadataJSON = &meta
-	}
-}
-
 // markTakeoverResumeConsumed clears the takeover-resume marker after a successful
 // resumed turn so it is not re-applied on later runs. No-op when absent.
 func (r *Runner) markTakeoverResumeConsumed(ctx context.Context, loop *storage.LoopRecord) {
@@ -243,10 +219,10 @@ func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord)
 	return loops.ReadHITLAsk(meta)
 }
 
-// detectHumanAsk consumes the agent's ask sentinel (if any) and, when present,
+// detectHITLAskSentinel consumes the agent's source-of-truth ask sentinel and, when present,
 // returns a typed awaitingHumanError carrying the question, options, and the
 // agent's native session id (so the run can resume the same session).
-func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
+func (r *Runner) detectHITLAskSentinel(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
 	ask, err := consumeAskSentinel(worktreePath)
 	if err != nil {
 		// Best-effort: a read error is treated as "no ask" rather than failing the
@@ -326,11 +302,6 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			updated.MetadataJSON = &meta
 		}
 		if meta, werr := loopcondition.Set(updated.MetadataJSON, loopcondition.Record{Kind: loopcondition.HumanAnswered, Since: nowISO}); werr == nil {
-			updated.MetadataJSON = &meta
-		}
-		// The agent re-asked after reading the queued human messages, so they're
-		// consumed — clear the inbox so they aren't re-injected on the next resume.
-		if meta, werr := loops.ClearHumanInbox(updated.MetadataJSON); werr == nil {
 			updated.MetadataJSON = &meta
 		}
 		updated.Status = "awaiting_human"

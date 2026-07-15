@@ -275,11 +275,6 @@ type WebhookNotificationConfig struct {
 	AppIDEnv     string `json:"appIdEnv,omitempty"`
 	AppSecretEnv string `json:"appSecretEnv,omitempty"`
 	ChatID       string `json:"chatId,omitempty"`
-	// VerificationTokenEnv names the env var holding the Feishu app Verification
-	// Token. It gates the inbound HITL card-action callback (/hitl/feishu): the
-	// callback's envelope token must match, proving the request came from Feishu.
-	// A NAME, never the secret value — looper is open source.
-	VerificationTokenEnv string `json:"verificationTokenEnv,omitempty"`
 	// MentionOpenIds are Feishu open_ids to @-mention on messages that need a human
 	// (the mid-run ask, and failures), so follow-up items aren't missed in a busy
 	// group. Plain user ids, not secrets.
@@ -698,33 +693,15 @@ type Config struct {
 
 // HITLConfig gates the mid-run human-in-the-loop feature: when Enabled, agents
 // may pause mid-run to ask a human (by writing .looper/ask.json), the loop
-// suspends as awaiting_human, an ask-card is sent via the app-bot notifier, and
-// POST /api/v1/loops/{seq}/respond resumes the same agent session with the
-// answer. When Disabled (the default) every HITL code path is skipped and
-// runners behave exactly as before. It reuses the app-bot credentials in
-// notifications.webhook (appIdEnv/appSecretEnv/chatId) for send + listen.
+// suspends as awaiting_human, and the question is posted to the configured source
+// of truth. Feishu may notify the owner, but never accepts answers.
 type HITLConfig struct {
 	Enabled bool `json:"enabled"`
 	// AnswerTransport selects how a mid-run question is delivered and how the
-	// human's answer comes back: "github" (PR comment, the zero-infra default),
-	// "feishu" (a team that lives in Feishu; needs the feishu transport), or
-	// "respond" (only the /respond API). Empty defaults to "github".
+	// human's answer comes back: "github" (PR comment, the default) or "respond"
+	// (only the authenticated /respond API). Empty defaults to "github".
 	AnswerTransport string            `json:"answerTransport,omitempty"`
 	GitHub          *HITLGitHubConfig `json:"github,omitempty"`
-	Feishu          *HITLFeishuConfig `json:"feishu,omitempty"`
-}
-
-// HITLFeishuConfig tunes the Feishu HITL transport (answers come back via the
-// shared-app Cloudflare event inbox that the looper polls).
-type HITLFeishuConfig struct {
-	// Inbound selects how the answer reaches this looper: "cf-inbox" (poll the
-	// shared Cloudflare inbox) is the supported mode.
-	Inbound string `json:"inbound,omitempty"`
-	// EventInboxURLEnv names the env var holding the inbox poll URL
-	// (https://…/events). EventInboxTokenEnv names the env var holding the shared
-	// bearer token. Env var NAMES, never the values.
-	EventInboxURLEnv   string `json:"eventInboxUrlEnv,omitempty"`
-	EventInboxTokenEnv string `json:"eventInboxTokenEnv,omitempty"`
 }
 
 // HITLGitHubConfig tunes the GitHub PR-comment HITL transport.
@@ -837,7 +814,6 @@ type PartialWebhookNotificationConfig struct {
 	AppIDEnv              *string                   `json:"appIdEnv,omitempty"`
 	AppSecretEnv          *string                   `json:"appSecretEnv,omitempty"`
 	ChatID                *string                   `json:"chatId,omitempty"`
-	VerificationTokenEnv  *string                   `json:"verificationTokenEnv,omitempty"`
 	MentionOpenIds        *[]string                 `json:"mentionOpenIds,omitempty"`
 }
 
@@ -984,19 +960,12 @@ type PartialHITLConfig struct {
 	Enabled         *bool                    `json:"enabled,omitempty"`
 	AnswerTransport *string                  `json:"answerTransport,omitempty"`
 	GitHub          *PartialHITLGitHubConfig `json:"github,omitempty"`
-	Feishu          *PartialHITLFeishuConfig `json:"feishu,omitempty"`
 }
 
 type PartialHITLGitHubConfig struct {
 	AwaitingLabel *string   `json:"awaitingLabel,omitempty"`
 	MentionLogins *[]string `json:"mentionLogins,omitempty"`
 	AnswerAuthors *[]string `json:"answerAuthors,omitempty"`
-}
-
-type PartialHITLFeishuConfig struct {
-	Inbound            *string `json:"inbound,omitempty"`
-	EventInboxURLEnv   *string `json:"eventInboxUrlEnv,omitempty"`
-	EventInboxTokenEnv *string `json:"eventInboxTokenEnv,omitempty"`
 }
 
 type PartialIssueRoleTriggersConfig struct {

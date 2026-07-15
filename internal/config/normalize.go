@@ -325,20 +325,6 @@ func mergeConfig(config *Config, partial PartialConfig) {
 				config.HITL.GitHub.AnswerAuthors = append([]string(nil), (*gh.AnswerAuthors)...)
 			}
 		}
-		if fs := partial.HITL.Feishu; fs != nil {
-			if config.HITL.Feishu == nil {
-				config.HITL.Feishu = &HITLFeishuConfig{}
-			}
-			if fs.Inbound != nil {
-				config.HITL.Feishu.Inbound = strings.TrimSpace(*fs.Inbound)
-			}
-			if fs.EventInboxURLEnv != nil {
-				config.HITL.Feishu.EventInboxURLEnv = strings.TrimSpace(*fs.EventInboxURLEnv)
-			}
-			if fs.EventInboxTokenEnv != nil {
-				config.HITL.Feishu.EventInboxTokenEnv = strings.TrimSpace(*fs.EventInboxTokenEnv)
-			}
-		}
 	}
 
 	if partial.Roles != nil {
@@ -722,10 +708,6 @@ func mergeWebhookNotificationConfig(config *WebhookNotificationConfig, partial P
 
 	if partial.ChatID != nil {
 		config.ChatID = strings.TrimSpace(*partial.ChatID)
-	}
-
-	if partial.VerificationTokenEnv != nil {
-		config.VerificationTokenEnv = strings.TrimSpace(*partial.VerificationTokenEnv)
 	}
 
 	if partial.MentionOpenIds != nil {

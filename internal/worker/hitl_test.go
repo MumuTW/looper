@@ -81,7 +81,7 @@ func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 		HITLEnabled: true,
 		// This test exercises the Feishu-notify transport; github is the default and
 		// is covered separately.
-		HITLAnswerTransport: "feishu",
+		HITLAnswerTransport: "respond",
 		HITLNotify: func(_ context.Context, n HITLAskNotification) error {
 			sent = append(sent, n)
 			return nil

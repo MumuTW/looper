@@ -380,14 +380,10 @@ func TestFeishuThreadsRootByTaskSharesOneCardAcrossLoops(t *testing.T) {
 	if err != nil || root != "om_root_planner" {
 		t.Fatalf("RootByTask() = %q, %v; want om_root_planner", root, err)
 	}
-	// Worker joins the same card and re-points reply routing at itself.
+	// Worker joins the same outbound notification thread.
 	if err := repos.FeishuThreads.Upsert(ctx, "om_root_planner", "loop_worker", taskKey, "oc_group", "2026-04-11T12:05:00.000Z"); err != nil {
 		t.Fatalf("Upsert(worker join) error = %v", err)
 	}
-	if loop, err := repos.FeishuThreads.LoopByRoot(ctx, "om_root_planner"); err != nil || loop != "loop_worker" {
-		t.Fatalf("LoopByRoot() = %q, %v; want loop_worker (reply routes to active loop)", loop, err)
-	}
-
 	// A task-less loop (empty taskKey) keeps per-loop keying and does not collide.
 	if err := repos.FeishuThreads.Upsert(ctx, "om_root_pr", "loop_pr", "", "oc_group", "2026-04-11T12:10:00.000Z"); err != nil {
 		t.Fatalf("Upsert(taskless) error = %v", err)

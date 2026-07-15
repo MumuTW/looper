@@ -139,13 +139,6 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		r.terminateShepherd(ctx, repositories, loop, repo, prNumber, outcome, nowISO, logger)
 		return
 	}
-	// HITL: a human thread @-mention lands in the loop's humanInbox but changes no PR
-	// field, so the folded-signal guard below would skip it and the shepherd would look
-	// unresponsive. Wake a pass now (enqueueShepherdPass is idempotent — deduped by loop
-	// id — and we honor the pass cap) so the shepherd drains + answers the thread message.
-	if len(loops.ReadHumanInbox(loop.MetadataJSON)) > 0 && marker.PassCount < shepherdMaxPasses {
-		r.enqueueShepherdPass(ctx, repositories, loop, repo, prNumber, nowISO, logger)
-	}
 	signal := foldShepherdSignal(pr)
 	if signal == marker.LastSignal {
 		r.persistShepherdBlockedCondition(ctx, repositories, loop, shepherdRestingCondition(pr, signal, nowISO), nowISO)

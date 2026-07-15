@@ -99,6 +99,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "scheduler.discoveryCacheTtlSeconds", Message: "must be an integer >= 0"})
 	}
 
+	answerTransport := strings.ToLower(strings.TrimSpace(config.HITL.AnswerTransport))
+	if answerTransport != "" && answerTransport != "github" && answerTransport != "respond" {
+		issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be github or respond; Feishu is notification-only"})
+	}
+
 	if config.Webhook.FallbackPollIntervalSeconds < 60 {
 		issues = append(issues, ValidationIssue{Path: "webhook.fallbackPollIntervalSeconds", Message: "must be an integer >= 60"})
 	}

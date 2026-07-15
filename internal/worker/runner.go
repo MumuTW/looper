@@ -1489,29 +1489,6 @@ func (r *Runner) runShepherdStep(ctx context.Context, input stepInput) (workerCh
 	}
 	prompt := buildShepherdPrompt(*checkpoint.Work, checkpoint.PullRequest.Number, sessionLost)
 
-	// HITL (gated): fold any human thread messages posted WHILE shepherding into this
-	// pass, so a thread @-mention during shepherding is actually read + answered. It was
-	// previously dropped — the shepherd path never drained the inbox, so Looper looked
-	// unresponsive to reviewers who @-mentioned it on an in-flight PR. The agent replies
-	// by writing .looper/ask.json, detected after the turn (posts to the thread + parks
-	// for the human).
-	drainedHuman := false
-	if r.hitlEnabled {
-		if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
-			drainedHuman = true
-			var msgs strings.Builder
-			msgs.WriteString("\n\nWhile you were shepherding this PR toward merge, the human posted these messages in the task thread:")
-			for _, m := range inbox {
-				if t := strings.TrimSpace(m.Text); t != "" {
-					msgs.WriteString("\n- ")
-					msgs.WriteString(t)
-				}
-			}
-			msgs.WriteString("\nIMPORTANT: these are ONLY the thread messages that @-mentioned you — the @ is a TRIGGER, not the whole conversation. You are NOT seeing the full thread, and earlier replies (possibly from other people, possibly with screenshots) may already answer this. Before you ask the human anything, EXHAUST every context you CAN access: read this PR's description + ALL its comments + reviews + review threads + linked issues + git history (git log, related/earlier merged PRs) + the actual code and diff. The answer (e.g. 'is #N redundant?', 'was this already fixed?') is usually resolvable from those. Only write .looper/ask.json if it is GENUINELY unresolved after checking everything accessible. If your investigation resolves it, act on the conclusion (and leave a PR comment stating what you found) and keep driving — do NOT bounce an already-answerable question back to the human. Do NOT ignore these messages.")
-			prompt += msgs.String()
-		}
-	}
-
 	r.stampShepherd(ctx, &input.Loop, func(s *loops.Shepherd) {
 		s.Phase = "fixing"
 		s.PassCount++
@@ -1523,25 +1500,8 @@ func (r *Runner) runShepherdStep(ctx context.Context, input stepInput) (workerCh
 	if err != nil {
 		return checkpoint, err
 	}
-	result, err := execution.Wait(ctx)
-	if err != nil {
+	if _, err := execution.Wait(ctx); err != nil {
 		return checkpoint, err
-	}
-	// HITL (gated): only when this pass folded in a human thread message — if the agent
-	// replied by writing .looper/ask.json, surface it. detectHumanAsk posts the reply to
-	// the thread and returns a typed awaiting-human suspension; the loop parks until the
-	// human answers, then resumes another shepherd pass via the durable
-	// $.shepherd.active marker. Clear the drained inbox either way so it is not
-	// re-injected on the next pass.
-	if r.hitlEnabled && drainedHuman && result.Status == "completed" {
-		awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, executionID)
-		if awaitErr != nil {
-			return checkpoint, awaitErr
-		}
-		r.clearHumanInbox(ctx, &input.Loop)
-		if awaiting != nil {
-			return checkpoint, awaiting
-		}
 	}
 	// The agent committed+pushed any fix itself. The tail parks the loop back into
 	// shepherding; the reconciler re-wakes on the next PR signal change and
@@ -2197,28 +2157,6 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				prompt += "\n\n" + takeoverPrompt
 			}
 		}
-		// Free-text human messages queued in the thread at any time (a follow-up
-		// question, a new instruction, or an answer to interpret) — drain them into
-		// this turn, resuming the same session so the agent has the full
-		// conversation. Conversational: the agent may answer + ask again rather than
-		// treat them as a final decision.
-		if r.hitlEnabled {
-			if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
-				var msgs strings.Builder
-				msgs.WriteString("While you were working, the human sent these messages in the task thread:")
-				for _, m := range inbox {
-					if t := strings.TrimSpace(m.Text); t != "" {
-						msgs.WriteString("\n- ")
-						msgs.WriteString(t)
-					}
-				}
-				msgs.WriteString("\nThese are ONLY the thread messages that @-mentioned you — the @ is a TRIGGER, not the whole conversation; earlier replies (possibly from other people, possibly with screenshots) may already answer this. Read them in context and respond appropriately: if a message answers a question you asked, proceed using it; if it is a follow-up question or a new instruction, address it. Before you ask the human anything, EXHAUST every context you can access first — the issue/PR + its comments + reviews + linked items + git history + the code — because the answer is usually already there. Only ask again (write .looper/ask.json, with your response to what they said) if it is GENUINELY unresolved after checking everything accessible. Do not ignore these messages.")
-				prompt += "\n\n" + msgs.String()
-				if nativeSessionID == "" {
-					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID)
-				}
-			}
-		}
 		executionID := eventlog.NewEventID("agent")
 		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
@@ -2239,7 +2177,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// the run so a human can answer. Returned as a typed error the step loop
 		// converts into an awaiting_human suspension (not a failure).
 		if r.hitlEnabled && result.Status == "completed" {
-			if awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, executionID); awaitErr != nil {
+			if awaiting, awaitErr := r.detectHITLAskSentinel(ctx, input, worktree.Path, executionID); awaitErr != nil {
 				return checkpoint, awaitErr
 			} else if awaiting != nil {
 				return checkpoint, awaiting
@@ -2264,7 +2202,6 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// retry, while a successful one never re-injects it on a later run.
 		if r.hitlEnabled {
 			r.markHumanAnswerConsumed(ctx, &input.Loop)
-			r.clearHumanInbox(ctx, &input.Loop)
 		}
 		r.markTakeoverResumeConsumed(ctx, &input.Loop)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
@@ -2716,20 +2653,9 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	// The full checkpoint (PullRequest/Work/Lifecycle/Worktree) is carried
 	// forward. This is the source of control truth; loop.Status is display only.
 	shepherdRun := loops.ShepherdActive(loop.MetadataJSON) && checkpoint.PullRequest != nil
-	// FOLLOW-UP RESUME (线程永远可追问): a finished worker loop that just received a
-	// new human thread message is reactivated for ONE incremental turn — resume the
-	// SAME agent session (so the code author's full history is retained), drain the
-	// queued message in the execute step, and reuse the existing PR. It NEVER
-	// re-implements from scratch and NEVER opens a duplicate PR. It mirrors the
-	// awaiting_human execute-replay and is heavily guarded (see shouldFollowupResume)
-	// so the dangerous "re-do the whole task" path can never be taken.
-	followupResume := !shepherdRun && r.shouldFollowupResume(ctx, loop, latestRun, checkpoint)
 	switch {
 	case shepherdRun:
 		startStep = stepShepherd
-	case followupResume:
-		startStep = stepExecute
-		resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
 	case latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "":
 		if restartFromDiscover {
 			startStep = stepPrepareWork
@@ -2741,7 +2667,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			startStep = next
 		}
 	}
-	resumed := shepherdRun || followupResume || (latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork)
+	resumed := shepherdRun || (latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork)
 	nowISO := r.nowISO()
 	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
@@ -2749,7 +2675,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		switch {
 		case restartFromDiscover:
 			run.LastCompletedStep = nil
-		case followupResume || shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint):
+		case shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint):
 			if prev := previousWorkerStep(startStep); prev != "" {
 				value := string(prev)
 				run.LastCompletedStep = &value
@@ -2767,47 +2693,6 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: parsedCheckpoint, Resumed: resumed}, nil
-}
-
-// shouldFollowupResume reports whether a finished worker loop that just received a
-// new human thread message can be safely reactivated for a single incremental
-// follow-up turn (线程永远可追问). When true, createRunContext resumes at stepExecute
-// with the execution checkpoint rewound so the execute step native-resumes the
-// SAME agent session, drains the queued human message, and reuses the existing PR
-// (open-pr is idempotent) rather than re-implementing or opening a duplicate.
-//
-// It is deliberately strict so the "re-do the whole task" path is never taken:
-//   - the prior run must have completed successfully ("success"); and
-//   - the loop must carry at least one pending human message; and
-//   - the checkpoint must carry a completed execution + a worktree to resume into; and
-//   - a native agent session id must be captured. Without a session, native resume
-//     is impossible and the execute step would restart from the original
-//     implement-this-issue prompt (a full re-run) — so we refuse and let the caller
-//     fall back to the honest closed-task ack instead.
-//
-// This branch is only ever reachable via the follow-up reactivation path
-// (enqueueHumanMessageToLoop), which itself only reactivates worker loops that have
-// a captured session; a completed loop is otherwise never re-dispatched.
-func (r *Runner) shouldFollowupResume(ctx context.Context, loop storage.LoopRecord, latestRun *storage.RunRecord, checkpoint workerCheckpoint) bool {
-	if latestRun == nil || latestRun.Status != "success" {
-		return false
-	}
-	if len(loops.ReadHumanInbox(loop.MetadataJSON)) == 0 {
-		return false
-	}
-	if checkpoint.Worktree == nil {
-		return false
-	}
-	// The prior run must carry a completed, well-parsed execution to resume from —
-	// mirrors runExecuteStep's executionCompleted gate. (validateCompletedExecution-
-	// Checkpoint returns nil for a nil execution, so the presence check is required.)
-	if checkpoint.Execution == nil || checkpoint.Execution.Status != "completed" {
-		return false
-	}
-	if validateCompletedExecutionCheckpoint(checkpoint.Execution) != nil {
-		return false
-	}
-	return strings.TrimSpace(r.latestNativeSessionID(ctx, loop.ID)) != ""
 }
 
 func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, step WorkerStep, checkpoint workerCheckpoint) (storage.RunRecord, error) {

@@ -12,7 +12,6 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
-	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1442,20 +1441,13 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 	}
 }
 
-// setupCompletedPlannerLoop seeds a finished (status "completed") planner loop with
-// a pending human thread message and a "success" run whose checkpoint carries a
-// completed write-spec + node-H gate flags. Returns the loop id. withSession seeds a
-// captured native agent session (the gate for a safe follow-up resume).
+// setupCompletedPlannerLoop seeds a finished planner loop and its successful run.
 func setupCompletedPlannerLoop(t *testing.T, fixture *runnerFixture, loopID string, withSession bool) {
 	t.Helper()
 	ctx := context.Background()
 	projectID := "project_1"
 	target := "issue:acme/looper:42"
-	meta, err := loops.AppendHumanMessage(nil, loops.HumanMessage{At: fixture.nowISO(), Text: "产品答案:导出优先 PDF"})
-	if err != nil {
-		t.Fatalf("AppendHumanMessage() error = %v", err)
-	}
-	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 42, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "completed", MetadataJSON: &meta, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 42, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "completed", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if withSession {
@@ -1475,10 +1467,7 @@ func setupCompletedPlannerLoop(t *testing.T, fixture *runnerFixture, loopID stri
 	}
 }
 
-// C1 强操控: a run INTERRUPTED by a human's mid-run @bot (not a clean success) must,
-// with a pending message, resume the MAIN write-spec session — never silently resume the
-// interrupted grill/review step (which would let the fresh grill critic answer).
-func TestCreateRunContextInterruptedRunWithHumanMessageResumesMainSession(t *testing.T) {
+func TestCreateRunContextInterruptedRunResumesFromCheckpoint(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
@@ -1486,8 +1475,7 @@ func TestCreateRunContextInterruptedRunWithHumanMessageResumesMainSession(t *tes
 	loopID := "loop_planner_interrupted"
 	projectID := "project_1"
 	target := "issue:acme/looper:42"
-	meta, _ := loops.AppendHumanMessage(nil, loops.HumanMessage{At: fixture.nowISO(), Text: "背景清晰吗?"})
-	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 43, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &meta, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 43, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_" + loopID, ProjectID: &projectID, LoopID: &loopID, Vendor: "claude", Status: "killed", NativeSessionID: stringPtr("sess_1"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
@@ -1512,12 +1500,12 @@ func TestCreateRunContextInterruptedRunWithHumanMessageResumesMainSession(t *tes
 	if err != nil {
 		t.Fatalf("createRunContext() error = %v", err)
 	}
-	if !resumed.Resumed || resumed.StartStep != stepWriteSpec {
-		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want followup-resume at write-spec (main session answers), not the interrupted step", resumed.Resumed, resumed.StartStep)
+	if !resumed.Resumed || resumed.StartStep != stepPublish {
+		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want checkpoint continuation", resumed.Resumed, resumed.StartStep)
 	}
 }
 
-func TestCreateRunContextFollowupResumesCompletedPlannerLoopWithHumanMessage(t *testing.T) {
+func TestCreateRunContextDoesNotResumeCompletedPlannerLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
@@ -1531,26 +1519,8 @@ func TestCreateRunContextFollowupResumesCompletedPlannerLoopWithHumanMessage(t *
 	if err != nil {
 		t.Fatalf("createRunContext() error = %v", err)
 	}
-	// Resume the SAME session at write-spec (incremental spec revision), NOT
-	// discover-issues (a full re-plan).
-	if !resumed.Resumed || resumed.StartStep != stepWriteSpec {
-		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want a resumed write-spec follow-up (never discover-issues)", resumed.Resumed, resumed.StartStep)
-	}
-	// write-spec re-runs the agent (respond in the SAME session so the MAIN looper
-	// answers, not the fresh grill critic); Grilled/Reviewed are PRESERVED so a follow-up
-	// does NOT auto-re-run the minutes-long grill/review passes or re-post their notes
-	// (强操控: respond, then hand the wheel back to the human). Issue + worktree preserved.
-	if resumed.Checkpoint.WriteSpec != nil {
-		t.Fatalf("WriteSpec = %#v, want cleared so the write-spec agent runs again", resumed.Checkpoint.WriteSpec)
-	}
-	if resumed.Checkpoint.Publish == nil || !resumed.Checkpoint.Publish.Grilled || !resumed.Checkpoint.Publish.Reviewed {
-		t.Fatalf("Publish = %#v, want Grilled/Reviewed PRESERVED (a follow-up must not auto-re-grill/review)", resumed.Checkpoint.Publish)
-	}
-	if resumed.Checkpoint.Issue == nil || resumed.Checkpoint.Worktree == nil {
-		t.Fatalf("checkpoint = %#v, want preserved issue + worktree", resumed.Checkpoint)
-	}
-	if resumed.Run.LastCompletedStep == nil || *resumed.Run.LastCompletedStep != string(stepPrepareWorktree) {
-		t.Fatalf("run.LastCompletedStep = %#v, want prepare-worktree", resumed.Run.LastCompletedStep)
+	if resumed.Resumed || resumed.StartStep != stepDiscoverIssues {
+		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want completed loop to remain non-resumable", resumed.Resumed, resumed.StartStep)
 	}
 }
 

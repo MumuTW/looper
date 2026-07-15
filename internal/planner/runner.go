@@ -1244,36 +1244,11 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			// owner in product language (via the productAsk marker field).
 			prompt += "\n\n" + plannerProductAskInstruction
 		}
-		// Follow-up resume (线程永远可追问): drain any human thread messages queued while
-		// the spec awaited review, and native-resume the SAME planner session so the
-		// agent keeps its full spec-authoring history and revises the spec incrementally
-		// (incorporating a product decision / answering a follow-up) — never replanning
-		// from scratch. On a fresh first run the inbox is empty, so this is a no-op and
-		// the agent starts normally.
-		nativeResumePrompt := ""
-		nativeSessionID := ""
-		var drainedInbox []loops.HumanMessage
-		if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
-			drainedInbox = inbox
-			var msgs strings.Builder
-			msgs.WriteString("While this spec was awaiting review, the human sent these messages in the task thread:")
-			for _, m := range inbox {
-				if t := strings.TrimSpace(m.Text); t != "" {
-					msgs.WriteString("\n- ")
-					msgs.WriteString(t)
-				}
-			}
-			msgs.WriteString("\nRead them in context and update the spec accordingly — incorporate a product decision, answer a follow-up, or tighten an open question. Do NOT rewrite the spec from scratch: revise the existing spec file incrementally to reflect their input.")
-			msgs.WriteString("\n\nThen DECIDE whether you can proceed or still need them, and LEAN TOWARD ASKING rather than silently continuing (强操控 — the human is driving). Unless they clearly gave the go-ahead (e.g. \"继续\" / \"go ahead\", or they answered the pending decision), put your reply to them in the productAsk field: briefly state how you understood/answered them, then explicitly ask \"可以继续吗?\" so they know the ball is in their court. In THIS follow-up turn the productAsk IS your conversational reply to them (an answer + a can-I-continue check, or the surfaced decision) — not necessarily a formal product decision, so the usual \"no decision → empty\" rule does not apply here. Only when they have clearly told you to proceed, set productAsk to \"\" so the spec moves on to review.")
-			nativeResumePrompt = msgs.String()
-			prompt += "\n\n" + nativeResumePrompt
-			nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID)
-		}
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1307,10 +1282,6 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
 		productAsk = strings.TrimSpace(result.ProductAsk)
-		// Clear ONLY the messages this turn actually consumed (fed above). A message that
-		// arrived mid-run — after the inbox was read — was never seen by the agent, so it
-		// stays queued for a follow-up turn instead of being silently eaten here.
-		r.clearHumanInbox(ctx, &input.Loop, drainedInbox)
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -1349,7 +1320,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	// Node H product-decision hold: the spec turn surfaced a real product question
 	// only the owner can answer. Ask them in the thread (product language) and HOLD
 	// before the owner-approval gate — publish/grill/review don't run yet. The run
-	// still completes (skipReason), so the loop reaches "completed" and a thread reply
+	// still completes (skipReason), so the loop reaches "completed" and a source update
 	// reactivates it via the follow-up resume, which re-runs write-spec with the
 	// answer; once no product question remains the flow proceeds to owner approval. On
 	// a fresh first run or a resume that RESOLVED the question, productAsk is empty and
@@ -2140,99 +2111,6 @@ func (r *Runner) runNotifyStep(input stepInput) (plannerCheckpoint, error) {
 	return checkpoint, nil
 }
 
-// latestNativeSessionID returns the loop's most recent captured agent session id, so
-// a follow-up write-spec turn can native-resume the SAME session and keep the full
-// spec-authoring conversation. Empty when none is recorded (e.g. a vendor that did
-// not emit a session id) — the follow-up gate then refuses to reactivate.
-func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) string {
-	if r.repos == nil || r.repos.AgentExecutions == nil {
-		return ""
-	}
-	execution, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
-	if err != nil || execution == nil || execution.NativeSessionID == nil {
-		return ""
-	}
-	return strings.TrimSpace(*execution.NativeSessionID)
-}
-
-// clearHumanInbox drops ONLY the messages that were actually fed to this write-spec
-// turn (drained), so they are not re-injected on a later run. Messages that arrived
-// WHILE the agent was mid-run (never read by it) are preserved for a follow-up turn
-// rather than silently eaten. No-op when nothing was drained or the inbox is empty.
-func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord, drained []loops.HumanMessage) {
-	if r.repos == nil || r.repos.Loops == nil || len(drained) == 0 {
-		return
-	}
-	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil || fresh == nil {
-		return
-	}
-	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
-		return
-	}
-	meta, werr := loops.RemoveHumanMessages(fresh.MetadataJSON, drained)
-	if werr != nil {
-		return
-	}
-	fresh.MetadataJSON = &meta
-	fresh.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
-		loop.MetadataJSON = &meta
-	}
-}
-
-// shouldFollowupResume reports whether a finished planner loop that just received a
-// new human thread message can be safely reactivated for a single incremental
-// follow-up turn (线程永远可追问). When true, createRunContext resumes at stepWriteSpec
-// with the spec-authoring + node-H gate flags rewound so the write-spec step
-// native-resumes the SAME planner session, drains the queued message, and revises
-// the spec incrementally — then re-publishes/re-grills/re-reviews the updated spec
-// (all idempotent). It NEVER re-discovers or re-plans from scratch.
-//
-// Strict guard so the "re-plan the whole thing" path can never be taken:
-//   - the prior run must have completed successfully ("success"); and
-//   - the loop must carry at least one pending human message; and
-//   - the checkpoint must carry the issue + a worktree + a completed write-spec; and
-//   - a native agent session id must be captured. Without a session, native resume
-//     is impossible and write-spec would author a fresh spec — so we refuse and let
-//     the caller fall back to the honest closed-task ack instead.
-//
-// Only ever reachable via the follow-up reactivation path (enqueueHumanMessageToLoop,
-// which only reactivates planner loops that have a captured session); a completed
-// loop is otherwise never re-dispatched.
-func (r *Runner) shouldFollowupResume(ctx context.Context, loop storage.LoopRecord, latestRun *storage.RunRecord, checkpoint plannerCheckpoint) bool {
-	// "success" = a finished loop the human is following up on; "interrupted" = the
-	// human's mid-run @bot killed the active agent (强操控) — either way, answer them from
-	// the main write-spec session. A genuinely "failed" run still retries normally.
-	if latestRun == nil || (latestRun.Status != "success" && latestRun.Status != "interrupted") {
-		return false
-	}
-	if len(loops.ReadHumanInbox(loop.MetadataJSON)) == 0 {
-		return false
-	}
-	if checkpoint.Issue == nil || checkpoint.Worktree == nil {
-		return false
-	}
-	if checkpoint.WriteSpec == nil || !strings.EqualFold(checkpoint.WriteSpec.Status, "completed") {
-		return false
-	}
-	return strings.TrimSpace(r.latestNativeSessionID(ctx, loop.ID)) != ""
-}
-
-// rewindPlannerCheckpointForFollowup rewinds a completed planner checkpoint so a
-// follow-up turn re-enters write-spec (re-runs the agent, native-resuming the SAME
-// session with the human message so the MAIN looper — not the fresh grill critic —
-// answers). It does NOT clear Grilled/Reviewed: a follow-up is "respond then hand the
-// wheel back to the human" (强操控), so it must NOT auto-re-run the minutes-long
-// grill/review passes or re-post their thread notes on every question. The revised
-// spec re-settles at the human approval gate; the human drives any re-validation.
-// Preserves everything needed to resume: issue, worktree, lock, lifecycle, publish ref.
-func rewindPlannerCheckpointForFollowup(checkpoint plannerCheckpoint) plannerCheckpoint {
-	checkpoint.WriteSpec = nil
-	checkpoint.SkipReason = ""
-	return checkpoint
-}
-
 func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) (resumedRunContext, error) {
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
@@ -2244,39 +2122,22 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		check = parseCheckpoint(latestRun.CheckpointJSON)
 		lastCompleted = asPlannerStep(derefString(latestRun.LastCompletedStep))
 	}
-	// FOLLOW-UP RESUME (线程永远可追问): a planner loop got a new human message — resume
-	// the SAME session at write-spec so the MAIN looper answers (never the fresh grill
-	// critic), for ONE incremental turn (see shouldFollowupResume). This takes PRECEDENCE
-	// over shouldResume: when a run was interrupted BY the human's message (强操控 mid-run
-	// @bot kills the active agent → interrupted), we must answer them from the main
-	// session, not silently resume the interrupted grill/review step.
-	followupResume := r.shouldFollowupResume(ctx, loop, latestRun, check)
-	shouldResume := !followupResume && latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
+	shouldResume := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
 	startStep := stepDiscoverIssues
-	switch {
-	case followupResume:
-		startStep = stepWriteSpec
-	case shouldResume:
+	if shouldResume {
 		if next := nextPlannerStep(lastCompleted); next != "" {
 			startStep = next
 		}
 	}
-	resumed := followupResume || (shouldResume && startStep != stepDiscoverIssues)
+	resumed := shouldResume && startStep != stepDiscoverIssues
 	initialCheckpoint := plannerCheckpoint{ResumePolicy: "replay_step"}
-	if followupResume {
-		initialCheckpoint = rewindPlannerCheckpointForFollowup(check)
-		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
-	} else if resumed {
+	if resumed {
 		initialCheckpoint = check
 		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
 	}
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
-	if followupResume {
-		if prev := previousPlannerStep(startStep); prev != "" {
-			run.LastCompletedStep = stringPtr(string(prev))
-		}
-	} else if resumed && lastCompleted != "" {
+	if resumed && lastCompleted != "" {
 		run.LastCompletedStep = stringPtr(string(lastCompleted))
 	}
 	encoded := mustMarshalJSON(initialCheckpoint)

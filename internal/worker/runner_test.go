@@ -1106,101 +1106,18 @@ func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(
 	}
 }
 
-func TestCreateRunContextFollowupResumesCompletedLoopWithHumanMessage(t *testing.T) {
+func TestCreateRunContextDoesNotResumeCompletedLoop(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
 
-	// A finished worker loop (last run "success") that just got a new human thread
-	// message, with a captured native session — it should follow-up-resume at execute.
+	// Completed loops are never reactivated by chat messages now that Feishu is a
+	// one-way notification channel.
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
 	if err != nil || loop == nil {
 		t.Fatalf("Loops.GetByID() error = %v, loop = %v", err, loop)
 	}
-	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: fixture.nowISO(), Text: "能把导出按钮挪到右边吗?"})
-	if err != nil {
-		t.Fatalf("AppendHumanMessage() error = %v", err)
-	}
-	loop.MetadataJSON = &meta
-	loop.Status = "completed"
-	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-	projectID := "project_1"
-	loopID := "loop_worker_1"
-	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_done_1", ProjectID: &projectID, LoopID: &loopID, Vendor: "opencode", Status: "completed", NativeSessionID: stringPtr("sess_worker_1"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
-		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
-	}
-	checkpointJSON := mustMarshalJSON(workerCheckpoint{
-		Work:           &workerInput{Title: "Worker task", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
-		ClaimedLockKey: "issue:acme/looper:27",
-		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
-		Plan:           &checkpointPlan{Summary: "plan"},
-		Execution:      &checkpointExecution{Status: "completed", Summary: "shipped", ParseStatus: "parsed", GitReconciled: true},
-		Validation:     &ValidationResult{Passed: true, Summary: "green"},
-		PullRequest:    &checkpointPullPR{Number: 101, URL: "https://example/pr/101"},
-	})
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
-		ID:                "run_completed_ok",
-		LoopID:            loopID,
-		Status:            "success",
-		CurrentStep:       nil,
-		LastCompletedStep: stringPtr(string(stepOpenPR)),
-		CheckpointJSON:    &checkpointJSON,
-		StartedAt:         fixture.nowISO(),
-		CreatedAt:         fixture.nowISO(),
-		UpdatedAt:         fixture.nowISO(),
-	}); err != nil {
-		t.Fatalf("Runs.Upsert() error = %v", err)
-	}
-
-	refreshed, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
-	if err != nil || refreshed == nil {
-		t.Fatalf("Loops.GetByID() error = %v, loop = %v", err, refreshed)
-	}
-	resumed, err := runner.createRunContext(context.Background(), *refreshed)
-	if err != nil {
-		t.Fatalf("createRunContext() error = %v", err)
-	}
-	if !resumed.Resumed || resumed.StartStep != stepExecute {
-		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want a resumed execute follow-up", resumed.Resumed, resumed.StartStep)
-	}
-	// Execute is re-run with a fresh agent turn (native-resumed session drains the
-	// message); PR/validation checkpoints are cleared so open-pr re-resolves the
-	// existing PR idempotently. Work + worktree + plan are preserved.
-	if resumed.Checkpoint.Execution != nil {
-		t.Fatalf("Execution = %#v, want cleared so the execute step runs again", resumed.Checkpoint.Execution)
-	}
-	if resumed.Checkpoint.PullRequest != nil || resumed.Checkpoint.Validation != nil {
-		t.Fatalf("PullRequest/Validation not cleared: %#v", resumed.Checkpoint)
-	}
-	if resumed.Checkpoint.Work == nil || resumed.Checkpoint.Worktree == nil || resumed.Checkpoint.Plan == nil {
-		t.Fatalf("checkpoint = %#v, want preserved work/worktree/plan", resumed.Checkpoint)
-	}
-	if resumed.Run.LastCompletedStep == nil || *resumed.Run.LastCompletedStep != string(stepPlan) {
-		t.Fatalf("run.LastCompletedStep = %#v, want plan", resumed.Run.LastCompletedStep)
-	}
-}
-
-func TestCreateRunContextDoesNotFollowupResumeWithoutNativeSession(t *testing.T) {
-	t.Parallel()
-
-	fixture := newRunnerFixture(t)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
-
-	// Same completed loop + pending human message, but NO captured session — the
-	// follow-up bridge must refuse (native resume impossible; re-running would risk a
-	// full re-implementation). A completed run is not otherwise resumed.
-	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
-	if err != nil || loop == nil {
-		t.Fatalf("Loops.GetByID() error = %v, loop = %v", err, loop)
-	}
-	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: fixture.nowISO(), Text: "再改一版?"})
-	if err != nil {
-		t.Fatalf("AppendHumanMessage() error = %v", err)
-	}
-	loop.MetadataJSON = &meta
 	loop.Status = "completed"
 	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
