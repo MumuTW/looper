@@ -14,6 +14,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -147,6 +148,7 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 	}
 	signal := foldShepherdSignal(pr)
 	if signal == marker.LastSignal {
+		r.persistShepherdBlockedCondition(ctx, repositories, loop, shepherdRestingCondition(pr, signal, nowISO), nowISO)
 		return
 	}
 	// The folded PR signal changed → persist a fresh snapshot (best-effort, only on a
@@ -160,7 +162,16 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 	// Milestone thread note + @-mention on entering a report-worthy phase, BEFORE we
 	// persist — so LastReportedPhase is saved and the next pass doesn't double-post.
 	r.reportShepherdPhase(ctx, &marker, loop, prNumber, prValidated(pr))
+	wakePass := shepherdActionable(pr) || commentedOnCurrentHead(pr)
 	if newMeta, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
+		if wakePass {
+			newMeta, werr = loopcondition.Clear(&newMeta)
+		} else {
+			newMeta, werr = loopcondition.Set(&newMeta, shepherdRestingCondition(pr, signal, nowISO))
+		}
+		if werr != nil {
+			return
+		}
 		r.persistLoopMetadata(ctx, repositories, loop.ID, newMeta, nowISO)
 		// The folded signal changed (past the guard above), so the phase may have
 		// advanced (👀 评审中 → 🔧 修复中 → ✅ 待合并). Refresh the anchor card now: a
@@ -175,7 +186,7 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 	// feedback the pass should read + address or answer. We only reach here past the
 	// LastSignal guard, i.e. on a genuinely new signal (new review round included), so
 	// this fires once per round, not every tick.
-	if shepherdActionable(pr) || commentedOnCurrentHead(pr) {
+	if wakePass {
 		if marker.PassCount >= shepherdMaxPasses {
 			if logger != nil {
 				logger.Info("shepherd: pass cap reached — leaving PR for a human", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "passCount": marker.PassCount})
@@ -184,6 +195,25 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		}
 		r.enqueueShepherdPass(ctx, repositories, loop, repo, prNumber, nowISO, logger)
 	}
+}
+
+func shepherdRestingCondition(pr githubinfra.PullRequestDetail, signal, nowISO string) loopcondition.Record {
+	kind := loopcondition.ReviewUpdated
+	if shepherdCIPhase(pr) == "pending" {
+		kind = loopcondition.CISettled
+	}
+	return loopcondition.Record{Kind: kind, Since: nowISO, Fingerprint: signal}
+}
+
+func (r *Runtime) persistShepherdBlockedCondition(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, record loopcondition.Record, nowISO string) {
+	if current, ok := loopcondition.Read(loop.MetadataJSON); ok && current.Kind == record.Kind && current.Fingerprint == record.Fingerprint {
+		return
+	}
+	metadata, err := loopcondition.Set(loop.MetadataJSON, record)
+	if err != nil {
+		return
+	}
+	r.persistLoopMetadata(ctx, repositories, loop.ID, metadata, nowISO)
 }
 
 // captureShepherdSnapshot persists a PullRequestSnapshot from the PR detail the

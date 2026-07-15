@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -322,6 +323,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	}
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
+			updated.MetadataJSON = &meta
+		}
+		if meta, werr := loopcondition.Set(updated.MetadataJSON, loopcondition.Record{Kind: loopcondition.HumanAnswered, Since: nowISO}); werr == nil {
 			updated.MetadataJSON = &meta
 		}
 		// The agent re-asked after reading the queued human messages, so they're

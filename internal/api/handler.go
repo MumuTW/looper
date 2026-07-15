@@ -27,6 +27,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
@@ -4501,6 +4502,10 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		ask.Status = "answered"
 		ask.AnsweredAt = nowISO
 		metadataJSON, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		metadataJSON, err = loopcondition.Clear(&metadataJSON)
 		if err != nil {
 			return storage.LoopRecord{}, err
 		}

@@ -1192,8 +1192,8 @@ func (r *Runtime) runWakeReconcile(ctx context.Context, reason string) {
 	// (flowchart top: bug/feature → product-spec gate → looper:plan / worker-ready).
 	// Env-gated (LOOPER_PLANE_AUTO_INTAKE=1); a no-op otherwise.
 	r.reconcileAutoIntake(ctx)
-	// Resume planner loops whose product spec was supplied while they were held (E2).
-	r.reconcileAwaitingProductSpec(ctx)
+	// Resume loops whose named, externally-observed blocking condition cleared.
+	r.reconcileBlockedConditions(ctx)
 	// Dispatch the worker for tech specs a human approved on the Plane page (node H→I).
 	r.reconcileSpecApproval(ctx)
 	// Drive worker loops shepherding their impl PR toward merge (looper:auto): wake
@@ -1224,6 +1224,9 @@ func (r *Runtime) runSchedulerClaimLoop(ctx context.Context, stopCh <-chan struc
 		}
 		lastPass = now
 	}
+	// Reconcile named holds once at boot before claiming work. This closes the
+	// restart gap where an external answer/spec arrived while looperd was down.
+	r.reconcileBlockedConditions(ctx)
 	r.executeSchedulerClaimPass(ctx)
 	ticker := time.NewTicker(claimPumpInterval)
 	defer ticker.Stop()

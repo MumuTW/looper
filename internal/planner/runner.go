@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
@@ -1044,6 +1045,14 @@ func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.
 		return
 	}
 	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingProductSpec": waiting})
+	if err != nil {
+		return
+	}
+	if waiting {
+		metadataJSON, err = loopcondition.Set(&metadataJSON, loopcondition.Record{Kind: loopcondition.ProductSpec, Since: r.nowISO()})
+	} else {
+		metadataJSON, err = loopcondition.Clear(&metadataJSON)
+	}
 	if err != nil {
 		return
 	}

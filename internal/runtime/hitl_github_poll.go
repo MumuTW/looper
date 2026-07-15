@@ -7,6 +7,7 @@ import (
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -312,6 +313,10 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	ask.Status = "answered"
 	ask.AnsweredAt = nowISO
 	meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+	if werr != nil {
+		return werr
+	}
+	meta, werr = loopcondition.Clear(&meta)
 	if werr != nil {
 		return werr
 	}
