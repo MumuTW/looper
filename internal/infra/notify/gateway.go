@@ -556,6 +556,20 @@ type HITLAskCard struct {
 	Confidence string
 }
 
+type feishuDecisionCardIntent struct {
+	LoopID         string   `json:"loopId"`
+	Body           string   `json:"body"`
+	ActionURL      string   `json:"actionUrl"`
+	MentionOpenIDs []string `json:"mentionOpenIds,omitempty"`
+}
+
+type feishuCardIntent struct {
+	Kind     string                    `json:"kind"`
+	HITL     *HITLAskCard              `json:"hitl,omitempty"`
+	Decision *feishuDecisionCardIntent `json:"decision,omitempty"`
+	Attempts int64                     `json:"attempts,omitempty"`
+}
+
 // feishuMentionMarkup renders Feishu open_ids as card @-mention tags, e.g.
 // "<at id=ou_x></at> <at id=ou_y></at>". Returns "" when there is nothing to ping.
 func feishuMentionMarkup(openIDs []string) string {
@@ -575,6 +589,10 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	if strings.TrimSpace(card.SourceURL) == "" {
 		return fmt.Errorf("decision notification requires an exact source-of-truth URL")
 	}
+	return g.enqueueFeishuCard(ctx, "Decision needed", card.Question, card.LoopID, feishuCardIntent{Kind: "hitl", HITL: &card})
+}
+
+func (g *Gateway) deliverHITLAsk(ctx context.Context, card HITLAskCard) error {
 	cfg := g.config.Webhook
 	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
 	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
@@ -611,6 +629,137 @@ func firstFeishuOwner(openIDs []string) []string {
 		}
 	}
 	return nil
+}
+
+func (g *Gateway) enqueueFeishuCard(ctx context.Context, title, body, loopID string, intent feishuCardIntent) error {
+	if g.repositories == nil || g.repositories.Notifications == nil || g.repositories.Events == nil {
+		return fmt.Errorf("feishu card outbox repositories are not configured")
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(g.now().UTC())
+	payload, err := json.Marshal(intent)
+	if err != nil {
+		return err
+	}
+	record := storage.NotificationRecord{
+		ID:          eventlog.NewEventID("notification"),
+		LoopID:      g.existingLoopID(ctx, loopID),
+		EntityType:  stringPointer("notification"),
+		Channel:     "feishu_card",
+		Level:       "action",
+		Title:       strings.TrimSpace(title),
+		Body:        strings.TrimSpace(body),
+		Status:      "pending",
+		PayloadJSON: stringPointer(string(payload)),
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}
+	if err := g.persistNotification(ctx, record); err != nil {
+		return err
+	}
+	return g.attemptFeishuCard(ctx, record)
+}
+
+func (g *Gateway) existingLoopID(ctx context.Context, loopID string) *string {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" || g.repositories == nil || g.repositories.Loops == nil {
+		return nil
+	}
+	loop, err := g.repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return nil
+	}
+	return &loopID
+}
+
+// RetryPendingCards redelivers due action-card intents. The intent is persisted
+// before the first network call, so a daemon crash or transient Feishu outage cannot
+// make an actionable request disappear silently.
+func (g *Gateway) RetryPendingCards(ctx context.Context, limit int64) (int, error) {
+	if g.repositories == nil || g.repositories.Notifications == nil {
+		return 0, nil
+	}
+	due, err := g.repositories.Notifications.ListPendingOutbox(ctx, limit)
+	if err != nil {
+		return 0, err
+	}
+	retried := 0
+	for _, record := range due {
+		if !g.feishuCardRetryDue(record) {
+			continue
+		}
+		_ = g.attemptFeishuCard(ctx, record)
+		retried++
+	}
+	return retried, nil
+}
+
+func (g *Gateway) feishuCardRetryDue(record storage.NotificationRecord) bool {
+	var intent feishuCardIntent
+	if record.PayloadJSON == nil || json.Unmarshal([]byte(*record.PayloadJSON), &intent) != nil || intent.Attempts <= 0 {
+		return true
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, record.UpdatedAt)
+	if err != nil {
+		return true
+	}
+	exponent := intent.Attempts - 1
+	if exponent > 5 {
+		exponent = 5
+	}
+	delay := time.Duration(15*(int64(1)<<exponent)) * time.Second
+	return !g.now().UTC().Before(updatedAt.Add(delay))
+}
+
+func (g *Gateway) attemptFeishuCard(ctx context.Context, record storage.NotificationRecord) error {
+	var intent feishuCardIntent
+	if record.PayloadJSON == nil || json.Unmarshal([]byte(*record.PayloadJSON), &intent) != nil {
+		intent.Attempts = 5
+		return g.finishFeishuCardAttempt(ctx, record, intent, fmt.Errorf("invalid Feishu card outbox payload"))
+	}
+	var deliveryErr error
+	switch intent.Kind {
+	case "hitl":
+		if intent.HITL == nil {
+			deliveryErr = fmt.Errorf("missing HITL card payload")
+		} else {
+			deliveryErr = g.deliverHITLAsk(ctx, *intent.HITL)
+		}
+	case "decision":
+		if intent.Decision == nil {
+			deliveryErr = fmt.Errorf("missing decision card payload")
+		} else {
+			deliveryErr = g.deliverThreadDecisionCard(ctx, *intent.Decision)
+		}
+	default:
+		deliveryErr = fmt.Errorf("unsupported Feishu card intent %q", intent.Kind)
+	}
+	return g.finishFeishuCardAttempt(ctx, record, intent, deliveryErr)
+}
+
+func (g *Gateway) finishFeishuCardAttempt(ctx context.Context, record storage.NotificationRecord, intent feishuCardIntent, deliveryErr error) error {
+	intent.Attempts++
+	now := g.now().UTC()
+	nowISO := eventlog.FormatJavaScriptISOString(now)
+	record.UpdatedAt = nowISO
+	if deliveryErr == nil {
+		record.Status = "delivered"
+		record.ErrorMessage = nil
+		record.SentAt = &nowISO
+	} else {
+		record.ErrorMessage = stringPointer(deliveryErr.Error())
+		if intent.Attempts >= 5 {
+			record.Status = "failed"
+		} else {
+			record.Status = "pending"
+		}
+	}
+	if payload, err := json.Marshal(intent); err == nil {
+		record.PayloadJSON = stringPointer(string(payload))
+	}
+	if err := g.persistNotification(ctx, record); err != nil {
+		return err
+	}
+	return deliveryErr
 }
 
 // RecordMilestone appends one human-scannable milestone to a loop's story
@@ -1078,7 +1227,8 @@ func (g *Gateway) threadRootForLoop(ctx context.Context, loopID string) string {
 }
 
 // feishuThreadHeaderText builds a loop thread's plain-text root header, e.g.
-// "🔧 开始处理 #360 · owner/repo\n<title>". Best-effort; falls back to the loop id.
+// "🔧 开始处理 #360 · owner/repo\n<title>". Best-effort; never exposes an
+// internal loop id when the record cannot be resolved.
 func (g *Gateway) feishuThreadHeaderText(ctx context.Context, loopID string) string {
 	var loop *storage.LoopRecord
 	if g.repositories != nil && g.repositories.Loops != nil {
@@ -1087,7 +1237,7 @@ func (g *Gateway) feishuThreadHeaderText(ctx context.Context, loopID string) str
 		}
 	}
 	if loop == nil {
-		return "🔧 开始处理任务 " + loopID
+		return "🔧 Looper 任务更新"
 	}
 	head := "🔧 开始处理"
 	target := ""
@@ -1934,23 +2084,33 @@ func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body, acti
 	if loopID == "" || strings.TrimSpace(body) == "" || actionURL == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
 		return nil
 	}
+	intent := feishuDecisionCardIntent{LoopID: loopID, Body: strings.TrimSpace(body), ActionURL: actionURL, MentionOpenIDs: firstFeishuOwner(mentionOpenIDs)}
+	return g.enqueueFeishuCard(ctx, "Plane action needed", body, loopID, feishuCardIntent{Kind: "decision", Decision: &intent})
+}
+
+func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDecisionCardIntent) error {
+	loopID := strings.TrimSpace(intent.LoopID)
+	body := strings.TrimSpace(intent.Body)
+	actionURL := strings.TrimSpace(intent.ActionURL)
 	cfg := g.config.Webhook
 	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
 	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
 	if appID == "" || appSecret == "" {
-		return nil
+		return fmt.Errorf("feishu app credentials are not configured")
 	}
 	token, err := g.feishuTenantToken(ctx, appID, appSecret)
 	if err != nil {
 		return err
 	}
-	root := g.threadRootForLoop(ctx, loopID)
 	chatID := strings.TrimSpace(cfg.ChatID)
-	if strings.TrimSpace(root) == "" || chatID == "" {
-		return nil
+	if chatID == "" {
+		return fmt.Errorf("feishu chat id is not configured")
 	}
+	// This also creates a real anchor for run-less coordinator loops. Previously the
+	// decision delivery required an already-existing root and silently no-op'd.
+	root := g.ensureFeishuThreadRoot(ctx, token, chatID, loopID)
 	lead := "🙋 这个需求有个地方需要你来拍板 —— 请前往 Plane 的具体评论回答。飞书回复不会被读取。"
-	if mention := feishuMentionMarkup(firstFeishuOwner(mentionOpenIDs)); mention != "" {
+	if mention := feishuMentionMarkup(firstFeishuOwner(intent.MentionOpenIDs)); mention != "" {
 		lead = mention + " " + lead
 	}
 	card := map[string]any{
@@ -1958,7 +2118,7 @@ func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body, acti
 		"elements": []any{
 			larkDiv(lead),
 			map[string]any{"tag": "hr"},
-			larkDiv(strings.TrimSpace(body)),
+			larkDiv(body),
 			map[string]any{"tag": "action", "actions": []any{map[string]any{
 				"tag": "button", "type": "primary",
 				"text": map[string]any{"tag": "plain_text", "content": "前往 Plane 回答"},
@@ -2378,9 +2538,21 @@ func (g *Gateway) persistNotification(ctx context.Context, record storage.Notifi
 		return err
 	}
 
+	eventType := "notification.sent"
+	switch record.Status {
+	case "pending":
+		eventType = "notification.pending"
+	case "delivered", "success":
+		eventType = "notification.delivered"
+	case "failed":
+		eventType = "notification.failed"
+	}
+	if record.ErrorMessage != nil && record.Status == "pending" {
+		eventType = "notification.delivery_failed"
+	}
 	return eventlog.Append(ctx, g.repositories, eventlog.AppendInput{
 		ID:         eventlog.NewEventID("event"),
-		EventType:  "notification.sent",
+		EventType:  eventType,
 		ProjectID:  record.ProjectID,
 		LoopID:     record.LoopID,
 		RunID:      record.RunID,
@@ -2392,8 +2564,9 @@ func (g *Gateway) persistNotification(ctx context.Context, record storage.Notifi
 			"status":    record.Status,
 			"dedupeKey": record.DedupeKey,
 			"title":     record.Title,
+			"error":     record.ErrorMessage,
 		},
-		CreatedAt: mustParseJSISOString(record.CreatedAt),
+		CreatedAt: mustParseJSISOString(record.UpdatedAt),
 	})
 }
 

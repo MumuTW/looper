@@ -329,6 +329,18 @@ func (r *NotificationsRepository) Upsert(ctx context.Context, record Notificatio
 	return nil
 }
 
+func (r *NotificationsRepository) ListPendingOutbox(ctx context.Context, limit int64) ([]NotificationRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM notifications WHERE channel = 'feishu_card' AND status = 'pending' ORDER BY created_at ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending notification outbox: %w", err)
+	}
+	defer rows.Close()
+	return scanNotifications(rows)
+}
+
 func (r *NotificationsRepository) GetByID(ctx context.Context, id string) (*NotificationRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM notifications WHERE id = ?`, id)
 	record, err := scanNotification(row)

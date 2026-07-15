@@ -2318,6 +2318,13 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 
 	return defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
+			if retried, err := notificationGateway.RetryPendingCards(ctx, 50); err != nil {
+				if logger != nil {
+					logger.Warn("notification outbox retry failed", map[string]any{"error": err.Error()})
+				}
+			} else if retried > 0 && logger != nil {
+				logger.Info("notification outbox retried", map[string]any{"count": retried})
+			}
 			return runDefaultSchedulerTick(ctx, inputForServices(services))
 		},
 		claim: func(ctx context.Context, services Services) error {

@@ -1352,21 +1352,31 @@ type pullRequestLoopStatus struct {
 }
 
 type loopResponse struct {
-	ID           string  `json:"id"`
-	Seq          int64   `json:"seq"`
-	ProjectID    string  `json:"projectId"`
-	Type         string  `json:"type"`
-	TargetType   string  `json:"targetType"`
-	TargetID     *string `json:"targetId"`
-	Repo         *string `json:"repo"`
-	PRNumber     *int64  `json:"prNumber"`
-	Status       string  `json:"status"`
-	ConfigJSON   *string `json:"configJson"`
-	MetadataJSON *string `json:"metadataJson"`
-	LastRunAt    *string `json:"lastRunAt"`
-	NextRunAt    *string `json:"nextRunAt"`
-	CreatedAt    string  `json:"createdAt"`
-	UpdatedAt    string  `json:"updatedAt"`
+	ID            string             `json:"id"`
+	Seq           int64              `json:"seq"`
+	ProjectID     string             `json:"projectId"`
+	Type          string             `json:"type"`
+	TargetType    string             `json:"targetType"`
+	TargetID      *string            `json:"targetId"`
+	Repo          *string            `json:"repo"`
+	PRNumber      *int64             `json:"prNumber"`
+	Status        string             `json:"status"`
+	ConfigJSON    *string            `json:"configJson"`
+	MetadataJSON  *string            `json:"metadataJson"`
+	LastRunAt     *string            `json:"lastRunAt"`
+	NextRunAt     *string            `json:"nextRunAt"`
+	CreatedAt     string             `json:"createdAt"`
+	UpdatedAt     string             `json:"updatedAt"`
+	Relationships *loopRelationships `json:"relationships,omitempty"`
+}
+
+type loopRelationships struct {
+	Title          string `json:"title,omitempty"`
+	SourceURL      string `json:"sourceUrl,omitempty"`
+	PlaneURL       string `json:"planeUrl,omitempty"`
+	PullRequestURL string `json:"pullRequestUrl,omitempty"`
+	ActionURL      string `json:"actionUrl,omitempty"`
+	BlockedOn      string `json:"blockedOn,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -1631,8 +1641,14 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 		}
 
 		responseItems := make([]loopResponse, 0, len(items))
+		includeRelationships := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("include")), "relationships")
 		for _, item := range items {
-			responseItems = append(responseItems, serializeLoop(item))
+			serialized := serializeLoop(item)
+			if includeRelationships {
+				relationships := loopRelationshipsFromRecord(item)
+				serialized.Relationships = &relationships
+			}
+			responseItems = append(responseItems, serialized)
 		}
 
 		return loopsListResponse{Items: responseItems}, nil
@@ -4812,6 +4828,41 @@ func serializeLoop(loop storage.LoopRecord) loopResponse {
 		CreatedAt:    loop.CreatedAt,
 		UpdatedAt:    loop.UpdatedAt,
 	}
+}
+
+func loopRelationshipsFromRecord(loop storage.LoopRecord) loopRelationships {
+	metadata := parseJSONObject(loop.MetadataJSON)
+	worker, _ := metadata["worker"].(map[string]any)
+	firstString := func(values ...any) string {
+		for _, value := range values {
+			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+				return strings.TrimSpace(text)
+			}
+		}
+		return ""
+	}
+	rel := loopRelationships{
+		Title:     firstString(metadata["title"], worker["title"]),
+		SourceURL: firstString(metadata["issueUrl"], worker["issueUrl"]),
+	}
+	if strings.Contains(strings.ToLower(rel.SourceURL), "plane") {
+		rel.PlaneURL = rel.SourceURL
+	}
+	if hitl, ok := metadata["hitl"].(map[string]any); ok {
+		rel.ActionURL = firstString(hitl["actionUrl"])
+		if strings.Contains(strings.ToLower(rel.ActionURL), "plane") {
+			rel.PlaneURL = strings.SplitN(rel.ActionURL, "#", 2)[0]
+		}
+	}
+	if blocked, ok := metadata["blockedCondition"].(map[string]any); ok {
+		rel.BlockedOn = firstString(blocked["kind"])
+	}
+	if loop.Repo != nil && loop.PRNumber != nil && strings.TrimSpace(*loop.Repo) != "" && *loop.PRNumber > 0 {
+		rel.PullRequestURL = fmt.Sprintf("https://github.com/%s/pull/%d", strings.Trim(*loop.Repo, "/"), *loop.PRNumber)
+	} else {
+		rel.PullRequestURL = firstString(metadata["prUrl"], worker["prUrl"])
+	}
+	return rel
 }
 
 func serializeRun(run storage.RunRecord) runResponse {

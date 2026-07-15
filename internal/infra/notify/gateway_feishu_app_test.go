@@ -3,12 +3,13 @@ package notify
 import (
 	"context"
 	"encoding/json"
-	"github.com/nexu-io/looper/internal/loops"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -307,6 +308,73 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 			t.Fatalf("feishu_app error = %q, want level filtered", got)
 		}
 	})
+}
+
+func TestFeishuCardOutboxRetriesAndCreatesRunlessCoordinatorAnchor(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+	ctx := context.Background()
+	coordinator := openNotifyCoordinator(t, t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	projectID := "project_1"
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: t.TempDir(), CreatedAt: eventISO(now), UpdatedAt: eventISO(now)}); err != nil {
+		t.Fatal(err)
+	}
+	repo := "acme/looper"
+	target := "issue:acme/looper:42"
+	metadata := `{"issueNumber":42,"issueUrl":"https://plane.test/issues/42","title":"Runless intake"}`
+	loop := storage.LoopRecord{ID: "loop_coordinator", Seq: 42, ProjectID: projectID, Type: "coordinator", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "running", MetadataJSON: &metadata, CreatedAt: eventISO(now), UpdatedAt: eventISO(now)}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	messageAttempts := 0
+	gateway := NewGateway(Options{
+		Config: config.NotificationConfig{Webhook: appModeConfig()}, Repositories: repos, Now: func() time.Time { return now },
+		FeishuAppHTTP: func(_ context.Context, _ string, url string, _ map[string]string, _ []byte) (int, []byte, error) {
+			if strings.Contains(url, "/auth/v3/tenant_access_token/internal") {
+				return 200, []byte(`{"code":0,"tenant_access_token":"token","expire":7200}`), nil
+			}
+			messageAttempts++
+			if messageAttempts <= 2 {
+				return 500, []byte(`{"code":1,"msg":"temporary"}`), nil
+			}
+			return 200, []byte(`{"code":0,"data":{"message_id":"om_` + strconv.Itoa(messageAttempts) + `"}}`), nil
+		},
+	})
+	err := gateway.PostThreadDecisionCard(ctx, loop.ID, "Choose A or B", "https://plane.test/pages/p#comment-c", []string{"ou_owner", "ou_extra"})
+	if err == nil {
+		t.Fatal("first delivery error = nil, want transient failure")
+	}
+	records, _ := repos.Notifications.List(ctx, 10)
+	if len(records) != 1 || records[0].Status != "pending" {
+		t.Fatalf("outbox after failure = %#v", records)
+	}
+	now = now.Add(15 * time.Second)
+	if retried, err := gateway.RetryPendingCards(ctx, 10); err != nil || retried != 1 {
+		t.Fatalf("RetryPendingCards() = %d, %v", retried, err)
+	}
+	records, _ = repos.Notifications.List(ctx, 10)
+	if records[0].Status != "delivered" || records[0].SentAt == nil {
+		t.Fatalf("outbox after retry = %#v", records[0])
+	}
+	root, err := repos.FeishuThreads.RootByLoop(ctx, loop.ID)
+	if err != nil || root == "" {
+		t.Fatalf("run-less coordinator root = %q, %v", root, err)
+	}
+	if runs, err := repos.Runs.ListByLoop(ctx, loop.ID); err != nil || len(runs) != 0 {
+		t.Fatalf("coordinator runs = %#v, %v; anchor must not require a run", runs, err)
+	}
+}
+
+func eventISO(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
+
+func TestFeishuHeaderFallbackNeverLeaksLoopID(t *testing.T) {
+	gateway := &Gateway{}
+	text := gateway.feishuThreadHeaderText(context.Background(), "loop_secret_internal_id")
+	if strings.Contains(text, "loop_secret_internal_id") {
+		t.Fatalf("fallback leaked internal loop id: %q", text)
+	}
 }
 
 func TestBuildFeishuAskCardRendersMention(t *testing.T) {
