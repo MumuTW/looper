@@ -311,8 +311,20 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 		_ = gateway.AddWorkItemLabel(ctx, planeProjectID, workItemID, intakeAwaitingProductLabel)
 		// Plane-side node E ask. The Feishu @product card is a separate surface driven
 		// off the same hold label once the item is picked up downstream.
-		if err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", item.Title); err != nil && logger != nil {
+		comment, err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", item.Title)
+		if err != nil && logger != nil {
 			logger.Warn("auto-intake: request product spec failed", map[string]any{"projectId": project.ID, "item": item.Number, "error": err.Error()})
+		}
+		if err == nil && coordLoopID != "" {
+			if notifyGateway, ok := r.shepherdNotifyGateway(); ok {
+				actionURL := planedoc.WorkItemCommentURL(item.HTMLURL, comment.ID)
+				owner := strings.TrimSpace(config.ProjectProductOwner(r.config, project.ID).FeishuOpenID)
+				mentions := []string{}
+				if owner != "" {
+					mentions = []string{owner}
+				}
+				_ = notifyGateway.PostThreadDecisionCard(ctx, coordLoopID, "这个功能还缺 product spec。请前往 Plane 的具体评论补充方案页链接或正文；飞书回复不会被读取。", actionURL, mentions)
+			}
 		}
 		r.logIntake(logger, project.ID, item.Number, "hold: awaiting product spec")
 	case intakeHoldUnclear:

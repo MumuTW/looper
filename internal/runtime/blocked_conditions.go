@@ -99,15 +99,95 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 			}
 			return condition.Fingerprint != "" && foldShepherdSignal(pr) != condition.Fingerprint, nil
 		},
-		loopcondition.HumanAnswered: func(_ context.Context, loop storage.LoopRecord, _ loopcondition.Record) (bool, error) {
+		loopcondition.HumanAnswered: func(ctx context.Context, loop storage.LoopRecord, _ loopcondition.Record) (bool, error) {
 			ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-			return ok && strings.EqualFold(strings.TrimSpace(ask.Status), "answered") && strings.TrimSpace(ask.Answer) != "", nil
+			if !ok {
+				return false, nil
+			}
+			if strings.EqualFold(strings.TrimSpace(ask.Status), "answered") && strings.TrimSpace(ask.Answer) != "" {
+				return true, nil
+			}
+			if !strings.EqualFold(ask.Transport, "plane") || !strings.EqualFold(ask.Status, "awaiting") {
+				return false, nil
+			}
+			planeGateway, planeProjectID, configured := planeDocForProject(cfg, loop.ProjectID)
+			if !configured || planeGateway == nil {
+				return false, nil
+			}
+			askedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(ask.AskedAt))
+			if err != nil {
+				return false, fmt.Errorf("invalid Plane HITL askedAt %q: %w", ask.AskedAt, err)
+			}
+			pageURL := strings.SplitN(strings.TrimSpace(ask.ActionURL), "#", 2)[0]
+			comments, err := planeGateway.ListHumanSpecComments(ctx, planeProjectID, pageURL)
+			if err != nil {
+				return false, err
+			}
+			var answer *planedoc.PageComment
+			for i := range comments {
+				createdAt, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(comments[i].CreatedAt))
+				if parseErr != nil || !createdAt.After(askedAt) {
+					continue
+				}
+				if answer == nil {
+					answer = &comments[i]
+					continue
+				}
+				currentAt, _ := time.Parse(time.RFC3339Nano, answer.CreatedAt)
+				if createdAt.Before(currentAt) {
+					answer = &comments[i]
+				}
+			}
+			if answer == nil {
+				return false, nil
+			}
+			text := strings.TrimSpace(answer.CommentStripped)
+			if text == "" {
+				text = strings.TrimSpace(answer.CommentHTML)
+			}
+			if err := recordPlaneHITLAnswer(ctx, repositories, loop.ID, text, answer.CreatedAt); err != nil {
+				return false, err
+			}
+			return true, nil
 		},
 		loopcondition.InfraRecovered: func(ctx context.Context, loop storage.LoopRecord, condition loopcondition.Record) (bool, error) {
 			projectID := loop.ProjectID
 			return recoverableInfraConditionCleared(ctx, cfg, repositories, &projectID, condition.Fingerprint)
 		},
 	}
+}
+
+func recordPlaneHITLAnswer(ctx context.Context, repositories *storage.Repositories, loopID, answer, answeredAt string) error {
+	current, err := repositories.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return fmt.Errorf("Plane HITL loop disappeared: %s", loopID)
+	}
+	ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
+	if !ok || ask.Transport != "plane" || ask.Status != "awaiting" {
+		return nil
+	}
+	ask.Answer = strings.TrimSpace(answer)
+	ask.AnsweredAt = strings.TrimSpace(answeredAt)
+	ask.Status = "answered"
+	metadata, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
+	if err != nil {
+		return err
+	}
+	var object map[string]any
+	if err := json.Unmarshal([]byte(metadata), &object); err != nil {
+		return err
+	}
+	object["awaitingProductAnswer"] = false
+	encoded, err := json.Marshal(object)
+	if err != nil {
+		return err
+	}
+	current.MetadataJSON = stringPtr(string(encoded))
+	current.UpdatedAt = strings.TrimSpace(answeredAt)
+	return repositories.Loops.Upsert(ctx, *current)
 }
 
 func effectiveBlockedCondition(loop storage.LoopRecord) (loopcondition.Record, bool) {

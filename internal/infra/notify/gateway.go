@@ -520,9 +520,8 @@ func feishuNotificationText(payload SystemNotificationPayload) string {
 	return mention + body
 }
 
-// HITLAskCard is a mid-run human-in-the-loop question rendered as an interactive
-// Feishu card with one button per option. Each button's value carries the loop
-// source-of-truth action details for the human receiving the notification.
+// HITLAskCard is a one-way Feishu notification for a decision that lives in
+// Plane or GitHub. The only card action opens the exact source-of-truth comment.
 type HITLAskCard struct {
 	ProjectID      string
 	LoopID         string
@@ -555,11 +554,6 @@ type HITLAskCard struct {
 	Consequences map[string]string
 	// Confidence is the agent's self-assessed certainty ("high"/"medium"/"low").
 	Confidence string
-
-	// AnsweredWith, when set, renders the card in its resolved state: the option
-	// buttons are replaced by a "✅ 已选:<answer>" line while the question, research
-	// and consequences stay intact for later review.
-	AnsweredWith string
 }
 
 // feishuMentionMarkup renders Feishu open_ids as card @-mention tags, e.g.
@@ -578,6 +572,9 @@ func feishuMentionMarkup(openIDs []string) string {
 // the app-bot credentials in notifications.webhook (appIdEnv/appSecretEnv/chatId)
 // and is a no-op error when they are not configured. Best-effort; caller logs.
 func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
+	if strings.TrimSpace(card.SourceURL) == "" {
+		return fmt.Errorf("decision notification requires an exact source-of-truth URL")
+	}
 	cfg := g.config.Webhook
 	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
 	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
@@ -593,17 +590,27 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	if len(card.MentionOpenIds) == 0 {
 		card.MentionOpenIds = cfg.MentionOpenIds
 	}
+	card.MentionOpenIds = firstFeishuOwner(card.MentionOpenIds)
 	cardJSON, err := buildFeishuAskCard(card)
 	if err != nil {
 		return err
 	}
-	// Thread the ask card under the loop's root so the question lands in the same
-	// thread as the task's other updates. Card buttons still work inside a thread.
+	// Thread the notification under the loop's root; its sole button is an outbound
+	// deep link and never sends a decision back to Looper.
 	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, card.LoopID)
 	// The loop is awaiting_human now — turn the anchor card orange "等你定夺".
 	g.updateFeishuThreadHeader(ctx, token, card.LoopID)
 	_, err = g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON))
 	return err
+}
+
+func firstFeishuOwner(openIDs []string) []string {
+	for _, id := range openIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			return []string{id}
+		}
+	}
+	return nil
 }
 
 // RecordMilestone appends one human-scannable milestone to a loop's story
@@ -686,31 +693,16 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 		body = title
 	}
 	seq := strconv.FormatInt(card.LoopSeq, 10)
-	recommended := strings.TrimSpace(card.RecommendedOption)
-
-	// Option buttons — the recommended one is marked ⭐ and stays "primary"; the
-	// rest drop to "default" so the recommendation reads at a glance.
-	actions := make([]any, 0, len(card.Options))
+	options := make([]string, 0, len(card.Options))
 	for _, option := range card.Options {
 		option = strings.TrimSpace(option)
 		if option == "" {
 			continue
 		}
-		label := option
-		btnType := "primary"
-		if recommended != "" {
-			if strings.EqualFold(option, recommended) {
-				label = "⭐ " + option + " · 推荐"
-			} else {
-				btnType = "default"
-			}
+		if strings.EqualFold(option, strings.TrimSpace(card.RecommendedOption)) {
+			option = "⭐ " + option + "（推荐）"
 		}
-		actions = append(actions, map[string]any{
-			"tag":   "button",
-			"type":  btnType,
-			"text":  map[string]any{"tag": "plain_text", "content": label},
-			"value": map[string]any{"loopSeq": seq, "answer": option},
-		})
+		options = append(options, "- "+option)
 	}
 
 	elements := make([]any, 0, 8)
@@ -729,13 +721,8 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if rec := strings.TrimSpace(card.Recommendation); rec != "" {
 		elements = append(elements, larkDiv("🔎 "+rec))
 	}
-	// Options — or, once answered, the resolved selection. Buttons are removed (so
-	// it can't be re-clicked) but the question, research and consequences stay for
-	// later review.
-	if answered := strings.TrimSpace(card.AnsweredWith); answered != "" {
-		elements = append(elements, larkDiv("✅ **已选:"+answered+"** · Looper 继续处理中 →"))
-	} else if len(actions) > 0 {
-		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
+	if len(options) > 0 {
+		elements = append(elements, larkDiv("**可选项**\n"+strings.Join(options, "\n")))
 	}
 	// Per-option consequences: pick this → that happens.
 	if conseq := feishuConsequences(card); conseq != "" {
@@ -746,13 +733,16 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if c := feishuConfidenceLabel(card.Confidence); c != "" {
 		noteParts = append(noteParts, c)
 	}
-	noteParts = append(noteParts, "loop "+seq, "点选项或直接回文字")
+	noteParts = append(noteParts, "loop "+seq, "请在来源系统回答；飞书回复不会被读取")
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
+	elements = append(elements, map[string]any{"tag": "action", "actions": []any{map[string]any{
+		"tag":  "button",
+		"type": "primary",
+		"text": map[string]any{"tag": "plain_text", "content": "前往回答"},
+		"url":  strings.TrimSpace(card.SourceURL),
+	}}})
 
 	header := map[string]any{"template": "orange", "title": map[string]any{"tag": "plain_text", "content": "Looper needs a decision"}}
-	if strings.TrimSpace(card.AnsweredWith) != "" {
-		header = map[string]any{"template": "green", "title": map[string]any{"tag": "plain_text", "content": "✅ 已定夺"}}
-	}
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
 		"header":   header,
@@ -1938,9 +1928,10 @@ func (g *Gateway) PostThreadNote(ctx context.Context, loopID, text string, menti
 // markdown). The card has no title bar on purpose: it should read as a threaded note,
 // not a banner. @-mentions the product owner via the card <at id=..> form. No-op unless
 // the app transport is configured and the loop already has a thread root.
-func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body string, mentionOpenIDs []string) error {
+func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error {
 	loopID = strings.TrimSpace(loopID)
-	if loopID == "" || strings.TrimSpace(body) == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+	actionURL = strings.TrimSpace(actionURL)
+	if loopID == "" || strings.TrimSpace(body) == "" || actionURL == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
 		return nil
 	}
 	cfg := g.config.Webhook
@@ -1958,8 +1949,8 @@ func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body strin
 	if strings.TrimSpace(root) == "" || chatID == "" {
 		return nil
 	}
-	lead := "🙋 这个需求有个地方需要你来拍板 —— 直接在本 thread 回复你的选择就行,我会据此更新方案。"
-	if mention := feishuMentionMarkup(mentionOpenIDs); mention != "" {
+	lead := "🙋 这个需求有个地方需要你来拍板 —— 请前往 Plane 的具体评论回答。飞书回复不会被读取。"
+	if mention := feishuMentionMarkup(firstFeishuOwner(mentionOpenIDs)); mention != "" {
 		lead = mention + " " + lead
 	}
 	card := map[string]any{
@@ -1968,6 +1959,11 @@ func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body strin
 			larkDiv(lead),
 			map[string]any{"tag": "hr"},
 			larkDiv(strings.TrimSpace(body)),
+			map[string]any{"tag": "action", "actions": []any{map[string]any{
+				"tag": "button", "type": "primary",
+				"text": map[string]any{"tag": "plain_text", "content": "前往 Plane 回答"},
+				"url":  actionURL,
+			}}},
 		},
 	}
 	cardJSON, err := json.Marshal(card)

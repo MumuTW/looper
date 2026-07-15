@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1505,6 +1506,44 @@ func TestCreateRunContextInterruptedRunResumesFromCheckpoint(t *testing.T) {
 	}
 }
 
+func TestCreateRunContextAnsweredPlaneDecisionResumesWriteSpec(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	loopID := "loop_plane_answered"
+	projectID := "project_1"
+	ask := loops.HITLAsk{Question: "A or B?", Answer: "B", Status: "answered", Transport: "plane", SessionID: "sess-plane"}
+	metadata, err := loops.WriteHITLAsk(nil, ask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: loopID, Seq: 44, ProjectID: projectID, Type: "planner", TargetType: "issue", Status: "queued", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	checkpointJSON := mustMarshalJSON(plannerCheckpoint{
+		Issue:      &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md", URL: "https://plane/x/42"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "looper/plan", BaseBranch: "main", SpecPath: "specs/42.md"},
+		WriteSpec:  &checkpointWriteSpec{Status: "completed", GitReconciled: true},
+		SkipReason: awaitingProductDecisionSkipReason,
+	})
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_" + loopID, LoopID: loopID, Status: "success", LastCompletedStep: stringPtr(string(stepWriteSpec)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := runner.createRunContext(ctx, loop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepWriteSpec || resumed.Checkpoint.WriteSpec != nil || resumed.Checkpoint.SkipReason != "" {
+		t.Fatalf("resumed = %#v", resumed)
+	}
+	prompt, session := pendingPlaneDecisionAnswer(loop)
+	if session != "sess-plane" || !strings.Contains(prompt, "B") {
+		t.Fatalf("resume prompt/session = %q, %q", prompt, session)
+	}
+}
+
 func TestCreateRunContextDoesNotResumeCompletedPlannerLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1572,27 +1611,30 @@ func TestSetAwaitingProductAnswerMarker(t *testing.T) {
 	}
 }
 
-func TestRequestProductDecisionInThreadMentionsProductOwner(t *testing.T) {
+func TestNotifyProductDecisionUsesExactPlaneURLAndMentionsProductOwner(t *testing.T) {
 	t.Parallel()
-	var gotLoopID, gotText string
+	var gotLoopID, gotText, gotActionURL string
 	var gotMentions []string
 	roleCfg := &config.Config{Projects: []config.ProjectRefConfig{{ID: "project_1", ProductOwner: &config.ProductOwnerConfig{FeishuOpenID: "ou_sunqingyu"}}}}
 	r := &Runner{
 		logger:            &testLogger{},
 		projectRoleConfig: roleCfg,
-		postThreadNote: func(_ context.Context, loopID, text string, mentions []string) error {
-			gotLoopID, gotText, gotMentions = loopID, text, mentions
+		postThreadCard: func(_ context.Context, loopID, text, actionURL string, mentions []string) error {
+			gotLoopID, gotText, gotActionURL, gotMentions = loopID, text, actionURL, mentions
 			return nil
 		},
 	}
 	in := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Loop: storage.LoopRecord{ID: "loop_x"}}
-	r.requestProductDecisionInThread(context.Background(), in, "① 背景:客户 A 要导出。\n③ 问题:先做 A 还是 B?建议 A。")
+	r.notifyProductDecision(context.Background(), in, "① 背景:客户 A 要导出。\n③ 问题:先做 A 还是 B?建议 A。", "https://plane.test/pages/pg-1#comment-c-1")
 
 	if gotLoopID != "loop_x" {
 		t.Fatalf("loopID = %q, want loop_x", gotLoopID)
 	}
 	if !strings.Contains(gotText, "① 背景") || !strings.Contains(gotText, "建议 A") {
 		t.Fatalf("text = %q, want the productAsk embedded", gotText)
+	}
+	if gotActionURL != "https://plane.test/pages/pg-1#comment-c-1" {
+		t.Fatalf("actionURL = %q, want exact Plane comment URL", gotActionURL)
 	}
 	if len(gotMentions) != 1 || gotMentions[0] != "ou_sunqingyu" {
 		t.Fatalf("mentions = %v, want [ou_sunqingyu] (@ product owner)", gotMentions)

@@ -318,7 +318,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
-	if !r.hitlTransportGitHub() && r.hitlNotify != nil {
+	if r.hitlNotify != nil && strings.TrimSpace(ask.ActionURL) != "" {
 		notif := HITLAskNotification{
 			ProjectID:         input.Project.ID,
 			LoopID:            input.Loop.ID,
@@ -333,18 +333,22 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			Consequences:      awaiting.consequences,
 			Confidence:        awaiting.confidence,
 		}
-		// Source + trigger come from the loop's work metadata (issue #, url, author).
+		// Source + trigger come from the durable source-of-truth ask and work metadata.
+		notif.SourceURL = ask.ActionURL
 		if w := checkpoint.Work; w != nil {
 			notif.TriggerLogin = w.TriggerLogin
 			switch {
 			case w.PRNumber > 0:
-				notif.SourceType = "GitHub PR"
+				notif.SourceType = "GitHub decision comment"
 				notif.SourceRef = "#" + strconv.FormatInt(w.PRNumber, 10)
 			case w.IssueNumber > 0:
 				notif.SourceType = "GitHub Issue"
 				notif.SourceRef = "#" + strconv.FormatInt(w.IssueNumber, 10)
-				notif.SourceURL = w.IssueURL
 			}
+		}
+		if ask.PRNumber > 0 {
+			notif.SourceType = "GitHub decision comment"
+			notif.SourceRef = "PR #" + strconv.FormatInt(ask.PRNumber, 10)
 		}
 		if err := r.hitlNotify(ctx, notif); err != nil && r.logger != nil {
 			// The loop is already parked in awaiting_human; if the human is never
@@ -439,6 +443,10 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkp
 	}
 
 	ask.Transport = "github"
+	ask.ActionURL = strings.TrimSpace(res.URL)
+	if ask.ActionURL == "" && res.ID > 0 {
+		ask.ActionURL = fmt.Sprintf("https://github.com/%s/pull/%d#issuecomment-%d", strings.Trim(repo, "/"), prNumber, res.ID)
+	}
 	ask.PRNumber = prNumber
 	ask.AskCommentID = res.ID
 	return nil

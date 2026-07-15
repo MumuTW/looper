@@ -50,6 +50,8 @@ const (
 	maxRetryDelay       = 300 * time.Second
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
+
+	awaitingProductDecisionSkipReason = "awaiting product decision on Plane"
 )
 
 var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepGrill, stepReview, stepNotify}
@@ -340,11 +342,9 @@ type Options struct {
 	// PostThreadNote posts a plain-text reply into a loop's Feishu thread (node H
 	// touchpoints: spec-draft FYI, grill transcript), optionally @-mentioning open_ids.
 	PostThreadNote func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
-	// PostThreadCard posts a header-less interactive card into a loop's Feishu thread —
-	// used for the node-H product-decision ask so the product-language body renders with
-	// structure (bold sub-headers, line breaks) instead of a flat text wall. Falls back
-	// to PostThreadNote when unset (e.g. tests).
-	PostThreadCard  func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
+	// PostThreadCard posts a one-way decision notification with an exact Plane/GitHub
+	// action URL. Feishu never receives the answer.
+	PostThreadCard  func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
 	DiscoveryPolicy DiscoveryPolicy
 	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
 	// project whose task source is Plane (§8 flowchart). nil / (…,false) → the
@@ -385,7 +385,7 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	postThreadNote          func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
-	postThreadCard          func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
+	postThreadCard          func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
 	discoveryPolicy         DiscoveryPolicy
 	planeDoc                PlaneDocResolver
 }
@@ -860,7 +860,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, err
 	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		updated.Status = "completed"
+		if checkpoint.SkipReason == awaitingProductDecisionSkipReason {
+			updated.Status = "awaiting_human"
+		} else {
+			updated.Status = "completed"
+		}
 		updated.LastRunAt = stringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	}); err != nil {
@@ -1004,13 +1008,13 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 		r.setAwaitingProductSpecMarker(ctx, input.Loop, false)
 		return nil // has a product spec → proceed to write the tech spec
 	}
-	if err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", issue.Title); err != nil && r.logger != nil {
-		r.logger.Warn("planner: request product spec failed", map[string]any{"projectId": input.Project.ID, "workItem": workItemID, "error": err.Error()})
+	comment, err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", issue.Title)
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("request product spec on Plane: %v", err), kind: FailureRetryableTransient}
 	}
-	// Also @-mention the product owner in the Feishu thread — not only the Plane
-	// comment — so they see the ask where they actually watch. The open_id comes from
-	// per-project config (ProjectProductOwner), never hardcoded. Best-effort.
-	r.requestProductSpecInThread(ctx, input, issue.Title)
+	// Plane owns the response. Feishu only targets the owner and deep-links to the
+	// exact source comment; replies in the thread are intentionally ignored.
+	r.requestProductSpecInThread(ctx, input, issue.Title, planedoc.WorkItemCommentURL(issue.URL, comment.ID))
 	// Mark the hold reason so the anchor card reads "⏸ 等待产品方案" (node E) rather
 	// than the generic "⏸ 等你定夺" — the header alone tells you what's blocking.
 	r.setAwaitingProductSpecMarker(ctx, input.Loop, true)
@@ -1022,16 +1026,16 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 // Plane comment RequestProductSpec posts, so the ask reaches them where they watch.
 // The open_id is resolved per-project from config (never hardcoded); a missing
 // transport or an unset owner just skips the ping. Best-effort.
-func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput, workItemTitle string) {
-	if r.postThreadNote == nil || r.projectRoleConfig == nil {
+func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput, workItemTitle, actionURL string) {
+	if r.postThreadCard == nil || r.projectRoleConfig == nil || strings.TrimSpace(actionURL) == "" {
 		return
 	}
 	var mentions []string
 	if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
 		mentions = []string{openID}
 	}
-	note := fmt.Sprintf("⏸ 需求「%s」还没有产品 spec —— 请补一份:把方案页链接或正文直接发在本 thread,looper 会自动关联并继续。", strings.TrimSpace(workItemTitle))
-	if err := r.postThreadNote(ctx, input.Loop.ID, note, mentions); err != nil && r.logger != nil {
+	note := fmt.Sprintf("⏸ 需求「%s」还没有产品 spec。请前往 Plane 的具体评论补充方案页链接或正文；飞书回复不会被读取。", strings.TrimSpace(workItemTitle))
+	if err := r.postThreadCard(ctx, input.Loop.ID, note, actionURL, mentions); err != nil && r.logger != nil {
 		r.logger.Warn("planner: post product-spec request note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 	}
 }
@@ -1061,14 +1065,82 @@ func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.
 	}
 }
 
-// requestProductDecisionInThread posts the agent's product-language question
-// (productAsk, node H) into the loop's Feishu thread, @-mentioning the project's
-// product owner so they see it where they watch. The message is already written in
-// product language by the agent; this only frames + @-tags it. The open_id is
-// resolved per-project from config (never hardcoded); a missing transport just skips
-// and an unset owner posts without a mention. Best-effort.
-func (r *Runner) requestProductDecisionInThread(ctx context.Context, input stepInput, productAsk string) {
-	if r.postThreadCard == nil && r.postThreadNote == nil {
+// requestProductDecisionOnPlane persists the decision at its source of truth first,
+// then sends a one-way Feishu notification carrying the exact comment URL. Repeated
+// execution reuses the current awaiting ask instead of creating duplicate comments.
+func (r *Runner) requestProductDecisionOnPlane(ctx context.Context, input stepInput, checkpoint plannerCheckpoint, productAsk string) (string, error) {
+	if r.planeDoc == nil {
+		return "", fmt.Errorf("planner: Plane decision requires a Plane document gateway")
+	}
+	gateway, planeProjectID, ok := r.planeDoc(input.Project.ID)
+	if !ok || gateway == nil {
+		return "", fmt.Errorf("planner: Plane decision gateway is not configured for project %s", input.Project.ID)
+	}
+	issue, err := requireIssue(checkpoint)
+	if err != nil {
+		return "", err
+	}
+	worktree, err := requireWorktree(checkpoint)
+	if err != nil {
+		return "", err
+	}
+	if err := r.publishTechSpecToPlane(ctx, input, *issue, *worktree); err != nil {
+		return "", fmt.Errorf("planner: publish tech spec before product decision: %w", err)
+	}
+	workItemID := planedoc.WorkItemIDFromURL(issue.URL)
+	if workItemID == "" {
+		return "", fmt.Errorf("planner: cannot resolve Plane work item from %q", issue.URL)
+	}
+	specURL, found, err := gateway.FindSpecLink(ctx, planeProjectID, workItemID, planedoc.TechSpecLinkTitle)
+	if err != nil {
+		return "", err
+	}
+	if !found || planedoc.PageIDFromURL(specURL) == "" {
+		return "", fmt.Errorf("planner: published tech spec has no Plane page link")
+	}
+
+	fresh, err := r.repos.Loops.GetByID(ctx, input.Loop.ID)
+	if err != nil {
+		return "", err
+	}
+	if fresh == nil {
+		return "", fmt.Errorf("planner: loop disappeared: %s", input.Loop.ID)
+	}
+	ask, hasAsk := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !(hasAsk && ask.Transport == "plane" && ask.Status == "awaiting" && strings.TrimSpace(ask.Question) == strings.TrimSpace(productAsk) && strings.TrimSpace(ask.ActionURL) != "") {
+		body := "<p><strong>🙋 需要产品负责人拍板</strong></p><p>" + strings.ReplaceAll(htmlpkg.EscapeString(strings.TrimSpace(productAsk)), "\n", "<br>") + "</p>"
+		comment, createErr := gateway.CreatePageComment(ctx, planeProjectID, planedoc.PageIDFromURL(specURL), planedoc.SignComment(body, "planner", r.agentModel))
+		if createErr != nil {
+			return "", createErr
+		}
+		actionURL := planedoc.PageCommentURL(specURL, comment.ID)
+		if actionURL == "" {
+			return "", fmt.Errorf("planner: Plane decision comment did not return an id")
+		}
+		ask = loops.HITLAsk{Question: strings.TrimSpace(productAsk), SessionID: r.latestNativeSessionID(ctx, input.Loop.ID), Status: "awaiting", AskedAt: r.nowISO(), Transport: "plane", ActionURL: actionURL}
+		metadata, writeErr := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
+		if writeErr != nil {
+			return "", writeErr
+		}
+		metadata, writeErr = mergeLoopMetadataJSON(&metadata, map[string]any{"awaitingProductAnswer": true})
+		if writeErr != nil {
+			return "", writeErr
+		}
+		metadata, writeErr = loopcondition.Set(&metadata, loopcondition.Record{Kind: loopcondition.HumanAnswered, Since: ask.AskedAt})
+		if writeErr != nil {
+			return "", writeErr
+		}
+		if _, writeErr = r.updateLoop(ctx, *fresh, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadata) }); writeErr != nil {
+			return "", writeErr
+		}
+	}
+
+	r.notifyProductDecision(ctx, input, productAsk, ask.ActionURL)
+	return ask.ActionURL, nil
+}
+
+func (r *Runner) notifyProductDecision(ctx context.Context, input stepInput, productAsk, actionURL string) {
+	if r.postThreadCard == nil || strings.TrimSpace(actionURL) == "" {
 		return
 	}
 	var mentions []string
@@ -1077,19 +1149,8 @@ func (r *Runner) requestProductDecisionInThread(ctx context.Context, input stepI
 			mentions = []string{openID}
 		}
 	}
-	// Prefer a header-less lark_md card so the product-language body keeps its structure
-	// (bold sub-headers, blank lines, one option per line); a plain "text" message would
-	// render none of it and collapse to a wall. Fall back to a text note only when the
-	// card path isn't wired (e.g. tests).
-	if r.postThreadCard != nil {
-		if err := r.postThreadCard(ctx, input.Loop.ID, strings.TrimSpace(productAsk), mentions); err != nil && r.logger != nil {
-			r.logger.Warn("planner: post product-decision card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
-		}
-		return
-	}
-	note := "🙋 这个需求有个地方需要你来拍板 —— 直接在本 thread 回复你的选择就行,我会据此更新方案:\n\n" + strings.TrimSpace(productAsk)
-	if err := r.postThreadNote(ctx, input.Loop.ID, note, mentions); err != nil && r.logger != nil {
-		r.logger.Warn("planner: post product-decision request note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+	if err := r.postThreadCard(ctx, input.Loop.ID, strings.TrimSpace(productAsk), actionURL, mentions); err != nil && r.logger != nil {
+		r.logger.Warn("planner: post product-decision card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 	}
 }
 
@@ -1248,7 +1309,8 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
+		nativeResumePrompt, nativeSessionID := pendingPlaneDecisionAnswer(input.Loop)
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1282,6 +1344,9 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
 		productAsk = strings.TrimSpace(result.ProductAsk)
+		if nativeResumePrompt != "" {
+			r.markPlaneDecisionAnswerConsumed(ctx, &input.Loop)
+		}
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -1317,19 +1382,15 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	checkpoint.WriteSpec.GitReconciled = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	// Node H product-decision hold: the spec turn surfaced a real product question
-	// only the owner can answer. Ask them in the thread (product language) and HOLD
-	// before the owner-approval gate — publish/grill/review don't run yet. The run
-	// still completes (skipReason), so the loop reaches "completed" and a source update
-	// reactivates it via the follow-up resume, which re-runs write-spec with the
-	// answer; once no product question remains the flow proceeds to owner approval. On
-	// a fresh first run or a resume that RESOLVED the question, productAsk is empty and
-	// any prior hold marker is cleared so the loop advances normally.
+	// Node H product-decision hold. Plane owns the answer; Feishu only notifies with
+	// the exact comment link. The blocked-condition reconciler observes a later human
+	// Plane comment, records it, and native-resumes this same authoring session.
 	if productAsk != "" && r.isPlaneProject(input.Project.ID) {
-		r.requestProductDecisionInThread(ctx, input, productAsk)
-		r.setAwaitingProductAnswerMarker(ctx, input.Loop, true)
+		if _, err := r.requestProductDecisionOnPlane(ctx, input, checkpoint, productAsk); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
 		r.setNodeHPhase(ctx, input.Loop.ID, "awaiting_product_answer")
-		checkpoint.SkipReason = "awaiting product decision — asked the product owner in the thread"
+		checkpoint.SkipReason = awaitingProductDecisionSkipReason
 		return checkpoint, nil
 	}
 	r.setAwaitingProductAnswerMarker(ctx, input.Loop, false)
@@ -1630,11 +1691,15 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
 		return checkpoint, &loopError{message: "review agent did not complete", kind: FailureRetryableAfterResume}
 	}
-	if summary := cleanAgentSummary(result.Summary); summary != "" {
-		body := planedoc.SignComment("<p>👀 <b>REVIEW 复核结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p><p>方案已过 grill + review。请人过目,无异议在本页评论 <b>approve / 同意 / 👍</b> 即进入实现。</p>", "reviewer", r.agentModel)
-		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
-			r.logger.Warn("review: post verdict failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
-		}
+	summary := cleanAgentSummary(result.Summary)
+	body := planedoc.SignComment("<p>👀 <b>REVIEW 复核结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p><p>方案已过 grill + review。请直接回复本评论；无异议可答 <b>approve / 同意 / 👍</b>，随后进入实现。</p>", "reviewer", r.agentModel)
+	reviewComment, err := gateway.CreateCommentOnPageURL(ctx, planeProjectID, specURL, body)
+	if err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("review: post verdict: %v", err), kind: FailureRetryableTransient}
+	}
+	reviewActionURL := planedoc.PageCommentURL(specURL, reviewComment.ID)
+	if reviewActionURL == "" {
+		return checkpoint, &loopError{message: "review: Plane verdict did not return a comment id", kind: FailureRetryableTransient}
 	}
 	if checkpoint.Publish == nil {
 		checkpoint.Publish = &checkpointPublishState{}
@@ -1651,7 +1716,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 			r.logger.Warn("review: retire looper:plan failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
 	}
-	r.postNodeHThreadNote(ctx, input, "approvalRequest", "🙋 方案已过 GRILL 拷问 + 独立 REVIEW,请你审批 —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现:"+specURL, true)
+	r.notifyProductDecision(ctx, input, "🙋 方案已过 GRILL 拷问 + 独立 REVIEW。请直接回复这条 REVIEW 评论；无异议可答 approve / 同意 / 👍，随后进入实现。", reviewActionURL)
 	if r.repos != nil && r.repos.Loops != nil {
 		if loop, gErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); gErr == nil && loop != nil {
 			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {
@@ -2124,9 +2189,21 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	shouldResume := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
 	startStep := stepDiscoverIssues
+	_, _, hasPlaneAnswer := planeDecisionAnswer(loop)
+	if hasPlaneAnswer && latestRun != nil {
+		// The previous successful run stopped after write-spec solely to await the
+		// Plane decision. Re-enter that step with its issue/worktree checkpoint.
+		shouldResume = true
+		startStep = stepWriteSpec
+		check.WriteSpec = nil
+		check.SkipReason = ""
+		lastCompleted = stepPrepareWorktree
+	}
 	if shouldResume {
-		if next := nextPlannerStep(lastCompleted); next != "" {
-			startStep = next
+		if startStep == stepDiscoverIssues {
+			if next := nextPlannerStep(lastCompleted); next != "" {
+				startStep = next
+			}
 		}
 	}
 	resumed := shouldResume && startStep != stepDiscoverIssues
@@ -2146,6 +2223,60 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: initialCheckpoint, Resumed: resumed}, nil
+}
+
+func planeDecisionAnswer(loop storage.LoopRecord) (answer, sessionID string, ok bool) {
+	ask, exists := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !exists || !strings.EqualFold(ask.Transport, "plane") || !strings.EqualFold(ask.Status, "answered") || strings.TrimSpace(ask.Answer) == "" {
+		return "", "", false
+	}
+	return strings.TrimSpace(ask.Answer), strings.TrimSpace(ask.SessionID), true
+}
+
+func pendingPlaneDecisionAnswer(loop storage.LoopRecord) (prompt, sessionID string) {
+	answer, sessionID, ok := planeDecisionAnswer(loop)
+	if !ok {
+		return "", ""
+	}
+	return "The product owner answered your pending decision on the Plane spec page:\n\n" + answer + "\n\nRevise the tech spec to reflect this decision. Continue from the existing work; do not restart or ask the same question again.", sessionID
+}
+
+func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) string {
+	if r.repos == nil || r.repos.AgentExecutions == nil {
+		return ""
+	}
+	execution, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+	if err != nil || execution == nil || execution.NativeSessionID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*execution.NativeSessionID)
+}
+
+func (r *Runner) markPlaneDecisionAnswerConsumed(ctx context.Context, loop *storage.LoopRecord) {
+	if r.repos == nil || r.repos.Loops == nil || loop == nil {
+		return
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !ok || ask.Transport != "plane" || ask.Status != "answered" {
+		return
+	}
+	ask.Status = "consumed"
+	metadata, err := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
+	if err != nil {
+		return
+	}
+	metadata, err = mergeLoopMetadataJSON(&metadata, map[string]any{"awaitingProductAnswer": false})
+	if err != nil {
+		return
+	}
+	updated, err := r.updateLoop(ctx, *fresh, func(current *storage.LoopRecord) { current.MetadataJSON = stringPtr(metadata) })
+	if err == nil {
+		*loop = updated
+	}
 }
 
 func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, step PlannerStep, checkpoint plannerCheckpoint) (storage.RunRecord, error) {

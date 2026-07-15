@@ -245,14 +245,14 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		}
 	})
 
-	t.Run("SendHITLAsk posts a card with option buttons carrying loop seq + answer", func(t *testing.T) {
+	t.Run("SendHITLAsk posts a one-way card with exact action URL", func(t *testing.T) {
 		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
 		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
 
 		var calls []capturedFeishuCall
 		gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
 
-		if err := gateway.SendHITLAsk(ctx, HITLAskCard{ProjectID: "od", LoopSeq: 71, Repo: "acme/looper", Title: "Which datastore?", Question: "Redis or Postgres for the cache?", Options: []string{"redis", "postgres"}}); err != nil {
+		if err := gateway.SendHITLAsk(ctx, HITLAskCard{ProjectID: "od", LoopSeq: 71, Repo: "acme/looper", Title: "Which datastore?", Question: "Redis or Postgres for the cache?", Options: []string{"redis", "postgres"}, SourceURL: "https://github.com/acme/looper/pull/7#issuecomment-71"}); err != nil {
 			t.Fatalf("SendHITLAsk() error = %v", err)
 		}
 		if len(calls) != 2 {
@@ -271,9 +271,8 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		if !strings.Contains(envelope.Content, "Redis or Postgres") {
 			t.Fatalf("card missing question: %s", envelope.Content)
 		}
-		// Each option becomes a button whose value carries loopSeq + answer.
-		if !strings.Contains(envelope.Content, `"loopSeq":"71"`) || !strings.Contains(envelope.Content, `"answer":"redis"`) || !strings.Contains(envelope.Content, `"answer":"postgres"`) {
-			t.Fatalf("card missing option buttons with loopSeq/answer values: %s", envelope.Content)
+		if !strings.Contains(envelope.Content, "https://github.com/acme/looper/pull/7#issuecomment-71") || strings.Contains(envelope.Content, `"answer":"redis"`) {
+			t.Fatalf("card must deep-link outward without callback values: %s", envelope.Content)
 		}
 	})
 
@@ -362,30 +361,13 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 		"https://github.com/nexu-io/synclo-test/issues/132", // clickable link
 		"由 @lefarcen 提出",                                    // trigger attribution
 		"README 都是中文",                                       // recommendation
-		"⭐ 中文 · 推荐",                                         // recommended option marked prominently
+		"⭐ 中文（推荐）",                                          // recommended option marked prominently
 		"置信度 中",                                             // confidence
 		"写\\\"Welcome",                                      // a consequence (quote json-escaped)
 	} {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("decision-brief card missing %q\ncard=%s", want, raw)
 		}
-	}
-
-	// Answered state: buttons gone, "✅ 已选" shown, brief still present for review.
-	answered, err := buildFeishuAskCard(HITLAskCard{
-		LoopSeq: 132, Title: "welcome.txt 用哪种语言?", Question: "welcome.txt 用哪种语言?",
-		Options: []string{"中文", "英文"}, Recommendation: "README 都是中文,推荐中文。",
-		AnsweredWith: "中文",
-	})
-	if err != nil {
-		t.Fatalf("buildFeishuAskCard(answered) error = %v", err)
-	}
-	ar := string(answered)
-	if !strings.Contains(ar, "已选:中文") || !strings.Contains(ar, "已定夺") || !strings.Contains(ar, "README 都是中文") {
-		t.Fatalf("answered card missing selection or brief: %s", ar)
-	}
-	if strings.Contains(ar, `"tag":"action"`) {
-		t.Fatalf("answered card should have no clickable action buttons: %s", ar)
 	}
 
 	// A bare ask (no brief) must still render — the fields are optional.

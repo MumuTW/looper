@@ -283,8 +283,12 @@ func TestDecideIntakeAndHasProductSpec(t *testing.T) {
 func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
 	f := &fakeRun{stdouts: []string{`{"id":"c1"}`}}
 	g := newGateway(f)
-	if err := g.RequestProductSpec(context.Background(), "p1", "wi-1", "@产品<x>", "登录 & 注册"); err != nil {
+	comment, err := g.RequestProductSpec(context.Background(), "p1", "wi-1", "@产品<x>", "登录 & 注册")
+	if err != nil {
 		t.Fatalf("RequestProductSpec error = %v", err)
+	}
+	if comment.ID != "c1" {
+		t.Fatalf("comment id = %q, want c1", comment.ID)
 	}
 	args := f.calls[0]
 	if !argsContain(args, "api", "comment", "create") || !argPairPresent(args, "--work-item", "wi-1") {

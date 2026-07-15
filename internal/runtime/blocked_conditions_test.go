@@ -8,6 +8,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/infra/disk"
+	"github.com/nexu-io/looper/internal/loops"
 	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -22,6 +23,32 @@ func TestEffectiveBlockedConditionMigratesLegacyMarkers(t *testing.T) {
 	record, inferred = effectiveBlockedCondition(storage.LoopRecord{Type: "worker", Status: "awaiting_human", MetadataJSON: &humanMetadata})
 	if !inferred || record.Kind != loopcondition.HumanAnswered {
 		t.Fatalf("effectiveBlockedCondition(human) = %#v, %v", record, inferred)
+	}
+}
+
+func TestRecordPlaneHITLAnswerPersistsSourceAnswer(t *testing.T) {
+	repositories := newEnqueueTestRepos(t)
+	ctx := context.Background()
+	nowISO := "2026-07-15T12:00:00.000Z"
+	ask := loops.HITLAsk{Question: "A or B?", Status: "awaiting", AskedAt: nowISO, Transport: "plane", ActionURL: "https://plane.test/pages/pg-1#comment-ask"}
+	metadata, err := loops.WriteHITLAsk(nil, ask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: "loop_plane_answer", Seq: 9, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repositories.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPlaneHITLAnswer(ctx, repositories, loop.ID, "Choose B", "2026-07-15T12:01:00.000Z"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := repositories.Loops.GetByID(ctx, loop.ID)
+	gotAsk, ok := loops.ReadHITLAsk(got.MetadataJSON)
+	if !ok || gotAsk.Status != "answered" || gotAsk.Answer != "Choose B" || gotAsk.AnsweredAt != "2026-07-15T12:01:00.000Z" {
+		t.Fatalf("persisted ask = %#v, present=%v", gotAsk, ok)
 	}
 }
 

@@ -272,7 +272,7 @@ func (g *Gateway) WriteTechSpec(ctx context.Context, projectID, workItemID, name
 // PageIDFromURL extracts a Plane page id from a page URL of the form
 // .../pages/<uuid>[/]. Returns "" when the URL isn't a Plane page link.
 func PageIDFromURL(pageURL string) string {
-	trimmed := strings.TrimRight(strings.TrimSpace(pageURL), "/")
+	trimmed := strings.TrimRight(strings.TrimSpace(strings.SplitN(pageURL, "#", 2)[0]), "/")
 	marker := "/pages/"
 	i := strings.LastIndex(trimmed, marker)
 	if i < 0 {
@@ -283,6 +283,22 @@ func PageIDFromURL(pageURL string) string {
 		return ""
 	}
 	return id
+}
+
+// PageCommentURL returns the exact browser destination for a decision comment.
+// Plane currently exposes page comments as anchors on the page, so notification
+// transports can remain one-way and still take the owner directly to the source.
+func PageCommentURL(pageURL, commentID string) string {
+	pageURL = strings.TrimRight(strings.TrimSpace(strings.SplitN(pageURL, "#", 2)[0]), "/")
+	commentID = strings.TrimSpace(commentID)
+	if pageURL == "" || commentID == "" {
+		return ""
+	}
+	return pageURL + "#comment-" + commentID
+}
+
+func WorkItemCommentURL(workItemURL, commentID string) string {
+	return PageCommentURL(workItemURL, commentID)
 }
 
 // IntakeAction is what a looper:auto feature work item needs next at the intake
@@ -310,31 +326,48 @@ func (g *Gateway) HasProductSpec(ctx context.Context, projectID, workItemID stri
 	return found, url, err
 }
 
-// CommentOnWorkItem posts an HTML comment on a Plane work item.
-func (g *Gateway) CommentOnWorkItem(ctx context.Context, projectID, workItemID, commentHTML string) error {
+type WorkItemComment struct {
+	ID string `json:"id"`
+}
+
+// CreateWorkItemComment posts an HTML comment and returns its id so callers can
+// build a deep link to the exact source-of-truth location.
+func (g *Gateway) CreateWorkItemComment(ctx context.Context, projectID, workItemID, commentHTML string) (WorkItemComment, error) {
 	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(workItemID) == "" || strings.TrimSpace(commentHTML) == "" {
-		return fmt.Errorf("planedoc: CommentOnWorkItem requires project id, work item id, and html")
+		return WorkItemComment{}, fmt.Errorf("planedoc: CreateWorkItemComment requires project id, work item id, and html")
 	}
 	data := fmt.Sprintf(`{"comment_html":%s}`, jsonString(commentHTML))
 	args := []string{"api", "comment", "create", "--project", projectID, "--work-item", workItemID, "--data", data}
 	args = append(args, g.globalArgs()...)
-	if _, err := g.runPlane(ctx, "", args...); err != nil {
-		return fmt.Errorf("planedoc: comment on work item: %w", err)
+	result, err := g.runPlane(ctx, "", args...)
+	if err != nil {
+		return WorkItemComment{}, fmt.Errorf("planedoc: comment on work item: %w", err)
 	}
-	return nil
+	var comment WorkItemComment
+	if strings.TrimSpace(result.Stdout) != "" {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(result.Stdout)), &comment); err != nil {
+			return WorkItemComment{}, fmt.Errorf("planedoc: decode work item comment: %w", err)
+		}
+	}
+	return comment, nil
+}
+
+func (g *Gateway) CommentOnWorkItem(ctx context.Context, projectID, workItemID, commentHTML string) error {
+	_, err := g.CreateWorkItemComment(ctx, projectID, workItemID, commentHTML)
+	return err
 }
 
 // RequestProductSpec asks the product owner (by an already-rendered mention/name)
 // to supply a product spec, as a comment on the work item (flowchart node E, Plane
 // side — the task-card @-mention in Feishu is a separate surface). The comment
 // tells them looper will auto-associate whatever spec link/text they reply with.
-func (g *Gateway) RequestProductSpec(ctx context.Context, projectID, workItemID, ownerMention, workItemName string) error {
+func (g *Gateway) RequestProductSpec(ctx context.Context, projectID, workItemID, ownerMention, workItemName string) (WorkItemComment, error) {
 	html := fmt.Sprintf(
 		"<p>%s 这个需求「%s」还没有 product spec。请补一份 —— 直接把方案页链接或正文发在这里,looper 会自动把它关联到本 work item 并继续。</p>",
 		htmlpkg.EscapeString(strings.TrimSpace(ownerMention)),
 		htmlpkg.EscapeString(strings.TrimSpace(workItemName)),
 	)
-	return g.CommentOnWorkItem(ctx, projectID, workItemID, html)
+	return g.CreateWorkItemComment(ctx, projectID, workItemID, html)
 }
 
 // PageComment is a Notion-style comment on a Plane page (powerformer/plane PR #11,
@@ -432,12 +465,16 @@ func (g *Gateway) PostSpecReviewComment(ctx context.Context, projectID, pageURL,
 // node H audit notes such as "✅ approved by X". Always posts (no idempotency check),
 // unlike PostSpecReviewComment.
 func (g *Gateway) CommentOnPageURL(ctx context.Context, projectID, pageURL, commentHTML string) error {
+	_, err := g.CreateCommentOnPageURL(ctx, projectID, pageURL, commentHTML)
+	return err
+}
+
+func (g *Gateway) CreateCommentOnPageURL(ctx context.Context, projectID, pageURL, commentHTML string) (PageComment, error) {
 	pageID := PageIDFromURL(pageURL)
 	if pageID == "" {
-		return fmt.Errorf("planedoc: CommentOnPageURL cannot resolve page id from %q", pageURL)
+		return PageComment{}, fmt.Errorf("planedoc: CreateCommentOnPageURL cannot resolve page id from %q", pageURL)
 	}
-	_, err := g.CreatePageComment(ctx, projectID, pageID, commentHTML)
-	return err
+	return g.CreatePageComment(ctx, projectID, pageID, commentHTML)
 }
 
 // ListHumanSpecComments resolves the spec page at pageURL and returns the human
