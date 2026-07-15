@@ -940,6 +940,61 @@ func TestRunExecuteStepRecoversStaleWorktreePathBeforeAgentStart(t *testing.T) {
 	}
 }
 
+func TestRunExecuteStepRecreatesWorktreeFromBranchWhenNoneRegistered(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	stalePath := filepath.Join(t.TempDir(), "deleted-worktree")
+	branch := "looper/feature"
+	git := &fakeGitGateway{
+		// No registered worktree to restore — the checkout dir was reclaimed (disk-pressure
+		// GC / manual cleanup). Recovery must recreate one FROM THE BRANCH and continue,
+		// never park the loop for a human (the old staleWorkerWorktreeError dead-end).
+		restoreReturnsNil: true,
+		createResult:      CreateWorktreeResult{WorktreePath: "recreated", Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_recreated"},
+		inspectResult:     InspectHeadResult{HeadSHA: "def456"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_recreate_worktree", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project,
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: stalePath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteStep() error = %v, want recreate-from-branch recovery (never manual intervention)", err)
+	}
+	// Restore was tried first, found nothing, then a fresh worktree was created for the branch.
+	if len(git.restoreCalls) != 1 {
+		t.Fatalf("restoreCalls = %#v, want exactly one restore attempt before recreate", git.restoreCalls)
+	}
+	if len(git.createCalls) != 1 || git.createCalls[0].Branch != branch {
+		t.Fatalf("createCalls = %#v, want a single recreate from branch %q", git.createCalls, branch)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path == stalePath || strings.TrimSpace(checkpoint.Worktree.Path) == "" {
+		t.Fatalf("checkpoint.Worktree = %#v, want a fresh recreated worktree (not the stale path)", checkpoint.Worktree)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != checkpoint.Worktree.Path {
+		t.Fatalf("agent starts = %#v, want agent started in the recreated worktree %q", agent.starts, checkpoint.Worktree.Path)
+	}
+}
+
 func TestRunExecuteStepRecoversWorktreeOutsideWorktreeRootBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -3998,22 +4053,23 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 }
 
 type fakeGitGateway struct {
-	createResult   CreateWorktreeResult
-	restoreResult  *RestoreWorktreeResult
-	prepareResult  PrepareWorktreeResult
-	inspectResult  InspectHeadResult
-	inspectResults []InspectHeadResult
-	inspectErrors  []error
-	inspectIndex   int
-	commitResult   CommitResult
-	createCalls    []CreateWorktreeInput
-	restoreCalls   []RestoreWorktreeInput
-	pushCalls      []PushInput
-	prepareCalls   []PrepareWorktreeInput
-	inspectCalls   []InspectHeadInput
-	commitCalls    []CommitInput
-	pushErrors     []error
-	pushIndex      int
+	createResult      CreateWorktreeResult
+	restoreResult     *RestoreWorktreeResult
+	restoreReturnsNil bool
+	prepareResult     PrepareWorktreeResult
+	inspectResult     InspectHeadResult
+	inspectResults    []InspectHeadResult
+	inspectErrors     []error
+	inspectIndex      int
+	commitResult      CommitResult
+	createCalls       []CreateWorktreeInput
+	restoreCalls      []RestoreWorktreeInput
+	pushCalls         []PushInput
+	prepareCalls      []PrepareWorktreeInput
+	inspectCalls      []InspectHeadInput
+	commitCalls       []CommitInput
+	pushErrors        []error
+	pushIndex         int
 }
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
@@ -4036,6 +4092,9 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 
 func (f *fakeGitGateway) RestoreWorktree(_ context.Context, input RestoreWorktreeInput) (*RestoreWorktreeResult, error) {
 	f.restoreCalls = append(f.restoreCalls, input)
+	if f.restoreReturnsNil {
+		return nil, nil
+	}
 	if f.restoreResult != nil {
 		return f.restoreResult, nil
 	}

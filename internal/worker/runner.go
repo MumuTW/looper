@@ -2048,7 +2048,37 @@ func (r *Runner) recoverWorkerWorktree(ctx context.Context, input stepInput, che
 		return worktree, &loopError{message: fmt.Sprintf("Worker worktree path %s for branch %s is stale (%s) and re-resolving registered git worktrees failed: %v", worktree.Path, branch, reason, restoreErr), kind: FailureRetryableAfterResume}
 	}
 	if restored == nil || strings.TrimSpace(restored.WorktreePath) == "" {
-		return worktree, staleWorkerWorktreeError(worktree, work, reason+" and no active git worktree is registered for that branch")
+		// No registered worktree to restore — the checkout dir was deleted (disk-pressure
+		// GC, manual cleanup, an orphaned add). The BRANCH is the source of truth: its
+		// commits are durable (committed locally and normally pushed to origin), so
+		// recreate a fresh worktree checked out to it and carry on. Worst case we lose only
+		// the uncommitted increment of the interrupted step, which the resumed agent redoes
+		// — never a reason to park the whole loop for a human. This replaces the old
+		// staleWorkerWorktreeError (a FailureManualIntervention dead-end that stranded the
+		// loop in paused forever with no reconciler to revive it).
+		created, createErr := r.git.CreateWorktree(ctx, CreateWorktreeInput{
+			ProjectID:         input.Project.ID,
+			RepoPath:          input.Project.RepoPath,
+			WorktreeRoot:      worktreeRoot,
+			Branch:            branch,
+			BaseBranch:        firstNonEmpty(worktree.BaseBranch, work.BaseBranch),
+			PRNumber:          work.PRNumber,
+			ProtectedBranches: compactStrings([]string{firstNonEmpty(worktree.BaseBranch, work.BaseBranch)}),
+		})
+		if createErr != nil {
+			// Recreation itself failed (a real git/disk fault, or the branch is unresolvable
+			// even after fetch). Retry after resume — a transient fault must not become a
+			// permanent manual-intervention park; if the branch is genuinely gone the retries
+			// surface it without silently stranding the loop.
+			return worktree, &loopError{message: fmt.Sprintf("Worker worktree path %s for branch %s is stale (%s) and recreating it from the branch failed: %v", worktree.Path, branch, reason, createErr), kind: FailureRetryableAfterResume}
+		}
+		restored = &RestoreWorktreeResult{
+			WorktreePath: created.WorktreePath,
+			Branch:       created.Branch,
+			BaseBranch:   created.BaseBranch,
+			HeadSHA:      created.HeadSHA,
+			WorktreeID:   created.WorktreeID,
+		}
 	}
 	recovered := worktree
 	recovered.Path = restored.WorktreePath
