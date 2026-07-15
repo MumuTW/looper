@@ -63,14 +63,14 @@ var fixerStepSequence = []FixerStep{
 
 type FixerStep string
 
-type QueueFailureKind string
+type QueueFailureKind = failureclass.Kind
 
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureRecoverableInfra     QueueFailureKind = "recoverable_infra"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = failureclass.RetryableTransient
+	FailureRetryableAfterResume = failureclass.RetryableAfterResume
+	FailureRecoverableInfra     = failureclass.RecoverableInfra
+	FailureNonRetryable         = failureclass.NonRetryable
+	FailureManualIntervention   = failureclass.ManualIntervention
 
 	noopResolveManualIntervention = "resolve-comments left review threads unresolved because fixer produced no new commits to push"
 	riskyConflictManualHold       = "risky conflict fixes require manual intervention"

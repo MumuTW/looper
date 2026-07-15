@@ -82,14 +82,14 @@ const (
 	reviewEventAgentNative    ReviewEvent = "AGENT_NATIVE"
 )
 
-type QueueFailureKind string
+type QueueFailureKind = failureclass.Kind
 
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureRecoverableInfra     QueueFailureKind = "recoverable_infra"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = failureclass.RetryableTransient
+	FailureRetryableAfterResume = failureclass.RetryableAfterResume
+	FailureRecoverableInfra     = failureclass.RecoverableInfra
+	FailureNonRetryable         = failureclass.NonRetryable
+	FailureManualIntervention   = failureclass.ManualIntervention
 )
 
 const (

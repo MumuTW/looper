@@ -9,6 +9,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -103,6 +104,9 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (storage.LoopRe
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
+		if metadata, stateErr := loopengine.Write(record.MetadataJSON, loopengine.FromLegacy(record.Status, "", nowISO)); stateErr == nil {
+			record.MetadataJSON = &metadata
+		}
 		if input.Status == domain.LoopStatusRunning {
 			record.NextRunAt = &nowISO
 		}
@@ -162,6 +166,9 @@ func (s *Service) TransitionStatus(ctx context.Context, loopID string, input Tra
 		updated := *loop
 		updated.Status = string(input.Status)
 		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		if metadata, stateErr := loopengine.Write(updated.MetadataJSON, loopengine.FromLegacy(updated.Status, "", updated.UpdatedAt)); stateErr == nil {
+			updated.MetadataJSON = &metadata
+		}
 		if input.NextRunAt != nil {
 			nextRunAt := eventlog.FormatJavaScriptISOString(*input.NextRunAt)
 			updated.NextRunAt = &nextRunAt
@@ -210,6 +217,9 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 		updated.Status = string(domain.LoopStatusPaused)
 		updated.NextRunAt = nil
 		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		if metadata, stateErr := loopengine.Write(updated.MetadataJSON, loopengine.FromLegacy(updated.Status, "manual_pause", updated.UpdatedAt)); stateErr == nil {
+			updated.MetadataJSON = &metadata
+		}
 		if err := repos.Loops.Upsert(ctx, updated); err != nil {
 			return PauseResult{}, err
 		}
@@ -249,6 +259,9 @@ func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) 
 		updated.Status = string(domain.LoopStatusTerminated)
 		updated.NextRunAt = nil
 		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		if metadata, stateErr := loopengine.Write(updated.MetadataJSON, loopengine.FromLegacy(updated.Status, "", updated.UpdatedAt)); stateErr == nil {
+			updated.MetadataJSON = &metadata
+		}
 		if err := repos.Loops.Upsert(ctx, updated); err != nil {
 			return TerminateResult{}, err
 		}

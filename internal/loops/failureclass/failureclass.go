@@ -43,6 +43,7 @@ const (
 	RecoverableInfra     Kind = "recoverable_infra"
 	NonRetryable         Kind = "non_retryable"
 	ManualIntervention   Kind = "manual_intervention"
+	HITLInterrupt        Kind = "hitl_interrupt"
 )
 
 type Context struct {

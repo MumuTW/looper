@@ -9,6 +9,7 @@ import (
 	"github.com/nexu-io/looper/internal/e2e/harness"
 	"github.com/nexu-io/looper/internal/loops"
 	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -70,6 +71,9 @@ func TestBlockedConditionAnsweredWhileDaemonDownResumesOnBoot(t *testing.T) {
 		if err == nil && loop != nil && loop.Status == "queued" {
 			if _, ok := loopcondition.Read(loop.MetadataJSON); ok {
 				t.Fatal("blocked condition remained after boot reconciliation")
+			}
+			if state, ok := loopengine.Read(loop.MetadataJSON); !ok || state.Phase != loopengine.PhaseRunning {
+				t.Fatalf("lifecycle state after resume = %#v, present=%v", state, ok)
 			}
 			active, queueErr := liveRepositories.Queue.FindActiveByLoopID(context.Background(), loopID)
 			if queueErr != nil || active == nil || active.Status != "queued" {

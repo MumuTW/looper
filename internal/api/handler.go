@@ -27,6 +27,7 @@ import (
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/loops"
 	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
@@ -1377,6 +1378,9 @@ type loopRelationships struct {
 	PullRequestURL string `json:"pullRequestUrl,omitempty"`
 	ActionURL      string `json:"actionUrl,omitempty"`
 	BlockedOn      string `json:"blockedOn,omitempty"`
+	Phase          string `json:"phase"`
+	Outcome        string `json:"outcome,omitempty"`
+	DeadReason     string `json:"deadReason,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -4845,6 +4849,15 @@ func loopRelationshipsFromRecord(loop storage.LoopRecord) loopRelationships {
 		Title:     firstString(metadata["title"], worker["title"]),
 		SourceURL: firstString(metadata["issueUrl"], worker["issueUrl"]),
 	}
+	state, ok := loopengine.Read(loop.MetadataJSON)
+	if !ok {
+		condition := ""
+		if blocked, found := loopcondition.Read(loop.MetadataJSON); found {
+			condition = string(blocked.Kind)
+		}
+		state = loopengine.FromLegacy(loop.Status, condition, loop.UpdatedAt)
+	}
+	rel.Phase, rel.Outcome, rel.DeadReason = string(state.Phase), state.Outcome, state.Reason
 	if strings.Contains(strings.ToLower(rel.SourceURL), "plane") {
 		rel.PlaneURL = rel.SourceURL
 	}

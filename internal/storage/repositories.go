@@ -1263,6 +1263,14 @@ func (r *LocksRepository) Release(ctx context.Context, key string) error {
 	return nil
 }
 
+func (r *LocksRepository) ReleaseOwned(ctx context.Context, key, owner string) error {
+	_, err := r.q.ExecContext(ctx, `DELETE FROM locks WHERE key = ? AND owner = ?`, key, owner)
+	if err != nil {
+		return fmt.Errorf("release owned lock: %w", err)
+	}
+	return nil
+}
+
 func (r *LocksRepository) Get(ctx context.Context, key string) (*LockRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM locks WHERE key = ?`, key)
 	record, err := scanLock(row)

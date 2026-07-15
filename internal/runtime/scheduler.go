@@ -26,6 +26,8 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/infra/planedoc"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
@@ -711,7 +713,22 @@ type plannerAgentExecutorAdapter struct {
 	executor *agent.ConfiguredExecutor
 	registry *ActiveExecutionRegistry
 }
-type plannerAgentExecutionAdapter struct{ execution agent.Execution }
+
+type convertedAgentExecution[T any] struct {
+	execution agent.Execution
+	convert   func(agent.Result) T
+}
+
+func (a convertedAgentExecution[T]) Wait(ctx context.Context) (T, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return a.convert(result), nil
+}
+
+func (a convertedAgentExecution[T]) Kill(reason string) error { return a.execution.Kill(reason) }
 
 func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
 	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
@@ -728,15 +745,9 @@ func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.Ag
 		_, _ = execution.Wait(context.Background())
 		unregister()
 	}()
-	return plannerAgentExecutionAdapter{execution: execution}, nil
-}
-
-func (a plannerAgentExecutionAdapter) Wait(ctx context.Context) (planner.AgentResult, error) {
-	result, err := a.execution.Wait(ctx)
-	if err != nil {
-		return planner.AgentResult{}, err
-	}
-	return planner.AgentResult{Status: result.Status, Summary: result.Summary, ProductAsk: result.ProductAsk, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, Interrupted: result.Interrupted}, nil
+	return convertedAgentExecution[planner.AgentResult]{execution: execution, convert: func(result agent.Result) planner.AgentResult {
+		return planner.AgentResult{Status: result.Status, Summary: result.Summary, ProductAsk: result.ProductAsk, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, Interrupted: result.Interrupted}
+	}}, nil
 }
 
 type reviewerGitHubAdapter struct {
@@ -1058,7 +1069,6 @@ func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input re
 }
 
 type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
-type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
 
 type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
 
@@ -1087,19 +1097,9 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 	if err != nil {
 		return nil, err
 	}
-	return reviewerAgentExecutionAdapter{execution: execution}, nil
-}
-
-func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.AgentResult, error) {
-	result, err := a.execution.Wait(ctx)
-	if err != nil {
-		return reviewer.AgentResult{}, err
-	}
-	return reviewer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
-}
-
-func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
-	return a.execution.Kill(reason)
+	return convertedAgentExecution[reviewer.AgentResult]{execution: execution, convert: func(result agent.Result) reviewer.AgentResult {
+		return reviewer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
+	}}, nil
 }
 
 type fixerGitHubAdapter struct {
@@ -1446,22 +1446,15 @@ func (a fixerGitAdapter) CleanupWorktree(ctx context.Context, input fixer.Cleanu
 }
 
 type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
-type fixerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
 	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
 	if err != nil {
 		return nil, err
 	}
-	return fixerAgentExecutionAdapter{execution: execution}, nil
-}
-
-func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult, error) {
-	result, err := a.execution.Wait(ctx)
-	if err != nil {
-		return fixer.AgentResult{}, err
-	}
-	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+	return convertedAgentExecution[fixer.AgentResult]{execution: execution, convert: func(result agent.Result) fixer.AgentResult {
+		return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
+	}}, nil
 }
 
 type workerGitHubAdapter struct {
@@ -1903,9 +1896,6 @@ type workerAgentExecutorAdapter struct {
 	executor *agent.ConfiguredExecutor
 	registry *ActiveExecutionRegistry
 }
-type workerAgentExecutionAdapter struct {
-	execution agent.Execution
-}
 
 func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
 	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
@@ -1920,19 +1910,9 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 		_, _ = execution.Wait(context.Background())
 		unregister()
 	}()
-	return workerAgentExecutionAdapter{execution: execution}, nil
-}
-
-func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResult, error) {
-	result, err := a.execution.Wait(ctx)
-	if err != nil {
-		return worker.AgentResult{}, err
-	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
-}
-
-func (a workerAgentExecutionAdapter) Kill(reason string) error {
-	return a.execution.Kill(reason)
+	return convertedAgentExecution[worker.AgentResult]{execution: execution, convert: func(result agent.Result) worker.AgentResult {
+		return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
+	}}, nil
 }
 
 func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), shepherd webhookforward.TargetedShepherd) defaultSchedulerHandlers {
@@ -2834,6 +2814,9 @@ func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, inpu
 	if err != nil || loop == nil {
 		return false
 	}
+	if state, ok := loopengine.Read(loop.MetadataJSON); ok && state.Phase == loopengine.PhaseBlocked && (state.Condition == "manual_pause" || state.Condition == "human_takeover") {
+		return true
+	}
 	switch loop.Status {
 	case "human_takeover", "paused":
 		return true
@@ -2888,7 +2871,7 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			continue
 		}
 		item := item
-		processFn := process
+		processFn := withLifecycleLease(item, input, process)
 
 		if input.AsyncRunner != nil {
 			input.AsyncRunner.Go(func() {
@@ -2908,6 +2891,62 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		return nil
 	}
 	return errors.Join(errList...)
+}
+
+func withLifecycleLease(item storage.QueueItemRecord, input defaultSchedulerTickInput, process func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if item.LoopID == nil || strings.TrimSpace(*item.LoopID) == "" || input.Repos == nil || input.Repos.Locks == nil {
+			return process(ctx)
+		}
+		loopID := strings.TrimSpace(*item.LoopID)
+		now := input.Now
+		if now == nil {
+			now = time.Now
+		}
+		lease := loopengine.StorageLease{Locks: input.Repos.Locks, Key: "lifecycle:" + loopID, Owner: item.ID, TTL: 2 * time.Hour, Now: now}
+		acquired, err := lease.Acquire(ctx)
+		if err != nil {
+			return err
+		}
+		if !acquired {
+			// This claimed item is a duplicate reconcile attempt. The lease owner is
+			// already advancing the loop, so retire only this queue row.
+			if input.Repos.Queue != nil {
+				_ = input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
+			}
+			return nil
+		}
+		defer func() { _ = lease.Release(context.Background()) }()
+		syncLifecycleState(ctx, input.Repos, loopID, now)
+		err = process(ctx)
+		syncLifecycleState(ctx, input.Repos, loopID, now)
+		return err
+	}
+}
+
+func syncLifecycleState(ctx context.Context, repositories *storage.Repositories, loopID string, now func() time.Time) {
+	if repositories == nil || repositories.Loops == nil {
+		return
+	}
+	loop, err := repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return
+	}
+	condition := ""
+	if blocked, ok := loopcondition.Read(loop.MetadataJSON); ok {
+		condition = string(blocked.Kind)
+	}
+	state := loopengine.FromLegacy(loop.Status, condition, formatJavaScriptISOString(now().UTC()))
+	if current, ok := loopengine.Read(loop.MetadataJSON); ok && current.Phase == state.Phase && current.Condition == state.Condition && current.Outcome == state.Outcome && current.Reason == state.Reason {
+		return
+	}
+	metadata, err := loopengine.Write(loop.MetadataJSON, state)
+	if err != nil {
+		return
+	}
+	loop.MetadataJSON = &metadata
+	loop.UpdatedAt = state.UpdatedAt
+	_ = repositories.Loops.Upsert(ctx, *loop)
 }
 
 func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {

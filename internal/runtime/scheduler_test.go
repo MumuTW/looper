@@ -24,10 +24,10 @@ import (
 	"github.com/nexu-io/looper/internal/worker"
 )
 
-func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
+func TestConvertedAgentExecutionPropagatesResult(t *testing.T) {
 	t.Parallel()
 
-	adapter := workerAgentExecutionAdapter{execution: stubAgentExecution{result: agent.Result{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", ChangedFiles: []string{"worker.go"}, Commits: []string{"abc123"}}}}
+	adapter := convertedAgentExecution[agent.Result]{execution: stubAgentExecution{result: agent.Result{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", ChangedFiles: []string{"worker.go"}, Commits: []string{"abc123"}}}, convert: func(result agent.Result) agent.Result { return result }}
 
 	result, err := adapter.Wait(context.Background())
 	if err != nil {

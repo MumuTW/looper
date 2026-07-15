@@ -58,19 +58,19 @@ var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree,
 
 type PlannerStep string
 
-type QueueFailureKind string
+type QueueFailureKind = failureclass.Kind
 
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureRecoverableInfra     QueueFailureKind = "recoverable_infra"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = failureclass.RetryableTransient
+	FailureRetryableAfterResume = failureclass.RetryableAfterResume
+	FailureRecoverableInfra     = failureclass.RecoverableInfra
+	FailureNonRetryable         = failureclass.NonRetryable
+	FailureManualIntervention   = failureclass.ManualIntervention
 	// FailureHITLInterrupt marks a step whose agent was deliberately killed to answer a
 	// human's mid-run @bot (强操控). It is NOT a real failure: the run completes as
 	// "interrupted" and is re-dispatched immediately so follow-up-resume answers them
 	// from the MAIN session, without counting against the retry cap.
-	FailureHITLInterrupt QueueFailureKind = "hitl_interrupt"
+	FailureHITLInterrupt = failureclass.HITLInterrupt
 )
 
 // plannerInterruptError signals that the step's agent was killed by a human mid-run

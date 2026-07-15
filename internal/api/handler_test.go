@@ -6730,4 +6730,5 @@ func TestLoopsListIncludesQueryableRelationshipsOnRequest(t *testing.T) {
 	relationships := items[0].(map[string]any)["relationships"].(map[string]any)
 	assertEqual(t, relationships["actionUrl"], "https://plane.example/pages/p#comment-c")
 	assertEqual(t, relationships["pullRequestUrl"], "https://github.com/acme/looper/pull/9")
+	assertEqual(t, relationships["phase"], "blocked")
 }

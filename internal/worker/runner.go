@@ -48,11 +48,11 @@ const (
 	// the start-step resolver forces it via the durable `$.shepherd.active` marker.
 	stepShepherd WorkerStep = "shepherd"
 
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureRecoverableInfra     QueueFailureKind = "recoverable_infra"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = failureclass.RetryableTransient
+	FailureRetryableAfterResume = failureclass.RetryableAfterResume
+	FailureRecoverableInfra     = failureclass.RecoverableInfra
+	FailureNonRetryable         = failureclass.NonRetryable
+	FailureManualIntervention   = failureclass.ManualIntervention
 
 	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
@@ -90,7 +90,7 @@ var workerStepSequence = []WorkerStep{
 
 type WorkerStep string
 
-type QueueFailureKind string
+type QueueFailureKind = failureclass.Kind
 
 type PullRequestSummary struct {
 	Number      int64

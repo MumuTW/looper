@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/loops"
 	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -25,7 +26,7 @@ func (r *Runtime) reconcileBlockedConditions(ctx context.Context) {
 	logger := r.logger
 	gateway := r.githubGateway
 	r.mu.RUnlock()
-	if repositories == nil || repositories.Loops == nil || repositories.Queue == nil {
+	if repositories == nil || repositories.Loops == nil || repositories.Queue == nil || repositories.Locks == nil {
 		return
 	}
 	if now == nil {
@@ -37,36 +38,44 @@ func (r *Runtime) reconcileBlockedConditions(ctx context.Context) {
 		return
 	}
 	for _, loop := range blocked {
-		record, inferred := effectiveBlockedCondition(loop)
-		if !record.Valid() {
+		lease := loopengine.StorageLease{Locks: repositories.Locks, Key: "lifecycle:" + loop.ID, Owner: "blocked-condition-reconciler", TTL: time.Minute, Now: now}
+		acquired, leaseErr := lease.Acquire(ctx)
+		if leaseErr != nil || !acquired {
 			continue
 		}
-		check := registry[record.Kind]
-		if check == nil {
-			continue
-		}
-		ready, checkErr := check(ctx, loop, record)
-		if checkErr != nil {
+		func() {
+			defer func() { _ = lease.Release(context.Background()) }()
+			record, inferred := effectiveBlockedCondition(loop)
+			if !record.Valid() {
+				return
+			}
+			check := registry[record.Kind]
+			if check == nil {
+				return
+			}
+			ready, checkErr := check(ctx, loop, record)
+			if checkErr != nil {
+				if logger != nil {
+					logger.Warn("blocked condition reconcile failed", map[string]any{"loopId": loop.ID, "condition": record.Kind, "error": checkErr.Error()})
+				}
+				return
+			}
+			if !ready {
+				if inferred {
+					r.persistInferredBlockedCondition(ctx, repositories, loop, record, now)
+				}
+				return
+			}
+			if err := resumeBlockedLoop(ctx, repositories, loop, record, now); err != nil {
+				if logger != nil {
+					logger.Warn("blocked condition cleared but loop requeue failed", map[string]any{"loopId": loop.ID, "condition": record.Kind, "error": err.Error()})
+				}
+				return
+			}
 			if logger != nil {
-				logger.Warn("blocked condition reconcile failed", map[string]any{"loopId": loop.ID, "condition": record.Kind, "error": checkErr.Error()})
+				logger.Info("resumed loop after blocked condition cleared", map[string]any{"loopId": loop.ID, "condition": record.Kind})
 			}
-			continue
-		}
-		if !ready {
-			if inferred {
-				r.persistInferredBlockedCondition(ctx, repositories, loop, record, now)
-			}
-			continue
-		}
-		if err := resumeBlockedLoop(ctx, repositories, loop, record, now); err != nil {
-			if logger != nil {
-				logger.Warn("blocked condition cleared but loop requeue failed", map[string]any{"loopId": loop.ID, "condition": record.Kind, "error": err.Error()})
-			}
-			continue
-		}
-		if logger != nil {
-			logger.Info("resumed loop after blocked condition cleared", map[string]any{"loopId": loop.ID, "condition": record.Kind})
-		}
+		}()
 	}
 }
 
@@ -257,6 +266,9 @@ func resumeBlockedLoop(ctx context.Context, repositories *storage.Repositories, 
 	current.Status = "queued"
 	current.NextRunAt = &availableAt
 	current.UpdatedAt = nowISO
+	if stateJSON, stateErr := loopengine.Write(current.MetadataJSON, loopengine.FromLegacy(current.Status, "", nowISO)); stateErr == nil {
+		current.MetadataJSON = &stateJSON
+	}
 	if err := repositories.Loops.Upsert(ctx, *current); err != nil {
 		return err
 	}

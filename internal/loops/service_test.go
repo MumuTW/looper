@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/domain"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -32,6 +33,9 @@ func TestServiceCreateAndPauseResumeLoop(t *testing.T) {
 	if loop.Seq != 1 {
 		t.Fatalf("Create().Seq = %d, want 1", loop.Seq)
 	}
+	if state, ok := loopengine.Read(loop.MetadataJSON); !ok || state.Phase != loopengine.PhaseRunning {
+		t.Fatalf("created lifecycle state = %#v, present=%v", state, ok)
+	}
 
 	reason := "pause for test"
 	paused, err := service.Pause(ctx, loop.ID, &reason)
@@ -40,6 +44,9 @@ func TestServiceCreateAndPauseResumeLoop(t *testing.T) {
 	}
 	if paused.Loop.Status != string(domain.LoopStatusPaused) {
 		t.Fatalf("Pause().Loop.Status = %q, want paused", paused.Loop.Status)
+	}
+	if state, ok := loopengine.Read(paused.Loop.MetadataJSON); !ok || state.Phase != loopengine.PhaseBlocked || state.Condition != "manual_pause" {
+		t.Fatalf("paused lifecycle state = %#v, present=%v", state, ok)
 	}
 
 	resumed, err := service.Resume(ctx, loop.ID)
