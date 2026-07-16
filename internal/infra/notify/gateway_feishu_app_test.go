@@ -739,6 +739,38 @@ func TestLoopTaskKeyFromRecordCollapsesSiblingLoops(t *testing.T) {
 	}
 }
 
+func TestFeishuThreadHeaderCardLinksCheckpointIssueURL(t *testing.T) {
+	ctx := context.Background()
+	coordinator := openNotifyCoordinator(t, t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-07-16T02:00:00.000Z"
+	projectID := "project_checkpoint_link"
+	loopID := "loop_checkpoint_link"
+	target := "issue:nexu-io/open-design:582"
+	repo := "nexu-io/open-design"
+	metadata := `{"issueNumber":582,"title":"High-fidelity export"}`
+	checkpoint := `{"issue":{"url":"https://plane.example/open-design/browse/OPEND-582"}}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "running", MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_checkpoint_link", LoopID: loopID, Status: "running", CheckpointJSON: &checkpoint, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	gateway := NewGateway(Options{Repositories: repos})
+	card, ok := gateway.feishuThreadHeaderCard(ctx, loopID)
+	if !ok {
+		t.Fatal("feishuThreadHeaderCard() did not render")
+	}
+	want := `[Issue #582](https://plane.example/open-design/browse/OPEND-582)`
+	if !strings.Contains(card, want) {
+		t.Fatalf("checkpoint issue reference is not clickable; want %q in %s", want, card)
+	}
+}
+
 // cardText concatenates all lark_md element contents from a card JSON, decoded
 // (so JSON < escapes appear as the < the way Feishu renders them).
 func cardText(t *testing.T, card []byte) string {

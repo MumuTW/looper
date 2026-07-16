@@ -163,6 +163,38 @@ func TestResumeBlockedLoopClearsConditionAndRequeues(t *testing.T) {
 	}
 }
 
+func TestResumeProductSpecLoopClearsLegacyWaitMarker(t *testing.T) {
+	repositories := newEnqueueTestRepos(t)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "project_product_spec_resume"
+	loopID := "loop_product_spec_resume"
+	repo := "owner/repo"
+	targetID := "issue:owner/repo:42"
+	metadata := `{"awaitingProductSpec":true,"blockedCondition":{"kind":"product_spec","since":"2026-07-15T11:00:00.000Z"}}`
+	if err := repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: loopID, Seq: 2, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repositories.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	if err := resumeBlockedLoop(ctx, repositories, loop, loopcondition.Record{Kind: loopcondition.ProductSpec}, func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || got == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", got, err)
+	}
+	if metadataBool(got.MetadataJSON, "awaitingProductSpec") {
+		t.Fatalf("awaitingProductSpec remained true after resume: %s", derefString(got.MetadataJSON))
+	}
+	if _, inferred := effectiveBlockedCondition(*got); inferred {
+		t.Fatalf("resumed loop still infers product-spec blocking: %s", derefString(got.MetadataJSON))
+	}
+}
+
 func TestDiskConditionClearedUsesHighWatermark(t *testing.T) {
 	original := diskUsageStat
 	t.Cleanup(func() { diskUsageStat = original })

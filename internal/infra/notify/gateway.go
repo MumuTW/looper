@@ -1275,11 +1275,13 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	// Source = where the task CAME FROM (the originating issue), kept stable even
 	// after the loop target flips to the PR it opens — so the anchor never relabels
 	// its own source line as "PR" (which mismatched the issue link before).
-	issueURL := loopWorkerString(loop.MetadataJSON, "issueUrl")
+	issueURL := g.loopIssueURL(ctx, loop)
 	sourceLabel, sourceURL := "", ""
 	if issueURL != "" {
 		sourceLabel = "Issue"
-		if n := urlTrailingNumber(issueURL); n != "" {
+		if n := loopIssueNumber(loop.MetadataJSON); n > 0 {
+			sourceLabel = fmt.Sprintf("Issue #%d", n)
+		} else if n := urlTrailingNumber(issueURL); n != "" {
 			sourceLabel = "Issue #" + n
 		}
 		sourceURL = issueURL
@@ -1400,6 +1402,35 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 		return "", false
 	}
 	return string(raw), true
+}
+
+// loopIssueURL resolves the originating issue URL for an anchor card. Current
+// loops persist it in metadata, but older or checkpoint-resumed planners may only
+// have it in their latest run checkpoint. Falling back keeps the source reference
+// clickable while those loops converge onto the current metadata shape.
+func (g *Gateway) loopIssueURL(ctx context.Context, loop *storage.LoopRecord) string {
+	if loop == nil {
+		return ""
+	}
+	if issueURL := loopWorkerString(loop.MetadataJSON, "issueUrl"); issueURL != "" {
+		return issueURL
+	}
+	if g.repositories == nil || g.repositories.Runs == nil {
+		return ""
+	}
+	run, err := g.repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil || run == nil || run.CheckpointJSON == nil {
+		return ""
+	}
+	var checkpoint struct {
+		Issue *struct {
+			URL string `json:"url"`
+		} `json:"issue"`
+	}
+	if json.Unmarshal([]byte(*run.CheckpointJSON), &checkpoint) != nil || checkpoint.Issue == nil {
+		return ""
+	}
+	return strings.TrimSpace(checkpoint.Issue.URL)
 }
 
 // feishuLoopStatusTerminal reports whether a loop has reached an end state — no

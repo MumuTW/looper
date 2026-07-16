@@ -340,6 +340,12 @@ func resumeBlockedLoop(ctx context.Context, repositories *storage.Repositories, 
 	if err != nil {
 		return err
 	}
+	if record.Kind == loopcondition.ProductSpec {
+		metadata, err = writeMetadataBool(metadata, "awaitingProductSpec", false)
+		if err != nil {
+			return err
+		}
+	}
 	current.MetadataJSON = &metadata
 	current.Status = "queued"
 	current.NextRunAt = &availableAt
@@ -361,6 +367,19 @@ func resumeBlockedLoop(ctx context.Context, repositories *storage.Repositories, 
 		PayloadJSON: payload,
 		CreatedAt:   nowISO,
 	})
+}
+
+func writeMetadataBool(metadataJSON, key string, value bool) (string, error) {
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+		return "", err
+	}
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	metadata[key] = value
+	payload, err := json.Marshal(metadata)
+	return string(payload), err
 }
 
 func diskConditionCleared(cfg *config.Config) (bool, error) {
