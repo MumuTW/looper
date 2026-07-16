@@ -1287,7 +1287,26 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				}
 				continue
 			}
-			if running {
+			// Reap when the leader is still live, and also when the leader has
+			// already exited but the executor-created process group still has
+			// descendants (for example TERM-ignoring grandchildren). Marking
+			// the execution terminal while the group is live would reopen the
+			// scheduler against a worktree that can still mutate.
+			needsTermination := running
+			if !running {
+				groupExited, probeErr := r.recoveredProcessGroupExited(pid)
+				if probeErr != nil {
+					if r.logger != nil {
+						r.logger.Warn("failed to probe orphan agent process group", map[string]any{"executionId": execution.ID, "pid": pid, "error": probeErr.Error()})
+					}
+					if err := protectUncertainExecution(execution, pid, "orphan_cleanup_group_probe_error"); err != nil {
+						return RecoverySummary{}, err
+					}
+					continue
+				}
+				needsTermination = !groupExited
+			}
+			if needsTermination {
 				if err := r.terminateRecoveredExecution(ctx, execution, pid, 5*time.Second); err != nil {
 					if r.logger != nil {
 						r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
@@ -2779,11 +2798,16 @@ func (r *Runtime) terminateRecoveredExecution(ctx context.Context, execution sto
 		return err
 	}
 	if leaderExited {
-		groupExited, probeErr := observeOwnedGroup()
-		if probeErr != nil || groupExited {
+		// Leader PID is gone: the persisted PID is still the process-group ID
+		// from Setpgid. Probe that group and, when descendants remain, escalate
+		// TERM→KILL without requiring a live matching leader first.
+		groupExited, probeErr := r.recoveredProcessGroupExited(pid)
+		if probeErr != nil {
 			return probeErr
 		}
-		return fmt.Errorf("execution %s leader pid %d exited before recovery established process-group ownership", execution.ID, pid)
+		if groupExited {
+			return nil
+		}
 	}
 	if err := r.signalAgentProcessGroup(pid, syscall.SIGTERM); err != nil {
 		if !errors.Is(err, syscall.ESRCH) {
@@ -2796,7 +2820,12 @@ func (r *Runtime) terminateRecoveredExecution(ctx context.Context, execution sto
 		if groupExited {
 			return nil
 		}
-		return fmt.Errorf("execution %s process group %d rejected recovery SIGTERM but remains live", execution.ID, pid)
+		// SIGTERM returned ESRCH but the group probe still sees members (for
+		// example a race where the leader vanished mid-call). Continue to
+		// SIGKILL escalation rather than stranding descendants.
+		if !leaderExited {
+			return fmt.Errorf("execution %s process group %d rejected recovery SIGTERM but remains live", execution.ID, pid)
+		}
 	}
 	exited, err := waitForRecoveredExecutionExit(ctx, grace, observeOwnedGroup)
 	if err != nil || exited {

@@ -1776,6 +1776,70 @@ func TestTerminateRecoveredExecutionEscalatesOnlyWhileIdentityMatchesAndAwaitsEx
 	}
 }
 
+func TestTerminateRecoveredExecutionReapsProcessGroupAfterLeaderAlreadyExited(t *testing.T) {
+	t.Parallel()
+
+	groupRunning := true
+	var signals []syscall.Signal
+	rt := New(Options{
+		ReadProcessCommand: func(context.Context, int) (string, error) {
+			// Leader PID is already gone at recovery time.
+			return "", nil
+		},
+		SignalProcess: func(pid int, signal syscall.Signal) error {
+			if pid != -4242 {
+				t.Fatalf("SignalProcess pid = %d, want -4242", pid)
+			}
+			if signal == 0 {
+				if groupRunning {
+					return nil
+				}
+				return syscall.ESRCH
+			}
+			signals = append(signals, signal)
+			if signal == syscall.SIGKILL {
+				groupRunning = false
+			}
+			return nil
+		},
+	})
+	execution := storage.AgentExecutionRecord{ID: "exec_leader_gone", CommandJSON: stringPtr(`{"command":"codex","args":["exec","test"]}`)}
+	if err := rt.terminateRecoveredExecution(context.Background(), execution, 4242, 10*time.Millisecond); err != nil {
+		t.Fatalf("terminateRecoveredExecution() error = %v", err)
+	}
+	if !slices.Equal(signals, []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL}) {
+		t.Fatalf("signals = %#v, want TERM then KILL for leader-gone process group", signals)
+	}
+	if groupRunning {
+		t.Fatal("terminateRecoveredExecution returned before process group exit")
+	}
+}
+
+func TestTerminateRecoveredExecutionNoopsWhenLeaderAndProcessGroupAlreadyExited(t *testing.T) {
+	t.Parallel()
+
+	var signals []syscall.Signal
+	rt := New(Options{
+		ReadProcessCommand: func(context.Context, int) (string, error) {
+			return "", nil
+		},
+		SignalProcess: func(pid int, signal syscall.Signal) error {
+			if signal == 0 {
+				return syscall.ESRCH
+			}
+			signals = append(signals, signal)
+			return nil
+		},
+	})
+	execution := storage.AgentExecutionRecord{ID: "exec_already_gone", CommandJSON: stringPtr(`{"command":"codex","args":["exec","test"]}`)}
+	if err := rt.terminateRecoveredExecution(context.Background(), execution, 4242, 10*time.Millisecond); err != nil {
+		t.Fatalf("terminateRecoveredExecution() error = %v", err)
+	}
+	if len(signals) != 0 {
+		t.Fatalf("signals = %#v, want no termination signals when leader and group are gone", signals)
+	}
+}
+
 func TestTerminateRecoveredExecutionFinishesAfterStartupContextCancellation(t *testing.T) {
 	t.Parallel()
 

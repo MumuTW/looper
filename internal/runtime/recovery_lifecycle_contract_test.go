@@ -235,6 +235,137 @@ func TestStartupRecoveryReapsDescendantAfterLeaderExitsOnTERMBeforeSchedulerTick
 	}
 }
 
+// TestStartupRecoveryReapsDescendantWhenLeaderAlreadyExitedBeforeRestart covers the
+// restart window where the agent leader has already exited but a TERM-resistant
+// descendant still holds the executor-created process group. Recovery must reap
+// that group before the scheduler becomes visible.
+func TestStartupRecoveryReapsDescendantWhenLeaderAlreadyExitedBeforeRestart(t *testing.T) {
+	workingDir := t.TempDir()
+	script := filepath.Join(workingDir, "leader-already-exited-orphan.sh")
+	descendantPIDFile := filepath.Join(workingDir, "descendant.pid")
+	readyFile := filepath.Join(workingDir, "ready")
+	// Leader exits immediately after spawning a TERM-resistant child that keeps
+	// the process group alive under the leader's PGID.
+	scriptBody := "#!/bin/sh\n" +
+		"/bin/sh -c 'trap \"\" TERM HUP; echo $$ > \"$DESCENDANT_PID_FILE\"; : > \"$READY_FILE\"; while :; do sleep 1; done' &\n" +
+		"while [ ! -s \"$DESCENDANT_PID_FILE\" ]; do sleep 0.01; done\n" +
+		"exit 0\n"
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("write orphan script: %v", err)
+	}
+	cmd := exec.Command("/bin/sh", script)
+	cmd.Env = append(os.Environ(), "READY_FILE="+readyFile, "DESCENDANT_PID_FILE="+descendantPIDFile)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start orphan: %v", err)
+	}
+	leaderPID := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("leader Wait() error = %v", err)
+	}
+	waitForRecoveryContractFile(t, readyFile)
+	rawDescendantPID, err := os.ReadFile(descendantPIDFile)
+	if err != nil {
+		t.Fatalf("read descendant pid: %v", err)
+	}
+	descendantPID, err := strconv.Atoi(strings.TrimSpace(string(rawDescendantPID)))
+	if err != nil || descendantPID <= 0 {
+		t.Fatalf("parse descendant pid %q: %v", rawDescendantPID, err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-leaderPID, syscall.SIGKILL)
+		_ = syscall.Kill(descendantPID, syscall.SIGKILL)
+	})
+	if err := syscall.Kill(descendantPID, 0); err != nil {
+		t.Fatalf("descendant %d not live before recovery: %v", descendantPID, err)
+	}
+	if !recoveryProcessGroupExists(leaderPID) {
+		t.Fatalf("process group %d not live before recovery", leaderPID)
+	}
+	// Leader must already be gone so executionMatchesProcess reports running=false.
+	if live, err := shellinfra.ProcessRunnable(leaderPID); err != nil {
+		t.Fatalf("ProcessRunnable(leader) error = %v", err)
+	} else if live {
+		t.Fatalf("leader pid %d still runnable; test requires leader already exited", leaderPID)
+	}
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_leader_gone", Name: "Project", RepoPath: workingDir}}
+	nowISO := formatJavaScriptISOString(time.Now().UTC().Add(-time.Hour))
+	seed := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	repos := storage.NewRepositories(seed.DB())
+	projectID := "project_leader_gone"
+	loopID := "loop_leader_gone"
+	runID := "run_leader_gone"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: workingDir, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("execute"), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	commandJSON, err := json.Marshal(map[string]any{"command": "/bin/sh", "args": []string{script}})
+	if err != nil {
+		t.Fatalf("marshal command metadata: %v", err)
+	}
+	leaderPID64 := int64(leaderPID)
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_leader_gone", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &leaderPID64, CommandJSON: stringPtr(string(commandJSON)), CWD: &workingDir, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("seed coordinator close: %v", err)
+	}
+
+	ticked := make(chan struct{}, 1)
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error {
+			if recoveryProcessGroupExists(leaderPID) {
+				t.Errorf("scheduler ticked while orphan process group %d was still live", leaderPID)
+			}
+			if err := syscall.Kill(descendantPID, 0); err == nil || !errors.Is(err, syscall.ESRCH) {
+				t.Errorf("scheduler ticked while orphan descendant %d was still live: %v", descendantPID, err)
+			}
+			select {
+			case ticked <- struct{}{}:
+			default:
+			}
+			return nil
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Runtime.Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+	select {
+	case <-ticked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler did not start after leader-already-exited process-group recovery")
+	}
+	if recoveryProcessGroupExists(leaderPID) {
+		t.Fatalf("orphan process group %d survived startup recovery after leader exit", leaderPID)
+	}
+	if err := syscall.Kill(descendantPID, 0); err == nil || !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("orphan descendant %d survived startup recovery: %v", descendantPID, err)
+	}
+	execution, err := rt.Services().Repositories.AgentExecutions.GetByID(context.Background(), "exec_leader_gone")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if execution == nil || execution.Status != "killed" {
+		t.Fatalf("recovered execution = %#v, want killed", execution)
+	}
+}
+
 func waitForRecoveryContractFile(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
