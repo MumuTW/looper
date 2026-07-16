@@ -141,6 +141,22 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 	}
 	signal := foldShepherdSignal(pr)
 	if signal == marker.LastSignal {
+		// A shepherd pass stamps the durable phase to "fixing" while the agent is
+		// running. The pass can finish without changing the PR signal (for example,
+		// a final read-only sweep after approval + green CI). In that case the old
+		// early return left the Feishu card permanently stuck on 修复中 even though
+		// the live PR was already awaiting QA/merge. Always reconcile phase drift
+		// from the live PR before resting, even when the wake signal is unchanged.
+		if syncShepherdPhase(&marker, pr) {
+			r.reportShepherdPhase(ctx, &marker, loop, prNumber, prValidated(pr))
+			if newMeta, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
+				if newMeta, werr = loopcondition.Set(&newMeta, shepherdRestingCondition(pr, signal, nowISO)); werr == nil {
+					r.persistLoopMetadata(ctx, repositories, loop.ID, newMeta, nowISO)
+					r.refreshShepherdCard(ctx, loop.ID)
+				}
+			}
+			return
+		}
 		r.persistShepherdBlockedCondition(ctx, repositories, loop, shepherdRestingCondition(pr, signal, nowISO), nowISO)
 		return
 	}
@@ -150,8 +166,7 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 	// off. No extra gh call — reuses the detail already fetched this tick.
 	r.captureShepherdSnapshot(ctx, repositories, gateway, loop, repo, prNumber, pr, nowISO)
 	marker.LastSignal = signal
-	marker.Phase = shepherdPhaseFor(pr)
-	marker.HeadSHA = pr.HeadSHA
+	syncShepherdPhase(&marker, pr)
 	// Milestone thread note + @-mention on entering a report-worthy phase, BEFORE we
 	// persist — so LastReportedPhase is saved and the next pass doesn't double-post.
 	r.reportShepherdPhase(ctx, &marker, loop, prNumber, prValidated(pr))
@@ -429,6 +444,21 @@ func shepherdPhaseFor(pr githubinfra.PullRequestDetail) string {
 		return "awaiting_merge"
 	}
 	return "reviewing"
+}
+
+// syncShepherdPhase updates the durable card phase from the current PR snapshot.
+// It intentionally runs independently of the folded wake signal: an agent pass
+// temporarily stamps "fixing", so phase can drift even while GitHub state remains
+// unchanged. Returns true only when the persisted phase needs a refresh.
+func syncShepherdPhase(marker *loops.Shepherd, pr githubinfra.PullRequestDetail) bool {
+	if marker == nil {
+		return false
+	}
+	desired := shepherdPhaseFor(pr)
+	changed := marker.Phase != desired
+	marker.Phase = desired
+	marker.HeadSHA = pr.HeadSHA
+	return changed
 }
 
 // refreshShepherdLock keeps the pr:<repo>:<n> lock alive under the stable

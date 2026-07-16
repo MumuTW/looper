@@ -1816,6 +1816,7 @@ func buildGrillPrompt(issue checkpointIssue, specFilePath string) string {
 		"Adversarially interrogate it against the REAL codebase in this worktree: open the actual source at any file:line it cites; if a claim can't be verified from real code, flag it '⚠️ 未经源码验证'. Never pretend to have read code you didn't.",
 		"Hunt for: missing/weak acceptance criteria, unhandled edge cases, security/data/migration/concurrency risk, hand-wavy steps, scope creep, and anything a worker couldn't implement unambiguously.",
 		fmt.Sprintf("REVISE the spec file `%s` IN PLACE to resolve what you can (keep the structure; tighten, don't bloat). Edit ONLY that file — do NOT write anything outside this worktree, do NOT run `plane`/`gh`, do NOT push or open a pull request. looper publishes the file to Plane for you.", specFilePath),
+		"Keep the entire technical spec in Simplified Chinese; preserve code identifiers, file paths, commands, API names, and other exact technical tokens in their original form.",
 		"For anything you genuinely cannot decide (a real product ambiguity), do NOT guess — leave it as a clearly-labelled open question in the spec.",
 		"Finish with a concise grill transcript as your final summary: what you challenged, what you fixed in the file, and what remains open.",
 	}, "\n")
@@ -1828,8 +1829,9 @@ func buildReviewPrompt(issue checkpointIssue, specFilePath string) string {
 		fmt.Sprintf("You are an INDEPENDENT spec reviewer for %s#%d, reviewing a tech spec that already passed an adversarial grill.", issue.Repo, issue.IssueNumber),
 		fmt.Sprintf("Read the spec file `%s` in this worktree.", specFilePath),
 		"Verify against the real codebase in this worktree (open cited source; flag unverified claims). Judge whether a worker could implement it unambiguously and safely.",
+		"Verify that the technical spec itself is written in Simplified Chinese, while exact code identifiers, file paths, commands, and API names remain unchanged; treat a language mismatch as a blocker.",
 		"This is a READ-ONLY verdict pass: do NOT edit any file, do NOT run `plane`/`gh`, do NOT push or open a pull request. If you find a blocking gap, state it precisely; otherwise confirm it is implementation-ready.",
-		"Finish with a concise verdict as your final summary: READY or the specific blockers.",
+		"Finish with a concise Simplified-Chinese verdict as your final summary: READY or the specific blockers.",
 	}, "\n")
 }
 
@@ -2748,6 +2750,7 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"Requirements:",
 		"- Create or update the spec at " + issue.SpecPath,
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
+		"- Write the entire technical spec in Simplified Chinese; keep code identifiers, file paths, commands, API names, and other exact technical tokens in their original form",
 		"- Treat the product spec as authoritative for user-visible scope, phase order, priorities, and acceptance criteria; the issue is supporting context only",
 		"- Do not replace an explicit product decision with your own recommendation or invent pricing, packaging, or prioritization questions that the product spec does not mark unresolved",
 		"- Keep the implementation scope aligned to the product spec",

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/loops"
 )
 
 func check(status, conclusion string) map[string]any {
@@ -109,6 +110,29 @@ func TestShepherdValidationGate(t *testing.T) {
 	// head/decision still wakes the reconcile to re-evaluate + re-report.
 	if foldShepherdSignal(needsVal) == foldShepherdSignal(validated) {
 		t.Fatal("adding `validated` must change the folded signal (else QA sign-off is missed)")
+	}
+}
+
+func TestSyncShepherdPhaseRepairsFixingDriftWithoutSignalChange(t *testing.T) {
+	green := []map[string]any{check("COMPLETED", "SUCCESS")}
+	pr := githubinfra.PullRequestDetail{
+		State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "ready-head", Checks: green,
+		Reviews: []map[string]any{{"state": "APPROVED", "commit": map[string]any{"oid": "ready-head"}}},
+		Labels:  []string{"needs-validation"},
+	}
+	marker := loops.Shepherd{Active: true, Phase: "fixing", LastSignal: foldShepherdSignal(pr)}
+
+	if !syncShepherdPhase(&marker, pr) {
+		t.Fatal("syncShepherdPhase() = false, want phase drift repaired")
+	}
+	if marker.Phase != "awaiting_validation" {
+		t.Fatalf("phase = %q, want awaiting_validation", marker.Phase)
+	}
+	if marker.HeadSHA != "ready-head" {
+		t.Fatalf("head = %q, want ready-head", marker.HeadSHA)
+	}
+	if syncShepherdPhase(&marker, pr) {
+		t.Fatal("second syncShepherdPhase() = true, want no-op once aligned")
 	}
 }
 

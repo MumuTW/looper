@@ -83,10 +83,21 @@ func TestBuildPlannerPromptMakesProductSpecAuthoritative(t *testing.T) {
 	}
 	prompt, _ := buildPlannerPrompt(project, customInstructionConfig(nil), issue, &checkpointWorktree{Branch: "looper/582", BaseBranch: "main"}, false, config.DefaultDisclosureConfig(), "", "")
 
-	for _, want := range []string{"AUTHORITATIVE PRODUCT SPEC", "第一阶段提供 React + 独立 CSS", "highest-priority source of truth", "Do not replace an explicit product decision"} {
+	for _, want := range []string{"AUTHORITATIVE PRODUCT SPEC", "第一阶段提供 React + 独立 CSS", "highest-priority source of truth", "Do not replace an explicit product decision", "entire technical spec in Simplified Chinese"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestPlannerReviewPromptsPreserveChineseTechnicalSpec(t *testing.T) {
+	t.Parallel()
+	issue := checkpointIssue{Repo: "nexu-io/open-design", IssueNumber: 582}
+	if prompt := buildGrillPrompt(issue, "specs/582.md"); !strings.Contains(prompt, "entire technical spec in Simplified Chinese") {
+		t.Fatalf("grill prompt missing Chinese-spec requirement:\n%s", prompt)
+	}
+	if prompt := buildReviewPrompt(issue, "specs/582.md"); !strings.Contains(prompt, "technical spec itself is written in Simplified Chinese") || !strings.Contains(prompt, "Simplified-Chinese verdict") {
+		t.Fatalf("review prompt missing Chinese spec/verdict requirement:\n%s", prompt)
 	}
 }
 
