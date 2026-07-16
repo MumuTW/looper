@@ -1241,7 +1241,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (p
 		}
 	}
 	if checkpoint.Worktree != nil {
-		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err == nil {
+		if plannerCheckpointWorktreeUsable(checkpoint.Worktree.Path, input.Project.RepoPath, worktreeRoot) {
 			return checkpoint, nil
 		}
 		checkpoint.Worktree = nil
@@ -1327,7 +1327,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	if rootErr != nil {
 		return checkpoint, rootErr
 	}
-	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
+	if !plannerCheckpointWorktreeUsable(worktree.Path, input.Project.RepoPath, worktreeRoot) {
 		checkpoint.Worktree = nil
 		if checkpoint.WriteSpec != nil && !checkpoint.WriteSpec.GitReconciled {
 			checkpoint.WriteSpec = nil
@@ -1452,6 +1452,14 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	r.setAwaitingProductAnswerMarker(ctx, input.Loop, false)
 	return checkpoint, nil
+}
+
+func plannerCheckpointWorktreeUsable(worktreePath, repoPath, worktreeRoot string) bool {
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktreePath, RepoPath: repoPath, WorktreeRoot: worktreeRoot}); err != nil {
+		return false
+	}
+	info, err := os.Stat(worktreePath)
+	return err == nil && info.IsDir()
 }
 
 func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {

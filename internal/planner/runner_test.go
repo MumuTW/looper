@@ -3,6 +3,7 @@ package planner
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -392,6 +393,49 @@ func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *t
 	}
 	if checkpoint.WriteSpec == nil || checkpoint.WriteSpec.Status != "completed" || !checkpoint.WriteSpec.GitReconciled {
 		t.Fatalf("checkpoint.WriteSpec = %#v, want completed and reconciled write-spec after worktree recovery", checkpoint.WriteSpec)
+	}
+}
+
+func TestRunWriteSpecStepRecreatesCleanedCheckpointWithinWorktreeRoot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	cleanedPath := filepath.Join(worktreeRoot, "looper-planner-42-plan-this")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_cleaned_worktree"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "restored"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{
+			Issue:    issue,
+			Worktree: &checkpointWorktree{Path: cleanedPath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runWriteSpecStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want cleaned checkpoint recreated", len(git.createCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path == cleanedPath {
+		t.Fatalf("checkpoint.Worktree = %#v, want replacement for cleaned path", checkpoint.Worktree)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != checkpoint.Worktree.Path {
+		t.Fatalf("agent starts = %#v, want replacement worktree cwd %q", agent.starts, checkpoint.Worktree.Path)
 	}
 }
 
@@ -1375,6 +1419,9 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	}
 	if result.BaseBranch == "" {
 		result.BaseBranch = input.BaseBranch
+	}
+	if err := os.MkdirAll(result.WorktreePath, 0o755); err != nil {
+		return CreateWorktreeResult{}, err
 	}
 	f.createResult = result
 	return result, nil
