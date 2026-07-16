@@ -70,8 +70,12 @@ func New(o Options) *Gateway {
 
 // Page is a Plane spec document.
 type Page struct {
-	ID   string
-	Name string
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	ContentHTML string `json:"description_html"`
+	CreatedBy   string `json:"created_by"`
+	UpdatedBy   string `json:"updated_by"`
+	OwnedBy     string `json:"owned_by"`
 	// URL is the human-clickable page URL (constructed; Plane's page API returns no
 	// URL). The page id is embedded, so a link back to it is reverse-parseable.
 	URL string
@@ -149,6 +153,45 @@ func (g *Gateway) PageContent(ctx context.Context, projectID, pageID string) (st
 		return "", fmt.Errorf("planedoc: get page content: %w", err)
 	}
 	return strings.TrimRight(result.Stdout, "\n"), nil
+}
+
+// PageDocument returns a page's content and authorship metadata. Product-spec
+// callers use this instead of PageContent because a non-empty page is not enough:
+// the configured product owner must have created, owned, or last updated it.
+func (g *Gateway) PageDocument(ctx context.Context, projectID, pageID string) (Page, error) {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(pageID) == "" {
+		return Page{}, fmt.Errorf("planedoc: PageDocument requires project id and page id")
+	}
+	args := []string{"api", "page", "get", "--project", projectID, pageID, "--json"}
+	args = append(args, g.globalArgs()...)
+	result, err := g.runPlane(ctx, "", args...)
+	if err != nil {
+		return Page{}, fmt.Errorf("planedoc: get page document: %w", err)
+	}
+	var page Page
+	if err := json.Unmarshal([]byte(result.Stdout), &page); err != nil {
+		return Page{}, fmt.Errorf("planedoc: decode page document: %w", err)
+	}
+	if strings.TrimSpace(page.ID) == "" {
+		return Page{}, fmt.Errorf("planedoc: page document has no id")
+	}
+	page.ContentHTML = strings.TrimSpace(page.ContentHTML)
+	page.URL = g.pageWebURL(projectID, page.ID)
+	return page, nil
+}
+
+// AuthoredBy reports whether Plane attributes the page to memberID. Any one of
+// creator, owner, or latest editor is enough: product may take ownership of an
+// existing shell and complete it, but a page touched only by Looper's account is
+// never accepted as product-authored.
+func (p Page) AuthoredBy(memberID string) bool {
+	memberID = strings.TrimSpace(memberID)
+	if memberID == "" {
+		return false
+	}
+	return strings.TrimSpace(p.CreatedBy) == memberID ||
+		strings.TrimSpace(p.UpdatedBy) == memberID ||
+		strings.TrimSpace(p.OwnedBy) == memberID
 }
 
 // UpdatePageContent replaces a Plane page's body with bodyMarkdown (converted to HTML
@@ -383,7 +426,7 @@ func (g *Gateway) CommentOnWorkItem(ctx context.Context, projectID, workItemID, 
 // tells them looper will auto-associate whatever spec link/text they reply with.
 func (g *Gateway) RequestProductSpec(ctx context.Context, projectID, workItemID, ownerMention, workItemName string) (WorkItemComment, error) {
 	html := fmt.Sprintf(
-		"<p>%s 请先为需求「%s」补一份可执行的 product spec，再让 looper 开始技术梳理。</p><p>至少写清：用户问题与目标、首版范围和非目标、关键交互或输出、验收标准；涉及付费策略或阶段优先级，也请直接在 spec 中定下来。</p><p>把方案页链接或正文回复在这里，looper 会自动关联到本 work item 并继续。</p>",
+		"<p>%s 请先为需求「%s」补一份可执行的 product spec，再让 looper 开始技术梳理。</p><p>至少写清：用户问题与目标、首版范围和非目标、关键交互或输出、验收标准；涉及付费策略或阶段优先级，也请直接在 spec 中定下来。</p><p>请由产品负责人创建或更新方案页，或由产品负责人在这条评论下明确回复方案链接/正文。Looper 不会代写产品范围；验证产品身份后才会关联到本 work item 并继续。</p>",
 		htmlpkg.EscapeString(strings.TrimSpace(ownerMention)),
 		htmlpkg.EscapeString(strings.TrimSpace(workItemName)),
 	)

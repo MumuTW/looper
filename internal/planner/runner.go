@@ -984,9 +984,11 @@ func (input stepInput) CheckpointIssueLogin() string {
 }
 
 // productSpecGate implements flowchart node D/E for a Plane-provider feature: check
-// whether the work item has a readable, non-empty product spec; if not, ask product on the work item and
-// return a hold (FailureManualIntervention) so the planner doesn't write a tech spec
-// without one. A no-op for github/forgejo projects and non-features.
+// whether the work item has a readable, non-empty product spec whose provenance
+// resolves to the configured product owner. A link created only by Looper or its
+// operator is not a product spec. If verification fails, ask product on the work
+// item and hold before any technical planning. A no-op for github/forgejo projects
+// and non-features.
 func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoint plannerCheckpoint) *loopError {
 	if r.planeDoc == nil || checkpoint.Issue == nil {
 		return nil
@@ -999,6 +1001,11 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 	if !stringInSlice("kind/feature", issue.Labels) {
 		return nil // bugs / refactors / perf don't need a product spec
 	}
+	// Checkpoints survive retries. Never carry a formerly accepted product spec
+	// across a fresh provenance check; only repopulate these fields after the current
+	// linked document passes verification below.
+	issue.ProductSpec = ""
+	issue.ProductSpecURL = ""
 	workItemID := planedoc.WorkItemIDFromURL(issue.URL)
 	if workItemID == "" {
 		return nil
@@ -1007,16 +1014,23 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("check product spec on work item: %v", err), kind: FailureRetryableTransient}
 	}
+	productOwnerPlaneID := ""
+	if r.projectRoleConfig != nil {
+		productOwnerPlaneID = strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).PlaneID)
+	}
 	productSpec := strings.TrimSpace(productSpecURL)
+	verified := present && loops.ProductSpecConfirmedBy(input.Loop.MetadataJSON, productSpecURL, productOwnerPlaneID)
 	if present {
 		if pageID := planedoc.PageIDFromURL(productSpecURL); pageID != "" {
-			productSpec, err = gateway.PageContent(ctx, planeProjectID, pageID)
+			page, err := gateway.PageDocument(ctx, planeProjectID, pageID)
 			if err != nil {
-				return &loopError{message: fmt.Sprintf("read product spec on work item: %v", err), kind: FailureRetryableTransient}
+				return &loopError{message: fmt.Sprintf("read product spec document on work item: %v", err), kind: FailureRetryableTransient}
 			}
+			productSpec = page.ContentHTML
+			verified = verified || page.AuthoredBy(productOwnerPlaneID)
 		}
 	}
-	if present && strings.TrimSpace(productSpec) != "" {
+	if present && strings.TrimSpace(productSpec) != "" && verified {
 		issue.ProductSpec = strings.TrimSpace(productSpec)
 		issue.ProductSpecURL = strings.TrimSpace(productSpecURL)
 		// A resumed planner passes here once product supplied the spec (node E2) —
@@ -1024,13 +1038,21 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 		r.setAwaitingProductSpecMarker(ctx, input.Loop, false, "", issue)
 		return nil // has a product spec → proceed to write the tech spec
 	}
+	reason := "还没有关联产品 spec"
+	if present && productOwnerPlaneID == "" {
+		reason = "已有关联页面，但项目尚未配置产品负责人的 Plane member ID，无法验证作者"
+	} else if present && strings.TrimSpace(productSpec) == "" {
+		reason = "已有关联页面，但正文为空"
+	} else if present {
+		reason = "已有关联页面，但它不是由配置的产品负责人创建、接管或明确确认的"
+	}
 	comment, err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", issue.Title)
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("request product spec on Plane: %v", err), kind: FailureRetryableTransient}
 	}
 	// Plane owns the response. Feishu only targets the owner and deep-links to the
 	// exact source comment; replies in the thread are intentionally ignored.
-	r.requestProductSpecInThread(ctx, input, issue.Title, planedoc.WorkItemCommentURL(issue.URL, comment.ID))
+	r.requestProductSpecInThread(ctx, input, issue.Title, reason, planedoc.WorkItemCommentURL(issue.URL, comment.ID))
 	// Mark the hold reason so the anchor card reads "⏸ 等待产品方案" (node E) rather
 	// than the generic "⏸ 等你定夺" — the header alone tells you what's blocking.
 	r.setAwaitingProductSpecMarker(ctx, input.Loop, true, comment.ID, issue)
@@ -1042,7 +1064,7 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 // Plane comment RequestProductSpec posts, so the ask reaches them where they watch.
 // The open_id is resolved per-project from config (never hardcoded); a missing
 // transport or an unset owner just skips the ping. Best-effort.
-func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput, workItemTitle, actionURL string) {
+func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput, workItemTitle, reason, actionURL string) {
 	if r.postThreadProductSpecCard == nil || r.projectRoleConfig == nil || strings.TrimSpace(actionURL) == "" {
 		return
 	}
@@ -1050,7 +1072,7 @@ func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput
 	if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
 		mentions = []string{openID}
 	}
-	note := fmt.Sprintf("⏸ 需求「%s」还没有可执行的产品 spec。请前往 Plane 的具体评论补充方案页链接或正文；飞书回复不会被读取。", strings.TrimSpace(workItemTitle))
+	note := fmt.Sprintf("⏸ 需求「%s」需要产品负责人先出 product spec：%s。请前往 Plane 的具体评论补充方案页链接或正文；Looper 不会代写产品范围，飞书回复不会被读取。", strings.TrimSpace(workItemTitle), strings.TrimSpace(reason))
 	if err := r.postThreadProductSpecCard(ctx, input.Loop.ID, note, actionURL, mentions); err != nil && r.logger != nil {
 		r.logger.Warn("planner: post product-spec request note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 	}

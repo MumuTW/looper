@@ -93,6 +93,20 @@ func TestPageContentReturnsBody(t *testing.T) {
 	}
 }
 
+func TestPageDocumentReturnsContentAndProvenance(t *testing.T) {
+	f := &fakeRun{stdouts: []string{`{"id":"pg-1","name":"Product spec","description_html":"<p>Scope</p>","created_by":"owner","updated_by":"editor","owned_by":"owner"}`}}
+	page, err := newGateway(f).PageDocument(context.Background(), "proj-1", "pg-1")
+	if err != nil {
+		t.Fatalf("PageDocument error = %v", err)
+	}
+	if page.ContentHTML != "<p>Scope</p>" || !page.AuthoredBy("owner") || !page.AuthoredBy("editor") || page.AuthoredBy("someone-else") {
+		t.Fatalf("page provenance = %+v", page)
+	}
+	if !argsContain(f.calls[0], "api", "page", "get", "--json") || argsContain(f.calls[0], "--content") {
+		t.Fatalf("get args = %v", f.calls[0])
+	}
+}
+
 func TestFindSpecLinkFiltersByTitle(t *testing.T) {
 	f := &fakeRun{stdouts: []string{`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://x/pages/p9"},{"id":"l2","title":"other","url":"https://y"}]}`}}
 	g := newGateway(f)
@@ -311,7 +325,7 @@ func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
 }
 
 func TestRequestProductSpecReusesExactExistingAsk(t *testing.T) {
-	html := `<p>产品负责人 请先为需求「导出」补一份可执行的 product spec，再让 looper 开始技术梳理。</p><p>至少写清：用户问题与目标、首版范围和非目标、关键交互或输出、验收标准；涉及付费策略或阶段优先级，也请直接在 spec 中定下来。</p><p>把方案页链接或正文回复在这里，looper 会自动关联到本 work item 并继续。</p>`
+	html := `<p>产品负责人 请先为需求「导出」补一份可执行的 product spec，再让 looper 开始技术梳理。</p><p>至少写清：用户问题与目标、首版范围和非目标、关键交互或输出、验收标准；涉及付费策略或阶段优先级，也请直接在 spec 中定下来。</p><p>请由产品负责人创建或更新方案页，或由产品负责人在这条评论下明确回复方案链接/正文。Looper 不会代写产品范围；验证产品身份后才会关联到本 work item 并继续。</p>`
 	f := &fakeRun{stdouts: []string{`{"results":[{"id":"existing","comment_html":` + jsonString(html) + `}]}`}}
 	comment, err := newGateway(f).RequestProductSpec(context.Background(), "p1", "wi-1", "产品负责人", "导出")
 	if err != nil {

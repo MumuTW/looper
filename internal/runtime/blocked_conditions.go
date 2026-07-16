@@ -98,11 +98,18 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 			if workItemID == "" {
 				return false, nil
 			}
-			present, _, err := planeGateway.HasProductSpec(ctx, planeProjectID, workItemID)
-			if err != nil || present {
-				return shouldResumeForProductSpec(loop.Type, loop.Status, hasSpecPR, present), err
+			productOwnerPlaneID := ""
+			if cfg != nil {
+				productOwnerPlaneID = strings.TrimSpace(config.ProjectProductOwner(*cfg, loop.ProjectID).PlaneID)
 			}
-			associated, err := associateProductSpecReply(ctx, planeGateway, planeProjectID, workItemID, loop, condition)
+			verified, err := verifiedProductSpec(ctx, planeGateway, planeProjectID, workItemID, productOwnerPlaneID, loop.MetadataJSON)
+			if err != nil || verified {
+				return shouldResumeForProductSpec(loop.Type, loop.Status, hasSpecPR, verified), err
+			}
+			associated, confirmation, err := associateProductSpecReply(ctx, planeGateway, planeProjectID, workItemID, loop, condition, productOwnerPlaneID)
+			if err == nil && associated {
+				err = recordProductSpecConfirmation(ctx, repositories, loop.ID, confirmation)
+			}
 			return shouldResumeForProductSpec(loop.Type, loop.Status, hasSpecPR, associated), err
 		},
 		loopcondition.DiskRecovered: func(_ context.Context, _ storage.LoopRecord, _ loopcondition.Record) (bool, error) {
@@ -193,6 +200,29 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 	}
 }
 
+func verifiedProductSpec(ctx context.Context, gateway *planedoc.Gateway, planeProjectID, workItemID, productOwnerPlaneID string, metadataJSON *string) (bool, error) {
+	productOwnerPlaneID = strings.TrimSpace(productOwnerPlaneID)
+	if productOwnerPlaneID == "" {
+		return false, nil
+	}
+	url, found, err := gateway.FindSpecLink(ctx, planeProjectID, workItemID, planedoc.ProductSpecLinkTitle)
+	if err != nil || !found {
+		return false, err
+	}
+	if loops.ProductSpecConfirmedBy(metadataJSON, url, productOwnerPlaneID) {
+		return true, nil
+	}
+	pageID := planedoc.PageIDFromURL(url)
+	if pageID == "" {
+		return false, nil
+	}
+	page, err := gateway.PageDocument(ctx, planeProjectID, pageID)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(page.ContentHTML) != "" && page.AuthoredBy(productOwnerPlaneID), nil
+}
+
 func earliestHumanWorkItemAnswer(comments []planedoc.WorkItemComment, askedAt time.Time) *planedoc.WorkItemComment {
 	var answer *planedoc.WorkItemComment
 	for i := range comments {
@@ -235,19 +265,26 @@ func latestRunIssueURL(ctx context.Context, repositories *storage.Repositories, 
 	return strings.TrimSpace(checkpoint.Issue.URL), nil
 }
 
-func associateProductSpecReply(ctx context.Context, gateway *planedoc.Gateway, planeProjectID, workItemID string, loop storage.LoopRecord, condition loopcondition.Record) (bool, error) {
+func associateProductSpecReply(ctx context.Context, gateway *planedoc.Gateway, planeProjectID, workItemID string, loop storage.LoopRecord, condition loopcondition.Record, productOwnerPlaneID string) (bool, loops.ProductSpecConfirmation, error) {
+	productOwnerPlaneID = strings.TrimSpace(productOwnerPlaneID)
+	if productOwnerPlaneID == "" {
+		return false, loops.ProductSpecConfirmation{}, nil
+	}
 	since, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(condition.Since))
 	if err != nil {
-		return false, nil
+		return false, loops.ProductSpecConfirmation{}, nil
 	}
 	comments, err := gateway.ListWorkItemComments(ctx, planeProjectID, workItemID)
 	if err != nil {
-		return false, err
+		return false, loops.ProductSpecConfirmation{}, err
 	}
 	var reply *planedoc.WorkItemComment
 	for index := range comments {
 		comment := &comments[index]
 		if comment.ID == condition.Fingerprint {
+			continue
+		}
+		if strings.TrimSpace(comment.Actor) != productOwnerPlaneID {
 			continue
 		}
 		createdAt, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(comment.CreatedAt))
@@ -268,7 +305,7 @@ func associateProductSpecReply(ctx context.Context, gateway *planedoc.Gateway, p
 		}
 	}
 	if reply == nil {
-		return false, nil
+		return false, loops.ProductSpecConfirmation{}, nil
 	}
 	url, inlineText := planedoc.DroppedSpecContent(*reply)
 	issueNumber, _ := parseIssueNumberFromTargetID(derefString(loop.TargetID))
@@ -276,8 +313,31 @@ func associateProductSpecReply(ctx context.Context, gateway *planedoc.Gateway, p
 	if issueNumber > 0 {
 		pageName = fmt.Sprintf("Product spec #%d", issueNumber)
 	}
-	_, err = gateway.AssociateDroppedSpec(ctx, planeProjectID, workItemID, planedoc.SpecKindProduct, url, inlineText, pageName)
-	return err == nil, err
+	associatedURL, err := gateway.AssociateDroppedSpec(ctx, planeProjectID, workItemID, planedoc.SpecKindProduct, url, inlineText, pageName)
+	if err != nil {
+		return false, loops.ProductSpecConfirmation{}, err
+	}
+	return true, loops.ProductSpecConfirmation{URL: associatedURL, PlaneActorID: productOwnerPlaneID, ConfirmedAt: reply.CreatedAt}, nil
+}
+
+func recordProductSpecConfirmation(ctx context.Context, repositories *storage.Repositories, loopID string, confirmation loops.ProductSpecConfirmation) error {
+	if repositories == nil || repositories.Loops == nil {
+		return fmt.Errorf("record product spec confirmation: loop repository unavailable")
+	}
+	current, err := repositories.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return fmt.Errorf("record product spec confirmation: loop disappeared: %s", loopID)
+	}
+	metadata, err := loops.WriteProductSpecConfirmation(current.MetadataJSON, confirmation)
+	if err != nil {
+		return err
+	}
+	current.MetadataJSON = stringPtr(metadata)
+	current.UpdatedAt = firstNonEmpty(strings.TrimSpace(confirmation.ConfirmedAt), current.UpdatedAt)
+	return repositories.Loops.Upsert(ctx, *current)
 }
 
 func recordPlaneHITLAnswer(ctx context.Context, repositories *storage.Repositories, loopID, answer, answeredAt string) error {

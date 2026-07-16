@@ -4,10 +4,15 @@ import (
 	"context"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+func productOwnerConfig(planeID string) *config.Config {
+	return &config.Config{Projects: []config.ProjectRefConfig{{ID: "proj-1", ProductOwner: &config.ProductOwnerConfig{PlaneID: planeID}}}}
+}
 
 // scriptedGateway builds a planedoc gateway whose plane CLI returns the given
 // stdouts in order, and records the invocations.
@@ -59,10 +64,12 @@ func TestProductSpecGateHoldsFeatureWithoutSpec(t *testing.T) {
 func TestProductSpecGateProceedsWhenSpecPresent(t *testing.T) {
 	gw, calls := scriptedGateway(
 		`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`,
-		`<p>目标：首版导出 React + CSS。验收：产物可独立运行。</p>`,
+		`{"id":"pg1","description_html":"<p>目标：首版导出 React + CSS。验收：产物可独立运行。</p>","created_by":"product-owner"}`,
 	)
-	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }}
+	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }, projectRoleConfig: productOwnerConfig("product-owner")}
 	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
+	cp.Issue.ProductSpec = "stale content from an earlier checkpoint"
+	cp.Issue.ProductSpecURL = "https://plane.x/old"
 	if gateErr := r.productSpecGate(context.Background(), in, cp); gateErr != nil {
 		t.Fatalf("gate = %v, want nil (has product spec → proceed)", gateErr)
 	}
@@ -77,12 +84,14 @@ func TestProductSpecGateProceedsWhenSpecPresent(t *testing.T) {
 func TestProductSpecGateHoldsEmptyLinkedSpec(t *testing.T) {
 	gw, calls := scriptedGateway(
 		`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`,
-		` `,
+		`{"id":"pg1","description_html":" ","created_by":"product-owner"}`,
 		`{"results":[]}`,
 		`{"id":"c-empty"}`,
 	)
-	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }}
+	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }, projectRoleConfig: productOwnerConfig("product-owner")}
 	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
+	cp.Issue.ProductSpec = "stale content from an earlier checkpoint"
+	cp.Issue.ProductSpecURL = "https://plane.x/old"
 
 	gateErr := r.productSpecGate(context.Background(), in, cp)
 	if gateErr == nil || gateErr.kind != FailureManualIntervention {
@@ -90,6 +99,31 @@ func TestProductSpecGateHoldsEmptyLinkedSpec(t *testing.T) {
 	}
 	if len(*calls) != 4 {
 		t.Fatalf("calls = %d, want link read + page read + ask lookup + comment", len(*calls))
+	}
+	if cp.Issue.ProductSpec != "" || cp.Issue.ProductSpecURL != "" {
+		t.Fatalf("stale product spec survived failed revalidation: %q, %q", cp.Issue.ProductSpec, cp.Issue.ProductSpecURL)
+	}
+}
+
+func TestProductSpecGateRejectsPageAuthoredByLooperOwner(t *testing.T) {
+	gw, calls := scriptedGateway(
+		`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`,
+		`{"id":"pg1","description_html":"<p>E2E draft written by Looper owner</p>","created_by":"looper-owner","updated_by":"looper-owner","owned_by":"looper-owner"}`,
+		`{"results":[]}`,
+		`{"id":"ask-product"}`,
+	)
+	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }, projectRoleConfig: productOwnerConfig("product-owner")}
+	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
+
+	gateErr := r.productSpecGate(context.Background(), in, cp)
+	if gateErr == nil || gateErr.kind != FailureManualIntervention {
+		t.Fatalf("gate = %v, want untrusted page to hold", gateErr)
+	}
+	if len(*calls) != 4 {
+		t.Fatalf("calls = %d, want link + page provenance + ask lookup + comment", len(*calls))
+	}
+	if cp.Issue.ProductSpec != "" {
+		t.Fatalf("untrusted product spec leaked into planner prompt: %q", cp.Issue.ProductSpec)
 	}
 }
 

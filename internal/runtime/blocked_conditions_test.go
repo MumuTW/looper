@@ -18,7 +18,7 @@ import (
 
 func TestAssociateProductSpecReplyLinksFirstPlaneReplyAfterAsk(t *testing.T) {
 	responses := []string{
-		`{"results":[{"id":"ask","comment_html":"<p>ask</p>","created_at":"2026-07-15T12:00:00.000Z"},{"id":"reply","comment_html":"<p><a href=\"https://docs.example/product-spec\">方案</a></p>","created_at":"2026-07-15T12:01:00.000Z"}]}`,
+		`{"results":[{"id":"ask","comment_html":"<p>ask</p>","actor":"looper-owner","created_at":"2026-07-15T12:00:00.000Z"},{"id":"reply","comment_html":"<p><a href=\"https://docs.example/product-spec\">方案</a></p>","actor":"product-owner","created_at":"2026-07-15T12:01:00.000Z"}]}`,
 		`{"results":[]}`,
 		`{"id":"link-1"}`,
 	}
@@ -29,19 +29,33 @@ func TestAssociateProductSpecReplyLinksFirstPlaneReplyAfterAsk(t *testing.T) {
 		return shell.Result{Stdout: stdout}, nil
 	}})
 	targetID := "issue:nexu-io/open-design:582"
-	associated, err := associateProductSpecReply(
+	associated, confirmation, err := associateProductSpecReply(
 		context.Background(),
 		gateway,
 		"plane-project",
 		"work-item",
 		storage.LoopRecord{TargetID: &targetID},
 		loopcondition.Record{Since: "2026-07-15T12:00:30.000Z", Fingerprint: "ask"},
+		"product-owner",
 	)
 	if err != nil || !associated {
 		t.Fatalf("associateProductSpecReply() = %v, %v", associated, err)
 	}
 	if len(calls) != 3 || !strings.Contains(strings.Join(calls[2], " "), "looper:product-spec") {
 		t.Fatalf("calls = %v, want comment list then product-spec link lookup/create", calls)
+	}
+	if confirmation.URL != "https://docs.example/product-spec" || confirmation.PlaneActorID != "product-owner" {
+		t.Fatalf("confirmation = %+v", confirmation)
+	}
+}
+
+func TestAssociateProductSpecReplyIgnoresNonProductActor(t *testing.T) {
+	gateway := planedoc.New(planedoc.Options{Run: func(_ context.Context, _ shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: `{"results":[{"id":"reply","comment_html":"<p>my draft</p>","actor":"looper-owner","created_at":"2026-07-15T12:01:00.000Z"}]}`}, nil
+	}})
+	associated, _, err := associateProductSpecReply(context.Background(), gateway, "project", "item", storage.LoopRecord{}, loopcondition.Record{Since: "2026-07-15T12:00:00.000Z"}, "product-owner")
+	if err != nil || associated {
+		t.Fatalf("associateProductSpecReply() = %v, %v; want non-product reply ignored", associated, err)
 	}
 }
 
