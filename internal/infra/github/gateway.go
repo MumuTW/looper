@@ -27,6 +27,7 @@ const (
 	defaultGhCommandTimeout = 60 * time.Second
 	prListGhCommandTimeout  = 15 * time.Second
 	prDiffGhCommandTimeout  = 180 * time.Second
+	prListRESTJQ            = `[.[] | {number,title,html_url,state,updated_at,draft,labels:[.labels[]? | {name}],head:{ref:.head.ref,sha:.head.sha},base:{ref:.base.ref,sha:.base.sha},user:{login:.user.login},author_association,requested_reviewers:[.requested_reviewers[]? | {login,id}]}]`
 )
 
 var (
@@ -810,6 +811,8 @@ func (g *Gateway) listOpenPullRequestsREST(ctx context.Context, input ListOpenPu
 		"state=open",
 		"-f",
 		fmt.Sprintf("per_page=%d", defaultLimit(input.Limit)),
+		"--jq",
+		prListRESTJQ,
 	)
 	if err != nil {
 		return nil, err

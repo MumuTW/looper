@@ -375,7 +375,7 @@ func TestGatewayListOpenPullRequestsFallsBackToRESTForWorkerDedupe(t *testing.T)
 			result := shell.Result{ExitCode: 1, Stderr: "HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)"}
 			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
 		}
-		if args == "api --method GET repos/acme/looper/pulls -f state=open -f per_page=100" {
+		if args == "api --method GET repos/acme/looper/pulls -f state=open -f per_page=100 --jq "+prListRESTJQ {
 			return shell.Result{Stdout: `[{"number":42,"title":"Existing PR","html_url":"https://example.test/pull/42","state":"open","updated_at":"2026-07-16T11:00:00Z","draft":false,"labels":[{"name":"ready"}],"head":{"ref":"feature","sha":"abc123"},"base":{"ref":"main","sha":"def456"},"user":{"login":"octocat"},"author_association":"MEMBER","requested_reviewers":[{"login":"reviewer","id":7}]}]`}, nil
 		}
 		t.Fatalf("unexpected gh args: %q", args)
