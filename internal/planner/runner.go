@@ -1050,12 +1050,13 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("request product spec on Plane: %v", err), kind: FailureRetryableTransient}
 	}
+	// Mark the hold reason so the anchor card reads "⏸ 等待产品方案" (node E) rather
+	// than the generic "⏸ 等你定夺". Persist this before posting the Feishu card:
+	// card delivery refreshes the anchor header from the current loop metadata.
+	r.setAwaitingProductSpecMarker(ctx, input.Loop, true, comment.ID, issue)
 	// Plane owns the response. Feishu only targets the owner and deep-links to the
 	// exact source comment; replies in the thread are intentionally ignored.
 	r.requestProductSpecInThread(ctx, input, issue.Title, reason, planedoc.WorkItemCommentURL(issue.URL, comment.ID))
-	// Mark the hold reason so the anchor card reads "⏸ 等待产品方案" (node E) rather
-	// than the generic "⏸ 等你定夺" — the header alone tells you what's blocking.
-	r.setAwaitingProductSpecMarker(ctx, input.Loop, true, comment.ID, issue)
 	return &loopError{message: "awaiting an actionable product spec — asked product to supply one on the work item", kind: FailureManualIntervention}
 }
 
