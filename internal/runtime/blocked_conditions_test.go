@@ -98,20 +98,25 @@ func TestRecordPlaneHITLAnswerPersistsSourceAnswer(t *testing.T) {
 	}
 }
 
-func TestEarliestHumanWorkItemAnswerIgnoresLooperAndPreAskComments(t *testing.T) {
+func TestCollectWorkItemDecisionAnswerMergesProductReplyBurst(t *testing.T) {
 	t.Parallel()
 
 	askedAt := time.Date(2026, time.July, 16, 3, 0, 0, 0, time.UTC)
 	comments := []planedoc.WorkItemComment{
-		{ID: "later", CommentStripped: "已更新产品 spec", CreatedAt: "2026-07-16T03:03:00.000Z"},
+		{ID: "third", Actor: "product-owner", CommentStripped: "静默更新在按钮下方", CreatedAt: "2026-07-16T03:03:00.000Z"},
 		{ID: "looper", CommentStripped: "ask · Powered by Looper", CreatedAt: "2026-07-16T03:01:00.000Z"},
 		{ID: "before", CommentStripped: "旧评论", CreatedAt: "2026-07-16T02:59:00.000Z"},
-		{ID: "first", CommentStripped: "产品 spec 已补齐", CreatedAt: "2026-07-16T03:02:00.000Z"},
+		{ID: "other", Actor: "looper-owner", CommentStripped: "我觉得可以", CreatedAt: "2026-07-16T03:02:30.000Z"},
+		{ID: "first", Actor: "product-owner", CommentHTML: "<p>later</p>", CreatedAt: "2026-07-16T03:02:00.000Z"},
+		{ID: "second", Actor: "product-owner", CommentStripped: "install", CreatedAt: "2026-07-16T03:02:10.000Z"},
 	}
 
-	answer := earliestHumanWorkItemAnswer(comments, askedAt)
-	if answer == nil || answer.ID != "first" {
-		t.Fatalf("answer = %#v, want first human reply after ask", answer)
+	answer, answeredAt, ok := collectWorkItemDecisionAnswer(comments, askedAt, "product-owner")
+	if !ok || answer != "<p>later</p>\n\ninstall\n\n静默更新在按钮下方" {
+		t.Fatalf("answer = %q, ok=%v, want all product replies in chronological order", answer, ok)
+	}
+	if answeredAt != "2026-07-16T03:03:00.000Z" {
+		t.Fatalf("answeredAt = %q, want latest product reply time", answeredAt)
 	}
 }
 

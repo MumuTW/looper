@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -151,12 +152,15 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 				if listErr != nil {
 					return false, listErr
 				}
-				answer := earliestHumanWorkItemAnswer(comments, askedAt)
-				if answer == nil {
+				productOwnerPlaneID := ""
+				if cfg != nil {
+					productOwnerPlaneID = strings.TrimSpace(config.ProjectProductOwner(*cfg, loop.ProjectID).PlaneID)
+				}
+				answer, answeredAt, found := collectWorkItemDecisionAnswer(comments, askedAt, productOwnerPlaneID)
+				if !found {
 					return false, nil
 				}
-				text := firstNonEmpty(strings.TrimSpace(answer.CommentStripped), strings.TrimSpace(answer.CommentHTML))
-				if err := recordPlaneHITLAnswer(ctx, repositories, loop.ID, text, answer.CreatedAt); err != nil {
+				if err := recordPlaneHITLAnswer(ctx, repositories, loop.ID, answer, answeredAt); err != nil {
 					return false, err
 				}
 				return true, nil
@@ -223,24 +227,35 @@ func verifiedProductSpec(ctx context.Context, gateway *planedoc.Gateway, planePr
 	return strings.TrimSpace(page.ContentHTML) != "" && page.AuthoredBy(productOwnerPlaneID), nil
 }
 
-func earliestHumanWorkItemAnswer(comments []planedoc.WorkItemComment, askedAt time.Time) *planedoc.WorkItemComment {
-	var answer *planedoc.WorkItemComment
+func collectWorkItemDecisionAnswer(comments []planedoc.WorkItemComment, askedAt time.Time, productOwnerPlaneID string) (string, string, bool) {
+	productOwnerPlaneID = strings.TrimSpace(productOwnerPlaneID)
+	type reply struct {
+		text      string
+		createdAt time.Time
+		rawTime   string
+	}
+	replies := make([]reply, 0, len(comments))
 	for i := range comments {
 		text := firstNonEmpty(strings.TrimSpace(comments[i].CommentStripped), strings.TrimSpace(comments[i].CommentHTML))
 		createdAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(comments[i].CreatedAt))
 		if err != nil || !createdAt.After(askedAt) || strings.Contains(text, planedoc.LooperSignatureMark) || strings.Contains(text, planedoc.LooperCommentMarker) {
 			continue
 		}
-		if answer == nil {
-			answer = &comments[i]
+		if productOwnerPlaneID != "" && strings.TrimSpace(comments[i].Actor) != productOwnerPlaneID {
 			continue
 		}
-		currentAt, _ := time.Parse(time.RFC3339Nano, answer.CreatedAt)
-		if createdAt.Before(currentAt) {
-			answer = &comments[i]
-		}
+		replies = append(replies, reply{text: text, createdAt: createdAt, rawTime: comments[i].CreatedAt})
 	}
-	return answer
+	if len(replies) == 0 {
+		return "", "", false
+	}
+	sort.Slice(replies, func(i, j int) bool { return replies[i].createdAt.Before(replies[j].createdAt) })
+	parts := make([]string, 0, len(replies))
+	for _, item := range replies {
+		parts = append(parts, item.text)
+	}
+	latest := replies[len(replies)-1]
+	return strings.Join(parts, "\n\n"), strings.TrimSpace(latest.rawTime), true
 }
 
 func latestRunIssueURL(ctx context.Context, repositories *storage.Repositories, loopID string) (string, error) {

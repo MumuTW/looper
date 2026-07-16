@@ -2297,7 +2297,7 @@ func pendingPlaneDecisionAnswer(loop storage.LoopRecord) (prompt, sessionID stri
 	if !ok {
 		return "", ""
 	}
-	return "The product owner answered your pending decision on the Plane spec page:\n\n" + answer + "\n\nRevise the tech spec to reflect this decision. Continue from the existing work; do not restart or ask the same question again.", sessionID
+	return "The product owner answered your pending decision in the target Plane comment thread:\n\n" + answer + "\n\nTreat this comment-thread answer as authoritative lightweight product input. Revise the tech spec to reflect it. Continue from the existing work; do not restart or ask the same question again.", sessionID
 }
 
 func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) string {
