@@ -18,8 +18,9 @@ const (
 	defaultGracefulStop   = 5 * time.Second
 	// startAttempts covers transient Linux ETXTBSY after a binary/script is
 	// installed (common when tests write a fake tool then exec it immediately).
-	startAttempts      = 8
-	startRetryBaseWait = 5 * time.Millisecond
+	startAttempts        = 8
+	startRetryBaseWait   = 5 * time.Millisecond
+	descendantDrainGrace = 100 * time.Millisecond
 )
 
 type Result struct {
@@ -75,7 +76,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 
 	waitCh := make(chan error, 1)
 	go func() {
-		waitCh <- cmd.Wait()
+		waitCh <- WaitProcessGroup(cmd)
 	}()
 
 	var (
@@ -92,12 +93,12 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			if cmd.Process == nil {
 				return
 			}
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !isProcessDone(err) {
-				_ = cmd.Process.Kill()
+			if err := SignalProcessGroup(cmd, syscall.SIGTERM); err != nil && !isProcessDone(err) {
+				_ = KillProcessGroup(cmd)
 				return
 			}
 			if gracefulShutdown <= 0 {
-				_ = cmd.Process.Kill()
+				_ = KillProcessGroup(cmd)
 				return
 			}
 			killAt = time.After(gracefulShutdown)
@@ -112,6 +113,9 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	for waiting {
 		select {
 		case waitErr = <-waitCh:
+			if errors.Is(waitErr, exec.ErrWaitDelay) {
+				_ = KillProcessGroup(cmd)
+			}
 			waiting = false
 		case <-terminationStart:
 			timedOut = true
@@ -120,7 +124,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		case <-killAt:
 			killAt = nil
 			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
+				_ = KillProcessGroup(cmd)
 			}
 		case <-ctx.Done():
 			if canceledErr == nil {
@@ -151,6 +155,9 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return result, &CommandExecutionError{Message: commandFailureMessage(result), Result: result}
 	}
 	if waitErr != nil {
+		if errors.Is(waitErr, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+			return result, nil
+		}
 		return result, waitErr
 	}
 	return result, nil
@@ -171,6 +178,7 @@ func startCommand(ctx context.Context, options Options, stdout, stderr *boundedB
 		}
 
 		cmd := exec.Command(options.Command, options.Args...)
+		ConfigureProcessGroup(cmd, descendantDrainGrace)
 		cmd.Dir = options.CWD
 		if len(options.Env) > 0 {
 			cmd.Env = envSlice(options.Env)
@@ -239,7 +247,7 @@ func exitCode(cmd *exec.Cmd) int {
 }
 
 func isProcessDone(err error) bool {
-	return err == nil || err == os.ErrProcessDone
+	return err == nil || errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH)
 }
 
 type boundedBuffer struct {

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -20,6 +22,48 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
 )
+
+func TestMutationReadinessHandlerAllowsReadsAndGatesMutations(t *testing.T) {
+	ready := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	handler := mutationReadinessHandler(next, func() bool { return ready })
+
+	read := httptest.NewRecorder()
+	handler.ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/api/v1/loops", nil))
+	if read.Code != http.StatusNoContent {
+		t.Fatalf("GET status = %d, want %d", read.Code, http.StatusNoContent)
+	}
+	mutation := httptest.NewRecorder()
+	handler.ServeHTTP(mutation, httptest.NewRequest(http.MethodPost, "/api/v1/loops", nil))
+	if mutation.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST before recovery status = %d, want %d", mutation.Code, http.StatusServiceUnavailable)
+	}
+	ready = true
+	accepted := httptest.NewRecorder()
+	handler.ServeHTTP(accepted, httptest.NewRequest(http.MethodPost, "/api/v1/loops", nil))
+	if accepted.Code != http.StatusNoContent {
+		t.Fatalf("POST after recovery status = %d, want %d", accepted.Code, http.StatusNoContent)
+	}
+}
+
+func TestMutationReadinessHandlerGatesMutationsAfterSupervisorFailure(t *testing.T) {
+	supervisor := looperdruntime.NewExecutionSupervisor()
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	handler := mutationReadinessHandler(next, func() bool { return supervisor.Failure() == nil })
+
+	supervisor.MarkDegraded(errors.New("terminal execution persistence failed"))
+
+	mutation := httptest.NewRecorder()
+	handler.ServeHTTP(mutation, httptest.NewRequest(http.MethodPost, "/api/v1/loops", nil))
+	if mutation.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST after supervisor failure status = %d, want %d", mutation.Code, http.StatusServiceUnavailable)
+	}
+	read := httptest.NewRecorder()
+	handler.ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/api/v1/loops", nil))
+	if read.Code != http.StatusNoContent {
+		t.Fatalf("GET after supervisor failure status = %d, want %d", read.Code, http.StatusNoContent)
+	}
+}
 
 func TestRunPrintsVersionWithoutBootstrappingCommandHandling(t *testing.T) {
 	stdout := &bytes.Buffer{}
@@ -1145,6 +1189,23 @@ func TestStopAllLoopsReportsPausedOnlyWhenPIDVerificationRejectsOwnership(t *tes
 	}
 	if item := response.Items[0]; item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipVerifierRejectedPID {
 		t.Fatalf("stopAllLoops() item = %#v", item)
+	}
+}
+
+func TestStopCandidateDoesNotFallBackToPersistedPIDWhenSupervisorKeyIsIncomplete(t *testing.T) {
+	pid := int64(4103)
+	execution := storage.AgentExecutionRecord{ID: "exec_without_run", Status: "running", PID: &pid}
+	result, err := stopCandidateExecution(context.Background(), looperdruntime.Services{
+		ActiveExecutions: looperdruntime.NewExecutionSupervisor(),
+	}, stopAllCandidate{Loop: storage.LoopRecord{ID: "loop_without_run"}, Execution: &execution}, "stop", time.Now, func(int, syscall.Signal) error {
+		t.Fatal("signal invoked for persisted PID without complete Supervisor key")
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("stopCandidateExecution() error = %v", err)
+	}
+	if result.Outcome != stopOutcomePausedOnly || result.ProcessSkipReason != processSkipNoSignal || result.PID != 0 {
+		t.Fatalf("stopCandidateExecution() result = %#v, want paused-only without PID authority", result)
 	}
 }
 

@@ -1055,6 +1055,91 @@ func TestExecutorTimeoutMarksTimeout(t *testing.T) {
 	}
 }
 
+func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "agent.pid")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+		"command": "/bin/sh", "args": []any{"-c", `echo $$ > "$PID_FILE"; trap '' TERM; while true; do sleep 1; done`},
+	}}, Repos: repos})
+
+	handle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_initial_persist_failure", WorkingDirectory: workDir, Prompt: "ignored", Timeout: time.Second, Env: map[string]string{"PID_FILE": pidPath}})
+	if err == nil {
+		t.Fatal("Start() error = nil, want initial persistence failure")
+	}
+	if handle != nil {
+		t.Fatalf("Start() handle = %#v, want nil", handle)
+	}
+	if data, readErr := os.ReadFile(pidPath); readErr == nil {
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if parseErr != nil {
+			t.Fatalf("parse pid: %v", parseErr)
+		}
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("spawned process %d survived failed Start", pid)
+	}
+}
+
+func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+		"command": "/bin/sh", "args": []any{"-c", "sleep 0.2; printf 'done\\n'"},
+	}}, Repos: repos})
+	handle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_terminal_persist_failure", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+
+	_, err = handle.Wait(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "persist terminal agent execution") {
+		t.Fatalf("Wait() error = %v, want terminal persistence failure", err)
+	}
+}
+
+func TestCheckpointFallbackReapsSpawnWhenOwnershipPersistenceFails(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+	configured := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+		"command": "/bin/sh", "args": []any{"-c", "trap '' TERM; while true; do sleep 1; done"},
+	}}, Repos: repos})
+	x := &execution{
+		executor:       configured,
+		input:          RunInput{WorkingDirectory: t.TempDir(), Prompt: "retry", Timeout: time.Second},
+		executionID:    "agent_fallback_persist_failure",
+		startedAt:      time.Now(),
+		startedAtISO:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		maxOutputBytes: defaultMaxOutputBytes,
+	}
+
+	_, _, ok, err := x.runCheckpointFallback(context.Background(), "resume failed")
+	if ok {
+		t.Fatal("runCheckpointFallback() ok = true, want infrastructure failure")
+	}
+	if err == nil || !strings.Contains(err.Error(), "persist fallback agent execution ownership") {
+		t.Fatalf("runCheckpointFallback() error = %v, want ownership persistence failure", err)
+	}
+	if x.process == nil || x.process.ProcessState == nil {
+		t.Fatal("fallback process was not started and reaped before returning")
+	}
+}
+
 func TestExecutorKillTerminatesChildProcessGroup(t *testing.T) {
 	workDir := t.TempDir()
 	childPIDPath := filepath.Join(workDir, "child.pid")
@@ -1084,6 +1169,34 @@ func TestExecutorKillTerminatesChildProcessGroup(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("child process %d is still running after execution Kill", childPID)
+}
+
+func TestExecutorNormalLeaderExitReapsBackgroundChild(t *testing.T) {
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "background.pid")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+		"command": "/bin/sh", "args": []any{"-c", `(trap '' TERM; while :; do sleep 1; done) >/dev/null 2>&1 & echo $! > "$PID_FILE"`},
+	}}})
+	handle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_background_child", WorkingDirectory: workDir, Prompt: "ignored", Timeout: time.Second, Env: map[string]string{"PID_FILE": pidPath}})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := handle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("result.Status = %q, want completed", result.Status)
+	}
+	pid := waitForPIDFile(t, pidPath)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("background child %d survived completed execution", pid)
 }
 
 func TestExecutorHeartbeatTimeoutMarksTimeout(t *testing.T) {

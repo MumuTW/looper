@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -154,7 +156,12 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 			rt.TriggerSchedulerTick()
 		},
 	})
-	root := looperdapi.NewRootHandler(apiHandler, dashboard.Handler())
+	var startupReady atomic.Bool
+	supervisor := rt.Services().ActiveExecutions
+	mutationsReady := func() bool {
+		return startupReady.Load() && supervisor != nil && supervisor.Failure() == nil
+	}
+	root := mutationReadinessHandler(looperdapi.NewRootHandler(apiHandler, dashboard.Handler()), mutationsReady)
 	server := looperdapi.NewServer(deps.Config, root)
 	if err := server.Start(); err != nil {
 		if deps.Logger != nil {
@@ -176,12 +183,30 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		rt.WaitForShutdown()
 		return nil, err
 	}
+	startupReady.Store(true)
 
 	return &daemonRuntime{
 		runtime:         rt,
 		server:          server,
 		shutdownTimeout: shutdownTimeout,
 	}, nil
+}
+
+func mutationReadinessHandler(next http.Handler, ready func() bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			next.ServeHTTP(w, r)
+			return
+		}
+		if ready == nil || !ready() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"code":"runtime_mutations_unavailable","message":"runtime is not ready to accept mutations"}}`)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func stopServerWithTimeout(stop func(context.Context) error, timeout time.Duration) error {
@@ -252,6 +277,10 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	result := stopLoopResult{Stopped: false, LoopID: loopID, Outcome: stopOutcomePausedOnly}
 	if services.Loops == nil {
 		return nil, fmt.Errorf("loops service is not configured")
+	}
+	if services.ActiveExecutions != nil {
+		releaseStop := services.ActiveExecutions.BeginLoopStop(loopID, reason)
+		defer releaseStop()
 	}
 
 	reasonCopy := reason
@@ -331,6 +360,11 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			}
 			return complete()
 		}
+		// A running daemon never reconstructs live ownership from a persisted
+		// PID. PID inspection is reserved for startup recovery; without a
+		// Supervisor handle, stop fails loud instead of risking a reused PID.
+		result.ProcessSkipReason = processSkipNoSignal
+		return complete()
 	}
 	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
 		result.ProcessSkipReason = processSkipNoPID
@@ -798,18 +832,22 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 		runID = candidate.Run.ID
 		result.RunID = candidate.Run.ID
 	}
-	if services.ActiveExecutions != nil && runID != "" {
-		killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
-		if err != nil {
-			return result, err
-		}
-		if killed {
-			result.Outcome = stopOutcomeProcessSignaled
-			if err := markExecutionCancelling(ctx, services, *candidate.Execution, reason, now); err != nil {
+	if services.ActiveExecutions != nil {
+		if runID != "" {
+			killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
+			if err != nil {
 				return result, err
 			}
-			return result, nil
+			if killed {
+				result.Outcome = stopOutcomeProcessSignaled
+				if err := markExecutionCancelling(ctx, services, *candidate.Execution, reason, now); err != nil {
+					return result, err
+				}
+				return result, nil
+			}
 		}
+		result.ProcessSkipReason = processSkipNoSignal
+		return result, nil
 	}
 	if candidate.Execution.PID == nil || *candidate.Execution.PID <= 0 {
 		result.ProcessSkipReason = processSkipNoPID

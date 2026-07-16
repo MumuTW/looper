@@ -153,7 +153,7 @@ type Runtime struct {
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
-	activeExecutions            *ActiveExecutionRegistry
+	activeExecutions            *ExecutionSupervisor
 	projectCatalog              *projects.Catalog
 	githubGateway               *githubinfra.Gateway
 	webhook                     *webhookRuntime
@@ -222,7 +222,7 @@ func New(options Options) *Runtime {
 		deferRecovery:               options.DeferRecovery,
 		recovery:                    createEmptyRecoverySummary(),
 		shutdownCh:                  make(chan struct{}),
-		activeExecutions:            NewActiveExecutionRegistry(),
+		activeExecutions:            NewExecutionSupervisor(),
 		projectCatalog:              projectCatalog,
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
 	}
@@ -261,10 +261,20 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
 
+		// Close execution admission before cancelling Scheduler work. Every
+		// already-claimed item has a Supervisor reservation, so shutdown can
+		// cancel and wait without creating an unowned durable claim.
+		r.activeExecutions.BeginShutdown(reason)
 		r.stopDeferredReviewerRecovery()
 		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
 		r.stopWebhookRuntime()
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), r.shutdownTimeout)
+		ownershipWaitErr := r.activeExecutions.Wait(waitCtx)
+		if ownershipWaitErr != nil && r.logger != nil {
+			r.logger.Warn("looperd stop retained storage because execution ownership did not drain", map[string]any{"error": ownershipWaitErr.Error(), "timeoutMs": r.shutdownTimeout.Milliseconds()})
+		}
+		waitCancel()
 
 		r.mu.Lock()
 		r.stopped = true
@@ -293,7 +303,11 @@ func (r *Runtime) Stop(reason string) {
 		if networkManager != nil {
 			networkManager.Stop()
 		}
-		if coordinator != nil {
+		// Closing storage while an admitted execution still owns terminal-state
+		// publication converts a bounded shutdown into durable state corruption.
+		// On timeout the process is already leaving, so retain the coordinator and
+		// let process teardown reclaim it instead.
+		if coordinator != nil && ownershipWaitErr == nil {
 			if err := coordinator.Close(); err != nil && r.logger != nil {
 				r.logger.Warn("looperd runtime close failed", map[string]any{"error": err.Error()})
 			}

@@ -1023,6 +1023,8 @@ func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExec
 			ended_at=excluded.ended_at,
 			metadata_json=excluded.metadata_json,
 			updated_at=excluded.updated_at
+		WHERE agent_executions.status IN ('running', 'cancelling')
+		   OR excluded.status NOT IN ('running', 'cancelling')
 	`, record.ID, record.ProjectID, record.LoopID, record.RunID, record.Vendor, record.Status, record.PID, record.CommandJSON, record.CWD, record.Summary, record.ParseStatus, record.CompletionSignal, record.HeartbeatCount, record.LastHeartbeatAt, record.OutputJSON, record.ErrorMessage, record.NativeSessionID, record.NativeResumeMode, record.NativeResumeStatus, record.NativeResumeError, record.StartedAt, record.EndedAt, record.MetadataJSON, record.CreatedAt, record.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("upsert agent execution: %w", err)

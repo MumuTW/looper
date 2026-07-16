@@ -86,6 +86,7 @@ type defaultSchedulerTickInput struct {
 	ClaimMu                  *sync.Mutex
 	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
+	ExecutionSupervisor      *ActiveExecutionRegistry
 	RequestSchedulerWake     func()
 	Planner                  plannerScheduler
 	Coordinator              coordinatorScheduler
@@ -982,7 +983,10 @@ func (a plannerGitAdapter) Push(ctx context.Context, input planner.PushInput) er
 	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
 
-type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type plannerAgentExecutorAdapter struct {
+	executor *agent.ConfiguredExecutor
+	registry *ActiveExecutionRegistry
+}
 type plannerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
@@ -990,6 +994,7 @@ func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.Ag
 	if err != nil {
 		return nil, err
 	}
+	registerActiveAgentExecution(a.registry, input.LoopID, input.RunID, input.ExecutionID, execution)
 	return plannerAgentExecutionAdapter{execution: execution}, nil
 }
 
@@ -1643,6 +1648,7 @@ func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input re
 
 type reviewerAgentExecutorAdapter struct {
 	executor   *agent.ConfiguredExecutor
+	registry   *ActiveExecutionRegistry
 	realLooper string
 	trustedEnv map[string]string
 	// configPath is the daemon-loaded config file path injected as LOOPER_CONFIG
@@ -1842,6 +1848,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		proxyCleanup()
 		return nil, err
 	}
+	registerActiveAgentExecution(a.registry, input.LoopID, input.RunID, input.ExecutionID, execution)
 	return &reviewerAgentExecutionAdapter{execution: execution, cleanup: proxyCleanup}, nil
 }
 
@@ -2266,7 +2273,10 @@ func (a fixerGitAdapter) CleanupWorktree(ctx context.Context, input fixer.Cleanu
 	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
-type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type fixerAgentExecutorAdapter struct {
+	executor *agent.ConfiguredExecutor
+	registry *ActiveExecutionRegistry
+}
 type fixerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
@@ -2274,6 +2284,7 @@ func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentR
 	if err != nil {
 		return nil, err
 	}
+	registerActiveAgentExecution(a.registry, input.LoopID, input.RunID, input.ExecutionID, execution)
 	return fixerAgentExecutionAdapter{execution: execution}, nil
 }
 
@@ -2731,15 +2742,22 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 	if err != nil {
 		return nil, err
 	}
-	unregister := func() {}
-	if a.registry != nil {
-		unregister = a.registry.Register(input.LoopID, input.RunID, input.ExecutionID, execution)
+	registerActiveAgentExecution(a.registry, input.LoopID, input.RunID, input.ExecutionID, execution)
+	return workerAgentExecutionAdapter{execution: execution}, nil
+}
+
+func registerActiveAgentExecution(registry *ActiveExecutionRegistry, loopID, runID, executionID string, execution agent.Execution) {
+	if registry == nil || execution == nil {
+		return
 	}
+	unregister := registry.Register(loopID, runID, executionID, execution)
 	go func() {
-		_, _ = execution.Wait(context.Background())
+		_, err := execution.Wait(context.Background())
+		if errors.Is(err, agent.ErrExecutionPersistence) {
+			registry.MarkDegraded(err)
+		}
 		unregister()
 	}()
-	return workerAgentExecutionAdapter{execution: execution}, nil
 }
 
 func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResult, error) {
@@ -2942,7 +2960,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Repos:              repos,
 		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:                plannerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor},
+		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
 		Logger:             logger,
 		Now:                now,
 		AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
@@ -2984,6 +3002,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Git:    reviewerGitAdapter{gateway: gitGateway},
 		AgentExecutor: reviewerAgentExecutorAdapter{
 			executor:   agentExecutor,
+			registry:   activeExecutions,
 			realLooper: looperCLIPath,
 			trustedEnv: providerTrustedEnv(cfg),
 			configPath: strings.TrimSpace(configPath),
@@ -3029,7 +3048,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Repos:              repos,
 		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
+		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
 		Logger:             logger,
 		Now:                now,
 		AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
@@ -3123,6 +3142,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ClaimMu:                  claimMu,
 			ReconcileStaleRuns:       reconcileStaleRuns,
 			AsyncRunner:              runner,
+			ExecutionSupervisor:      services.ActiveExecutions,
 			RequestSchedulerWake:     requestWake,
 			Planner:                  plannerRunner,
 			Coordinator:              coordinatorRunner,
@@ -3585,13 +3605,50 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
+	reservations := make(map[string]*ExecutionReservation, availableSlots)
+	claim := func(longTerm bool) (*storage.QueueItemRecord, error) {
+		var reservation *ExecutionReservation
+		if input.ExecutionSupervisor != nil {
+			var err error
+			reservation, err = input.ExecutionSupervisor.Reserve("")
+			if err != nil {
+				return nil, err
+			}
+		}
+		var item *storage.QueueItemRecord
+		var err error
+		if longTerm {
+			item, err = input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
+		} else {
+			item, err = input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
+		}
+		if err != nil || item == nil {
+			if reservation != nil {
+				reservation.Release()
+			}
+			return item, err
+		}
+		if reservation != nil {
+			loopID := ""
+			if item.LoopID != nil {
+				loopID = *item.LoopID
+			}
+			reservation.BindLoop(loopID)
+			reservations[item.ID] = reservation
+		}
+		return item, nil
+	}
+	runClaimed := func(claimErr error) ([]storage.QueueItemRecord, error) {
+		runErr := runScheduledQueueItemsWithReservations(ctx, queueItems, reservations, input)
+		return queueItems, errors.Join(claimErr, runErr)
+	}
 	for i := 0; i < availableSlots; i++ {
 		if err := ctx.Err(); err != nil {
-			return queueItems, err
+			return runClaimed(err)
 		}
-		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
+		item, err := claim(false)
 		if err != nil {
-			return queueItems, err
+			return runClaimed(err)
 		}
 		if item == nil {
 			break
@@ -3600,18 +3657,18 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	for len(queueItems) < availableSlots {
 		if err := ctx.Err(); err != nil {
-			return queueItems, err
+			return runClaimed(err)
 		}
-		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
+		item, err := claim(true)
 		if err != nil {
-			return queueItems, err
+			return runClaimed(err)
 		}
 		if item == nil {
 			break
 		}
 		queueItems = append(queueItems, *item)
 	}
-	return queueItems, runScheduledQueueItems(ctx, queueItems, input)
+	return runClaimed(nil)
 }
 
 // schedulerLoopParked reports whether a claimed queue item's loop was parked
@@ -3634,6 +3691,10 @@ func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, inpu
 }
 
 func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {
+	return runScheduledQueueItemsWithReservations(ctx, queueItems, nil, input)
+}
+
+func runScheduledQueueItemsWithReservations(ctx context.Context, queueItems []storage.QueueItemRecord, reservations map[string]*ExecutionReservation, input defaultSchedulerTickInput) error {
 	if len(queueItems) == 0 {
 		return nil
 	}
@@ -3643,8 +3704,14 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		now = time.Now
 	}
 	errList := make([]error, 0)
-	for _, item := range queueItems {
+	for index, item := range queueItems {
+		reservation := reservations[item.ID]
 		if err := ctx.Err(); err != nil {
+			for _, pending := range queueItems[index:] {
+				if pendingReservation := reservations[pending.ID]; pendingReservation != nil {
+					pendingReservation.Release()
+				}
+			}
 			return err
 		}
 
@@ -3652,6 +3719,9 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		// queue item survived a race with the parking and got claimed. Release the
 		// claim (so the slot frees) and skip — only an explicit handback re-arms it.
 		if schedulerLoopParked(ctx, item, input) {
+			if reservation != nil {
+				reservation.Release()
+			}
 			if input.Repos != nil && input.Repos.Queue != nil {
 				_ = input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
 			}
@@ -3667,22 +3737,44 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 
 		process, err := schedulerQueueProcessor(item, input)
 		if err != nil {
+			if reservation != nil {
+				reservation.Release()
+			}
 			errList = append(errList, err)
 			continue
 		}
 		item := item
 		processFn := process
+		run := func() error {
+			runCtx := ctx
+			cancel := func(error) {}
+			stop := func() bool { return false }
+			if reservation != nil {
+				defer reservation.Release()
+				runCtx, cancel = context.WithCancelCause(ctx)
+				stop = context.AfterFunc(reservation.Context(), func() {
+					cancel(context.Cause(reservation.Context()))
+				})
+				defer stop()
+				defer cancel(nil)
+			}
+			err := processFn(runCtx)
+			if errors.Is(err, agent.ErrExecutionPersistence) && input.ExecutionSupervisor != nil {
+				input.ExecutionSupervisor.MarkDegraded(err)
+			}
+			return err
+		}
 
 		if input.AsyncRunner != nil {
 			input.AsyncRunner.Go(func() {
-				if err := processFn(ctx); err != nil && input.Logger != nil {
+				if err := run(); err != nil && input.Logger != nil {
 					input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
 				}
 			})
 			continue
 		}
 		go func() {
-			if err := processFn(ctx); err != nil && input.Logger != nil {
+			if err := run(); err != nil && input.Logger != nil {
 				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
 			}
 		}()

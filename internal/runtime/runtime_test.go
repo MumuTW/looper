@@ -3149,6 +3149,35 @@ func TestRuntimeStopClosesCoordinatorAndUnblocksWaitForShutdown(t *testing.T) {
 	defer db.Close()
 }
 
+func TestRuntimeStopRetainsCoordinatorWhenExecutionOwnershipDoesNotDrain(t *testing.T) {
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, ShutdownTimeout: 20 * time.Millisecond})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	coordinator := rt.Services().Coordinator
+	reservation, err := rt.activeExecutions.Reserve("loop_never_released")
+	if err != nil {
+		t.Fatalf("Reserve() error = %v", err)
+	}
+
+	rt.Stop("test timeout")
+
+	if err := coordinator.DB().PingContext(context.Background()); err != nil {
+		t.Fatalf("coordinator was closed while execution ownership remained: %v", err)
+	}
+	reservation.Release()
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() cleanup error = %v", err)
+	}
+}
+
 func TestRuntimeStopTimesOutWaitingForSchedulerLoop(t *testing.T) {
 	t.Parallel()
 

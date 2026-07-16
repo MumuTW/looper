@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -19,15 +20,19 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
+	shellinfra "github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
 const (
-	defaultMaxOutputBytes    = 256 * 1024
-	maxPersistedLogReadBytes = 16 * 1024 * 1024
-	completionMarkerEnv      = "LOOPER_COMPLETION_MARKER"
+	defaultMaxOutputBytes     = 256 * 1024
+	maxPersistedLogReadBytes  = 16 * 1024 * 1024
+	completionMarkerEnv       = "LOOPER_COMPLETION_MARKER"
+	agentDescendantDrainGrace = 100 * time.Millisecond
 )
+
+var ErrExecutionPersistence = errors.New("agent execution persistence failed")
 
 var unsafeAgentEnvKeys = []string{
 	"OLDPWD",
@@ -287,7 +292,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	shellinfra.ConfigureProcessGroup(cmd, agentDescendantDrainGrace)
 	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, e.config.Env, input.Env)
 
 	maxOutputBytes := input.MaxOutputBytes
@@ -329,7 +334,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			command, args = ResolveSpawn(e.config, input.WorkingDirectory, input.Prompt)
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
-			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			shellinfra.ConfigureProcessGroup(cmd, agentDescendantDrainGrace)
 			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, e.config.Env, input.Env)
 			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
@@ -351,7 +356,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	}
 
 	resumeSessionID, resumeMode, resumeStatus, _ := x.nativeResumeSnapshot()
-	x.persistStatus("running", nil, nil, nil)
+	if err := x.persistStatus(ctx, "running", nil, nil, nil); err != nil {
+		_ = x.killProcessGroup()
+		_ = cmd.Wait()
+		return nil, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist initial agent execution ownership: %w", err))
+	}
 	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory, "nativeResumeMode": resumeMode, "nativeResumeStatus": resumeStatus, "nativeSessionId": resumeSessionID}, startedAtISO)
 
 	go x.run(ctx)
@@ -381,6 +390,8 @@ type execution struct {
 	lastProgressAt     time.Time
 
 	mu                      sync.Mutex
+	persistMu               sync.Mutex
+	terminalPersisted       bool
 	status                  string
 	stdout                  []byte
 	stderr                  []byte
@@ -416,38 +427,16 @@ func (x *execution) Kill(reason string) error {
 }
 
 func (x *execution) signalProcessGroup(signal syscall.Signal) error {
-	if x.process.Process == nil {
-		return os.ErrProcessDone
-	}
-	pid := x.process.Process.Pid
-	if pid <= 0 {
-		return x.process.Process.Signal(signal)
-	}
-	if err := syscall.Kill(-pid, signal); err != nil {
-		if err == syscall.ESRCH {
-			return os.ErrProcessDone
-		}
-		return err
-	}
-	return nil
+	return shellinfra.SignalProcessGroup(x.process, signal)
 }
 
 func (x *execution) killProcessGroup() error {
-	if x.process.Process == nil {
-		return os.ErrProcessDone
-	}
-	pid := x.process.Process.Pid
-	if pid > 0 {
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil || err == syscall.ESRCH {
-			return nil
-		}
-	}
-	return x.process.Process.Kill()
+	return shellinfra.KillProcessGroup(x.process)
 }
 
 func (x *execution) run(ctx context.Context) {
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- x.process.Wait() }()
+	go func() { waitCh <- shellinfra.WaitProcessGroup(x.process) }()
 
 	var (
 		waitErr         error
@@ -497,6 +486,9 @@ func (x *execution) run(ctx context.Context) {
 	for waiting {
 		select {
 		case waitErr = <-waitCh:
+			if errors.Is(waitErr, exec.ErrWaitDelay) {
+				_ = x.killProcessGroup()
+			}
 			waiting = false
 		case <-timeoutTimer:
 			timeoutTimer = nil
@@ -613,8 +605,11 @@ func (x *execution) run(ctx context.Context) {
 		LastProgressAt:               lastProgressAt,
 		PID:                          pidOrZero(x.process.Process),
 	}
+	var fallbackInfrastructureErr error
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
-		if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
+		fallbackResult, fallbackErrorMessage, ok, infrastructureErr := x.runCheckpointFallback(ctx, errorMessage)
+		fallbackInfrastructureErr = infrastructureErr
+		if ok {
 			result = fallbackResult
 			status = fallbackResult.Status
 			timeoutType = fallbackResult.TimeoutType
@@ -623,7 +618,7 @@ func (x *execution) run(ctx context.Context) {
 		}
 	}
 
-	x.persistFinal(status, result, errorMessage, endedAtISO)
+	persistErr := errors.Join(fallbackInfrastructureErr, x.persistFinal(status, result, errorMessage, endedAtISO))
 	eventType := "agent.completed"
 	if status == "timeout" {
 		switch timeoutType {
@@ -649,7 +644,10 @@ func (x *execution) run(ctx context.Context) {
 		"summary":                      result.Summary,
 	}, endedAtISO)
 
-	x.doneCh <- execOutcome{result: result, err: nil}
+	if persistErr != nil {
+		persistErr = errors.Join(ErrExecutionPersistence, fmt.Errorf("persist terminal agent execution: %w", persistErr))
+	}
+	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
 func (x *execution) shouldFallbackNativeResume(status string, stdout string, stderr string) bool {
@@ -686,11 +684,11 @@ func normalizeNativeResumeErrorLine(line string) string {
 	return strings.TrimSpace(line)
 }
 
-func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
+func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool, error) {
 	command, args := ResolveSpawn(x.executor.config, x.input.WorkingDirectory, x.input.Prompt)
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	shellinfra.ConfigureProcessGroup(cmd, agentDescendantDrainGrace)
 	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, x.executor.config.Env, x.input.Env)
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
@@ -711,20 +709,23 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
 	x.mu.Unlock()
-	x.persistStatus("running", nil, nil, nil)
-	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
-
 	if err := cmd.Start(); err != nil {
 		x.mu.Lock()
 		x.status = "failed"
 		x.nativeResumeStatus = "fallback_failed"
 		x.nativeResumeError = firstNonEmpty(err.Error(), nativeError)
 		x.mu.Unlock()
-		return Result{}, "", false
+		return Result{}, "", false, nil
 	}
+	if err := x.persistStatus(ctx, "running", nil, nil, nil); err != nil {
+		_ = x.killProcessGroup()
+		_ = shellinfra.WaitProcessGroup(cmd)
+		return Result{}, "", false, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist fallback agent execution ownership: %w", err))
+	}
+	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
 
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
+	go func() { waitCh <- shellinfra.WaitProcessGroup(cmd) }()
 	var (
 		waitErr        error
 		timedOut       bool
@@ -768,6 +769,9 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	for waiting {
 		select {
 		case waitErr = <-waitCh:
+			if errors.Is(waitErr, exec.ErrWaitDelay) {
+				_ = x.killProcessGroup()
+			}
 			waiting = false
 		case <-timeoutTimer:
 			timeoutTimer = nil
@@ -862,7 +866,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
 		PID:                          pidOrZero(cmd.Process),
-	}, errorMessage, true
+	}, errorMessage, true, nil
 }
 
 func (x *execution) onOutput(stream string, chunk []byte) {
@@ -901,7 +905,7 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	x.mu.Unlock()
 
 	outputJSON := x.outputJSON(stdout, stderr)
-	x.persistStatus(x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON)
+	_ = x.persistStatus(context.Background(), x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON)
 	x.bumpRunHeartbeat(nowISO)
 	x.maybeEmitProgress(now, stdout, stderr)
 }
@@ -1009,9 +1013,14 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 	_ = x.executor.repos.Runs.Upsert(ctx, updated)
 }
 
-func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbeatAt *string, outputJSON *string) {
+func (x *execution) persistStatus(ctx context.Context, status string, heartbeatCount *int64, heartbeatAt *string, outputJSON *string) error {
+	x.persistMu.Lock()
+	defer x.persistMu.Unlock()
+	if x.terminalPersisted {
+		return nil
+	}
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
-		return
+		return nil
 	}
 	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
 	metadata := mustJSON(x.executionMetadata(""))
@@ -1046,12 +1055,15 @@ func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbea
 	if outputJSON != nil {
 		record.OutputJSON = outputJSON
 	}
-	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
+	return x.executor.repos.AgentExecutions.Upsert(ctx, record)
 }
 
-func (x *execution) persistFinal(status string, result Result, errorMessage, endedAtISO string) {
+func (x *execution) persistFinal(status string, result Result, errorMessage, endedAtISO string) error {
+	x.persistMu.Lock()
+	defer x.persistMu.Unlock()
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
-		return
+		x.terminalPersisted = true
+		return nil
 	}
 	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
@@ -1104,7 +1116,9 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 		CreatedAt:          x.startedAtISO,
 		UpdatedAt:          endedAtISO,
 	}
-	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
+	err := x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
+	x.terminalPersisted = true
+	return err
 }
 
 func (x *execution) currentStatus() string {

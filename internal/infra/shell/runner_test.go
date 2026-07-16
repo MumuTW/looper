@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -126,6 +127,68 @@ func TestRunRespectsContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
+}
+
+func TestRunCancellationReapsTermResistantChild(t *testing.T) {
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "child.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(ctx, Options{Command: "/bin/sh", Args: []string{"-c", `(trap '' TERM; while :; do sleep 1; done) & echo $! > "$PID_FILE"; wait`}, CWD: workDir, Env: map[string]string{"PID_FILE": pidPath}, GracefulShutdown: 20 * time.Millisecond})
+		done <- err
+	}()
+	childPID := waitForShellPID(t, pidPath)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(childPID, 0); err == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("child process %d survived Run cancellation", childPID)
+}
+
+func TestRunNormalLeaderExitReapsBackgroundChild(t *testing.T) {
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "background.pid")
+	result, err := Run(context.Background(), Options{Command: "/bin/sh", Args: []string{"-c", `(trap '' TERM; while :; do sleep 1; done) >/dev/null 2>&1 & echo $! > "$PID_FILE"`}, CWD: workDir, Env: map[string]string{"PID_FILE": pidPath}, GracefulShutdown: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("Run() exit = %d, want 0", result.ExitCode)
+	}
+	childPID := waitForShellPID(t, pidPath)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(childPID, 0); err == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("background child %d survived successful Run", childPID)
+}
+
+func waitForShellPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for pid file %s", path)
+	return 0
 }
 
 func TestIsTextFileBusy(t *testing.T) {

@@ -701,6 +701,81 @@ func TestClaimAndRunScheduledQueueItemsUsesLongTermRetryOnlyForIdleSlots(t *test
 	}
 }
 
+func TestClaimedQueueItemRemainsOwnedUntilShutdownCancellationFinishes(t *testing.T) {
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "owned-claim.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "project-owned-claim"
+	loopID := "loop-owned-claim"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Owned claim", RepoPath: workingDir, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue-owned-claim", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "worker:owned-claim", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	supervisor := NewActiveExecutionRegistry()
+	runner := &cancellableWorkerScheduler{started: make(chan struct{}), cancelled: make(chan struct{})}
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 1, defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Worker: runner, ExecutionSupervisor: supervisor,
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed count = %d, want 1", len(claimed))
+	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("claimed runner did not start")
+	}
+
+	supervisor.BeginShutdown("daemon shutting down")
+	select {
+	case <-runner.cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("claimed runner did not observe shutdown cancellation")
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := supervisor.Wait(waitCtx); err != nil {
+		t.Fatalf("supervisor.Wait() error = %v", err)
+	}
+}
+
+func TestRunScheduledQueueItemsReleasesUnstartedReservationsAfterCancellation(t *testing.T) {
+	supervisor := NewExecutionSupervisor()
+	first, err := supervisor.Reserve("loop-first")
+	if err != nil {
+		t.Fatalf("Reserve(first) error = %v", err)
+	}
+	second, err := supervisor.Reserve("loop-second")
+	if err != nil {
+		t.Fatalf("Reserve(second) error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = runScheduledQueueItemsWithReservations(ctx,
+		[]storage.QueueItemRecord{{ID: "first", Type: "worker"}, {ID: "second", Type: "worker"}},
+		map[string]*ExecutionReservation{"first": first, "second": second},
+		defaultSchedulerTickInput{Worker: &stubWorkerScheduler{}},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runScheduledQueueItemsWithReservations() error = %v, want context.Canceled", err)
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := supervisor.Wait(waitCtx); err != nil {
+		t.Fatalf("Supervisor.Wait() error = %v, want all unstarted reservations released", err)
+	}
+}
+
 func TestRunScheduledQueueItemsRejectsUnsupportedType(t *testing.T) {
 	t.Parallel()
 
@@ -716,6 +791,23 @@ func TestRunScheduledQueueItemsErrorsWhenRunnerMissing(t *testing.T) {
 	err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{{Type: "worker"}}, defaultSchedulerTickInput{})
 	if err == nil || !strings.Contains(err.Error(), "worker runner is not configured") {
 		t.Fatalf("runScheduledQueueItems() error = %v, want missing worker runner error", err)
+	}
+}
+
+func TestRunScheduledQueueItemsDegradesSupervisorOnExecutionPersistenceFailure(t *testing.T) {
+	supervisor := NewExecutionSupervisor()
+	runner := &stubWorkerScheduler{processErr: errors.Join(agent.ErrExecutionPersistence, errors.New("sqlite unavailable"))}
+	if err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{{ID: "queue-persist-failure", Type: "worker"}}, defaultSchedulerTickInput{
+		Worker: runner, ExecutionSupervisor: supervisor,
+	}); err != nil {
+		t.Fatalf("runScheduledQueueItems() error = %v", err)
+	}
+	waitForSchedulerCondition(t, func() bool { return supervisor.Failure() != nil })
+	if !errors.Is(supervisor.Failure(), agent.ErrExecutionPersistence) {
+		t.Fatalf("supervisor.Failure() = %v, want ErrExecutionPersistence", supervisor.Failure())
+	}
+	if _, err := supervisor.Reserve("loop-after-persist-failure"); !errors.Is(err, ErrExecutionSupervisorDegraded) {
+		t.Fatalf("Reserve() error = %v, want ErrExecutionSupervisorDegraded", err)
 	}
 }
 
@@ -1581,6 +1673,22 @@ type blockingWorkerScheduler struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type cancellableWorkerScheduler struct {
+	started   chan struct{}
+	cancelled chan struct{}
+}
+
+func (s *cancellableWorkerScheduler) ProcessNext(ctx context.Context, _ string) (*worker.ProcessResult, error) {
+	close(s.started)
+	<-ctx.Done()
+	close(s.cancelled)
+	return nil, ctx.Err()
+}
+
+func (s *cancellableWorkerScheduler) ProcessClaimedQueueItem(ctx context.Context, _ storage.QueueItemRecord) (*worker.ProcessResult, error) {
+	return s.ProcessNext(ctx, "")
 }
 
 func (s *blockingWorkerScheduler) ProcessNext(_ context.Context, _ string) (*worker.ProcessResult, error) {

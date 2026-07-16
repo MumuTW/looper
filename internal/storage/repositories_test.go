@@ -13,6 +13,33 @@ import (
 	"time"
 )
 
+func TestAgentExecutionTerminalObservationCannotRegressToRunning(t *testing.T) {
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-16T12:00:00.000Z"
+	endedAt := "2026-07-16T12:01:00.000Z"
+	terminal := AgentExecutionRecord{ID: "agent_terminal_monotonic", Vendor: "codex", Status: "completed", StartedAt: startedAt, EndedAt: &endedAt, CreatedAt: startedAt, UpdatedAt: endedAt}
+	if err := repos.AgentExecutions.Upsert(ctx, terminal); err != nil {
+		t.Fatalf("Upsert(terminal) error = %v", err)
+	}
+	staleLive := terminal
+	staleLive.Status = "running"
+	staleLive.EndedAt = nil
+	staleLive.UpdatedAt = startedAt
+	if err := repos.AgentExecutions.Upsert(ctx, staleLive); err != nil {
+		t.Fatalf("Upsert(stale live) error = %v", err)
+	}
+
+	got, err := repos.AgentExecutions.GetByID(ctx, terminal.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.Status != "completed" || got.EndedAt == nil {
+		t.Fatalf("execution = %#v, want completed terminal observation", got)
+	}
+}
+
 func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.T) {
 	t.Parallel()
 
