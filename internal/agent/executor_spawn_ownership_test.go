@@ -2,10 +2,13 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -13,6 +16,99 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// cancelAfterRunningOwnershipUpsert cancels Start's context immediately after the
+// durable running AgentExecutions row commits, reproducing a stop/shutdown race
+// before run/persistFinal can launch.
+type cancelAfterRunningOwnershipUpsert struct {
+	db     *sql.DB
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (q *cancelAfterRunningOwnershipUpsert) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	result, err := q.db.ExecContext(ctx, query, args...)
+	if err == nil && strings.Contains(query, "INSERT INTO agent_executions") && len(args) > 5 {
+		if status, ok := args[5].(string); ok && status == "running" {
+			q.once.Do(func() {
+				if q.cancel != nil {
+					q.cancel()
+				}
+			})
+		}
+	}
+	return result, err
+}
+
+func (q *cancelAfterRunningOwnershipUpsert) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *cancelAfterRunningOwnershipUpsert) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return q.db.QueryRowContext(ctx, query, args...)
+}
+
+func TestStopAfterRunningOwnershipUpsertPersistsTerminalStatus(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	t.Cleanup(cancelRun)
+	querier := &cancelAfterRunningOwnershipUpsert{db: coordinator.DB(), cancel: cancelRun}
+	repos := storage.NewRepositories(querier)
+
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "agent.pid")
+	const executionID = "agent_stop_after_running_upsert"
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+			"command": "/bin/sh",
+			"args":    []any{"-c", `trap '' TERM; echo $$ > "$PID_FILE"; while true; do sleep 1; done`},
+		}},
+		Repos: repos,
+	})
+
+	execHandle, err := executor.Start(runCtx, RunInput{
+		ExecutionID:      executionID,
+		WorkingDirectory: workDir,
+		Prompt:           "ignored",
+		Timeout:          10 * time.Second,
+		Env:              map[string]string{"PID_FILE": pidPath},
+	})
+	if execHandle != nil {
+		t.Cleanup(func() {
+			_ = execHandle.Kill("test cleanup")
+			_, _ = execHandle.Wait(context.Background())
+		})
+		t.Fatalf("Start() execution = %#v, want nil after post-upsert stop", execHandle)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context.Canceled", err)
+	}
+
+	// Process may already be reaped; best-effort kill if the pid file raced ahead.
+	if data, readErr := os.ReadFile(pidPath); readErr == nil {
+		if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			waitForProcessExit(t, pid, time.Second)
+		}
+	}
+
+	record, getErr := repos.AgentExecutions.GetByID(context.Background(), executionID)
+	if getErr != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", getErr)
+	}
+	if record == nil || record.Status != "killed" || record.EndedAt == nil {
+		t.Fatalf("execution after post-upsert stop = %#v, want durable killed status with ended_at", record)
+	}
+	active, listErr := repos.AgentExecutions.ListActive(context.Background())
+	if listErr != nil {
+		t.Fatalf("AgentExecutions.ListActive() error = %v", listErr)
+	}
+	for _, item := range active {
+		if item.ID == executionID {
+			t.Fatalf("ListActive still includes %s after terminal post-upsert stop", executionID)
+		}
+	}
+}
 
 func TestInitialCancellationDuringOwnershipPersistenceReapsProcess(t *testing.T) {
 	coordinator := openAgentCoordinator(t)

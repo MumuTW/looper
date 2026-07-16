@@ -1426,6 +1426,11 @@ func (x *execution) persistRunningOwnership(ctx context.Context, cmd *exec.Cmd) 
 	case err := <-done:
 		if reason, stopped := x.pendingStop(ctx); stopped {
 			cleanupErr := x.reapStartedProcess(cmd)
+			// Running Upsert already committed: Start will not launch run/persistFinal,
+			// so write terminal status here or recovery sees a dead PID as live.
+			if err == nil {
+				cleanupErr = errors.Join(cleanupErr, x.persistAbortedOwnership(reason, cleanupErr))
+			}
 			return reason, errors.Join(ctx.Err(), cleanupErr)
 		}
 		if err != nil {
@@ -1435,15 +1440,76 @@ func (x *execution) persistRunningOwnership(ctx context.Context, cmd *exec.Cmd) 
 	case reason := <-x.killCh:
 		cancel()
 		cleanupErr := x.reapStartedProcess(cmd)
-		return firstNonEmpty(reason, "agent execution stopped"), cleanupErr
-	case <-persistCtx.Done():
-		persistErr := persistCtx.Err()
-		persistErr = errors.Join(persistErr, x.reapStartedProcess(cmd))
-		if reason, stopped := x.pendingStop(ctx); stopped {
-			return reason, persistErr
+		stopReason := firstNonEmpty(reason, "agent execution stopped")
+		// Prefer an immediate drain when the running write already finished; otherwise
+		// finish terminalization asynchronously so Start is not blocked on a locked Upsert.
+		select {
+		case persistErr := <-done:
+			if persistErr == nil {
+				cleanupErr = errors.Join(cleanupErr, x.persistAbortedOwnership(stopReason, cleanupErr))
+			}
+		default:
+			go x.finishAbortedOwnershipAfterPersist(done, stopReason)
 		}
-		return "", persistErr
+		return stopReason, cleanupErr
+	case <-persistCtx.Done():
+		cleanupErr := x.reapStartedProcess(cmd)
+		reason, stopped := x.pendingStop(ctx)
+		select {
+		case persistErr := <-done:
+			if persistErr == nil {
+				stopReason := reason
+				if !stopped {
+					stopReason = firstNonEmpty(persistCtx.Err().Error(), "ownership persistence deadline exceeded")
+				}
+				cleanupErr = errors.Join(cleanupErr, x.persistAbortedOwnership(stopReason, cleanupErr))
+			}
+			if stopped {
+				return reason, errors.Join(persistCtx.Err(), cleanupErr)
+			}
+			if persistErr != nil {
+				return "", errors.Join(persistErr, cleanupErr)
+			}
+			return "", errors.Join(persistCtx.Err(), cleanupErr)
+		default:
+			// Upsert still in flight (e.g. SQLite write lock). Do not block Start; if the
+			// write later commits, clear the stranded running row asynchronously.
+			stopReason := reason
+			if !stopped {
+				stopReason = firstNonEmpty(persistCtx.Err().Error(), "ownership persistence deadline exceeded")
+			}
+			go x.finishAbortedOwnershipAfterPersist(done, stopReason)
+			if stopped {
+				return reason, errors.Join(persistCtx.Err(), cleanupErr)
+			}
+			return "", errors.Join(persistCtx.Err(), cleanupErr)
+		}
 	}
+}
+
+func (x *execution) finishAbortedOwnershipAfterPersist(done <-chan error, reason string) {
+	if err := <-done; err == nil {
+		_ = x.persistAbortedOwnership(reason, nil)
+	}
+}
+
+// persistAbortedOwnership writes a durable killed terminal row when Start reaps a
+// process after the running ownership Upsert already committed but before run starts.
+func (x *execution) persistAbortedOwnership(reason string, cleanupErr error) error {
+	x.setStatus("killed")
+	endedAtISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+	errorMessage := joinReasonAndError(reason, cleanupErr)
+	result := Result{
+		Status:                       "killed",
+		Summary:                      errorMessage,
+		ParseStatus:                  "missing",
+		ConfiguredIdleTimeoutSeconds: durationSeconds(x.heartbeatTimeout),
+		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
+		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
+		LastProgressAt:               x.lastProgressAtISO(),
+		PID:                          pidOrZero(x.process.Process),
+	}
+	return x.persistFinal("killed", result, errorMessage, endedAtISO)
 }
 
 func (x *execution) persistStatusContext(ctx context.Context, status string, heartbeatCount *int64, heartbeatAt *string, outputJSON *string) error {

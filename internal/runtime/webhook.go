@@ -387,13 +387,17 @@ func (w *webhookRuntime) Stop() {
 		w.wg.Wait()
 		close(waitDone)
 	}()
-	timer := time.NewTimer(w.shutdownTimeout())
+	// runForwarder waits shutdownTimeout after SIGTERM before escalating to Kill.
+	// Budget a second equal interval so Stop does not return at the same moment
+	// Kill starts, before cmd.Wait and forwarder record cleanup finish.
+	shutdownBudget := 2 * w.shutdownTimeout()
+	timer := time.NewTimer(shutdownBudget)
 	defer timer.Stop()
 	select {
 	case <-waitDone:
 	case <-timer.C:
 		if w.logger != nil {
-			w.logger.Warn("webhook shutdown timed out", map[string]any{"timeout": w.shutdownTimeout().String()})
+			w.logger.Warn("webhook shutdown timed out", map[string]any{"timeout": shutdownBudget.String()})
 		}
 	}
 }

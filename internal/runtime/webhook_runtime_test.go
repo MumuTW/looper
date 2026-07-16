@@ -7,8 +7,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1180,6 +1182,9 @@ func TestWebhookRuntimeForwarderHelperProcess(t *testing.T) {
 	if message := os.Getenv("LOOPER_HELPER_STDERR_EXIT"); message != "" {
 		_, _ = os.Stderr.WriteString(message + "\n")
 		os.Exit(1)
+	}
+	if os.Getenv("LOOPER_HELPER_IGNORE_TERM") == "1" {
+		signal.Ignore(syscall.SIGTERM)
 	}
 	select {}
 }
