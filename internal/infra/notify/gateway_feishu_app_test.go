@@ -377,6 +377,44 @@ func TestFeishuHeaderFallbackNeverLeaksLoopID(t *testing.T) {
 	}
 }
 
+func TestPostThreadApprovalCardUsesApprovalCopyAndSeparateMessageKey(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+	var calls []capturedFeishuCall
+	gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+	ctx := context.Background()
+	now := eventISO(time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC))
+	if err := gateway.repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: "loop_approval", Seq: 42, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "completed", CreatedAt: now, UpdatedAt: now}
+	if err := gateway.repositories.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gateway.PostThreadApprovalCard(ctx, loop.ID, "方案已通过 REVIEW", "https://plane.test/pages/spec#comment-review", []string{"ou_looper_owner"}); err != nil {
+		t.Fatalf("PostThreadApprovalCard() error = %v", err)
+	}
+	var bodies strings.Builder
+	for _, call := range calls {
+		bodies.Write(call.body)
+	}
+	posted := bodies.String()
+	if !strings.Contains(posted, "技术方案已完成 GRILL + REVIEW") || !strings.Contains(posted, "前往 Plane 审核") {
+		t.Fatalf("Feishu calls missing approval-specific copy: %s", posted)
+	}
+	if strings.Contains(posted, "这个需求有个地方需要你来拍板") {
+		t.Fatalf("approval card reused product-decision copy: %s", posted)
+	}
+	if got := gateway.loopMetaString(ctx, loop.ID, approvalCardMsgIDKey); got == "" {
+		t.Fatal("approval card message id was not persisted")
+	}
+	if got := gateway.loopMetaString(ctx, loop.ID, decisionCardMsgIDKey); got != "" {
+		t.Fatalf("product decision message id = %q, want empty", got)
+	}
+}
+
 func TestBuildFeishuAskCardRendersMention(t *testing.T) {
 	card, err := buildFeishuAskCard(HITLAskCard{
 		LoopSeq: 7, Repo: "acme/looper", Question: "A or B?",

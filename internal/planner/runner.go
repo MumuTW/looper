@@ -344,8 +344,12 @@ type Options struct {
 	PostThreadNote func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
 	// PostThreadCard posts a one-way decision notification with an exact Plane/GitHub
 	// action URL. Feishu never receives the answer.
-	PostThreadCard  func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
-	DiscoveryPolicy DiscoveryPolicy
+	PostThreadCard func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	// PostThreadApprovalCard posts the separate owner-facing tech-spec approval card.
+	// Keeping this distinct from product decisions prevents the wrong role, copy, and
+	// card dedupe key from being reused at node H.
+	PostThreadApprovalCard func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	DiscoveryPolicy        DiscoveryPolicy
 	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
 	// project whose task source is Plane (§8 flowchart). nil / (…,false) → the
 	// project keeps the repo-file spec path (github/forgejo). Set for plane projects.
@@ -386,6 +390,7 @@ type Runner struct {
 	onQueueItemEnqueued     func()
 	postThreadNote          func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
 	postThreadCard          func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	postThreadApprovalCard  func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
 	discoveryPolicy         DiscoveryPolicy
 	planeDoc                PlaneDocResolver
 }
@@ -550,7 +555,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, postThreadCard: options.PostThreadCard, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, postThreadCard: options.PostThreadCard, postThreadApprovalCard: options.PostThreadApprovalCard, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -854,10 +859,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		prNumber = checkpoint.Publish.PullRequest.Number
 	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
-		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: prNumber}, nil
+		if !errors.Is(err, storage.ErrQueueItemNotActive) {
+			return ProcessResult{}, err
 		}
-		return ProcessResult{}, err
 	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		if checkpoint.SkipReason == awaitingProductDecisionSkipReason {
@@ -1157,6 +1161,21 @@ func (r *Runner) notifyProductDecision(ctx context.Context, input stepInput, pro
 	}
 	if err := r.postThreadCard(ctx, input.Loop.ID, strings.TrimSpace(productAsk), actionURL, mentions); err != nil && r.logger != nil {
 		r.logger.Warn("planner: post product-decision card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+	}
+}
+
+func (r *Runner) notifySpecApproval(ctx context.Context, input stepInput, body, actionURL string) {
+	if r.postThreadApprovalCard == nil || strings.TrimSpace(actionURL) == "" {
+		return
+	}
+	var mentions []string
+	if r.projectRoleConfig != nil {
+		if openID := strings.TrimSpace(config.ProjectOwner(*r.projectRoleConfig, input.Project.ID)); openID != "" {
+			mentions = []string{openID}
+		}
+	}
+	if err := r.postThreadApprovalCard(ctx, input.Loop.ID, strings.TrimSpace(body), actionURL, mentions); err != nil && r.logger != nil {
+		r.logger.Warn("planner: post spec-approval card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 	}
 }
 
@@ -1638,8 +1657,6 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
 			r.logger.Warn("grill: post transcript failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
-		// node H condition #2: surface the grill transcript in the Feishu thread too.
-		r.postNodeHThreadNote(ctx, input, "grillTranscript", "🔬 GRILL 拷问结论:\n"+truncateRunes(summary, 1200), false)
 	}
 	if checkpoint.Publish == nil {
 		checkpoint.Publish = &checkpointPublishState{}
@@ -1722,7 +1739,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 			r.logger.Warn("review: retire looper:plan failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
 	}
-	r.notifyProductDecision(ctx, input, "🙋 方案已过 GRILL 拷问 + 独立 REVIEW。请直接回复这条 REVIEW 评论；无异议可答 approve / 同意 / 👍，随后进入实现。", reviewActionURL)
+	r.notifySpecApproval(ctx, input, "方案已过 GRILL 拷问 + 独立 REVIEW。请直接回复这条 REVIEW 评论；无异议可答 approve / 同意 / 👍，随后进入实现。", reviewActionURL)
 	if r.repos != nil && r.repos.Loops != nil {
 		if loop, gErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); gErr == nil && loop != nil {
 			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {

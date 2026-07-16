@@ -371,7 +371,7 @@ func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *t
 	}
 }
 
-func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
+func TestProcessClaimedItemManualPlannerCompletesLoopWhenQueueAlreadyInactive(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	issue := IssueSummary{Number: 42, Title: "Plan this"}
@@ -396,6 +396,12 @@ func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	if claimed.ID != queueItem.ID {
 		t.Fatalf("claimed.ID = %q, want %q", claimed.ID, queueItem.ID)
 	}
+	// Recovery can complete the queue record while the original worker is still
+	// finishing. That benign race must not leave the successfully finished loop
+	// stuck in running forever.
+	if err := fixture.repos.Queue.Complete(context.Background(), claimed.ID, fixture.nowISO()); err != nil {
+		t.Fatalf("Queue.Complete() precondition error = %v", err)
+	}
 	result, err := runner.ProcessClaimedItem(context.Background(), *claimed)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
@@ -408,6 +414,10 @@ func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	}
 	if len(agent.starts) != 1 {
 		t.Fatalf("agent starts = %d, want 1", len(agent.starts))
+	}
+	completed, err := fixture.repos.Loops.GetByID(context.Background(), loopResult.record.ID)
+	if err != nil || completed == nil || completed.Status != "completed" {
+		t.Fatalf("loop after success = %#v, %v; want completed", completed, err)
 	}
 }
 
@@ -1638,5 +1648,34 @@ func TestNotifyProductDecisionUsesExactPlaneURLAndMentionsProductOwner(t *testin
 	}
 	if len(gotMentions) != 1 || gotMentions[0] != "ou_sunqingyu" {
 		t.Fatalf("mentions = %v, want [ou_sunqingyu] (@ product owner)", gotMentions)
+	}
+}
+
+func TestNotifySpecApprovalMentionsLooperOwner(t *testing.T) {
+	t.Parallel()
+
+	var gotActionURL string
+	var gotMentions []string
+	roleCfg := &config.Config{Projects: []config.ProjectRefConfig{{
+		ID:           "project_1",
+		ProductOwner: &config.ProductOwnerConfig{FeishuOpenID: "ou_product"},
+		Owner:        &config.FeishuActorConfig{FeishuOpenID: "ou_looper_owner"},
+	}}}
+	r := &Runner{
+		logger:            &testLogger{},
+		projectRoleConfig: roleCfg,
+		postThreadApprovalCard: func(_ context.Context, _, _, actionURL string, mentions []string) error {
+			gotActionURL, gotMentions = actionURL, mentions
+			return nil
+		},
+	}
+	in := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Loop: storage.LoopRecord{ID: "loop_x"}}
+	r.notifySpecApproval(context.Background(), in, "请审核技术方案", "https://plane.test/pages/spec#comment-review")
+
+	if gotActionURL != "https://plane.test/pages/spec#comment-review" {
+		t.Fatalf("actionURL = %q, want exact review comment URL", gotActionURL)
+	}
+	if len(gotMentions) != 1 || gotMentions[0] != "ou_looper_owner" {
+		t.Fatalf("mentions = %v, want [ou_looper_owner], not product owner", gotMentions)
 	}
 }

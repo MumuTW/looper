@@ -561,6 +561,7 @@ type feishuDecisionCardIntent struct {
 	Body           string   `json:"body"`
 	ActionURL      string   `json:"actionUrl"`
 	MentionOpenIDs []string `json:"mentionOpenIds,omitempty"`
+	Purpose        string   `json:"purpose,omitempty"`
 }
 
 type feishuCardIntent struct {
@@ -2110,12 +2111,22 @@ func (g *Gateway) PostThreadNote(ctx context.Context, loopID, text string, menti
 // not a banner. @-mentions the product owner via the card <at id=..> form. No-op unless
 // the app transport is configured and the loop already has a thread root.
 func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error {
+	return g.postThreadActionCard(ctx, loopID, body, actionURL, mentionOpenIDs, "decision")
+}
+
+// PostThreadApprovalCard posts the owner-facing node-H tech-spec approval card.
+// It deliberately uses distinct copy and a distinct message id from product asks.
+func (g *Gateway) PostThreadApprovalCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error {
+	return g.postThreadActionCard(ctx, loopID, body, actionURL, mentionOpenIDs, "approval")
+}
+
+func (g *Gateway) postThreadActionCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string, purpose string) error {
 	loopID = strings.TrimSpace(loopID)
 	actionURL = strings.TrimSpace(actionURL)
 	if loopID == "" || strings.TrimSpace(body) == "" || actionURL == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
 		return nil
 	}
-	intent := feishuDecisionCardIntent{LoopID: loopID, Body: strings.TrimSpace(body), ActionURL: actionURL, MentionOpenIDs: firstFeishuOwner(mentionOpenIDs)}
+	intent := feishuDecisionCardIntent{LoopID: loopID, Body: strings.TrimSpace(body), ActionURL: actionURL, MentionOpenIDs: firstFeishuOwner(mentionOpenIDs), Purpose: purpose}
 	return g.enqueueFeishuCard(ctx, "Plane action needed", body, loopID, feishuCardIntent{Kind: "decision", Decision: &intent})
 }
 
@@ -2140,7 +2151,15 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 	// This also creates a real anchor for run-less coordinator loops. Previously the
 	// decision delivery required an already-existing root and silently no-op'd.
 	root := g.ensureFeishuThreadRoot(ctx, token, chatID, loopID)
+	approval := strings.EqualFold(strings.TrimSpace(intent.Purpose), "approval")
 	lead := "🙋 这个需求有个地方需要你来拍板 —— 请前往 Plane 的具体评论回答。飞书回复不会被读取。"
+	buttonText := "前往 Plane 回答"
+	messageIDKey := decisionCardMsgIDKey
+	if approval {
+		lead = "👀 技术方案已完成 GRILL + REVIEW，请前往 Plane 审核。飞书回复不会被读取。"
+		buttonText = "前往 Plane 审核"
+		messageIDKey = approvalCardMsgIDKey
+	}
 	if mention := feishuMentionMarkup(firstFeishuOwner(intent.MentionOpenIDs)); mention != "" {
 		lead = mention + " " + lead
 	}
@@ -2152,7 +2171,7 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 			larkDiv(body),
 			map[string]any{"tag": "action", "actions": []any{map[string]any{
 				"tag": "button", "type": "primary",
-				"text": map[string]any{"tag": "plain_text", "content": "前往 Plane 回答"},
+				"text": map[string]any{"tag": "plain_text", "content": buttonText},
 				"url":  actionURL,
 			}}},
 		},
@@ -2164,7 +2183,7 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 	// A follow-up (线程永远可追问) revises the ask — UPDATE the existing 拍板 card in place
 	// so the thread shows ONE evolving card, not a fresh duplicate on every question. Fall
 	// back to a new post when there's no prior card or the patch fails (e.g. it aged out).
-	if prior := g.loopMetaString(ctx, loopID, decisionCardMsgIDKey); prior != "" {
+	if prior := g.loopMetaString(ctx, loopID, messageIDKey); prior != "" {
 		if err := g.patchFeishuAppCard(ctx, token, prior, string(cardJSON)); err == nil {
 			g.updateFeishuThreadHeader(ctx, token, loopID)
 			return nil
@@ -2175,7 +2194,7 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 		return err
 	}
 	if strings.TrimSpace(msgID) != "" {
-		g.setLoopMetaString(ctx, loopID, decisionCardMsgIDKey, msgID)
+		g.setLoopMetaString(ctx, loopID, messageIDKey, msgID)
 	}
 	g.updateFeishuThreadHeader(ctx, token, loopID)
 	return nil
@@ -2184,6 +2203,8 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 // decisionCardMsgIDKey stores the node-H 拍板 card's message id in loop metadata so a
 // follow-up revision patches that card in place instead of posting a duplicate.
 const decisionCardMsgIDKey = "productAskCardMsgId"
+
+const approvalCardMsgIDKey = "specApprovalCardMsgId"
 
 // loopMetaString reads a top-level string field from a loop's metadata; "" when absent
 // or unreadable.
