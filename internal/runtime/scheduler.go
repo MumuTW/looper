@@ -1502,7 +1502,13 @@ func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input wor
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
 	}
-	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Label: input.Label})
+	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{
+		Repo:                      input.Repo,
+		CWD:                       input.CWD,
+		Limit:                     input.Limit,
+		Label:                     input.Label,
+		FallbackToRESTOnTransient: true,
+	})
 	if err != nil {
 		return nil, err
 	}
