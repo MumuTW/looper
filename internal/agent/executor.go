@@ -587,10 +587,28 @@ func (x *execution) killProcessGroup() error {
 	process := x.process.Process
 	pid := process.Pid
 	if pid > 0 {
+		// Probe before SIGKILL. After Wait reaps a short-lived leader with no
+		// descendants, the numeric PGID may already be free for reuse; treating
+		// no-members/ESRCH as resolved avoids an unconditional kill(-pid) that
+		// could hit an unrelated process group. Zombie-only groups are not live
+		// ownership barriers. Hold the execution lock across the probe so a
+		// concurrent ForceKill cannot race a successful "no runnable members"
+		// observation and signal a newly reused numeric PGID.
+		live, err := shellinfra.ProcessGroupRunnable(pid)
+		if err != nil {
+			return fmt.Errorf("probe process group %d before SIGKILL: %w", pid, err)
+		}
+		if !live {
+			x.processGroupResolved = true
+			x.processGroupSignalsDone = true
+			return os.ErrProcessDone
+		}
 		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil {
 			x.processGroupKillSent = true
 			return nil
 		} else if err == syscall.ESRCH {
+			x.processGroupResolved = true
+			x.processGroupSignalsDone = true
 			return os.ErrProcessDone
 		} else {
 			return err
@@ -659,9 +677,10 @@ func (x *execution) awaitProcessGroupExit(cmd *exec.Cmd) error {
 
 	// Hold the execution lock across the bounded probe barrier. ForceKill cannot
 	// race a successful "no runnable members" observation and signal a newly
-	// reused numeric PGID. SIGKILL was sent before entering this function;
-	// probes never resend it. Zombie-only groups count as resolved so unreaped
-	// orphans cannot fail an otherwise completed agent.
+	// reused numeric PGID. When SIGKILL was sent, probes never resend it; when
+	// the pre-kill probe already resolved an empty group, this is a no-op.
+	// Zombie-only groups count as resolved so unreaped orphans cannot fail an
+	// otherwise completed agent.
 	pid := cmd.Process.Pid
 	deadline := time.Now().Add(processGroupExitTimeout)
 	for {

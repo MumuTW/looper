@@ -57,6 +57,85 @@ func TestExecutionWaitCancellationKeepsOwnershipUntilProcessGroupIsReaped(t *tes
 	}
 }
 
+func TestFinishProcessGroupSkipsSIGKILLWhenReapedGroupHasNoMembers(t *testing.T) {
+	// After Wait reaps a short-lived leader with no descendants, the numeric
+	// PGID is free for reuse. finishProcessGroup/killProcessGroup must probe
+	// first and treat no-members as resolved instead of unconditionally SIGKILLing.
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	originalPID := cmd.Process.Pid
+	if _, err := cmd.Process.Wait(); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		live, err := shellinfra.ProcessGroupRunnable(originalPID)
+		if err != nil {
+			t.Fatalf("ProcessGroupRunnable(%d) error = %v", originalPID, err)
+		}
+		if !live {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process group %d remained live after Wait", originalPID)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	x := &execution{process: cmd}
+	if err := x.finishProcessGroup(cmd); err != nil {
+		t.Fatalf("finishProcessGroup() after reaped exit error = %v", err)
+	}
+	x.mu.Lock()
+	resolved := x.processGroupResolved
+	killSent := x.processGroupKillSent
+	x.mu.Unlock()
+	if !resolved {
+		t.Fatal("finishProcessGroup() did not mark empty group resolved")
+	}
+	if killSent {
+		t.Fatal("finishProcessGroup() sent SIGKILL to an empty reaped group")
+	}
+
+	// Live descendants must still be cleaned up by probe-then-SIGKILL.
+	live := exec.Command("/bin/sh", "-c", `trap '' TERM; while :; do sleep 1; done`)
+	live.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := live.Start(); err != nil {
+		t.Fatalf("Start(live) error = %v", err)
+	}
+	liveDone := make(chan error, 1)
+	go func() { liveDone <- live.Wait() }()
+	t.Cleanup(func() {
+		_ = syscall.Kill(-live.Process.Pid, syscall.SIGKILL)
+		select {
+		case <-liveDone:
+		case <-time.After(time.Second):
+		}
+	})
+	xLive := &execution{process: live}
+	if err := xLive.finishProcessGroup(live); err != nil {
+		t.Fatalf("finishProcessGroup(live) error = %v", err)
+	}
+	select {
+	case <-liveDone:
+	case <-time.After(time.Second):
+		t.Fatal("live process group was not cleaned up")
+	}
+	xLive.mu.Lock()
+	liveResolved := xLive.processGroupResolved
+	liveKillSent := xLive.processGroupKillSent
+	xLive.mu.Unlock()
+	if !liveResolved {
+		t.Fatal("finishProcessGroup(live) did not mark group resolved")
+	}
+	if !liveKillSent {
+		t.Fatal("finishProcessGroup(live) did not send SIGKILL to live descendants")
+	}
+}
+
 func TestExecutionForceKillEscalatesProcessGroupAndIsSafeAfterExit(t *testing.T) {
 	workDir := t.TempDir()
 	pidPath := filepath.Join(workDir, "agent.pid")
