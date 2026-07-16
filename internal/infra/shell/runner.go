@@ -81,16 +81,17 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}()
 
 	var (
-		waitErr          error
-		timedOut         bool
-		canceledErr      error
-		cleanupErr       error
-		forceKillSent    bool
-		timeoutTimer     *time.Timer
-		killTimer        *time.Timer
-		terminationStart <-chan time.Time
-		killAt           <-chan time.Time
-		terminateOnce    sync.Once
+		waitErr              error
+		timedOut             bool
+		canceledErr          error
+		cleanupErr           error
+		forceKillSent        bool
+		processGroupResolved bool
+		timeoutTimer         *time.Timer
+		killTimer            *time.Timer
+		terminationStart     <-chan time.Time
+		killAt               <-chan time.Time
+		terminateOnce        sync.Once
 	)
 
 	terminate := func() {
@@ -98,14 +99,25 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			if cmd.Process == nil {
 				return
 			}
-			if err := signalCommandGroup(cmd, syscall.SIGTERM); err != nil && !isProcessDone(err) {
+			if err := signalCommandGroup(cmd, syscall.SIGTERM); err != nil {
+				if isProcessDone(err) {
+					// Wait may have already reaped the original group. Record
+					// that fact so post-wait cleanup does not SIGKILL a numeric
+					// PGID that has been reused by an unrelated process group.
+					processGroupResolved = true
+					return
+				}
 				forceKillSent = true
-				_ = signalCommandGroup(cmd, syscall.SIGKILL)
+				if killErr := signalCommandGroup(cmd, syscall.SIGKILL); killErr != nil && isProcessDone(killErr) {
+					processGroupResolved = true
+				}
 				return
 			}
 			if gracefulShutdown <= 0 {
 				forceKillSent = true
-				_ = signalCommandGroup(cmd, syscall.SIGKILL)
+				if killErr := signalCommandGroup(cmd, syscall.SIGKILL); killErr != nil && isProcessDone(killErr) {
+					processGroupResolved = true
+				}
 				return
 			}
 			killTimer = time.NewTimer(gracefulShutdown)
@@ -129,7 +141,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			// owned group. Resolve the group on every terminal path, not only
 			// timeout/cancellation, before returning ownership to the caller.
 			var err error
-			if forceKillSent {
+			if forceKillSent || processGroupResolved {
 				err = WaitProcessGroupExit(cmd, processGroupExitWait)
 			} else {
 				err = KillProcessGroupAndWait(cmd, processGroupExitWait)
@@ -145,7 +157,9 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		case <-killAt:
 			killAt = nil
 			forceKillSent = true
-			_ = signalCommandGroup(cmd, syscall.SIGKILL)
+			if killErr := signalCommandGroup(cmd, syscall.SIGKILL); killErr != nil && isProcessDone(killErr) {
+				processGroupResolved = true
+			}
 		case <-ctxDone:
 			ctxDone = nil
 			canceledErr = ctx.Err()

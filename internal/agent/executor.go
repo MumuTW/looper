@@ -568,6 +568,11 @@ func (x *execution) signalProcessGroup(signal syscall.Signal) error {
 	}
 	if err := syscall.Kill(-pid, signal); err != nil {
 		if err == syscall.ESRCH {
+			// Wait may have reaped the original group before this stop signal
+			// runs. Mark ownership resolved so finishProcessGroup/ForceKill do
+			// not later SIGKILL a numeric PGID that has been reused.
+			x.processGroupResolved = true
+			x.processGroupSignalsDone = true
 			return os.ErrProcessDone
 		}
 		return err

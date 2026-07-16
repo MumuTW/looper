@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,6 +55,75 @@ func TestExecutionWaitCancellationKeepsOwnershipUntilProcessGroupIsReaped(t *tes
 	}
 	if live {
 		t.Fatalf("process group %d still has runnable members after Wait", pid)
+	}
+}
+
+func TestSignalProcessGroupMarksResolvedOnESRCH(t *testing.T) {
+	// Stop can race after Wait reaps a naturally exited agent but before run
+	// consumes waitCh. ESRCH proves the original group is gone; leave the
+	// resolved/signals-done bits set so later finishProcessGroup/ForceKill do
+	// not SIGKILL a reused numeric PGID.
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	originalPID := cmd.Process.Pid
+	if _, err := cmd.Process.Wait(); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := syscall.Kill(-originalPID, 0); errors.Is(err, syscall.ESRCH) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process group %d remained signalable after Wait", originalPID)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	x := &execution{process: cmd}
+	if err := x.signalProcessGroup(syscall.SIGTERM); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("signalProcessGroup() error = %v, want os.ErrProcessDone", err)
+	}
+	x.mu.Lock()
+	resolved := x.processGroupResolved
+	signalsDone := x.processGroupSignalsDone
+	killSent := x.processGroupKillSent
+	x.mu.Unlock()
+	if !resolved || !signalsDone {
+		t.Fatalf("processGroupResolved=%v processGroupSignalsDone=%v, want both true after ESRCH", resolved, signalsDone)
+	}
+	if killSent {
+		t.Fatal("signalProcessGroup() set processGroupKillSent after ESRCH")
+	}
+
+	// A reused numeric PGID must not be signaled by later cleanup/ForceKill.
+	sentinel := exec.Command("/bin/sh", "-c", "while true; do sleep 1; done")
+	sentinel.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := sentinel.Start(); err != nil {
+		t.Fatalf("start reused-group sentinel: %v", err)
+	}
+	sentinelDone := make(chan error, 1)
+	go func() { sentinelDone <- sentinel.Wait() }()
+	t.Cleanup(func() {
+		_ = syscall.Kill(-sentinel.Process.Pid, syscall.SIGKILL)
+		select {
+		case <-sentinelDone:
+		case <-time.After(time.Second):
+		}
+	})
+	x.mu.Lock()
+	x.process = sentinel
+	x.mu.Unlock()
+	if err := x.ForceKill(); err != nil {
+		t.Fatalf("ForceKill() after ESRCH resolve error = %v", err)
+	}
+	select {
+	case err := <-sentinelDone:
+		t.Fatalf("ForceKill() signaled a reused process group: %v", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

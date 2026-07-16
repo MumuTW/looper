@@ -3798,7 +3798,19 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 					} else {
 						reason := "loop stop rejected run registration"
 						if loopID != "" {
-							_, _ = input.Repos.Queue.CancelByLoop(ctx, loopID, nowISO, &reason)
+							// Scheduler ctx may already be canceled during loop stop;
+							// use a bounded background context so claim release can finish
+							// and surface durable failures instead of leaving the row running.
+							cancelCtx, cancelRelease := context.WithTimeout(context.Background(), registerRunReleaseTimeout)
+							_, cancelErr := input.Repos.Queue.CancelByLoop(cancelCtx, loopID, nowISO, &reason)
+							cancelRelease()
+							if cancelErr != nil {
+								errList = append(errList, fmt.Errorf("cancel claimed queue item %s after loop stop rejected run registration: %w", item.ID, cancelErr))
+								if input.Logger != nil {
+									input.Logger.Warn("scheduler failed to cancel claimed item after loop stop rejected run registration", map[string]any{"queueItemId": item.ID, "loopId": loopID, "error": cancelErr.Error()})
+								}
+								continue
+							}
 						}
 						if input.Logger != nil {
 							input.Logger.Info("scheduler cancelled claimed item after loop stop rejected run registration", map[string]any{"queueItemId": item.ID, "loopId": loopID})

@@ -348,6 +348,60 @@ func TestRunScheduledQueueItemsSurfacesRequeueFailureAfterShutdownRejectsRegiste
 	}
 }
 
+func TestRunScheduledQueueItemsSurfacesCancelFailureAfterLoopStopRejectsRegisterRun(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "register-run-loop-stop-fail.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "project_register_loop_stop_fail"
+	loopID := "loop_register_loop_stop_fail"
+	queueID := "queue_register_loop_stop_fail"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Register loop stop fail", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	claimed := storage.QueueItemRecord{
+		ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:register_loop_stop_fail", Priority: storage.QueuePriorityWorker, Status: "running",
+		AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, ClaimedBy: stringPtr("scheduler"), ClaimedAt: stringPtr(nowISO),
+		StartedAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Queue.Upsert(context.Background(), claimed); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	registry := NewActiveExecutionRegistry()
+	releaseStop := registry.BeginLoopStop(loopID)
+	defer releaseStop()
+	// Close the DB so CancelByLoop fails after RegisterRun rejection.
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+
+	runner := &stubWorkerScheduler{}
+	err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{claimed}, defaultSchedulerTickInput{
+		Repos:            repos,
+		Now:              func() time.Time { return now },
+		Worker:           runner,
+		ActiveExecutions: registry,
+	})
+	if err == nil {
+		t.Fatal("runScheduledQueueItems() error = nil, want cancel failure after loop-stop rejected registration")
+	}
+	if !strings.Contains(err.Error(), "cancel claimed queue item") {
+		t.Fatalf("error = %q, want cancel claimed queue item context", err.Error())
+	}
+	if runner.processItemCount() != 0 {
+		t.Fatalf("worker processed %d items after RegisterRun rejection, want 0", runner.processItemCount())
+	}
+}
+
 func TestCommentInfosToObjectsPreservesNestedAuthorLogin(t *testing.T) {
 	t.Parallel()
 
