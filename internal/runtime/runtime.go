@@ -20,6 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	shellinfra "github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
@@ -127,6 +128,7 @@ type Runtime struct {
 	customSchedulerTick    bool
 	readProcessCommand     ReadProcessCommandFunc
 	signalProcess          SignalProcessFunc
+	customSignalProcess    bool
 	shutdownTimeout        time.Duration
 	deferRecovery          bool
 
@@ -193,6 +195,7 @@ func New(options Options) *Runtime {
 	}
 
 	signalProcess := options.SignalProcess
+	customSignalProcess := signalProcess != nil
 	if signalProcess == nil {
 		signalProcess = defaultSignalProcess
 	}
@@ -217,6 +220,7 @@ func New(options Options) *Runtime {
 		customSchedulerTick:         customSchedulerTick,
 		readProcessCommand:          readProcessCommand,
 		signalProcess:               signalProcess,
+		customSignalProcess:         customSignalProcess,
 		shutdownTimeout:             shutdownTimeout,
 		worktreeCleanupInitialDelay: options.WorktreeCleanupInitialDelay,
 		deferRecovery:               options.DeferRecovery,
@@ -2701,6 +2705,19 @@ func (r *Runtime) signalAgentProcessGroup(pid int, signal syscall.Signal) error 
 func (r *Runtime) recoveredProcessGroupExited(pid int) (bool, error) {
 	if r.signalProcess == nil {
 		return false, fmt.Errorf("process signal authority is not configured")
+	}
+	// Production recovery uses the non-zombie process-group probe. kill(-pgid, 0)
+	// can keep succeeding for unreaped zombie-only groups on Linux after recovery
+	// SIGKILL; treating those as live strands orphan cleanup as
+	// orphan_cleanup_termination_error instead of marking the execution killed.
+	// Injected SignalProcess mocks keep kill(0)-only semantics so unit tests can
+	// drive the barrier without real PIDs.
+	if !r.customSignalProcess {
+		live, err := shellinfra.ProcessGroupRunnable(pid)
+		if err != nil {
+			return false, fmt.Errorf("probe recovered process group %d: %w", pid, err)
+		}
+		return !live, nil
 	}
 	err := r.signalProcess(-pid, 0)
 	switch {

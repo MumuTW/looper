@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	shellinfra "github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -249,4 +250,61 @@ func waitForRecoveryContractFile(t *testing.T, path string) {
 func recoveryProcessGroupExists(pid int) bool {
 	err := syscall.Kill(-pid, 0)
 	return err == nil || !errors.Is(err, syscall.ESRCH)
+}
+
+// TestRecoveredProcessGroupExitedTreatsZombieOnlyGroupAsExited locks the recovery
+// barrier to the non-zombie probe: after SIGKILL, kill(-pgid, 0) can still
+// succeed for unreaped zombies on Linux, but recovery must treat the group as
+// exited so orphan cleanup marks the execution killed instead of uncertain.
+func TestRecoveredProcessGroupExitedTreatsZombieOnlyGroupAsExited(t *testing.T) {
+	// Leaf process only: a shell -c "sleep …" can leave a live sleep sibling in
+	// the group after the shell is killed (dash forks), which is not the
+	// zombie-only case under test.
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	pgid := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_, _ = cmd.Process.Wait()
+	})
+
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL process group: %v", err)
+	}
+	// Wait until the leader is no longer runnable without reaping it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		live, err := shellinfra.ProcessRunnable(pgid)
+		if err != nil {
+			t.Fatalf("ProcessRunnable() settle error = %v", err)
+		}
+		if !live {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d remained runnable after SIGKILL", pgid)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// kill(0) may still succeed (or return EPERM) while the process is a zombie.
+	if err := syscall.Kill(pgid, 0); err != nil && !errors.Is(err, syscall.ESRCH) && !errors.Is(err, syscall.EPERM) {
+		t.Fatalf("kill(%d,0) error = %v", pgid, err)
+	}
+
+	rt := New(Options{Logger: &testLogger{}})
+	startedAt := time.Now()
+	exited, err := rt.recoveredProcessGroupExited(pgid)
+	if err != nil {
+		t.Fatalf("recoveredProcessGroupExited() error = %v", err)
+	}
+	if !exited {
+		t.Fatalf("recoveredProcessGroupExited(%d) = false, want true for zombie-only group", pgid)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 100*time.Millisecond {
+		t.Fatalf("recoveredProcessGroupExited() elapsed = %s, want immediate zombie-only success", elapsed)
+	}
 }
