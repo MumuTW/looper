@@ -311,7 +311,7 @@ func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
 }
 
 func TestRequestProductSpecReusesExactExistingAsk(t *testing.T) {
-	html := `<p>产品负责人 这个需求「导出」还没有 product spec。请补一份 —— 直接把方案页链接或正文发在这里,looper 会自动把它关联到本 work item 并继续。</p>`
+	html := `<p>产品负责人 请先为需求「导出」补一份可执行的 product spec，再让 looper 开始技术梳理。</p><p>至少写清：用户问题与目标、首版范围和非目标、关键交互或输出、验收标准；涉及付费策略或阶段优先级，也请直接在 spec 中定下来。</p><p>把方案页链接或正文回复在这里，looper 会自动关联到本 work item 并继续。</p>`
 	f := &fakeRun{stdouts: []string{`{"results":[{"id":"existing","comment_html":` + jsonString(html) + `}]}`}}
 	comment, err := newGateway(f).RequestProductSpec(context.Background(), "p1", "wi-1", "产品负责人", "导出")
 	if err != nil {

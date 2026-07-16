@@ -415,6 +415,41 @@ func TestPostThreadApprovalCardUsesApprovalCopyAndSeparateMessageKey(t *testing.
 	}
 }
 
+func TestPostThreadProductSpecCardPointsToPlaneSpecWork(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+	var calls []capturedFeishuCall
+	gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+	ctx := context.Background()
+	now := eventISO(time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC))
+	if err := gateway.repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: "loop_product_spec", Seq: 43, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "awaiting_human", CreatedAt: now, UpdatedAt: now}
+	if err := gateway.repositories.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gateway.PostThreadProductSpecCard(ctx, loop.ID, "请补齐首版范围", "https://plane.test/issues/582#comment-product", []string{"ou_product_owner"}); err != nil {
+		t.Fatalf("PostThreadProductSpecCard() error = %v", err)
+	}
+	var bodies strings.Builder
+	for _, call := range calls {
+		bodies.Write(call.body)
+	}
+	posted := bodies.String()
+	if !strings.Contains(posted, "请先补充产品 spec") || !strings.Contains(posted, "前往 Plane 补 spec") {
+		t.Fatalf("Feishu calls missing product-spec copy: %s", posted)
+	}
+	if strings.Contains(posted, "技术方案已完成") || strings.Contains(posted, "这个需求有个地方需要你来拍板") {
+		t.Fatalf("product-spec card reused another gate's copy: %s", posted)
+	}
+	if got := gateway.loopMetaString(ctx, loop.ID, decisionCardMsgIDKey); got == "" {
+		t.Fatal("product-spec card message id was not persisted")
+	}
+}
+
 func TestBuildFeishuAskCardRendersMention(t *testing.T) {
 	card, err := buildFeishuAskCard(HITLAskCard{
 		LoopSeq: 7, Repo: "acme/looper", Question: "A or B?",

@@ -2121,9 +2121,9 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
-		PostThreadNote:         notificationGateway.PostThreadNote,
-		PostThreadCard:         notificationGateway.PostThreadDecisionCard,
-		PostThreadApprovalCard: notificationGateway.PostThreadApprovalCard,
+		PostThreadNote:            notificationGateway.PostThreadNote,
+		PostThreadApprovalCard:    notificationGateway.PostThreadApprovalCard,
+		PostThreadProductSpecCard: notificationGateway.PostThreadProductSpecCard,
 	})
 	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
 		Repos:   repos,

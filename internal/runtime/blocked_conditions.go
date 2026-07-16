@@ -138,7 +138,23 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 			if err != nil {
 				return false, fmt.Errorf("invalid Plane HITL askedAt %q: %w", ask.AskedAt, err)
 			}
-			pageURL := strings.SplitN(strings.TrimSpace(ask.ActionURL), "#", 2)[0]
+			sourceURL := strings.SplitN(strings.TrimSpace(ask.ActionURL), "#", 2)[0]
+			if workItemID := planedoc.WorkItemIDFromURL(sourceURL); workItemID != "" {
+				comments, listErr := planeGateway.ListWorkItemComments(ctx, planeProjectID, workItemID)
+				if listErr != nil {
+					return false, listErr
+				}
+				answer := earliestHumanWorkItemAnswer(comments, askedAt)
+				if answer == nil {
+					return false, nil
+				}
+				text := firstNonEmpty(strings.TrimSpace(answer.CommentStripped), strings.TrimSpace(answer.CommentHTML))
+				if err := recordPlaneHITLAnswer(ctx, repositories, loop.ID, text, answer.CreatedAt); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+			pageURL := sourceURL
 			comments, err := planeGateway.ListHumanSpecComments(ctx, planeProjectID, pageURL)
 			if err != nil {
 				return false, err
@@ -175,6 +191,26 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 			return recoverableInfraConditionCleared(ctx, cfg, repositories, &projectID, condition.Fingerprint)
 		},
 	}
+}
+
+func earliestHumanWorkItemAnswer(comments []planedoc.WorkItemComment, askedAt time.Time) *planedoc.WorkItemComment {
+	var answer *planedoc.WorkItemComment
+	for i := range comments {
+		text := firstNonEmpty(strings.TrimSpace(comments[i].CommentStripped), strings.TrimSpace(comments[i].CommentHTML))
+		createdAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(comments[i].CreatedAt))
+		if err != nil || !createdAt.After(askedAt) || strings.Contains(text, planedoc.LooperSignatureMark) || strings.Contains(text, planedoc.LooperCommentMarker) {
+			continue
+		}
+		if answer == nil {
+			answer = &comments[i]
+			continue
+		}
+		currentAt, _ := time.Parse(time.RFC3339Nano, answer.CreatedAt)
+		if createdAt.Before(currentAt) {
+			answer = &comments[i]
+		}
+	}
+	return answer
 }
 
 func latestRunIssueURL(ctx context.Context, repositories *storage.Repositories, loopID string) (string, error) {

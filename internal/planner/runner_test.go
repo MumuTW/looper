@@ -10,6 +10,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
@@ -62,6 +63,28 @@ func TestBuildPlannerPromptUsesForgejoIssueTextForForgejoProjects(t *testing.T) 
 	}
 	if strings.Contains(prompt, "GitHub issue") {
 		t.Fatalf("prompt = %q, want no GitHub-specific issue text", prompt)
+	}
+}
+
+func TestBuildPlannerPromptMakesProductSpecAuthoritative(t *testing.T) {
+	t.Parallel()
+
+	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}
+	issue := &checkpointIssue{
+		Repo:           "nexu-io/open-design",
+		IssueNumber:    582,
+		Title:          "高保真导出",
+		Body:           "建议先做 HTML",
+		SpecPath:       "specs/582.md",
+		ProductSpecURL: "https://plane.test/pages/product-582",
+		ProductSpec:    "目标：第一阶段提供 React + 独立 CSS；保留现有 HTML 入口。",
+	}
+	prompt, _ := buildPlannerPrompt(project, customInstructionConfig(nil), issue, &checkpointWorktree{Branch: "looper/582", BaseBranch: "main"}, false, config.DefaultDisclosureConfig(), "", "")
+
+	for _, want := range []string{"AUTHORITATIVE PRODUCT SPEC", "第一阶段提供 React + 独立 CSS", "highest-priority source of truth", "Do not replace an explicit product decision"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
 	}
 }
 
@@ -1623,7 +1646,7 @@ func TestSetAwaitingProductAnswerMarker(t *testing.T) {
 	}
 }
 
-func TestNotifyProductDecisionUsesExactPlaneURLAndMentionsProductOwner(t *testing.T) {
+func TestNotifyProductSpecClarificationUsesExactPlaneURLAndMentionsProductOwner(t *testing.T) {
 	t.Parallel()
 	var gotLoopID, gotText, gotActionURL string
 	var gotMentions []string
@@ -1631,13 +1654,13 @@ func TestNotifyProductDecisionUsesExactPlaneURLAndMentionsProductOwner(t *testin
 	r := &Runner{
 		logger:            &testLogger{},
 		projectRoleConfig: roleCfg,
-		postThreadCard: func(_ context.Context, loopID, text, actionURL string, mentions []string) error {
+		postThreadProductSpecCard: func(_ context.Context, loopID, text, actionURL string, mentions []string) error {
 			gotLoopID, gotText, gotActionURL, gotMentions = loopID, text, actionURL, mentions
 			return nil
 		},
 	}
 	in := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Loop: storage.LoopRecord{ID: "loop_x"}}
-	r.notifyProductDecision(context.Background(), in, "① 背景:客户 A 要导出。\n③ 问题:先做 A 还是 B?建议 A。", "https://plane.test/pages/pg-1#comment-c-1")
+	r.notifyProductSpecClarification(context.Background(), in, "① 背景:客户 A 要导出。\n③ 问题:先做 A 还是 B?建议 A。", "https://plane.test/issues/wi-1#comment-c-1")
 
 	if gotLoopID != "loop_x" {
 		t.Fatalf("loopID = %q, want loop_x", gotLoopID)
@@ -1645,11 +1668,55 @@ func TestNotifyProductDecisionUsesExactPlaneURLAndMentionsProductOwner(t *testin
 	if !strings.Contains(gotText, "① 背景") || !strings.Contains(gotText, "建议 A") {
 		t.Fatalf("text = %q, want the productAsk embedded", gotText)
 	}
-	if gotActionURL != "https://plane.test/pages/pg-1#comment-c-1" {
+	if gotActionURL != "https://plane.test/issues/wi-1#comment-c-1" {
 		t.Fatalf("actionURL = %q, want exact Plane comment URL", gotActionURL)
 	}
 	if len(gotMentions) != 1 || gotMentions[0] != "ou_sunqingyu" {
 		t.Fatalf("mentions = %v, want [ou_sunqingyu] (@ product owner)", gotMentions)
+	}
+}
+
+func TestRequestProductSpecClarificationReturnsToWorkItem(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	loop := storage.LoopRecord{ID: "loop_product_clarification", Seq: 82, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	gw, calls := scriptedGateway(`{"id":"comment-product-spec"}`)
+	var notifiedURL string
+	r := &Runner{
+		repos: fixture.repos,
+		now:   fixture.now,
+		planeDoc: func(string) (*planedoc.Gateway, string, bool) {
+			return gw, "plane-project", true
+		},
+		postThreadProductSpecCard: func(_ context.Context, _, _, actionURL string, _ []string) error {
+			notifiedURL = actionURL
+			return nil
+		},
+	}
+	in := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Loop: loop}
+	checkpoint := plannerCheckpoint{Issue: &checkpointIssue{URL: "https://plane.test/open-design/projects/p/issues/work-item-582"}}
+
+	actionURL, err := r.requestProductSpecClarificationOnPlane(ctx, in, checkpoint, "请在产品 spec 明确首版范围")
+	if err != nil {
+		t.Fatalf("requestProductSpecClarificationOnPlane() error = %v", err)
+	}
+	if actionURL != "https://plane.test/open-design/projects/p/issues/work-item-582#comment-comment-product-spec" || notifiedURL != actionURL {
+		t.Fatalf("action URLs = %q, %q; want exact work-item comment", actionURL, notifiedURL)
+	}
+	joinedCall := ""
+	if len(*calls) == 1 {
+		joinedCall = strings.Join((*calls)[0], " ")
+	}
+	if len(*calls) != 1 || !strings.Contains(joinedCall, "api comment create") || strings.Contains(joinedCall, " page ") {
+		t.Fatalf("Plane calls = %v, want one work-item comment and no tech-page publish", *calls)
+	}
+	if !strings.Contains(joinedCall, "产品 spec 需要补充") {
+		t.Fatalf("comment call missing product-spec guidance: %v", (*calls)[0])
 	}
 }
 

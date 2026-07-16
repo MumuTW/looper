@@ -2120,6 +2120,12 @@ func (g *Gateway) PostThreadApprovalCard(ctx context.Context, loopID, body, acti
 	return g.postThreadActionCard(ctx, loopID, body, actionURL, mentionOpenIDs, "approval")
 }
 
+// PostThreadProductSpecCard points product to the work-item comment where they can
+// create or update the authoritative product spec before planning continues.
+func (g *Gateway) PostThreadProductSpecCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error {
+	return g.postThreadActionCard(ctx, loopID, body, actionURL, mentionOpenIDs, "product_spec")
+}
+
 func (g *Gateway) postThreadActionCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string, purpose string) error {
 	loopID = strings.TrimSpace(loopID)
 	actionURL = strings.TrimSpace(actionURL)
@@ -2152,6 +2158,7 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 	// decision delivery required an already-existing root and silently no-op'd.
 	root := g.ensureFeishuThreadRoot(ctx, token, chatID, loopID)
 	approval := strings.EqualFold(strings.TrimSpace(intent.Purpose), "approval")
+	productSpec := strings.EqualFold(strings.TrimSpace(intent.Purpose), "product_spec")
 	lead := "🙋 这个需求有个地方需要你来拍板 —— 请前往 Plane 的具体评论回答。飞书回复不会被读取。"
 	buttonText := "前往 Plane 回答"
 	messageIDKey := decisionCardMsgIDKey
@@ -2159,6 +2166,9 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 		lead = "👀 技术方案已完成 GRILL + REVIEW，请前往 Plane 审核。飞书回复不会被读取。"
 		buttonText = "前往 Plane 审核"
 		messageIDKey = approvalCardMsgIDKey
+	} else if productSpec {
+		lead = "📝 请先补充产品 spec，再让 Looper 开始技术梳理。请前往 Plane work item 处理；飞书回复不会被读取。"
+		buttonText = "前往 Plane 补 spec"
 	}
 	if mention := feishuMentionMarkup(firstFeishuOwner(intent.MentionOpenIDs)); mention != "" {
 		lead = mention + " " + lead
@@ -2200,8 +2210,8 @@ func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDe
 	return nil
 }
 
-// decisionCardMsgIDKey stores the node-H 拍板 card's message id in loop metadata so a
-// follow-up revision patches that card in place instead of posting a duplicate.
+// decisionCardMsgIDKey stores the product-action card's message id in loop metadata
+// so a follow-up revision patches that card in place instead of posting a duplicate.
 const decisionCardMsgIDKey = "productAskCardMsgId"
 
 const approvalCardMsgIDKey = "specApprovalCardMsgId"

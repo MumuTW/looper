@@ -342,14 +342,14 @@ type Options struct {
 	// PostThreadNote posts a plain-text reply into a loop's Feishu thread (node H
 	// touchpoints: spec-draft FYI, grill transcript), optionally @-mentioning open_ids.
 	PostThreadNote func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
-	// PostThreadCard posts a one-way decision notification with an exact Plane/GitHub
-	// action URL. Feishu never receives the answer.
-	PostThreadCard func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
 	// PostThreadApprovalCard posts the separate owner-facing tech-spec approval card.
 	// Keeping this distinct from product decisions prevents the wrong role, copy, and
 	// card dedupe key from being reused at node H.
 	PostThreadApprovalCard func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
-	DiscoveryPolicy        DiscoveryPolicy
+	// PostThreadProductSpecCard asks product to create or update the authoritative
+	// product spec on Plane before planning continues.
+	PostThreadProductSpecCard func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	DiscoveryPolicy           DiscoveryPolicy
 	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
 	// project whose task source is Plane (§8 flowchart). nil / (…,false) → the
 	// project keeps the repo-file spec path (github/forgejo). Set for plane projects.
@@ -368,31 +368,31 @@ type DiscoveryPolicy struct {
 }
 
 type Runner struct {
-	db                      *sql.DB
-	repos                   *storage.Repositories
-	github                  GitHubGateway
-	git                     GitGateway
-	agentExecutor           AgentExecutor
-	logger                  bootstrap.Logger
-	now                     func() time.Time
-	agentTimeout            time.Duration
-	agentIdleTimeout        time.Duration
-	claimTTL                time.Duration
-	allowAutoPush           bool
-	disclosure              config.DisclosureConfig
-	agentRuntime            string
-	customInstructions      config.Config
-	projectRoleConfig       *config.Config
-	agentModel              string
-	retryBaseDelay          time.Duration
-	retryMaxAttempts        int64
-	onAgentExecutionStarted AgentExecutionStartedFunc
-	onQueueItemEnqueued     func()
-	postThreadNote          func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
-	postThreadCard          func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
-	postThreadApprovalCard  func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
-	discoveryPolicy         DiscoveryPolicy
-	planeDoc                PlaneDocResolver
+	db                        *sql.DB
+	repos                     *storage.Repositories
+	github                    GitHubGateway
+	git                       GitGateway
+	agentExecutor             AgentExecutor
+	logger                    bootstrap.Logger
+	now                       func() time.Time
+	agentTimeout              time.Duration
+	agentIdleTimeout          time.Duration
+	claimTTL                  time.Duration
+	allowAutoPush             bool
+	disclosure                config.DisclosureConfig
+	agentRuntime              string
+	customInstructions        config.Config
+	projectRoleConfig         *config.Config
+	agentModel                string
+	retryBaseDelay            time.Duration
+	retryMaxAttempts          int64
+	onAgentExecutionStarted   AgentExecutionStartedFunc
+	onQueueItemEnqueued       func()
+	postThreadNote            func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
+	postThreadApprovalCard    func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	postThreadProductSpecCard func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	discoveryPolicy           DiscoveryPolicy
+	planeDoc                  PlaneDocResolver
 }
 
 type DiscoveryInput struct {
@@ -440,6 +440,8 @@ type checkpointIssue struct {
 	Labels             []string `json:"labels,omitempty"`
 	CurrentUserLogin   string   `json:"currentUserLogin,omitempty"`
 	SpecPath           string   `json:"specPath,omitempty"`
+	ProductSpecURL     string   `json:"productSpecUrl,omitempty"`
+	ProductSpec        string   `json:"productSpec,omitempty"`
 	RequestedReviewers []string `json:"requestedReviewers,omitempty"`
 }
 
@@ -555,7 +557,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, postThreadCard: options.PostThreadCard, postThreadApprovalCard: options.PostThreadApprovalCard, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, postThreadApprovalCard: options.PostThreadApprovalCard, postThreadProductSpecCard: options.PostThreadProductSpecCard, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -982,10 +984,9 @@ func (input stepInput) CheckpointIssueLogin() string {
 }
 
 // productSpecGate implements flowchart node D/E for a Plane-provider feature: check
-// whether the work item has a product spec; if not, ask product on the work item and
+// whether the work item has a readable, non-empty product spec; if not, ask product on the work item and
 // return a hold (FailureManualIntervention) so the planner doesn't write a tech spec
-// without one. A no-op for github/forgejo projects, non-features, or when the work
-// item / spec status can't be resolved (fail open — don't wedge non-Plane flows).
+// without one. A no-op for github/forgejo projects and non-features.
 func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoint plannerCheckpoint) *loopError {
 	if r.planeDoc == nil || checkpoint.Issue == nil {
 		return nil
@@ -1002,11 +1003,22 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 	if workItemID == "" {
 		return nil
 	}
-	present, _, err := gateway.HasProductSpec(ctx, planeProjectID, workItemID)
+	productSpecURL, present, err := gateway.FindSpecLink(ctx, planeProjectID, workItemID, planedoc.ProductSpecLinkTitle)
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("check product spec on work item: %v", err), kind: FailureRetryableTransient}
 	}
+	productSpec := strings.TrimSpace(productSpecURL)
 	if present {
+		if pageID := planedoc.PageIDFromURL(productSpecURL); pageID != "" {
+			productSpec, err = gateway.PageContent(ctx, planeProjectID, pageID)
+			if err != nil {
+				return &loopError{message: fmt.Sprintf("read product spec on work item: %v", err), kind: FailureRetryableTransient}
+			}
+		}
+	}
+	if present && strings.TrimSpace(productSpec) != "" {
+		issue.ProductSpec = strings.TrimSpace(productSpec)
+		issue.ProductSpecURL = strings.TrimSpace(productSpecURL)
 		// A resumed planner passes here once product supplied the spec (node E2) —
 		// clear the hold marker so the card leaves "⏸ 等待产品方案".
 		r.setAwaitingProductSpecMarker(ctx, input.Loop, false, "", issue)
@@ -1022,7 +1034,7 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 	// Mark the hold reason so the anchor card reads "⏸ 等待产品方案" (node E) rather
 	// than the generic "⏸ 等你定夺" — the header alone tells you what's blocking.
 	r.setAwaitingProductSpecMarker(ctx, input.Loop, true, comment.ID, issue)
-	return &loopError{message: "awaiting product spec — asked product to supply one on the work item", kind: FailureManualIntervention}
+	return &loopError{message: "awaiting an actionable product spec — asked product to supply one on the work item", kind: FailureManualIntervention}
 }
 
 // requestProductSpecInThread @-mentions the project's product owner in the loop's
@@ -1031,15 +1043,15 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 // The open_id is resolved per-project from config (never hardcoded); a missing
 // transport or an unset owner just skips the ping. Best-effort.
 func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput, workItemTitle, actionURL string) {
-	if r.postThreadCard == nil || r.projectRoleConfig == nil || strings.TrimSpace(actionURL) == "" {
+	if r.postThreadProductSpecCard == nil || r.projectRoleConfig == nil || strings.TrimSpace(actionURL) == "" {
 		return
 	}
 	var mentions []string
 	if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
 		mentions = []string{openID}
 	}
-	note := fmt.Sprintf("⏸ 需求「%s」还没有产品 spec。请前往 Plane 的具体评论补充方案页链接或正文；飞书回复不会被读取。", strings.TrimSpace(workItemTitle))
-	if err := r.postThreadCard(ctx, input.Loop.ID, note, actionURL, mentions); err != nil && r.logger != nil {
+	note := fmt.Sprintf("⏸ 需求「%s」还没有可执行的产品 spec。请前往 Plane 的具体评论补充方案页链接或正文；飞书回复不会被读取。", strings.TrimSpace(workItemTitle))
+	if err := r.postThreadProductSpecCard(ctx, input.Loop.ID, note, actionURL, mentions); err != nil && r.logger != nil {
 		r.logger.Warn("planner: post product-spec request note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 	}
 }
@@ -1075,10 +1087,11 @@ func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.
 	}
 }
 
-// requestProductDecisionOnPlane persists the decision at its source of truth first,
-// then sends a one-way Feishu notification carrying the exact comment URL. Repeated
-// execution reuses the current awaiting ask instead of creating duplicate comments.
-func (r *Runner) requestProductDecisionOnPlane(ctx context.Context, input stepInput, checkpoint plannerCheckpoint, productAsk string) (string, error) {
+// requestProductSpecClarificationOnPlane returns a genuinely blocking product gap
+// to the work item, where product can update the authoritative spec. Feishu remains
+// a one-way notification carrying the exact comment URL. Repeated execution reuses
+// the current awaiting ask instead of creating duplicate comments.
+func (r *Runner) requestProductSpecClarificationOnPlane(ctx context.Context, input stepInput, checkpoint plannerCheckpoint, productAsk string) (string, error) {
 	if r.planeDoc == nil {
 		return "", fmt.Errorf("planner: Plane decision requires a Plane document gateway")
 	}
@@ -1090,25 +1103,10 @@ func (r *Runner) requestProductDecisionOnPlane(ctx context.Context, input stepIn
 	if err != nil {
 		return "", err
 	}
-	worktree, err := requireWorktree(checkpoint)
-	if err != nil {
-		return "", err
-	}
-	if err := r.publishTechSpecToPlane(ctx, input, *issue, *worktree); err != nil {
-		return "", fmt.Errorf("planner: publish tech spec before product decision: %w", err)
-	}
 	workItemID := planedoc.WorkItemIDFromURL(issue.URL)
 	if workItemID == "" {
 		return "", fmt.Errorf("planner: cannot resolve Plane work item from %q", issue.URL)
 	}
-	specURL, found, err := gateway.FindSpecLink(ctx, planeProjectID, workItemID, planedoc.TechSpecLinkTitle)
-	if err != nil {
-		return "", err
-	}
-	if !found || planedoc.PageIDFromURL(specURL) == "" {
-		return "", fmt.Errorf("planner: published tech spec has no Plane page link")
-	}
-
 	fresh, err := r.repos.Loops.GetByID(ctx, input.Loop.ID)
 	if err != nil {
 		return "", err
@@ -1118,14 +1116,14 @@ func (r *Runner) requestProductDecisionOnPlane(ctx context.Context, input stepIn
 	}
 	ask, hasAsk := loops.ReadHITLAsk(fresh.MetadataJSON)
 	if !(hasAsk && ask.Transport == "plane" && ask.Status == "awaiting" && strings.TrimSpace(ask.Question) == strings.TrimSpace(productAsk) && strings.TrimSpace(ask.ActionURL) != "") {
-		body := "<p><strong>🙋 需要产品负责人拍板</strong></p><p>" + strings.ReplaceAll(htmlpkg.EscapeString(strings.TrimSpace(productAsk)), "\n", "<br>") + "</p>"
-		comment, createErr := gateway.CreatePageComment(ctx, planeProjectID, planedoc.PageIDFromURL(specURL), planedoc.SignComment(body, "planner", r.agentModel))
+		body := "<p><strong>📝 产品 spec 需要补充</strong></p><p>" + strings.ReplaceAll(htmlpkg.EscapeString(strings.TrimSpace(productAsk)), "\n", "<br>") + "</p><p>请先更新本 work item 已关联的 product spec，再回复本评论说明已更新。Looper 会重新读取 product spec 后再做技术方案。</p>"
+		comment, createErr := gateway.CreateWorkItemComment(ctx, planeProjectID, workItemID, planedoc.SignComment(body, "planner", r.agentModel))
 		if createErr != nil {
 			return "", createErr
 		}
-		actionURL := planedoc.PageCommentURL(specURL, comment.ID)
+		actionURL := planedoc.WorkItemCommentURL(issue.URL, comment.ID)
 		if actionURL == "" {
-			return "", fmt.Errorf("planner: Plane decision comment did not return an id")
+			return "", fmt.Errorf("planner: Plane product-spec comment did not return an id")
 		}
 		ask = loops.HITLAsk{Question: strings.TrimSpace(productAsk), SessionID: r.latestNativeSessionID(ctx, input.Loop.ID), Status: "awaiting", AskedAt: r.nowISO(), Transport: "plane", ActionURL: actionURL}
 		metadata, writeErr := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
@@ -1145,12 +1143,12 @@ func (r *Runner) requestProductDecisionOnPlane(ctx context.Context, input stepIn
 		}
 	}
 
-	r.notifyProductDecision(ctx, input, productAsk, ask.ActionURL)
+	r.notifyProductSpecClarification(ctx, input, productAsk, ask.ActionURL)
 	return ask.ActionURL, nil
 }
 
-func (r *Runner) notifyProductDecision(ctx context.Context, input stepInput, productAsk, actionURL string) {
-	if r.postThreadCard == nil || strings.TrimSpace(actionURL) == "" {
+func (r *Runner) notifyProductSpecClarification(ctx context.Context, input stepInput, productAsk, actionURL string) {
+	if r.postThreadProductSpecCard == nil || strings.TrimSpace(actionURL) == "" {
 		return
 	}
 	var mentions []string
@@ -1159,8 +1157,8 @@ func (r *Runner) notifyProductDecision(ctx context.Context, input stepInput, pro
 			mentions = []string{openID}
 		}
 	}
-	if err := r.postThreadCard(ctx, input.Loop.ID, strings.TrimSpace(productAsk), actionURL, mentions); err != nil && r.logger != nil {
-		r.logger.Warn("planner: post product-decision card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+	if err := r.postThreadProductSpecCard(ctx, input.Loop.ID, strings.TrimSpace(productAsk), actionURL, mentions); err != nil && r.logger != nil {
+		r.logger.Warn("planner: post product-spec clarification card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 	}
 }
 
@@ -1249,7 +1247,9 @@ As you write the spec, sort every open question into PRODUCT vs TECHNICAL.
 - TECHNICAL (which library, how to structure the code, a data shape, error handling, an internal name, anything a competent engineer can just pick): DECIDE it yourself, note it in the spec, and do NOT escalate.
 - PRODUCT: a decision only the product owner can make — it changes what the user sees or can do, the product's scope/behavior, or hinges on business intent, a user-facing tradeoff, or an unstated requirement.
 
-ONLY when at least one real PRODUCT decision genuinely needs the product owner to choose, ALSO emit a "productAsk" field in your final __LOOPER_RESULT__ line: ONE message written FOR the product owner, in the product owner's own language (match the language of the issue/thread).
+The authoritative product spec has already been supplied above. Follow every explicit decision in it. Do NOT reopen or replace its phase order, scope, priority, acceptance criteria, or other user-visible decisions. Do NOT invent optional pricing, packaging, or prioritization questions merely because the product spec does not discuss them.
+
+ONLY when the product spec itself marks a required item unresolved/TBD, or omits information without which implementation is genuinely impossible, emit a "productAsk" field in your final __LOOPER_RESULT__ line. The message asks the product owner to UPDATE THE PRODUCT SPEC before planning continues. Write it in the product owner's own language (match the issue/thread).
 
 FORMATTING — this message is shown as a Feishu card, so it MUST be structured, never one long paragraph. Use lark-markdown: **bold** for every sub-header and for the recommended option; a BLANK LINE between sections; and put each option on ITS OWN line. Do NOT use "#" headers (use **bold** instead). Lay it out EXACTLY like this (keep the bold sub-headers verbatim):
 
@@ -1270,7 +1270,7 @@ FORMATTING — this message is shown as a Feishu card, so it MUST be structured,
 Hard rules for productAsk:
   - Write like a product manager briefing a business stakeholder, NOT like an engineer. Someone who cannot read code must be able to decide from it alone.
   - NO engineering jargon of ANY kind: no API/endpoint/route, component/module/package/library names, field/column/schema names, CSS/z-index, file paths, or function names. Translate every technical thing into what the user actually experiences. (e.g. "read from the brand endpoint" → "where a brand's info is pulled from"; "the design-system package" → "the brand kit they imported".)
-  - Put everything needed to decide INSIDE the message. Do NOT include a spec link or tell them to go read the spec.
+  - Put everything needed to update the product spec INSIDE the message. Do NOT include a tech-spec link.
   - If there is NO product decision (only technical questions, which you resolved yourself), set productAsk to "" — never invent one.
 
 The productAsk value is a JSON string, so encode the line breaks as \n (a blank line between sections is \n\n). Your final marker line carries the extra field:
@@ -1280,6 +1280,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	checkpoint := input.Checkpoint
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
+	}
+	// Re-read the product spec immediately before authoring. This covers native
+	// resume after a product clarification and makes the product page—not a stale
+	// checkpoint or the issue body—the planner's current source of truth.
+	if gateErr := r.productSpecGate(ctx, input, checkpoint); gateErr != nil {
+		return checkpoint, gateErr
 	}
 	writeSpecCompleted := checkpoint.WriteSpec != nil && strings.EqualFold(checkpoint.WriteSpec.Status, "completed")
 	productAsk := ""
@@ -1411,7 +1417,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	// the exact comment link. The blocked-condition reconciler observes a later human
 	// Plane comment, records it, and native-resumes this same authoring session.
 	if productAsk != "" && r.isPlaneProject(input.Project.ID) {
-		if _, err := r.requestProductDecisionOnPlane(ctx, input, checkpoint, productAsk); err != nil {
+		if _, err := r.requestProductSpecClarificationOnPlane(ctx, input, checkpoint, productAsk); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
 		r.setNodeHPhase(ctx, input.Loop.ID, "awaiting_product_answer")
@@ -2687,6 +2693,13 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 	if strings.TrimSpace(issue.Body) != "" {
 		parts = append(parts, "Issue body:\n"+issue.Body)
 	}
+	if strings.TrimSpace(issue.ProductSpec) != "" {
+		productSpec := "AUTHORITATIVE PRODUCT SPEC (highest-priority source of truth):\n" + issue.ProductSpec
+		if strings.TrimSpace(issue.ProductSpecURL) != "" {
+			productSpec += "\nProduct spec URL: " + issue.ProductSpecURL
+		}
+		parts = append(parts, productSpec)
+	}
 	if strings.TrimSpace(issue.URL) != "" {
 		parts = append(parts, "Issue URL: "+issue.URL)
 	}
@@ -2701,7 +2714,9 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"Requirements:",
 		"- Create or update the spec at " + issue.SpecPath,
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
-		"- Keep the implementation scope aligned to the issue",
+		"- Treat the product spec as authoritative for user-visible scope, phase order, priorities, and acceptance criteria; the issue is supporting context only",
+		"- Do not replace an explicit product decision with your own recommendation or invent pricing, packaging, or prioritization questions that the product spec does not mark unresolved",
+		"- Keep the implementation scope aligned to the product spec",
 	}
 	if allowAutoPush {
 		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")

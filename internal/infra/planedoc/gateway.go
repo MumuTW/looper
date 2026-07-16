@@ -383,7 +383,7 @@ func (g *Gateway) CommentOnWorkItem(ctx context.Context, projectID, workItemID, 
 // tells them looper will auto-associate whatever spec link/text they reply with.
 func (g *Gateway) RequestProductSpec(ctx context.Context, projectID, workItemID, ownerMention, workItemName string) (WorkItemComment, error) {
 	html := fmt.Sprintf(
-		"<p>%s 这个需求「%s」还没有 product spec。请补一份 —— 直接把方案页链接或正文发在这里,looper 会自动把它关联到本 work item 并继续。</p>",
+		"<p>%s 请先为需求「%s」补一份可执行的 product spec，再让 looper 开始技术梳理。</p><p>至少写清：用户问题与目标、首版范围和非目标、关键交互或输出、验收标准；涉及付费策略或阶段优先级，也请直接在 spec 中定下来。</p><p>把方案页链接或正文回复在这里，looper 会自动关联到本 work item 并继续。</p>",
 		htmlpkg.EscapeString(strings.TrimSpace(ownerMention)),
 		htmlpkg.EscapeString(strings.TrimSpace(workItemName)),
 	)

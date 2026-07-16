@@ -57,14 +57,39 @@ func TestProductSpecGateHoldsFeatureWithoutSpec(t *testing.T) {
 }
 
 func TestProductSpecGateProceedsWhenSpecPresent(t *testing.T) {
-	gw, calls := scriptedGateway(`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`)
+	gw, calls := scriptedGateway(
+		`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`,
+		`<p>目标：首版导出 React + CSS。验收：产物可独立运行。</p>`,
+	)
 	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }}
 	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
 	if gateErr := r.productSpecGate(context.Background(), in, cp); gateErr != nil {
 		t.Fatalf("gate = %v, want nil (has product spec → proceed)", gateErr)
 	}
-	if len(*calls) != 1 {
-		t.Fatalf("calls = %d, want only the link list (no comment)", len(*calls))
+	if len(*calls) != 2 {
+		t.Fatalf("calls = %d, want link list + product page read (no comment)", len(*calls))
+	}
+	if cp.Issue.ProductSpec == "" || cp.Issue.ProductSpecURL == "" {
+		t.Fatalf("issue product spec = %q, %q; want authoritative content + URL", cp.Issue.ProductSpec, cp.Issue.ProductSpecURL)
+	}
+}
+
+func TestProductSpecGateHoldsEmptyLinkedSpec(t *testing.T) {
+	gw, calls := scriptedGateway(
+		`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`,
+		` `,
+		`{"results":[]}`,
+		`{"id":"c-empty"}`,
+	)
+	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }}
+	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
+
+	gateErr := r.productSpecGate(context.Background(), in, cp)
+	if gateErr == nil || gateErr.kind != FailureManualIntervention {
+		t.Fatalf("gate = %v, want empty linked spec to hold", gateErr)
+	}
+	if len(*calls) != 4 {
+		t.Fatalf("calls = %d, want link read + page read + ask lookup + comment", len(*calls))
 	}
 }
 

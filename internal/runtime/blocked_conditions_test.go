@@ -84,6 +84,23 @@ func TestRecordPlaneHITLAnswerPersistsSourceAnswer(t *testing.T) {
 	}
 }
 
+func TestEarliestHumanWorkItemAnswerIgnoresLooperAndPreAskComments(t *testing.T) {
+	t.Parallel()
+
+	askedAt := time.Date(2026, time.July, 16, 3, 0, 0, 0, time.UTC)
+	comments := []planedoc.WorkItemComment{
+		{ID: "later", CommentStripped: "已更新产品 spec", CreatedAt: "2026-07-16T03:03:00.000Z"},
+		{ID: "looper", CommentStripped: "ask · Powered by Looper", CreatedAt: "2026-07-16T03:01:00.000Z"},
+		{ID: "before", CommentStripped: "旧评论", CreatedAt: "2026-07-16T02:59:00.000Z"},
+		{ID: "first", CommentStripped: "产品 spec 已补齐", CreatedAt: "2026-07-16T03:02:00.000Z"},
+	}
+
+	answer := earliestHumanWorkItemAnswer(comments, askedAt)
+	if answer == nil || answer.ID != "first" {
+		t.Fatalf("answer = %#v, want first human reply after ask", answer)
+	}
+}
+
 func TestBlockedConditionRegistryContainsEveryNamedCondition(t *testing.T) {
 	runtime := &Runtime{}
 	registry := runtime.blockedConditionRegistry(&config.Config{}, nil, nil)
