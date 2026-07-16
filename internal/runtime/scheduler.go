@@ -3759,8 +3759,21 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			var accepted bool
 			unregisterRun, accepted = input.ActiveExecutions.RegisterRun(*item.LoopID, item.ID, cancelProcess, processDone)
 			if !accepted {
+				// Claim already moved the item to running; RegisterRun rejects when
+				// BeginLoopStop/shutdown wins the race. Release the claim so the
+				// slot does not stay stranded until a later recovery pass.
 				close(processDone)
 				cancelProcess()
+				if input.Repos != nil && input.Repos.Queue != nil {
+					_ = input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
+				}
+				if input.Logger != nil {
+					loopID := ""
+					if item.LoopID != nil {
+						loopID = *item.LoopID
+					}
+					input.Logger.Info("scheduler released claimed item after rejected run registration", map[string]any{"queueItemId": item.ID, "loopId": loopID})
+				}
 				continue
 			}
 		}
