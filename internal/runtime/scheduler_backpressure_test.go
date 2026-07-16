@@ -3,6 +3,7 @@ package runtime
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/infra/disk"
@@ -23,13 +24,23 @@ func backpressureConfig(enabled bool, path string, high, hard float64) *config.C
 func stubDiskUsage(t *testing.T, usedPercent float64, err error) {
 	t.Helper()
 	original := diskUsageStat
+	resetDiskBackpressureLogStates()
 	diskUsageStat = func(path string) (disk.Usage, error) {
 		if err != nil {
 			return disk.Usage{}, err
 		}
 		return disk.Usage{Path: path, TotalBytes: 100 << 30, AvailBytes: 10 << 30, UsedPercent: usedPercent}, nil
 	}
-	t.Cleanup(func() { diskUsageStat = original })
+	t.Cleanup(func() {
+		diskUsageStat = original
+		resetDiskBackpressureLogStates()
+	})
+}
+
+func resetDiskBackpressureLogStates() {
+	diskBackpressureLogMu.Lock()
+	defer diskBackpressureLogMu.Unlock()
+	diskBackpressureLogStates = map[string]diskBackpressureLogState{}
 }
 
 func TestDiskBackpressureClampAllowsWhenDisabled(t *testing.T) {
@@ -76,6 +87,60 @@ func TestDiskBackpressureClampHardStopSignalsEmergency(t *testing.T) {
 		t.Fatalf("at/above hard stop must clamp to 0; got %d", got)
 	}
 	logger.requireMessage(t, "disk backpressure: hard stop — refusing to claim new runs (disk emergency)")
+}
+
+func TestDiskBackpressureClampRateLimitsRepeatedWarningsAndReportsRecovery(t *testing.T) {
+	usedPercent := 87.0
+	original := diskUsageStat
+	diskUsageStat = func(path string) (disk.Usage, error) {
+		return disk.Usage{Path: path, TotalBytes: 100 << 30, AvailBytes: 13 << 30, UsedPercent: usedPercent}, nil
+	}
+	now := time.Date(2026, time.July, 16, 11, 0, 0, 0, time.UTC)
+	originalNow := diskBackpressureNow
+	diskBackpressureNow = func() time.Time { return now }
+	resetDiskBackpressureLogStates()
+	t.Cleanup(func() {
+		diskUsageStat = original
+		diskBackpressureNow = originalNow
+		resetDiskBackpressureLogStates()
+	})
+
+	logger := &capturingSchedulerLogger{}
+	cfg := backpressureConfig(true, "/wt", 85, 93)
+	for range 20 {
+		if got := diskBackpressureClamp(1, cfg, logger); got != 0 {
+			t.Fatalf("blocked clamp = %d, want 0", got)
+		}
+	}
+	if got := countSchedulerLogMessages(logger, "disk backpressure: above high watermark — pausing new run claims"); got != 1 {
+		t.Fatalf("warning count = %d, want 1 within throttle interval", got)
+	}
+
+	now = now.Add(diskBackpressureLogInterval)
+	diskBackpressureClamp(1, cfg, logger)
+	if got := countSchedulerLogMessages(logger, "disk backpressure: above high watermark — pausing new run claims"); got != 2 {
+		t.Fatalf("warning count after interval = %d, want 2", got)
+	}
+
+	usedPercent = 80
+	if got := diskBackpressureClamp(1, cfg, logger); got != 1 {
+		t.Fatalf("recovered clamp = %d, want 1", got)
+	}
+	if got := countSchedulerLogMessages(logger, "disk backpressure: recovered below high watermark — resuming new run claims"); got != 1 {
+		t.Fatalf("recovery count = %d, want 1", got)
+	}
+}
+
+func countSchedulerLogMessages(logger *capturingSchedulerLogger, message string) int {
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
+	count := 0
+	for _, entry := range logger.entries {
+		if entry.message == message {
+			count++
+		}
+	}
+	return count
 }
 
 func TestDiskBackpressureClampFailsOpenOnStatError(t *testing.T) {

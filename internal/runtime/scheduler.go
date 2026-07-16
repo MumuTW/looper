@@ -2726,6 +2726,42 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 // capacity; tests override it to simulate a full disk deterministically.
 var diskUsageStat = disk.Stat
 
+const diskBackpressureLogInterval = 5 * time.Minute
+
+type diskBackpressureLogState struct {
+	level        string
+	lastLoggedAt time.Time
+}
+
+var (
+	diskBackpressureLogMu     sync.Mutex
+	diskBackpressureLogStates = map[string]diskBackpressureLogState{}
+	diskBackpressureNow       = time.Now
+)
+
+func shouldLogDiskBackpressure(path, level string, now time.Time) bool {
+	diskBackpressureLogMu.Lock()
+	defer diskBackpressureLogMu.Unlock()
+
+	state, ok := diskBackpressureLogStates[path]
+	if ok && state.level == level && now.Sub(state.lastLoggedAt) < diskBackpressureLogInterval {
+		return false
+	}
+	diskBackpressureLogStates[path] = diskBackpressureLogState{level: level, lastLoggedAt: now}
+	return true
+}
+
+func clearDiskBackpressureLogState(path string) bool {
+	diskBackpressureLogMu.Lock()
+	defer diskBackpressureLogMu.Unlock()
+
+	if _, ok := diskBackpressureLogStates[path]; !ok {
+		return false
+	}
+	delete(diskBackpressureLogStates, path)
+	return true
+}
+
 // diskBackpressureClamp reduces the runs the scheduler may START this phase to
 // zero when the volume backing the worktrees is at/above the configured
 // capacity. It governs NEW claims only; loops already running keep going. It
@@ -2763,6 +2799,14 @@ func diskBackpressureClamp(availableSlots int, cfg *config.Config, logger bootst
 
 	high := bp.HighWatermarkPercent
 	if high <= 0 || usage.UsedPercent < high {
+		if logger != nil && clearDiskBackpressureLogState(usage.Path) {
+			logger.Info("disk backpressure: recovered below high watermark — resuming new run claims", map[string]any{
+				"path":          usage.Path,
+				"usedPercent":   math.Round(usage.UsedPercent*10) / 10,
+				"availGiB":      math.Round(float64(usage.AvailBytes)/(1<<30)*100) / 100,
+				"highWatermark": high,
+			})
+		}
 		return availableSlots
 	}
 
@@ -2776,7 +2820,14 @@ func diskBackpressureClamp(availableSlots int, cfg *config.Config, logger bootst
 		"blockedSlots":  availableSlots,
 	}
 	if logger != nil {
+		level := "high"
 		if hard > 0 && usage.UsedPercent >= hard {
+			level = "hard"
+		}
+		if !shouldLogDiskBackpressure(usage.Path, level, diskBackpressureNow().UTC()) {
+			return 0
+		}
+		if level == "hard" {
 			logger.Error("disk backpressure: hard stop — refusing to claim new runs (disk emergency)", fields)
 		} else {
 			logger.Warn("disk backpressure: above high watermark — pausing new run claims", fields)
