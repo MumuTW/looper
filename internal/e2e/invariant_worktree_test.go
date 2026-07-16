@@ -397,8 +397,8 @@ func TestInvariantWorkerResumeAdoptsExistingPRAndEntersShepherding(t *testing.T)
 	fakeAgent := harness.NewFakeAgent(t, bins)
 	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{}})
 	branch := "looper/a4-existing-pr"
-	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{
-		"pr list": map[string]any{"stdout": json.RawMessage(`[{"number":201,"url":"https://example.test/acme/looper/pull/201","state":"OPEN","headRefName":"looper/a4-existing-pr","baseRefName":"main"}]`)},
+	fakeGH.WriteState(t, harness.GHState{Routes: map[string]any{
+		"repos/acme/looper/pulls": json.RawMessage(`[{"number":201,"title":"Existing PR","html_url":"https://example.test/acme/looper/pull/201","state":"open","head":{"ref":"looper/a4-existing-pr"},"base":{"ref":"main"}}]`),
 	}})
 	cfg := configWithFakeTools(t, bins, home, repo, fakeGH, fakeAgent, port)
 	cfg.Defaults.OpenPRStrategy = "all_done"
@@ -474,7 +474,7 @@ func TestInvariantWorkerResumeAdoptsExistingPRAndEntersShepherding(t *testing.T)
 		t.Fatalf("fake agent evidence = %v, want no agent execution during PR adoption", err)
 	}
 	invocations := readInvocationLog(t, fakeGH.InvocationLog)
-	assertInvocationContainsOrdered(t, invocations, []string{"pr", "list"})
+	assertInvocationContainsOrdered(t, invocations, []string{"api", "--method", "GET", "repos/acme/looper/pulls"})
 	assertNoInvocationStartsWith(t, invocations, []string{"pr", "create"})
 	proc.Stop(context.Background())
 }

@@ -497,15 +497,15 @@ type UpdatePullRequestBodyInput struct {
 }
 
 type ListOpenPullRequestsInput struct {
-	Repo                      string
-	CWD                       string
-	Limit                     int
-	Label                     string
-	Labels                    []string
-	Author                    string
-	BaseRefName               string
-	Timeout                   time.Duration
-	FallbackToRESTOnTransient bool
+	Repo        string
+	CWD         string
+	Limit       int
+	Label       string
+	Labels      []string
+	Author      string
+	BaseRefName string
+	Timeout     time.Duration
+	PreferREST  bool
 }
 
 type ListReviewRequestedPullRequestsInput struct {
@@ -669,6 +669,9 @@ func New(options Options) *Gateway {
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	if input.PreferREST {
+		return g.listOpenPullRequestsREST(ctx, input)
+	}
 	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
 		return snapshot.listOpenPullRequests(ctx, input)
 	}
@@ -760,9 +763,6 @@ func (g *Gateway) listOpenPullRequestsWithFields(ctx context.Context, input List
 	rows, err := g.listOpenPullRequestRows(ctx, input, fields)
 	if err != nil && IsInaccessibleReviewRequestReviewerError(err) {
 		rows, err = g.listOpenPullRequestRows(ctx, input, withoutJSONField(fields, "reviewRequests"))
-	}
-	if err != nil && input.FallbackToRESTOnTransient && IsTransientError(err) {
-		return g.listOpenPullRequestsREST(ctx, input)
 	}
 	if err != nil {
 		return nil, err
