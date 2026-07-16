@@ -71,6 +71,14 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (storage.LoopRe
 		}
 		summaries := make([]domain.LoopSummary, 0, len(existingLoops))
 		for _, loop := range existingLoops {
+			// Uniqueness only considers statuses that can conflict with a new
+			// loop. Historical deployments sometimes retired terminal issue
+			// loops by suffixing target_id (for example, ":retired-rerun"),
+			// which is intentionally no longer a parseable issue target. Do not
+			// let such non-conflicting audit records block every future Create.
+			if !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+				continue
+			}
 			summary, convErr := loopSummaryFromRecord(loop)
 			if convErr != nil {
 				return storage.LoopRecord{}, convErr

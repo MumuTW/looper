@@ -226,7 +226,14 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	// re-did items whose planner spec was already written and human-approved.)
 	if repos := r.services.Repositories; repos != nil && repos.Loops != nil {
 		if existing, err := repos.Loops.GetByTargetID(ctx, fmt.Sprintf("issue:%s:%d", project.Repo, item.Number)); err == nil && existing != nil {
-			return
+			// A coordinator loop is only the notification/thread anchor created
+			// immediately before classification. If the daemon stops in that
+			// window, recovery requeues the anchor but there is no queue item that
+			// could ever finish it. Resume classification and reuse that anchor;
+			// planner/worker loops still prove the item was actually routed.
+			if domain.LoopType(existing.Type) != domain.LoopTypeCoordinator {
+				return
+			}
 		}
 	}
 	workItemID := planedoc.WorkItemIDFromURL(item.HTMLURL)
@@ -377,6 +384,30 @@ func (r *Runtime) createIntakeAnchor(ctx context.Context, project config.Project
 	gw, ok := r.shepherdNotifyGateway()
 	if !ok || r.services.Loops == nil {
 		return ""
+	}
+	targetID := fmt.Sprintf("issue:%s:%d", project.Repo, item.Number)
+	if repos := r.services.Repositories; repos != nil && repos.Loops != nil {
+		if existing, err := repos.Loops.GetByTargetID(ctx, targetID); err == nil && existing != nil && domain.LoopType(existing.Type) == domain.LoopTypeCoordinator {
+			status := domain.LoopStatus(existing.Status)
+			if status != domain.LoopStatusRunning {
+				if status != domain.LoopStatusQueued {
+					if _, err := r.services.Loops.TransitionStatus(ctx, existing.ID, loops.TransitionInput{Status: domain.LoopStatusQueued}); err != nil {
+						status = ""
+					} else {
+						status = domain.LoopStatusQueued
+					}
+				}
+				if status == domain.LoopStatusQueued {
+					if _, err := r.services.Loops.TransitionStatus(ctx, existing.ID, loops.TransitionInput{Status: domain.LoopStatusRunning}); err == nil {
+						status = domain.LoopStatusRunning
+					}
+				}
+			}
+			if status == domain.LoopStatusRunning {
+				gw.RefreshThreadHeader(ctx, existing.ID, nil, 0)
+				return existing.ID
+			}
+		}
 	}
 	meta, err := json.Marshal(map[string]any{"issueNumber": item.Number, "issueUrl": item.HTMLURL, "title": strings.TrimSpace(item.Title)})
 	if err != nil {
