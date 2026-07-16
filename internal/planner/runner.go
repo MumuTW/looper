@@ -1092,20 +1092,23 @@ func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.
 		updates["issueTitle"] = issue.Title
 		updates["issueNumber"] = issue.IssueNumber
 	}
-	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, updates)
-	if err != nil {
-		return
-	}
-	if waiting {
-		metadataJSON, err = loopcondition.Set(&metadataJSON, loopcondition.Record{Kind: loopcondition.ProductSpec, Since: r.nowISO(), Fingerprint: strings.TrimSpace(askCommentID)})
-	} else {
-		metadataJSON, err = loopcondition.Clear(&metadataJSON)
-	}
-	if err != nil {
-		return
-	}
-	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil && r.logger != nil {
+	var metadataErr error
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, updates)
+		if err == nil && waiting {
+			metadataJSON, err = loopcondition.Set(&metadataJSON, loopcondition.Record{Kind: loopcondition.ProductSpec, Since: r.nowISO(), Fingerprint: strings.TrimSpace(askCommentID)})
+		} else if err == nil {
+			metadataJSON, err = loopcondition.Clear(&metadataJSON)
+		}
+		if err != nil {
+			metadataErr = err
+			return
+		}
+		updated.MetadataJSON = stringPtr(metadataJSON)
+	}); err != nil && r.logger != nil {
 		r.logger.Warn("planner: mark awaiting product spec failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+	} else if metadataErr != nil && r.logger != nil {
+		r.logger.Warn("planner: encode awaiting product spec marker failed", map[string]any{"loopId": loop.ID, "error": metadataErr.Error()})
 	}
 }
 

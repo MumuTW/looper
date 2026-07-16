@@ -14,6 +14,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1643,6 +1644,36 @@ func TestSetAwaitingProductAnswerMarker(t *testing.T) {
 	cleared, _ := fixture.repos.Loops.GetByID(ctx, loopID)
 	if v, _ := parseJSONObject(cleared.MetadataJSON)["awaitingProductAnswer"].(bool); v {
 		t.Fatalf("awaitingProductAnswer = true after clear, want false; meta=%q", derefString(cleared.MetadataJSON))
+	}
+}
+
+func TestSetAwaitingProductSpecMarkerPreservesFreshCardMessageID(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	r := &Runner{repos: fixture.repos, now: fixture.now, logger: fixture.logger}
+	ctx := context.Background()
+	loopID := "loop_product_spec_card"
+	loop := storage.LoopRecord{ID: loopID, Seq: 8, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	stale, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	fresh, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	cardMetadata := `{"productAskCardMsgId":"om_product_spec"}`
+	fresh.MetadataJSON = &cardMetadata
+	if err := fixture.repos.Loops.Upsert(ctx, *fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	r.setAwaitingProductSpecMarker(ctx, *stale, true, "comment-product", &checkpointIssue{IssueNumber: 582, Title: "导出", URL: "https://plane.test/issues/582"})
+	after, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	metadata := parseJSONObject(after.MetadataJSON)
+	if metadata["productAskCardMsgId"] != "om_product_spec" || metadata["awaitingProductSpec"] != true {
+		t.Fatalf("metadata = %s; want fresh card id preserved with product-spec hold", derefString(after.MetadataJSON))
+	}
+	condition, ok := loopcondition.Read(after.MetadataJSON)
+	if !ok || condition.Kind != loopcondition.ProductSpec || condition.Fingerprint != "comment-product" {
+		t.Fatalf("condition = %#v, present=%v", condition, ok)
 	}
 }
 
