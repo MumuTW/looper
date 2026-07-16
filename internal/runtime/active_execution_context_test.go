@@ -151,8 +151,10 @@ func TestFailedReapRemainsOwnedUntilForcedResolution(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("StopAndWait() looped after the retained execution reported a failed reap")
 	}
-	if err := registry.ForceKillAndWait(context.Background()); err != nil {
-		t.Fatalf("ForceKillAndWait() error = %v", err)
+	// ForceKill resolves process-group ownership, but the original Wait error is
+	// still preserved so terminal failures (including persistFinal) are not dropped.
+	if err := registry.ForceKillAndWait(context.Background()); !errors.Is(err, errRegistryReapFailed) {
+		t.Fatalf("ForceKillAndWait() error = %v, want failed-reap error preserved", err)
 	}
 	select {
 	case <-execution.forceKilled:
@@ -180,8 +182,11 @@ func TestRuntimeStopLogsGracefulReapFailureAfterSuccessfulForceResolution(t *tes
 	default:
 		t.Fatal("Runtime.Stop() did not force-resolve failed reap ownership")
 	}
-	if !logger.containsMessage("looperd runtime required forced active-execution reap") {
-		t.Fatal("Runtime.Stop() did not log the graceful reap failure")
+	// ForceKill resolves ownership, but the preserved Wait error still makes
+	// ForceKillAndWait fail so Runtime.Stop reports the force-reap failure path
+	// instead of treating durable state as cleanly closed.
+	if !logger.containsMessage("looperd runtime failed while force-reaping active executions") {
+		t.Fatal("Runtime.Stop() dropped the original Wait error after forced process-group resolution")
 	}
 }
 

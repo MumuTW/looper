@@ -508,18 +508,30 @@ func (r *ActiveExecutionRegistry) ForceKillAndWait(ctx context.Context) error {
 				continue
 			}
 			waitErr := execution.entry.err()
-			if execution.forceErr != nil && waitErr != nil {
-				errList = append(errList, execution.forceErr, fmt.Errorf("wait for force-killed execution reap: %w", waitErr))
+			if execution.forceErr != nil {
+				// ForceKill did not confirm process-group resolution. Keep the
+				// live handle and surface both failures.
+				if waitErr != nil {
+					errList = append(errList, execution.forceErr, fmt.Errorf("wait for force-killed execution reap: %w", waitErr))
+				} else {
+					errList = append(errList, execution.forceErr)
+				}
 				continue
 			}
-			// Either Wait confirmed the original reap or ForceKill confirmed a
-			// later probe. Only those authorities can retire the retained entry.
+			// ForceKill confirmed the process group is gone, so process ownership
+			// can be retired. Preserve a non-nil Wait error (for example a
+			// terminal persistFinal failure) so shutdown cannot treat durable
+			// status as cleanly closed while the agent_executions row remains
+			// running/cancelling.
 			r.mu.Lock()
 			if r.executions[execution.key] == execution.entry {
 				delete(r.executions, execution.key)
 				r.notifyStateChangedLocked()
 			}
 			r.mu.Unlock()
+			if waitErr != nil {
+				errList = append(errList, fmt.Errorf("wait for force-killed execution reap: %w", waitErr))
+			}
 		}
 		for _, run := range runs {
 			if err := waitForActiveDone(ctx, run.entry.done); err != nil {

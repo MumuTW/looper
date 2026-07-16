@@ -100,6 +100,36 @@ func TestActiveExecutionRegistryForceKillWaitsForReap(t *testing.T) {
 	}
 }
 
+func TestActiveExecutionRegistryForceKillPreservesTerminalWaitError(t *testing.T) {
+	t.Parallel()
+
+	registry := NewActiveExecutionRegistry()
+	execution := newTerminalPersistFailureRegistryExecution()
+	registry.Register("loop_persist", "run_persist", "exec_persist", execution)
+	<-execution.waited
+
+	// Graceful shutdown keeps the live handle while durable terminal status
+	// remains unwritten.
+	if _, err := registry.StopAndWait(context.Background(), "loop_persist", "", "", "stop"); !errors.Is(err, errRegistryTerminalPersist) {
+		t.Fatalf("StopAndWait() error = %v, want terminal persist failure", err)
+	}
+
+	// ForceKill confirms the process group is gone and retires the handle, but
+	// must still surface the terminal Wait error so shutdown cannot treat the
+	// durable agent_executions row as cleanly closed.
+	if err := registry.ForceKillAndWait(context.Background()); !errors.Is(err, errRegistryTerminalPersist) {
+		t.Fatalf("ForceKillAndWait() error = %v, want terminal persist failure preserved", err)
+	}
+	select {
+	case <-execution.forceKilled:
+	default:
+		t.Fatal("ForceKill was not invoked")
+	}
+	if err := registry.ForceKillAndWait(context.Background()); err != nil {
+		t.Fatalf("second ForceKillAndWait() error = %v after ownership retired", err)
+	}
+}
+
 func TestActiveExecutionRegistryRejectsExecutionRegisteredAfterShutdownBoundary(t *testing.T) {
 	t.Parallel()
 
@@ -241,6 +271,36 @@ type blockingRegistryExecution struct {
 	finishOnce  sync.Once
 	killOnce    sync.Once
 	forceOnce   sync.Once
+}
+
+var errRegistryTerminalPersist = errors.New("persist terminal agent execution status")
+
+// terminalPersistFailureRegistryExecution models Wait after process reaping when
+// the durable agent_executions terminal Upsert still failed.
+type terminalPersistFailureRegistryExecution struct {
+	waited      chan struct{}
+	forceKilled chan struct{}
+	waitOnce    sync.Once
+	forceOnce   sync.Once
+}
+
+func newTerminalPersistFailureRegistryExecution() *terminalPersistFailureRegistryExecution {
+	return &terminalPersistFailureRegistryExecution{
+		waited:      make(chan struct{}),
+		forceKilled: make(chan struct{}),
+	}
+}
+
+func (e *terminalPersistFailureRegistryExecution) Wait(context.Context) (agent.Result, error) {
+	e.waitOnce.Do(func() { close(e.waited) })
+	return agent.Result{Status: "killed"}, errRegistryTerminalPersist
+}
+
+func (e *terminalPersistFailureRegistryExecution) Kill(string) error { return nil }
+
+func (e *terminalPersistFailureRegistryExecution) ForceKill() error {
+	e.forceOnce.Do(func() { close(e.forceKilled) })
+	return nil
 }
 
 type gatedRegistryStarter struct {
