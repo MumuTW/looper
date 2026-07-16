@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -231,6 +232,63 @@ func TestRunSuccessfulRootExitStillStopsBackgroundDescendants(t *testing.T) {
 	waitForProcessExit(t, childPID)
 }
 
+func TestProcessGroupRunnableTreatsZombieOnlyGroupAsNotLive(t *testing.T) {
+	// Create an owned process, SIGKILL it without Wait so it becomes a zombie
+	// still signalable via kill(-pgid, 0). Cleanup barriers must not treat that
+	// as a live runnable group.
+	cmd := exec.Command("/bin/sh", "-c", "sleep 30")
+	ConfigureProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	pgid := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	if err := syscall.Kill(pgid, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL process: %v", err)
+	}
+	// Give the kernel a moment to mark the process zombie without reaping it.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pgid, 0); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// kill(pgid,0) may still succeed while the process is a zombie.
+	if err := syscall.Kill(pgid, 0); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("kill(%d,0) error = %v", pgid, err)
+	}
+
+	live, err := ProcessGroupRunnable(pgid)
+	if err != nil {
+		t.Fatalf("ProcessGroupRunnable() error = %v", err)
+	}
+	if live {
+		t.Fatalf("ProcessGroupRunnable(%d) = true, want false for zombie-only group", pgid)
+	}
+	live, err = ProcessRunnable(pgid)
+	if err != nil {
+		t.Fatalf("ProcessRunnable() error = %v", err)
+	}
+	if live {
+		t.Fatalf("ProcessRunnable(%d) = true, want false for zombie", pgid)
+	}
+
+	// WaitProcessGroupExit must return promptly instead of timing out on zombies.
+	startedAt := time.Now()
+	if err := WaitProcessGroupExit(cmd, 200*time.Millisecond); err != nil {
+		t.Fatalf("WaitProcessGroupExit() error = %v", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 150*time.Millisecond {
+		t.Fatalf("WaitProcessGroupExit() elapsed = %s, want immediate zombie-only success", elapsed)
+	}
+}
+
 func waitForPIDFile(t *testing.T, path string) int {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -256,7 +314,11 @@ func waitForProcessExit(t *testing.T, pid int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+		live, err := ProcessRunnable(pid)
+		if err != nil {
+			t.Fatalf("probe process %d: %v", pid, err)
+		}
+		if !live {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

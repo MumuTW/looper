@@ -320,9 +320,11 @@ func KillProcessGroup(cmd *exec.Cmd) error {
 }
 
 // KillProcessGroupAndWait sends one terminal SIGKILL using the live command's
-// owned process-group id, then waits until that group is no longer signalable.
-// The poll never sends another destructive signal, so a numeric group id that
-// is reused after disappearance cannot be killed by delayed escalation.
+// owned process-group id, then waits until that group has no runnable members.
+// Zombie-only groups are treated as cleaned: kill(-pgid, 0) can still succeed
+// for unreaped zombies, but they are not live work. The poll never sends another
+// destructive signal, so a numeric group id that is reused after disappearance
+// cannot be killed by delayed escalation.
 func KillProcessGroupAndWait(cmd *exec.Cmd, timeout time.Duration) error {
 	err := KillProcessGroup(cmd)
 	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
@@ -335,7 +337,8 @@ func KillProcessGroupAndWait(cmd *exec.Cmd, timeout time.Duration) error {
 }
 
 // WaitProcessGroupExit waits for a previously signaled owned process group to
-// disappear without sending another signal to its numeric id.
+// have no runnable members without sending another signal to its numeric id.
+// Zombie-only groups count as exited so unreaped orphans cannot fail cleanup.
 func WaitProcessGroupExit(cmd *exec.Cmd, timeout time.Duration) error {
 	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
 		return os.ErrProcessDone
@@ -349,10 +352,12 @@ func WaitProcessGroupExit(cmd *exec.Cmd, timeout time.Duration) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
-			return nil
-		} else if err != nil && !errors.Is(err, syscall.EPERM) {
+		live, err := ProcessGroupRunnable(pid)
+		if err != nil {
 			return fmt.Errorf("probe command process group %d: %w", pid, err)
+		}
+		if !live {
+			return nil
 		}
 		select {
 		case <-ticker.C:

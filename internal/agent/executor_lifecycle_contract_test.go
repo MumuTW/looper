@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	shellinfra "github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -47,8 +48,12 @@ func TestExecutionWaitCancellationKeepsOwnershipUntilProcessGroupIsReaped(t *tes
 	if result.Status != "killed" {
 		t.Fatalf("result.Status = %q, want killed", result.Status)
 	}
-	if err := syscall.Kill(-pid, 0); err != syscall.ESRCH {
-		t.Fatalf("process group %d remains after Wait: %v", pid, err)
+	live, err := shellinfra.ProcessGroupRunnable(pid)
+	if err != nil {
+		t.Fatalf("probe process group %d: %v", pid, err)
+	}
+	if live {
+		t.Fatalf("process group %d still has runnable members after Wait", pid)
 	}
 }
 

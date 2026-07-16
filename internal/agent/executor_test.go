@@ -14,6 +14,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
+	shellinfra "github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1297,7 +1298,11 @@ func TestExecutorKillTerminatesChildProcessGroup(t *testing.T) {
 	}
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(childPID, 0); err == syscall.ESRCH {
+		live, err := shellinfra.ProcessRunnable(childPID)
+		if err != nil {
+			t.Fatalf("probe child process %d: %v", childPID, err)
+		}
+		if !live {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -1341,8 +1346,12 @@ func TestExecutorCleansDescendantsAfterRootExit(t *testing.T) {
 	if elapsed := time.Since(startedAt); elapsed > time.Second {
 		t.Fatalf("Wait() elapsed = %s, want prompt cleanup after root exit", elapsed)
 	}
-	if err := syscall.Kill(-result.PID, 0); err != syscall.ESRCH {
-		t.Fatalf("process group %d remains after Wait: %v", result.PID, err)
+	live, err := shellinfra.ProcessGroupRunnable(result.PID)
+	if err != nil {
+		t.Fatalf("probe process group %d: %v", result.PID, err)
+	}
+	if live {
+		t.Fatalf("process group %d still has runnable members after Wait", result.PID)
 	}
 }
 
@@ -1544,7 +1553,11 @@ func waitForProcessExit(t *testing.T, pid int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+		live, err := shellinfra.ProcessRunnable(pid)
+		if err != nil {
+			t.Fatalf("probe process %d: %v", pid, err)
+		}
+		if !live {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

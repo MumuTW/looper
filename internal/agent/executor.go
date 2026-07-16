@@ -20,6 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
+	shellinfra "github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -657,24 +658,26 @@ func (x *execution) awaitProcessGroupExit(cmd *exec.Cmd) error {
 	}
 
 	// Hold the execution lock across the bounded probe barrier. ForceKill cannot
-	// race a successful ESRCH observation and signal a newly reused numeric PGID.
-	// SIGKILL was sent before entering this function; probes never resend it.
+	// race a successful "no runnable members" observation and signal a newly
+	// reused numeric PGID. SIGKILL was sent before entering this function;
+	// probes never resend it. Zombie-only groups count as resolved so unreaped
+	// orphans cannot fail an otherwise completed agent.
 	pid := cmd.Process.Pid
 	deadline := time.Now().Add(processGroupExitTimeout)
 	for {
-		err := syscall.Kill(-pid, 0)
-		if err == syscall.ESRCH {
+		live, err := shellinfra.ProcessGroupRunnable(pid)
+		if err != nil {
+			x.processGroupSignalsDone = true
+			return fmt.Errorf("probe process group %d after SIGKILL: %w", pid, err)
+		}
+		if !live {
 			x.processGroupResolved = true
 			x.processGroupSignalsDone = true
 			return nil
 		}
-		if err != nil && err != syscall.EPERM {
-			x.processGroupSignalsDone = true
-			return fmt.Errorf("probe process group %d after SIGKILL: %w", pid, err)
-		}
 		if !time.Now().Before(deadline) {
 			x.processGroupSignalsDone = true
-			return fmt.Errorf("process group %d still exists %s after SIGKILL", pid, processGroupExitTimeout)
+			return fmt.Errorf("process group %d still has runnable members %s after SIGKILL", pid, processGroupExitTimeout)
 		}
 		time.Sleep(processGroupProbeInterval)
 	}
