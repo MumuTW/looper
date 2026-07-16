@@ -1031,6 +1031,26 @@ func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExec
 	return nil
 }
 
+// UpdateLiveProgress updates only non-authoritative side-effect fields for a live
+// execution. Full Upsert from the output path can race with ownership writes
+// (initial spawn or native-resume fallback) and restore a dead PID or stale
+// native-resume metadata after the live process group has already changed.
+func (r *AgentExecutionsRepository) UpdateLiveProgress(ctx context.Context, id string, heartbeatCount int64, heartbeatAt string, outputJSON string) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE agent_executions
+		SET heartbeat_count = ?,
+		    last_heartbeat_at = ?,
+		    output_json = ?,
+		    updated_at = ?
+		WHERE id = ?
+		  AND status IN ('running', 'cancelling')
+	`, heartbeatCount, heartbeatAt, outputJSON, heartbeatAt, id)
+	if err != nil {
+		return fmt.Errorf("update agent execution live progress: %w", err)
+	}
+	return nil
+}
+
 func (r *AgentExecutionsRepository) GetByID(ctx context.Context, id string) (*AgentExecutionRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE id = ?`, id)
 	record, err := scanAgentExecution(row)

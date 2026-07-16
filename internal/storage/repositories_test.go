@@ -226,6 +226,46 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 		t.Fatalf("AgentExecutions.GetByID() = %#v, want agent_1 with heartbeat_count=2 and native session", agentExecution)
 	}
 
+	fallbackPID := int64(9756)
+	fallbackMode := "checkpoint_restart"
+	fallbackStatus := "fallback_started"
+	fallbackError := "resume failed"
+	if err := repos.AgentExecutions.Upsert(ctx, AgentExecutionRecord{
+		ID:                 "agent_1",
+		RunID:              strPtr("run_1"),
+		LoopID:             strPtr("loop_1"),
+		ProjectID:          strPtr("project_1"),
+		Vendor:             "codex",
+		Status:             "running",
+		PID:                &fallbackPID,
+		CommandJSON:        &agentCommand,
+		CWD:                &agentCWD,
+		HeartbeatCount:     0,
+		NativeResumeMode:   &fallbackMode,
+		NativeResumeStatus: &fallbackStatus,
+		NativeResumeError:  &fallbackError,
+		StartedAt:          now,
+		LastHeartbeatAt:    &now,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(fallback ownership) error = %v", err)
+	}
+	staleOutput := `{"stdout":"","stderr":"resume failed\n"}`
+	if err := repos.AgentExecutions.UpdateLiveProgress(ctx, "agent_1", 1, now, staleOutput); err != nil {
+		t.Fatalf("AgentExecutions.UpdateLiveProgress() error = %v", err)
+	}
+	progress, err := repos.AgentExecutions.GetByID(ctx, "agent_1")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID(after progress) error = %v", err)
+	}
+	if progress == nil || progress.PID == nil || *progress.PID != fallbackPID || progress.HeartbeatCount != 1 || progress.OutputJSON == nil || *progress.OutputJSON != staleOutput {
+		t.Fatalf("AgentExecutions after UpdateLiveProgress = %#v, want preserved fallback PID %d with progress fields", progress, fallbackPID)
+	}
+	if progress.NativeResumeMode == nil || *progress.NativeResumeMode != fallbackMode || progress.NativeResumeStatus == nil || *progress.NativeResumeStatus != fallbackStatus || progress.NativeResumeError == nil || *progress.NativeResumeError != fallbackError {
+		t.Fatalf("AgentExecutions after UpdateLiveProgress = %#v, want preserved native-resume ownership metadata", progress)
+	}
+
 	latestExecution, err := repos.AgentExecutions.GetLatestByRunID(ctx, "run_1")
 	if err != nil {
 		t.Fatalf("AgentExecutions.GetLatestByRunID() error = %v", err)

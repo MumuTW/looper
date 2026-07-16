@@ -1878,11 +1878,21 @@ func (x *execution) processOutputPersistence() {
 				return
 			}
 			ctx, cancel := context.WithTimeout(x.outputPersistenceCtx, outputPersistenceTimeout)
-			_ = x.persistStatusContext(ctx, update.status, &update.heartbeatCount, &update.heartbeatAt, &update.outputJSON)
+			// Best-effort progress must not full-Upsert ownership fields. A stale
+			// output write can otherwise clobber a later fallback/start PID and
+			// native-resume metadata after the live process group has changed.
+			_ = x.persistLiveProgress(ctx, update.heartbeatCount, update.heartbeatAt, update.outputJSON)
 			x.bumpRunHeartbeat(ctx, update.heartbeatAt)
 			cancel()
 		}
 	}
+}
+
+func (x *execution) persistLiveProgress(ctx context.Context, heartbeatCount int64, heartbeatAt string, outputJSON string) error {
+	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
+		return nil
+	}
+	return x.executor.repos.AgentExecutions.UpdateLiveProgress(ctx, x.executionID, heartbeatCount, heartbeatAt, outputJSON)
 }
 
 func (x *execution) stopOutputPersistence() {

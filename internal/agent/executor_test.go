@@ -887,12 +887,28 @@ func TestExecutorPersistsSilentFallbackPIDImmediatelyAfterSpawn(t *testing.T) {
 	fallbackPID := waitForPIDFile(t, fallbackPIDPath)
 	t.Cleanup(func() { _ = syscall.Kill(-fallbackPID, syscall.SIGKILL) })
 
-	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_silent_fallback")
-	if err != nil {
-		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	// Fallback spawn writes the PID file before ownership persistence completes,
+	// and resume stderr can still be draining through the output worker. Poll for
+	// the authoritative fallback PID instead of racing the first GetByID.
+	record := waitForExecutionPID(t, repos, "agent_silent_fallback", fallbackPID)
+	if record.NativeResumeMode == nil || *record.NativeResumeMode != "checkpoint_restart" || record.NativeResumeStatus == nil || *record.NativeResumeStatus != "fallback_started" {
+		t.Fatalf("native resume metadata = mode:%#v status:%#v, want checkpoint_restart/fallback_started", record.NativeResumeMode, record.NativeResumeStatus)
 	}
-	if record == nil || record.PID == nil || *record.PID != int64(fallbackPID) {
-		t.Fatalf("fallback execution record = %#v, want live fallback PID %d", record, fallbackPID)
+	// Give any in-flight resume output progress a chance to land and prove it
+	// cannot restore the dead resume PID or pre-fallback native-resume metadata.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		stable, err := repos.AgentExecutions.GetByID(context.Background(), "agent_silent_fallback")
+		if err != nil {
+			t.Fatalf("AgentExecutions.GetByID(stable) error = %v", err)
+		}
+		if stable == nil || stable.PID == nil || *stable.PID != int64(fallbackPID) {
+			t.Fatalf("fallback ownership clobbered after progress drain: %#v, want PID %d", stable, fallbackPID)
+		}
+		if stable.NativeResumeMode == nil || *stable.NativeResumeMode != "checkpoint_restart" || stable.NativeResumeStatus == nil || *stable.NativeResumeStatus != "fallback_started" {
+			t.Fatalf("fallback native-resume metadata clobbered after progress drain: mode:%#v status:%#v", stable.NativeResumeMode, stable.NativeResumeStatus)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err := execHandle.Kill("test cleanup"); err != nil {
 		t.Fatalf("Kill() error = %v", err)
@@ -1535,6 +1551,25 @@ func waitForPIDFile(t *testing.T, path string) int {
 	}
 	t.Fatalf("timed out waiting for pid file %s", path)
 	return 0
+}
+
+func waitForExecutionPID(t *testing.T, repos *storage.Repositories, executionID string, wantPID int) *storage.AgentExecutionRecord {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last *storage.AgentExecutionRecord
+	for time.Now().Before(deadline) {
+		record, err := repos.AgentExecutions.GetByID(context.Background(), executionID)
+		if err != nil {
+			t.Fatalf("AgentExecutions.GetByID(%s) error = %v", executionID, err)
+		}
+		last = record
+		if record != nil && record.PID != nil && *record.PID == int64(wantPID) {
+			return record
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for execution %s PID %d; last record = %#v", executionID, wantPID, last)
+	return nil
 }
 
 func waitForFile(t *testing.T, path string) {
