@@ -151,6 +151,14 @@ type workerRunCompletedNotificationInput struct {
 	PullRequestURL    string
 }
 
+func projectOwnerMentionOpenIDs(cfg config.Config, projectID string) []string {
+	openID := strings.TrimSpace(config.ProjectOwner(cfg, projectID))
+	if openID == "" {
+		return nil
+	}
+	return []string{openID}
+}
+
 type coordinatorNetworkGateway struct {
 	statePath string
 	client    *http.Client
@@ -2015,9 +2023,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			payload.Body = fmt.Sprintf("PR #%d is ready: %s", input.PullRequestNumber, runtimeFirstNonEmpty(input.PullRequestURL, input.Summary))
 			payload.DedupeKey = fmt.Sprintf("runtime.worker.pr_ready:%s", input.RunID)
 			// The requested work is delivered — @-mention the owner so it isn't missed.
-			if openID := strings.TrimSpace(config.ProjectProductOwner(cfg, input.ProjectID).FeishuOpenID); openID != "" {
-				payload.MentionOpenIds = []string{openID}
-			}
+			payload.MentionOpenIds = projectOwnerMentionOpenIDs(cfg, input.ProjectID)
 			// Reflect the PR in Plane's own state column: In Progress → In Review. Plane
 			// projects only; best-effort (a failure must never disturb the notification).
 			setPlaneWorkItemState(ctx, &cfg, repos, logger, input.ProjectID, input.LoopID, "In Review")

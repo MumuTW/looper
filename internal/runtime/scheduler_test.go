@@ -41,6 +41,21 @@ func TestConvertedAgentExecutionPropagatesResult(t *testing.T) {
 	}
 }
 
+func TestProjectOwnerMentionOpenIDsUsesLooperOwnerNotProductOwner(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{Projects: []config.ProjectRefConfig{{
+		ID:           "project_1",
+		Owner:        &config.FeishuActorConfig{FeishuOpenID: "ou_looper_owner"},
+		ProductOwner: &config.ProductOwnerConfig{FeishuOpenID: "ou_product_owner"},
+	}}}
+
+	got := projectOwnerMentionOpenIDs(cfg, "project_1")
+	if len(got) != 1 || got[0] != "ou_looper_owner" {
+		t.Fatalf("projectOwnerMentionOpenIDs() = %v, want [ou_looper_owner]", got)
+	}
+}
+
 func TestCommentInfosToObjectsPreservesNestedAuthorLogin(t *testing.T) {
 	t.Parallel()
 
