@@ -125,6 +125,18 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 	}
 }
 
+// IsClosing reports whether BeginShutdown has closed the spawn boundary.
+// Callers that race RegisterRun against shutdown use this to decide whether
+// unstarted claimed work should be requeued for restart recovery.
+func (r *ActiveExecutionRegistry) IsClosing() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closing
+}
+
 // StartAgentExecution acquires an ownership lease before invoking Start. The
 // lease closes the spawn-to-register gap: shutdown cannot observe an empty
 // registry while a starter may already have created a child process.

@@ -3760,19 +3760,33 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			unregisterRun, accepted = input.ActiveExecutions.RegisterRun(*item.LoopID, item.ID, cancelProcess, processDone)
 			if !accepted {
 				// Claim already moved the item to running; RegisterRun rejects when
-				// BeginLoopStop/shutdown wins the race. Release the claim so the
-				// slot does not stay stranded until a later recovery pass.
+				// BeginLoopStop/shutdown wins the race. Unstarted work must not be
+				// marked completed: shutdown requeues for restart recovery, while
+				// intentional loop-stop cancels the claim.
 				close(processDone)
 				cancelProcess()
 				if input.Repos != nil && input.Repos.Queue != nil {
-					_ = input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
-				}
-				if input.Logger != nil {
+					nowISO := formatJavaScriptISOString(now().UTC())
 					loopID := ""
 					if item.LoopID != nil {
 						loopID = *item.LoopID
 					}
-					input.Logger.Info("scheduler released claimed item after rejected run registration", map[string]any{"queueItemId": item.ID, "loopId": loopID})
+					if input.ActiveExecutions.IsClosing() {
+						if loopID != "" {
+							_, _ = input.Repos.Queue.RequeueRunningByLoop(ctx, loopID, nowISO)
+						}
+						if input.Logger != nil {
+							input.Logger.Info("scheduler requeued claimed item after shutdown rejected run registration", map[string]any{"queueItemId": item.ID, "loopId": loopID})
+						}
+					} else {
+						reason := "loop stop rejected run registration"
+						if loopID != "" {
+							_, _ = input.Repos.Queue.CancelByLoop(ctx, loopID, nowISO, &reason)
+						}
+						if input.Logger != nil {
+							input.Logger.Info("scheduler cancelled claimed item after loop stop rejected run registration", map[string]any{"queueItemId": item.ID, "loopId": loopID})
+						}
+					}
 				}
 				continue
 			}

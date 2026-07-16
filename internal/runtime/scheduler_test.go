@@ -187,7 +187,7 @@ func TestScheduledAgentRunRemainsOwnedAfterAgentPhase(t *testing.T) {
 	}
 }
 
-func TestRunScheduledQueueItemsReleasesClaimWhenRegisterRunRejected(t *testing.T) {
+func TestRunScheduledQueueItemsCancelsClaimWhenLoopStopRejectsRegisterRun(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -235,8 +235,63 @@ func TestRunScheduledQueueItemsReleasesClaimWhenRegisterRunRejected(t *testing.T
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if updated == nil || updated.Status != "completed" {
-		t.Fatalf("queue item = %#v, want status completed after rejected run registration", updated)
+	if updated == nil || updated.Status != "cancelled" {
+		t.Fatalf("queue item = %#v, want status cancelled after loop-stop rejected run registration", updated)
+	}
+}
+
+func TestRunScheduledQueueItemsRequeuesClaimWhenShutdownRejectsRegisterRun(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "register-run-shutdown.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "project_register_shutdown"
+	loopID := "loop_register_shutdown"
+	queueID := "queue_register_shutdown"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Register shutdown", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	claimed := storage.QueueItemRecord{
+		ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:register_shutdown", Priority: storage.QueuePriorityWorker, Status: "running",
+		AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, ClaimedBy: stringPtr("scheduler"), ClaimedAt: stringPtr(nowISO),
+		StartedAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Queue.Upsert(context.Background(), claimed); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	registry := NewActiveExecutionRegistry()
+	registry.BeginShutdown("daemon shutting down")
+
+	runner := &stubWorkerScheduler{}
+	if err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{claimed}, defaultSchedulerTickInput{
+		Repos:            repos,
+		Now:              func() time.Time { return now },
+		Worker:           runner,
+		ActiveExecutions: registry,
+	}); err != nil {
+		t.Fatalf("runScheduledQueueItems() error = %v", err)
+	}
+	if runner.processItemCount() != 0 {
+		t.Fatalf("worker processed %d items after RegisterRun rejection, want 0", runner.processItemCount())
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil || updated.Status != "queued" {
+		t.Fatalf("queue item = %#v, want status queued after shutdown rejected run registration", updated)
+	}
+	if updated.ClaimedBy != nil || updated.ClaimedAt != nil || updated.StartedAt != nil {
+		t.Fatalf("queue item claim fields = claimedBy=%v claimedAt=%v startedAt=%v, want cleared", updated.ClaimedBy, updated.ClaimedAt, updated.StartedAt)
 	}
 }
 

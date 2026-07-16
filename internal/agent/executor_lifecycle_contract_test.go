@@ -154,9 +154,12 @@ func TestCheckpointFallbackDoesNotSpawnAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	result, _, ok := x.runCheckpointFallback(ctx, "resume failed")
+	result, _, cleanupErr, ok := x.runCheckpointFallback(ctx, "resume failed")
 	if !ok || result.Status != "killed" {
 		t.Fatalf("fallback result = %#v, ok=%v, want killed without spawn", result, ok)
+	}
+	if cleanupErr != nil {
+		t.Fatalf("cleanupErr = %v, want nil for unstarted fallback stop", cleanupErr)
 	}
 	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
 		t.Fatalf("fallback marker stat error = %v, want no fallback process", err)

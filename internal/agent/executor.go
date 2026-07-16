@@ -837,7 +837,10 @@ func (x *execution) run(ctx context.Context) {
 		tr.ingestAll(stdout)
 		completion = parseCompletion(tr.combinedText(), stderr)
 		if tr.threadID != "" {
+			// Guard against concurrent live persistence reads of nativeSessionID.
+			x.mu.Lock()
 			x.nativeSessionID = tr.threadID
+			x.mu.Unlock()
 		}
 	}
 	if status != "completed" {
@@ -871,12 +874,15 @@ func (x *execution) run(ctx context.Context) {
 		PID:                          pidOrZero(cmd.Process),
 	}
 	if cleanupErr == nil && x.shouldFallbackNativeResume(status, stdout, stderr) {
-		if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
+		if fallbackResult, fallbackErrorMessage, fallbackCleanupErr, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
 			result = fallbackResult
 			status = fallbackResult.Status
 			timeoutType = fallbackResult.TimeoutType
 			errorMessage = fallbackErrorMessage
 			endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+			// Fallback owns a new process group; its cleanup barrier is the
+			// authority for Wait, not the original native-resume cleanupErr.
+			cleanupErr = fallbackCleanupErr
 		}
 	}
 
@@ -946,9 +952,9 @@ func normalizeNativeResumeErrorLine(line string) string {
 	return strings.TrimSpace(line)
 }
 
-func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
+func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, error, bool) {
 	if reason, stopped := x.pendingStop(ctx); stopped {
-		return x.stoppedFallbackResult(reason)
+		return x.stoppedFallbackResult(reason, nil)
 	}
 	command, args := ResolveSpawn(x.executor.config, x.input.WorkingDirectory, x.input.Prompt)
 	cmd := exec.Command(command, args...)
@@ -980,7 +986,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.mu.Unlock()
 	if reason, stopped := x.pendingStop(ctx); stopped {
 		x.retireUnstartedProcess(cmd)
-		return x.stoppedFallbackResult(reason)
+		return x.stoppedFallbackResult(reason, nil)
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -990,17 +996,22 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		x.nativeResumeStatus = "fallback_failed"
 		x.nativeResumeError = firstNonEmpty(err.Error(), nativeError)
 		x.mu.Unlock()
-		return Result{}, "", false
+		return Result{}, "", nil, false
 	}
 	if reason, stopped := x.pendingStop(ctx); stopped {
 		cleanupErr := x.reapStartedProcess(cmd)
-		return x.stoppedFallbackResult(joinReasonAndError(reason, cleanupErr))
+		return x.stoppedFallbackResult(joinReasonAndError(reason, cleanupErr), cleanupErr)
 	}
 	stopReason, err := x.persistRunningOwnership(ctx, cmd)
 	if stopReason != "" {
-		return x.stoppedFallbackResult(joinReasonAndError(stopReason, err))
+		// persistRunningOwnership already reaped on stop; only an unresolved
+		// process-group barrier must become Wait's cleanup error (not ctx cancel).
+		cleanupErr := x.finishProcessGroup(cmd)
+		return x.stoppedFallbackResult(joinReasonAndError(stopReason, err), cleanupErr)
 	}
 	if err != nil {
+		// Reap already ran for the persistence failure path; confirm the barrier.
+		cleanupErr := x.finishProcessGroup(cmd)
 		message := fmt.Sprintf("persist running checkpoint fallback: %v", err)
 		x.mu.Lock()
 		x.status = "failed"
@@ -1016,7 +1027,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 			LastProgressAt:               x.lastProgressAtISO(),
 			PID:                          pidOrZero(cmd.Process),
-		}, message, true
+		}, joinReasonAndError(message, cleanupErr), cleanupErr, true
 	}
 	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
 
@@ -1181,7 +1192,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
 		PID:                          pidOrZero(cmd.Process),
-	}, errorMessage, true
+	}, errorMessage, cleanupErr, true
 }
 
 func (x *execution) pendingStop(ctx context.Context) (string, bool) {
@@ -1196,7 +1207,7 @@ func (x *execution) pendingStop(ctx context.Context) (string, bool) {
 	return firstNonEmpty(x.killRequestedReason, "agent execution stopped"), true
 }
 
-func (x *execution) stoppedFallbackResult(reason string) (Result, string, bool) {
+func (x *execution) stoppedFallbackResult(reason string, cleanupErr error) (Result, string, error, bool) {
 	x.setStatus("killed")
 	return Result{
 		Status:                       "killed",
@@ -1206,7 +1217,7 @@ func (x *execution) stoppedFallbackResult(reason string) (Result, string, bool) 
 		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
-	}, reason, true
+	}, reason, cleanupErr, true
 }
 
 func joinReasonAndError(reason string, err error) string {
