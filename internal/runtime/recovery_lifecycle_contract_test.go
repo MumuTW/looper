@@ -235,11 +235,12 @@ func TestStartupRecoveryReapsDescendantAfterLeaderExitsOnTERMBeforeSchedulerTick
 	}
 }
 
-// TestStartupRecoveryReapsDescendantWhenLeaderAlreadyExitedBeforeRestart covers the
-// restart window where the agent leader has already exited but a TERM-resistant
-// descendant still holds the executor-created process group. Recovery must reap
-// that group before the scheduler becomes visible.
-func TestStartupRecoveryReapsDescendantWhenLeaderAlreadyExitedBeforeRestart(t *testing.T) {
+// TestStartupRecoveryProtectsLeaderlessLiveProcessGroupAsUncertain covers the
+// restart window where the agent leader has already exited but a process group
+// under the persisted PGID is still live. Without a live identity-matched
+// leader, recovery must not signal the group (PGID reuse risk) and must protect
+// the run as uncertain instead of marking the execution terminal.
+func TestStartupRecoveryProtectsLeaderlessLiveProcessGroupAsUncertain(t *testing.T) {
 	workingDir := t.TempDir()
 	script := filepath.Join(workingDir, "leader-already-exited-orphan.sh")
 	descendantPIDFile := filepath.Join(workingDir, "descendant.pid")
@@ -324,17 +325,12 @@ func TestStartupRecoveryReapsDescendantWhenLeaderAlreadyExitedBeforeRestart(t *t
 		t.Fatalf("seed coordinator close: %v", err)
 	}
 
+	logger := &testLogger{}
 	ticked := make(chan struct{}, 1)
 	rt := New(Options{
 		Config: cfg,
-		Logger: &testLogger{},
+		Logger: logger,
 		RunSchedulerTick: func(context.Context, Services) error {
-			if recoveryProcessGroupExists(leaderPID) {
-				t.Errorf("scheduler ticked while orphan process group %d was still live", leaderPID)
-			}
-			if err := syscall.Kill(descendantPID, 0); err == nil || !errors.Is(err, syscall.ESRCH) {
-				t.Errorf("scheduler ticked while orphan descendant %d was still live: %v", descendantPID, err)
-			}
 			select {
 			case ticked <- struct{}{}:
 			default:
@@ -349,20 +345,41 @@ func TestStartupRecoveryReapsDescendantWhenLeaderAlreadyExitedBeforeRestart(t *t
 	select {
 	case <-ticked:
 	case <-time.After(2 * time.Second):
-		t.Fatal("scheduler did not start after leader-already-exited process-group recovery")
+		t.Fatal("scheduler did not start after leaderless uncertain recovery protection")
 	}
-	if recoveryProcessGroupExists(leaderPID) {
-		t.Fatalf("orphan process group %d survived startup recovery after leader exit", leaderPID)
+	// Must not signal a leaderless group: descendants remain live under the PGID.
+	if !recoveryProcessGroupExists(leaderPID) {
+		t.Fatalf("process group %d was reaped; want leaderless group left unsignaled", leaderPID)
 	}
-	if err := syscall.Kill(descendantPID, 0); err == nil || !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("orphan descendant %d survived startup recovery: %v", descendantPID, err)
+	if err := syscall.Kill(descendantPID, 0); err != nil {
+		t.Fatalf("descendant %d was killed during recovery: %v", descendantPID, err)
 	}
 	execution, err := rt.Services().Repositories.AgentExecutions.GetByID(context.Background(), "exec_leader_gone")
 	if err != nil {
 		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
 	}
-	if execution == nil || execution.Status != "killed" {
-		t.Fatalf("recovered execution = %#v, want killed", execution)
+	if execution == nil || execution.Status != "running" || execution.EndedAt != nil {
+		t.Fatalf("recovered execution = %#v, want still running (uncertain, not killed)", execution)
+	}
+	run, err := rt.Services().Repositories.Runs.GetByID(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run == nil || run.Status != "running" || run.EndedAt != nil {
+		t.Fatalf("run = %#v, want preserved running run for uncertain leaderless group", run)
+	}
+	events, err := rt.Services().Repositories.Events.ListByEntity(context.Background(), "agent_execution", "exec_leader_gone")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if !containsEventType(events, "looperd.recovery.process_identity_uncertain") {
+		t.Fatalf("events = %#v, want uncertain-identity event for leaderless live group", events)
+	}
+	if recovery := rt.RecoverySummary(); recovery.OrphanAgentCleanup.CleanedCount != 0 {
+		t.Fatalf("RecoverySummary() = %#v, want cleanedCount=0 for leaderless uncertain group", recovery)
+	}
+	if !logger.containsMessage("recovery skipped due to uncertain process identity") {
+		t.Fatalf("logger entries = %#v, want uncertain process identity warning", logger.messages())
 	}
 }
 

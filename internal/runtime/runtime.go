@@ -1287,12 +1287,14 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				}
 				continue
 			}
-			// Reap when the leader is still live, and also when the leader has
-			// already exited but the executor-created process group still has
-			// descendants (for example TERM-ignoring grandchildren). Marking
-			// the execution terminal while the group is live would reopen the
-			// scheduler against a worktree that can still mutate.
-			needsTermination := running
+			// Only terminate when the leader PID is still live and identity-matched.
+			// A leaderless live process group is not safe to signal: the persisted
+			// PGID can be reused after the original agent group exits, and without a
+			// verified leader (or other group-member identity check) recovery cannot
+			// distinguish agent descendants from an unrelated group. Protect as
+			// uncertain so the run is not reopened while a possibly foreign group
+			// remains under that ID. When both leader and group are gone, mark the
+			// execution terminal without signaling.
 			if !running {
 				groupExited, probeErr := r.recoveredProcessGroupExited(pid)
 				if probeErr != nil {
@@ -1304,9 +1306,13 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 					}
 					continue
 				}
-				needsTermination = !groupExited
-			}
-			if needsTermination {
+				if !groupExited {
+					if err := protectUncertainExecution(execution, pid, "orphan_cleanup_leaderless_group"); err != nil {
+						return RecoverySummary{}, err
+					}
+					continue
+				}
+			} else {
 				if err := r.terminateRecoveredExecution(ctx, execution, pid, 5*time.Second); err != nil {
 					if r.logger != nil {
 						r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
@@ -2068,6 +2074,39 @@ func (r *Runtime) verifyRunExecutionLiveness(ctx context.Context, repositories *
 			result.Live = true
 			continue
 		}
+		// Leader PID is gone. A still-live process group under the persisted
+		// PGID is not safe to treat as dead (or to signal): without a verified
+		// leader identity, PGID reuse can leave an unrelated group under that
+		// ID. Protect as uncertain so stale-run recovery does not mark the
+		// execution terminal while that group remains.
+		groupExited, probeErr := r.recoveredProcessGroupExited(pid)
+		if probeErr != nil {
+			if r.logger != nil {
+				r.logger.Warn("failed to probe orphan agent process group", map[string]any{"executionId": execution.ID, "pid": pid, "error": probeErr.Error(), "scope": scope})
+			}
+			nowISO := formatJavaScriptISOString(now)
+			written, appendErr := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, scope+"_group_probe_error", nowISO)
+			if appendErr != nil {
+				return executionLivenessResult{}, appendErr
+			}
+			result.Uncertain = true
+			if written {
+				result.EventsWritten += 1
+			}
+			continue
+		}
+		if !groupExited {
+			nowISO := formatJavaScriptISOString(now)
+			written, appendErr := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, scope+"_leaderless_group", nowISO)
+			if appendErr != nil {
+				return executionLivenessResult{}, appendErr
+			}
+			result.Uncertain = true
+			if written {
+				result.EventsWritten += 1
+			}
+			continue
+		}
 		result.DeadExecutions = append(result.DeadExecutions, execution)
 	}
 	return result, nil
@@ -2798,9 +2837,10 @@ func (r *Runtime) terminateRecoveredExecution(ctx context.Context, execution sto
 		return err
 	}
 	if leaderExited {
-		// Leader PID is gone: the persisted PID is still the process-group ID
-		// from Setpgid. Probe that group and, when descendants remain, escalate
-		// TERM→KILL without requiring a live matching leader first.
+		// Leader is already gone before recovery signaling. A live numeric PGID
+		// alone is not ownership: the ID may have been reused by an unrelated
+		// group after the original agent leader exited. Only treat leader+group
+		// disappearance as success; refuse to signal without identity authority.
 		groupExited, probeErr := r.recoveredProcessGroupExited(pid)
 		if probeErr != nil {
 			return probeErr
@@ -2808,6 +2848,7 @@ func (r *Runtime) terminateRecoveredExecution(ctx context.Context, execution sto
 		if groupExited {
 			return nil
 		}
+		return fmt.Errorf("execution %s leader pid %d is gone; process group %d remains live without verifiable identity", execution.ID, pid, pid)
 	}
 	if err := r.signalAgentProcessGroup(pid, syscall.SIGTERM); err != nil {
 		if !errors.Is(err, syscall.ESRCH) {
@@ -2821,11 +2862,10 @@ func (r *Runtime) terminateRecoveredExecution(ctx context.Context, execution sto
 			return nil
 		}
 		// SIGTERM returned ESRCH but the group probe still sees members (for
-		// example a race where the leader vanished mid-call). Continue to
-		// SIGKILL escalation rather than stranding descendants.
-		if !leaderExited {
-			return fmt.Errorf("execution %s process group %d rejected recovery SIGTERM but remains live", execution.ID, pid)
-		}
+		// example a race where the verified leader vanished mid-call). Continue
+		// to SIGKILL escalation rather than stranding descendants of a group we
+		// already identity-matched before the first signal.
+		return fmt.Errorf("execution %s process group %d rejected recovery SIGTERM but remains live", execution.ID, pid)
 	}
 	exited, err := waitForRecoveredExecutionExit(ctx, grace, observeOwnedGroup)
 	if err != nil || exited {

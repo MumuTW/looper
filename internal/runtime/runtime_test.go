@@ -1776,7 +1776,7 @@ func TestTerminateRecoveredExecutionEscalatesOnlyWhileIdentityMatchesAndAwaitsEx
 	}
 }
 
-func TestTerminateRecoveredExecutionReapsProcessGroupAfterLeaderAlreadyExited(t *testing.T) {
+func TestTerminateRecoveredExecutionRefusesLeaderlessLiveProcessGroup(t *testing.T) {
 	t.Parallel()
 
 	groupRunning := true
@@ -1797,21 +1797,22 @@ func TestTerminateRecoveredExecutionReapsProcessGroupAfterLeaderAlreadyExited(t 
 				return syscall.ESRCH
 			}
 			signals = append(signals, signal)
-			if signal == syscall.SIGKILL {
-				groupRunning = false
-			}
 			return nil
 		},
 	})
 	execution := storage.AgentExecutionRecord{ID: "exec_leader_gone", CommandJSON: stringPtr(`{"command":"codex","args":["exec","test"]}`)}
-	if err := rt.terminateRecoveredExecution(context.Background(), execution, 4242, 10*time.Millisecond); err != nil {
-		t.Fatalf("terminateRecoveredExecution() error = %v", err)
+	err := rt.terminateRecoveredExecution(context.Background(), execution, 4242, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("terminateRecoveredExecution() error = nil, want refusal for leaderless live group")
 	}
-	if !slices.Equal(signals, []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL}) {
-		t.Fatalf("signals = %#v, want TERM then KILL for leader-gone process group", signals)
+	if !strings.Contains(err.Error(), "without verifiable identity") {
+		t.Fatalf("terminateRecoveredExecution() error = %v, want verifiable-identity refusal", err)
 	}
-	if groupRunning {
-		t.Fatal("terminateRecoveredExecution returned before process group exit")
+	if len(signals) != 0 {
+		t.Fatalf("signals = %#v, want no termination signals for leaderless live group", signals)
+	}
+	if !groupRunning {
+		t.Fatal("leaderless live process group must remain unsignaled")
 	}
 }
 
