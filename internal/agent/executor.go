@@ -1515,9 +1515,13 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 		CreatedAt:          x.startedAtISO,
 		UpdatedAt:          endedAtISO,
 	}
-	runBoundedSideEffect(outputPersistenceTimeout, func(ctx context.Context) {
-		_ = x.executor.repos.AgentExecutions.Upsert(ctx, record)
-	})
+	// Terminal status is authoritative for startup/reconcile ListActive. Wait for
+	// the durable write with the ownership budget instead of the short best-effort
+	// output side-effect timeout, which can leave status as running/cancelling
+	// after the live handle is released.
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipPersistenceTimeout)
+	defer cancel()
+	_ = x.executor.repos.AgentExecutions.Upsert(ctx, record)
 }
 
 func (x *execution) currentStatus() string {
