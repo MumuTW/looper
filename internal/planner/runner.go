@@ -2219,6 +2219,10 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		shouldResume = true
 		startStep = stepWriteSpec
 		check.WriteSpec = nil
+		// The product answer can change scope and acceptance criteria. Everything
+		// derived from the prior draft must be regenerated before owner approval.
+		check.Publish = nil
+		check.Notify = nil
 		check.SkipReason = ""
 		lastCompleted = stepPrepareWorktree
 	}

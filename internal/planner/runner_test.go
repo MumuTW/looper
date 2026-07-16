@@ -1536,6 +1536,8 @@ func TestCreateRunContextAnsweredPlaneDecisionResumesWriteSpec(t *testing.T) {
 		Issue:      &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md", URL: "https://plane/x/42"},
 		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "looper/plan", BaseBranch: "main", SpecPath: "specs/42.md"},
 		WriteSpec:  &checkpointWriteSpec{Status: "completed", GitReconciled: true},
+		Publish:    &checkpointPublishState{PlaneSpecReview: true, Grilled: true, Reviewed: true},
+		Notify:     &checkpointNotify{SentAt: fixture.nowISO(), Message: "stale"},
 		SkipReason: awaitingProductDecisionSkipReason,
 	})
 	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_" + loopID, LoopID: loopID, Status: "success", LastCompletedStep: stringPtr(string(stepWriteSpec)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
@@ -1545,7 +1547,7 @@ func TestCreateRunContextAnsweredPlaneDecisionResumesWriteSpec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resumed.Resumed || resumed.StartStep != stepWriteSpec || resumed.Checkpoint.WriteSpec != nil || resumed.Checkpoint.SkipReason != "" {
+	if !resumed.Resumed || resumed.StartStep != stepWriteSpec || resumed.Checkpoint.WriteSpec != nil || resumed.Checkpoint.Publish != nil || resumed.Checkpoint.Notify != nil || resumed.Checkpoint.SkipReason != "" {
 		t.Fatalf("resumed = %#v", resumed)
 	}
 	prompt, session := pendingPlaneDecisionAnswer(loop)
