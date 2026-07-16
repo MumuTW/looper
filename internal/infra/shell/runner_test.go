@@ -233,28 +233,38 @@ func TestRunSuccessfulRootExitStillStopsBackgroundDescendants(t *testing.T) {
 }
 
 func TestProcessGroupRunnableTreatsZombieOnlyGroupAsNotLive(t *testing.T) {
-	// Create an owned process, SIGKILL it without Wait so it becomes a zombie
-	// still signalable via kill(-pgid, 0). Cleanup barriers must not treat that
-	// as a live runnable group.
-	cmd := exec.Command("/bin/sh", "-c", "sleep 30")
+	// Leaf process only: /bin/sh -c "sleep …" leaves a live sleep sibling in the
+	// group after the shell is killed on Linux (dash forks), which is not the
+	// zombie-only case under test. SIGKILL the group without Wait so the leader
+	// remains an unreaped zombie still signalable via kill(-pgid, 0).
+	cmd := exec.Command("sleep", "30")
 	ConfigureProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
 	pgid := cmd.Process.Pid
 	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		_, _ = cmd.Process.Wait()
 	})
 
-	if err := syscall.Kill(pgid, syscall.SIGKILL); err != nil {
-		t.Fatalf("SIGKILL process: %v", err)
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL process group: %v", err)
 	}
-	// Give the kernel a moment to mark the process zombie without reaping it.
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pgid, 0); err == nil {
+	// Wait until the leader is no longer runnable (zombie) without reaping it.
+	// kill(pid, 0) succeeds for both live and zombie processes, so signalability
+	// alone cannot settle this race.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		live, err := ProcessRunnable(pgid)
+		if err != nil {
+			t.Fatalf("ProcessRunnable() settle error = %v", err)
+		}
+		if !live {
 			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d remained runnable after SIGKILL", pgid)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
