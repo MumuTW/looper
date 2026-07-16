@@ -247,6 +247,40 @@ func TestRunDefaultSchedulerTickSecondClaimPassDoesNotExceedAvailableSlots(t *te
 	}
 }
 
+func TestSchedulerAvailableSlotsCountsRunningRunWhenQueueWasRequeued(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-running-run-cap.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	nowISO := "2026-07-16T11:07:45.000Z"
+	projectID := "project_1"
+	loopID := "loop_prepare_work"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: workingDir, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_prepare_work", LoopID: loopID, Status: "running", CurrentStep: stringPtr("prepare-work"), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	queued := schedulerTestQueueItem("queue_requeued_while_running", "worker", nowISO)
+	queued.LoopID = &loopID
+	queued.ProjectID = &projectID
+	if err := repos.Queue.Upsert(context.Background(), queued); err != nil {
+		t.Fatal(err)
+	}
+
+	available, err := schedulerAvailableSlots(context.Background(), repos, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available != 0 {
+		t.Fatalf("schedulerAvailableSlots() = %d, want 0 while persisted run is active despite queued queue row", available)
+	}
+}
+
 func TestRunDefaultSchedulerTickSecondClaimPassDoesNotDoubleClaim(t *testing.T) {
 	t.Parallel()
 

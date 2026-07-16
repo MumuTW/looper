@@ -2701,7 +2701,21 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 	if err != nil {
 		return 0, err
 	}
-	available := maxConcurrentRuns - int(runningCount)
+	// Queue state can briefly lag an already-running role process during recovery
+	// (for example, a claimed item is requeued while its prepare-work coroutine is
+	// still alive). Count persisted running runs too and use the larger value so a
+	// stale queue row can never make the scheduler exceed maxConcurrentRuns.
+	effectiveRunning := runningCount
+	if repos.Runs != nil {
+		runCounts, err := repos.Runs.CountByStatus(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if runningRuns := runCounts["running"]; runningRuns > effectiveRunning {
+			effectiveRunning = runningRuns
+		}
+	}
+	available := maxConcurrentRuns - int(effectiveRunning)
 	if available < 0 {
 		return 0, nil
 	}
