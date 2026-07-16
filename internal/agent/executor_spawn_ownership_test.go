@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -239,5 +240,95 @@ func TestPersistFinalWaitsForTerminalStatusBeyondOutputTimeout(t *testing.T) {
 		if item.ID == executionID {
 			t.Fatalf("ListActive still includes %s after terminal persistence", executionID)
 		}
+	}
+}
+
+func TestPersistFinalFailurePropagatesFromWait(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "agent.pid")
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+			"command": "/bin/sh",
+			"args":    []any{"-c", `trap '' TERM; echo $$ > "$PID_FILE"; while true; do sleep 1; done`},
+		}},
+		Repos: repos,
+	})
+	const executionID = "agent_terminal_persist_failure"
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID:      executionID,
+		WorkingDirectory: workDir,
+		Prompt:           "ignored",
+		Timeout:          10 * time.Second,
+		GracefulShutdown: 20 * time.Millisecond,
+		Env:              map[string]string{"PID_FILE": pidPath},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	pid := waitForPIDFile(t, pidPath)
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+
+	tx, err := coordinator.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback() })
+	if _, err := tx.ExecContext(context.Background(), `UPDATE agent_executions SET status = status WHERE id = ?`, executionID); err != nil {
+		t.Fatalf("hold SQLite write lock: %v", err)
+	}
+
+	type outcome struct {
+		result Result
+		err    error
+	}
+	finished := make(chan outcome, 1)
+	go func() {
+		if killErr := execHandle.Kill("terminal persist timeout"); killErr != nil {
+			finished <- outcome{err: killErr}
+			return
+		}
+		result, waitErr := execHandle.Wait(context.Background())
+		finished <- outcome{result: result, err: waitErr}
+	}()
+
+	// Keep the write lock past ownershipPersistenceTimeout so terminal Upsert fails.
+	// Wait must surface that failure so ActiveExecutionRegistry retains ownership.
+	select {
+	case got := <-finished:
+		if got.err == nil {
+			t.Fatalf("Wait() err = nil after terminal persist deadline; result=%#v", got.result)
+		}
+		if !errors.Is(got.err, context.DeadlineExceeded) && !strings.Contains(got.err.Error(), "persist terminal agent execution status") {
+			t.Fatalf("Wait() error = %v, want terminal persist failure", got.err)
+		}
+		if got.result.Status != "killed" {
+			t.Fatalf("result.Status = %q, want killed (process reaped even when durable write fails)", got.result.Status)
+		}
+	case <-time.After(ownershipPersistenceTimeout + 3*time.Second):
+		t.Fatal("Wait() remained blocked after ownershipPersistenceTimeout for failed terminal Upsert")
+	}
+
+	record, err := repos.AgentExecutions.GetByID(context.Background(), executionID)
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil || record.Status != "running" {
+		t.Fatalf("durable execution = %#v, want still running while terminal write failed", record)
+	}
+	active, err := repos.AgentExecutions.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("AgentExecutions.ListActive() error = %v", err)
+	}
+	found := false
+	for _, item := range active {
+		if item.ID == executionID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ListActive missing %s after failed terminal persistence", executionID)
 	}
 }

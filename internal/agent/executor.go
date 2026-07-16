@@ -888,7 +888,10 @@ func (x *execution) run(ctx context.Context) {
 
 	x.stopOutput()
 	x.stopOutputPersistence()
-	x.persistFinal(status, result, errorMessage, endedAtISO)
+	// Terminal AgentExecutions.Upsert is authoritative for ListActive/startup
+	// recovery. Propagate failures so ActiveExecutionRegistry keeps the live
+	// handle instead of releasing ownership while the durable row stays active.
+	persistErr := x.persistFinal(status, result, errorMessage, endedAtISO)
 	eventType := "agent.completed"
 	if status == "timeout" {
 		switch timeoutType {
@@ -915,7 +918,7 @@ func (x *execution) run(ctx context.Context) {
 	}, endedAtISO)
 
 	x.stopProgress()
-	x.doneCh <- execOutcome{result: result, err: cleanupErr}
+	x.doneCh <- execOutcome{result: result, err: errors.Join(cleanupErr, persistErr)}
 }
 
 func (x *execution) shouldFallbackNativeResume(status string, stdout string, stderr string) bool {
@@ -1471,9 +1474,9 @@ func (x *execution) persistStatusContext(ctx context.Context, status string, hea
 	return x.executor.repos.AgentExecutions.Upsert(ctx, record)
 }
 
-func (x *execution) persistFinal(status string, result Result, errorMessage, endedAtISO string) {
+func (x *execution) persistFinal(status string, result Result, errorMessage, endedAtISO string) error {
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
-		return
+		return nil
 	}
 	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
@@ -1532,7 +1535,10 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	// after the live handle is released.
 	ctx, cancel := context.WithTimeout(context.Background(), ownershipPersistenceTimeout)
 	defer cancel()
-	_ = x.executor.repos.AgentExecutions.Upsert(ctx, record)
+	if err := x.executor.repos.AgentExecutions.Upsert(ctx, record); err != nil {
+		return fmt.Errorf("persist terminal agent execution status: %w", err)
+	}
+	return nil
 }
 
 func (x *execution) currentStatus() string {
