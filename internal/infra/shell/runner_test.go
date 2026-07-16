@@ -232,6 +232,62 @@ func TestRunSuccessfulRootExitStillStopsBackgroundDescendants(t *testing.T) {
 	waitForProcessExit(t, childPID)
 }
 
+func TestKillProcessGroupAndWaitSkipsSIGKILLWhenReapedGroupHasNoMembers(t *testing.T) {
+	// After Wait reaps a short-lived leader with no descendants, the numeric
+	// PGID is free for reuse. KillProcessGroupAndWait must probe first and treat
+	// no-members/ESRCH as resolved instead of unconditionally SIGKILLing.
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	ConfigureProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	originalPID := cmd.Process.Pid
+	if _, err := cmd.Process.Wait(); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		live, err := ProcessGroupRunnable(originalPID)
+		if err != nil {
+			t.Fatalf("ProcessGroupRunnable(%d) error = %v", originalPID, err)
+		}
+		if !live {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process group %d remained live after Wait", originalPID)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := KillProcessGroupAndWait(cmd, 200*time.Millisecond); err != nil {
+		t.Fatalf("KillProcessGroupAndWait() after reaped exit error = %v", err)
+	}
+
+	// Live descendants must still be cleaned up by probe-then-SIGKILL.
+	live := exec.Command("/bin/sh", "-c", `trap '' TERM; while :; do sleep 1; done`)
+	ConfigureProcessGroup(live)
+	if err := live.Start(); err != nil {
+		t.Fatalf("Start(live) error = %v", err)
+	}
+	liveDone := make(chan error, 1)
+	go func() { liveDone <- live.Wait() }()
+	t.Cleanup(func() {
+		_ = syscall.Kill(-live.Process.Pid, syscall.SIGKILL)
+		select {
+		case <-liveDone:
+		case <-time.After(time.Second):
+		}
+	})
+	if err := KillProcessGroupAndWait(live, time.Second); err != nil {
+		t.Fatalf("KillProcessGroupAndWait(live) error = %v", err)
+	}
+	select {
+	case <-liveDone:
+	case <-time.After(time.Second):
+		t.Fatal("live process group was not cleaned up")
+	}
+}
+
 func TestProcessGroupRunnableTreatsZombieOnlyGroupAsNotLive(t *testing.T) {
 	// Leaf process only: /bin/sh -c "sleep …" leaves a live sleep sibling in the
 	// group after the shell is killed on Linux (dash forks), which is not the

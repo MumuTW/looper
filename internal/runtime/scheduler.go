@@ -35,6 +35,11 @@ import (
 	"github.com/nexu-io/looper/internal/worker"
 )
 
+// registerRunReleaseTimeout bounds durable claim release after RegisterRun
+// rejects a claimed item during daemon shutdown. The scheduler context may
+// already be canceled by Runtime.Stop, so release uses a detached budget.
+const registerRunReleaseTimeout = 5 * time.Second
+
 type plannerScheduler interface {
 	DiscoverIssues(context.Context, planner.DiscoveryInput) (planner.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*planner.ProcessResult, error)
@@ -3773,7 +3778,19 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 					}
 					if input.ActiveExecutions.IsClosing() {
 						if loopID != "" {
-							_, _ = input.Repos.Queue.RequeueRunningByLoop(ctx, loopID, nowISO)
+							// Scheduler ctx may already be canceled during Runtime.Stop;
+							// use a bounded background context so release can finish and
+							// surface durable failures instead of leaving the row running.
+							requeueCtx, cancelRequeue := context.WithTimeout(context.Background(), registerRunReleaseTimeout)
+							_, requeueErr := input.Repos.Queue.RequeueRunningByLoop(requeueCtx, loopID, nowISO)
+							cancelRequeue()
+							if requeueErr != nil {
+								errList = append(errList, fmt.Errorf("requeue claimed queue item %s after shutdown rejected run registration: %w", item.ID, requeueErr))
+								if input.Logger != nil {
+									input.Logger.Warn("scheduler failed to requeue claimed item after shutdown rejected run registration", map[string]any{"queueItemId": item.ID, "loopId": loopID, "error": requeueErr.Error()})
+								}
+								continue
+							}
 						}
 						if input.Logger != nil {
 							input.Logger.Info("scheduler requeued claimed item after shutdown rejected run registration", map[string]any{"queueItemId": item.ID, "loopId": loopID})

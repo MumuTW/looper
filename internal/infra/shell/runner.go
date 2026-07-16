@@ -319,14 +319,27 @@ func KillProcessGroup(cmd *exec.Cmd) error {
 	return err
 }
 
-// KillProcessGroupAndWait sends one terminal SIGKILL using the live command's
-// owned process-group id, then waits until that group has no runnable members.
-// Zombie-only groups are treated as cleaned: kill(-pgid, 0) can still succeed
-// for unreaped zombies, but they are not live work. The poll never sends another
-// destructive signal, so a numeric group id that is reused after disappearance
-// cannot be killed by delayed escalation.
+// KillProcessGroupAndWait sends one terminal SIGKILL only while the owned
+// process group still has runnable members, then waits until that group has no
+// runnable members. After cmd.Wait/cmd.Run reaps a short-lived leader with no
+// descendants, the numeric PGID may already be free for reuse; probing first
+// treats no-members/ESRCH as resolved without an unconditional SIGKILL that
+// could hit an unrelated process group. Zombie-only groups are treated as
+// cleaned. The poll never sends another destructive signal, so a numeric group
+// id reused after disappearance cannot be killed by delayed escalation.
 func KillProcessGroupAndWait(cmd *exec.Cmd, timeout time.Duration) error {
-	err := KillProcessGroup(cmd)
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
+		return nil
+	}
+	pid := cmd.Process.Pid
+	live, err := ProcessGroupRunnable(pid)
+	if err != nil {
+		return fmt.Errorf("probe command process group %d before SIGKILL: %w", pid, err)
+	}
+	if !live {
+		return nil
+	}
+	err = KillProcessGroup(cmd)
 	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
