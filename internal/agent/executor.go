@@ -1864,7 +1864,11 @@ func (x *execution) processOutputPersistence() {
 func (x *execution) stopOutputPersistence() {
 	x.outputPersistenceOnce.Do(func() {
 		x.outputPersistenceCancel()
-		_ = waitForWorker(x.outputPersistenceDone, outputPersistenceTimeout)
+		// Fully drain the live worker before any terminal AgentExecutions write.
+		// A bounded wait would allow an in-flight "running" Upsert to complete
+		// after persistFinal and reanimate ListActive/startup recovery, because
+		// repository Upsert has no monotonic terminal-state guard.
+		<-x.outputPersistenceDone
 	})
 }
 

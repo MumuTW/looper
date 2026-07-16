@@ -243,6 +243,120 @@ func TestPersistFinalWaitsForTerminalStatusBeyondOutputTimeout(t *testing.T) {
 	}
 }
 
+func TestStopOutputPersistenceDrainsLiveUpsertBeforeTerminal(t *testing.T) {
+	// Live output persistence must fully drain before persistFinal. If stop only
+	// waited outputPersistenceTimeout, an in-flight "running" Upsert that outlives
+	// cancellation could complete after the terminal row and reanimate ListActive.
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "agent.pid")
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+			"command": "/bin/sh",
+			"args": []any{"-c", `trap '' TERM; echo $$ > "$PID_FILE"; ` +
+				`while true; do echo live-output-chunk; sleep 0.05; done`},
+		}},
+		Repos: repos,
+	})
+	const executionID = "agent_drain_live_output_before_terminal"
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID:      executionID,
+		WorkingDirectory: workDir,
+		Prompt:           "ignored",
+		Timeout:          10 * time.Second,
+		GracefulShutdown: 20 * time.Millisecond,
+		Env:              map[string]string{"PID_FILE": pidPath},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	pid := waitForPIDFile(t, pidPath)
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+
+	// Let the live worker issue at least one running Upsert so the next write is real.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		record, getErr := repos.AgentExecutions.GetByID(context.Background(), executionID)
+		if getErr != nil {
+			t.Fatalf("AgentExecutions.GetByID(pre-lock) error = %v", getErr)
+		}
+		if record != nil && record.Status == "running" && record.HeartbeatCount > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for live output heartbeat on %s: %#v", executionID, record)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	tx, err := coordinator.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback() })
+	if _, err := tx.ExecContext(context.Background(), `UPDATE agent_executions SET status = status WHERE id = ?`, executionID); err != nil {
+		t.Fatalf("hold SQLite write lock: %v", err)
+	}
+	// Keep producing output under the write lock so the live persistence worker is
+	// blocked inside Upsert when teardown begins.
+	time.Sleep(100 * time.Millisecond)
+
+	type outcome struct {
+		result Result
+		err    error
+	}
+	finished := make(chan outcome, 1)
+	go func() {
+		if killErr := execHandle.Kill("drain live output before terminal"); killErr != nil {
+			finished <- outcome{err: killErr}
+			return
+		}
+		result, waitErr := execHandle.Wait(context.Background())
+		finished <- outcome{result: result, err: waitErr}
+	}()
+
+	// Previously stopOutputPersistence returned after 250ms even while the live
+	// Upsert was still in flight. Drain must keep Wait blocked past that budget.
+	select {
+	case got := <-finished:
+		t.Fatalf("Wait() returned after %v while live/terminal Upsert was blocked: %#v err=%v", outputPersistenceTimeout, got.result, got.err)
+	case <-time.After(outputPersistenceTimeout + 200*time.Millisecond):
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+	select {
+	case got := <-finished:
+		if got.err != nil {
+			t.Fatalf("Kill()/Wait() error = %v", got.err)
+		}
+		if got.result.Status != "killed" {
+			t.Fatalf("result.Status = %q, want killed", got.result.Status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait() remained blocked after write lock was released")
+	}
+
+	record, err := repos.AgentExecutions.GetByID(context.Background(), executionID)
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID(terminal) error = %v", err)
+	}
+	if record == nil || record.Status != "killed" || record.EndedAt == nil {
+		t.Fatalf("terminal execution = %#v, want durable killed status with ended_at", record)
+	}
+	active, err := repos.AgentExecutions.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("AgentExecutions.ListActive() error = %v", err)
+	}
+	for _, item := range active {
+		if item.ID == executionID {
+			t.Fatalf("ListActive still includes %s after drained terminal persistence", executionID)
+		}
+	}
+}
+
 func TestPersistFinalFailurePropagatesFromWait(t *testing.T) {
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
