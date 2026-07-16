@@ -12,13 +12,17 @@ import (
 )
 
 type agentLLM struct {
-	executor    *agent.ConfiguredExecutor
+	executor    AgentExecutor
 	now         func() time.Time
 	timeout     time.Duration
 	idleTimeout time.Duration
 }
 
-func NewAgentLLM(executor *agent.ConfiguredExecutor, now func() time.Time, timeout time.Duration, idleTimeout time.Duration) triage.LLM {
+type AgentExecutor interface {
+	Start(context.Context, agent.RunInput) (agent.Execution, error)
+}
+
+func NewAgentLLM(executor AgentExecutor, now func() time.Time, timeout time.Duration, idleTimeout time.Duration) triage.LLM {
 	if now == nil {
 		now = time.Now
 	}
@@ -46,6 +50,9 @@ func (l agentLLM) Complete(ctx context.Context, req triage.Request) (string, err
 	result, err := execHandle.Wait(ctx)
 	if err != nil {
 		return "", err
+	}
+	if result.Status != "completed" {
+		return "", fmt.Errorf("coordinator triage agent execution %s", result.Status)
 	}
 	if strings.TrimSpace(result.Stdout) == "" {
 		return "", fmt.Errorf("coordinator triage returned empty stdout")

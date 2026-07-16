@@ -16,6 +16,8 @@ import (
 const (
 	defaultMaxOutputBytes = 256 * 1024
 	defaultGracefulStop   = 5 * time.Second
+	descendantDrainGrace  = 100 * time.Millisecond
+	processGroupExitWait  = time.Second
 	// startAttempts covers transient Linux ETXTBSY after a binary/script is
 	// installed (common when tests write a fake tool then exec it immediately).
 	startAttempts      = 8
@@ -82,6 +84,10 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		waitErr          error
 		timedOut         bool
 		canceledErr      error
+		cleanupErr       error
+		forceKillSent    bool
+		timeoutTimer     *time.Timer
+		killTimer        *time.Timer
 		terminationStart <-chan time.Time
 		killAt           <-chan time.Time
 		terminateOnce    sync.Once
@@ -92,26 +98,45 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			if cmd.Process == nil {
 				return
 			}
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !isProcessDone(err) {
-				_ = cmd.Process.Kill()
+			if err := signalCommandGroup(cmd, syscall.SIGTERM); err != nil && !isProcessDone(err) {
+				forceKillSent = true
+				_ = signalCommandGroup(cmd, syscall.SIGKILL)
 				return
 			}
 			if gracefulShutdown <= 0 {
-				_ = cmd.Process.Kill()
+				forceKillSent = true
+				_ = signalCommandGroup(cmd, syscall.SIGKILL)
 				return
 			}
-			killAt = time.After(gracefulShutdown)
+			killTimer = time.NewTimer(gracefulShutdown)
+			killAt = killTimer.C
 		})
 	}
 
 	if options.Timeout > 0 {
-		terminationStart = time.After(options.Timeout)
+		timeoutTimer = time.NewTimer(options.Timeout)
+		terminationStart = timeoutTimer.C
 	}
+	defer stopAndDrainTimer(timeoutTimer)
+	defer func() { stopAndDrainTimer(killTimer) }()
 
+	ctxDone := ctx.Done()
 	waiting := true
 	for waiting {
 		select {
 		case waitErr = <-waitCh:
+			// The root can exit while a background descendant remains in the
+			// owned group. Resolve the group on every terminal path, not only
+			// timeout/cancellation, before returning ownership to the caller.
+			var err error
+			if forceKillSent {
+				err = WaitProcessGroupExit(cmd, processGroupExitWait)
+			} else {
+				err = KillProcessGroupAndWait(cmd, processGroupExitWait)
+			}
+			if err != nil && !isProcessDone(err) {
+				cleanupErr = err
+			}
 			waiting = false
 		case <-terminationStart:
 			timedOut = true
@@ -119,14 +144,12 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			terminate()
 		case <-killAt:
 			killAt = nil
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		case <-ctx.Done():
-			if canceledErr == nil {
-				canceledErr = ctx.Err()
-				terminate()
-			}
+			forceKillSent = true
+			_ = signalCommandGroup(cmd, syscall.SIGKILL)
+		case <-ctxDone:
+			ctxDone = nil
+			canceledErr = ctx.Err()
+			terminate()
 		}
 	}
 
@@ -142,21 +165,37 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}
 
 	if timedOut {
-		return result, &CommandExecutionError{Message: "Command timed out", Result: result}
+		primaryErr := &CommandExecutionError{Message: "Command timed out", Result: result}
+		return result, joinProcessGroupCleanupError(primaryErr, cleanupErr)
 	}
 	if canceledErr != nil {
-		return result, canceledErr
+		return result, joinProcessGroupCleanupError(canceledErr, cleanupErr)
 	}
 	if result.ExitCode != 0 {
-		return result, &CommandExecutionError{Message: commandFailureMessage(result), Result: result}
+		primaryErr := &CommandExecutionError{Message: commandFailureMessage(result), Result: result}
+		return result, joinProcessGroupCleanupError(primaryErr, cleanupErr)
+	}
+	if errors.Is(waitErr, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		waitErr = nil
 	}
 	if waitErr != nil {
-		return result, waitErr
+		return result, joinProcessGroupCleanupError(waitErr, cleanupErr)
 	}
-	return result, nil
+	return result, joinProcessGroupCleanupError(nil, cleanupErr)
+}
+
+func joinProcessGroupCleanupError(primaryErr, cleanupErr error) error {
+	if cleanupErr == nil || isProcessDone(cleanupErr) {
+		return primaryErr
+	}
+	return errors.Join(primaryErr, fmt.Errorf("clean up command process group: %w", cleanupErr))
 }
 
 func startCommand(ctx context.Context, options Options, stdout, stderr *boundedBuffer) (*exec.Cmd, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < startAttempts; attempt++ {
 		if attempt > 0 {
@@ -171,6 +210,8 @@ func startCommand(ctx context.Context, options Options, stdout, stderr *boundedB
 		}
 
 		cmd := exec.Command(options.Command, options.Args...)
+		ConfigureProcessGroup(cmd)
+		cmd.WaitDelay = descendantDrainGrace
 		cmd.Dir = options.CWD
 		if len(options.Env) > 0 {
 			cmd.Env = envSlice(options.Env)
@@ -195,6 +236,16 @@ func startCommand(ctx context.Context, options Options, stdout, stderr *boundedB
 		return cmd, nil
 	}
 	return nil, lastErr
+}
+
+func stopAndDrainTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
 }
 
 func isTextFileBusy(err error) bool {
@@ -239,7 +290,76 @@ func exitCode(cmd *exec.Cmd) int {
 }
 
 func isProcessDone(err error) bool {
-	return err == nil || err == os.ErrProcessDone
+	return err == nil || errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH)
+}
+
+func signalCommandGroup(cmd *exec.Cmd, signal syscall.Signal) error {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
+		return os.ErrProcessDone
+	}
+	return syscall.Kill(-cmd.Process.Pid, signal)
+}
+
+// ConfigureProcessGroup gives cmd ownership of a fresh process group so
+// cancellation can stop every descendant that remains in the group.
+func ConfigureProcessGroup(cmd *exec.Cmd) {
+	if cmd != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
+}
+
+// KillProcessGroup forcibly stops cmd and every descendant remaining in its
+// process group. A command that has not started or whose group has exited is
+// reported as os.ErrProcessDone.
+func KillProcessGroup(cmd *exec.Cmd) error {
+	err := signalCommandGroup(cmd, syscall.SIGKILL)
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	}
+	return err
+}
+
+// KillProcessGroupAndWait sends one terminal SIGKILL using the live command's
+// owned process-group id, then waits until that group is no longer signalable.
+// The poll never sends another destructive signal, so a numeric group id that
+// is reused after disappearance cannot be killed by delayed escalation.
+func KillProcessGroupAndWait(cmd *exec.Cmd, timeout time.Duration) error {
+	err := KillProcessGroup(cmd)
+	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return WaitProcessGroupExit(cmd, timeout)
+}
+
+// WaitProcessGroupExit waits for a previously signaled owned process group to
+// disappear without sending another signal to its numeric id.
+func WaitProcessGroupExit(cmd *exec.Cmd, timeout time.Duration) error {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
+		return os.ErrProcessDone
+	}
+	if timeout <= 0 {
+		timeout = processGroupExitWait
+	}
+	pid := cmd.Process.Pid
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
+			return nil
+		} else if err != nil && !errors.Is(err, syscall.EPERM) {
+			return fmt.Errorf("probe command process group %d: %w", pid, err)
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			return fmt.Errorf("command process group %d remained live after SIGKILL for %s", pid, timeout)
+		}
+	}
 }
 
 type boundedBuffer struct {

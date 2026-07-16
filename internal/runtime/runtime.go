@@ -261,9 +261,31 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
 
+		// Close the spawn boundary before cancelling scheduler producers. Starts
+		// already in flight remain pending ownership leases until they fail or
+		// publish a handle; later starts are rejected before spawning.
+		r.activeExecutions.BeginShutdown(reason)
 		r.stopDeferredReviewerRecovery()
 		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
+		reapCtx, cancelReap := context.WithTimeout(context.Background(), r.shutdownTimeout)
+		reapErr := r.activeExecutions.ShutdownAndWait(reapCtx, reason)
+		cancelReap()
+		if reapErr != nil {
+			// The configured daemon deadline bounds graceful TERM handling. At
+			// that boundary, force the executor-owned process groups down and
+			// allow a short, bounded reap before storage is closed.
+			forceCtx, cancelForce := context.WithTimeout(context.Background(), time.Second)
+			forceErr := r.activeExecutions.ForceKillAndWait(forceCtx)
+			cancelForce()
+			if r.logger != nil {
+				message := "looperd runtime required forced active-execution reap"
+				if forceErr != nil {
+					message = "looperd runtime failed while force-reaping active executions"
+				}
+				r.logger.Warn(message, map[string]any{"error": errors.Join(reapErr, forceErr).Error()})
+			}
+		}
 		r.stopWebhookRuntime()
 
 		r.mu.Lock()
@@ -1218,6 +1240,23 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary.OrphanAgentCleanup.Attempted = true
 	uncertainAgentRunIDs := make(map[string]struct{})
 	uncertainExecutionIDs := make(map[string]struct{})
+	protectUncertainExecution := func(execution storage.AgentExecutionRecord, pid int, scope string) error {
+		if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
+			uncertainAgentRunIDs[*execution.RunID] = struct{}{}
+		}
+		if _, protected := uncertainExecutionIDs[execution.ID]; protected {
+			return nil
+		}
+		uncertainExecutionIDs[execution.ID] = struct{}{}
+		written, err := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, scope, nowISO)
+		if err != nil {
+			return err
+		}
+		if written {
+			eventsWritten += 1
+		}
+		return nil
+	}
 	if repositories.AgentExecutions != nil {
 		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
 		if err != nil {
@@ -1233,42 +1272,26 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				if r.logger != nil {
 					r.logger.Warn("failed to verify orphan agent execution identity", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
 				}
+				if err := protectUncertainExecution(execution, pid, "orphan_cleanup_verifier_error"); err != nil {
+					return RecoverySummary{}, err
+				}
 				continue
 			}
 			if running && !matches {
-				if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
-					uncertainAgentRunIDs[*execution.RunID] = struct{}{}
-				}
-				if _, ok := uncertainExecutionIDs[execution.ID]; !ok {
-					uncertainExecutionIDs[execution.ID] = struct{}{}
-				}
-				written, err := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, "orphan_cleanup", nowISO)
-				if err != nil {
+				if err := protectUncertainExecution(execution, pid, "orphan_cleanup"); err != nil {
 					return RecoverySummary{}, err
-				}
-				if written {
-					eventsWritten += 1
 				}
 				continue
 			}
 			if running {
-				if err := r.signalAgentProcessGroup(pid, syscall.SIGTERM); err != nil {
-					if errors.Is(err, syscall.ESRCH) {
-						running = false
-					} else {
-						if r.logger != nil {
-							r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
-						}
-						continue
+				if err := r.terminateRecoveredExecution(ctx, execution, pid, 5*time.Second); err != nil {
+					if r.logger != nil {
+						r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
 					}
-				}
-				if running {
-					go func(pid int) {
-						timer := time.NewTimer(5 * time.Second)
-						defer timer.Stop()
-						<-timer.C
-						_ = r.signalAgentProcessGroup(pid, syscall.SIGKILL)
-					}(pid)
+					if err := protectUncertainExecution(execution, pid, "orphan_cleanup_termination_error"); err != nil {
+						return RecoverySummary{}, err
+					}
+					continue
 				}
 			}
 			if err := r.markRecoveredExecutionTerminal(ctx, repositories, execution, pid, nowISO, "Killed during looperd recovery"); err != nil {
@@ -1347,6 +1370,15 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			if err != nil {
 				if r.logger != nil {
 					r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error()})
+				}
+				if err := protectUncertainExecution(execution, pid, "active_scan_verifier_error"); err != nil {
+					return RecoverySummary{}, err
+				}
+				continue
+			}
+			if running && !matches {
+				if err := protectUncertainExecution(execution, pid, "active_scan"); err != nil {
+					return RecoverySummary{}, err
 				}
 				continue
 			}
@@ -2661,15 +2693,139 @@ func defaultSignalProcess(pid int, signal syscall.Signal) error {
 
 func (r *Runtime) signalAgentProcessGroup(pid int, signal syscall.Signal) error {
 	if r.signalProcess == nil {
-		return nil
+		return fmt.Errorf("process signal authority is not configured")
 	}
-	if err := r.signalProcess(-pid, signal); err != nil {
+	return r.signalProcess(-pid, signal)
+}
+
+func (r *Runtime) recoveredProcessGroupExited(pid int) (bool, error) {
+	if r.signalProcess == nil {
+		return false, fmt.Errorf("process signal authority is not configured")
+	}
+	err := r.signalProcess(-pid, 0)
+	switch {
+	case err == nil, errors.Is(err, syscall.EPERM):
+		return false, nil
+	case errors.Is(err, syscall.ESRCH):
+		return true, nil
+	default:
+		return false, fmt.Errorf("probe recovered process group %d: %w", pid, err)
+	}
+}
+
+func (r *Runtime) terminateRecoveredExecution(ctx context.Context, execution storage.AgentExecutionRecord, pid int, grace time.Duration) error {
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	// Once recovery has begun terminating an identified orphan, startup
+	// cancellation must not strand it between TERM and KILL. Give the cleanup
+	// its own bounded lifetime so an early daemon shutdown signal can still
+	// cancel the rest of startup without abandoning the process group.
+	terminationCtx, cancelTermination := context.WithTimeout(context.WithoutCancel(ctx), 2*grace+time.Second)
+	defer cancelTermination()
+	ctx = terminationCtx
+	verifyLeader := func() (bool, error) {
+		matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
+		if err != nil {
+			return false, err
+		}
+		if !running {
+			return true, nil
+		}
+		if !matches {
+			return false, fmt.Errorf("execution %s pid %d identity changed while awaiting recovery cleanup", execution.ID, pid)
+		}
+		return false, nil
+	}
+	observeOwnedGroup := func() (bool, error) {
+		exited, err := r.recoveredProcessGroupExited(pid)
+		if err != nil {
+			return false, err
+		}
+		if exited {
+			leaderExited, verifyErr := verifyLeader()
+			if verifyErr != nil || leaderExited {
+				return leaderExited, verifyErr
+			}
+			return false, fmt.Errorf("execution %s leader pid %d remains live outside its recovered process group", execution.ID, pid)
+		}
+		// A leader that remains live must still match before escalation. Once a
+		// verified leader exits, the original group can remain alive through its
+		// descendants; group disappearance, not leader disappearance, is then the
+		// completion authority.
+		_, err = verifyLeader()
+		return false, err
+	}
+
+	leaderExited, err := verifyLeader()
+	if err != nil {
+		return err
+	}
+	if leaderExited {
+		groupExited, probeErr := observeOwnedGroup()
+		if probeErr != nil || groupExited {
+			return probeErr
+		}
+		return fmt.Errorf("execution %s leader pid %d exited before recovery established process-group ownership", execution.ID, pid)
+	}
+	if err := r.signalAgentProcessGroup(pid, syscall.SIGTERM); err != nil {
 		if !errors.Is(err, syscall.ESRCH) {
 			return err
 		}
-		return r.signalProcess(pid, signal)
+		groupExited, probeErr := observeOwnedGroup()
+		if probeErr != nil {
+			return probeErr
+		}
+		if groupExited {
+			return nil
+		}
+		return fmt.Errorf("execution %s process group %d rejected recovery SIGTERM but remains live", execution.ID, pid)
+	}
+	exited, err := waitForRecoveredExecutionExit(ctx, grace, observeOwnedGroup)
+	if err != nil || exited {
+		return err
+	}
+
+	// Re-probe the group and revalidate any still-live leader at the escalation
+	// boundary. If TERM removed only the leader, the verified pre-TERM ownership
+	// plus the still-live group is authoritative for its descendants.
+	exited, err = observeOwnedGroup()
+	if err != nil || exited {
+		return err
+	}
+	if err := r.signalAgentProcessGroup(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	exited, err = waitForRecoveredExecutionExit(ctx, grace, func() (bool, error) {
+		return r.recoveredProcessGroupExited(pid)
+	})
+	if err != nil {
+		return err
+	}
+	if !exited {
+		return fmt.Errorf("execution %s pid %d was not reaped after recovery SIGKILL", execution.ID, pid)
 	}
 	return nil
+}
+
+func waitForRecoveredExecutionExit(ctx context.Context, timeout time.Duration, verify func() (bool, error)) (bool, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-timer.C:
+			return verify()
+		case <-ticker.C:
+			exited, err := verify()
+			if err != nil || exited {
+				return exited, err
+			}
+		}
+	}
 }
 
 func createEmptyRecoverySummary() RecoverySummary {

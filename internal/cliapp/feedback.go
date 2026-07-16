@@ -4,20 +4,27 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/disclosure"
+	shellinfra "github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/spf13/cobra"
 )
 
 const feedbackRepo = "nexu-io/looper"
 
-const feedbackCommandTimeout = 5 * time.Minute
+const (
+	feedbackCommandTimeout   = 5 * time.Minute
+	feedbackCommandWaitDelay = time.Second
+)
 
 var feedbackIssueURLPattern = regexp.MustCompile(`https://github\.com/` + regexp.QuoteMeta(feedbackRepo) + `/issues/\d+`)
 
@@ -63,13 +70,30 @@ func (r *commandRuntime) feedback(cmd *cobra.Command, args []string) error {
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	process := exec.CommandContext(runCtx, command, commandArgs...)
+	shellinfra.ConfigureProcessGroup(process)
+	var cancellationKillSent atomic.Bool
+	process.Cancel = func() error {
+		cancellationKillSent.Store(true)
+		return shellinfra.KillProcessGroup(process)
+	}
+	process.WaitDelay = feedbackCommandWaitDelay
 	process.Dir = cwd
 	process.Stdout = stdout
 	process.Stderr = stderr
 	process.Env = agent.BuildCommandEnv(cwd, prompt, loaded.Config.Agent.Env)
 
-	if err := process.Run(); err != nil {
-		return feedbackRunError(err, stdout.String(), stderr.String())
+	runErr := process.Run()
+	var cleanupErr error
+	if cancellationKillSent.Load() {
+		cleanupErr = shellinfra.WaitProcessGroupExit(process, feedbackCommandWaitDelay)
+	} else {
+		cleanupErr = shellinfra.KillProcessGroupAndWait(process, feedbackCommandWaitDelay)
+	}
+	if errors.Is(runErr, exec.ErrWaitDelay) && process.ProcessState != nil && process.ProcessState.Success() {
+		runErr = nil
+	}
+	if err := feedbackRunAndCleanupError(runErr, cleanupErr, stdout.String(), stderr.String()); err != nil {
+		return err
 	}
 
 	issueURL := extractFeedbackIssueURL(stdout.String(), stderr.String())
@@ -156,4 +180,17 @@ func feedbackRunError(err error, stdout string, stderr string) error {
 		return fmt.Errorf("run feedback agent: %w (%s)", err, summary)
 	}
 	return fmt.Errorf("run feedback agent: %w", err)
+}
+
+func feedbackRunAndCleanupError(runErr, cleanupErr error, stdout, stderr string) error {
+	if cleanupErr == nil || errors.Is(cleanupErr, os.ErrProcessDone) {
+		cleanupErr = nil
+	} else {
+		cleanupErr = fmt.Errorf("clean up feedback agent process group: %w", cleanupErr)
+	}
+	combinedErr := errors.Join(runErr, cleanupErr)
+	if combinedErr == nil {
+		return nil
+	}
+	return feedbackRunError(combinedErr, stdout, stderr)
 }

@@ -107,14 +107,11 @@ const (
 	stopOutcomeAlreadyStopping = "already_stopping"
 	stopOutcomeAlreadyFinished = "already_finished"
 
-	processSkipNoRuns              = "no_running_run"
-	processSkipNoExecution         = "no_execution"
-	processSkipAlreadyFinished     = "execution_already_finished"
-	processSkipAlreadyStopping     = "execution_already_stopping"
-	processSkipNoPID               = "pid_unavailable"
-	processSkipNoSignal            = "signal_unavailable"
-	processSkipVerifierNotRunning  = "pid_not_running"
-	processSkipVerifierRejectedPID = "pid_verification_rejected"
+	processSkipNoRuns          = "no_running_run"
+	processSkipNoExecution     = "no_execution"
+	processSkipAlreadyFinished = "execution_already_finished"
+	processSkipAlreadyStopping = "execution_already_stopping"
+	processSkipNoLiveExecution = "live_execution_unavailable"
 )
 
 type signalProcessFunc func(int, syscall.Signal) error
@@ -132,23 +129,25 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		return nil, err
 	}
 
+	startupReady := make(chan struct{})
 	apiHandler := looperdapi.NewHandler(looperdapi.Context{
-		Config:  deps.Config,
-		Runtime: rt,
+		Config:       deps.Config,
+		Runtime:      rt,
+		StartupReady: startupReady,
 		ReconcileStaleRuns: func(ctx context.Context) (looperdruntime.StaleRunReconcileSummary, error) {
 			return rt.ReconcileStaleRunningRuns(ctx)
 		},
 		StopLoop: func(ctx context.Context, loopID, reason string) (any, error) {
-			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
+			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, nil, nil)
 		},
 		CloseLoop: func(ctx context.Context, loopID, reason string) (any, error) {
-			return closeLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
+			return closeLoop(ctx, rt.Services(), loopID, reason, time.Now, nil, nil)
 		},
 		StopAll: func(ctx context.Context, reason string) (any, error) {
-			return stopAllLoops(ctx, rt.Services(), reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
+			return stopAllLoops(ctx, rt.Services(), reason, time.Now, nil, nil)
 		},
 		TakeoverLoop: func(ctx context.Context, loopID, reason string) (looperdapi.TakeoverResult, error) {
-			return takeoverLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
+			return takeoverLoop(ctx, rt.Services(), loopID, reason, time.Now, nil, nil)
 		},
 		TriggerSchedulerTick: func() {
 			rt.TriggerSchedulerTick()
@@ -170,18 +169,47 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		shutdownTimeout = time.Second
 	}
 
-	if err := rt.CompleteStartup(ctx); err != nil {
+	if err := completeStartupAndOpenGate(ctx, rt.CompleteStartup, startupReady); err != nil {
 		_ = stopServerWithTimeout(server.Stop, shutdownTimeout)
 		rt.Stop("runtime startup failed after api server ownership")
 		rt.WaitForShutdown()
 		return nil, err
 	}
 
-	return &daemonRuntime{
+	daemon := &daemonRuntime{
 		runtime:         rt,
 		server:          server,
 		shutdownTimeout: shutdownTimeout,
-	}, nil
+	}
+	monitorAPIServerErrors(server.Errors(), deps.Logger, daemon.Stop)
+	return daemon, nil
+}
+
+// completeStartupAndOpenGate makes successful runtime startup the sole
+// authority for admitting API mutations. Failure leaves the gate closed until
+// the already-bound server is shut down by the caller.
+func completeStartupAndOpenGate(ctx context.Context, complete func(context.Context) error, startupReady chan struct{}) error {
+	if err := complete(ctx); err != nil {
+		return err
+	}
+	close(startupReady)
+	return nil
+}
+
+func monitorAPIServerErrors(serverErrors <-chan error, logger bootstrap.Logger, stop func(string)) {
+	if serverErrors == nil || stop == nil {
+		return
+	}
+	go func() {
+		err, ok := <-serverErrors
+		if !ok || err == nil {
+			return
+		}
+		if logger != nil {
+			logger.Error("looperd API server stopped unexpectedly", map[string]any{"error": err.Error()})
+		}
+		stop("api server failed: " + err.Error())
+	}()
 }
 
 func stopServerWithTimeout(stop func(context.Context) error, timeout time.Duration) error {
@@ -239,8 +267,13 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			}
 		}
 	}
-	if _, err := stopLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess); err != nil {
+	stopValue, err := stopLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess)
+	if err != nil {
 		return result, err
+	}
+	stopResult, ok := stopValue.(stopLoopResult)
+	if !ok || !stopResultAllowsOwnershipTransfer(stopResult) {
+		return result, fmt.Errorf("cannot transfer loop %s while its prior execution is not confirmed stopped", loopID)
 	}
 	if _, err := services.Loops.TransitionStatus(ctx, loopID, loops.TransitionInput{Status: domain.LoopStatusHumanTakeover}); err != nil {
 		return result, err
@@ -248,67 +281,99 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	return result, nil
 }
 
-func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc, terminal bool) (any, error) {
+func stopResultAllowsOwnershipTransfer(result stopLoopResult) bool {
+	return result.Outcome == stopOutcomeProcessSignaled || result.Outcome == stopOutcomeAlreadyFinished
+}
+
+func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, _ signalProcessFunc, _ executionMatchesProcessFunc, terminal bool) (any, error) {
 	result := stopLoopResult{Stopped: false, LoopID: loopID, Outcome: stopOutcomePausedOnly}
 	if services.Loops == nil {
 		return nil, fmt.Errorf("loops service is not configured")
 	}
+	releaseLoopStop := func() {}
+	if services.ActiveExecutions != nil {
+		releaseLoopStop = services.ActiveExecutions.BeginLoopStop(loopID)
+	}
+	defer releaseLoopStop()
 
 	reasonCopy := reason
 	complete := func() (any, error) {
-		if !terminal {
-			return result, nil
-		}
-		terminated, err := services.Loops.Terminate(ctx, loopID, &reasonCopy)
-		if err != nil {
-			return nil, err
+		if terminal {
+			terminated, err := services.Loops.Terminate(ctx, loopID, &reasonCopy)
+			if err != nil {
+				return nil, err
+			}
+			result.LoopID = terminated.Loop.ID
+		} else {
+			paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
+			if err != nil {
+				return nil, err
+			}
+			result.LoopID = paused.Loop.ID
 		}
 		result.Stopped = true
-		result.LoopID = terminated.Loop.ID
 		return result, nil
 	}
 
-	if !terminal {
-		paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
+	liveStopped := false
+	if services.ActiveExecutions != nil {
+		var err error
+		liveStopped, err = services.ActiveExecutions.StopAndWait(ctx, result.LoopID, "", "", reason)
 		if err != nil {
 			return nil, err
 		}
-		result.Stopped = true
-		result.LoopID = paused.Loop.ID
 	}
 
 	if services.Repositories == nil || services.Repositories.Runs == nil {
+		if liveStopped {
+			result.Outcome = stopOutcomeProcessSignaled
+			return complete()
+		}
 		result.ProcessSkipReason = processSkipNoRuns
-		return complete()
+		return result, nil
 	}
 
 	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
 	if err != nil {
 		return nil, err
 	}
+	if latestRun != nil {
+		result.RunID = latestRun.ID
+	}
+
+	var latestExecution *storage.AgentExecutionRecord
+	if latestRun != nil && services.Repositories.AgentExecutions != nil {
+		latestExecution, err = services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
+		if err != nil {
+			return nil, err
+		}
+		if latestExecution != nil {
+			result.ExecutionID = latestExecution.ID
+			result.Vendor = latestExecution.Vendor
+		}
+	}
+
+	if liveStopped {
+		result.Outcome = stopOutcomeProcessSignaled
+		result.ProcessSkipReason = ""
+		if latestExecution != nil && isStoppableExecutionStatus(latestExecution.Status) {
+			if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
+				return nil, err
+			}
+		}
+		return complete()
+	}
+
 	if latestRun == nil || latestRun.Status != "running" {
 		result.Outcome = stopOutcomeAlreadyFinished
 		result.ProcessSkipReason = processSkipNoRuns
 		return complete()
 	}
-	result.RunID = latestRun.ID
 
-	if services.Repositories.AgentExecutions == nil {
-		result.ProcessSkipReason = processSkipNoExecution
-		return complete()
-	}
-
-	latestExecution, err := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
-	if err != nil {
-		return nil, err
-	}
 	if latestExecution == nil {
 		result.ProcessSkipReason = processSkipNoExecution
-		return complete()
+		return result, nil
 	}
-
-	result.ExecutionID = latestExecution.ID
-	result.Vendor = latestExecution.Vendor
 	if !isStoppableExecutionStatus(latestExecution.Status) {
 		result.Outcome = stopOutcomeAlreadyFinished
 		result.ProcessSkipReason = processSkipAlreadyFinished
@@ -318,58 +383,12 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		result.Outcome = stopOutcomeAlreadyStopping
 		result.ProcessSkipReason = processSkipAlreadyStopping
 	}
-	if services.ActiveExecutions != nil {
-		killed, err := services.ActiveExecutions.Kill(result.LoopID, latestRun.ID, latestExecution.ID, reason)
-		if err != nil {
-			return nil, err
-		}
-		if killed {
-			result.Outcome = stopOutcomeProcessSignaled
-			result.ProcessSkipReason = ""
-			if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
-				return nil, err
-			}
-			return complete()
-		}
-	}
-	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
-		result.ProcessSkipReason = processSkipNoPID
-		return complete()
-	}
-
-	pid := int(*latestExecution.PID)
-	if executionMatchesProcess != nil {
-		matches, running, err := executionMatchesProcess(ctx, *latestExecution, pid)
-		if err != nil {
-			return nil, err
-		}
-		if !running || !matches {
-			if !running {
-				result.Outcome = stopOutcomeAlreadyFinished
-				result.ProcessSkipReason = processSkipVerifierNotRunning
-			} else {
-				result.ProcessSkipReason = processSkipVerifierRejectedPID
-			}
-			return complete()
-		}
-	}
-	result.PID = *latestExecution.PID
-	if signal != nil {
-		if err := signalAgentProcessGroup(pid, signal, 5*time.Second); err != nil {
-			return nil, err
-		}
-		result.Outcome = stopOutcomeProcessSignaled
-		result.ProcessSkipReason = ""
-	} else {
-		result.ProcessSkipReason = processSkipNoSignal
-		return complete()
-	}
-
-	if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
-		return nil, err
-	}
-
-	return complete()
+	// A persisted PID is not cancellation authority. If the live handle/run is
+	// absent, this may be the narrow spawn-to-register window; raw signaling
+	// would bypass executor state and could trigger a native-resume replacement.
+	// Startup recovery exclusively owns conservative PID/command cleanup.
+	result.ProcessSkipReason = processSkipNoLiveExecution
+	return result, nil
 }
 
 type stopAllResult string
@@ -478,12 +497,17 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 				item.Error = err.Error()
 			}
 		} else {
+			liveOwnershipResolved := false
 			if stopResult, ok := stopResultValue.(stopLoopResult); ok {
 				item.Outcome = stopResult.Outcome
 				item.ProcessSkipReason = stopResult.ProcessSkipReason
 				item.Result = classifyStopAllItemResult(stopResult)
+				liveOwnershipResolved = stopResult.Outcome == stopOutcomeProcessSignaled
 			}
 			for _, execution := range candidate.Executions {
+				if liveOwnershipResolved {
+					break
+				}
 				if execution.Status != "running" {
 					continue
 				}
@@ -778,8 +802,13 @@ func classifyStopAllResult(candidate stopAllCandidate) stopAllResult {
 	return stopAllResultStopped
 }
 
-func stopCandidateExecution(ctx context.Context, services looperdruntime.Services, candidate stopAllCandidate, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (stopLoopResult, error) {
+func stopCandidateExecution(ctx context.Context, services looperdruntime.Services, candidate stopAllCandidate, reason string, now func() time.Time, _ signalProcessFunc, _ executionMatchesProcessFunc) (stopLoopResult, error) {
 	result := stopLoopResult{LoopID: candidate.Loop.ID, Outcome: stopOutcomePausedOnly}
+	releaseLoopStop := func() {}
+	if services.ActiveExecutions != nil {
+		releaseLoopStop = services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID)
+	}
+	defer releaseLoopStop()
 	if candidate.Execution == nil {
 		result.Outcome = stopOutcomeAlreadyFinished
 		result.ProcessSkipReason = processSkipNoExecution
@@ -799,11 +828,11 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 		result.RunID = candidate.Run.ID
 	}
 	if services.ActiveExecutions != nil && runID != "" {
-		killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
+		stopped, err := services.ActiveExecutions.StopAndWait(ctx, candidate.Loop.ID, runID, candidate.Execution.ID, reason)
 		if err != nil {
 			return result, err
 		}
-		if killed {
+		if stopped {
 			result.Outcome = stopOutcomeProcessSignaled
 			if err := markExecutionCancelling(ctx, services, *candidate.Execution, reason, now); err != nil {
 				return result, err
@@ -811,73 +840,12 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 			return result, nil
 		}
 	}
-	if candidate.Execution.PID == nil || *candidate.Execution.PID <= 0 {
-		result.ProcessSkipReason = processSkipNoPID
-		return result, nil
-	}
-	result.PID = *candidate.Execution.PID
-	pid := int(*candidate.Execution.PID)
-	if executionMatchesProcess != nil {
-		matches, running, err := executionMatchesProcess(ctx, *candidate.Execution, pid)
-		if err != nil {
-			return result, err
-		}
-		if !running || !matches {
-			if !running {
-				result.Outcome = stopOutcomeAlreadyFinished
-				result.ProcessSkipReason = processSkipVerifierNotRunning
-			} else {
-				result.ProcessSkipReason = processSkipVerifierRejectedPID
-			}
-			return result, nil
-		}
-	}
-	if signal == nil {
-		result.ProcessSkipReason = processSkipNoSignal
-		return result, nil
-	}
-	if err := signalAgentProcessGroup(pid, signal, 5*time.Second); err != nil {
-		return result, err
-	}
-	result.Outcome = stopOutcomeProcessSignaled
-	result.ProcessSkipReason = ""
-	if err := markExecutionCancelling(ctx, services, *candidate.Execution, reason, now); err != nil {
-		return result, err
-	}
+	result.ProcessSkipReason = processSkipNoLiveExecution
 	return result, nil
 }
 
 func isStoppableExecutionStatus(status string) bool {
 	return status == "running" || status == "cancelling"
-}
-
-func signalAgentProcessGroup(pid int, signalProcess signalProcessFunc, grace time.Duration) error {
-	termSignaled := false
-	if err := signalProcess(-pid, syscall.SIGTERM); err != nil {
-		if !errors.Is(err, syscall.ESRCH) {
-			return err
-		}
-		if err := signalProcess(pid, syscall.SIGTERM); err != nil {
-			if errors.Is(err, syscall.ESRCH) {
-				return nil
-			}
-			return err
-		}
-		termSignaled = true
-	} else {
-		termSignaled = true
-	}
-	if grace > 0 && termSignaled {
-		go func() {
-			timer := time.NewTimer(grace)
-			defer timer.Stop()
-			<-timer.C
-			if err := signalProcess(-pid, syscall.SIGKILL); errors.Is(err, syscall.ESRCH) {
-				_ = signalProcess(pid, syscall.SIGKILL)
-			}
-		}()
-	}
-	return nil
 }
 
 func markExecutionCancelling(ctx context.Context, services looperdruntime.Services, execution storage.AgentExecutionRecord, reason string, now func() time.Time) error {

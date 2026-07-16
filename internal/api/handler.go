@@ -63,8 +63,11 @@ type activeRunExecutionVerifier interface {
 }
 
 type Context struct {
-	Config             config.Config
-	Runtime            RuntimeState
+	Config  config.Config
+	Runtime RuntimeState
+	// StartupReady closes only after deferred startup recovery succeeds. A nil
+	// channel keeps standalone/test handlers backward compatible and ready.
+	StartupReady       <-chan struct{}
 	WebhookForwarder   webhookforward.Forwarder
 	ProjectsService    projectService
 	Now                func() time.Time
@@ -193,6 +196,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		h.writeError(w, requestID, typed)
+		return
+	}
+	if !isSafeRequestMethod(r.Method) && !h.startupReady() {
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeRuntimeControlUnavailable,
+			status:  http.StatusServiceUnavailable,
+			message: "Runtime startup recovery is still in progress",
+		})
 		return
 	}
 
@@ -503,6 +514,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status:  http.StatusNotFound,
 		message: fmt.Sprintf("Unknown route: %s", path),
 	})
+}
+
+func (h *Handler) startupReady() bool {
+	if h.context.StartupReady == nil {
+		return true
+	}
+	select {
+	case <-h.context.StartupReady:
+		return true
+	default:
+		return false
+	}
+}
+
+func isSafeRequestMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.ForwardResult, error) {

@@ -382,7 +382,20 @@ func (w *webhookRuntime) Stop() {
 		_ = server.server.Shutdown(ctx)
 		cancel()
 	}
-	w.wg.Wait()
+	waitDone := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(waitDone)
+	}()
+	timer := time.NewTimer(w.shutdownTimeout())
+	defer timer.Stop()
+	select {
+	case <-waitDone:
+	case <-timer.C:
+		if w.logger != nil {
+			w.logger.Warn("webhook shutdown timed out", map[string]any{"timeout": w.shutdownTimeout().String()})
+		}
+	}
 }
 
 func (w *webhookRuntime) Status() WebhookStatus {
@@ -542,21 +555,27 @@ func (w *webhookRuntime) adoptionGate(record storage.WebhookForwarderRecord, com
 	return ""
 }
 
-func (w *webhookRuntime) adoptForwarder(record storage.WebhookForwarderRecord, command []string) {
+func (w *webhookRuntime) adoptForwarder(record storage.WebhookForwarderRecord, command []string) bool {
 	pid := int(record.PID)
 	spawnedAt := formatJavaScriptISOString(time.Unix(0, record.SpawnedAt).UTC())
 	stopCh := make(chan struct{})
 	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return false
+	}
 	if w.forwarderStopCh == nil {
 		w.forwarderStopCh = map[string]chan struct{}{}
 	}
 	w.forwarderStopCh[record.Repo] = stopCh
 	w.status.Forwarders = append(w.status.Forwarders, WebhookForwarderState{Repo: record.Repo, Running: true, PID: &pid, Adopted: true, Fingerprint: record.Fingerprint, SpawnedAt: &spawnedAt, Command: append([]string{}, command...)})
+	// Add while holding the same gate Stop uses to set stopped. This guarantees
+	// no positive WaitGroup delta can race an empty Wait after shutdown begins.
+	w.wg.Add(1)
 	w.mu.Unlock()
 	if w.logger != nil {
 		w.logger.Info("webhook.forwarder.adopted", map[string]any{"repo": record.Repo, "pid": pid, "process_start": record.ProcessStart, "fingerprint": record.Fingerprint})
 	}
-	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
 		proc := &adoptedForwarderProcess{pid: pid, processStart: record.ProcessStart, probe: w.processProbe()}
@@ -592,6 +611,7 @@ func (w *webhookRuntime) adoptForwarder(record storage.WebhookForwarderRecord, c
 			}
 		}
 	}()
+	return true
 }
 
 func (w *webhookRuntime) waitForAdoptedStop(proc *adoptedForwarderProcess, repo string) {
@@ -777,12 +797,19 @@ func (w *webhookRuntime) processProbe() processProbe {
 	return w.probe
 }
 
-func (w *webhookRuntime) launchForwarder(repo string) {
+func (w *webhookRuntime) launchForwarder(repo string) bool {
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return false
+	}
 	w.wg.Add(1)
+	w.mu.Unlock()
 	go func() {
 		defer w.wg.Done()
 		w.runForwarder(repo)
 	}()
+	return true
 }
 
 func (w *webhookRuntime) isStopped() bool {
@@ -1145,21 +1172,24 @@ func (w *webhookRuntime) killAndWait(cmd *exec.Cmd) {
 }
 
 func (w *webhookRuntime) shutdownTimeout() time.Duration {
+	if w != nil && w.cfg.Daemon.ShutdownTimeoutMS > 0 {
+		return time.Duration(w.cfg.Daemon.ShutdownTimeoutMS) * time.Millisecond
+	}
 	return 5 * time.Second
 }
 
-func (w *webhookRuntime) scheduleReconcileRetry(repos *storage.Repositories) {
+func (w *webhookRuntime) scheduleReconcileRetry(repos *storage.Repositories) bool {
 	if w == nil || repos == nil {
-		return
+		return false
 	}
 	w.mu.Lock()
 	if w.stopped || w.reconcileRetry {
 		w.mu.Unlock()
-		return
+		return false
 	}
 	w.reconcileRetry = true
-	w.mu.Unlock()
 	w.wg.Add(1)
+	w.mu.Unlock()
 	go func() {
 		defer w.wg.Done()
 		timer := time.NewTimer(webhookReconcileRetryDelay)
@@ -1182,6 +1212,7 @@ func (w *webhookRuntime) scheduleReconcileRetry(repos *storage.Repositories) {
 		w.mu.Unlock()
 		w.Reconcile(repos)
 	}()
+	return true
 }
 
 func webhookBaseURL(cfg config.Config) string {

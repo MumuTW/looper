@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -52,6 +53,30 @@ func TestRunReturnsCommandExecutionErrorOnNonZeroExit(t *testing.T) {
 	}
 	if !strings.Contains(commandErr.Error(), "bad") {
 		t.Fatalf("error = %q, want stderr detail", commandErr.Error())
+	}
+}
+
+func TestJoinProcessGroupCleanupErrorPreservesEveryPrimaryFailure(t *testing.T) {
+	cleanupErr := errors.New("cleanup barrier failed")
+	primaries := map[string]error{
+		"timeout": &CommandExecutionError{Message: "Command timed out"},
+		"cancel":  context.Canceled,
+		"nonzero": &CommandExecutionError{Message: "Command exited with code 7"},
+		"wait":    errors.New("wait failed"),
+	}
+	for name, primaryErr := range primaries {
+		t.Run(name, func(t *testing.T) {
+			err := joinProcessGroupCleanupError(primaryErr, cleanupErr)
+			if !errors.Is(err, primaryErr) {
+				t.Fatalf("error = %v, want primary error %v", err, primaryErr)
+			}
+			if !errors.Is(err, cleanupErr) {
+				t.Fatalf("error = %v, want cleanup barrier error", err)
+			}
+			if !strings.Contains(err.Error(), "clean up command process group") {
+				t.Fatalf("error = %q, want cleanup context", err)
+			}
+		})
 	}
 }
 
@@ -126,6 +151,117 @@ func TestRunRespectsContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
+}
+
+func TestRunDoesNotStartPreCanceledCommand(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := Run(ctx, Options{
+		Command: filepath.Join(t.TempDir(), "missing-command"),
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunCancellationStopsDescendants(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "child.pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := Run(ctx, Options{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", `trap "" TERM; /bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do sleep 1; done' sh "$1" </dev/null >/dev/null 2>&1 & wait`, "sh", pidPath},
+			GracefulShutdown: 20 * time.Millisecond,
+		})
+		resultCh <- err
+	}()
+
+	childPID := waitForPIDFile(t, pidPath)
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	cancel()
+
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return after cancellation")
+	}
+
+	waitForProcessExit(t, childPID)
+}
+
+func TestRunTimeoutStopsDescendants(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "child.pid")
+	result, err := Run(context.Background(), Options{
+		Command:          "/bin/sh",
+		Args:             []string{"-c", `/bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do sleep 1; done' sh "$1" </dev/null >/dev/null 2>&1 & wait`, "sh", pidPath},
+		Timeout:          100 * time.Millisecond,
+		GracefulShutdown: 20 * time.Millisecond,
+	})
+
+	childPID := waitForPIDFile(t, pidPath)
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	var commandErr *CommandExecutionError
+	if !errors.As(err, &commandErr) || commandErr.Message != "Command timed out" {
+		t.Fatalf("Run() error = %v, want Command timed out", err)
+	}
+	if result.Duration > time.Second {
+		t.Fatalf("Run() duration = %s, want bounded timeout cleanup", result.Duration)
+	}
+	waitForProcessExit(t, childPID)
+}
+
+func TestRunSuccessfulRootExitStillStopsBackgroundDescendants(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "child.pid")
+	_, err := Run(context.Background(), Options{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `/bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do sleep 1; done' sh "$1" </dev/null >/dev/null 2>&1 & while [ ! -s "$1" ]; do sleep 0.01; done`, "sh", pidPath},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	childPID := waitForPIDFile(t, pidPath)
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+	waitForProcessExit(t, childPID)
+}
+
+func waitForPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if parseErr != nil {
+				t.Fatalf("parse child PID %q: %v", data, parseErr)
+			}
+			return pid
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read child PID file: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("child PID file %q was not created", path)
+	return 0
+}
+
+func waitForProcessExit(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d is still alive", pid)
 }
 
 func TestIsTextFileBusy(t *testing.T) {

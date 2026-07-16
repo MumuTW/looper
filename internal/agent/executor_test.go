@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -280,6 +281,31 @@ func TestExecutorStartSanitizesChildEnvAndUsesWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestExecutorStartDoesNotSpawnWhenContextIsAlreadyCanceled(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), "started")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{
+		Vendor: config.AgentVendor("custom"),
+		Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf started > "$MARKER_PATH"`}},
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := executor.Start(ctx, RunInput{
+		ExecutionID:      "agent_pre_canceled",
+		WorkingDirectory: t.TempDir(),
+		Prompt:           "ignored",
+		Timeout:          time.Second,
+		Env:              map[string]string{"MARKER_PATH": markerPath},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context.Canceled", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("agent marker stat error = %v, want process not spawned", err)
+	}
+}
+
 func TestRecoverableNativeResumeSourceAllowsCompletedPending(t *testing.T) {
 	t.Parallel()
 
@@ -321,7 +347,7 @@ func TestExtractNativeSessionID(t *testing.T) {
 	}
 }
 
-func TestOnOutputRecomputesNativeSessionIDFromBufferedOutput(t *testing.T) {
+func TestCaptureOutputRecomputesNativeSessionIDFromBufferedOutput(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
@@ -329,11 +355,11 @@ func TestOnOutputRecomputesNativeSessionIDFromBufferedOutput(t *testing.T) {
 		executor:       New(ExecutorOptions{Now: func() time.Time { return now }}),
 		maxOutputBytes: 1024,
 	}
-	x.onOutput("stdout", []byte("session_id: abc"))
+	x.captureOutput("stdout", []byte("session_id: abc"))
 	if got := x.nativeSessionID; got != "abc" {
 		t.Fatalf("nativeSessionID after first chunk = %q, want abc", got)
 	}
-	x.onOutput("stdout", []byte("def\n"))
+	x.captureOutput("stdout", []byte("def\n"))
 	if got := x.nativeSessionID; got != "abcdef" {
 		t.Fatalf("nativeSessionID after second chunk = %q, want abcdef", got)
 	}
@@ -629,6 +655,103 @@ func TestExecutorFallbackTimeoutPropagatesTimeoutTypeToLifecycle(t *testing.T) {
 	}
 }
 
+func TestExecutorCancellationEscalatesTermResistantFallbackOnce(t *testing.T) {
+	workDir := t.TempDir()
+	fallbackPIDPath := filepath.Join(workDir, "fallback.pid")
+	scriptPath := filepath.Join(t.TempDir(), "mock-codex")
+	script := "#!/bin/sh\ncase \"$*\" in *resume*) printf '%s\\n' 'resume failed' >&2; exit 2;; esac\ntrap '' TERM\necho $$ > \"$FALLBACK_PID_FILE\"\nwhile true; do sleep 1; done\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	executor := New(ExecutorOptions{Config: ExecutorConfig{
+		Vendor:              config.AgentVendorCodex,
+		Params:              map[string]any{"command": scriptPath},
+		NativeResumeEnabled: true,
+	}})
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	execHandle, err := executor.Start(runCtx, RunInput{
+		ExecutionID:      "agent_fallback_cancel",
+		WorkingDirectory: workDir,
+		Prompt:           "checkpoint prompt",
+		NativeSessionID:  "session-1",
+		Timeout:          5 * time.Second,
+		GracefulShutdown: 30 * time.Millisecond,
+		Env:              map[string]string{"FALLBACK_PID_FILE": fallbackPIDPath},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	fallbackPID := waitForPIDFile(t, fallbackPIDPath)
+	t.Cleanup(func() { _ = syscall.Kill(-fallbackPID, syscall.SIGKILL) })
+
+	canceledAt := time.Now()
+	cancelRun()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), time.Second)
+	defer cancelWait()
+	result, err := execHandle.Wait(waitCtx)
+	if err != nil {
+		t.Fatalf("Wait() error = %v, want fallback reaped after cancellation", err)
+	}
+	if result.Status != "killed" {
+		t.Fatalf("result.Status = %q, want killed", result.Status)
+	}
+	if elapsed := time.Since(canceledAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("fallback cancellation elapsed = %s, want one grace period then escalation", elapsed)
+	}
+	waitForProcessExit(t, fallbackPID, time.Second)
+}
+
+func TestExecutorNativeResumeFallbackSharesLogicalMaxRuntime(t *testing.T) {
+	workDir := t.TempDir()
+	resumeReadyPath := filepath.Join(workDir, "resume.ready")
+	resumeReleasePath := filepath.Join(workDir, "resume.release")
+	fallbackReadyPath := filepath.Join(workDir, "fallback.ready")
+	scriptPath := filepath.Join(t.TempDir(), "mock-codex")
+	script := "#!/bin/sh\ncase \"$*\" in *resume*) : > \"$RESUME_READY_FILE\"; while [ ! -f \"$RESUME_RELEASE_FILE\" ]; do :; done; printf '%s\\n' 'resume failed' >&2; exit 2;; esac\n: > \"$FALLBACK_READY_FILE\"\nwhile true; do sleep 1; done\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	executor := New(ExecutorOptions{Config: ExecutorConfig{
+		Vendor:              config.AgentVendorCodex,
+		Params:              map[string]any{"command": scriptPath},
+		NativeResumeEnabled: true,
+	}})
+
+	startedAt := time.Now()
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID:      "agent_fallback_logical_deadline",
+		WorkingDirectory: workDir,
+		Prompt:           "checkpoint prompt",
+		NativeSessionID:  "session-1",
+		Timeout:          1500 * time.Millisecond,
+		GracefulShutdown: 20 * time.Millisecond,
+		Env: map[string]string{
+			"RESUME_READY_FILE":   resumeReadyPath,
+			"RESUME_RELEASE_FILE": resumeReleasePath,
+			"FALLBACK_READY_FILE": fallbackReadyPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitForFile(t, resumeReadyPath)
+	time.Sleep(300 * time.Millisecond)
+	if err := os.WriteFile(resumeReleasePath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile(resume release) error = %v", err)
+	}
+	waitForFile(t, fallbackReadyPath)
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "timeout" || result.TimeoutType != "max_runtime" {
+		t.Fatalf("result = %#v, want cumulative max-runtime timeout", result)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 1650*time.Millisecond {
+		t.Fatalf("logical execution elapsed = %s, want one shared 1.5s budget", elapsed)
+	}
+}
+
 func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	t.Parallel()
 
@@ -683,6 +806,102 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	}
 	if !containsEvent(events, "agent.invoked") || !containsEvent(events, "agent.completed") {
 		t.Fatalf("agent events = %#v, want invoked + completed", events)
+	}
+}
+
+func TestExecutorStartFailsAndReapsWhenInitialPersistenceFails(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "agent.pid")
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+			"command": "/bin/sh",
+			"args":    []any{"-c", `trap '' TERM; echo $$ > "$PID_FILE"; while true; do sleep 1; done`},
+		}},
+		Repos: repos,
+	})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID:      "agent_unpersisted_start",
+		WorkingDirectory: workDir,
+		Prompt:           "ignored",
+		Timeout:          5 * time.Second,
+		Env:              map[string]string{"PID_FILE": pidPath},
+	})
+	if err == nil {
+		if execHandle != nil {
+			_ = execHandle.Kill("test cleanup")
+			waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			_, _ = execHandle.Wait(waitCtx)
+			cancel()
+		}
+		t.Fatal("Start() error = nil, want persistence failure")
+	}
+	if execHandle != nil {
+		t.Fatalf("Start() execution = %#v, want nil after failed ownership persistence", execHandle)
+	}
+	if data, readErr := os.ReadFile(pidPath); readErr == nil {
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if parseErr != nil {
+			t.Fatalf("parse spawned pid: %v", parseErr)
+		}
+		waitForProcessExit(t, pid, time.Second)
+	}
+}
+
+func TestExecutorPersistsSilentFallbackPIDImmediatelyAfterSpawn(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	workDir := t.TempDir()
+	fallbackPIDPath := filepath.Join(workDir, "fallback.pid")
+	scriptPath := filepath.Join(t.TempDir(), "mock-codex")
+	script := "#!/bin/sh\ncase \"$*\" in *resume*) printf '%s\\n' 'resume failed' >&2; exit 2;; esac\ntrap '' TERM\necho $$ > \"$FALLBACK_PID_FILE\"\nwhile true; do sleep 1; done\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{
+			Vendor:              config.AgentVendorCodex,
+			Params:              map[string]any{"command": scriptPath},
+			NativeResumeEnabled: true,
+		},
+		Repos: repos,
+	})
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID:      "agent_silent_fallback",
+		WorkingDirectory: workDir,
+		Prompt:           "checkpoint prompt",
+		NativeSessionID:  "session-1",
+		Timeout:          5 * time.Second,
+		GracefulShutdown: 20 * time.Millisecond,
+		Env:              map[string]string{"FALLBACK_PID_FILE": fallbackPIDPath},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	fallbackPID := waitForPIDFile(t, fallbackPIDPath)
+	t.Cleanup(func() { _ = syscall.Kill(-fallbackPID, syscall.SIGKILL) })
+
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_silent_fallback")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil || record.PID == nil || *record.PID != int64(fallbackPID) {
+		t.Fatalf("fallback execution record = %#v, want live fallback PID %d", record, fallbackPID)
+	}
+	if err := execHandle.Kill("test cleanup"); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "killed" {
+		t.Fatalf("result.Status = %q, want killed", result.Status)
 	}
 }
 
@@ -1086,6 +1305,47 @@ func TestExecutorKillTerminatesChildProcessGroup(t *testing.T) {
 	t.Fatalf("child process %d is still running after execution Kill", childPID)
 }
 
+func TestExecutorCleansDescendantsAfterRootExit(t *testing.T) {
+	workDir := t.TempDir()
+	childPIDPath := filepath.Join(workDir, "child.pid")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{
+		Vendor: config.AgentVendor("custom"),
+		Params: map[string]any{
+			"command": "/bin/sh",
+			"args":    []any{"-c", `/bin/sh -c 'trap "" TERM HUP; while true; do sleep 1; done' & echo $! > "$CHILD_PID_FILE"; printf '__LOOPER_RESULT__={"summary":"root completed"}\n'`},
+		},
+	}})
+
+	startedAt := time.Now()
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID:      "agent_root_exit_cleanup",
+		WorkingDirectory: workDir,
+		Prompt:           "ignored",
+		Timeout:          250 * time.Millisecond,
+		GracefulShutdown: 20 * time.Millisecond,
+		Env:              map[string]string{"CHILD_PID_FILE": childPIDPath},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	childPID := waitForPIDFile(t, childPIDPath)
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" || result.Summary != "root completed" {
+		t.Fatalf("result = %#v, want completed root while descendants are cleaned", result)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("Wait() elapsed = %s, want prompt cleanup after root exit", elapsed)
+	}
+	if err := syscall.Kill(-result.PID, 0); err != syscall.ESRCH {
+		t.Fatalf("process group %d remains after Wait: %v", result.PID, err)
+	}
+}
+
 func TestExecutorHeartbeatTimeoutMarksTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -1253,7 +1513,7 @@ func strPtr(value string) *string {
 
 func waitForPIDFile(t *testing.T, path string) int {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(path)
 		if err == nil {
@@ -1266,6 +1526,30 @@ func waitForPIDFile(t *testing.T, path string) int {
 	}
 	t.Fatalf("timed out waiting for pid file %s", path)
 	return 0
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for file %s", path)
+}
+
+func waitForProcessExit(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d is still running", pid)
 }
 
 func TestLastNonEmptyLines(t *testing.T) {

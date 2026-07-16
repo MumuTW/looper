@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1669,6 +1670,8 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 		t.Fatalf("seed coordinator close error = %v", err)
 	}
 
+	processRunning := true
+	processGroupRunning := true
 	rt := New(Options{
 		Config: cfg,
 		Logger: &testLogger{},
@@ -1676,15 +1679,26 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 			return startedAt
 		},
 		ReadProcessCommand: func(context.Context, int) (string, error) {
+			if !processRunning {
+				return "", nil
+			}
 			return "codex exec fix failing tests", nil
 		},
 		SignalProcess: func(gotPID int, signal syscall.Signal) error {
-			if signal == syscall.SIGKILL {
-				return nil
+			if gotPID != -int(pid) {
+				t.Fatalf("SignalProcess pid = %d, want %d", gotPID, -pid)
 			}
-			if gotPID != -int(pid) || signal != syscall.SIGTERM {
-				t.Fatalf("SignalProcess(%d, %v), want (%d, SIGTERM)", gotPID, signal, -pid)
+			if signal == 0 {
+				if processGroupRunning {
+					return nil
+				}
+				return syscall.ESRCH
 			}
+			if signal != syscall.SIGTERM {
+				t.Fatalf("SignalProcess(%d, %v), want SIGTERM or signal-0 probe", gotPID, signal)
+			}
+			processRunning = false
+			processGroupRunning = false
 			return nil
 		},
 	})
@@ -1716,6 +1730,128 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 	recovery := rt.RecoverySummary()
 	if !recovery.OrphanAgentCleanup.Attempted || recovery.OrphanAgentCleanup.CleanedCount != 1 {
 		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want attempted + cleanedCount=1", recovery.OrphanAgentCleanup)
+	}
+}
+
+func TestTerminateRecoveredExecutionEscalatesOnlyWhileIdentityMatchesAndAwaitsExit(t *testing.T) {
+	t.Parallel()
+
+	running := true
+	groupRunning := true
+	var signals []syscall.Signal
+	rt := New(Options{
+		ReadProcessCommand: func(context.Context, int) (string, error) {
+			if !running {
+				return "", nil
+			}
+			return "codex exec test", nil
+		},
+		SignalProcess: func(pid int, signal syscall.Signal) error {
+			if pid != -4242 {
+				t.Fatalf("SignalProcess pid = %d, want -4242", pid)
+			}
+			if signal == 0 {
+				if groupRunning {
+					return nil
+				}
+				return syscall.ESRCH
+			}
+			signals = append(signals, signal)
+			if signal == syscall.SIGKILL {
+				running = false
+				groupRunning = false
+			}
+			return nil
+		},
+	})
+	execution := storage.AgentExecutionRecord{ID: "exec_recovery", CommandJSON: stringPtr(`{"command":"codex","args":["exec","test"]}`)}
+	if err := rt.terminateRecoveredExecution(context.Background(), execution, 4242, 10*time.Millisecond); err != nil {
+		t.Fatalf("terminateRecoveredExecution() error = %v", err)
+	}
+	if !slices.Equal(signals, []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL}) {
+		t.Fatalf("signals = %#v, want TERM then KILL", signals)
+	}
+	if running {
+		t.Fatal("terminateRecoveredExecution returned before verifier confirmed exit")
+	}
+}
+
+func TestTerminateRecoveredExecutionFinishesAfterStartupContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	running := true
+	groupRunning := true
+	var signals []syscall.Signal
+	rt := New(Options{
+		ReadProcessCommand: func(context.Context, int) (string, error) {
+			if !running {
+				return "", nil
+			}
+			return "codex exec test", nil
+		},
+		SignalProcess: func(pid int, signal syscall.Signal) error {
+			if pid != -4242 {
+				t.Fatalf("SignalProcess pid = %d, want -4242", pid)
+			}
+			if signal == 0 {
+				if groupRunning {
+					return nil
+				}
+				return syscall.ESRCH
+			}
+			signals = append(signals, signal)
+			if signal == syscall.SIGTERM {
+				cancel()
+			}
+			if signal == syscall.SIGKILL {
+				running = false
+				groupRunning = false
+			}
+			return nil
+		},
+	})
+	execution := storage.AgentExecutionRecord{ID: "exec_cancelled_startup", CommandJSON: stringPtr(`{"command":"codex","args":["exec","test"]}`)}
+	if err := rt.terminateRecoveredExecution(ctx, execution, 4242, 10*time.Millisecond); err != nil {
+		t.Fatalf("terminateRecoveredExecution() error = %v", err)
+	}
+	if !slices.Equal(signals, []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL}) {
+		t.Fatalf("signals = %#v, want TERM then KILL after startup cancellation", signals)
+	}
+	if running {
+		t.Fatal("terminateRecoveredExecution returned before cancelled-startup orphan exited")
+	}
+}
+
+func TestTerminateRecoveredExecutionDoesNotEscalateAfterIdentityChanges(t *testing.T) {
+	t.Parallel()
+
+	reads := 0
+	var signals []syscall.Signal
+	rt := New(Options{
+		ReadProcessCommand: func(context.Context, int) (string, error) {
+			reads++
+			if reads >= 3 {
+				return "python unrelated.py", nil
+			}
+			return "codex exec test", nil
+		},
+		SignalProcess: func(_ int, signal syscall.Signal) error {
+			if signal == 0 {
+				return nil
+			}
+			signals = append(signals, signal)
+			return nil
+		},
+	})
+	execution := storage.AgentExecutionRecord{ID: "exec_reused", CommandJSON: stringPtr(`{"command":"codex","args":["exec","test"]}`)}
+	err := rt.terminateRecoveredExecution(context.Background(), execution, 4242, 20*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("terminateRecoveredExecution() error = %v, want identity-change error", err)
+	}
+	if !slices.Equal(signals, []syscall.Signal{syscall.SIGTERM}) {
+		t.Fatalf("signals = %#v, want TERM without delayed KILL", signals)
 	}
 }
 
@@ -1829,6 +1965,8 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 	targetID := "pr:nexu-io/looper:186"
 	loopID := "loop_mismatched_agent_running"
 	runID := "run_mismatched_agent_running"
+	verifierErrorLoopID := "loop_verifier_error_agent_running"
+	verifierErrorRunID := "run_verifier_error_agent_running"
 	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() seed error = %v", err)
 	}
@@ -1838,7 +1976,14 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("execute"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Runs.Upsert() seed error = %v", err)
 	}
+	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: verifierErrorLoopID, Seq: 187, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert(verifier error) seed error = %v", err)
+	}
+	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{ID: verifierErrorRunID, LoopID: verifierErrorLoopID, Status: "running", CurrentStep: stringPtr("execute"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert(verifier error) seed error = %v", err)
+	}
 	pid := int64(4343)
+	verifierErrorPID := int64(4344)
 	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
 		ID:             "agent_mismatched_running_run",
 		ProjectID:      stringPtr("project_1"),
@@ -1856,6 +2001,12 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() seed error = %v", err)
 	}
+	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID: "agent_verifier_error_running_run", ProjectID: stringPtr("project_1"), LoopID: &verifierErrorLoopID, RunID: &verifierErrorRunID,
+		Vendor: "codex", Status: "running", PID: &verifierErrorPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(verifier error) seed error = %v", err)
+	}
 	if err := seedCoordinator.Close(); err != nil {
 		t.Fatalf("seed coordinator close error = %v", err)
 	}
@@ -1867,7 +2018,10 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 		Now: func() time.Time {
 			return startedAt
 		},
-		ReadProcessCommand: func(context.Context, int) (string, error) {
+		ReadProcessCommand: func(_ context.Context, gotPID int) (string, error) {
+			if gotPID == int(verifierErrorPID) {
+				return "", errors.New("ps temporarily unavailable")
+			}
 			return "python unrelated.py", nil
 		},
 		SignalProcess: func(int, syscall.Signal) error {
@@ -1913,6 +2067,27 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 	}
 	if !logger.containsMessage("recovery skipped due to uncertain process identity") {
 		t.Fatalf("logger entries = %#v, want uncertain process identity warning", logger.messages())
+	}
+	verifierErrorRun, err := services.Repositories.Runs.GetByID(context.Background(), verifierErrorRunID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID(verifier error) error = %v", err)
+	}
+	if verifierErrorRun == nil || verifierErrorRun.Status != "running" || verifierErrorRun.EndedAt != nil {
+		t.Fatalf("verifier-error run = %#v, want preserved running run", verifierErrorRun)
+	}
+	verifierErrorLoop, err := services.Repositories.Loops.GetByID(context.Background(), verifierErrorLoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID(verifier error) error = %v", err)
+	}
+	if verifierErrorLoop == nil || verifierErrorLoop.Status != "running" {
+		t.Fatalf("verifier-error loop = %#v, want preserved running loop", verifierErrorLoop)
+	}
+	verifierEvents, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_verifier_error_running_run")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(verifier error) error = %v", err)
+	}
+	if !containsEventType(verifierEvents, "looperd.recovery.process_identity_uncertain") {
+		t.Fatalf("verifier-error events = %#v, want uncertain identity event", verifierEvents)
 	}
 }
 

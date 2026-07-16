@@ -1,10 +1,16 @@
 package forge
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestValidateTrustedReviewProxyArgv(t *testing.T) {
@@ -191,6 +197,114 @@ func TestStartTrustedReviewProxyInjectsTokensIntoChild(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "proxy-child-ran")); err != nil {
 		t.Fatalf("proxy child did not run in bound cwd %q: %v", dir, err)
 	}
+}
+
+func TestTrustedReviewProxyCleanupStopsChildDescendants(t *testing.T) {
+	dir := t.TempDir()
+	realLooper := filepath.Join(dir, "real-looper")
+	pidPath := filepath.Join(dir, "child.pid")
+	script := strings.Join([]string{
+		"#!/bin/sh",
+		`/bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do sleep 1; done' sh "` + pidPath + `" </dev/null >/dev/null 2>&1 &`,
+		"wait",
+	}, "\n")
+	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, "", testTrustedReviewPolicy())
+	if err != nil {
+		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
+	}
+	var cleanupOnce sync.Once
+	stop := func() { cleanupOnce.Do(cleanup) }
+	t.Cleanup(stop)
+	t.Setenv(TrustedReviewSockEnv, sockPath)
+	t.Setenv(trustedReviewProxySkipEnv, "")
+
+	requestDone := make(chan error, 1)
+	go func() {
+		requestDone <- ProxyReviewSubmit([]string{"review", "submit", "acme/looper#1", "--event", "COMMENT"}, []byte(`{"body":"x"}`), dir)
+	}()
+	childPID := waitForTrustedReviewProcessPID(t, pidPath)
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+
+	cleanupDone := make(chan struct{})
+	startedAt := time.Now()
+	go func() {
+		stop()
+		close(cleanupDone)
+	}()
+	select {
+	case <-cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("trusted review proxy cleanup blocked on child process")
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("trusted review proxy cleanup duration = %s, want bounded cleanup", elapsed)
+	}
+	waitForTrustedReviewProcessExit(t, childPID)
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("proxy request did not unblock after cleanup")
+	}
+}
+
+func TestTrustedReviewProxyResponsePreservesExitCodeAndCleanupDiagnostics(t *testing.T) {
+	command := exec.Command("/bin/sh", "-c", "exit 7")
+	runErr := command.Run()
+	cleanupErr := errors.New("process group remained live")
+
+	response := trustedReviewProxyRunResponse("", "review failed", runErr, cleanupErr)
+	if response.ExitCode != 7 {
+		t.Fatalf("response.ExitCode = %d, want 7", response.ExitCode)
+	}
+	if !strings.Contains(response.Error, "clean up trusted review child process group") {
+		t.Fatalf("response.Error = %q, want cleanup diagnostics", response.Error)
+	}
+
+	err := trustedReviewProxyResponseError(response)
+	var exitErr interface{ ExitCode() int }
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+		t.Fatalf("error = %v, want exit code 7", err)
+	}
+	if !strings.Contains(err.Error(), "clean up trusted review child process group") {
+		t.Fatalf("error = %q, want cleanup diagnostics", err)
+	}
+}
+
+func waitForTrustedReviewProcessPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if parseErr != nil {
+				t.Fatalf("parse process PID %q: %v", data, parseErr)
+			}
+			return pid
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read process PID file: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process PID file %q was not created", path)
+	return 0
+}
+
+func waitForTrustedReviewProcessExit(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d is still alive", pid)
 }
 
 func TestStartTrustedReviewProxyRewritesPolicyFlags(t *testing.T) {

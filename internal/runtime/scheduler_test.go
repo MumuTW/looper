@@ -41,6 +41,152 @@ func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	}
 }
 
+func TestEveryRoleRegistersAgentExecutionForConfirmedStop(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		start func(agentExecutionStarter, *ActiveExecutionRegistry) error
+	}{
+		{name: "planner", start: func(starter agentExecutionStarter, registry *ActiveExecutionRegistry) error {
+			_, err := (plannerAgentExecutorAdapter{executor: starter, registry: registry}).Start(context.Background(), planner.AgentRunInput{LoopID: "loop_1", RunID: "run_1", ExecutionID: "exec_1"})
+			return err
+		}},
+		{name: "reviewer", start: func(starter agentExecutionStarter, registry *ActiveExecutionRegistry) error {
+			_, err := (reviewerAgentExecutorAdapter{executor: starter, registry: registry}).Start(context.Background(), reviewer.AgentRunInput{LoopID: "loop_1", RunID: "run_1", ExecutionID: "exec_1"})
+			return err
+		}},
+		{name: "fixer", start: func(starter agentExecutionStarter, registry *ActiveExecutionRegistry) error {
+			_, err := (fixerAgentExecutorAdapter{executor: starter, registry: registry}).Start(context.Background(), fixer.AgentRunInput{LoopID: "loop_1", RunID: "run_1", ExecutionID: "exec_1"})
+			return err
+		}},
+		{name: "worker", start: func(starter agentExecutionStarter, registry *ActiveExecutionRegistry) error {
+			_, err := (workerAgentExecutorAdapter{executor: starter, registry: registry}).Start(context.Background(), worker.AgentRunInput{LoopID: "loop_1", RunID: "run_1", ExecutionID: "exec_1"})
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			registry := NewActiveExecutionRegistry()
+			execution := newBlockingRegistryExecution()
+			if err := tt.start(stubAgentExecutionStarter{execution: execution}, registry); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			stopped := make(chan error, 1)
+			go func() {
+				_, err := registry.StopAndWait(context.Background(), "loop_1", "run_1", "exec_1", "test stop")
+				stopped <- err
+			}()
+			select {
+			case <-execution.killed:
+			case <-time.After(time.Second):
+				t.Fatal("registered execution was not killed")
+			}
+			execution.finish()
+			if err := <-stopped; err != nil {
+				t.Fatalf("StopAndWait() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestCoordinatorAgentExecutionRegistersForDaemonShutdown(t *testing.T) {
+	t.Parallel()
+
+	registry := NewActiveExecutionRegistry()
+	execution := newBlockingRegistryExecution()
+	adapter := coordinatorAgentExecutorAdapter{executor: stubAgentExecutionStarter{execution: execution}, registry: registry}
+	if _, err := adapter.Start(context.Background(), agent.RunInput{ExecutionID: "coord_exec_1", Prompt: "triage", WorkingDirectory: t.TempDir()}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	returned := make(chan error, 1)
+	go func() { returned <- registry.ShutdownAndWait(context.Background(), "test shutdown") }()
+	select {
+	case <-execution.killed:
+	case <-time.After(time.Second):
+		t.Fatal("coordinator execution was not killed during shutdown")
+	}
+	execution.finish()
+	if err := <-returned; err != nil {
+		t.Fatalf("ShutdownAndWait() error = %v", err)
+	}
+}
+
+func TestReviewerRegistryStopCancelsTrustedPublicationOwnership(t *testing.T) {
+	t.Parallel()
+
+	registry := NewActiveExecutionRegistry()
+	execution := newBlockingRegistryExecution()
+	proxyCancelled := make(chan struct{})
+	owned := &reviewerOwnedAgentExecution{execution: execution, cleanup: func() { close(proxyCancelled) }}
+	registry.Register("loop_review", "run_review", "exec_review", owned)
+	returned := make(chan error, 1)
+	go func() {
+		_, err := registry.StopAndWait(context.Background(), "loop_review", "run_review", "exec_review", "stop reviewer")
+		returned <- err
+	}()
+	select {
+	case <-execution.killed:
+	case <-time.After(time.Second):
+		t.Fatal("reviewer agent was not killed")
+	}
+	select {
+	case <-proxyCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("trusted publication proxy was not cancelled with reviewer ownership")
+	}
+	execution.finish()
+	if err := <-returned; err != nil {
+		t.Fatalf("StopAndWait() error = %v", err)
+	}
+}
+
+func TestReviewerOwnedExecutionRejectsUnsupportedForcedResolution(t *testing.T) {
+	t.Parallel()
+
+	owned := &reviewerOwnedAgentExecution{execution: stubAgentExecution{}}
+	if err := owned.ForceKill(); err == nil {
+		t.Fatal("ForceKill() returned nil without an underlying confirmed-reap contract")
+	}
+}
+
+func TestScheduledAgentRunRemainsOwnedAfterAgentPhase(t *testing.T) {
+	t.Parallel()
+
+	registry := NewActiveExecutionRegistry()
+	runner := &cancellableWorkerScheduler{started: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{})}
+	loopID := "loop_validation"
+	if err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{{ID: "queue_1", LoopID: &loopID, Type: "worker"}}, defaultSchedulerTickInput{Worker: runner, ActiveExecutions: registry}); err != nil {
+		t.Fatalf("runScheduledQueueItems() error = %v", err)
+	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled run did not start")
+	}
+	returned := make(chan error, 1)
+	go func() {
+		_, err := registry.StopAndWait(context.Background(), loopID, "run_1", "completed_agent", "stop validation")
+		returned <- err
+	}()
+	select {
+	case <-runner.cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled run context was not cancelled")
+	}
+	select {
+	case err := <-returned:
+		t.Fatalf("StopAndWait returned before runner cleanup: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(runner.release)
+	if err := <-returned; err != nil {
+		t.Fatalf("StopAndWait() error = %v", err)
+	}
+}
+
 func TestCommentInfosToObjectsPreservesNestedAuthorLogin(t *testing.T) {
 	t.Parallel()
 
@@ -1669,4 +1815,32 @@ func (s stubAgentExecution) Wait(context.Context) (agent.Result, error) {
 
 func (s stubAgentExecution) Kill(string) error {
 	return nil
+}
+
+type stubAgentExecutionStarter struct {
+	execution agent.Execution
+	err       error
+}
+
+func (s stubAgentExecutionStarter) Start(context.Context, agent.RunInput) (agent.Execution, error) {
+	return s.execution, s.err
+}
+
+type cancellableWorkerScheduler struct {
+	started   chan struct{}
+	cancelled chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (s *cancellableWorkerScheduler) ProcessNext(context.Context, string) (*worker.ProcessResult, error) {
+	return nil, nil
+}
+
+func (s *cancellableWorkerScheduler) ProcessClaimedQueueItem(ctx context.Context, _ storage.QueueItemRecord) (*worker.ProcessResult, error) {
+	s.once.Do(func() { close(s.started) })
+	<-ctx.Done()
+	close(s.cancelled)
+	<-s.release
+	return nil, ctx.Err()
 }

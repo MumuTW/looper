@@ -252,6 +252,9 @@ func TestBootstrapWaitForShutdownRegistersSignalsAndStopsRuntime(t *testing.T) {
 				return logger, nil
 			},
 			StartRuntime: func(context.Context, RuntimeDependencies) (Runtime, error) {
+				if notifier.ch == nil {
+					return nil, errors.New("signal handling was not installed before runtime startup")
+				}
 				return runtime, nil
 			},
 			WaitForShutdown: true,
@@ -305,6 +308,52 @@ func TestBootstrapWaitForShutdownRegistersSignalsAndStopsRuntime(t *testing.T) {
 	}
 	if got := logger.infoEntries[1].context["signal"]; got != "SIGTERM" {
 		t.Fatalf("logger.Info() context[signal] = %#v, want %#v", got, "SIGTERM")
+	}
+}
+
+func TestBootstrapSignalCancelsRuntimeStartup(t *testing.T) {
+	workingDir := t.TempDir()
+	rootDir := t.TempDir()
+	notifier := &stubSignalNotifier{}
+	startupEntered := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := Bootstrap(context.Background(), Options{
+			LoadConfig: func(config.LoadFileOptions) (config.LoadedFileConfig, error) {
+				return config.LoadedFileConfig{Config: config.Config{
+					Storage: config.StorageConfig{DBPath: filepath.Join(rootDir, "data", "looper.sqlite")},
+					Logging: config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 10, MaxFiles: 5},
+					Daemon:  config.DaemonConfig{LogDir: filepath.Join(rootDir, "logs"), WorkingDirectory: workingDir},
+				}}, nil
+			},
+			CreateLogger: func(config.LoggingConfig, string, LoggerOptions) (Logger, error) {
+				return &recordingLogger{}, nil
+			},
+			StartRuntime: func(ctx context.Context, _ RuntimeDependencies) (Runtime, error) {
+				close(startupEntered)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+			WaitForShutdown: true,
+			SignalNotifier:  notifier,
+		})
+		done <- err
+	}()
+
+	notifier.waitForRegistration(t)
+	<-startupEntered
+	notifier.emit(syscall.SIGTERM)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Bootstrap() error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Bootstrap() did not cancel runtime startup after SIGTERM")
+	}
+	if notifier.stopCalls != 1 {
+		t.Fatalf("SignalNotifier.Stop() calls = %d, want 1", notifier.stopCalls)
 	}
 }
 

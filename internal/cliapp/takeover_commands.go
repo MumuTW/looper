@@ -3,14 +3,20 @@ package cliapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"sync/atomic"
+	"time"
 
+	shellinfra "github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/spf13/cobra"
 )
+
+const takeoverCommandWaitDelay = time.Second
 
 // takeoverResumeResponse mirrors the daemon's POST /loops/{seq}/takeover reply.
 type takeoverResumeResponse struct {
@@ -56,11 +62,47 @@ func (r *commandRuntime) resumeLoopBySeq(cmd *cobra.Command, args []string) erro
 	}
 	fmt.Fprintf(out, "▶ Taking over loop %s — dropping you into its %s session. Exit the agent when done.\n  (%s)\n\n", seq, resp.Vendor, handbackHint)
 	shell := exec.CommandContext(ctx, "sh", "-c", resp.ResumeCommand)
+	shellinfra.ConfigureProcessGroup(shell)
+	var cancelKillAttempted atomic.Bool
+	shell.Cancel = func() error {
+		cancelKillAttempted.Store(true)
+		return shellinfra.KillProcessGroup(shell)
+	}
+	shell.WaitDelay = takeoverCommandWaitDelay
 	shell.Stdin = os.Stdin
 	shell.Stdout = os.Stdout
 	shell.Stderr = os.Stderr
-	// Interactive: a non-zero exit (the human Ctrl-C'ing out of the agent) is normal.
-	_ = shell.Run()
+	restoreTerminal, err := prepareTakeoverTerminal(shell, os.Stdin, systemTakeoverTerminalControl())
+	if err != nil {
+		return err
+	}
+	if err := shell.Start(); err != nil {
+		return errors.Join(fmt.Errorf("start interactive resume command: %w", err), restoreTerminal())
+	}
+	runErr := shell.Wait()
+	var cleanupErr error
+	if cancelKillAttempted.Load() {
+		cleanupErr = shellinfra.WaitProcessGroupExit(shell, takeoverCommandWaitDelay)
+	} else {
+		cleanupErr = shellinfra.KillProcessGroupAndWait(shell, takeoverCommandWaitDelay)
+	}
+	restoreErr := restoreTerminal()
+	if takeoverExitWasInterrupt(runErr) {
+		runErr = nil
+	}
+	var wrappedCleanupErr error
+	if cleanupErr != nil && !errors.Is(cleanupErr, os.ErrProcessDone) {
+		wrappedCleanupErr = fmt.Errorf("clean up interactive resume command: %w", cleanupErr)
+	}
+	if runErr != nil {
+		return errors.Join(fmt.Errorf("run interactive resume command: %w", runErr), wrappedCleanupErr, restoreErr)
+	}
+	if wrappedCleanupErr != nil {
+		return errors.Join(wrappedCleanupErr, restoreErr)
+	}
+	if restoreErr != nil {
+		return restoreErr
+	}
 	fmt.Fprintf(out, "\n✔ Session detached. To let the daemon continue (seeing your turns):  looper handback %s\n", seq)
 	return nil
 }

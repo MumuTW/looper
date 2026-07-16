@@ -53,6 +53,10 @@ const (
 	maxRetryDelay       = 300 * time.Second
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
+	// Validation is owned by the scheduled-run context. Keep its TERM grace
+	// below the daemon's forced-shutdown reap window so a resistant validation
+	// subprocess cannot outlive looperd after that context is cancelled.
+	validationGracefulShutdown = 250 * time.Millisecond
 
 	workerBranchSlugMaxLength        = 30
 	workerBranchSlugMaxWords         = 5
@@ -2563,12 +2567,15 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 
 	outputs := make([]string, 0, len(input.Commands)*2)
 	for _, command := range input.Commands {
-		result, err := shell.Run(ctx, shell.Options{Command: "/bin/sh", Args: []string{"-c", command}, CWD: input.CWD})
+		result, err := shell.Run(ctx, shell.Options{Command: "/bin/sh", Args: []string{"-c", command}, CWD: input.CWD, Timeout: r.agentTimeout, GracefulShutdown: validationGracefulShutdown})
 		if err != nil {
 			output := "Unknown validation failure"
 			var commandErr *shell.CommandExecutionError
 			if errors.As(err, &commandErr) {
 				output = strings.TrimSpace(strings.Join([]string{commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n"))
+				if output == "" {
+					output = commandErr.Error()
+				}
 			} else {
 				output = err.Error()
 			}

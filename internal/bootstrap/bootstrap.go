@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -109,7 +110,15 @@ func Bootstrap(ctx context.Context, options Options) (Result, error) {
 		return result, nil
 	}
 
-	runtime, err := options.StartRuntime(ctx, RuntimeDependencies{
+	runtimeCtx := ctx
+	shutdownReasons := (<-chan string)(nil)
+	cleanupSignals := func() {}
+	if options.WaitForShutdown {
+		runtimeCtx, shutdownReasons, cleanupSignals = captureShutdownSignals(ctx, logger, signalNotifierOrDefault(options.SignalNotifier))
+		defer cleanupSignals()
+	}
+
+	runtime, err := options.StartRuntime(runtimeCtx, RuntimeDependencies{
 		Config:   loadedConfig.Config,
 		Metadata: loadedConfig.Metadata,
 		Logger:   logger,
@@ -126,7 +135,16 @@ func Bootstrap(ctx context.Context, options Options) (Result, error) {
 			return Result{}, fmt.Errorf("runtime does not support shutdown coordination")
 		}
 
-		waitForShutdownWithSignals(shutdownRuntime, logger, signalNotifierOrDefault(options.SignalNotifier))
+		stopperDone := make(chan struct{})
+		go func() {
+			defer close(stopperDone)
+			if reason, ok := <-shutdownReasons; ok {
+				shutdownRuntime.Stop(reason)
+			}
+		}()
+		shutdownRuntime.WaitForShutdown()
+		cleanupSignals()
+		<-stopperDone
 	}
 
 	return result, nil
@@ -183,10 +201,11 @@ func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.
 	return nil
 }
 
-func waitForShutdownWithSignals(runtime ShutdownRuntime, logger Logger, notifier SignalNotifier) {
+func captureShutdownSignals(ctx context.Context, logger Logger, notifier SignalNotifier) (context.Context, <-chan string, func()) {
 	signals := make(chan os.Signal, 1)
 	notifier.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer notifier.Stop(signals)
+	runtimeCtx, cancel := context.WithCancel(ctx)
+	reasons := make(chan string, 1)
 
 	listenerStopped := make(chan struct{})
 	listenerDone := make(chan struct{})
@@ -202,14 +221,23 @@ func waitForShutdownWithSignals(runtime ShutdownRuntime, logger Logger, notifier
 
 			reason := signalReason(sig)
 			logger.Info("received shutdown signal", map[string]any{"signal": reason})
-			runtime.Stop(reason)
+			reasons <- reason
+			cancel()
 		case <-listenerStopped:
 		}
 	}()
 
-	runtime.WaitForShutdown()
-	close(listenerStopped)
-	<-listenerDone
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			close(listenerStopped)
+			<-listenerDone
+			close(reasons)
+			cancel()
+			notifier.Stop(signals)
+		})
+	}
+	return runtimeCtx, reasons, cleanup
 }
 
 func signalReason(sig os.Signal) string {

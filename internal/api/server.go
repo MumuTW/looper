@@ -20,6 +20,7 @@ type Server struct {
 	listener net.Listener
 	server   *http.Server
 	done     chan struct{}
+	errors   chan error
 }
 
 func NewServer(cfg config.Config, handler http.Handler) *Server {
@@ -40,6 +41,7 @@ func (s *Server) Start() error {
 	}
 
 	done := make(chan struct{})
+	serveErrors := make(chan error, 1)
 	server := &http.Server{
 		Handler:           s.handler,
 		ReadHeaderTimeout: 30 * time.Second,
@@ -48,11 +50,13 @@ func (s *Server) Start() error {
 	s.listener = listener
 	s.server = server
 	s.done = done
+	s.errors = serveErrors
 
 	go func() {
 		defer close(done)
+		defer close(serveErrors)
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			// Best-effort background serve error path; Start only reports listen errors.
+			serveErrors <- fmt.Errorf("serve API: %w", err)
 		}
 	}()
 
@@ -66,6 +70,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	s.server = nil
 	s.listener = nil
 	s.done = nil
+	s.errors = nil
 	s.mu.Unlock()
 
 	if server == nil {
@@ -74,9 +79,23 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	err := server.Shutdown(ctx)
 	if done != nil {
-		<-done
+		select {
+		case <-done:
+		case <-ctx.Done():
+			if err == nil {
+				err = ctx.Err()
+			}
+		}
 	}
 	return err
+}
+
+// Errors reports failures that happen after the listener has started. The
+// channel closes on an orderly Stop.
+func (s *Server) Errors() <-chan error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.errors
 }
 
 func (s *Server) Addr() net.Addr {

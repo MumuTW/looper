@@ -628,15 +628,20 @@ func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *t
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+	lockKey := storage.IssueLockKey("project_1", issue.Repo, issue.IssueNumber)
+	queueItem := storage.QueueItemRecord{ID: "queue_write_spec_rebuild"}
+	acquirePlannerTestLock(t, fixture, lockKey, queueItem.ID)
 
 	checkpoint, err := runner.runWriteSpecStep(context.Background(), stepInput{
-		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
-		Loop:    loopResult.record,
-		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:      loopResult.record,
+		Run:       storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		QueueItem: queueItem,
 		Checkpoint: plannerCheckpoint{
-			Issue:     issue,
-			Worktree:  &checkpointWorktree{Path: legacyPath, Branch: "stale", BaseBranch: "main"},
-			WriteSpec: &checkpointWriteSpec{Status: "completed"},
+			Issue:          issue,
+			Worktree:       &checkpointWorktree{Path: legacyPath, Branch: "stale", BaseBranch: "main"},
+			WriteSpec:      &checkpointWriteSpec{Status: "completed"},
+			ClaimedLockKey: lockKey,
 		},
 	})
 	if err != nil {
@@ -727,11 +732,14 @@ func TestRunWriteSpecStepRechecksPlannerHoldAfterAgentCompletion(t *testing.T) {
 	github := &fakeGitHubGateway{issueDetails: []IssueDetail{{Number: 42}, {Number: 42, Labels: []string{domain.HoldLabelGlobal}}}}
 	git := &fakeGitGateway{inspectResult: InspectHeadResult{HasUncommittedChanges: true}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now})
+	lockKey := storage.IssueLockKey("project_1", issue.Repo, issue.IssueNumber)
+	queueItem := storage.QueueItemRecord{ID: "queue_write_spec_held_after"}
+	acquirePlannerTestLock(t, fixture, lockKey, queueItem.ID)
 
 	_, err = runner.runWriteSpecStep(context.Background(), stepInput{
 		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
-		Loop:    loopResult.record, Run: storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
-		Checkpoint: plannerCheckpoint{Issue: issue, Worktree: &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"}},
+		Loop:    loopResult.record, Run: storage.RunRecord{ID: runID, LoopID: loopResult.record.ID}, QueueItem: queueItem,
+		Checkpoint: plannerCheckpoint{Issue: issue, Worktree: &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"}, ClaimedLockKey: lockKey},
 	})
 	var holdErr *holdSkipError
 	if !errors.As(err, &holdErr) {
@@ -909,6 +917,68 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	}
 	if run == nil || run.CheckpointJSON == nil || !strings.Contains(*run.CheckpointJSON, `"id":"worktree_1"`) {
 		t.Fatalf("run = %#v, want checkpoint with worktree id", run)
+	}
+}
+
+func TestPlannerExtendsIssueLockThroughAgentRuntime(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		issues:         []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}},
+		issueDetail:    IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}},
+		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	agentWaiting := make(chan struct{})
+	releaseAgent := make(chan struct{})
+	agent := &fakeAgentExecutor{
+		results: []AgentResult{{Status: "completed", Summary: "wrote spec", Stdout: "done"}},
+		wait: func(context.Context) error {
+			close(agentWaiting)
+			<-releaseAgent
+			return nil
+		},
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git,
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
+		AgentTimeout: 30 * time.Minute, ClaimTTL: time.Minute, AllowAutoPush: boolPtr(true),
+	})
+
+	_, _ = runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.ProcessClaimedItem(context.Background(), *claim)
+		done <- err
+	}()
+	select {
+	case <-agentWaiting:
+	case <-time.After(2 * time.Second):
+		t.Fatal("planner agent did not start")
+	}
+
+	lockKey := storage.IssueLockKey("project_1", "acme/looper", 42)
+	lock, err := fixture.repos.Locks.Get(context.Background(), lockKey)
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock == nil {
+		t.Fatalf("Locks.Get(%q) = nil, want live planner lock", lockKey)
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, lock.ExpiresAt)
+	if err != nil {
+		t.Fatalf("parse lock expiry %q: %v", lock.ExpiresAt, err)
+	}
+	if want := fixture.now().Add(30 * time.Minute); expiresAt.Before(want) {
+		t.Fatalf("lock expiry = %s, want at least agent deadline %s", expiresAt, want)
+	}
+
+	close(releaseAgent)
+	if err := <-done; err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
 }
 
@@ -1602,6 +1672,19 @@ func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add
 
 func (f *runnerFixture) nowISO() string {
 	return fmt.Sprintf("%s.000Z", f.current.UTC().Format("2006-01-02T15:04:05"))
+}
+
+func acquirePlannerTestLock(t *testing.T, fixture *runnerFixture, key, owner string) {
+	t.Helper()
+	reason := "planner-test"
+	acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{
+		Key: key, Owner: owner, Reason: &reason,
+		ExpiresAt: fixture.now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	})
+	if err != nil || !acquired {
+		t.Fatalf("Locks.Acquire(%q) = (%v, %v), want acquired", key, acquired, err)
+	}
 }
 
 type fakeGitHubGateway struct {

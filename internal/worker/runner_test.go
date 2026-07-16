@@ -3431,6 +3431,24 @@ func TestRunValidationReturnsCommandFailureOutput(t *testing.T) {
 	}
 }
 
+func TestRunValidationUsesRunnerDeadline(t *testing.T) {
+	runner := New(Options{AgentTimeout: 50 * time.Millisecond})
+	startedAt := time.Now()
+	result, err := runner.runValidation(context.Background(), ValidationInput{
+		CWD:      t.TempDir(),
+		Commands: []string{"trap '' TERM; while :; do sleep 1; done"},
+	})
+	if err != nil {
+		t.Fatalf("runValidation() error = %v", err)
+	}
+	if result.Passed || !strings.Contains(result.Output, "timed out") {
+		t.Fatalf("result = %#v, want timed-out validation failure", result)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 2*time.Second {
+		t.Fatalf("runValidation() elapsed = %s, want bounded cancellation", elapsed)
+	}
+}
+
 func TestProcessClaimedItemExecuteResumeDoesNotRerunAgentAfterTransientInspectFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

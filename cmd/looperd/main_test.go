@@ -9,10 +9,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/loops"
@@ -51,6 +54,21 @@ func TestRunPrintsVersionWithoutBootstrappingCommandHandling(t *testing.T) {
 
 	if got := stderr.String(); got != "" {
 		t.Fatalf("run([--version]) stderr = %q, want empty string", got)
+	}
+}
+
+func TestMonitorAPIServerErrorsStopsDaemonOnUnexpectedServeFailure(t *testing.T) {
+	serverErrors := make(chan error, 1)
+	stopped := make(chan string, 1)
+	monitorAPIServerErrors(serverErrors, nil, func(reason string) { stopped <- reason })
+	serverErrors <- errors.New("accept failed")
+	select {
+	case reason := <-stopped:
+		if !strings.Contains(reason, "accept failed") {
+			t.Fatalf("stop reason = %q, want serve error", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("daemon was not stopped after API serve failure")
 	}
 }
 
@@ -270,6 +288,23 @@ func TestStartRuntimeWithAPIDoesNotRunRecoveryBeforeServerOwnership(t *testing.T
 	}
 }
 
+func TestCompleteStartupAndOpenGateLeavesGateClosedOnFailure(t *testing.T) {
+	startupReady := make(chan struct{})
+	wantErr := errors.New("startup recovery failed")
+
+	err := completeStartupAndOpenGate(context.Background(), func(context.Context) error {
+		return wantErr
+	}, startupReady)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("completeStartupAndOpenGate() error = %v, want %v", err, wantErr)
+	}
+	select {
+	case <-startupReady:
+		t.Fatal("startup mutation gate opened after failed startup recovery")
+	default:
+	}
+}
+
 func TestStopServerWithTimeoutUsesDeadline(t *testing.T) {
 	t.Parallel()
 
@@ -294,7 +329,7 @@ func TestStopServerWithTimeoutUsesDeadline(t *testing.T) {
 	}
 }
 
-func TestStopLoopPausesLoopAndSignalsActiveExecution(t *testing.T) {
+func TestStopLoopDoesNotUsePersistedPIDWithoutLiveOwnership(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
 	if err != nil {
@@ -337,6 +372,7 @@ func TestStopLoopPausesLoopAndSignalsActiveExecution(t *testing.T) {
 	called := false
 	gotSignalPID := 0
 	verified := false
+	processRunning := true
 	gotResult, err := stopLoop(ctx, services, loop.ID, "Stopped by test", func() time.Time { return now }, func(pid int, sig syscall.Signal) error {
 		if sig == syscall.SIGKILL {
 			return nil
@@ -346,13 +382,14 @@ func TestStopLoopPausesLoopAndSignalsActiveExecution(t *testing.T) {
 		if sig != syscall.SIGTERM {
 			t.Fatalf("signal = %v, want %v", sig, syscall.SIGTERM)
 		}
+		processRunning = false
 		return nil
 	}, func(_ context.Context, execution storage.AgentExecutionRecord, gotPID int) (bool, bool, error) {
 		verified = true
 		if execution.ID != agentExecution.ID || gotPID != int(pid) {
 			t.Fatalf("execution verifier received execution=%q pid=%d, want %q pid=%d", execution.ID, gotPID, agentExecution.ID, pid)
 		}
-		return true, true, nil
+		return processRunning, processRunning, nil
 	})
 	if err != nil {
 		t.Fatalf("stopLoop() error = %v", err)
@@ -362,55 +399,29 @@ func TestStopLoopPausesLoopAndSignalsActiveExecution(t *testing.T) {
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != pid || result.Outcome != stopOutcomeProcessSignaled || result.ProcessSkipReason != "" {
+	if result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomePausedOnly || result.ProcessSkipReason != processSkipNoLiveExecution {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
-	if !called || gotSignalPID != -int(pid) {
-		t.Fatalf("signal invoked = %v pid=%d, want true pid=%d", called, gotSignalPID, -pid)
+	if called || gotSignalPID != 0 {
+		t.Fatalf("signal invoked = %v pid=%d, want no raw PID signaling", called, gotSignalPID)
 	}
-	if !verified {
-		t.Fatal("execution verifier was not called")
+	if verified {
+		t.Fatal("process verifier was called during normal stop")
 	}
 
 	storedLoop, err := repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if storedLoop == nil || storedLoop.Status != "paused" {
-		t.Fatalf("Loops.GetByID() = %#v, want paused loop", storedLoop)
+	if storedLoop == nil || storedLoop.Status != "running" {
+		t.Fatalf("Loops.GetByID() = %#v, want running until live ownership is available", storedLoop)
 	}
 	storedExecution, err := repos.AgentExecutions.GetByID(ctx, agentExecution.ID)
 	if err != nil {
 		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
 	}
-	if storedExecution == nil || storedExecution.Status != "cancelling" {
-		t.Fatalf("AgentExecutions.GetByID() = %#v, want cancelling execution", storedExecution)
-	}
-}
-
-func TestSignalAgentProcessGroupDoesNotEscalateAfterESRCH(t *testing.T) {
-	pid := 4321
-	grace := 10 * time.Millisecond
-	killCalled := make(chan struct{}, 1)
-
-	err := signalAgentProcessGroup(pid, func(gotPID int, sig syscall.Signal) error {
-		if sig == syscall.SIGKILL {
-			killCalled <- struct{}{}
-			return nil
-		}
-		if sig != syscall.SIGTERM {
-			t.Fatalf("signal = %v, want SIGTERM", sig)
-		}
-		return syscall.ESRCH
-	}, grace)
-	if err != nil {
-		t.Fatalf("signalAgentProcessGroup() error = %v", err)
-	}
-
-	select {
-	case <-killCalled:
-		t.Fatal("SIGKILL escalation was armed after SIGTERM returned ESRCH")
-	case <-time.After(3 * grace):
+	if storedExecution == nil || storedExecution.Status != "running" {
+		t.Fatalf("AgentExecutions.GetByID() = %#v, want untouched running execution", storedExecution)
 	}
 }
 
@@ -534,6 +545,51 @@ func TestCloseLoopDoesNotTerminateLoopWhenActiveKillFails(t *testing.T) {
 	}
 	if storedLoop == nil || storedLoop.Status != "running" {
 		t.Fatalf("Loops.GetByID() = %#v, want running loop after kill failure", storedLoop)
+	}
+}
+
+func TestCloseLoopDoesNotAdvanceTerminalStateWithoutStopAuthority(t *testing.T) {
+	ctx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_close", seq: 1, loopType: "worker", loopStatus: "running", runID: "run_close", runStatus: "running", executionID: "exec_close", executionStatus: "running"})
+
+	got, err := closeLoop(ctx, services, "loop_close", "close test", func() time.Time { return now }, nil, nil)
+	if err != nil {
+		t.Fatalf("closeLoop() error = %v", err)
+	}
+	result := got.(stopLoopResult)
+	if result.Stopped || result.Outcome != stopOutcomePausedOnly || result.ProcessSkipReason != processSkipNoLiveExecution {
+		t.Fatalf("closeLoop() result = %#v, want unconfirmed stop", result)
+	}
+	loop, err := repos.Loops.GetByID(ctx, "loop_close")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "running" {
+		t.Fatalf("loop = %#v, want running until execution is confirmed stopped", loop)
+	}
+}
+
+func TestTakeoverLoopDoesNotTransferOwnershipWhenVerifierRejectsRecoveredPID(t *testing.T) {
+	ctx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_takeover", seq: 1, loopType: "worker", loopStatus: "running", runID: "run_takeover", runStatus: "running", executionID: "exec_takeover", executionStatus: "running", pid: 4103})
+
+	_, err := takeoverLoop(ctx, services, "loop_takeover", "takeover test", func() time.Time { return now }, func(int, syscall.Signal) error {
+		t.Fatal("signal invoked for verifier-rejected pid")
+		return nil
+	}, func(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error) {
+		return false, true, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "not confirmed stopped") {
+		t.Fatalf("takeoverLoop() error = %v, want unconfirmed-stop error", err)
+	}
+	loop, err := repos.Loops.GetByID(ctx, "loop_takeover")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "running" {
+		t.Fatalf("loop = %#v, want ownership unchanged", loop)
 	}
 }
 
@@ -673,6 +729,48 @@ func TestStopLoopActiveInMemoryExecutionWinsBeforeVerifierRejectsPID(t *testing.
 	}
 }
 
+func TestControlTransferStopsLiveHandleDespiteTerminalDurableRun(t *testing.T) {
+	tests := []struct {
+		name       string
+		act        func(context.Context, looperdruntime.Services, time.Time) error
+		wantStatus string
+	}{
+		{name: "takeover", wantStatus: "human_takeover", act: func(ctx context.Context, services looperdruntime.Services, now time.Time) error {
+			_, err := takeoverLoop(ctx, services, "loop_stale", "takeover stale run", func() time.Time { return now }, nil, nil)
+			return err
+		}},
+		{name: "close", wantStatus: "terminated", act: func(ctx context.Context, services looperdruntime.Services, now time.Time) error {
+			_, err := closeLoop(ctx, services, "loop_stale", "close stale run", func() time.Time { return now }, nil, nil)
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			services, repos, now := newStopAllTestServices(t)
+			insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_stale", seq: 1, loopType: "worker", loopStatus: "running", runID: "run_stale", runStatus: "success", executionID: "exec_stale", executionStatus: "completed"})
+			registry := looperdruntime.NewActiveExecutionRegistry()
+			active := &fakeActiveExecution{}
+			registry.Register("loop_stale", "run_stale", "exec_stale", active)
+			services.ActiveExecutions = registry
+
+			if err := tt.act(ctx, services, now); err != nil {
+				t.Fatalf("control action error = %v", err)
+			}
+			if !active.killed {
+				t.Fatal("live handle was not killed before control transfer")
+			}
+			loop, err := repos.Loops.GetByID(ctx, "loop_stale")
+			if err != nil {
+				t.Fatalf("Loops.GetByID() error = %v", err)
+			}
+			if loop == nil || loop.Status != tt.wantStatus {
+				t.Fatalf("loop after control action = %#v, want status %q", loop, tt.wantStatus)
+			}
+		})
+	}
+}
+
 func TestStopLoopRetriesActiveInMemoryExecutionAlreadyCancelling(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
@@ -780,11 +878,13 @@ func TestStopLoopSignalsExecutionAlreadyCancelling(t *testing.T) {
 	}
 
 	var signalCalls []int
+	processRunning := true
 	gotResult, err := stopLoop(ctx, services, loop.ID, "Stopped by test", func() time.Time { return now }, func(gotPID int, _ syscall.Signal) error {
 		signalCalls = append(signalCalls, gotPID)
+		processRunning = false
 		return syscall.ESRCH
 	}, func(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error) {
-		return true, true, nil
+		return processRunning, processRunning, nil
 	})
 	if err != nil {
 		t.Fatalf("stopLoop() error = %v", err)
@@ -793,11 +893,11 @@ func TestStopLoopSignalsExecutionAlreadyCancelling(t *testing.T) {
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != pid || result.Outcome != stopOutcomeProcessSignaled || result.ProcessSkipReason != "" {
+	if result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomeAlreadyStopping || result.ProcessSkipReason != processSkipNoLiveExecution {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
-	if len(signalCalls) != 2 || signalCalls[0] != -int(pid) || signalCalls[1] != int(pid) {
-		t.Fatalf("signal calls = %#v, want process group then process", signalCalls)
+	if len(signalCalls) != 0 {
+		t.Fatalf("signal calls = %#v, want no raw PID signaling", signalCalls)
 	}
 }
 
@@ -841,7 +941,7 @@ func TestStopLoopDoesNotClaimProcessSignaledWithoutSignaler(t *testing.T) {
 		t.Fatalf("stopLoop() error = %v", err)
 	}
 	result := gotResult.(stopLoopResult)
-	if result.Outcome != stopOutcomePausedOnly || result.ProcessSkipReason != processSkipNoSignal {
+	if result.Outcome != stopOutcomePausedOnly || result.ProcessSkipReason != processSkipNoLiveExecution {
 		t.Fatalf("stopLoop() result = %#v, want paused-only without signal authority", result)
 	}
 }
@@ -902,11 +1002,11 @@ func TestStopLoopSkipsStaleActiveExecutionWhenLatestExecutionCompleted(t *testin
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomeAlreadyFinished || result.ProcessSkipReason != processSkipAlreadyFinished {
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomeProcessSignaled || result.ProcessSkipReason != "" {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
-	if active.killed {
-		t.Fatal("active execution Kill invoked, want stale registry entry skipped")
+	if !active.killed {
+		t.Fatal("active execution Kill was not invoked; live handle must outrank persisted status")
 	}
 	if signaled {
 		t.Fatal("signal invoked, want completed execution to be skipped")
@@ -1046,7 +1146,7 @@ func TestStopLoopSkipsSignalWhenExecutionVerifierRejectsPID(t *testing.T) {
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomePausedOnly || result.ProcessSkipReason != processSkipVerifierRejectedPID {
+	if result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomePausedOnly || result.ProcessSkipReason != processSkipNoLiveExecution {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
 	if signaled {
@@ -1075,35 +1175,37 @@ func TestStopAllLoopsHandlesMixedTypesPartialFailureAndRepeatedCalls(t *testing.
 	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_waiting", seq: 7, loopType: "reviewer", loopStatus: "waiting", runID: "run_waiting", runStatus: "success"})
 
 	var signalPIDs []int
+	deadPIDs := map[int]bool{}
 	response, err := stopAllLoops(ctx, services, "Stopped by test", func() time.Time { return now }, func(pid int, sig syscall.Signal) error {
 		if sig != syscall.SIGTERM {
 			return nil
 		}
 		signalPIDs = append(signalPIDs, pid)
-		if pid == -4102 || pid == 4102 {
+		if pid == -4102 {
 			return fmt.Errorf("signal failed")
 		}
+		deadPIDs[-pid] = true
 		return syscall.ESRCH
 	}, func(_ context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {
-		return true, true, nil
+		return !deadPIDs[pid], !deadPIDs[pid], nil
 	})
 	if err != nil {
 		t.Fatalf("stopAllLoops() error = %v", err)
 	}
 
-	if got, want := response.Summary, (stopAllSummary{Total: 7, Stopped: 4, AlreadyFinished: 2, Failed: 1}); got != want {
+	if got, want := response.Summary, (stopAllSummary{Total: 7, PausedOnly: 4, AlreadyFinished: 2, AlreadyStopping: 1}); got != want {
 		t.Fatalf("stopAllLoops() summary = %#v, want %#v", got, want)
 	}
 	if got := stopAllItemTypes(response.Items); !slices.Equal(got, []string{"planner", "reviewer", "worker", "fixer", "auditor", "worker", "reviewer"}) {
 		t.Fatalf("item types = %#v, want mixed known and future types", got)
 	}
-	assertStopAllItemResult(t, response.Items, "loop_reviewer", string(stopAllResultFailed))
-	assertStopAllItemResult(t, response.Items, "loop_fixer", string(stopAllResultStopped))
-	assertStopAllItemResult(t, response.Items, "loop_future", string(stopAllResultStopped))
+	assertStopAllItemResult(t, response.Items, "loop_reviewer", string(stopAllResultPausedOnly))
+	assertStopAllItemResult(t, response.Items, "loop_fixer", string(stopAllResultAlreadyStopping))
+	assertStopAllItemResult(t, response.Items, "loop_future", string(stopAllResultPausedOnly))
 	assertStopAllItemResult(t, response.Items, "loop_queued", string(stopAllResultAlreadyFinished))
 	assertStopAllItemResult(t, response.Items, "loop_waiting", string(stopAllResultAlreadyFinished))
-	if !slices.Contains(signalPIDs, -4101) || !slices.Contains(signalPIDs, -4103) || !slices.Contains(signalPIDs, -4105) {
-		t.Fatalf("signal pids = %#v, want other loops processed after failure", signalPIDs)
+	if len(signalPIDs) != 0 {
+		t.Fatalf("signal pids = %#v, want no persisted PID signaling", signalPIDs)
 	}
 
 	repeated, err := stopAllLoops(ctx, services, "Stopped by test again", func() time.Time { return now.Add(time.Minute) }, func(pid int, sig syscall.Signal) error {
@@ -1117,10 +1219,32 @@ func TestStopAllLoopsHandlesMixedTypesPartialFailureAndRepeatedCalls(t *testing.
 	if err != nil {
 		t.Fatalf("second stopAllLoops() error = %v", err)
 	}
-	if repeated.Summary.AlreadyStopping < 4 {
-		t.Fatalf("second stopAllLoops() summary = %#v, want repeated call to report alreadyStopping", repeated.Summary)
+	if repeated.Summary.PausedOnly != 4 || repeated.Summary.AlreadyStopping != 1 {
+		t.Fatalf("second stopAllLoops() summary = %#v, want ownership gaps preserved", repeated.Summary)
 	}
-	assertStopAllItemResult(t, repeated.Items, "loop_future", string(stopAllResultAlreadyStopping))
+	assertStopAllItemResult(t, repeated.Items, "loop_future", string(stopAllResultPausedOnly))
+}
+
+func TestStopAllLoopsReportsStoppedAfterLiveRegistryReap(t *testing.T) {
+	ctx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_live", seq: 1, loopType: "worker", loopStatus: "running", runID: "run_live", runStatus: "running", executionID: "exec_live", executionStatus: "running"})
+	registry := looperdruntime.NewActiveExecutionRegistry()
+	active := &fakeActiveExecution{}
+	registry.Register("loop_live", "run_live", "exec_live", active)
+	services.ActiveExecutions = registry
+
+	response, err := stopAllLoops(ctx, services, "stop all", func() time.Time { return now }, nil, nil)
+	if err != nil {
+		t.Fatalf("stopAllLoops() error = %v", err)
+	}
+	if got, want := response.Summary, (stopAllSummary{Total: 1, Stopped: 1}); got != want {
+		t.Fatalf("stopAllLoops() summary = %#v, want %#v", got, want)
+	}
+	if !active.killed {
+		t.Fatal("live execution was not killed")
+	}
+	assertStopAllItemResult(t, response.Items, "loop_live", string(stopAllResultStopped))
 }
 
 func TestStopAllLoopsReportsPausedOnlyWhenPIDVerificationRejectsOwnership(t *testing.T) {
@@ -1143,7 +1267,7 @@ func TestStopAllLoopsReportsPausedOnlyWhenPIDVerificationRejectsOwnership(t *tes
 	if len(response.Items) != 1 {
 		t.Fatalf("len(response.Items) = %d, want 1", len(response.Items))
 	}
-	if item := response.Items[0]; item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipVerifierRejectedPID {
+	if item := response.Items[0]; item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipNoLiveExecution {
 		t.Fatalf("stopAllLoops() item = %#v", item)
 	}
 }
@@ -1159,14 +1283,21 @@ func TestStopAllLoopsReportsPausedOnlyWhenSecondaryExecutionIsVerifierRejected(t
 	}
 
 	var signalPIDs []int
+	primaryRunning := true
 	response, err := stopAllLoops(ctx, services, "Stopped by test", func() time.Time { return now }, func(pid int, sig syscall.Signal) error {
 		if sig != syscall.SIGTERM {
 			return nil
 		}
 		signalPIDs = append(signalPIDs, pid)
+		if pid == -4103 {
+			primaryRunning = false
+		}
 		return syscall.ESRCH
 	}, func(_ context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {
-		return execution.ID == "exec_primary", true, nil
+		if execution.ID != "exec_primary" {
+			return false, true, nil
+		}
+		return primaryRunning, primaryRunning, nil
 	})
 	if err != nil {
 		t.Fatalf("stopAllLoops() error = %v", err)
@@ -1178,11 +1309,11 @@ func TestStopAllLoopsReportsPausedOnlyWhenSecondaryExecutionIsVerifierRejected(t
 		t.Fatalf("len(response.Items) = %d, want 1", len(response.Items))
 	}
 	item := response.Items[0]
-	if item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipVerifierRejectedPID {
+	if item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipNoLiveExecution {
 		t.Fatalf("stopAllLoops() item = %#v", item)
 	}
-	if !slices.Contains(signalPIDs, -4103) {
-		t.Fatalf("signal pids = %#v, want primary execution signaled", signalPIDs)
+	if len(signalPIDs) != 0 {
+		t.Fatalf("signal pids = %#v, want no persisted PID signaling", signalPIDs)
 	}
 }
 
@@ -1196,29 +1327,31 @@ func TestStopAllLoopsReportsStoppedWhenOlderExecutionSignalsAfterLatestFinished(
 	}
 
 	var signalPIDs []int
+	running := true
 	response, err := stopAllLoops(ctx, services, "Stopped by test", func() time.Time { return now }, func(pid int, sig syscall.Signal) error {
 		if sig == syscall.SIGTERM {
 			signalPIDs = append(signalPIDs, pid)
+			running = false
 		}
 		return nil
 	}, func(_ context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {
-		return execution.ID == "exec_running", true, nil
+		return execution.ID == "exec_running" && running, running, nil
 	})
 	if err != nil {
 		t.Fatalf("stopAllLoops() error = %v", err)
 	}
-	if got, want := response.Summary, (stopAllSummary{Total: 1, Stopped: 1}); got != want {
+	if got, want := response.Summary, (stopAllSummary{Total: 1, PausedOnly: 1}); got != want {
 		t.Fatalf("stopAllLoops() summary = %#v, want %#v", got, want)
 	}
 	if len(response.Items) != 1 {
 		t.Fatalf("len(response.Items) = %d, want 1", len(response.Items))
 	}
 	item := response.Items[0]
-	if item.Result != string(stopAllResultStopped) || item.Outcome != stopOutcomeProcessSignaled || item.ProcessSkipReason != "" {
+	if item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipNoLiveExecution {
 		t.Fatalf("stopAllLoops() item = %#v", item)
 	}
-	if !slices.Contains(signalPIDs, -4103) {
-		t.Fatalf("signal pids = %#v, want running execution signaled", signalPIDs)
+	if len(signalPIDs) != 0 {
+		t.Fatalf("signal pids = %#v, want no persisted PID signaling", signalPIDs)
 	}
 }
 
@@ -1232,29 +1365,31 @@ func TestStopAllLoopsReportsStoppedWhenOlderExecutionSignalsAfterLatestCancellin
 	}
 
 	var signalPIDs []int
+	running := true
 	response, err := stopAllLoops(ctx, services, "Stopped by test", func() time.Time { return now }, func(pid int, sig syscall.Signal) error {
 		if sig == syscall.SIGTERM {
 			signalPIDs = append(signalPIDs, pid)
+			running = false
 		}
 		return nil
 	}, func(_ context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {
-		return execution.ID == "exec_running", true, nil
+		return execution.ID == "exec_running" && running, running, nil
 	})
 	if err != nil {
 		t.Fatalf("stopAllLoops() error = %v", err)
 	}
-	if got, want := response.Summary, (stopAllSummary{Total: 1, Stopped: 1}); got != want {
+	if got, want := response.Summary, (stopAllSummary{Total: 1, PausedOnly: 1}); got != want {
 		t.Fatalf("stopAllLoops() summary = %#v, want %#v", got, want)
 	}
 	if len(response.Items) != 1 {
 		t.Fatalf("len(response.Items) = %d, want 1", len(response.Items))
 	}
 	item := response.Items[0]
-	if item.Result != string(stopAllResultStopped) || item.Outcome != stopOutcomeProcessSignaled || item.ProcessSkipReason != "" {
+	if item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipNoLiveExecution {
 		t.Fatalf("stopAllLoops() item = %#v", item)
 	}
-	if !slices.Contains(signalPIDs, -4103) {
-		t.Fatalf("signal pids = %#v, want running execution signaled", signalPIDs)
+	if len(signalPIDs) != 0 {
+		t.Fatalf("signal pids = %#v, want no persisted PID signaling", signalPIDs)
 	}
 }
 
@@ -1283,7 +1418,7 @@ func TestStopAllLoopsReplacesFinishedSkipReasonWhenOlderExecutionVerifierRejecte
 		t.Fatalf("len(response.Items) = %d, want 1", len(response.Items))
 	}
 	item := response.Items[0]
-	if item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipVerifierRejectedPID {
+	if item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipNoLiveExecution {
 		t.Fatalf("stopAllLoops() item = %#v", item)
 	}
 }
@@ -1340,15 +1475,39 @@ type fakeActiveExecution struct {
 	killed bool
 	reason string
 	onKill func() error
+	mu     sync.Mutex
+	done   chan struct{}
+	once   sync.Once
 }
 
 func (f *fakeActiveExecution) Kill(reason string) error {
 	f.killed = true
 	f.reason = reason
 	if f.onKill != nil {
-		return f.onKill()
+		if err := f.onKill(); err != nil {
+			return err
+		}
 	}
+	f.once.Do(func() { close(f.doneChannel()) })
 	return nil
+}
+
+func (f *fakeActiveExecution) Wait(ctx context.Context) (agent.Result, error) {
+	select {
+	case <-f.doneChannel():
+		return agent.Result{Status: "killed"}, nil
+	case <-ctx.Done():
+		return agent.Result{}, ctx.Err()
+	}
+}
+
+func (f *fakeActiveExecution) doneChannel() chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.done == nil {
+		f.done = make(chan struct{})
+	}
+	return f.done
 }
 
 type stopAllLoopFixture struct {

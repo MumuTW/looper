@@ -989,6 +989,24 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 				return checkpoint, &holdSkipError{summary: summary}
 			}
 		}
+		// The lock must cover the agent's entire logical runtime. Keep the normal
+		// claim TTL after that deadline as the teardown/crash-recovery window.
+		lockTTL := r.agentTimeout + r.claimTTL
+		lockReason := "planner-agent"
+		lockUpdatedAt := r.nowISO()
+		refreshed, err := r.repos.Locks.Refresh(ctx, storage.LockRecord{
+			Key:       checkpoint.ClaimedLockKey,
+			Owner:     input.QueueItem.ID,
+			Reason:    &lockReason,
+			ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(lockTTL)),
+			UpdatedAt: lockUpdatedAt,
+		})
+		if err != nil {
+			return checkpoint, err
+		}
+		if !refreshed {
+			return checkpoint, &loopError{message: "Planner issue lock ownership was lost before agent start", kind: FailureRetryableTransient}
+		}
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err

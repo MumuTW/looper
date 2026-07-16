@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -24,9 +25,15 @@ import (
 )
 
 const (
-	defaultMaxOutputBytes    = 256 * 1024
-	maxPersistedLogReadBytes = 16 * 1024 * 1024
-	completionMarkerEnv      = "LOOPER_COMPLETION_MARKER"
+	defaultMaxOutputBytes       = 256 * 1024
+	maxPersistedLogReadBytes    = 16 * 1024 * 1024
+	completionMarkerEnv         = "LOOPER_COMPLETION_MARKER"
+	descendantPipeDrainGrace    = 100 * time.Millisecond
+	outputQueueCapacity         = 512
+	outputPersistenceTimeout    = 250 * time.Millisecond
+	ownershipPersistenceTimeout = 6 * time.Second
+	processGroupExitTimeout     = time.Second
+	processGroupProbeInterval   = 5 * time.Millisecond
 )
 
 var unsafeAgentEnvKeys = []string{
@@ -169,19 +176,39 @@ type Execution interface {
 }
 
 type ConfiguredExecutor struct {
-	config     ExecutorConfig
-	repos      *storage.Repositories
-	logDir     string
-	now        func() time.Time
-	onProgress func(context.Context, ProgressUpdate)
+	config                ExecutorConfig
+	repos                 *storage.Repositories
+	logDir                string
+	now                   func() time.Time
+	onProgress            func(context.Context, ProgressUpdate)
+	appendPersistedLog    func(string, []byte) bool
+	appendLifecycleRecord func(context.Context, storage.EventLogRecord) error
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
-	now := options.Now
-	if now == nil {
-		now = time.Now
+	rawNow := options.Now
+	if rawNow == nil {
+		rawNow = time.Now
 	}
-	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now, onProgress: options.OnProgress}
+	var nowMu sync.Mutex
+	now := func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return rawNow()
+	}
+	var appendLifecycleRecord func(context.Context, storage.EventLogRecord) error
+	if options.Repos != nil && options.Repos.Events != nil {
+		appendLifecycleRecord = options.Repos.Events.Append
+	}
+	return &ConfiguredExecutor{
+		config:                options.Config,
+		repos:                 options.Repos,
+		logDir:                options.LogDir,
+		now:                   now,
+		onProgress:            options.OnProgress,
+		appendPersistedLog:    appendPersistedLogFile,
+		appendLifecycleRecord: appendLifecycleRecord,
+	}
 }
 
 // liveProgressInterval throttles OnProgress so a chatty agent doesn't hammer the
@@ -262,6 +289,9 @@ func isRecoverableNativeResumeSource(status string, resumeStatus *string) bool {
 }
 
 func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Execution, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(input.Prompt) == "" {
 		return nil, fmt.Errorf("agent prompt is required")
 	}
@@ -288,39 +318,73 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = descendantPipeDrainGrace
 	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, e.config.Env, input.Env)
 
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
 		maxOutputBytes = defaultMaxOutputBytes
 	}
+	progressCtx, progressCancel := context.WithCancel(ctx)
+	outputCtx, outputCancel := context.WithCancel(context.Background())
+	outputPersistenceCtx, outputPersistenceCancel := context.WithCancel(context.Background())
+	ownershipTransferred := false
+	defer func() {
+		if !ownershipTransferred {
+			progressCancel()
+		}
+	}()
 
 	x := &execution{
-		executor:           e,
-		input:              input,
-		executionID:        executionID,
-		startedAt:          startedAt,
-		command:            command,
-		args:               args,
-		startedAtISO:       startedAtISO,
-		process:            cmd,
-		timeout:            input.Timeout,
-		heartbeatTimeout:   input.HeartbeatTimeout,
-		gracefulShutdown:   input.GracefulShutdown,
-		maxOutputBytes:     maxOutputBytes,
-		lastHeartbeatAtISO: startedAtISO,
-		lastOutputAt:       startedAt,
-		status:             "running",
-		nativeSessionID:    resume.SessionID,
-		nativeResumeMode:   resume.Mode,
-		nativeResumeStatus: resume.Status,
-		killCh:             make(chan string, 1),
-		doneCh:             make(chan execOutcome, 1),
+		executor:                e,
+		input:                   input,
+		executionID:             executionID,
+		startedAt:               startedAt,
+		command:                 command,
+		args:                    args,
+		startedAtISO:            startedAtISO,
+		process:                 cmd,
+		timeout:                 input.Timeout,
+		heartbeatTimeout:        input.HeartbeatTimeout,
+		gracefulShutdown:        input.GracefulShutdown,
+		maxOutputBytes:          maxOutputBytes,
+		lastHeartbeatAtISO:      startedAtISO,
+		lastOutputAt:            startedAt,
+		status:                  "running",
+		nativeSessionID:         resume.SessionID,
+		nativeResumeMode:        resume.Mode,
+		nativeResumeStatus:      resume.Status,
+		progressCtx:             progressCtx,
+		progressCancel:          progressCancel,
+		outputCtx:               outputCtx,
+		outputCancel:            outputCancel,
+		outputCh:                make(chan outputMessage, outputQueueCapacity),
+		outputDone:              make(chan struct{}),
+		outputPersistenceCtx:    outputPersistenceCtx,
+		outputPersistenceCancel: outputPersistenceCancel,
+		outputPersistenceCh:     make(chan outputPersistence, 1),
+		outputPersistenceDone:   make(chan struct{}),
+		killCh:                  make(chan string, 1),
+		doneCh:                  make(chan execOutcome, 1),
+	}
+	go x.processOutput()
+	go x.processOutputPersistence()
+	defer func() {
+		if !ownershipTransferred {
+			x.stopOutput()
+			x.stopOutputPersistence()
+		}
+	}()
+	if input.Timeout > 0 {
+		x.maxRuntimeDeadline = time.Now().Add(input.Timeout)
 	}
 	x.stdoutLogPath, x.stderrLogPath = e.executionLogPaths(input, executionID)
 	x.initializePersistedLogs()
-	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
-	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
+	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.enqueueOutput("stdout", chunk) }}
+	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.enqueueOutput("stderr", chunk) }}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		if resume.Enabled {
 			if markErr := e.markNativeResumeFailed(ctx, resume.SourceExecutionID, err.Error()); markErr == nil && e.logDir != "" {
@@ -330,18 +394,25 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.WaitDelay = descendantPipeDrainGrace
 			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, e.config.Env, input.Env)
-			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
-			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
+			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.enqueueOutput("stdout", chunk) }}
+			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.enqueueOutput("stderr", chunk) }}
 			x.mu.Lock()
 			x.command = command
 			x.args = args
 			x.process = cmd
+			x.processGroupResolved = false
+			x.processGroupKillSent = false
+			x.processGroupSignalsDone = false
 			x.nativeSessionID = ""
 			x.nativeResumeMode = "checkpoint_restart"
 			x.nativeResumeStatus = "fallback_started"
 			x.nativeResumeError = err.Error()
 			x.mu.Unlock()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			if startErr := cmd.Start(); startErr != nil {
 				return nil, fmt.Errorf("start agent command: %w (native resume fallback after: %v)", startErr, err)
 			}
@@ -349,12 +420,34 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			return nil, fmt.Errorf("start agent command: %w", err)
 		}
 	}
+	if reason, stopped := x.pendingStop(ctx); stopped {
+		cleanupErr := x.reapStartedProcess(cmd)
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Join(err, cleanupErr)
+		}
+		return nil, errors.Join(fmt.Errorf("agent execution stopped before ownership persisted: %s", reason), cleanupErr)
+	}
 
 	resumeSessionID, resumeMode, resumeStatus, _ := x.nativeResumeSnapshot()
-	x.persistStatus("running", nil, nil, nil)
-	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory, "nativeResumeMode": resumeMode, "nativeResumeStatus": resumeStatus, "nativeSessionId": resumeSessionID}, startedAtISO)
-
+	stopReason, err := x.persistRunningOwnership(ctx, cmd)
+	if stopReason != "" {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.Join(ctxErr, err)
+		}
+		return nil, errors.Join(fmt.Errorf("agent execution stopped before ownership persisted: %s", stopReason), err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("persist running agent execution: %w", err)
+	}
+	x.mu.Lock()
+	x.progressReady = true
+	x.outputPersistenceReady = true
+	x.mu.Unlock()
 	go x.run(ctx)
+	ownershipTransferred = true
+	// The live run owns cancellation/reaping before non-authoritative event I/O.
+	// A slow event sink must never leave a spawned process without a run goroutine.
+	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory, "nativeResumeMode": resumeMode, "nativeResumeStatus": resumeStatus, "nativeSessionId": resumeSessionID}, startedAtISO)
 	return x, nil
 }
 
@@ -379,6 +472,7 @@ type execution struct {
 	lastHeartbeatAtISO string
 	lastOutputAt       time.Time
 	lastProgressAt     time.Time
+	maxRuntimeDeadline time.Time
 
 	mu                      sync.Mutex
 	status                  string
@@ -392,6 +486,26 @@ type execution struct {
 	nativeResumeMode        string
 	nativeResumeStatus      string
 	nativeResumeError       string
+	progressCtx             context.Context
+	progressCancel          context.CancelFunc
+	progressReady           bool
+	progressInFlight        bool
+	outputCtx               context.Context
+	outputCancel            context.CancelFunc
+	outputCh                chan outputMessage
+	outputDone              chan struct{}
+	outputStopOnce          sync.Once
+	outputPersistenceCtx    context.Context
+	outputPersistenceCancel context.CancelFunc
+	outputPersistenceCh     chan outputPersistence
+	outputPersistenceDone   chan struct{}
+	outputPersistenceReady  bool
+	outputPersistenceOnce   sync.Once
+	killRequested           bool
+	killRequestedReason     string
+	processGroupResolved    bool
+	processGroupKillSent    bool
+	processGroupSignalsDone bool
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -400,7 +514,10 @@ type execution struct {
 func (x *execution) Wait(ctx context.Context) (Result, error) {
 	select {
 	case <-ctx.Done():
-		return Result{}, ctx.Err()
+		_ = x.Kill(ctx.Err().Error())
+		out := <-x.doneCh
+		x.doneCh <- out
+		return out.result, out.err
 	case out := <-x.doneCh:
 		x.doneCh <- out
 		return out.result, out.err
@@ -408,6 +525,12 @@ func (x *execution) Wait(ctx context.Context) (Result, error) {
 }
 
 func (x *execution) Kill(reason string) error {
+	x.mu.Lock()
+	x.killRequested = true
+	if x.killRequestedReason == "" {
+		x.killRequestedReason = reason
+	}
+	x.mu.Unlock()
 	select {
 	case x.killCh <- reason:
 	default:
@@ -415,13 +538,32 @@ func (x *execution) Kill(reason string) error {
 	return nil
 }
 
+// ForceKill escalates an already-requested stop to SIGKILL for the whole
+// process group and confirms that the group is no longer signalable. SIGKILL is
+// sent at most once; after an earlier cleanup barrier timed out, later calls
+// only re-probe the still-owned group. A nil result therefore authorizes the
+// live-handle registry to release ownership safely.
+func (x *execution) ForceKill() error {
+	killErr := x.killProcessGroup()
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	x.mu.Lock()
+	cmd := x.process
+	x.mu.Unlock()
+	return processGroupCleanupError(killErr, x.awaitProcessGroupExit(cmd))
+}
+
 func (x *execution) signalProcessGroup(signal syscall.Signal) error {
-	if x.process.Process == nil {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.processGroupResolved || x.processGroupSignalsDone || x.process == nil || x.process.Process == nil {
 		return os.ErrProcessDone
 	}
-	pid := x.process.Process.Pid
+	process := x.process.Process
+	pid := process.Pid
 	if pid <= 0 {
-		return x.process.Process.Signal(signal)
+		return process.Signal(signal)
 	}
 	if err := syscall.Kill(-pid, signal); err != nil {
 		if err == syscall.ESRCH {
@@ -433,34 +575,129 @@ func (x *execution) signalProcessGroup(signal syscall.Signal) error {
 }
 
 func (x *execution) killProcessGroup() error {
-	if x.process.Process == nil {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.processGroupResolved || x.processGroupSignalsDone || x.process == nil || x.process.Process == nil {
 		return os.ErrProcessDone
 	}
-	pid := x.process.Process.Pid
+	if x.processGroupKillSent {
+		return nil
+	}
+	process := x.process.Process
+	pid := process.Pid
 	if pid > 0 {
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil || err == syscall.ESRCH {
+		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil {
+			x.processGroupKillSent = true
 			return nil
+		} else if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		} else {
+			return err
 		}
 	}
-	return x.process.Process.Kill()
+	if err := process.Kill(); err == nil {
+		x.processGroupKillSent = true
+		return nil
+	} else {
+		return err
+	}
+}
+
+func (x *execution) retireUnstartedProcess(cmd *exec.Cmd) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.process == cmd && (cmd == nil || cmd.Process == nil) {
+		x.processGroupResolved = true
+		x.processGroupSignalsDone = true
+	}
+}
+
+func (x *execution) reapStartedProcess(cmd *exec.Cmd) error {
+	killErr := x.killProcessGroup()
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	_ = cmd.Wait()
+	cleanupErr := x.awaitProcessGroupExit(cmd)
+	x.flushOutput()
+	return processGroupCleanupError(killErr, cleanupErr)
+}
+
+func (x *execution) finishProcessGroup(cmd *exec.Cmd) error {
+	killErr := x.killProcessGroup()
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	return processGroupCleanupError(killErr, x.awaitProcessGroupExit(cmd))
+}
+
+func processGroupCleanupError(killErr, barrierErr error) error {
+	// A failed signal can race the group's natural exit. Once the barrier proves
+	// ESRCH, ownership is resolved and the earlier signal error is no longer a
+	// cleanup failure. Without that proof, retain both diagnostics.
+	if barrierErr == nil {
+		return nil
+	}
+	return errors.Join(killErr, barrierErr)
+}
+
+func (x *execution) awaitProcessGroupExit(cmd *exec.Cmd) error {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.process != cmd {
+		return fmt.Errorf("process group cleanup lost command ownership")
+	}
+	if x.processGroupResolved {
+		return nil
+	}
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
+		x.processGroupResolved = true
+		x.processGroupSignalsDone = true
+		return nil
+	}
+
+	// Hold the execution lock across the bounded probe barrier. ForceKill cannot
+	// race a successful ESRCH observation and signal a newly reused numeric PGID.
+	// SIGKILL was sent before entering this function; probes never resend it.
+	pid := cmd.Process.Pid
+	deadline := time.Now().Add(processGroupExitTimeout)
+	for {
+		err := syscall.Kill(-pid, 0)
+		if err == syscall.ESRCH {
+			x.processGroupResolved = true
+			x.processGroupSignalsDone = true
+			return nil
+		}
+		if err != nil && err != syscall.EPERM {
+			x.processGroupSignalsDone = true
+			return fmt.Errorf("probe process group %d after SIGKILL: %w", pid, err)
+		}
+		if !time.Now().Before(deadline) {
+			x.processGroupSignalsDone = true
+			return fmt.Errorf("process group %d still exists %s after SIGKILL", pid, processGroupExitTimeout)
+		}
+		time.Sleep(processGroupProbeInterval)
+	}
 }
 
 func (x *execution) run(ctx context.Context) {
+	cmd := x.process
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- x.process.Wait() }()
+	go func() { waitCh <- cmd.Wait() }()
 
 	var (
-		waitErr         error
-		timedOut        bool
-		timeoutType     string
-		killed          bool
-		killReason      string
-		graceKillTimer  <-chan time.Time
-		timeoutTimer    <-chan time.Time
-		inactivityTimer *time.Ticker
-		termDelivered   bool
-		terminateOnce   sync.Once
-		terminateSignal = func() {
+		waitErr          error
+		timedOut         bool
+		timeoutType      string
+		killed           bool
+		killReason       string
+		graceKillTimer   *time.Timer
+		graceKillTimerCh <-chan time.Time
+		timeoutTimer     *time.Timer
+		timeoutTimerCh   <-chan time.Time
+		inactivityTimer  *time.Ticker
+		terminateOnce    sync.Once
+		terminateSignal  = func() {
 			terminateOnce.Do(func() {
 				if x.process.Process == nil {
 					return
@@ -471,19 +708,26 @@ func (x *execution) run(ctx context.Context) {
 					}
 					return
 				}
-				termDelivered = true
 				grace := x.gracefulShutdown
 				if grace <= 0 {
 					grace = 5 * time.Second
 				}
-				graceKillTimer = time.After(grace)
+				graceKillTimer = time.NewTimer(grace)
+				graceKillTimerCh = graceKillTimer.C
 			})
 		}
 	)
 
 	if x.timeout > 0 {
-		timeoutTimer = time.After(x.timeout)
+		timeoutTimer = time.NewTimer(x.remainingMaxRuntime())
+		timeoutTimerCh = timeoutTimer.C
+		defer timeoutTimer.Stop()
 	}
+	defer func() {
+		if graceKillTimer != nil {
+			graceKillTimer.Stop()
+		}
+	}()
 	if x.heartbeatTimeout > 0 {
 		interval := x.heartbeatTimeout
 		if interval > time.Second {
@@ -493,13 +737,14 @@ func (x *execution) run(ctx context.Context) {
 		defer inactivityTimer.Stop()
 	}
 
+	ctxDone := ctx.Done()
 	waiting := true
 	for waiting {
 		select {
 		case waitErr = <-waitCh:
 			waiting = false
-		case <-timeoutTimer:
-			timeoutTimer = nil
+		case <-timeoutTimerCh:
+			timeoutTimerCh = nil
 			select {
 			case waitErr = <-waitCh:
 				waiting = false
@@ -540,35 +785,44 @@ func (x *execution) run(ctx context.Context) {
 			killReason = reason
 			x.setStatus("killed")
 			terminateSignal()
-		case <-ctx.Done():
+		case <-ctxDone:
+			ctxDone = nil
 			killed = true
 			if killReason == "" {
 				killReason = ctx.Err().Error()
 			}
 			x.setStatus("killed")
 			terminateSignal()
-		case <-graceKillTimer:
-			graceKillTimer = nil
+		case <-graceKillTimerCh:
+			graceKillTimerCh = nil
 			_ = x.killProcessGroup()
 		}
 	}
-	if termDelivered && (killed || timedOut) {
-		_ = x.killProcessGroup()
-	}
+	stopTimer(timeoutTimer)
+	stopTimer(graceKillTimer)
+	cleanupErr := x.finishProcessGroup(cmd)
+	x.flushOutput()
 
 	stdout, stderr := x.resolveOutputLogs()
 	status := x.finalStatus(timedOut, killed)
+	if cleanupErr != nil && status == "completed" {
+		status = "failed"
+		x.setStatus(status)
+	}
 	if waitErr != nil && status == "failed" && strings.TrimSpace(stderr) == "" {
 		stderr = waitErr.Error()
-		if x.appendPersistedLog(x.stderrLogPath, []byte(stderr)) {
-			x.markPersistedLogWriteFailed()
-		}
+		// The result retains this diagnostic in memory/final persistence. Do not
+		// perform synchronous log I/O on the lifecycle teardown path.
+		x.markPersistedLogWriteFailed()
 	}
 	errorMessage := ""
 	if status == "failed" || status == "timeout" || status == "killed" {
 		errorMessage = strings.TrimSpace(stderr)
 		if errorMessage == "" {
 			errorMessage = killReason
+		}
+		if cleanupErr != nil {
+			errorMessage = joinReasonAndError(errorMessage, cleanupErr)
 		}
 	}
 	completion := parseCompletion(stdout, stderr)
@@ -611,9 +865,9 @@ func (x *execution) run(ctx context.Context) {
 		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               lastProgressAt,
-		PID:                          pidOrZero(x.process.Process),
+		PID:                          pidOrZero(cmd.Process),
 	}
-	if x.shouldFallbackNativeResume(status, stdout, stderr) {
+	if cleanupErr == nil && x.shouldFallbackNativeResume(status, stdout, stderr) {
 		if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
 			result = fallbackResult
 			status = fallbackResult.Status
@@ -623,6 +877,8 @@ func (x *execution) run(ctx context.Context) {
 		}
 	}
 
+	x.stopOutput()
+	x.stopOutputPersistence()
 	x.persistFinal(status, result, errorMessage, endedAtISO)
 	eventType := "agent.completed"
 	if status == "timeout" {
@@ -649,7 +905,8 @@ func (x *execution) run(ctx context.Context) {
 		"summary":                      result.Summary,
 	}, endedAtISO)
 
-	x.doneCh <- execOutcome{result: result, err: nil}
+	x.stopProgress()
+	x.doneCh <- execOutcome{result: result, err: cleanupErr}
 }
 
 func (x *execution) shouldFallbackNativeResume(status string, stdout string, stderr string) bool {
@@ -687,13 +944,17 @@ func normalizeNativeResumeErrorLine(line string) string {
 }
 
 func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
+	if reason, stopped := x.pendingStop(ctx); stopped {
+		return x.stoppedFallbackResult(reason)
+	}
 	command, args := ResolveSpawn(x.executor.config, x.input.WorkingDirectory, x.input.Prompt)
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = descendantPipeDrainGrace
 	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, x.executor.config.Env, x.input.Env)
-	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
-	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
+	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.enqueueOutput("stdout", chunk) }}
+	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.enqueueOutput("stderr", chunk) }}
 
 	now := x.executor.now().UTC()
 	nowISO := eventlog.FormatJavaScriptISOString(now)
@@ -701,6 +962,9 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.command = command
 	x.args = args
 	x.process = cmd
+	x.processGroupResolved = false
+	x.processGroupKillSent = false
+	x.processGroupSignalsDone = false
 	x.status = "running"
 	x.stdout = nil
 	x.stderr = nil
@@ -711,10 +975,13 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
 	x.mu.Unlock()
-	x.persistStatus("running", nil, nil, nil)
-	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
+	if reason, stopped := x.pendingStop(ctx); stopped {
+		x.retireUnstartedProcess(cmd)
+		return x.stoppedFallbackResult(reason)
+	}
 
 	if err := cmd.Start(); err != nil {
+		x.retireUnstartedProcess(cmd)
 		x.mu.Lock()
 		x.status = "failed"
 		x.nativeResumeStatus = "fallback_failed"
@@ -722,22 +989,53 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		x.mu.Unlock()
 		return Result{}, "", false
 	}
+	if reason, stopped := x.pendingStop(ctx); stopped {
+		cleanupErr := x.reapStartedProcess(cmd)
+		return x.stoppedFallbackResult(joinReasonAndError(reason, cleanupErr))
+	}
+	stopReason, err := x.persistRunningOwnership(ctx, cmd)
+	if stopReason != "" {
+		return x.stoppedFallbackResult(joinReasonAndError(stopReason, err))
+	}
+	if err != nil {
+		message := fmt.Sprintf("persist running checkpoint fallback: %v", err)
+		x.mu.Lock()
+		x.status = "failed"
+		x.nativeResumeStatus = "fallback_failed"
+		x.nativeResumeError = message
+		x.mu.Unlock()
+		return Result{
+			Status:                       "failed",
+			Summary:                      message,
+			ParseStatus:                  "missing",
+			ConfiguredIdleTimeoutSeconds: durationSeconds(x.heartbeatTimeout),
+			ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
+			ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
+			LastProgressAt:               x.lastProgressAtISO(),
+			PID:                          pidOrZero(cmd.Process),
+		}, message, true
+	}
+	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
 
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 	var (
-		waitErr        error
-		timedOut       bool
-		killed         bool
-		timeoutType    string
-		killReason     string
-		timeoutTimer   <-chan time.Time
-		graceKillTimer <-chan time.Time
-		idleTicker     *time.Ticker
-		termDelivered  bool
+		waitErr          error
+		timedOut         bool
+		killed           bool
+		timeoutType      string
+		killReason       string
+		timeoutTimer     *time.Timer
+		timeoutTimerCh   <-chan time.Time
+		graceKillTimer   *time.Timer
+		graceKillTimerCh <-chan time.Time
+		idleTicker       *time.Ticker
+		terminateOnce    sync.Once
 	)
 	if x.timeout > 0 {
-		timeoutTimer = time.After(x.timeout)
+		timeoutTimer = time.NewTimer(x.remainingMaxRuntime())
+		timeoutTimerCh = timeoutTimer.C
+		defer timeoutTimer.Stop()
 	}
 	if x.heartbeatTimeout > 0 {
 		interval := x.heartbeatTimeout
@@ -748,29 +1046,37 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		defer idleTicker.Stop()
 	}
 	terminate := func() {
-		if cmd.Process == nil {
-			return
-		}
-		if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
-			if err != os.ErrProcessDone {
-				_ = x.killProcessGroup()
+		terminateOnce.Do(func() {
+			if cmd.Process == nil {
+				return
 			}
-			return
-		}
-		termDelivered = true
-		grace := x.gracefulShutdown
-		if grace <= 0 {
-			grace = 5 * time.Second
-		}
-		graceKillTimer = time.After(grace)
+			if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
+				if err != os.ErrProcessDone {
+					_ = x.killProcessGroup()
+				}
+				return
+			}
+			grace := x.gracefulShutdown
+			if grace <= 0 {
+				grace = 5 * time.Second
+			}
+			graceKillTimer = time.NewTimer(grace)
+			graceKillTimerCh = graceKillTimer.C
+		})
 	}
+	defer func() {
+		if graceKillTimer != nil {
+			graceKillTimer.Stop()
+		}
+	}()
+	ctxDone := ctx.Done()
 	waiting := true
 	for waiting {
 		select {
 		case waitErr = <-waitCh:
 			waiting = false
-		case <-timeoutTimer:
-			timeoutTimer = nil
+		case <-timeoutTimerCh:
+			timeoutTimerCh = nil
 			if !timedOut {
 				timedOut = true
 				timeoutType = "max_runtime"
@@ -789,18 +1095,22 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			killed = true
 			killReason = reason
 			terminate()
-		case <-ctx.Done():
+		case <-ctxDone:
+			ctxDone = nil
 			killed = true
-			killReason = ctx.Err().Error()
+			if killReason == "" {
+				killReason = ctx.Err().Error()
+			}
 			terminate()
-		case <-graceKillTimer:
-			graceKillTimer = nil
+		case <-graceKillTimerCh:
+			graceKillTimerCh = nil
 			_ = x.killProcessGroup()
 		}
 	}
-	if termDelivered && (killed || timedOut) {
-		_ = x.killProcessGroup()
-	}
+	stopTimer(timeoutTimer)
+	stopTimer(graceKillTimer)
+	cleanupErr := x.finishProcessGroup(cmd)
+	x.flushOutput()
 	stdout := x.stdoutString()
 	stderr := x.stderrString()
 	now = x.executor.now().UTC()
@@ -817,7 +1127,10 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		status = "timeout"
 	} else if killed {
 		status = "killed"
-	} else if waitErr != nil || (cmd.ProcessState != nil && cmd.ProcessState.ExitCode() != 0) {
+	} else if waitErr != nil && !errors.Is(waitErr, exec.ErrWaitDelay) || (cmd.ProcessState != nil && cmd.ProcessState.ExitCode() != 0) {
+		status = "failed"
+	}
+	if cleanupErr != nil {
 		status = "failed"
 	}
 	errorMessage := ""
@@ -828,6 +1141,9 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		}
 		if errorMessage == "" {
 			errorMessage = killReason
+		}
+		if cleanupErr != nil {
+			errorMessage = joinReasonAndError(errorMessage, cleanupErr)
 		}
 	}
 	completion := parseCompletion(stdout, stderr)
@@ -865,7 +1181,42 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	}, errorMessage, true
 }
 
-func (x *execution) onOutput(stream string, chunk []byte) {
+func (x *execution) pendingStop(ctx context.Context) (string, bool) {
+	if err := ctx.Err(); err != nil {
+		return err.Error(), true
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if !x.killRequested {
+		return "", false
+	}
+	return firstNonEmpty(x.killRequestedReason, "agent execution stopped"), true
+}
+
+func (x *execution) stoppedFallbackResult(reason string) (Result, string, bool) {
+	x.setStatus("killed")
+	return Result{
+		Status:                       "killed",
+		Summary:                      reason,
+		ParseStatus:                  "missing",
+		ConfiguredIdleTimeoutSeconds: durationSeconds(x.heartbeatTimeout),
+		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
+		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
+		LastProgressAt:               x.lastProgressAtISO(),
+	}, reason, true
+}
+
+func joinReasonAndError(reason string, err error) string {
+	if err == nil {
+		return reason
+	}
+	if strings.TrimSpace(reason) == "" {
+		return err.Error()
+	}
+	return reason + "; " + err.Error()
+}
+
+func (x *execution) captureOutput(stream string, chunk []byte) {
 	now := x.executor.now().UTC()
 	nowISO := eventlog.FormatJavaScriptISOString(now)
 	x.mu.Lock()
@@ -873,37 +1224,34 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
 	if stream == "stdout" {
-		if x.appendPersistedLog(x.stdoutLogPath, chunk) {
-			x.persistedLogWriteFailed = true
-		}
 		x.stdout = appendTailBounded(x.stdout, chunk, x.maxOutputBytes)
 	} else {
-		if x.appendPersistedLog(x.stderrLogPath, chunk) {
-			x.persistedLogWriteFailed = true
-		}
 		x.stderr = appendTailBounded(x.stderr, chunk, x.maxOutputBytes)
 	}
-	heartbeatCount := x.heartbeatCount
 	stdout := string(x.stdout)
 	stderr := string(x.stderr)
+	x.mu.Unlock()
+
 	// Capture the native session id AS SOON as it appears, so it's persisted while
 	// the run is live (a human taking over mid-run needs it — completion is too
 	// late). Text-mode ids can stream in across chunks, so re-extract each time; the
 	// codex --json thread id arrives whole in a thread.started line, so capture it
 	// once (only when text extraction found nothing and it's not already known).
-	if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
-		x.nativeSessionID = nativeSessionID
-	} else if x.jsonMode() && strings.TrimSpace(x.nativeSessionID) == "" {
-		if threadID := extractCodexThreadID(stdout); threadID != "" {
-			x.nativeSessionID = threadID
-		}
+	nativeSessionID := extractNativeSessionID(stdout, stderr)
+	jsonSessionID := ""
+	if nativeSessionID == "" && x.jsonMode() {
+		jsonSessionID = extractCodexThreadID(stdout)
 	}
-	x.mu.Unlock()
-
-	outputJSON := x.outputJSON(stdout, stderr)
-	x.persistStatus(x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON)
-	x.bumpRunHeartbeat(nowISO)
-	x.maybeEmitProgress(now, stdout, stderr)
+	if nativeSessionID == "" && jsonSessionID == "" {
+		return
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if nativeSessionID != "" {
+		x.nativeSessionID = nativeSessionID
+	} else if jsonSessionID != "" && strings.TrimSpace(x.nativeSessionID) == "" {
+		x.nativeSessionID = jsonSessionID
+	}
 }
 
 // maybeEmitProgress hands a throttled activity snapshot (last few output lines +
@@ -915,11 +1263,13 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 		return
 	}
 	x.mu.Lock()
-	if !x.lastProgressAt.IsZero() && now.Sub(x.lastProgressAt) < liveProgressInterval {
+	if !x.progressReady || x.progressInFlight || (!x.lastProgressAt.IsZero() && now.Sub(x.lastProgressAt) < liveProgressInterval) {
 		x.mu.Unlock()
 		return
 	}
 	x.lastProgressAt = now
+	x.progressInFlight = true
+	progressCtx := x.progressCtx
 	x.mu.Unlock()
 	elapsed := int64(now.Sub(x.startedAt).Seconds())
 	if elapsed < 0 {
@@ -933,13 +1283,27 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 		// Combine streams; the last N lines skew toward whichever is actively writing.
 		tail = lastNonEmptyLines(stdout+"\n"+stderr, liveProgressTailLines)
 	}
-	x.executor.onProgress(context.Background(), ProgressUpdate{
+	update := ProgressUpdate{
 		LoopID:         x.input.LoopID,
 		RunID:          x.input.RunID,
-		ExecutionID:    x.input.ExecutionID,
+		ExecutionID:    x.executionID,
 		TailLines:      tail,
 		ElapsedSeconds: elapsed,
-	})
+	}
+	go func() {
+		defer func() {
+			x.mu.Lock()
+			x.progressInFlight = false
+			x.mu.Unlock()
+		}()
+		x.executor.onProgress(progressCtx, update)
+	}()
+}
+
+func (x *execution) stopProgress() {
+	if x.progressCancel != nil {
+		x.progressCancel()
+	}
 }
 
 // jsonMode reports whether this run is a codex `--json` run (structured events).
@@ -994,11 +1358,10 @@ func meaningfulProgressLine(line string) bool {
 	return true
 }
 
-func (x *execution) bumpRunHeartbeat(nowISO string) {
+func (x *execution) bumpRunHeartbeat(ctx context.Context, nowISO string) {
 	if x.input.RunID == "" || x.executor.repos == nil || x.executor.repos.Runs == nil {
 		return
 	}
-	ctx := context.Background()
 	run, err := x.executor.repos.Runs.GetByID(ctx, x.input.RunID)
 	if err != nil || run == nil {
 		return
@@ -1009,14 +1372,59 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 	_ = x.executor.repos.Runs.Upsert(ctx, updated)
 }
 
-func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbeatAt *string, outputJSON *string) {
-	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
-		return
+func (x *execution) persistRunningOwnership(ctx context.Context, cmd *exec.Cmd) (string, error) {
+	persistCtx, cancel := context.WithTimeout(ctx, ownershipPersistenceTimeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- x.persistStatusContext(persistCtx, "running", nil, nil, nil)
+	}()
+
+	select {
+	case err := <-done:
+		if reason, stopped := x.pendingStop(ctx); stopped {
+			cleanupErr := x.reapStartedProcess(cmd)
+			return reason, errors.Join(ctx.Err(), cleanupErr)
+		}
+		if err != nil {
+			err = errors.Join(err, x.reapStartedProcess(cmd))
+		}
+		return "", err
+	case reason := <-x.killCh:
+		cancel()
+		cleanupErr := x.reapStartedProcess(cmd)
+		return firstNonEmpty(reason, "agent execution stopped"), cleanupErr
+	case <-persistCtx.Done():
+		persistErr := persistCtx.Err()
+		persistErr = errors.Join(persistErr, x.reapStartedProcess(cmd))
+		if reason, stopped := x.pendingStop(ctx); stopped {
+			return reason, persistErr
+		}
+		return "", persistErr
 	}
-	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
+}
+
+func (x *execution) persistStatusContext(ctx context.Context, status string, heartbeatCount *int64, heartbeatAt *string, outputJSON *string) error {
+	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
+		return nil
+	}
+	x.mu.Lock()
+	nativeSessionID := x.nativeSessionID
+	nativeResumeMode := x.nativeResumeMode
+	nativeResumeStatus := x.nativeResumeStatus
+	nativeResumeError := x.nativeResumeError
+	command := x.command
+	args := append([]string(nil), x.args...)
+	process := x.process
+	x.mu.Unlock()
 	metadata := mustJSON(x.executionMetadata(""))
-	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
-	pid := int64(pidOrZero(x.process.Process))
+	commandJSON := mustJSON(map[string]any{"command": command, "args": args})
+	var osProcess *os.Process
+	if process != nil {
+		osProcess = process.Process
+	}
+	pid := int64(pidOrZero(osProcess))
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,
 		ProjectID:          emptyToNil(x.input.ProjectID),
@@ -1046,7 +1454,7 @@ func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbea
 	if outputJSON != nil {
 		record.OutputJSON = outputJSON
 	}
-	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
+	return x.executor.repos.AgentExecutions.Upsert(ctx, record)
 }
 
 func (x *execution) persistFinal(status string, result Result, errorMessage, endedAtISO string) {
@@ -1104,7 +1512,9 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 		CreatedAt:          x.startedAtISO,
 		UpdatedAt:          endedAtISO,
 	}
-	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
+	runBoundedSideEffect(outputPersistenceTimeout, func(ctx context.Context) {
+		_ = x.executor.repos.AgentExecutions.Upsert(ctx, record)
+	})
 }
 
 func (x *execution) currentStatus() string {
@@ -1200,6 +1610,30 @@ func durationSeconds(duration time.Duration) int64 {
 	return seconds
 }
 
+func (x *execution) remainingMaxRuntime() time.Duration {
+	if x.timeout <= 0 {
+		return 0
+	}
+	if x.maxRuntimeDeadline.IsZero() {
+		return x.timeout
+	}
+	remaining := time.Until(x.maxRuntimeDeadline)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}
+
 func (x *execution) resolveOutputLogs() (string, string) {
 	stdout := x.stdoutString()
 	stderr := x.stderrString()
@@ -1247,6 +1681,200 @@ func (w *streamCapture) Write(p []byte) (int, error) {
 		w.onChunk(chunk)
 	}
 	return len(p), nil
+}
+
+type outputMessage struct {
+	stream string
+	chunk  []byte
+	done   chan struct{}
+}
+
+type outputSnapshot struct {
+	now            time.Time
+	nowISO         string
+	heartbeatCount int64
+	stdout         string
+	stderr         string
+	status         string
+	persistOutput  bool
+}
+
+type outputPersistence struct {
+	status         string
+	heartbeatCount int64
+	heartbeatAt    string
+	outputJSON     string
+}
+
+func (x *execution) enqueueOutput(stream string, chunk []byte) {
+	if len(chunk) == 0 {
+		return
+	}
+	x.captureOutput(stream, chunk)
+	message := outputMessage{stream: stream, chunk: chunk}
+	select {
+	case <-x.outputCtx.Done():
+		x.markPersistedLogWriteFailed()
+	case x.outputCh <- message:
+	default:
+		x.markPersistedLogWriteFailed()
+	}
+}
+
+func (x *execution) processOutput() {
+	defer close(x.outputDone)
+	for {
+		select {
+		case <-x.outputCtx.Done():
+			return
+		case message := <-x.outputCh:
+			if x.outputCtx.Err() != nil {
+				return
+			}
+			if len(message.chunk) > 0 {
+				x.processOutputSideEffects(message)
+			}
+			if message.done != nil {
+				close(message.done)
+			}
+		}
+	}
+}
+
+func (x *execution) processOutputSideEffects(message outputMessage) {
+	if x.outputCtx.Err() != nil {
+		return
+	}
+	path := x.stderrLogPath
+	if message.stream == "stdout" {
+		path = x.stdoutLogPath
+	}
+	if x.appendPersistedLog(path, message.chunk) {
+		x.markPersistedLogWriteFailed()
+	}
+	if x.outputCtx.Err() != nil {
+		return
+	}
+	snapshot := x.currentOutputSnapshot()
+	if snapshot.persistOutput {
+		x.submitOutputPersistence(outputPersistence{
+			status:         snapshot.status,
+			heartbeatCount: snapshot.heartbeatCount,
+			heartbeatAt:    snapshot.nowISO,
+			outputJSON:     x.outputJSON(snapshot.stdout, snapshot.stderr),
+		})
+	}
+	x.maybeEmitProgress(snapshot.now, snapshot.stdout, snapshot.stderr)
+}
+
+func (x *execution) currentOutputSnapshot() outputSnapshot {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return outputSnapshot{
+		now:            x.lastOutputAt,
+		nowISO:         x.lastHeartbeatAtISO,
+		heartbeatCount: x.heartbeatCount,
+		stdout:         string(x.stdout),
+		stderr:         string(x.stderr),
+		status:         x.status,
+		persistOutput:  x.outputPersistenceReady,
+	}
+}
+
+func (x *execution) flushOutput() {
+	done := make(chan struct{})
+	select {
+	case <-x.outputCtx.Done():
+		return
+	case x.outputCh <- outputMessage{done: done}:
+	default:
+		x.markPersistedLogWriteFailed()
+		return
+	}
+	if !waitForWorker(done, outputPersistenceTimeout) {
+		x.markPersistedLogWriteFailed()
+	}
+}
+
+func (x *execution) stopOutput() {
+	x.outputStopOnce.Do(func() {
+		x.outputCancel()
+		_ = waitForWorker(x.outputDone, outputPersistenceTimeout)
+	})
+}
+
+func (x *execution) submitOutputPersistence(update outputPersistence) {
+	select {
+	case x.outputPersistenceCh <- update:
+		return
+	default:
+	}
+	select {
+	case <-x.outputPersistenceCh:
+	default:
+	}
+	select {
+	case x.outputPersistenceCh <- update:
+	default:
+	}
+}
+
+func (x *execution) processOutputPersistence() {
+	defer close(x.outputPersistenceDone)
+	for {
+		select {
+		case <-x.outputPersistenceCtx.Done():
+			return
+		case update := <-x.outputPersistenceCh:
+			if x.outputPersistenceCtx.Err() != nil {
+				return
+			}
+			ctx, cancel := context.WithTimeout(x.outputPersistenceCtx, outputPersistenceTimeout)
+			_ = x.persistStatusContext(ctx, update.status, &update.heartbeatCount, &update.heartbeatAt, &update.outputJSON)
+			x.bumpRunHeartbeat(ctx, update.heartbeatAt)
+			cancel()
+		}
+	}
+}
+
+func (x *execution) stopOutputPersistence() {
+	x.outputPersistenceOnce.Do(func() {
+		x.outputPersistenceCancel()
+		_ = waitForWorker(x.outputPersistenceDone, outputPersistenceTimeout)
+	})
+}
+
+func waitForWorker(done <-chan struct{}, timeout time.Duration) bool {
+	if done == nil {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func runBoundedSideEffect(timeout time.Duration, sideEffect func(context.Context)) bool {
+	if sideEffect == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		sideEffect(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func ResolveSpawn(cfg ExecutorConfig, workingDirectory string, prompt string) (string, []string) {
@@ -1741,6 +2369,13 @@ func firstNonEmpty(values ...string) string {
 }
 
 func (x *execution) appendPersistedLog(path string, chunk []byte) bool {
+	if x.executor != nil && x.executor.appendPersistedLog != nil {
+		return x.executor.appendPersistedLog(path, chunk)
+	}
+	return appendPersistedLogFile(path, chunk)
+}
+
+func appendPersistedLogFile(path string, chunk []byte) bool {
 	if path == "" || len(chunk) == 0 {
 		return false
 	}
@@ -1953,10 +2588,10 @@ func summarizeLogs(stdout, stderr string) string {
 }
 
 func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInput, executionID string, payload any, createdAt string) {
-	if e.repos == nil || e.repos.Events == nil {
+	if e.appendLifecycleRecord == nil {
 		return
 	}
-	_ = e.repos.Events.Append(context.Background(), storage.EventLogRecord{
+	record := storage.EventLogRecord{
 		ID:               eventlog.NewEventID("event"),
 		EventType:        eventType,
 		ProjectID:        emptyToNil(input.ProjectID),
@@ -1969,6 +2604,9 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 		ActorDisplayName: stringPtr(string(e.config.Vendor)),
 		PayloadJSON:      mustJSON(payload),
 		CreatedAt:        createdAt,
+	}
+	runBoundedSideEffect(outputPersistenceTimeout, func(ctx context.Context) {
+		_ = e.appendLifecycleRecord(ctx, record)
 	})
 }
 

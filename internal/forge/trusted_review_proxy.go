@@ -2,7 +2,9 @@ package forge
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,7 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	shellinfra "github.com/nexu-io/looper/internal/infra/shell"
 )
 
 // TrustedReviewSockEnv is the agent-facing env key for the trusted review-submit
@@ -23,6 +28,12 @@ const TrustedReviewSockEnv = "LOOPER_TRUSTED_REVIEW_SOCK"
 // trustedReviewProxySkipEnv marks a proxy-spawned looper child so it does not
 // re-enter the proxy (the child receives provider tokens directly).
 const trustedReviewProxySkipEnv = "LOOPER_TRUSTED_REVIEW_PROXY_CHILD"
+
+const (
+	trustedReviewProxyRequestTimeout = 2 * time.Minute
+	trustedReviewProxyWaitDelay      = time.Second
+	trustedReviewProxyCleanupTimeout = 2 * time.Second
+)
 
 type trustedReviewProxyRequest struct {
 	Argv  []string `json:"argv"`
@@ -121,6 +132,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 		return "", nil, fmt.Errorf("chmod trusted review proxy socket: %w", err)
 	}
 
+	proxyCtx, cancelProxy := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 	wg.Add(1)
@@ -139,23 +151,45 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
-				handleTrustedReviewProxyConn(c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfigPath, boundPolicy)
+				handleTrustedReviewProxyConn(proxyCtx, c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfigPath, boundPolicy)
 			}(conn)
 		}
 	}()
 
+	var cleanupOnce sync.Once
 	cleanup = func() {
-		close(stop)
-		_ = listener.Close()
-		wg.Wait()
-		_ = os.RemoveAll(dir)
+		cleanupOnce.Do(func() {
+			cancelProxy()
+			close(stop)
+			_ = listener.Close()
+			waitDone := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(waitDone)
+			}()
+			cleanupTimer := time.NewTimer(trustedReviewProxyCleanupTimeout)
+			defer cleanupTimer.Stop()
+			select {
+			case <-waitDone:
+				_ = os.RemoveAll(dir)
+			case <-cleanupTimer.C:
+				go func() {
+					<-waitDone
+					_ = os.RemoveAll(dir)
+				}()
+			}
+		})
 	}
 	return sockPath, cleanup, nil
 }
 
-func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy TrustedReviewProxyPolicy) {
+func handleTrustedReviewProxyConn(parentCtx context.Context, conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy TrustedReviewProxyPolicy) {
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
+	requestCtx, cancelRequest := context.WithTimeout(parentCtx, trustedReviewProxyRequestTimeout)
+	defer cancelRequest()
+	stopContextClose := context.AfterFunc(requestCtx, func() { _ = conn.Close() })
+	defer stopContextClose()
+	_ = conn.SetDeadline(time.Now().Add(trustedReviewProxyRequestTimeout))
 
 	var req trustedReviewProxyRequest
 	decoder := json.NewDecoder(conn)
@@ -171,7 +205,14 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 	// Authority for clean/blocking event policy is the daemon-bound policy, not
 	// agent argv. Rewrite local policy flags after shape/PR validation.
 	childArgv := applyTrustedReviewProxyPolicy(req.Argv, policy)
-	cmd := exec.Command(realLooper, childArgv...)
+	cmd := exec.CommandContext(requestCtx, realLooper, childArgv...)
+	shellinfra.ConfigureProcessGroup(cmd)
+	var cancellationKillSent atomic.Bool
+	cmd.Cancel = func() error {
+		cancellationKillSent.Store(true)
+		return shellinfra.KillProcessGroup(cmd)
+	}
+	cmd.WaitDelay = trustedReviewProxyWaitDelay
 	// Never honor request-supplied cwd: project/provider resolution for
 	// provider-qualified same-owner/repo checkouts is CWD-sensitive. The child
 	// always runs in the daemon-selected worktree bound at proxy start.
@@ -182,16 +223,42 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
-	resp := trustedReviewProxyResponse{Stdout: stdout.String(), Stderr: stderr.String()}
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			resp.ExitCode = exitErr.ExitCode()
-		} else {
-			resp.ExitCode = 1
+	var cleanupErr error
+	if cancellationKillSent.Load() {
+		cleanupErr = shellinfra.WaitProcessGroupExit(cmd, trustedReviewProxyWaitDelay)
+	} else {
+		cleanupErr = shellinfra.KillProcessGroupAndWait(cmd, trustedReviewProxyWaitDelay)
+	}
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		err = nil
+	}
+	resp := trustedReviewProxyRunResponse(stdout.String(), stderr.String(), err, cleanupErr)
+	_ = json.NewEncoder(conn).Encode(resp)
+}
+
+func trustedReviewProxyRunResponse(stdout, stderr string, runErr, cleanupErr error) trustedReviewProxyResponse {
+	cleanupFailed := cleanupErr != nil && !errors.Is(cleanupErr, os.ErrProcessDone)
+	if cleanupFailed {
+		cleanupErr = fmt.Errorf("clean up trusted review child process group: %w", cleanupErr)
+	} else {
+		cleanupErr = nil
+	}
+	err := errors.Join(runErr, cleanupErr)
+	resp := trustedReviewProxyResponse{Stdout: stdout, Stderr: stderr}
+	if err == nil {
+		return resp
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		resp.ExitCode = exitErr.ExitCode()
+		if cleanupFailed {
 			resp.Error = err.Error()
 		}
+		return resp
 	}
-	_ = json.NewEncoder(conn).Encode(resp)
+	resp.ExitCode = 1
+	resp.Error = err.Error()
+	return resp
 }
 
 // trustedReviewProxyBlockedFlags are CLI overrides that must never be accepted
@@ -494,14 +561,15 @@ func ProxyReviewSubmit(argv []string, stdin []byte, cwd string) error {
 	if resp.Stderr != "" {
 		_, _ = os.Stderr.WriteString(resp.Stderr)
 	}
+	return trustedReviewProxyResponseError(resp)
+}
+
+func trustedReviewProxyResponseError(resp trustedReviewProxyResponse) error {
 	if resp.Error != "" && resp.ExitCode == 0 {
 		return fmt.Errorf("trusted review proxy: %s", resp.Error)
 	}
 	if resp.ExitCode != 0 {
-		if resp.Error != "" {
-			return fmt.Errorf("trusted review proxy: %s", resp.Error)
-		}
-		return &proxyExitError{code: resp.ExitCode}
+		return &proxyExitError{code: resp.ExitCode, detail: resp.Error}
 	}
 	return nil
 }
@@ -563,10 +631,14 @@ func extractTrustedReviewProxyPRRef(argv []string) string {
 }
 
 type proxyExitError struct {
-	code int
+	code   int
+	detail string
 }
 
 func (e *proxyExitError) Error() string {
+	if e != nil && strings.TrimSpace(e.detail) != "" {
+		return fmt.Sprintf("trusted review proxy: %s", e.detail)
+	}
 	return fmt.Sprintf("review submit exited with code %d", e.code)
 }
 

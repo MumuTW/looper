@@ -77,6 +77,25 @@ type schedulerAsyncRunner interface {
 	Go(func())
 }
 
+type agentExecutionStarter interface {
+	Start(context.Context, agent.RunInput) (agent.Execution, error)
+}
+
+type agentExecutionStarterFunc func(context.Context, agent.RunInput) (agent.Execution, error)
+
+func (f agentExecutionStarterFunc) Start(ctx context.Context, input agent.RunInput) (agent.Execution, error) {
+	return f(ctx, input)
+}
+
+type coordinatorAgentExecutorAdapter struct {
+	executor agentExecutionStarter
+	registry *ActiveExecutionRegistry
+}
+
+func (a coordinatorAgentExecutorAdapter) Start(ctx context.Context, input agent.RunInput) (agent.Execution, error) {
+	return startRegisteredAgentExecution(ctx, a.registry, input.LoopID, input.RunID, input.ExecutionID, a.executor, input)
+}
+
 type defaultSchedulerTickInput struct {
 	Repos                    *storage.Repositories
 	GitHubGateway            *githubinfra.Gateway
@@ -99,6 +118,7 @@ type defaultSchedulerTickInput struct {
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
+	ActiveExecutions         *ActiveExecutionRegistry
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
@@ -982,11 +1002,15 @@ func (a plannerGitAdapter) Push(ctx context.Context, input planner.PushInput) er
 	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
 
-type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type plannerAgentExecutorAdapter struct {
+	executor agentExecutionStarter
+	registry *ActiveExecutionRegistry
+}
 type plannerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	runInput := agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey}
+	execution, err := startRegisteredAgentExecution(ctx, a.registry, input.LoopID, input.RunID, input.ExecutionID, a.executor, runInput)
 	if err != nil {
 		return nil, err
 	}
@@ -1642,7 +1666,8 @@ func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input re
 }
 
 type reviewerAgentExecutorAdapter struct {
-	executor   *agent.ConfiguredExecutor
+	executor   agentExecutionStarter
+	registry   *ActiveExecutionRegistry
 	realLooper string
 	trustedEnv map[string]string
 	// configPath is the daemon-loaded config file path injected as LOOPER_CONFIG
@@ -1657,6 +1682,48 @@ type reviewerAgentExecutionAdapter struct {
 	execution agent.Execution
 	cleanup   func()
 	once      sync.Once
+}
+
+// reviewerOwnedAgentExecution extends the registry's live-process authority to
+// the trusted publication proxy. A stop request cancels both mutation paths;
+// Wait does not resolve until the agent is reaped and proxy cleanup has run.
+type reviewerOwnedAgentExecution struct {
+	execution agent.Execution
+	cleanup   func()
+	once      sync.Once
+}
+
+func (e *reviewerOwnedAgentExecution) closeProxy() {
+	if e == nil {
+		return
+	}
+	e.once.Do(func() {
+		if e.cleanup != nil {
+			e.cleanup()
+		}
+	})
+}
+
+func (e *reviewerOwnedAgentExecution) Wait(ctx context.Context) (agent.Result, error) {
+	defer e.closeProxy()
+	return e.execution.Wait(ctx)
+}
+
+func (e *reviewerOwnedAgentExecution) Kill(reason string) error {
+	err := e.execution.Kill(reason)
+	e.closeProxy()
+	return err
+}
+
+func (e *reviewerOwnedAgentExecution) ForceKill() error {
+	force, ok := e.execution.(forceKillingExecution)
+	if !ok {
+		e.closeProxy()
+		return fmt.Errorf("reviewer agent execution does not support confirmed forced process-group reap")
+	}
+	err := force.ForceKill()
+	e.closeProxy()
+	return err
 }
 
 func (a *reviewerAgentExecutionAdapter) closeProxy() {
@@ -1824,7 +1891,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		policy = reviewerAllowedReviewPolicy(input.Metadata)
 	}
 	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, a.configPath, policy, a.logger)
-	execution, err := a.executor.Start(ctx, agent.RunInput{
+	runInput := agent.RunInput{
 		ExecutionID:        input.ExecutionID,
 		ProjectID:          input.ProjectID,
 		LoopID:             input.LoopID,
@@ -1837,7 +1904,15 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		Metadata:           input.Metadata,
 		IdempotencyKey:     input.IdempotencyKey,
 		Env:                reviewerTrustedReviewEnv(sock),
+	}
+	ownedStarter := agentExecutionStarterFunc(func(startCtx context.Context, registeredInput agent.RunInput) (agent.Execution, error) {
+		execution, err := a.executor.Start(startCtx, registeredInput)
+		if err != nil {
+			return nil, err
+		}
+		return &reviewerOwnedAgentExecution{execution: execution, cleanup: proxyCleanup}, nil
 	})
+	execution, err := startRegisteredAgentExecution(ctx, a.registry, input.LoopID, input.RunID, input.ExecutionID, ownedStarter, runInput)
 	if err != nil {
 		proxyCleanup()
 		return nil, err
@@ -2266,11 +2341,15 @@ func (a fixerGitAdapter) CleanupWorktree(ctx context.Context, input fixer.Cleanu
 	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
-type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type fixerAgentExecutorAdapter struct {
+	executor agentExecutionStarter
+	registry *ActiveExecutionRegistry
+}
 type fixerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	runInput := agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey}
+	execution, err := startRegisteredAgentExecution(ctx, a.registry, input.LoopID, input.RunID, input.ExecutionID, a.executor, runInput)
 	if err != nil {
 		return nil, err
 	}
@@ -2719,7 +2798,7 @@ func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) erro
 }
 
 type workerAgentExecutorAdapter struct {
-	executor *agent.ConfiguredExecutor
+	executor agentExecutionStarter
 	registry *ActiveExecutionRegistry
 }
 type workerAgentExecutionAdapter struct {
@@ -2727,19 +2806,19 @@ type workerAgentExecutionAdapter struct {
 }
 
 func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	runInput := agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey}
+	execution, err := startRegisteredAgentExecution(ctx, a.registry, input.LoopID, input.RunID, input.ExecutionID, a.executor, runInput)
 	if err != nil {
 		return nil, err
 	}
-	unregister := func() {}
-	if a.registry != nil {
-		unregister = a.registry.Register(input.LoopID, input.RunID, input.ExecutionID, execution)
-	}
-	go func() {
-		_, _ = execution.Wait(context.Background())
-		unregister()
-	}()
 	return workerAgentExecutionAdapter{execution: execution}, nil
+}
+
+func startRegisteredAgentExecution(ctx context.Context, registry *ActiveExecutionRegistry, loopID, runID, executionID string, starter agentExecutionStarter, input agent.RunInput) (agent.Execution, error) {
+	if registry == nil {
+		return starter.Start(ctx, input)
+	}
+	return registry.StartAgentExecution(ctx, loopID, runID, executionID, starter, input)
 }
 
 func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResult, error) {
@@ -2942,7 +3021,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Repos:              repos,
 		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:                plannerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor},
+		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
 		Logger:             logger,
 		Now:                now,
 		AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
@@ -2972,7 +3051,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Logger:  logger,
 		Now:     now,
 		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
-		TriageLLM: coordinatorrole.NewAgentLLM(agentExecutor, now,
+		TriageLLM: coordinatorrole.NewAgentLLM(coordinatorAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions}, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
 			time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
 		),
@@ -2984,6 +3063,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Git:    reviewerGitAdapter{gateway: gitGateway},
 		AgentExecutor: reviewerAgentExecutorAdapter{
 			executor:   agentExecutor,
+			registry:   activeExecutions,
 			realLooper: looperCLIPath,
 			trustedEnv: providerTrustedEnv(cfg),
 			configPath: strings.TrimSpace(configPath),
@@ -3029,7 +3109,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Repos:              repos,
 		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
+		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
 		Logger:             logger,
 		Now:                now,
 		AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
@@ -3136,6 +3216,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			ActiveExecutions:         services.ActiveExecutions,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 		}
 	}
@@ -3671,7 +3752,24 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			continue
 		}
 		item := item
-		processFn := process
+		processCtx, cancelProcess := context.WithCancel(ctx)
+		processDone := make(chan struct{})
+		unregisterRun := func() {}
+		if input.ActiveExecutions != nil && item.LoopID != nil && isAgentRoleQueueType(item.Type) {
+			var accepted bool
+			unregisterRun, accepted = input.ActiveExecutions.RegisterRun(*item.LoopID, item.ID, cancelProcess, processDone)
+			if !accepted {
+				close(processDone)
+				cancelProcess()
+				continue
+			}
+		}
+		processFn := func(context.Context) error {
+			defer unregisterRun()
+			defer close(processDone)
+			defer cancelProcess()
+			return process(processCtx)
+		}
 
 		if input.AsyncRunner != nil {
 			input.AsyncRunner.Go(func() {
@@ -3691,6 +3789,15 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		return nil
 	}
 	return errors.Join(errList...)
+}
+
+func isAgentRoleQueueType(queueType string) bool {
+	switch queueType {
+	case "planner", "reviewer", "fixer", "worker":
+		return true
+	default:
+		return false
+	}
 }
 
 func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {
