@@ -87,6 +87,13 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 				return false, nil
 			}
 			issueURL, hasSpecPR := loopIssueURLAndSpecPR(loop.MetadataJSON)
+			if issueURL == "" {
+				var err error
+				issueURL, err = latestRunIssueURL(ctx, repositories, loop.ID)
+				if err != nil {
+					return false, err
+				}
+			}
 			workItemID := planedoc.WorkItemIDFromURL(issueURL)
 			if workItemID == "" {
 				return false, nil
@@ -168,6 +175,28 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 			return recoverableInfraConditionCleared(ctx, cfg, repositories, &projectID, condition.Fingerprint)
 		},
 	}
+}
+
+func latestRunIssueURL(ctx context.Context, repositories *storage.Repositories, loopID string) (string, error) {
+	if repositories == nil || repositories.Runs == nil {
+		return "", nil
+	}
+	run, err := repositories.Runs.GetLatestByLoopID(ctx, loopID)
+	if err != nil || run == nil || run.CheckpointJSON == nil {
+		return "", err
+	}
+	var checkpoint struct {
+		Issue *struct {
+			URL string `json:"url"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal([]byte(*run.CheckpointJSON), &checkpoint); err != nil {
+		return "", fmt.Errorf("decode latest product-spec checkpoint: %w", err)
+	}
+	if checkpoint.Issue == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(checkpoint.Issue.URL), nil
 }
 
 func associateProductSpecReply(ctx context.Context, gateway *planedoc.Gateway, planeProjectID, workItemID string, loop storage.LoopRecord, condition loopcondition.Record) (bool, error) {

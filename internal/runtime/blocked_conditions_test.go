@@ -101,6 +101,26 @@ func TestBlockedConditionRegistryContainsEveryNamedCondition(t *testing.T) {
 	}
 }
 
+func TestLatestRunIssueURLFallsBackToPlannerCheckpoint(t *testing.T) {
+	repositories := newEnqueueTestRepos(t)
+	checkpoint := `{"issue":{"url":"https://plane.example/workspaces/w/projects/p/issues/wi-1"}}`
+	now := "2026-07-15T12:00:00.000Z"
+	ctx := context.Background()
+	if err := repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_product_spec", Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repositories.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_product_spec", Seq: 11, ProjectID: "project_product_spec", Type: "planner", TargetType: "issue", Status: "paused", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repositories.Runs.Upsert(ctx, storage.RunRecord{ID: "run_product_spec", LoopID: "loop_product_spec", Status: "failed", CheckpointJSON: &checkpoint, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	url, err := latestRunIssueURL(ctx, repositories, "loop_product_spec")
+	if err != nil || url != "https://plane.example/workspaces/w/projects/p/issues/wi-1" {
+		t.Fatalf("latestRunIssueURL() = %q, %v", url, err)
+	}
+}
+
 func TestResumeBlockedLoopClearsConditionAndRequeues(t *testing.T) {
 	repositories := newEnqueueTestRepos(t)
 	ctx := context.Background()
