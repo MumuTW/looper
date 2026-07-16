@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	htmlpkg "html"
+	"regexp"
 	"strings"
 	"time"
 
@@ -327,7 +328,26 @@ func (g *Gateway) HasProductSpec(ctx context.Context, projectID, workItemID stri
 }
 
 type WorkItemComment struct {
-	ID string `json:"id"`
+	ID              string `json:"id"`
+	CommentHTML     string `json:"comment_html"`
+	CommentStripped string `json:"comment_stripped"`
+	Actor           string `json:"actor"`
+	CreatedAt       string `json:"created_at"`
+}
+
+// ListWorkItemComments returns work-item comments so source-of-truth waits can
+// observe a product reply without accepting any input from Feishu.
+func (g *Gateway) ListWorkItemComments(ctx context.Context, projectID, workItemID string) ([]WorkItemComment, error) {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(workItemID) == "" {
+		return nil, fmt.Errorf("planedoc: ListWorkItemComments requires project id and work item id")
+	}
+	args := []string{"api", "comment", "list", "--project", projectID, "--work-item", workItemID, "--json"}
+	args = append(args, g.globalArgs()...)
+	result, err := g.runPlane(ctx, "", args...)
+	if err != nil {
+		return nil, fmt.Errorf("planedoc: list work item comments: %w", err)
+	}
+	return decodeWorkItemComments(result.Stdout)
 }
 
 // CreateWorkItemComment posts an HTML comment and returns its id so callers can
@@ -337,7 +357,7 @@ func (g *Gateway) CreateWorkItemComment(ctx context.Context, projectID, workItem
 		return WorkItemComment{}, fmt.Errorf("planedoc: CreateWorkItemComment requires project id, work item id, and html")
 	}
 	data := fmt.Sprintf(`{"comment_html":%s}`, jsonString(commentHTML))
-	args := []string{"api", "comment", "create", "--project", projectID, "--work-item", workItemID, "--data", data}
+	args := []string{"api", "comment", "create", "--project", projectID, "--work-item", workItemID, "--data", data, "--json"}
 	args = append(args, g.globalArgs()...)
 	result, err := g.runPlane(ctx, "", args...)
 	if err != nil {
@@ -367,7 +387,42 @@ func (g *Gateway) RequestProductSpec(ctx context.Context, projectID, workItemID,
 		htmlpkg.EscapeString(strings.TrimSpace(ownerMention)),
 		htmlpkg.EscapeString(strings.TrimSpace(workItemName)),
 	)
+	comments, err := g.ListWorkItemComments(ctx, projectID, workItemID)
+	if err != nil {
+		return WorkItemComment{}, err
+	}
+	for index := len(comments) - 1; index >= 0; index-- {
+		if strings.TrimSpace(comments[index].CommentHTML) == html {
+			return comments[index], nil
+		}
+	}
 	return g.CreateWorkItemComment(ctx, projectID, workItemID, html)
+}
+
+var (
+	workItemCommentHrefPattern = regexp.MustCompile(`(?i)\bhref\s*=\s*["']([^"']+)["']`)
+	workItemCommentURLPattern  = regexp.MustCompile(`https?://[^\s<>"']+`)
+	workItemCommentBreaks      = regexp.MustCompile(`(?i)<br\s*/?>|</(?:p|div|li|h[1-6])\s*>`)
+	workItemCommentTags        = regexp.MustCompile(`<[^>]+>`)
+)
+
+// DroppedSpecContent maps a reply on the exact Plane ask to the existing
+// AssociateDroppedSpec contract. A linked document stays a link; inline text is
+// captured into a Plane page before the work-item association is written.
+func DroppedSpecContent(comment WorkItemComment) (url, inlineText string) {
+	if match := workItemCommentHrefPattern.FindStringSubmatch(comment.CommentHTML); len(match) == 2 {
+		return strings.TrimSpace(htmlpkg.UnescapeString(match[1])), ""
+	}
+	text := strings.TrimSpace(comment.CommentStripped)
+	if text == "" {
+		text = workItemCommentBreaks.ReplaceAllString(comment.CommentHTML, "\n")
+		text = workItemCommentTags.ReplaceAllString(text, "")
+		text = strings.TrimSpace(htmlpkg.UnescapeString(text))
+	}
+	if match := workItemCommentURLPattern.FindString(text); match != "" {
+		return strings.TrimSpace(match), ""
+	}
+	return "", text
 }
 
 // PageComment is a Notion-style comment on a Plane page (powerformer/plane PR #11,
@@ -916,6 +971,24 @@ func decodePageComments(stdout string) ([]PageComment, error) {
 	var bare []PageComment
 	if err := json.Unmarshal([]byte(stdout), &bare); err != nil {
 		return nil, fmt.Errorf("planedoc: decode page comments: %w", err)
+	}
+	return bare, nil
+}
+
+func decodeWorkItemComments(stdout string) ([]WorkItemComment, error) {
+	stdout = strings.TrimSpace(stdout)
+	if stdout == "" {
+		return nil, nil
+	}
+	var envelope struct {
+		Results []WorkItemComment `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err == nil && envelope.Results != nil {
+		return envelope.Results, nil
+	}
+	var bare []WorkItemComment
+	if err := json.Unmarshal([]byte(stdout), &bare); err != nil {
+		return nil, fmt.Errorf("planedoc: decode work item comments: %w", err)
 	}
 	return bare, nil
 }

@@ -1005,7 +1005,7 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 	if present {
 		// A resumed planner passes here once product supplied the spec (node E2) —
 		// clear the hold marker so the card leaves "⏸ 等待产品方案".
-		r.setAwaitingProductSpecMarker(ctx, input.Loop, false)
+		r.setAwaitingProductSpecMarker(ctx, input.Loop, false, "")
 		return nil // has a product spec → proceed to write the tech spec
 	}
 	comment, err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", issue.Title)
@@ -1017,7 +1017,7 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 	r.requestProductSpecInThread(ctx, input, issue.Title, planedoc.WorkItemCommentURL(issue.URL, comment.ID))
 	// Mark the hold reason so the anchor card reads "⏸ 等待产品方案" (node E) rather
 	// than the generic "⏸ 等你定夺" — the header alone tells you what's blocking.
-	r.setAwaitingProductSpecMarker(ctx, input.Loop, true)
+	r.setAwaitingProductSpecMarker(ctx, input.Loop, true, comment.ID)
 	return &loopError{message: "awaiting product spec — asked product to supply one on the work item", kind: FailureManualIntervention}
 }
 
@@ -1044,7 +1044,7 @@ func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput
 // flag in the loop metadata, so the anchor card can distinguish node E's product-spec
 // wait from a generic HITL ask. Best-effort + guarded: a Runner without a loops repo
 // (e.g. a unit/live test wiring only planeDoc) silently skips it.
-func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.LoopRecord, waiting bool) {
+func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.LoopRecord, waiting bool, askCommentID string) {
 	if r.repos == nil || r.repos.Loops == nil {
 		return
 	}
@@ -1053,7 +1053,7 @@ func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.
 		return
 	}
 	if waiting {
-		metadataJSON, err = loopcondition.Set(&metadataJSON, loopcondition.Record{Kind: loopcondition.ProductSpec, Since: r.nowISO()})
+		metadataJSON, err = loopcondition.Set(&metadataJSON, loopcondition.Record{Kind: loopcondition.ProductSpec, Since: r.nowISO(), Fingerprint: strings.TrimSpace(askCommentID)})
 	} else {
 		metadataJSON, err = loopcondition.Clear(&metadataJSON)
 	}

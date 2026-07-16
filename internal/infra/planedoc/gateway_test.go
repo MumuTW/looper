@@ -281,7 +281,7 @@ func TestDecideIntakeAndHasProductSpec(t *testing.T) {
 }
 
 func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
-	f := &fakeRun{stdouts: []string{`{"id":"c1"}`}}
+	f := &fakeRun{stdouts: []string{`{"results":[]}`, `{"id":"c1"}`}}
 	g := newGateway(f)
 	comment, err := g.RequestProductSpec(context.Background(), "p1", "wi-1", "@产品<x>", "登录 & 注册")
 	if err != nil {
@@ -290,8 +290,11 @@ func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
 	if comment.ID != "c1" {
 		t.Fatalf("comment id = %q, want c1", comment.ID)
 	}
-	args := f.calls[0]
-	if !argsContain(args, "api", "comment", "create") || !argPairPresent(args, "--work-item", "wi-1") {
+	if len(f.calls) != 2 || !argsContain(f.calls[0], "api", "comment", "list", "--json") {
+		t.Fatalf("calls = %v, want list then create", f.calls)
+	}
+	args := f.calls[1]
+	if !argsContain(args, "api", "comment", "create", "--json") || !argPairPresent(args, "--work-item", "wi-1") {
 		t.Fatalf("comment args = %v", args)
 	}
 	// The --data value is valid JSON whose decoded comment_html has the mention/name
@@ -304,6 +307,29 @@ func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
 	}
 	if !strings.Contains(data.CommentHTML, "&lt;x&gt;") || !strings.Contains(data.CommentHTML, "&amp;") {
 		t.Fatalf("comment_html not escaped: %q", data.CommentHTML)
+	}
+}
+
+func TestRequestProductSpecReusesExactExistingAsk(t *testing.T) {
+	html := `<p>产品负责人 这个需求「导出」还没有 product spec。请补一份 —— 直接把方案页链接或正文发在这里,looper 会自动把它关联到本 work item 并继续。</p>`
+	f := &fakeRun{stdouts: []string{`{"results":[{"id":"existing","comment_html":` + jsonString(html) + `}]}`}}
+	comment, err := newGateway(f).RequestProductSpec(context.Background(), "p1", "wi-1", "产品负责人", "导出")
+	if err != nil {
+		t.Fatalf("RequestProductSpec error = %v", err)
+	}
+	if comment.ID != "existing" || len(f.calls) != 1 {
+		t.Fatalf("comment = %+v, calls = %v; want one list call reusing existing ask", comment, f.calls)
+	}
+}
+
+func TestDroppedSpecContentPrefersLinkAndPreservesInlineText(t *testing.T) {
+	url, inline := DroppedSpecContent(WorkItemComment{CommentHTML: `<p>方案：<a href="https://docs.example/spec?a=1&amp;b=2">查看</a></p>`})
+	if url != "https://docs.example/spec?a=1&b=2" || inline != "" {
+		t.Fatalf("linked content = (%q, %q)", url, inline)
+	}
+	url, inline = DroppedSpecContent(WorkItemComment{CommentHTML: `<p>目标：高保真导出</p><p>验收：React 与 CSS 分离</p>`})
+	if url != "" || inline != "目标：高保真导出\n验收：React 与 CSS 分离" {
+		t.Fatalf("inline content = (%q, %q)", url, inline)
 	}
 }
 

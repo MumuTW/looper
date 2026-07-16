@@ -37,8 +37,8 @@ func gateInput(labels []string) (stepInput, plannerCheckpoint) {
 }
 
 func TestProductSpecGateHoldsFeatureWithoutSpec(t *testing.T) {
-	// link list (no product-spec) → then comment create (RequestProductSpec)
-	gw, calls := scriptedGateway(`{"results":[]}`, `{"id":"c1"}`)
+	// link list (no product-spec) → exact-ask lookup → comment create
+	gw, calls := scriptedGateway(`{"results":[]}`, `{"results":[]}`, `{"id":"c1"}`)
 	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }}
 	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
 
@@ -46,13 +46,13 @@ func TestProductSpecGateHoldsFeatureWithoutSpec(t *testing.T) {
 	if gateErr == nil || gateErr.kind != FailureManualIntervention {
 		t.Fatalf("gate = %v, want a manual-intervention hold", gateErr)
 	}
-	if len(*calls) != 2 {
-		t.Fatalf("calls = %d, want link list + comment create", len(*calls))
+	if len(*calls) != 3 {
+		t.Fatalf("calls = %d, want link list + ask lookup + comment create", len(*calls))
 	}
 	// asked product on the work item
-	comment := (*calls)[1]
+	comment := (*calls)[2]
 	if comment[1] != "comment" || comment[2] != "create" {
-		t.Fatalf("second call = %v, want comment create", comment)
+		t.Fatalf("third call = %v, want comment create", comment)
 	}
 }
 

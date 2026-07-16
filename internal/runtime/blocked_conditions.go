@@ -81,7 +81,7 @@ func (r *Runtime) reconcileBlockedConditions(ctx context.Context) {
 
 func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *storage.Repositories, gateway *githubinfra.Gateway) map[loopcondition.Kind]blockedConditionReconciler {
 	return map[loopcondition.Kind]blockedConditionReconciler{
-		loopcondition.ProductSpec: func(ctx context.Context, loop storage.LoopRecord, _ loopcondition.Record) (bool, error) {
+		loopcondition.ProductSpec: func(ctx context.Context, loop storage.LoopRecord, condition loopcondition.Record) (bool, error) {
 			planeGateway, planeProjectID, ok := planeDocForProject(cfg, loop.ProjectID)
 			if !ok || planeGateway == nil {
 				return false, nil
@@ -92,7 +92,11 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 				return false, nil
 			}
 			present, _, err := planeGateway.HasProductSpec(ctx, planeProjectID, workItemID)
-			return shouldResumeForProductSpec(loop.Type, loop.Status, hasSpecPR, present), err
+			if err != nil || present {
+				return shouldResumeForProductSpec(loop.Type, loop.Status, hasSpecPR, present), err
+			}
+			associated, err := associateProductSpecReply(ctx, planeGateway, planeProjectID, workItemID, loop, condition)
+			return shouldResumeForProductSpec(loop.Type, loop.Status, hasSpecPR, associated), err
 		},
 		loopcondition.DiskRecovered: func(_ context.Context, _ storage.LoopRecord, _ loopcondition.Record) (bool, error) {
 			return diskConditionCleared(cfg)
@@ -164,6 +168,51 @@ func (r *Runtime) blockedConditionRegistry(cfg *config.Config, repositories *sto
 			return recoverableInfraConditionCleared(ctx, cfg, repositories, &projectID, condition.Fingerprint)
 		},
 	}
+}
+
+func associateProductSpecReply(ctx context.Context, gateway *planedoc.Gateway, planeProjectID, workItemID string, loop storage.LoopRecord, condition loopcondition.Record) (bool, error) {
+	since, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(condition.Since))
+	if err != nil {
+		return false, nil
+	}
+	comments, err := gateway.ListWorkItemComments(ctx, planeProjectID, workItemID)
+	if err != nil {
+		return false, err
+	}
+	var reply *planedoc.WorkItemComment
+	for index := range comments {
+		comment := &comments[index]
+		if comment.ID == condition.Fingerprint {
+			continue
+		}
+		createdAt, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(comment.CreatedAt))
+		if parseErr != nil || !createdAt.After(since) {
+			continue
+		}
+		url, inlineText := planedoc.DroppedSpecContent(*comment)
+		if url == "" && inlineText == "" {
+			continue
+		}
+		if reply == nil {
+			reply = comment
+			continue
+		}
+		currentAt, _ := time.Parse(time.RFC3339Nano, strings.TrimSpace(reply.CreatedAt))
+		if createdAt.Before(currentAt) {
+			reply = comment
+		}
+	}
+	if reply == nil {
+		return false, nil
+	}
+	url, inlineText := planedoc.DroppedSpecContent(*reply)
+	issueNumber, _ := parseIssueNumberFromTargetID(derefString(loop.TargetID))
+	pageName := "Product spec"
+	if issueNumber > 0 {
+		pageName = fmt.Sprintf("Product spec #%d", issueNumber)
+	}
+	_, err = gateway.AssociateDroppedSpec(ctx, planeProjectID, workItemID, planedoc.SpecKindProduct, url, inlineText, pageName)
+	return err == nil, err
 }
 
 func recordPlaneHITLAnswer(ctx context.Context, repositories *storage.Repositories, loopID, answer, answeredAt string) error {

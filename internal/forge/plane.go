@@ -685,7 +685,12 @@ type planeUser struct {
 }
 
 func (u planeUser) login() string {
-	for _, candidate := range []string{u.DisplayName, u.Email, u.FirstName, u.ID} {
+	// Plane work-item assignees are represented by user UUIDs and PATCH expects
+	// those same UUIDs. Identity.Login is the provider-neutral string routing key
+	// used by the planner/worker adapters, so for Plane it must be the UUID rather
+	// than the human display name. Keep the readable fields only as defensive
+	// fallbacks for incomplete API fixtures/responses.
+	for _, candidate := range []string{u.ID, u.DisplayName, u.Email, u.FirstName} {
 		if strings.TrimSpace(candidate) != "" {
 			return strings.TrimSpace(candidate)
 		}

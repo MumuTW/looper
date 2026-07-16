@@ -3,15 +3,47 @@ package runtime
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/infra/disk"
+	"github.com/nexu-io/looper/internal/infra/planedoc"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
 	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+func TestAssociateProductSpecReplyLinksFirstPlaneReplyAfterAsk(t *testing.T) {
+	responses := []string{
+		`{"results":[{"id":"ask","comment_html":"<p>ask</p>","created_at":"2026-07-15T12:00:00.000Z"},{"id":"reply","comment_html":"<p><a href=\"https://docs.example/product-spec\">方案</a></p>","created_at":"2026-07-15T12:01:00.000Z"}]}`,
+		`{"results":[]}`,
+		`{"id":"link-1"}`,
+	}
+	var calls [][]string
+	gateway := planedoc.New(planedoc.Options{Run: func(_ context.Context, options shell.Options) (shell.Result, error) {
+		calls = append(calls, options.Args)
+		stdout := responses[len(calls)-1]
+		return shell.Result{Stdout: stdout}, nil
+	}})
+	targetID := "issue:nexu-io/open-design:582"
+	associated, err := associateProductSpecReply(
+		context.Background(),
+		gateway,
+		"plane-project",
+		"work-item",
+		storage.LoopRecord{TargetID: &targetID},
+		loopcondition.Record{Since: "2026-07-15T12:00:30.000Z", Fingerprint: "ask"},
+	)
+	if err != nil || !associated {
+		t.Fatalf("associateProductSpecReply() = %v, %v", associated, err)
+	}
+	if len(calls) != 3 || !strings.Contains(strings.Join(calls[2], " "), "looper:product-spec") {
+		t.Fatalf("calls = %v, want comment list then product-spec link lookup/create", calls)
+	}
+}
 
 func TestEffectiveBlockedConditionMigratesLegacyMarkers(t *testing.T) {
 	productMetadata := `{"awaitingProductSpec":true}`
