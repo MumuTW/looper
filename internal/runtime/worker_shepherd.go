@@ -29,6 +29,11 @@ const shepherdReconcileLockTTL = 20 * time.Minute
 // wake-reconcile.
 const shepherdReconcileInterval = 60 * time.Second
 
+// Plane state writes are best-effort and Plane can be temporarily slow or unavailable.
+// Remember failed attempts in the durable shepherd marker and retry at this cadence,
+// rather than hammering Plane on every 60-second PR reconciliation tick.
+const shepherdPlaneStateRetryInterval = 10 * time.Minute
+
 // shepherdMaxPasses caps how many agent passes one PR may consume before the
 // shepherd stops waking and leaves it for a human — a backstop against a flapping
 // PR burning agent quota. Counts only agent-waking passes.
@@ -60,12 +65,18 @@ func (r *Runtime) reconcileWorkerShepherd(ctx context.Context) {
 	if now == nil {
 		now = time.Now
 	}
-	shepherding, err := repositories.Loops.ListByStatuses(ctx, []string{"shepherding"})
+	// Completed shepherd loops are included only to retry a failed terminal Plane
+	// state write. They never touch GitHub or wake an agent again.
+	shepherding, err := repositories.Loops.ListByStatuses(ctx, []string{"shepherding", "completed"})
 	if err != nil {
 		return
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	for _, loop := range shepherding {
+		if strings.EqualFold(strings.TrimSpace(loop.Status), "completed") {
+			r.reconcileCompletedShepherdPlaneState(ctx, repositories, loop, nowISO)
+			continue
+		}
 		r.reconcileOneShepherdLoop(ctx, repositories, gateway, now, loop, nowISO, logger)
 	}
 }
@@ -118,6 +129,15 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		return
 	}
 	prNumber := *loop.PRNumber
+	// Shepherding itself proves the implementation PR exists, so keep Plane at
+	// In Review independently of the live GitHub read below. GitHub auth/network
+	// failures must not suppress Plane's own lifecycle reconciliation.
+	if r.syncShepherdPlaneState(ctx, repositories, &marker, loop, "In Review", nowISO) {
+		if metadata, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
+			r.persistLoopMetadata(ctx, repositories, loop.ID, metadata, nowISO)
+			loop.MetadataJSON = &metadata
+		}
+	}
 	cwd := ""
 	if proj, perr := repositories.Projects.GetByID(ctx, loop.ProjectID); perr == nil && proj != nil {
 		cwd = proj.RepoPath
@@ -147,7 +167,8 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		// early return left the Feishu card permanently stuck on 修复中 even though
 		// the live PR was already awaiting QA/merge. Always reconcile phase drift
 		// from the live PR before resting, even when the wake signal is unchanged.
-		if syncShepherdPhase(&marker, pr) {
+		phaseChanged := syncShepherdPhase(&marker, pr)
+		if phaseChanged {
 			r.reportShepherdPhase(ctx, &marker, loop, prNumber, prValidated(pr))
 			if newMeta, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
 				if newMeta, werr = loopcondition.Set(&newMeta, shepherdRestingCondition(pr, signal, nowISO)); werr == nil {
@@ -203,6 +224,53 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		}
 		r.enqueueShepherdPass(ctx, repositories, loop, repo, prNumber, nowISO, logger)
 	}
+}
+
+// syncShepherdPlaneState makes the In Review transition self-healing. The initial
+// worker-completed notification still attempts the update immediately; this durable
+// retry closes the gap when that one-shot write happened during a Plane outage.
+// It returns true when an attempt changed marker metadata and therefore needs
+// persistence by the caller.
+func (r *Runtime) syncShepherdPlaneState(ctx context.Context, repositories *storage.Repositories, marker *loops.Shepherd, loop storage.LoopRecord, desired, nowISO string) bool {
+	if marker == nil {
+		return false
+	}
+	now, err := time.Parse(time.RFC3339Nano, nowISO)
+	if err != nil || !shepherdPlaneStateSyncDue(*marker, desired, now) {
+		return false
+	}
+	marker.PlaneStateAttemptAt = nowISO
+
+	r.mu.RLock()
+	cfg := r.config
+	stateLogger := r.logger
+	r.mu.RUnlock()
+	if setPlaneWorkItemState(ctx, &cfg, repositories, stateLogger, loop.ProjectID, loop.ID, desired) {
+		marker.PlaneState = desired
+		marker.PlaneStateAttemptAt = ""
+	}
+	return true
+}
+
+func (r *Runtime) reconcileCompletedShepherdPlaneState(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string) {
+	marker, ok := loops.ReadShepherd(loop.MetadataJSON)
+	if !ok || marker.Active || !strings.EqualFold(strings.TrimSpace(marker.Outcome), "merged") {
+		return
+	}
+	if !r.syncShepherdPlaneState(ctx, repositories, &marker, loop, "Done", nowISO) {
+		return
+	}
+	if metadata, err := loops.WriteShepherd(loop.MetadataJSON, marker); err == nil {
+		r.persistLoopMetadata(ctx, repositories, loop.ID, metadata, nowISO)
+	}
+}
+
+func shepherdPlaneStateSyncDue(marker loops.Shepherd, desired string, now time.Time) bool {
+	if strings.EqualFold(strings.TrimSpace(marker.PlaneState), strings.TrimSpace(desired)) {
+		return false
+	}
+	attemptedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(marker.PlaneStateAttemptAt))
+	return err != nil || now.Sub(attemptedAt) >= shepherdPlaneStateRetryInterval
 }
 
 func shepherdRestingCondition(pr githubinfra.PullRequestDetail, signal, nowISO string) loopcondition.Record {
@@ -510,14 +578,9 @@ func (r *Runtime) terminateShepherd(ctx context.Context, repos *storage.Reposito
 	r.refreshShepherdCard(ctx, loop.ID)
 	if strings.EqualFold(strings.TrimSpace(outcome), "merged") {
 		r.postShepherdThreadNote(ctx, loop.ID, fmt.Sprintf("🎉 PR #%d 已合并。", prNumber), nil)
-		// Reflect the merge in Plane's own state column: In Review → Done. Plane projects
-		// only; best-effort (a failure must never disturb the terminate/merge flow).
-		r.mu.RLock()
-		cfg := r.config
-		stateRepos := r.services.Repositories
-		stateLogger := r.logger
-		r.mu.RUnlock()
-		setPlaneWorkItemState(ctx, &cfg, stateRepos, stateLogger, loop.ProjectID, loop.ID, "Done")
+		// Reflect the merge in Plane's own state column: In Review → Done. A failed
+		// best-effort write is recorded in the marker and retried by the reconciler.
+		r.reconcileCompletedShepherdPlaneState(ctx, repos, updated, nowISO)
 	}
 	if repos.Locks != nil {
 		_ = repos.Locks.Release(ctx, fmt.Sprintf("pr:%s:%d", repo, prNumber))

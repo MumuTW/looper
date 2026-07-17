@@ -2,10 +2,30 @@ package runtime
 
 import (
 	"testing"
+	"time"
 
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
 )
+
+func TestShepherdPlaneStateRetryGate(t *testing.T) {
+	now := time.Date(2026, 7, 17, 3, 0, 0, 0, time.UTC)
+
+	if !shepherdPlaneStateSyncDue(loops.Shepherd{}, "In Review", now) {
+		t.Fatal("never-attempted state should sync immediately")
+	}
+	if shepherdPlaneStateSyncDue(loops.Shepherd{PlaneState: "in review"}, "In Review", now) {
+		t.Fatal("already-synced state should not be written again")
+	}
+	recent := loops.Shepherd{PlaneStateAttemptAt: now.Add(-5 * time.Minute).Format(time.RFC3339Nano)}
+	if shepherdPlaneStateSyncDue(recent, "In Review", now) {
+		t.Fatal("failed attempt inside the retry window should be rate-limited")
+	}
+	stale := loops.Shepherd{PlaneStateAttemptAt: now.Add(-11 * time.Minute).Format(time.RFC3339Nano)}
+	if !shepherdPlaneStateSyncDue(stale, "In Review", now) {
+		t.Fatal("failed attempt outside the retry window should retry")
+	}
+}
 
 func check(status, conclusion string) map[string]any {
 	return map[string]any{"status": status, "conclusion": conclusion}
