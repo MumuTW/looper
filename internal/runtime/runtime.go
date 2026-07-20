@@ -113,6 +113,11 @@ type Runtime struct {
 	config config.Config
 	logger bootstrap.Logger
 	now    func() time.Time
+	// Injectable only to exercise the full Plane reconciliation state machines
+	// without a real CLI/network. Production uses planeDocForProject.
+	planeDocFactory planeDocFactory
+	// Test seam for the approval classifier; production builds the configured agent.
+	specApprovalJudge specApprovalJudgeFunc
 
 	openSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	syncConfiguredProjects SyncConfiguredProjectsFunc
@@ -1146,6 +1151,10 @@ func (r *Runtime) releaseExpiredLocks(ctx context.Context, repositories *storage
 const (
 	wakeReconcileThreshold    = 90 * time.Second
 	periodicReconcileInterval = 5 * time.Minute
+	// Plane has no inbound webhook seam for work-item/page comments in this
+	// runtime. Human decisions and spec approvals therefore need a much tighter
+	// lightweight poll than the full recovery/auto-intake sweep.
+	humanGateReconcileInterval = 30 * time.Second
 )
 
 // shouldWakeReconcile decides, from the time since the last claim pass and since
@@ -1194,6 +1203,9 @@ func (r *Runtime) runWakeReconcile(ctx context.Context, reason string) {
 	r.reconcileAutoIntake(ctx)
 	// Resume planner loops whose product spec was supplied while they were held (E2).
 	r.reconcileAwaitingProductSpec(ctx)
+	// Resume V2 planner loops only after the configured Plane role authorities have
+	// answered the current decision revision. Feishu is notification-only.
+	r.reconcileAwaitingRoleDecisions(ctx)
 	// Dispatch the worker for tech specs a human approved on the Plane page (node H→I).
 	r.reconcileSpecApproval(ctx)
 	// Drive worker loops shepherding their impl PR toward merge (looper:auto): wake
@@ -1213,11 +1225,18 @@ func (r *Runtime) runSchedulerClaimLoop(ctx context.Context, stopCh <-chan struc
 	}
 	lastPass := nowFn()
 	lastReconcile := lastPass
+	lastHumanGateReconcile := time.Time{}
 	// maybeReconcile detects a suspend/resume (or a periodic due time) before each
 	// claim pass and runs the wake reconcile so a laptop that was closed mid-run
 	// resumes its work rather than waiting for a full queue.
 	maybeReconcile := func() {
 		now := nowFn()
+		if lastHumanGateReconcile.IsZero() || now.Sub(lastHumanGateReconcile) >= humanGateReconcileInterval {
+			r.reconcileAwaitingProductSpec(ctx)
+			r.reconcileAwaitingRoleDecisions(ctx)
+			r.reconcileSpecApproval(ctx)
+			lastHumanGateReconcile = now
+		}
 		if run, reason := shouldWakeReconcile(now.Sub(lastPass), now.Sub(lastReconcile)); run {
 			r.runWakeReconcile(ctx, reason)
 			lastReconcile = now

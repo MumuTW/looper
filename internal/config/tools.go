@@ -20,6 +20,7 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 		LooperPath:    cloneStringPtr(configured.LooperPath),
 		OsascriptPath: cloneStringPtr(configured.OsascriptPath),
 		PlanePath:     cloneStringPtr(configured.PlanePath),
+		BrowserPath:   cloneStringPtr(configured.BrowserPath),
 	}
 
 	detection := map[string]ToolDetectionStatus{

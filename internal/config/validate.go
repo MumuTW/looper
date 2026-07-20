@@ -13,6 +13,7 @@ import (
 )
 
 var networkNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var planeMemberIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 type ValidationIssue struct {
 	Path    string
@@ -396,6 +397,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 		}
 		validateProductOwner(project.ProductOwner, prefix+".productOwner", &issues)
+		validateFeishuActor(project.DesignOwner, prefix+".designOwner", &issues)
 		validateFeishuActor(project.QA, prefix+".qa", &issues)
 		validateFeishuActor(project.Owner, prefix+".owner", &issues)
 		if project.Roles != nil && project.Roles.Coordinator != nil {
@@ -1105,17 +1107,8 @@ func validateProductOwner(owner *ProductOwnerConfig, path string, issues *[]Vali
 	if owner == nil {
 		return
 	}
-	openID := owner.FeishuOpenID
-	if openID == "" {
-		return
-	}
-	if strings.TrimSpace(openID) != openID {
-		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must not contain leading or trailing whitespace"})
-		return
-	}
-	if !strings.HasPrefix(openID, "ou_") {
-		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must be a Feishu open_id (starts with ou_)"})
-	}
+	validateFeishuOpenID(owner.FeishuOpenID, path+".feishuOpenId", issues)
+	validatePlaneMemberID(owner.PlaneID, path+".planeId", issues)
 }
 
 // validateFeishuActor checks an optional per-project @-mention actor (QA / owner):
@@ -1124,16 +1117,33 @@ func validateFeishuActor(actor *FeishuActorConfig, path string, issues *[]Valida
 	if actor == nil {
 		return
 	}
-	openID := actor.FeishuOpenID
+	validateFeishuOpenID(actor.FeishuOpenID, path+".feishuOpenId", issues)
+	validatePlaneMemberID(actor.PlaneID, path+".planeId", issues)
+}
+
+func validateFeishuOpenID(openID, path string, issues *[]ValidationIssue) {
 	if openID == "" {
 		return
 	}
 	if strings.TrimSpace(openID) != openID {
-		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must not contain leading or trailing whitespace"})
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must not contain leading or trailing whitespace"})
 		return
 	}
 	if !strings.HasPrefix(openID, "ou_") {
-		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must be a Feishu open_id (starts with ou_)"})
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a Feishu open_id (starts with ou_)"})
+	}
+}
+
+func validatePlaneMemberID(value, path string, issues *[]ValidationIssue) {
+	if value == "" {
+		return
+	}
+	if strings.TrimSpace(value) != value {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must not contain leading or trailing whitespace"})
+		return
+	}
+	if !planeMemberIDPattern.MatchString(value) {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a Plane member UUID"})
 	}
 }
 

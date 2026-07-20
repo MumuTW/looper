@@ -82,6 +82,15 @@ func (r *Runtime) reconcileAwaitingProductSpec(ctx context.Context) {
 		if !strings.EqualFold(strings.TrimSpace(loop.Type), "planner") {
 			continue
 		}
+		// V2 owns its formal-product-spec wait inside the revisioned decision
+		// checkpoint; the legacy gate must never wake a V2 role-decision wait.
+		var loopMeta map[string]any
+		if loop.MetadataJSON != nil {
+			_ = json.Unmarshal([]byte(*loop.MetadataJSON), &loopMeta)
+		}
+		if version, ok := loopMeta["plannerPipelineVersion"].(float64); ok && version >= 2 {
+			continue
+		}
 		gateway, planeProjectID, ok := planeDocForProject(&cfg, loop.ProjectID)
 		if !ok || gateway == nil {
 			continue

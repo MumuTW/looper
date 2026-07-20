@@ -193,6 +193,36 @@ func TestEnqueueHumanMessageReactivatesCompletedPlannerLoop(t *testing.T) {
 	}
 }
 
+func TestEnqueueHumanMessageDoesNotReactivatePlaneDecisionV2Planner(t *testing.T) {
+	repos := newEnqueueTestRepos(t)
+	ctx := context.Background()
+	nowISO := "2026-07-17T00:00:00.000Z"
+	projectID := "project_v2"
+	loopID := "loop_v2"
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "V2", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := `{"plannerPipelineVersion":2}`
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 4, ProjectID: projectID, Type: "planner", TargetType: "issue", Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	ackClosed, err := enqueueHumanMessageToLoop(ctx, repos, nowISO, loopID, "飞书里选 A")
+	if err != nil || ackClosed {
+		t.Fatalf("enqueue = (%v, %v)", ackClosed, err)
+	}
+	got, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || got == nil {
+		t.Fatal(err)
+	}
+	if got.Status != "paused" || len(loops.ReadHumanInbox(got.MetadataJSON)) != 0 {
+		t.Fatalf("V2 Plane-only loop mutated: %#v inbox=%#v", got, loops.ReadHumanInbox(got.MetadataJSON))
+	}
+	active, err := repos.Queue.FindActiveByLoopID(ctx, loopID)
+	if err != nil || active != nil {
+		t.Fatalf("unexpected queue item %#v, err=%v", active, err)
+	}
+}
+
 func TestDetectGitHubHITLAnswer(t *testing.T) {
 	comments := []githubAnswerComment{
 		{ID: 100, Author: "lefarcen", Body: "<!-- looper:hitl:ask v=1 --> which one?"}, // the ask (bot marker), == askCommentID

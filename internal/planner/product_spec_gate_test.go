@@ -2,12 +2,35 @@ package planner
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+func TestRequestProductSpecInThreadMatchesStrictPlaneLinkGate(t *testing.T) {
+	var got string
+	cfg := config.Config{Projects: []config.ProjectRefConfig{{ID: "project", ProductOwner: &config.ProductOwnerConfig{FeishuOpenID: "ou_product"}}}}
+	runner := &Runner{projectRoleConfig: &cfg, postThreadNote: func(_ context.Context, _ string, text string, mentions []string) error {
+		got = text
+		if len(mentions) != 1 || mentions[0] != "ou_product" {
+			t.Fatalf("mentions = %#v", mentions)
+		}
+		return nil
+	}}
+	runner.requestProductSpecInThread(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project"}, Loop: storage.LoopRecord{ID: "loop"}}, "跨页面导出")
+	for _, want := range []string{"looper:product-spec", "Links", "非空", "普通评论", "飞书回复", "不会解除"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("thread note missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "发在本 thread") || strings.Contains(got, "自动关联") {
+		t.Fatalf("thread note promises unsupported association: %s", got)
+	}
+}
 
 // scriptedGateway builds a planedoc gateway whose plane CLI returns the given
 // stdouts in order, and records the invocations.
@@ -57,14 +80,14 @@ func TestProductSpecGateHoldsFeatureWithoutSpec(t *testing.T) {
 }
 
 func TestProductSpecGateProceedsWhenSpecPresent(t *testing.T) {
-	gw, calls := scriptedGateway(`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`)
+	gw, calls := scriptedGateway(`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`, "# Product Spec")
 	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }}
 	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
 	if gateErr := r.productSpecGate(context.Background(), in, cp); gateErr != nil {
 		t.Fatalf("gate = %v, want nil (has product spec → proceed)", gateErr)
 	}
-	if len(*calls) != 1 {
-		t.Fatalf("calls = %d, want only the link list (no comment)", len(*calls))
+	if len(*calls) != 2 {
+		t.Fatalf("calls = %d, want link list + non-empty Plane page read (no comment)", len(*calls))
 	}
 }
 

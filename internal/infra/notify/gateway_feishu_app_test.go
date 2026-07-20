@@ -335,6 +335,53 @@ func TestBuildFeishuAskCardRendersMention(t *testing.T) {
 	}
 }
 
+func TestFeishuCardsAttributeTheLocalLooperOwner(t *testing.T) {
+	card, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq: 9, Question: "是否继续?", Options: []string{"继续"}, OwnerOpenID: "ou_local_owner",
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard() error = %v", err)
+	}
+	if raw := string(card); !strings.Contains(raw, "来自 ") || !strings.Contains(raw, "ou_local_owner") || !strings.Contains(raw, " 的 Looper") {
+		t.Fatalf("ask card missing local Looper owner attribution: %s", raw)
+	}
+
+	// Membership is deliberately not checked: an open_id outside the destination
+	// group is still emitted as an @ tag (Feishu may render it grey).
+	if card, ok := feishuLiveFeedCardWithOwner([]string{"✅ git status"}, 3, "ou_not_in_chat"); !ok || !strings.Contains(card, "ou_not_in_chat") || !strings.Contains(card, "来自 ") {
+		t.Fatalf("live card must preserve out-of-chat owner attribution: %q", card)
+	}
+
+	fallback, err := buildFeishuAskCard(HITLAskCard{LoopSeq: 10, Question: "A?", Options: []string{"A"}})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(no owner) error = %v", err)
+	}
+	if !strings.Contains(string(fallback), "未配置 owner") {
+		t.Fatalf("missing-owner card should diagnose attribution config: %s", fallback)
+	}
+
+	coordinator := openNotifyCoordinator(t, t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-07-17T12:00:00.000Z"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "open-design", Name: "Open Design", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	title := `{"worker":{"issueUrl":"https://plane.example/issues/582"},"issueTitle":"导出还原度"}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop-owner", Seq: 11, ProjectID: "open-design", Type: "planner", TargetType: "issue", Status: "running", MetadataJSON: &title, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := NewGateway(Options{Repositories: repos, ResolveOwnerOpenID: func(projectID string) string {
+		if projectID != "open-design" {
+			t.Fatalf("owner resolver project = %q", projectID)
+		}
+		return "ou_coworker_owner"
+	}})
+	anchor, ok := gateway.feishuThreadHeaderCard(context.Background(), "loop-owner")
+	if !ok || !strings.Contains(anchor, "ou_coworker_owner") || !strings.Contains(anchor, "来自 ") {
+		t.Fatalf("task anchor missing deployment owner attribution: %q", anchor)
+	}
+}
+
 func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 	card, err := buildFeishuAskCard(HITLAskCard{
 		LoopSeq:  132,

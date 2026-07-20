@@ -171,7 +171,10 @@ func (plane *PlaneClient) CurrentUser(ctx context.Context) (Identity, error) {
 	if err := plane.do(ctx, http.MethodGet, "users/me", nil, nil, &user); err != nil {
 		return Identity{}, err
 	}
-	return Identity{Login: user.login()}, nil
+	// Plane work-item assignees are member UUIDs. The shared forge interface calls
+	// this field Login, but returning a display name here makes manual plan/work
+	// commands PATCH an invalid assignee value (for example "mashu").
+	return Identity{Login: user.assignmentID()}, nil
 }
 
 // ListOpenIssues returns Plane work-items mapped onto looper's Issue type. When
@@ -365,14 +368,25 @@ func (plane *PlaneClient) ListIssueComments(ctx context.Context, issueNumber int
 // resolveWorkItem finds the full work-item (including its UUID, needed for
 // mutations) by its per-project sequence_id.
 func (plane *PlaneClient) resolveWorkItem(ctx context.Context, number int64) (planeWorkItem, error) {
-	items, err := plane.listWorkItems(ctx, 0)
-	if err != nil {
-		return planeWorkItem{}, err
-	}
-	for _, item := range items {
-		if item.SequenceID == number {
-			return item, nil
+	cursor := ""
+	for page := 0; page < planeMaxWorkItemPages; page++ {
+		query := url.Values{"per_page": {fmt.Sprintf("%d", planeWorkItemPageSize)}}
+		if cursor != "" {
+			query.Set("cursor", cursor)
 		}
+		var body planeWorkItemPage
+		if err := plane.do(ctx, http.MethodGet, plane.projectPath("work-items"), query, nil, &body); err != nil {
+			return planeWorkItem{}, err
+		}
+		for _, item := range body.results() {
+			if item.SequenceID == number {
+				return item, nil
+			}
+		}
+		if !body.NextPageResults || strings.TrimSpace(body.NextCursor) == "" {
+			break
+		}
+		cursor = body.NextCursor
 	}
 	return planeWorkItem{}, fmt.Errorf("plane client: work-item with sequence_id %d not found in project %s", number, plane.projectID)
 }
@@ -684,8 +698,8 @@ type planeUser struct {
 	FirstName   string `json:"first_name"`
 }
 
-func (u planeUser) login() string {
-	for _, candidate := range []string{u.DisplayName, u.Email, u.FirstName, u.ID} {
+func (u planeUser) assignmentID() string {
+	for _, candidate := range []string{u.ID, u.DisplayName, u.Email, u.FirstName} {
 		if strings.TrimSpace(candidate) != "" {
 			return strings.TrimSpace(candidate)
 		}

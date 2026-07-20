@@ -36,6 +36,16 @@ func ProjectProductOwner(cfg Config, projectID string) ProductOwnerConfig {
 	return *project.ProductOwner
 }
 
+// ProjectDesignOwner resolves the project's design-decision authority. PlaneID is
+// used for answers; FeishuOpenID targets the notification only.
+func ProjectDesignOwner(cfg Config, projectID string) FeishuActorConfig {
+	project := findConfiguredProject(cfg.Projects, projectID)
+	if project == nil || project.DesignOwner == nil {
+		return FeishuActorConfig{}
+	}
+	return *project.DesignOwner
+}
+
 // ProjectQA resolves a project's QA validator open_id — who the shepherd @-mentions
 // when a PR carries `needs-validation` and isn't `validated` yet. Project-level.
 // Unknown ids / unset config return an empty open_id (no one to ping).
@@ -56,6 +66,16 @@ func ProjectOwner(cfg Config, projectID string) string {
 		return ""
 	}
 	return project.Owner.FeishuOpenID
+}
+
+// ProjectOwnerActor resolves both identities for this deploy's owner. Keep
+// ProjectOwner for callers that only need the Feishu open_id.
+func ProjectOwnerActor(cfg Config, projectID string) FeishuActorConfig {
+	project := findConfiguredProject(cfg.Projects, projectID)
+	if project == nil || project.Owner == nil {
+		return FeishuActorConfig{}
+	}
+	return *project.Owner
 }
 
 func ProjectRoleAutoDiscoveryEnabled(cfg Config, projectID, role string) bool {

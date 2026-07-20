@@ -8,6 +8,15 @@ import (
 	"github.com/nexu-io/looper/internal/infra/planedoc"
 )
 
+type planeDocFactory func(*config.Config, string) (*planedoc.Gateway, string, bool)
+
+func (r *Runtime) resolvePlaneDoc(cfg *config.Config, projectID string) (*planedoc.Gateway, string, bool) {
+	if r != nil && r.planeDocFactory != nil {
+		return r.planeDocFactory(cfg, projectID)
+	}
+	return planeDocForProject(cfg, projectID)
+}
+
 // planeDocForProject builds a Plane spec-document gateway + the Plane project UUID
 // for a project whose task-source provider is "plane", so the planner / worker /
 // reviewer can read and write Plane spec pages and work-item links at runtime (the

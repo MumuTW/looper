@@ -4277,6 +4277,30 @@ func TestHandlerPlannersCreateTriggersSchedulerTickHook(t *testing.T) {
 	assertEqual(t, triggered, 1)
 }
 
+func TestManualPlannerPipelineVersionIncludesV2ForOptedInPlaneProject(t *testing.T) {
+	enabled := true
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "plane", Kind: config.ProviderKindPlane}},
+		Projects: []config.ProjectRefConfig{{
+			ID:       "plane-project",
+			Provider: "plane",
+			Roles: &config.PartialRoleConfigs{
+				Planner: &config.PartialPlannerRoleConfig{PreSpecDecisionGrill: &enabled},
+			},
+		}},
+	}
+	got := manualPlannerPipelineVersion(cfg, "plane-project")
+	if got != 2 {
+		t.Fatalf("manualPlannerPipelineVersion() = %d, want 2", got)
+	}
+	metadata, err := manualPlannerMetadataJSON(nil, 77, got)
+	if err != nil {
+		t.Fatalf("manualPlannerMetadataJSON() error = %v", err)
+	}
+	decoded := parseJSONObject(metadata)
+	assertEqual(t, decoded["plannerPipelineVersion"], float64(2))
+}
+
 func TestHandlerPlannersCreateChecksProjectBeforeIssueValidation(t *testing.T) {
 	fixture := newTestFixture(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"missing-project","issueNumber":0}`)))

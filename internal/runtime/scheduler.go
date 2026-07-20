@@ -695,7 +695,7 @@ func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.Inspec
 	if err != nil {
 		return planner.InspectHeadResult{}, err
 	}
-	return planner.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+	return planner.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, CommittedChangedFiles: result.CommittedChangedFiles, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
 }
 
 func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
@@ -1959,6 +1959,9 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
 		Repositories:  repos,
 		Now:           now,
+		ResolveOwnerOpenID: func(projectID string) string {
+			return config.ProjectOwner(cfg, projectID)
+		},
 	})
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
 	// CURRENT status (colour + label), without disturbing the retained live tail.
@@ -2145,8 +2148,10 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
-		PostThreadNote: notificationGateway.PostThreadNote,
-		PostThreadCard: notificationGateway.PostThreadDecisionCard,
+		PostThreadNote:         notificationGateway.PostThreadNote,
+		PostThreadNoteWithUUID: notificationGateway.PostThreadNoteWithUUID,
+		PostThreadCard:         notificationGateway.PostThreadDecisionCard,
+		PostThreadImage:        notificationGateway.PostThreadImage,
 	})
 	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
 		Repos:   repos,

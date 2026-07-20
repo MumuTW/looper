@@ -801,6 +801,14 @@ func mergeToolPathsConfig(config *ToolPathsConfig, partial PartialToolPathsConfi
 	if partial.OsascriptPath != nil {
 		config.OsascriptPath = stringPtr(*partial.OsascriptPath)
 	}
+
+	if partial.PlanePath != nil {
+		config.PlanePath = stringPtr(*partial.PlanePath)
+	}
+
+	if partial.BrowserPath != nil {
+		config.BrowserPath = stringPtr(*partial.BrowserPath)
+	}
 }
 
 func mergeDaemonConfig(config *DaemonConfig, partial PartialDaemonConfig) {
@@ -1184,6 +1192,9 @@ func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRol
 	if partial.AutoDiscovery != nil {
 		config.AutoDiscovery = *partial.AutoDiscovery
 	}
+	if partial.PreSpecDecisionGrill != nil {
+		config.PreSpecDecisionGrill = *partial.PreSpecDecisionGrill
+	}
 	if partial.Triggers != nil {
 		mergeIssueRoleTriggersConfig(&config.Triggers, *partial.Triggers)
 	}
@@ -1477,6 +1488,7 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			Instructions: cloneStringMap(project.Instructions),
 			Roles:        clonePartialRoleConfigs(project.Roles),
 			ProductOwner: cloneProductOwner(project.ProductOwner),
+			DesignOwner:  cloneFeishuActor(project.DesignOwner),
 			QA:           cloneFeishuActor(project.QA),
 			Owner:        cloneFeishuActor(project.Owner),
 		}
@@ -1579,6 +1591,7 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 			cloned[index].Webhook.Mode = *project.Webhook.Mode
 		}
 		cloned[index].ProductOwner = cloneProductOwner(project.ProductOwner)
+		cloned[index].DesignOwner = cloneFeishuActor(project.DesignOwner)
 		cloned[index].QA = cloneFeishuActor(project.QA)
 		cloned[index].Owner = cloneFeishuActor(project.Owner)
 

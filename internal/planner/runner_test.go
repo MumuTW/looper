@@ -2,7 +2,10 @@ package planner
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,11 +13,87 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/planner/decisions"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+func TestValidatedSpecApprovalReceiptRequiresRemoteTimestamp(t *testing.T) {
+	for _, comment := range []planedoc.PageComment{
+		{ID: "request"},
+		{ID: "request", CreatedAt: "not-a-time"},
+		{CreatedAt: "2026-07-17T12:00:00Z"},
+	} {
+		if _, _, err := validatedSpecApprovalReceipt(comment); err == nil {
+			t.Fatalf("invalid receipt unexpectedly accepted: %#v", comment)
+		}
+	}
+	if id, createdAt, err := validatedSpecApprovalReceipt(planedoc.PageComment{ID: " request ", CreatedAt: "2026-07-17T12:00:00Z"}); err != nil || id != "request" || createdAt != "2026-07-17T12:00:00Z" {
+		t.Fatalf("valid receipt = %q, %q, %v", id, createdAt, err)
+	}
+}
+
+func TestReviewRejectsPlanePageEditedWhileIndependentReviewerRuns(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRunnerFixture(t)
+	worktreePath := t.TempDir()
+	specPath := "specs/change.md"
+	if err := os.MkdirAll(filepath.Join(worktreePath, "specs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, specPath), []byte("# 已复核方案\n原始内容\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	originalRendered := "<h1>已复核方案</h1><p>原始内容</p>"
+	editedDuringReview := "<h1>未复核的新版本</h1><p>人工在 REVIEW 运行中改动</p>"
+	gw, calls := scriptedGateway(
+		`{"results":[{"id":"l1","title":"looper:tech-spec","url":"https://plane.x/pages/pg-1"}]}`,
+		editedDuringReview,
+	)
+	cfg := config.Config{Projects: []config.ProjectRefConfig{{ID: "project_1", Owner: &config.FeishuActorConfig{PlaneID: "owner-plane-id"}}}}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Git:                &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "review-head"}},
+		AgentExecutor:      &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "VERDICT: READY — 可以实现"}}},
+		Logger:             fixture.logger,
+		Now:                fixture.now,
+		CustomInstructions: &cfg,
+		PlaneDoc: func(string) (*planedoc.Gateway, string, bool) {
+			return gw, "plane-project", true
+		},
+	})
+
+	loopID, runID := "loop-review-race", "run-review-race"
+	now := fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := plannerCheckpoint{
+		Issue:    &checkpointIssue{Repo: "nexu-io/open-design", IssueNumber: 582, Title: "导出", URL: "https://plane.x/projects/p/issues/wi-1", SpecPath: specPath},
+		Worktree: &checkpointWorktree{Path: worktreePath, BaseBranch: "main", SpecPath: specPath},
+		Publish:  &checkpointPublishState{Grilled: true, ReviewPlaneContentHash: contentSHA256(originalRendered)},
+	}
+	encoded := mustMarshalJSON(checkpoint)
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CheckpointJSON: &encoded, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	input := stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{ID: loopID, ProjectID: "project_1"}, Run: storage.RunRecord{ID: runID, LoopID: loopID}, Checkpoint: checkpoint}
+	got, err := runner.runReviewStep(ctx, input)
+	var le *loopError
+	if !errors.As(err, &le) || le.kind != FailureRetryableAfterResume || !strings.Contains(err.Error(), "changed during independent REVIEW") {
+		t.Fatalf("runReviewStep() error = %v, want fail-closed REVIEW race", err)
+	}
+	if got.Publish == nil || got.Publish.ReviewPlaneContentHash != "" || got.Publish.Reviewed {
+		t.Fatalf("approval state after race = %#v, want hash invalidated and no approval", got.Publish)
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("Plane calls = %#v, want link lookup + post-REVIEW page read only (no approval comment)", *calls)
+	}
+}
 
 func TestBuildPlannerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 	t.Parallel()
@@ -30,6 +109,121 @@ func TestBuildPlannerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 		if strings.Contains(prompt, unwanted) {
 			t.Fatalf("prompt contains %q:\n%s", unwanted, prompt)
 		}
+	}
+}
+
+func TestCommitGrillSpecRevisionCommitsOnlyTheSpecFile(t *testing.T) {
+	project := storage.ProjectRecord{ID: "project", RepoPath: t.TempDir()}
+	worktree := checkpointWorktree{Path: filepath.Join(t.TempDir(), "worktree"), Branch: "looper/spec", BaseBranch: "main", SpecPath: "specs/change.md"}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "base-sha", HasUncommittedChanges: true, ChangedFiles: []string{"specs/change.md"}}, commitResult: CommitResult{CommitSHA: "grill-sha"}}
+	runner := &Runner{git: git}
+	checkpoint, err := runner.commitGrillSpecRevision(context.Background(), stepInput{Project: project}, plannerCheckpoint{}, checkpointIssue{Title: "导出方案"}, worktree, worktree.SpecPath, "base-sha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(git.commitCalls) != 1 || checkpoint.Lifecycle == nil || len(checkpoint.Lifecycle.CommitSHAs) != 1 || checkpoint.Lifecycle.CommitSHAs[0] != "grill-sha" {
+		t.Fatalf("commit/lifecycle = %#v, calls=%#v", checkpoint.Lifecycle, git.commitCalls)
+	}
+
+	unsafeGit := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "base-sha", HasUncommittedChanges: true, ChangedFiles: []string{"apps/web.ts"}}}
+	_, err = (&Runner{git: unsafeGit}).commitGrillSpecRevision(context.Background(), stepInput{Project: project}, plannerCheckpoint{}, checkpointIssue{Title: "x"}, worktree, worktree.SpecPath, "base-sha")
+	if err == nil || len(unsafeGit.commitCalls) != 0 {
+		t.Fatalf("non-spec edit must fail before commit: err=%v calls=%#v", err, unsafeGit.commitCalls)
+	}
+}
+
+func TestCommitGrillSpecRevisionRecoversDurableProductAskAfterCommitCheckpointFailure(t *testing.T) {
+	project := storage.ProjectRecord{ID: "project", RepoPath: t.TempDir()}
+	worktreePath := t.TempDir()
+	specPath := "specs/change.md"
+	if err := os.MkdirAll(filepath.Join(worktreePath, "specs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := "# revised spec\n"
+	if err := os.WriteFile(filepath.Join(worktreePath, specPath), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(content))
+	checkpoint := plannerCheckpoint{Publish: &checkpointPublishState{
+		GrillAgentCompleted: true,
+		GrillBaselineHead:   "base-sha",
+		GrillProductAsk:     "RETURN_TO_REQUIREMENTS: 重新确认产品边界",
+		GrillSpecHash:       fmt.Sprintf("%x", sum[:]),
+	}}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "looper-grill-commit", CommittedChangedFiles: []string{specPath}, HasUncommittedChanges: false}}
+	runner := &Runner{git: git}
+	got, err := runner.commitGrillSpecRevision(context.Background(), stepInput{Project: project}, checkpoint, checkpointIssue{Title: "导出方案"}, checkpointWorktree{Path: worktreePath, Branch: "looper/spec", BaseBranch: "main", SpecPath: specPath}, specPath, "base-sha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(git.commitCalls) != 0 || got.Publish == nil || got.Publish.GrillProductAsk == "" || got.Lifecycle == nil || len(got.Lifecycle.CommitSHAs) != 1 || got.Lifecycle.CommitSHAs[0] != "looper-grill-commit" {
+		t.Fatalf("recovered checkpoint=%#v lifecycle=%#v commitCalls=%#v", got.Publish, got.Lifecycle, git.commitCalls)
+	}
+}
+
+func TestVerifyDurableGrillSpecSupportsPostPublishRetryWithoutAnotherCommit(t *testing.T) {
+	project := storage.ProjectRecord{ID: "project", RepoPath: t.TempDir()}
+	worktreePath := t.TempDir()
+	specPath := "specs/change.md"
+	if err := os.MkdirAll(filepath.Join(worktreePath, "specs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := "# durable grill spec\n"
+	if err := os.WriteFile(filepath.Join(worktreePath, specPath), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(content))
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "grill-commit", HasUncommittedChanges: false}}
+	runner := &Runner{git: git}
+	worktree := checkpointWorktree{Path: worktreePath, Branch: "looper/spec", BaseBranch: "main", SpecPath: specPath}
+	if _, err := runner.verifyDurableGrillSpec(context.Background(), project, worktree, specPath, fmt.Sprintf("%x", sum[:]), true); err != nil {
+		t.Fatal(err)
+	}
+	if len(git.commitCalls) != 0 {
+		t.Fatalf("post-publish retry attempted another commit: %#v", git.commitCalls)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, specPath), []byte("# changed after checkpoint\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.verifyDurableGrillSpec(context.Background(), project, worktree, specPath, fmt.Sprintf("%x", sum[:]), true); err == nil {
+		t.Fatal("changed spec bytes must not pass a durable GRILL retry")
+	}
+}
+
+func TestCommitGrillSpecRevisionRejectsRecoveryCommitWithBusinessFiles(t *testing.T) {
+	project := storage.ProjectRecord{ID: "project", RepoPath: t.TempDir()}
+	worktreePath := t.TempDir()
+	specPath := "specs/change.md"
+	if err := os.MkdirAll(filepath.Join(worktreePath, "specs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := "# revised spec\n"
+	if err := os.WriteFile(filepath.Join(worktreePath, specPath), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(content))
+	checkpoint := plannerCheckpoint{Publish: &checkpointPublishState{GrillAgentCompleted: true, GrillBaselineHead: "base-sha", GrillSpecHash: fmt.Sprintf("%x", sum[:])}}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "agent-commit", CommittedChangedFiles: []string{specPath, "apps/web.ts"}}}
+	_, err := (&Runner{git: git}).commitGrillSpecRevision(context.Background(), stepInput{Project: project}, checkpoint, checkpointIssue{Title: "x"}, checkpointWorktree{Path: worktreePath, BaseBranch: "main"}, specPath, "base-sha")
+	if err == nil || !strings.Contains(err.Error(), "agent created commits") {
+		t.Fatalf("business-file agent commit was accepted: %v", err)
+	}
+}
+
+func TestPostNodeHThreadNoteUsesStableUUIDWithoutLegacyTransport(t *testing.T) {
+	var uuids []string
+	runner := &Runner{postThreadNoteWithUUID: func(_ context.Context, loopID, text string, mentions []string, uuid string) error {
+		if loopID != "loop" || text != "approve" || len(mentions) != 0 {
+			t.Fatalf("unexpected note: loop=%q text=%q mentions=%#v", loopID, text, mentions)
+		}
+		uuids = append(uuids, uuid)
+		return nil
+	}}
+	input := stepInput{Loop: storage.LoopRecord{ID: "loop"}, Project: storage.ProjectRecord{ID: "project"}}
+	runner.postNodeHThreadNote(context.Background(), input, "approval:hash", "approve", false)
+	runner.postNodeHThreadNote(context.Background(), input, "approval:hash", "approve", false)
+	if len(uuids) != 2 || uuids[0] == "" || uuids[0] != uuids[1] {
+		t.Fatalf("UUIDs = %#v; crash retry must use one stable visible-message UUID", uuids)
 	}
 }
 
@@ -1514,6 +1708,104 @@ func TestCreateRunContextInterruptedRunWithHumanMessageResumesMainSession(t *tes
 	}
 	if !resumed.Resumed || resumed.StartStep != stepWriteSpec {
 		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want followup-resume at write-spec (main session answers), not the interrupted step", resumed.Resumed, resumed.StartStep)
+	}
+}
+
+func TestCreateRunContextReopenedRequirementsResumesAtProductGrill(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	loopID := "loop_requirements_reopened"
+	projectID := "project_1"
+	target := "issue:acme/looper:42"
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 44, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatal(err)
+	}
+	checkpointJSON := mustMarshalJSON(plannerCheckpoint{
+		PipelineVersion: 2,
+		Issue:           &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this"},
+		Worktree:        &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "looper/plan", BaseBranch: "main"},
+		Decisions:       &decisions.State{Brief: decisions.Brief{Version: 1, Summary: "x"}, Stage: "requirements_reopened", ReopenReason: "RETURN_TO_REQUIREMENTS: missing boundary"},
+		ResumePolicy:    loops.ResumePolicyManualIntervention,
+	})
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_" + loopID, LoopID: loopID, Status: "failed", LastCompletedStep: stringPtr(string(stepGrillFinalDecisions)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatal(err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	resumed, err := runner.createRunContext(ctx, *loop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepGrillProductDecisions {
+		t.Fatalf("resumed = {Resumed:%v StartStep:%v}", resumed.Resumed, resumed.StartStep)
+	}
+	if resumed.Checkpoint.Decisions == nil || resumed.Checkpoint.Decisions.ReopenReason == "" {
+		t.Fatalf("reopen context was lost: %#v", resumed.Checkpoint.Decisions)
+	}
+}
+
+func TestCreateRunContextV2WaitRequiresResolvedPlaneBarrier(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	loopID := "loop_unresolved_v2_wait"
+	target := "issue:acme/looper:46"
+	metadata := `{"plannerPipelineVersion":2}`
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 46, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &target, Status: "queued", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := plannerCheckpoint{PipelineVersion: 2, Wait: &checkpointPlannerWait{ResumeStep: stepGrillFinalDecisions}, Decisions: &decisions.State{Brief: decisions.Brief{Version: 1}, Stage: "awaiting_downstream"}}
+	checkpointJSON := mustMarshalJSON(checkpoint)
+	run := storage.RunRecord{ID: "run_" + loopID, LoopID: loopID, Status: "success", LastCompletedStep: stringPtr(string(stepRouteDownstreamDecisions)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	loop, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	if _, err := runner.createRunContext(ctx, *loop); err == nil || !strings.Contains(err.Error(), "not resolved") {
+		t.Fatalf("unresolved Plane barrier was accepted: %v", err)
+	}
+	checkpoint.Decisions.Stage = "downstream_resolved"
+	checkpointJSON = mustMarshalJSON(checkpoint)
+	run.CheckpointJSON = &checkpointJSON
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := runner.createRunContext(ctx, *loop)
+	if err != nil || !resumed.Resumed || resumed.StartStep != stepGrillFinalDecisions {
+		t.Fatalf("resolved Plane barrier did not resume: %#v, %v", resumed, err)
+	}
+}
+
+func TestCreateRunContextPromotesStaleV1CheckpointFromFrozenLoopMetadata(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	loopID := "loop_pipeline_promote"
+	projectID := "project_1"
+	target := "issue:acme/looper:45"
+	metadata := `{"plannerPipelineVersion":2}`
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 45, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatal(err)
+	}
+	checkpointJSON := mustMarshalJSON(plannerCheckpoint{PipelineVersion: 1})
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_" + loopID, LoopID: loopID, Status: "failed", CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatal(err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	created, err := runner.createRunContext(ctx, *loop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Checkpoint.PipelineVersion != 2 {
+		t.Fatalf("PipelineVersion = %d, want frozen V2", created.Checkpoint.PipelineVersion)
 	}
 }
 

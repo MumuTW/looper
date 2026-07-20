@@ -218,6 +218,19 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return nil
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
+			loop, err := input.Repos.Loops.GetByID(ctx, loopID)
+			if err != nil {
+				return err
+			}
+			if planeDecisionV2Planner(loop) {
+				// The card already tells the sender that Feishu replies are not read.
+				// Advance the inbox cursor without interrupting an agent or requeueing
+				// an unresolved Plane decision barrier.
+				if input.Logger != nil {
+					input.Logger.Info("hitl feishu: ignored reply for Plane-only planner V2", map[string]any{"loopId": loopID})
+				}
+				return nil
+			}
 			// 强操控 (C1): if the loop's agent is running, interrupt it NOW so the human's
 			// mid-run message is answered from the main session immediately, instead of
 			// sitting in the inbox until the current step happens to finish.

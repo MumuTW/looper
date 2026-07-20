@@ -2397,9 +2397,11 @@ func TestLoadFileAutoDetectsMissingToolPathsAfterApplyingOverrides(t *testing.T)
 
 func TestDetectToolPathsLeavesMissingEntriesUnset(t *testing.T) {
 	configuredGitPath := "/configured/git"
+	configuredBrowserPath := "/Applications/Chromium"
 
 	result := DetectToolPaths(ToolPathsConfig{
-		GitPath: &configuredGitPath,
+		GitPath:     &configuredGitPath,
+		BrowserPath: &configuredBrowserPath,
 	}, fakeLookPath(map[string]string{}))
 
 	if result.Paths.GitPath == nil || *result.Paths.GitPath != configuredGitPath {
@@ -2408,6 +2410,9 @@ func TestDetectToolPathsLeavesMissingEntriesUnset(t *testing.T) {
 
 	if result.Paths.GHPath != nil {
 		t.Fatalf("DetectToolPaths().Paths.GHPath = %v, want nil", result.Paths.GHPath)
+	}
+	if result.Paths.BrowserPath == nil || *result.Paths.BrowserPath != configuredBrowserPath {
+		t.Fatalf("DetectToolPaths().Paths.BrowserPath = %v, want %q", result.Paths.BrowserPath, configuredBrowserPath)
 	}
 
 	if got := result.Detection["gitPath"]; got != ToolDetectionStatusConfigured {
@@ -3401,17 +3406,17 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	if !config.Daemon.WorktreeCleanup.Enabled {
 		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.Enabled = false, want true")
 	}
-	if config.Daemon.WorktreeCleanup.Interval != "24h" {
-		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.Interval = %q, want %q", config.Daemon.WorktreeCleanup.Interval, "24h")
+	if config.Daemon.WorktreeCleanup.Interval != "1h" {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.Interval = %q, want %q", config.Daemon.WorktreeCleanup.Interval, "1h")
 	}
-	if config.Daemon.WorktreeCleanup.RetentionDays != 7 {
-		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.RetentionDays = %d, want 7", config.Daemon.WorktreeCleanup.RetentionDays)
+	if config.Daemon.WorktreeCleanup.RetentionDays != 1 {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.RetentionDays = %d, want 1", config.Daemon.WorktreeCleanup.RetentionDays)
 	}
-	if config.Daemon.WorktreeCleanup.MaxPerTick != 10 {
-		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.MaxPerTick = %d, want 10", config.Daemon.WorktreeCleanup.MaxPerTick)
+	if config.Daemon.WorktreeCleanup.MaxPerTick != 50 {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.MaxPerTick = %d, want 50", config.Daemon.WorktreeCleanup.MaxPerTick)
 	}
-	if config.Daemon.WorktreeCleanup.IncludeOrphans {
-		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = true, want false")
+	if !config.Daemon.WorktreeCleanup.IncludeOrphans {
+		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = false, want true")
 	}
 	if config.Daemon.WorktreeCleanup.DryRun {
 		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.DryRun = true, want false")
@@ -3454,7 +3459,7 @@ func TestNormalizeMergesPartialWorktreeCleanupConfig(t *testing.T) {
 	if cfg.Daemon.WorktreeCleanup.RetentionDays != 14 {
 		t.Fatalf("Normalize().Daemon.WorktreeCleanup.RetentionDays = %d, want 14", cfg.Daemon.WorktreeCleanup.RetentionDays)
 	}
-	if cfg.Daemon.WorktreeCleanup.Interval != "24h" || cfg.Daemon.WorktreeCleanup.MaxPerTick != 10 || cfg.Daemon.WorktreeCleanup.DryRun {
+	if cfg.Daemon.WorktreeCleanup.Interval != "1h" || cfg.Daemon.WorktreeCleanup.MaxPerTick != 50 || !cfg.Daemon.WorktreeCleanup.IncludeOrphans || cfg.Daemon.WorktreeCleanup.DryRun {
 		t.Fatalf("Normalize().Daemon.WorktreeCleanup = %#v, want unspecified defaults preserved", cfg.Daemon.WorktreeCleanup)
 	}
 }
@@ -4003,5 +4008,30 @@ func TestProjectProductOwnerResolvesAndValidates(t *testing.T) {
 	cfg.Projects[0].ProductOwner = &ProductOwnerConfig{FeishuOpenID: "杨瑾龙"}
 	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "open_id") {
 		t.Fatalf("ValidateWithOptions() error = %v, want open_id rejection", err)
+	}
+}
+
+func TestProjectDecisionActorsResolveAndValidatePlaneIDs(t *testing.T) {
+	const planeID = "67d4b01c-fea2-4b8f-ac14-a6fff9c9e71b"
+	cfg := Config{Projects: []ProjectRefConfig{{
+		ID:          "open-design",
+		DesignOwner: &FeishuActorConfig{FeishuOpenID: "ou_design", PlaneID: planeID},
+		Owner:       &FeishuActorConfig{FeishuOpenID: "ou_owner", PlaneID: planeID},
+	}}}
+	if got := ProjectDesignOwner(cfg, "open-design"); got.PlaneID != planeID || got.FeishuOpenID != "ou_design" {
+		t.Fatalf("ProjectDesignOwner() = %#v", got)
+	}
+	if got := ProjectOwnerActor(cfg, "open-design"); got.PlaneID != planeID || got.FeishuOpenID != "ou_owner" {
+		t.Fatalf("ProjectOwnerActor() = %#v", got)
+	}
+	issues := []ValidationIssue{}
+	validateFeishuActor(cfg.Projects[0].DesignOwner, "projects[0].designOwner", &issues)
+	if len(issues) != 0 {
+		t.Fatalf("validateFeishuActor(valid) = %#v", issues)
+	}
+	invalid := &FeishuActorConfig{FeishuOpenID: "ou_owner", PlaneID: "not-a-uuid"}
+	validateFeishuActor(invalid, "projects[0].owner", &issues)
+	if !validationIssuesContainPath(issues, "projects[0].owner.planeId") {
+		t.Fatalf("issues = %#v, want owner.planeId", issues)
 	}
 }

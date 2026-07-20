@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -25,15 +26,22 @@ import (
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/planner/decisions"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 const (
-	stepDiscoverIssues  PlannerStep = "discover-issues"
-	stepPrepareWorktree PlannerStep = "prepare-worktree"
-	stepWriteSpec       PlannerStep = "write-spec"
-	stepPublish         PlannerStep = "publish"
+	stepDiscoverIssues           PlannerStep = "discover-issues"
+	stepPrepareWorktree          PlannerStep = "prepare-worktree"
+	stepAuthorDecisionBrief      PlannerStep = "author-decision-brief"
+	stepGrillProductDecisions    PlannerStep = "grill-product-decisions"
+	stepRouteProductDecisions    PlannerStep = "route-product-decisions"
+	stepGrillDownstreamDecisions PlannerStep = "grill-downstream-decisions"
+	stepRouteDownstreamDecisions PlannerStep = "route-downstream-decisions"
+	stepGrillFinalDecisions      PlannerStep = "grill-final-decisions"
+	stepWriteSpec                PlannerStep = "write-spec"
+	stepPublish                  PlannerStep = "publish"
 	// Plane node H: grill (fresh adversarial pass) → review (independent verdict). Both
 	// are no-ops for GitHub/forgejo projects (their spec is the PR, reviewed there).
 	stepGrill  PlannerStep = "grill"
@@ -52,6 +60,22 @@ const (
 )
 
 var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepGrill, stepReview, stepNotify}
+
+var plannerV2StepSequence = []PlannerStep{
+	stepDiscoverIssues,
+	stepPrepareWorktree,
+	stepAuthorDecisionBrief,
+	stepGrillProductDecisions,
+	stepRouteProductDecisions,
+	stepGrillDownstreamDecisions,
+	stepRouteDownstreamDecisions,
+	stepGrillFinalDecisions,
+	stepWriteSpec,
+	stepPublish,
+	stepGrill,
+	stepReview,
+	stepNotify,
+}
 
 type PlannerStep string
 
@@ -237,6 +261,7 @@ type InspectHeadInput struct {
 type InspectHeadResult struct {
 	HeadSHA               string
 	NewCommitSHAs         []string
+	CommittedChangedFiles []string
 	HasUncommittedChanges bool
 	ChangedFiles          []string
 }
@@ -337,12 +362,15 @@ type Options struct {
 	OnQueueItemEnqueued     func()
 	// PostThreadNote posts a plain-text reply into a loop's Feishu thread (node H
 	// touchpoints: spec-draft FYI, grill transcript), optionally @-mentioning open_ids.
-	PostThreadNote func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
+	PostThreadNote         func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
+	PostThreadNoteWithUUID func(ctx context.Context, loopID, text string, mentionOpenIDs []string, uuid string) error
 	// PostThreadCard posts a header-less interactive card into a loop's Feishu thread —
 	// used for the node-H product-decision ask so the product-language body renders with
 	// structure (bold sub-headers, line breaks) instead of a flat text wall. Falls back
 	// to PostThreadNote when unset (e.g. tests).
-	PostThreadCard  func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
+	PostThreadCard func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
+	// PostThreadImage uploads and posts one PNG with a stable Feishu message UUID.
+	PostThreadImage func(ctx context.Context, loopID, pngPath, dedupeUUID string) (string, error)
 	DiscoveryPolicy DiscoveryPolicy
 	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
 	// project whose task source is Plane (§8 flowchart). nil / (…,false) → the
@@ -383,7 +411,10 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	postThreadNote          func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
+	postThreadNoteWithUUID  func(ctx context.Context, loopID, text string, mentionOpenIDs []string, uuid string) error
 	postThreadCard          func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
+	postThreadImage         func(ctx context.Context, loopID, pngPath, dedupeUUID string) (string, error)
+	decisionArtifactRoot    string
 	discoveryPolicy         DiscoveryPolicy
 	planeDoc                PlaneDocResolver
 }
@@ -412,15 +443,24 @@ type ProcessResult struct {
 }
 
 type plannerCheckpoint struct {
-	ResumePolicy   string                  `json:"resumePolicy,omitempty"`
-	Issue          *checkpointIssue        `json:"issue,omitempty"`
-	ClaimedLockKey string                  `json:"claimedLockKey,omitempty"`
-	Worktree       *checkpointWorktree     `json:"worktree,omitempty"`
-	WriteSpec      *checkpointWriteSpec    `json:"writeSpec,omitempty"`
-	Lifecycle      *lifecycle.State        `json:"gitPrLifecycle,omitempty"`
-	Publish        *checkpointPublishState `json:"publish,omitempty"`
-	Notify         *checkpointNotify       `json:"notify,omitempty"`
-	SkipReason     string                  `json:"skipReason,omitempty"`
+	PipelineVersion int                     `json:"plannerPipelineVersion,omitempty"`
+	Phase           string                  `json:"phase,omitempty"`
+	Wait            *checkpointPlannerWait  `json:"wait,omitempty"`
+	Decisions       *decisions.State        `json:"decisions,omitempty"`
+	ResumePolicy    string                  `json:"resumePolicy,omitempty"`
+	Issue           *checkpointIssue        `json:"issue,omitempty"`
+	ClaimedLockKey  string                  `json:"claimedLockKey,omitempty"`
+	Worktree        *checkpointWorktree     `json:"worktree,omitempty"`
+	WriteSpec       *checkpointWriteSpec    `json:"writeSpec,omitempty"`
+	Lifecycle       *lifecycle.State        `json:"gitPrLifecycle,omitempty"`
+	Publish         *checkpointPublishState `json:"publish,omitempty"`
+	Notify          *checkpointNotify       `json:"notify,omitempty"`
+	SkipReason      string                  `json:"skipReason,omitempty"`
+}
+
+type checkpointPlannerWait struct {
+	Reason     string      `json:"reason"`
+	ResumeStep PlannerStep `json:"resumeStep"`
 }
 
 type checkpointIssue struct {
@@ -447,6 +487,7 @@ type checkpointWorktree struct {
 type checkpointWriteSpec struct {
 	Status                       string           `json:"status,omitempty"`
 	Summary                      string           `json:"summary,omitempty"`
+	ProductAsk                   string           `json:"productAsk,omitempty"`
 	Stdout                       string           `json:"stdout,omitempty"`
 	Commits                      []string         `json:"commits,omitempty"`
 	Lifecycle                    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
@@ -476,6 +517,19 @@ type checkpointPublishState struct {
 	// Grilled / Reviewed track node H's two mandatory agent gates (idempotent resume).
 	Grilled  bool `json:"grilled,omitempty"`
 	Reviewed bool `json:"reviewed,omitempty"`
+	// The technical GRILL result is persisted before Looper commits its spec edit.
+	// This closes the commit→checkpoint crash window for RETURN_TO_REQUIREMENTS.
+	GrillAgentCompleted bool   `json:"grillAgentCompleted,omitempty"`
+	GrillBaselineHead   string `json:"grillBaselineHead,omitempty"`
+	GrillProductAsk     string `json:"grillProductAsk,omitempty"`
+	GrillSummary        string `json:"grillSummary,omitempty"`
+	GrillSpecHash       string `json:"grillSpecHash,omitempty"`
+	GrillGitReconciled  bool   `json:"grillGitReconciled,omitempty"`
+	GrillReconciledHead string `json:"grillReconciledHead,omitempty"`
+	// ReviewPlaneContentHash binds the independent REVIEW to the exact rendered
+	// Plane page revision produced from the converged local spec. The approval
+	// gate may open only while the remote page still has this hash.
+	ReviewPlaneContentHash string `json:"reviewPlaneContentHash,omitempty"`
 }
 
 type checkpointNotify struct {
@@ -484,7 +538,31 @@ type checkpointNotify struct {
 }
 
 func checkpointWriteSpecFromAgentResult(result AgentResult) *checkpointWriteSpec {
-	return &checkpointWriteSpec{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
+	return &checkpointWriteSpec{Status: result.Status, Summary: result.Summary, ProductAsk: strings.TrimSpace(result.ProductAsk), Stdout: result.Stdout, Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
+}
+
+// reopenV2Requirements invalidates every authority receipt and every artifact derived
+// from the previous requirement revision. The brief itself is retained as adversarial
+// input for the fresh requirement grill, together with the explicit reopen reason;
+// nothing that previously proved a human answered or approved may survive as current.
+func reopenV2Requirements(checkpoint plannerCheckpoint, reason string) plannerCheckpoint {
+	if checkpoint.Decisions != nil {
+		checkpoint.Decisions.Stage = "requirements_reopened"
+		checkpoint.Decisions.ReopenReason = strings.TrimSpace(reason)
+		checkpoint.Decisions.ProductSpec = ""
+		checkpoint.Decisions.Requests = nil
+		checkpoint.Decisions.RequestedQuestions = nil
+		checkpoint.Decisions.Answers = nil
+		checkpoint.Decisions.DecisionLog = ""
+		checkpoint.Decisions.ImageMessages = nil
+	}
+	checkpoint.Phase = "requirements_reopened"
+	checkpoint.Wait = nil
+	checkpoint.WriteSpec = nil
+	checkpoint.Publish = nil
+	checkpoint.Notify = nil
+	checkpoint.SkipReason = ""
+	return checkpoint
 }
 
 type resumedRunContext struct {
@@ -548,7 +626,11 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, postThreadCard: options.PostThreadCard, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
+	artifactRoot := ""
+	if options.CustomInstructions != nil && strings.TrimSpace(options.CustomInstructions.Storage.DBPath) != "" {
+		artifactRoot = filepath.Join(filepath.Dir(options.CustomInstructions.Storage.DBPath), "decision-artifacts")
+	}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, postThreadNoteWithUUID: options.PostThreadNoteWithUUID, postThreadCard: options.PostThreadCard, postThreadImage: options.PostThreadImage, decisionArtifactRoot: artifactRoot, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -752,7 +834,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 
-	for _, step := range stepsFrom(resumedRun.StartStep) {
+	for _, step := range stepsFromVersion(resumedRun.StartStep, checkpoint.PipelineVersion) {
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
 			return ProcessResult{}, err
@@ -824,9 +906,15 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if checkpoint.SkipReason != "" {
 			break
 		}
+		if checkpoint.Wait != nil {
+			break
+		}
 	}
 
 	summary := checkpoint.SkipReason
+	if checkpoint.Wait != nil {
+		summary = checkpoint.Wait.Reason
+	}
 	if summary == "" {
 		issue := checkpoint.Issue
 		if issue != nil {
@@ -846,6 +934,8 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	status := "success"
 	if checkpoint.SkipReason != "" {
 		status = "skipped"
+	} else if checkpoint.Wait != nil {
+		status = "waiting"
 	}
 	prNumber := int64(0)
 	if checkpoint.Publish != nil && checkpoint.Publish.PullRequest != nil {
@@ -858,7 +948,15 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, err
 	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		updated.Status = "completed"
+		if checkpoint.Wait != nil {
+			updated.Status = "paused"
+			phase := checkpoint.Phase
+			if metadata, metaErr := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"decisionPhase": phase, "nodeHPhase": phase, "plannerPipelineVersion": checkpoint.PipelineVersion}); metaErr == nil {
+				updated.MetadataJSON = stringPtr(metadata)
+			}
+		} else {
+			updated.Status = "completed"
+		}
 		updated.LastRunAt = stringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	}); err != nil {
@@ -873,6 +971,18 @@ func (r *Runner) executeStep(ctx context.Context, step PlannerStep, input stepIn
 		return r.runDiscoverIssueStep(ctx, input)
 	case stepPrepareWorktree:
 		return r.runPrepareWorktreeStep(ctx, input)
+	case stepAuthorDecisionBrief:
+		return r.runAuthorDecisionBriefStep(ctx, input)
+	case stepGrillProductDecisions:
+		return r.runRequirementGrillStep(ctx, input, "product")
+	case stepRouteProductDecisions:
+		return r.runRouteProductDecisionsStep(ctx, input)
+	case stepGrillDownstreamDecisions:
+		return r.runRequirementGrillStep(ctx, input, "downstream")
+	case stepRouteDownstreamDecisions:
+		return r.runRouteDownstreamDecisionsStep(ctx, input)
+	case stepGrillFinalDecisions:
+		return r.runRequirementGrillStep(ctx, input, "final")
 	case stepWriteSpec:
 		return r.runWriteSpecStep(ctx, input)
 	case stepPublish:
@@ -890,6 +1000,15 @@ func (r *Runner) executeStep(ctx context.Context, step PlannerStep, input stepIn
 
 func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
 	payload := parseJSONObject(input.QueueItem.PayloadJSON)
+	checkpoint := input.Checkpoint
+	configuredPipelineVersion := int(int64FromAny(parseJSONObject(input.Loop.MetadataJSON)["plannerPipelineVersion"]))
+	if configuredPipelineVersion > checkpoint.PipelineVersion {
+		checkpoint.PipelineVersion = configuredPipelineVersion
+	}
+	if checkpoint.PipelineVersion == 0 {
+		checkpoint.PipelineVersion = 1
+	}
+	input.Checkpoint = checkpoint
 	repo := firstNonEmpty(derefString(input.QueueItem.Repo), derefString(input.Loop.Repo), projectRepo(input.Project))
 	issueNumber := int64FromAny(payload["issueNumber"])
 	if issueNumber == 0 {
@@ -955,7 +1074,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		}
 		detail.Assignees = appendUniqueStrings(detail.Assignees, currentLogin)
 	}
-	checkpoint := input.Checkpoint
+	checkpoint = input.Checkpoint
 	checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 	checkpoint.ClaimedLockKey = lockKey
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -1028,7 +1147,7 @@ func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput
 	if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
 		mentions = []string{openID}
 	}
-	note := fmt.Sprintf("⏸ 需求「%s」还没有产品 spec —— 请补一份:把方案页链接或正文直接发在本 thread,looper 会自动关联并继续。", strings.TrimSpace(workItemTitle))
+	note := fmt.Sprintf("⏸ 需求「%s」还没有正式产品 Spec。请在 Plane 创建或打开非空产品方案页，并在当前 work item 的 Links 中以 looper:product-spec 作为标题关联；外部链接、空白页、普通评论和飞书回复都不会解除门禁。链接完成后 Looper 会自动读取并继续。", strings.TrimSpace(workItemTitle))
 	if err := r.postThreadNote(ctx, input.Loop.ID, note, mentions); err != nil && r.logger != nil {
 		r.logger.Warn("planner: post product-spec request note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 	}
@@ -1108,8 +1227,10 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (p
 	// Flowchart node D/E: on a Plane project, a feature can't be planned until it has
 	// a product spec. If missing, ask product on the work item and hold (no worktree,
 	// no tech spec) until it's supplied.
-	if gateErr := r.productSpecGate(ctx, input, checkpoint); gateErr != nil {
-		return checkpoint, gateErr
+	if checkpoint.PipelineVersion < 2 {
+		if gateErr := r.productSpecGate(ctx, input, checkpoint); gateErr != nil {
+			return checkpoint, gateErr
+		}
 	}
 	projectMetadata := parseJSONObject(input.Project.MetadataJSON)
 	worktreeRoot := stringFromAnyDefault(projectMetadata["worktreeRoot"])
@@ -1185,8 +1306,16 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
+	if checkpoint.PipelineVersion >= 2 {
+		if checkpoint.Decisions == nil || checkpoint.Decisions.Stage != "grilled_final" {
+			return checkpoint, &loopError{message: "write-spec blocked: final requirement GRILL has not converged", kind: FailureNonRetryable}
+		}
+	}
 	writeSpecCompleted := checkpoint.WriteSpec != nil && strings.EqualFold(checkpoint.WriteSpec.Status, "completed")
 	productAsk := ""
+	if checkpoint.WriteSpec != nil {
+		productAsk = strings.TrimSpace(checkpoint.WriteSpec.ProductAsk)
+	}
 	issue, err := requireIssue(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -1219,7 +1348,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, err
 		}
 	}
-	if writeSpecCompleted && checkpoint.WriteSpec.GitReconciled {
+	if writeSpecCompleted && checkpoint.WriteSpec.GitReconciled && !(checkpoint.PipelineVersion >= 2 && productAsk != "") {
 		return checkpoint, nil
 	}
 	if !writeSpecCompleted {
@@ -1232,7 +1361,11 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			prompt += "\n\nCRITICAL — This is a Plane project: the spec will be published to a Plane page by looper, NOT as a pull request. Write ONLY the spec file in the worktree. Do NOT run `gh pr create`, do NOT `git push`, do NOT open or modify any pull request. Any PR you open will be closed as a mistake."
 			// Node H: let the agent escalate genuine product decisions to the product
 			// owner in product language (via the productAsk marker field).
-			prompt += "\n\n" + plannerProductAskInstruction
+			if checkpoint.PipelineVersion < 2 {
+				prompt += "\n\n" + plannerProductAskInstruction
+			} else {
+				prompt += "\n\n必须用中文编写研发技术 Spec。需求阶段已经收敛；下面的 Decision Log 是用户行为和角色决策的事实源，必须逐条引用，不得重新发明产品或设计行为。若真实代码调研发现新的阻塞需求问题，不得猜测，也不得继续写 Spec；在最终结果的 productAsk 中用 `RETURN_TO_REQUIREMENTS:` 开头列出问题，让 Looper fail closed 回到需求阶段。\n\n" + decisions.DecisionLogMarkdown(*checkpoint.Decisions)
+			}
 		}
 		// Follow-up resume (线程永远可追问): drain any human thread messages queued while
 		// the spec awaited review, and native-resume the SAME planner session so the
@@ -1296,7 +1429,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
-		productAsk = strings.TrimSpace(result.ProductAsk)
+		productAsk = checkpoint.WriteSpec.ProductAsk
 		// Clear ONLY the messages this turn actually consumed (fed above). A message that
 		// arrived mid-run — after the inbox was read — was never seen by the agent, so it
 		// stays queued for a follow-up turn instead of being silently eaten here.
@@ -1336,6 +1469,21 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	checkpoint.WriteSpec.GitReconciled = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	if checkpoint.PipelineVersion >= 2 && strings.HasPrefix(productAsk, "RETURN_TO_REQUIREMENTS:") {
+		checkpoint = reopenV2Requirements(checkpoint, productAsk)
+		// Git reconciliation above leaves the planner-owned spec revision committed
+		// and the worktree clean, so the requirement GRILL can safely resume.
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepWriteSpec, checkpoint); err != nil {
+			return checkpoint, wrapRetryableAfterResume(err)
+		}
+		return checkpoint, &loopError{message: productAsk, kind: FailureManualIntervention}
+	}
+	if checkpoint.PipelineVersion >= 2 && productAsk != "" {
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepWriteSpec, checkpoint); err != nil {
+			return checkpoint, wrapRetryableAfterResume(err)
+		}
+		return checkpoint, &loopError{message: "write-spec returned a non-empty V2 productAsk without the required RETURN_TO_REQUIREMENTS: prefix; refusing legacy product notification and technical-spec progress", kind: FailureManualIntervention}
+	}
 	// Node H product-decision hold: the spec turn surfaced a real product question
 	// only the owner can answer. Ask them in the thread (product language) and HOLD
 	// before the owner-approval gate — publish/grill/review don't run yet. The run
@@ -1555,6 +1703,9 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 	if err != nil {
 		return checkpoint, err
 	}
+	if r.projectRoleConfig == nil || strings.TrimSpace(config.ProjectOwnerActor(*r.projectRoleConfig, input.Project.ID).PlaneID) == "" {
+		return checkpoint, &loopError{message: "node H: Looper owner 缺少 planeId 配置；无法安全开放技术 Spec 审批", kind: FailureManualIntervention}
+	}
 	specURL, found, err := gateway.FindSpecLink(ctx, planeProjectID, planedoc.WorkItemIDFromURL(issue.URL), planedoc.TechSpecLinkTitle)
 	if err != nil {
 		return checkpoint, &loopError{message: fmt.Sprintf("grill: find spec link: %v", err), kind: FailureRetryableTransient}
@@ -1562,30 +1713,123 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 	if !found {
 		return checkpoint, nil // nothing to grill
 	}
+	if checkpoint.Publish == nil {
+		checkpoint.Publish = &checkpointPublishState{}
+	}
 	r.setNodeHPhase(ctx, input.Loop.ID, "grilling")
 	specPath := firstNonEmpty(worktree.SpecPath, issue.SpecPath)
-	prompt := buildGrillPrompt(*issue, specPath)
-	result, err := r.runPlannerAgent(ctx, input, worktree.Path, prompt, "grill")
+	decisionContext := ""
+	if checkpoint.PipelineVersion >= 2 && checkpoint.Decisions != nil {
+		decisionContext = decisions.DecisionLogMarkdown(*checkpoint.Decisions)
+	}
+	baselineHead := strings.TrimSpace(checkpoint.Publish.GrillBaselineHead)
+	result := AgentResult{Status: "completed", ProductAsk: checkpoint.Publish.GrillProductAsk, Summary: checkpoint.Publish.GrillSummary}
+	if !checkpoint.Publish.GrillAgentCompleted {
+		baselineHead, err = r.requirementWorktreeHead(ctx, input.Project, *worktree)
+		if err != nil {
+			return checkpoint, &loopError{message: "grill: establish clean worktree baseline: " + err.Error(), kind: FailureRetryableAfterResume}
+		}
+		prompt := buildGrillPrompt(*issue, specPath, decisionContext)
+		result, err = r.runPlannerAgent(ctx, input, worktree.Path, prompt, "grill")
+		if err != nil {
+			return checkpoint, err
+		}
+		if !strings.EqualFold(result.Status, "completed") {
+			if result.Interrupted {
+				return checkpoint, plannerInterruptError() // 强操控: answer the human from the main session
+			}
+			checkpoint.ResumePolicy = "retry_from_timeout_context"
+			return checkpoint, &loopError{message: "grill agent did not complete", kind: FailureRetryableAfterResume}
+		}
+		worktreeRoot, rootErr := plannerWorktreeRoot(input.Project)
+		if rootErr != nil {
+			return checkpoint, rootErr
+		}
+		postAgentInspect, inspectErr := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: baselineHead})
+		if inspectErr != nil {
+			return checkpoint, &loopError{message: "grill: inspect post-agent HEAD: " + inspectErr.Error(), kind: FailureRetryableAfterResume}
+		}
+		if strings.TrimSpace(postAgentInspect.HeadSHA) != baselineHead {
+			return checkpoint, &loopError{message: "grill agent created commits; only an uncommitted spec-file edit is allowed", kind: FailureManualIntervention}
+		}
+		revised, readErr := readPlannerSpecFile(worktree.Path, specPath)
+		if readErr != nil || strings.TrimSpace(revised) == "" {
+			return checkpoint, &loopError{message: "grill: cannot checkpoint revised spec before commit", kind: FailureRetryableAfterResume}
+		}
+		sum := sha256.Sum256([]byte(revised))
+		checkpoint.Publish.GrillAgentCompleted = true
+		checkpoint.Publish.GrillBaselineHead = baselineHead
+		checkpoint.Publish.GrillProductAsk = strings.TrimSpace(result.ProductAsk)
+		checkpoint.Publish.GrillSummary = result.Summary
+		checkpoint.Publish.GrillSpecHash = fmt.Sprintf("%x", sum[:])
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepGrill, checkpoint); err != nil {
+			return checkpoint, wrapRetryableAfterResume(err)
+		}
+	} else if baselineHead == "" || strings.TrimSpace(checkpoint.Publish.GrillSpecHash) == "" {
+		return checkpoint, &loopError{message: "grill: durable agent checkpoint is incomplete", kind: FailureManualIntervention}
+	}
+	currentHead, err := r.verifyDurableGrillSpec(ctx, input.Project, *worktree, specPath, checkpoint.Publish.GrillSpecHash, checkpoint.Publish.GrillGitReconciled)
 	if err != nil {
 		return checkpoint, err
 	}
-	if !strings.EqualFold(result.Status, "completed") {
-		if result.Interrupted {
-			return checkpoint, plannerInterruptError() // 强操控: answer the human from the main session
+	if checkpoint.Publish.GrillGitReconciled && strings.TrimSpace(checkpoint.Publish.GrillReconciledHead) != currentHead {
+		return checkpoint, &loopError{message: "grill: HEAD changed after the durable GRILL commit", kind: FailureManualIntervention}
+	}
+	if !checkpoint.Publish.GrillGitReconciled {
+		checkpoint, err = r.commitGrillSpecRevision(ctx, input, checkpoint, *issue, *worktree, specPath, baselineHead)
+		if err != nil {
+			return checkpoint, err
 		}
-		checkpoint.ResumePolicy = "retry_from_timeout_context"
-		return checkpoint, &loopError{message: "grill agent did not complete", kind: FailureRetryableAfterResume}
+		currentHead, err = r.verifyDurableGrillSpec(ctx, input.Project, *worktree, specPath, checkpoint.Publish.GrillSpecHash, true)
+		if err != nil {
+			return checkpoint, err
+		}
+		checkpoint.Publish.GrillGitReconciled = true
+		checkpoint.Publish.GrillReconciledHead = currentHead
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepGrill, checkpoint); err != nil {
+			return checkpoint, wrapRetryableAfterResume(err)
+		}
+	}
+	grillProductAsk := strings.TrimSpace(checkpoint.Publish.GrillProductAsk)
+	if checkpoint.PipelineVersion >= 2 && strings.HasPrefix(grillProductAsk, "RETURN_TO_REQUIREMENTS:") {
+		checkpoint = reopenV2Requirements(checkpoint, grillProductAsk)
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepGrill, checkpoint); err != nil {
+			return checkpoint, wrapRetryableAfterResume(err)
+		}
+		return checkpoint, &loopError{message: grillProductAsk, kind: FailureManualIntervention}
+	}
+	if checkpoint.PipelineVersion >= 2 && grillProductAsk != "" {
+		return checkpoint, &loopError{message: "grill returned a non-empty V2 productAsk without the required RETURN_TO_REQUIREMENTS: prefix; refusing technical-spec progress", kind: FailureManualIntervention}
 	}
 	// The grill revised the spec FILE in the worktree (sandbox-safe); re-publish it to
 	// the Plane page so the page reflects the converged spec.
 	if revised, rErr := readPlannerSpecFile(worktree.Path, specPath); rErr == nil && strings.TrimSpace(revised) != "" {
-		if err := gateway.UpdatePageContent(ctx, planeProjectID, planedoc.PageIDFromURL(specURL), revised); err != nil && r.logger != nil {
-			r.logger.Warn("grill: re-publish revised spec to Plane failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+		if err := gateway.UpdatePageContent(ctx, planeProjectID, planedoc.PageIDFromURL(specURL), revised); err != nil {
+			// The human approves the Plane page, while the revision hash is computed
+			// from this local file. Never open approval for two different documents.
+			return checkpoint, &loopError{message: "grill: re-publish revised spec to Plane: " + err.Error(), kind: FailureRetryableTransient}
 		}
+		pageContent, readPageErr := gateway.PageContent(ctx, planeProjectID, planedoc.PageIDFromURL(specURL))
+		if readPageErr != nil || strings.TrimSpace(pageContent) == "" {
+			message := "grill: read back published Plane spec"
+			if readPageErr != nil {
+				message += ": " + readPageErr.Error()
+			} else {
+				message += ": page is empty"
+			}
+			return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
+		}
+		checkpoint.Publish.ReviewPlaneContentHash = contentSHA256(pageContent)
+	} else {
+		message := "grill: revised spec is empty"
+		if rErr != nil {
+			message = "grill: read revised spec: " + rErr.Error()
+		}
+		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
 	// Record the grill transcript on the spec page (signed) so the challenge/fix trail
 	// sits next to the spec for the human reviewer.
-	if summary := cleanAgentSummary(result.Summary); summary != "" {
+	if summary := cleanAgentSummary(checkpoint.Publish.GrillSummary); summary != "" {
 		body := planedoc.SignComment("<p>🔬 <b>GRILL 拷问结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p>", "grill", r.agentModel)
 		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
 			r.logger.Warn("grill: post transcript failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
@@ -1593,13 +1837,122 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 		// node H condition #2: surface the grill transcript in the Feishu thread too.
 		r.postNodeHThreadNote(ctx, input, "grillTranscript", "🔬 GRILL 拷问结论:\n"+truncateRunes(summary, 1200), false)
 	}
-	if checkpoint.Publish == nil {
-		checkpoint.Publish = &checkpointPublishState{}
-	}
 	checkpoint.Publish.Grilled = true
 	r.setNodeHPhase(ctx, input.Loop.ID, "reviewing")
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) commitGrillSpecRevision(ctx context.Context, input stepInput, checkpoint plannerCheckpoint, issue checkpointIssue, worktree checkpointWorktree, specPath, baselineHead string) (plannerCheckpoint, error) {
+	if r.git == nil {
+		return checkpoint, &loopError{message: "grill: git gateway unavailable for worktree guard", kind: FailureRetryableAfterResume}
+	}
+	worktreeRoot, err := plannerWorktreeRoot(input.Project)
+	if err != nil {
+		return checkpoint, err
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: baselineHead})
+	if err != nil {
+		return checkpoint, &loopError{message: "grill: inspect revised spec: " + err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if strings.TrimSpace(inspect.HeadSHA) != strings.TrimSpace(baselineHead) {
+		// A previous attempt may have completed Looper's fallback commit and then
+		// failed to persist GrillGitReconciled. The pre-commit checkpoint binds that
+		// intent to the exact revised spec bytes, so a clean worktree with the same
+		// bytes is safe to recover without rerunning the authority-bearing GRILL.
+		if checkpoint.Publish != nil && checkpoint.Publish.GrillAgentCompleted && !inspect.HasUncommittedChanges && onlyExpectedCommittedFile(inspect.CommittedChangedFiles, specPath) {
+			revised, readErr := readPlannerSpecFile(worktree.Path, specPath)
+			if readErr == nil {
+				sum := sha256.Sum256([]byte(revised))
+				if fmt.Sprintf("%x", sum[:]) == strings.TrimSpace(checkpoint.Publish.GrillSpecHash) && strings.TrimSpace(inspect.HeadSHA) != "" {
+					checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
+					checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, strings.TrimSpace(inspect.HeadSHA))
+					checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceFallback
+					return checkpoint, nil
+				}
+			}
+		}
+		return checkpoint, &loopError{message: "grill agent created commits; only an uncommitted spec-file edit is allowed", kind: FailureManualIntervention}
+	}
+	if !inspect.HasUncommittedChanges {
+		return checkpoint, nil
+	}
+	want := filepath.ToSlash(filepath.Clean(strings.TrimSpace(specPath)))
+	for _, changed := range inspect.ChangedFiles {
+		got := filepath.ToSlash(filepath.Clean(strings.TrimSpace(changed)))
+		if got != want {
+			return checkpoint, &loopError{message: fmt.Sprintf("grill agent modified %q; only %q is allowed", changed, specPath), kind: FailureManualIntervention}
+		}
+	}
+	if len(inspect.ChangedFiles) == 0 {
+		return checkpoint, &loopError{message: "grill worktree is dirty but changed files are unavailable", kind: FailureManualIntervention}
+	}
+	committed, err := r.git.Commit(ctx, CommitInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: "planner: apply GRILL revision for " + strings.TrimSpace(issue.Title)})
+	if err != nil {
+		return checkpoint, &loopError{message: "grill: commit revised spec: " + err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if strings.TrimSpace(committed.CommitSHA) == "" {
+		return checkpoint, &loopError{message: "grill: commit returned no SHA", kind: FailureRetryableAfterResume}
+	}
+	checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
+	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, committed.CommitSHA)
+	checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceFallback
+	return checkpoint, nil
+}
+
+func (r *Runner) verifyDurableGrillSpec(ctx context.Context, project storage.ProjectRecord, worktree checkpointWorktree, specPath, expectedHash string, requireClean bool) (string, error) {
+	if r.git == nil {
+		return "", &loopError{message: "grill: git gateway unavailable for durable checkpoint verification", kind: FailureRetryableAfterResume}
+	}
+	revised, err := readPlannerSpecFile(worktree.Path, specPath)
+	if err != nil {
+		return "", &loopError{message: "grill: read durable revised spec: " + err.Error(), kind: FailureRetryableAfterResume}
+	}
+	sum := sha256.Sum256([]byte(revised))
+	if fmt.Sprintf("%x", sum[:]) != strings.TrimSpace(expectedHash) {
+		return "", &loopError{message: "grill: revised spec bytes no longer match the durable agent checkpoint", kind: FailureManualIntervention}
+	}
+	worktreeRoot, err := plannerWorktreeRoot(project)
+	if err != nil {
+		return "", err
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: worktree.BaseBranch})
+	if err != nil {
+		return "", &loopError{message: "grill: inspect durable revised spec: " + err.Error(), kind: FailureRetryableAfterResume}
+	}
+	// Before reconciliation, the expected spec-only edit may still be dirty. Once
+	// GrillGitReconciled is true callers separately skip commit and require clean.
+	if checkpointPathDirtyOutsideSpec(inspect, specPath) {
+		return "", &loopError{message: "grill: durable checkpoint contains changes outside the spec file", kind: FailureManualIntervention}
+	}
+	if requireClean && inspect.HasUncommittedChanges {
+		return "", &loopError{message: "grill: git-reconciled durable checkpoint unexpectedly has uncommitted changes", kind: FailureManualIntervention}
+	}
+	return strings.TrimSpace(inspect.HeadSHA), nil
+}
+
+func onlyExpectedCommittedFile(files []string, specPath string) bool {
+	if len(files) != 1 {
+		return false
+	}
+	want := filepath.ToSlash(filepath.Clean(strings.TrimSpace(specPath)))
+	return filepath.ToSlash(filepath.Clean(strings.TrimSpace(files[0]))) == want
+}
+
+func checkpointPathDirtyOutsideSpec(inspect InspectHeadResult, specPath string) bool {
+	if !inspect.HasUncommittedChanges {
+		return false
+	}
+	want := filepath.ToSlash(filepath.Clean(strings.TrimSpace(specPath)))
+	if len(inspect.ChangedFiles) == 0 {
+		return true
+	}
+	for _, changed := range inspect.ChangedFiles {
+		if filepath.ToSlash(filepath.Clean(strings.TrimSpace(changed))) != want {
+			return true
+		}
+	}
+	return false
 }
 
 // runReviewStep is node H's second mandatory gate (Plane-only): an INDEPENDENT reviewer
@@ -1621,6 +1974,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 	if checkpoint.Publish != nil && checkpoint.Publish.Reviewed {
 		return checkpoint, nil
 	}
+	if checkpoint.Publish == nil {
+		checkpoint.Publish = &checkpointPublishState{}
+	}
 	issue, err := requireIssue(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -1628,6 +1984,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
 		return checkpoint, err
+	}
+	if r.projectRoleConfig == nil || strings.TrimSpace(config.ProjectOwnerActor(*r.projectRoleConfig, input.Project.ID).PlaneID) == "" {
+		return checkpoint, &loopError{message: "review: Looper owner 缺少 planeId 配置；无法安全开放技术 Spec 审批", kind: FailureManualIntervention}
 	}
 	specURL, found, err := gateway.FindSpecLink(ctx, planeProjectID, planedoc.WorkItemIDFromURL(issue.URL), planedoc.TechSpecLinkTitle)
 	if err != nil {
@@ -1637,7 +1996,38 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 		return checkpoint, nil
 	}
 	r.setNodeHPhase(ctx, input.Loop.ID, "reviewing")
-	prompt := buildReviewPrompt(*issue, firstNonEmpty(worktree.SpecPath, issue.SpecPath))
+	decisionContext := ""
+	if checkpoint.PipelineVersion >= 2 && checkpoint.Decisions != nil {
+		decisionContext = decisions.DecisionLogMarkdown(*checkpoint.Decisions)
+	}
+	// Older/incomplete checkpoints may not yet carry the rendered Plane-page
+	// receipt. Re-publish the reviewed local source before starting a fresh REVIEW
+	// so local and remote are known to describe the same revision. If the page was
+	// edited after GRILL, this deliberately restores the converged source and the
+	// new REVIEW evaluates it from scratch.
+	if strings.TrimSpace(checkpoint.Publish.ReviewPlaneContentHash) == "" {
+		localSpec, readErr := readPlannerSpecFile(worktree.Path, firstNonEmpty(worktree.SpecPath, issue.SpecPath))
+		if readErr != nil || strings.TrimSpace(localSpec) == "" {
+			return checkpoint, &loopError{message: "review: cannot establish published revision from local spec", kind: FailureRetryableAfterResume}
+		}
+		pageID := planedoc.PageIDFromURL(specURL)
+		if err := gateway.UpdatePageContent(ctx, planeProjectID, pageID, localSpec); err != nil {
+			return checkpoint, &loopError{message: "review: re-publish local spec before REVIEW: " + err.Error(), kind: FailureRetryableTransient}
+		}
+		pageContent, pageErr := gateway.PageContent(ctx, planeProjectID, pageID)
+		if pageErr != nil || strings.TrimSpace(pageContent) == "" {
+			return checkpoint, &loopError{message: "review: read published revision before REVIEW", kind: FailureRetryableTransient}
+		}
+		checkpoint.Publish.ReviewPlaneContentHash = contentSHA256(pageContent)
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepReview, checkpoint); err != nil {
+			return checkpoint, wrapRetryableAfterResume(err)
+		}
+	}
+	prompt := buildReviewPrompt(*issue, firstNonEmpty(worktree.SpecPath, issue.SpecPath), decisionContext)
+	baselineHead, err := r.requirementWorktreeHead(ctx, input.Project, *worktree)
+	if err != nil {
+		return checkpoint, &loopError{message: "review: establish read-only worktree baseline: " + err.Error(), kind: FailureRetryableAfterResume}
+	}
 	result, err := r.runPlannerAgent(ctx, input, worktree.Path, prompt, "review")
 	if err != nil {
 		return checkpoint, err
@@ -1649,11 +2039,71 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
 		return checkpoint, &loopError{message: "review agent did not complete", kind: FailureRetryableAfterResume}
 	}
+	if err := r.assertRequirementAgentDidNotEditBusinessRepo(ctx, input.Project, *worktree, baselineHead); err != nil {
+		return checkpoint, &loopError{message: "review violated read-only worktree guard: " + err.Error(), kind: FailureManualIntervention}
+	}
+	verdict, verdictOK := parseSpecReviewVerdict(result.Summary)
+	if !verdictOK {
+		return checkpoint, &loopError{message: "review agent did not return the required VERDICT: READY or VERDICT: BLOCKED protocol", kind: FailureRetryableAfterResume}
+	}
+	if verdict == "blocked" {
+		message := "technical spec review blocked: " + cleanAgentSummary(result.Summary)
+		if checkpoint.PipelineVersion >= 2 && checkpoint.Decisions != nil {
+			checkpoint = reopenV2Requirements(checkpoint, "RETURN_TO_REQUIREMENTS: "+message)
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepReview, checkpoint); err != nil {
+				return checkpoint, wrapRetryableAfterResume(err)
+			}
+		}
+		return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
+	}
+	// The reviewer evaluated the local spec. Before recording READY or opening the
+	// human gate, prove the Plane page did not change while that reviewer ran.
+	pageContent, pageErr := gateway.PageContent(ctx, planeProjectID, planedoc.PageIDFromURL(specURL))
+	if pageErr != nil {
+		return checkpoint, &loopError{message: "review: re-read published revision after REVIEW: " + pageErr.Error(), kind: FailureRetryableTransient}
+	}
+	if got, want := contentSHA256(pageContent), strings.TrimSpace(checkpoint.Publish.ReviewPlaneContentHash); strings.TrimSpace(pageContent) == "" || got != want {
+		checkpoint.Publish.ReviewPlaneContentHash = ""
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepReview, checkpoint); err != nil {
+			return checkpoint, wrapRetryableAfterResume(err)
+		}
+		return checkpoint, &loopError{message: "review: Plane spec changed during independent REVIEW; re-publish and run a fresh REVIEW before approval", kind: FailureRetryableAfterResume}
+	}
 	if summary := cleanAgentSummary(result.Summary); summary != "" {
-		body := planedoc.SignComment("<p>👀 <b>REVIEW 复核结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p><p>方案已过 grill + review。请人过目,无异议在本页评论 <b>approve / 同意 / 👍</b> 即进入实现。</p>", "reviewer", r.agentModel)
+		body := planedoc.SignComment("<p>👀 <b>REVIEW 复核结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p>", "reviewer", r.agentModel)
 		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
 			r.logger.Warn("review: post verdict failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
+	}
+	approval, err := r.openSpecApprovalRevision(ctx, input, gateway, planeProjectID, specURL, worktree.Path, firstNonEmpty(worktree.SpecPath, issue.SpecPath), checkpoint.Publish.ReviewPlaneContentHash)
+	if err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("review: open revision approval gate: %v", err), kind: FailureRetryableTransient}
+	}
+	// Persist the local half of the remote approval gate before changing labels or
+	// notifying the owner. If this write fails, return retryable: the signed remote
+	// request is idempotently rediscovered on the next review pass.
+	if r.repos == nil || r.repos.Loops == nil {
+		return checkpoint, &loopError{message: "review: loop repository unavailable for approval gate", kind: FailureRetryableAfterResume}
+	}
+	loop, err := r.repos.Loops.GetByID(ctx, input.Loop.ID)
+	if err != nil || loop == nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("review: load loop for approval gate: %v", err), kind: FailureRetryableAfterResume}
+	}
+	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{
+		"awaitingSpecApproval":         true,
+		"specApprovedDispatched":       false,
+		"issueUrl":                     issue.URL,
+		"specApprovalRevision":         approval.Revision,
+		"specApprovalContentHash":      approval.ContentHash,
+		"specApprovalRequestCommentID": approval.CommentID,
+		"specApprovalRequestedAt":      approval.RequestedAt,
+		"specApprovalJudgedHash":       "",
+	})
+	if err != nil {
+		return checkpoint, &loopError{message: "review: encode approval gate metadata: " + err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if _, err := r.updateLoop(ctx, *loop, func(u *storage.LoopRecord) { u.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+		return checkpoint, &loopError{message: "review: persist approval gate metadata: " + err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if checkpoint.Publish == nil {
 		checkpoint.Publish = &checkpointPublishState{}
@@ -1670,16 +2120,106 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 			r.logger.Warn("review: retire looper:plan failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
 	}
-	r.postNodeHThreadNote(ctx, input, "approvalRequest", "🙋 方案已过 GRILL 拷问 + 独立 REVIEW,请你审批 —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现:"+specURL, true)
+	r.postNodeHThreadNote(ctx, input, "approvalRequest:"+approval.ContentHash, "🙋 技术方案已过 GRILL 拷问 + 独立 REVIEW，请 Looper owner 审批当前修订 v"+strconv.Itoa(approval.Revision)+" —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现："+specURL, true)
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	return checkpoint, nil
+}
+
+type specApprovalRevision struct {
+	Revision    int
+	ContentHash string
+	CommentID   string
+	RequestedAt string
+}
+
+func contentSHA256(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// openSpecApprovalRevision binds the human gate to the exact spec bytes that passed
+// REVIEW. The signed marker makes the remote write idempotent across a crash between
+// creating the Plane comment and persisting the loop metadata.
+func (r *Runner) openSpecApprovalRevision(ctx context.Context, input stepInput, gateway *planedoc.Gateway, planeProjectID, specURL, worktreePath, specPath, reviewedPageHash string) (specApprovalRevision, error) {
+	content, err := readPlannerSpecFile(worktreePath, specPath)
+	if err != nil {
+		return specApprovalRevision{}, err
+	}
+	if strings.TrimSpace(content) == "" {
+		return specApprovalRevision{}, fmt.Errorf("reviewed spec file is empty")
+	}
+	// The owner reads and approves the Plane page, so bind the gate to the bytes
+	// Plane actually returns—not merely to the local Markdown source used to publish
+	// it. A later manual page edit then invalidates this revision at reconcile time.
+	pageContent, err := gateway.PageContent(ctx, planeProjectID, planedoc.PageIDFromURL(specURL))
+	if err != nil {
+		return specApprovalRevision{}, fmt.Errorf("read published spec page: %w", err)
+	}
+	if strings.TrimSpace(pageContent) == "" {
+		return specApprovalRevision{}, fmt.Errorf("published spec page is empty")
+	}
+	contentHash := contentSHA256(pageContent)
+	if reviewedPageHash = strings.TrimSpace(reviewedPageHash); reviewedPageHash == "" || contentHash != reviewedPageHash {
+		return specApprovalRevision{}, fmt.Errorf("published spec page no longer matches the independently reviewed revision")
+	}
+	previousRevision := 0
 	if r.repos != nil && r.repos.Loops != nil {
-		if loop, gErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); gErr == nil && loop != nil {
-			if metadataJSON, mErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingSpecApproval": true}); mErr == nil {
-				_, _ = r.updateLoop(ctx, *loop, func(u *storage.LoopRecord) { u.MetadataJSON = stringPtr(metadataJSON) })
+		if loop, getErr := r.repos.Loops.GetByID(ctx, input.Loop.ID); getErr == nil && loop != nil {
+			meta := parseJSONObject(loop.MetadataJSON)
+			if value, ok := meta["specApprovalRevision"].(float64); ok {
+				previousRevision = int(value)
+			}
+			if oldHash, _ := meta["specApprovalContentHash"].(string); strings.TrimSpace(oldHash) == contentHash && previousRevision > 0 {
+				revision := specApprovalRevision{
+					Revision: previousRevision, ContentHash: contentHash,
+					CommentID:   stringFromAnyDefault(meta["specApprovalRequestCommentID"]),
+					RequestedAt: stringFromAnyDefault(meta["specApprovalRequestedAt"]),
+				}
+				if strings.TrimSpace(revision.CommentID) != "" && strings.TrimSpace(revision.RequestedAt) != "" {
+					if _, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(revision.RequestedAt)); parseErr == nil {
+						return revision, nil
+					}
+				}
 			}
 		}
 	}
-	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	return checkpoint, nil
+	revision := previousRevision + 1
+	marker := fmt.Sprintf("<!-- looper:spec-approval-request revision=%d hash=%s -->", revision, contentHash)
+	comments, err := gateway.ListPageComments(ctx, planeProjectID, planedoc.PageIDFromURL(specURL))
+	if err != nil {
+		return specApprovalRevision{}, err
+	}
+	for _, comment := range comments {
+		if strings.Contains(comment.CommentHTML, marker) {
+			commentID, requestedAt, receiptErr := validatedSpecApprovalReceipt(comment)
+			if receiptErr != nil {
+				return specApprovalRevision{}, receiptErr
+			}
+			return specApprovalRevision{Revision: revision, ContentHash: contentHash, CommentID: commentID, RequestedAt: requestedAt}, nil
+		}
+	}
+	body := planedoc.SignComment(marker+"<p>🙋 <b>技术方案修订 v"+strconv.Itoa(revision)+" 等待 Looper owner 审批</b></p><p>本次审批只对当前内容生效（SHA-256: <code>"+contentHash[:12]+"</code>）。请 owner 在本条之后评论 <b>approve / 同意 / 👍</b>；其他角色或旧修订的评论不会触发实现。</p>", "reviewer", r.agentModel)
+	created, err := gateway.CreateCommentOnPageURL(ctx, planeProjectID, specURL, body)
+	if err != nil {
+		return specApprovalRevision{}, err
+	}
+	commentID, requestedAt, receiptErr := validatedSpecApprovalReceipt(created)
+	if receiptErr != nil {
+		return specApprovalRevision{}, receiptErr
+	}
+	return specApprovalRevision{Revision: revision, ContentHash: contentHash, CommentID: commentID, RequestedAt: requestedAt}, nil
+}
+
+func validatedSpecApprovalReceipt(comment planedoc.PageComment) (string, string, error) {
+	commentID := strings.TrimSpace(comment.ID)
+	requestedAt := strings.TrimSpace(comment.CreatedAt)
+	if commentID == "" || requestedAt == "" {
+		return "", "", fmt.Errorf("Plane approval request receipt lacked id/created_at")
+	}
+	if _, parseErr := time.Parse(time.RFC3339Nano, requestedAt); parseErr != nil {
+		return "", "", fmt.Errorf("Plane approval request receipt had invalid created_at: %w", parseErr)
+	}
+	return commentID, requestedAt, nil
 }
 
 // runPlannerAgent runs one bounded agent pass in the worktree and returns its result —
@@ -1700,28 +2240,52 @@ func (r *Runner) runPlannerAgent(ctx context.Context, input stepInput, worktreeP
 // buildGrillPrompt is the fresh adversarial reviewer's brief (node H GRILL). It revises
 // the spec FILE in the worktree — never Plane or anything outside the project (the codex
 // sandbox blocks external writes); looper re-publishes the revised file to Plane after.
-func buildGrillPrompt(issue checkpointIssue, specFilePath string) string {
-	return strings.Join([]string{
+func buildGrillPrompt(issue checkpointIssue, specFilePath, decisionContext string) string {
+	parts := []string{
 		fmt.Sprintf("You are a FRESH, adversarial technical-spec reviewer for %s#%d — you did NOT write this spec.", issue.Repo, issue.IssueNumber),
 		fmt.Sprintf("The tech spec is the file `%s` in this worktree. Read it.", specFilePath),
 		"Adversarially interrogate it against the REAL codebase in this worktree: open the actual source at any file:line it cites; if a claim can't be verified from real code, flag it '⚠️ 未经源码验证'. Never pretend to have read code you didn't.",
 		"Hunt for: missing/weak acceptance criteria, unhandled edge cases, security/data/migration/concurrency risk, hand-wavy steps, scope creep, and anything a worker couldn't implement unambiguously.",
-		fmt.Sprintf("REVISE the spec file `%s` IN PLACE to resolve what you can (keep the structure; tighten, don't bloat). Edit ONLY that file — do NOT write anything outside this worktree, do NOT run `plane`/`gh`, do NOT push or open a pull request. looper publishes the file to Plane for you.", specFilePath),
-		"For anything you genuinely cannot decide (a real product ambiguity), do NOT guess — leave it as a clearly-labelled open question in the spec.",
+		fmt.Sprintf("REVISE the spec file `%s` IN PLACE to resolve what you can (keep the structure; tighten, don't bloat). Edit ONLY that file — do NOT commit, do NOT write anything outside this worktree, do NOT run `plane`/`gh`, do NOT push or open a pull request. looper validates, commits, and publishes the file for you.", specFilePath),
+		"For anything you genuinely cannot decide (a real product/design/engineering ambiguity), do NOT guess and do NOT let the spec proceed with a merely-labelled open question.",
 		"Finish with a concise grill transcript as your final summary: what you challenged, what you fixed in the file, and what remains open.",
-	}, "\n")
+	}
+	if strings.TrimSpace(decisionContext) != "" {
+		parts = append(parts,
+			"This V2 pipeline already froze requirements using the Decision Log below. Do not re-litigate a recorded fact or answer. If source inspection uncovers a genuinely new blocking ambiguity, your final line MUST be exactly one structured marker with productAsk beginning RETURN_TO_REQUIREMENTS: and a concise self-contained list of the missing decisions. Otherwise set productAsk to an empty string.",
+			decisionContext,
+			agent.CompletionMarker+`={"summary":"GRILL summary","productAsk":"RETURN_TO_REQUIREMENTS: ... or empty"}`,
+		)
+	}
+	return strings.Join(parts, "\n")
 }
 
 // buildReviewPrompt is the independent reviewer's brief (node H REVIEW) — a different
 // pass from the grill, reading the converged spec file and issuing a verdict (no writes).
-func buildReviewPrompt(issue checkpointIssue, specFilePath string) string {
-	return strings.Join([]string{
+func buildReviewPrompt(issue checkpointIssue, specFilePath, decisionContext string) string {
+	parts := []string{
 		fmt.Sprintf("You are an INDEPENDENT spec reviewer for %s#%d, reviewing a tech spec that already passed an adversarial grill.", issue.Repo, issue.IssueNumber),
 		fmt.Sprintf("Read the spec file `%s` in this worktree.", specFilePath),
 		"Verify against the real codebase in this worktree (open cited source; flag unverified claims). Judge whether a worker could implement it unambiguously and safely.",
 		"This is a READ-ONLY verdict pass: do NOT edit any file, do NOT run `plane`/`gh`, do NOT push or open a pull request. If you find a blocking gap, state it precisely; otherwise confirm it is implementation-ready.",
-		"Finish with a concise verdict as your final summary: READY or the specific blockers.",
-	}, "\n")
+		"Your final summary MUST begin with exactly `VERDICT: READY` when implementation is unambiguous and safe, or `VERDICT: BLOCKED` followed by the specific blockers. BLOCKED must never open human approval.",
+		agent.CompletionMarker + `={"summary":"VERDICT: READY — ... or VERDICT: BLOCKED — ..."}`,
+	}
+	if strings.TrimSpace(decisionContext) != "" {
+		parts = append(parts, "The V2 requirement Decision Log below is authoritative; verify the spec implements it and does not contain unresolved role decisions.", decisionContext)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func parseSpecReviewVerdict(summary string) (string, bool) {
+	normalized := strings.ToUpper(strings.TrimSpace(strings.ReplaceAll(summary, "**", "")))
+	if strings.HasPrefix(normalized, "VERDICT: READY") {
+		return "ready", true
+	}
+	if strings.HasPrefix(normalized, "VERDICT: BLOCKED") {
+		return "blocked", true
+	}
+	return "", false
 }
 
 // htmlEscape escapes text for safe embedding inside a Plane comment's HTML body.
@@ -1832,11 +2396,11 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 		}
 	}
 	// Leave a neutral [looper] status note on the spec page — the tech-spec draft has
-	// landed and is entering review (node H). The GRILL + human-approve (via a Feishu
-	// card, not a page reply) is a later stage; this note is only an audit breadcrumb,
+	// landed and is entering review (node H). The GRILL + owner approval is a later
+	// stage; this note is only an audit breadcrumb,
 	// not an approve invitation. Idempotent + best-effort — a failed note must not wedge
 	// the planner (the tech-spec link is the real discovery signal).
-	noteHTML := planedoc.SignComment("<p>技术方案初稿已写到本页,进入评审(node H)。人看过没问题在本页评论 approve / 同意 / 👍 即进入实现。</p>", "planner", strings.TrimSpace(r.agentModel))
+	noteHTML := planedoc.SignComment("<p>技术方案初稿已写到本页，正在进入 GRILL 拷问与独立 REVIEW。当前尚未开放审批；评审通过后 Looper 会另发带修订哈希的 owner 审批请求。</p>", "planner", strings.TrimSpace(r.agentModel))
 	if _, err := gateway.PostSpecReviewComment(ctx, planeProjectID, specURL, noteHTML); err != nil && r.logger != nil {
 		r.logger.Warn("planner: post spec status note failed (continuing)", map[string]any{"projectId": input.Project.ID, "page": specURL, "error": err.Error()})
 	}
@@ -1844,9 +2408,10 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 		checkpoint.Publish = &checkpointPublishState{}
 	}
 	checkpoint.Publish.PlaneSpecReview = true
-	// node H condition #2: surface the spec DRAFT in the Feishu thread + @product owner
-	// (FYI) — so a human sees it as review begins, before grill/review run.
-	r.postNodeHThreadNote(ctx, input, "specDraftFYI", "📋 技术方案初稿已出炉:"+specURL+"\n即将进入 fresh agent 拷问(GRILL)+ 独立复核(REVIEW),收敛后请你在方案页 approve。", false)
+	// node H condition #2: surface the spec DRAFT in the Feishu thread as an FYI —
+	// the local Looper owner is mentioned only after grill/review open the actionable
+	// approval gate.
+	r.postNodeHThreadNote(ctx, input, "specDraftFYI", "📋 技术方案初稿已出炉:"+specURL+"\n即将进入 fresh agent 拷问（GRILL）+ 独立复核（REVIEW）。当前无需操作；通过后 Looper 会另行 @ owner 审批当前修订。", false)
 	// node H begins here: the tech spec is on Plane. The grill step runs next; only
 	// after grill + review converge does the loop open the human-approve gate. Mark the
 	// card so it reads 🔬 方案拷问中 instead of resting on 编写技术方案中.
@@ -1856,11 +2421,11 @@ func (r *Runner) runPlanePublishStep(ctx context.Context, input stepInput, gatew
 }
 
 // postNodeHThreadNote posts a node H touchpoint into the loop's Feishu thread,
-// @-mentioning the project's product owner so a human sees the spec draft / grill
-// transcript in the thread (goal condition #2). Best-effort — a missing transport or
-// owner just skips the ping.
+// @-mentioning the project's local Looper owner for the actionable tech-spec approval.
+// Draft/grill notes remain informational. Best-effort — a missing transport or owner
+// just skips the ping.
 func (r *Runner) postNodeHThreadNote(ctx context.Context, input stepInput, dedupKey, text string, mention bool) {
-	if r.postThreadNote == nil {
+	if r.postThreadNote == nil && r.postThreadNoteWithUUID == nil {
 		return
 	}
 	// Post each node-H thread note at most ONCE per loop. A follow-up resume re-enters
@@ -1873,11 +2438,18 @@ func (r *Runner) postNodeHThreadNote(ctx context.Context, input stepInput, dedup
 	// transcript are informational and shouldn't ping a human every time.
 	var mentions []string
 	if mention && r.projectRoleConfig != nil {
-		if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
+		if openID := strings.TrimSpace(config.ProjectOwner(*r.projectRoleConfig, input.Project.ID)); openID != "" {
 			mentions = []string{openID}
 		}
 	}
-	if err := r.postThreadNote(ctx, input.Loop.ID, text, mentions); err != nil {
+	var err error
+	if r.postThreadNoteWithUUID != nil && strings.TrimSpace(dedupKey) != "" {
+		sum := sha256.Sum256([]byte("node-h-note:" + input.Loop.ID + ":" + dedupKey))
+		err = r.postThreadNoteWithUUID(ctx, input.Loop.ID, text, mentions, fmt.Sprintf("%x", sum[:16]))
+	} else if r.postThreadNote != nil {
+		err = r.postThreadNote(ctx, input.Loop.ID, text, mentions)
+	}
+	if err != nil {
 		if r.logger != nil {
 			r.logger.Warn("planner: post node H thread note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
@@ -2191,6 +2763,9 @@ func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord, 
 // which only reactivates planner loops that have a captured session); a completed
 // loop is otherwise never re-dispatched.
 func (r *Runner) shouldFollowupResume(ctx context.Context, loop storage.LoopRecord, latestRun *storage.RunRecord, checkpoint plannerCheckpoint) bool {
+	if checkpoint.PipelineVersion >= 2 {
+		return false
+	}
 	// "success" = a finished loop the human is following up on; "interrupted" = the
 	// human's mid-run @bot killed the active agent (强操控) — either way, answer them from
 	// the main write-spec session. A genuinely "failed" run still retries normally.
@@ -2234,6 +2809,13 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		check = parseCheckpoint(latestRun.CheckpointJSON)
 		lastCompleted = asPlannerStep(derefString(latestRun.LastCompletedStep))
 	}
+	configuredPipelineVersion := int(int64FromAny(parseJSONObject(loop.MetadataJSON)["plannerPipelineVersion"]))
+	if configuredPipelineVersion > check.PipelineVersion {
+		check.PipelineVersion = configuredPipelineVersion
+	}
+	if check.PipelineVersion == 0 {
+		check.PipelineVersion = 1
+	}
 	// FOLLOW-UP RESUME (线程永远可追问): a planner loop got a new human message — resume
 	// the SAME session at write-spec so the MAIN looper answers (never the fresh grill
 	// critic), for ONE incremental turn (see shouldFollowupResume). This takes PRECEDENCE
@@ -2241,29 +2823,57 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	// @bot kills the active agent → interrupted), we must answer them from the main
 	// session, not silently resume the interrupted grill/review step.
 	followupResume := r.shouldFollowupResume(ctx, loop, latestRun, check)
+	waitCandidate := !followupResume && latestRun != nil && latestRun.Status == "success" && check.Wait != nil && loop.Status == "queued"
+	waitResume := waitCandidate && (check.PipelineVersion < 2 || v2DecisionWaitResolved(check))
+	if waitCandidate && check.PipelineVersion >= 2 && !waitResume {
+		stage := "<missing>"
+		if check.Decisions != nil {
+			stage = check.Decisions.Stage
+		}
+		return resumedRunContext{}, fmt.Errorf("planner V2 decision barrier %q is not resolved; refusing non-Plane requeue", stage)
+	}
+	requirementsReopen := !followupResume && latestRun != nil && latestRun.Status == "failed" && check.PipelineVersion >= 2 && check.Decisions != nil && check.Decisions.Stage == "requirements_reopened"
 	shouldResume := !followupResume && latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
 	startStep := stepDiscoverIssues
 	switch {
 	case followupResume:
 		startStep = stepWriteSpec
+	case waitResume:
+		startStep = check.Wait.ResumeStep
+		if startStep == "" || !plannerStepInVersion(startStep, check.PipelineVersion) {
+			return resumedRunContext{}, fmt.Errorf("planner wait has invalid resumeStep %q for pipeline v%d", startStep, check.PipelineVersion)
+		}
+	case requirementsReopen:
+		startStep = stepGrillProductDecisions
 	case shouldResume:
-		if next := nextPlannerStep(lastCompleted); next != "" {
+		if next := nextPlannerStepForVersion(lastCompleted, check.PipelineVersion); next != "" {
 			startStep = next
 		}
 	}
-	resumed := followupResume || (shouldResume && startStep != stepDiscoverIssues)
-	initialCheckpoint := plannerCheckpoint{ResumePolicy: "replay_step"}
+	resumed := followupResume || waitResume || requirementsReopen || (shouldResume && startStep != stepDiscoverIssues)
+	// Even a brand-new run must carry the pipeline version frozen on the loop.
+	// Dropping it here makes stepsFromVersion choose V1; discover then reloads V2
+	// and write-spec correctly fails because the V2 decision gates were skipped.
+	initialCheckpoint := plannerCheckpoint{PipelineVersion: check.PipelineVersion, ResumePolicy: "replay_step"}
 	if followupResume {
 		initialCheckpoint = rewindPlannerCheckpointForFollowup(check)
 		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
 	} else if resumed {
 		initialCheckpoint = check
+		if waitResume {
+			initialCheckpoint.Wait = nil
+			initialCheckpoint.SkipReason = ""
+		}
 		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
 	}
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
 	if followupResume {
-		if prev := previousPlannerStep(startStep); prev != "" {
+		if prev := previousPlannerStepForVersion(startStep, initialCheckpoint.PipelineVersion); prev != "" {
+			run.LastCompletedStep = stringPtr(string(prev))
+		}
+	} else if waitResume || requirementsReopen {
+		if prev := previousPlannerStepForVersion(startStep, initialCheckpoint.PipelineVersion); prev != "" {
 			run.LastCompletedStep = stringPtr(string(prev))
 		}
 	} else if resumed && lastCompleted != "" {
@@ -2275,6 +2885,20 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: initialCheckpoint, Resumed: resumed}, nil
+}
+
+func v2DecisionWaitResolved(checkpoint plannerCheckpoint) bool {
+	if checkpoint.PipelineVersion < 2 || checkpoint.Wait == nil || checkpoint.Decisions == nil {
+		return false
+	}
+	switch checkpoint.Wait.ResumeStep {
+	case stepGrillDownstreamDecisions:
+		return checkpoint.Decisions.Stage == "product_resolved"
+	case stepGrillFinalDecisions:
+		return checkpoint.Decisions.Stage == "downstream_resolved"
+	default:
+		return false
+	}
 }
 
 func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, step PlannerStep, checkpoint plannerCheckpoint) (storage.RunRecord, error) {
@@ -2294,7 +2918,7 @@ func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, 
 func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord, step PlannerStep, checkpoint plannerCheckpoint) (storage.RunRecord, error) {
 	updated := run
 	nowISO := r.nowISO()
-	if next := nextPlannerStep(step); next != "" {
+	if next := nextPlannerStepForVersion(step, checkpoint.PipelineVersion); next != "" {
 		updated.CurrentStep = stringPtr(string(next))
 	} else {
 		updated.CurrentStep = nil
@@ -2405,13 +3029,24 @@ func (r *Runner) ensureLoopForIssue(ctx context.Context, project storage.Project
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	meta := mustMarshalJSON(map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)})
+	pipelineVersion := r.pipelineVersionForProject(project.ID)
+	meta := mustMarshalJSON(map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title), "plannerPipelineVersion": pipelineVersion})
 	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "planner", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "queued", MetadataJSON: &meta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
 		return loopUpsertResult{}, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.created", projectID: project.ID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"type": "planner", "repo": repo, "issueNumber": issue.Number}})
 	return loopUpsertResult{record: loop, created: true}, nil
+}
+
+func (r *Runner) pipelineVersionForProject(projectID string) int {
+	if r.projectRoleConfig == nil || !r.isPlaneProject(projectID) {
+		return 1
+	}
+	if config.ProjectRoleConfigs(*r.projectRoleConfig, projectID).Planner.PreSpecDecisionGrill {
+		return 2
+	}
+	return 1
 }
 
 type enqueueInput struct {
@@ -2522,7 +3157,7 @@ func plannerFailureBoundaryForStep(step PlannerStep) failureclass.Boundary {
 		return failureclass.BoundaryGitHubAPI
 	case stepPrepareWorktree:
 		return failureclass.BoundaryGitRemote
-	case stepWriteSpec, stepGrill, stepReview:
+	case stepAuthorDecisionBrief, stepGrillProductDecisions, stepGrillDownstreamDecisions, stepGrillFinalDecisions, stepWriteSpec, stepGrill, stepReview:
 		return failureclass.BoundaryModelProvider
 	default:
 		return failureclass.BoundaryUnknown
@@ -2545,36 +3180,67 @@ func plannerFailureKind(kind failureclass.Kind) QueueFailureKind {
 func (r *Runner) nowISO() string { return eventlog.FormatJavaScriptISOString(r.now()) }
 
 func stepsFrom(start PlannerStep) []PlannerStep {
+	return stepsFromVersion(start, 1)
+}
+
+func plannerStepsForVersion(version int) []PlannerStep {
+	if version >= 2 {
+		return plannerV2StepSequence
+	}
+	return plannerStepSequence
+}
+
+func plannerStepInVersion(step PlannerStep, version int) bool {
+	for _, candidate := range plannerStepsForVersion(version) {
+		if candidate == step {
+			return true
+		}
+	}
+	return false
+}
+
+func stepsFromVersion(start PlannerStep, version int) []PlannerStep {
+	sequence := plannerStepsForVersion(version)
 	startIndex := 0
-	for i, step := range plannerStepSequence {
+	for i, step := range sequence {
 		if step == start {
 			startIndex = i
 			break
 		}
 	}
-	return plannerStepSequence[startIndex:]
+	return sequence[startIndex:]
 }
 
 func nextPlannerStep(step PlannerStep) PlannerStep {
-	for i, candidate := range plannerStepSequence {
-		if candidate == step && i+1 < len(plannerStepSequence) {
-			return plannerStepSequence[i+1]
+	return nextPlannerStepForVersion(step, 1)
+}
+
+func nextPlannerStepForVersion(step PlannerStep, version int) PlannerStep {
+	sequence := plannerStepsForVersion(version)
+	for i, candidate := range sequence {
+		if candidate == step && i+1 < len(sequence) {
+			return sequence[i+1]
 		}
 	}
 	return ""
 }
 
 func previousPlannerStep(step PlannerStep) PlannerStep {
-	for i, candidate := range plannerStepSequence {
+	return previousPlannerStepForVersion(step, 1)
+}
+
+func previousPlannerStepForVersion(step PlannerStep, version int) PlannerStep {
+	sequence := plannerStepsForVersion(version)
+	for i, candidate := range sequence {
 		if candidate == step && i > 0 {
-			return plannerStepSequence[i-1]
+			return sequence[i-1]
 		}
 	}
 	return ""
 }
 
 func asPlannerStep(value string) PlannerStep {
-	for _, candidate := range plannerStepSequence {
+	for _, candidate := range append(append([]PlannerStep{}, plannerStepSequence...), plannerV2StepSequence...) {
 		if string(candidate) == value {
 			return candidate
 		}

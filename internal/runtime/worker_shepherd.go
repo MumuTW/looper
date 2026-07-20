@@ -535,6 +535,9 @@ func (r *Runtime) shepherdNotifyGateway() (*notify.Gateway, bool) {
 		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
 		Repositories:  repos,
 		Now:           now,
+		ResolveOwnerOpenID: func(projectID string) string {
+			return config.ProjectOwner(cfg, projectID)
+		},
 	}), true
 }
 

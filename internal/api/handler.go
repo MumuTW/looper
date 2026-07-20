@@ -3381,7 +3381,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		return loopResponse{}, err
 	}
 	if domain.LoopType(loopType) == domain.LoopTypePlanner {
-		metadataJSON, err = manualPlannerMetadataJSON(metadataJSON, target.IssueNumber)
+		metadataJSON, err = manualPlannerMetadataJSON(metadataJSON, target.IssueNumber, manualPlannerPipelineVersion(h.context.Config, projectID))
 		if err != nil {
 			return loopResponse{}, err
 		}
@@ -3915,7 +3915,7 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	targetID := fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
-	metadataJSONPtr, err := manualPlannerMetadataJSON(nil, *issueNumber)
+	metadataJSONPtr, err := manualPlannerMetadataJSON(nil, *issueNumber, manualPlannerPipelineVersion(h.context.Config, projectID))
 	if err != nil {
 		return plannerCreateResponse{}, err
 	}
@@ -5056,7 +5056,7 @@ func normalizeMetadataJSON(raw json.RawMessage) (*string, error) {
 	return &text, nil
 }
 
-func manualPlannerMetadataJSON(existing *string, issueNumber int64) (*string, error) {
+func manualPlannerMetadataJSON(existing *string, issueNumber int64, pipelineVersion int) (*string, error) {
 	metadata := map[string]any{}
 	if existing != nil && strings.TrimSpace(*existing) != "" {
 		if err := json.Unmarshal([]byte(*existing), &metadata); err != nil {
@@ -5065,12 +5065,22 @@ func manualPlannerMetadataJSON(existing *string, issueNumber int64) (*string, er
 	}
 	metadata["issueNumber"] = issueNumber
 	metadata["manual"] = true
+	if pipelineVersion >= 2 {
+		metadata["plannerPipelineVersion"] = pipelineVersion
+	}
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 	text := string(encoded)
 	return &text, nil
+}
+
+func manualPlannerPipelineVersion(cfg config.Config, projectID string) int {
+	if config.ProjectProviderKind(cfg, projectID) == config.ProviderKindPlane && config.ProjectRoleConfigs(cfg, projectID).Planner.PreSpecDecisionGrill {
+		return 2
+	}
+	return 1
 }
 
 func manualFixerMetadataJSON(existing *string, nowISO string) (*string, error) {

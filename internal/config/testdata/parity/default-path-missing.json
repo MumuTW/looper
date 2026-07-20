@@ -121,10 +121,10 @@
         "environment": {},
         "worktreeCleanup": {
           "enabled": true,
-          "interval": "24h",
-          "retentionDays": 7,
-          "maxPerTick": 10,
-          "includeOrphans": false,
+          "interval": "1h",
+          "retentionDays": 1,
+          "maxPerTick": 50,
+          "includeOrphans": true,
           "dryRun": false
         }
       },

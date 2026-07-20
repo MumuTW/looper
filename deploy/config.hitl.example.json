@@ -68,17 +68,24 @@
       "repo": "OWNER/REPO",
       "repoPath": "/ABSOLUTE/PATH/TO/LOCAL/CLONE",
       "productOwner": {
-        "feishuOpenId": "REPLACE_WITH_PRODUCT_OWNER_ou_xxx"
+        "feishuOpenId": "REPLACE_WITH_PRODUCT_OWNER_ou_xxx",
+        "planeId": ""
+      },
+      "designOwner": {
+        "feishuOpenId": "REPLACE_WITH_DESIGN_OWNER_ou_xxx",
+        "planeId": ""
       },
       "qa": {
         "feishuOpenId": "REPLACE_WITH_QA_ou_xxx"
       },
       "owner": {
-        "feishuOpenId": "FILLED_BY_looper_login_ou_xxx"
+        "feishuOpenId": "FILLED_BY_looper_login_ou_xxx",
+        "planeId": ""
       },
       "roles": {
         "planner": {
-          "autoDiscovery": false
+          "autoDiscovery": false,
+          "preSpecDecisionGrill": false
         },
         "worker": {
           "autoDiscovery": true,

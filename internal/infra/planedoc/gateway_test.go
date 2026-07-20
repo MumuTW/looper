@@ -267,7 +267,7 @@ func TestDecideIntakeAndHasProductSpec(t *testing.T) {
 		t.Fatal("no product spec → request from product")
 	}
 	// HasProductSpec finds the product-spec link.
-	f := &fakeRun{stdouts: []string{`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://x/pages/p1"}]}`}}
+	f := &fakeRun{stdouts: []string{`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://x/pages/p1"}]}`, "# Product Spec"}}
 	g := newGateway(f)
 	present, url, err := g.HasProductSpec(context.Background(), "p1", "wi-1")
 	if err != nil || !present || url != "https://x/pages/p1" {
@@ -277,6 +277,33 @@ func TestDecideIntakeAndHasProductSpec(t *testing.T) {
 	f2 := &fakeRun{stdouts: []string{`{"results":[]}`}}
 	if present, _, _ := newGateway(f2).HasProductSpec(context.Background(), "p1", "wi-1"); present {
 		t.Fatal("HasProductSpec = true, want false for a work item with no product-spec link")
+	}
+	for name, outputs := range map[string][]string{
+		"external": {`{"results":[{"title":"looper:product-spec","url":"https://feishu.example/doc/1"}]}`},
+		"blank":    {`{"results":[{"title":"looper:product-spec","url":"https://x/pages/p1"}]}`, "   "},
+	} {
+		if present, _, _ := newGateway(&fakeRun{stdouts: outputs}).HasProductSpec(context.Background(), "p1", "wi-1"); present {
+			t.Fatalf("HasProductSpec = true for %s formal Spec", name)
+		}
+	}
+}
+
+func TestWorkItemCommentsPreserveUUIDActorAndTime(t *testing.T) {
+	f := &fakeRun{stdouts: []string{
+		`{"results":[{"id":"comment-uuid","actor":"member-uuid","comment_html":"<p>ENG-001: A</p>","created_at":"2026-07-17T10:00:00Z","updated_at":"2026-07-17T10:01:00Z"}]}`,
+		`{"id":"created-uuid","actor":"bot-uuid","comment_html":"<p>ask</p>","created_at":"2026-07-17T10:02:00Z"}`,
+	}}
+	g := newGateway(f)
+	comments, err := g.ListWorkItemComments(context.Background(), "proj-1", "wi-1")
+	if err != nil || len(comments) != 1 || comments[0].ID != "comment-uuid" || comments[0].Actor != "member-uuid" || comments[0].CreatedAt == "" {
+		t.Fatalf("ListWorkItemComments = %#v, %v", comments, err)
+	}
+	created, err := g.CreateWorkItemComment(context.Background(), "proj-1", "wi-1", "<p>ask</p>")
+	if err != nil || created.ID != "created-uuid" || created.CreatedAt == "" {
+		t.Fatalf("CreateWorkItemComment = %#v, %v", created, err)
+	}
+	if !argsContain(f.calls[0], "workspaces/open-design/projects/proj-1/work-items/wi-1/comments/", "--method", "GET") || !argsContain(f.calls[1], "--method", "POST") {
+		t.Fatalf("calls = %#v", f.calls)
 	}
 }
 
@@ -300,6 +327,14 @@ func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
 	}
 	if !strings.Contains(data.CommentHTML, "&lt;x&gt;") || !strings.Contains(data.CommentHTML, "&amp;") {
 		t.Fatalf("comment_html not escaped: %q", data.CommentHTML)
+	}
+	for _, want := range []string{"looper:product-spec", "Links", "普通评论", "不会解除"} {
+		if !strings.Contains(data.CommentHTML, want) {
+			t.Fatalf("formal product Spec instruction missing %q: %q", want, data.CommentHTML)
+		}
+	}
+	if strings.Contains(data.CommentHTML, "正文发在这里") || strings.Contains(data.CommentHTML, "自动把它关联") {
+		t.Fatalf("formal product Spec instruction promises unsupported comment association: %q", data.CommentHTML)
 	}
 }
 

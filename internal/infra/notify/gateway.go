@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,15 +41,22 @@ type HTTPPostFunc func(url string, body []byte) (int, error)
 // It is injectable so tests can avoid real network calls.
 type FeishuAppHTTPFunc func(ctx context.Context, method, url string, headers map[string]string, body []byte) (int, []byte, error)
 
+// ResolveOwnerOpenID returns the Feishu open_id of the person who owns this
+// Looper deployment for a project. The identity is attribution only: Feishu may
+// render the mention grey when that person is not a member of the destination
+// chat, and delivery must still proceed.
+type ResolveOwnerOpenID func(projectID string) string
+
 type Options struct {
-	Config        config.NotificationConfig
-	OsascriptPath string
-	LogFilePath   string
-	Repositories  *storage.Repositories
-	Now           func() time.Time
-	RunCommand    RunCommandFunc
-	HTTPPost      HTTPPostFunc
-	FeishuAppHTTP FeishuAppHTTPFunc
+	Config             config.NotificationConfig
+	OsascriptPath      string
+	LogFilePath        string
+	Repositories       *storage.Repositories
+	Now                func() time.Time
+	RunCommand         RunCommandFunc
+	HTTPPost           HTTPPostFunc
+	FeishuAppHTTP      FeishuAppHTTPFunc
+	ResolveOwnerOpenID ResolveOwnerOpenID
 }
 
 type SystemNotificationPayload struct {
@@ -70,14 +79,15 @@ type SystemNotificationPayload struct {
 }
 
 type Gateway struct {
-	config        config.NotificationConfig
-	osascriptPath string
-	logFilePath   string
-	repositories  *storage.Repositories
-	now           func() time.Time
-	runCommand    RunCommandFunc
-	httpPost      HTTPPostFunc
-	feishuAppHTTP FeishuAppHTTPFunc
+	config             config.NotificationConfig
+	osascriptPath      string
+	logFilePath        string
+	repositories       *storage.Repositories
+	now                func() time.Time
+	runCommand         RunCommandFunc
+	httpPost           HTTPPostFunc
+	feishuAppHTTP      FeishuAppHTTPFunc
+	resolveOwnerOpenID ResolveOwnerOpenID
 
 	feishuTokenMu  sync.Mutex
 	feishuToken    string
@@ -155,14 +165,15 @@ func NewGateway(options Options) *Gateway {
 	}
 
 	return &Gateway{
-		config:        options.Config,
-		osascriptPath: options.OsascriptPath,
-		logFilePath:   options.LogFilePath,
-		repositories:  options.Repositories,
-		now:           now,
-		runCommand:    runCommand,
-		httpPost:      httpPost,
-		feishuAppHTTP: feishuAppHTTP,
+		config:             options.Config,
+		osascriptPath:      options.OsascriptPath,
+		logFilePath:        options.LogFilePath,
+		repositories:       options.Repositories,
+		now:                now,
+		runCommand:         runCommand,
+		httpPost:           httpPost,
+		feishuAppHTTP:      feishuAppHTTP,
+		resolveOwnerOpenID: options.ResolveOwnerOpenID,
 	}
 }
 
@@ -547,6 +558,10 @@ type HITLAskCard struct {
 	Question       string
 	Options        []string
 	MentionOpenIds []string
+	// OwnerOpenID identifies which teammate's local Looper emitted the card. It is
+	// deliberately independent from MentionOpenIds: the owner need not be the
+	// decision maker and need not be a member of the destination chat.
+	OwnerOpenID string
 
 	// Source identifies where the task came from so the human knows what they are
 	// deciding about. SourceType is a human label ("GitHub Issue", "GitHub PR",
@@ -607,6 +622,9 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	// The @-mention targets come from config (deployment-specific), not the caller.
 	if len(card.MentionOpenIds) == 0 {
 		card.MentionOpenIds = cfg.MentionOpenIds
+	}
+	if strings.TrimSpace(card.OwnerOpenID) == "" {
+		card.OwnerOpenID = g.ownerOpenID(card.ProjectID)
 	}
 	cardJSON, err := buildFeishuAskCard(card)
 	if err != nil {
@@ -815,6 +833,7 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	}
 	noteParts = append(noteParts, "loop "+seq, "点选项或直接回文字")
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
+	elements = append(elements, feishuLooperOwnerNote(card.OwnerOpenID))
 
 	header := map[string]any{"template": "orange", "title": map[string]any{"tag": "plain_text", "content": "Looper needs a decision"}}
 	if strings.TrimSpace(card.AnsweredWith) != "" {
@@ -831,6 +850,24 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 // larkDiv is a text block that renders lark markdown (bold, links, @-mentions).
 func larkDiv(content string) map[string]any {
 	return map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": content}}
+}
+
+func (g *Gateway) ownerOpenID(projectID string) string {
+	if g == nil || g.resolveOwnerOpenID == nil {
+		return ""
+	}
+	return strings.TrimSpace(g.resolveOwnerOpenID(strings.TrimSpace(projectID)))
+}
+
+// feishuLooperOwnerNote makes cards from multiple teammates' local Loopers
+// distinguishable in one shared group. An out-of-chat mention is intentionally
+// retained; Feishu renders it grey but still shows the owner's identity.
+func feishuLooperOwnerNote(openID string) map[string]any {
+	identity := "未配置 owner"
+	if openID = strings.TrimSpace(openID); openID != "" {
+		identity = "<at id=" + openID + "></at>"
+	}
+	return map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "来自 " + identity + " 的 Looper"}}}
 }
 
 // feishuSourceLine renders "📋 [GitHub Issue #132](url) · repo · 由 @who 提出".
@@ -957,6 +994,10 @@ func feishuMessageID(body []byte) string {
 // (reply_in_thread), so all of a loop's messages collapse into one thread;
 // otherwise it is posted top-level to chatID. Returns the new message id.
 func (g *Gateway) postFeishuAppMessage(ctx context.Context, token, chatID, rootMessageID, msgType, content string) (string, error) {
+	return g.postFeishuAppMessageWithUUID(ctx, token, chatID, rootMessageID, msgType, content, "")
+}
+
+func (g *Gateway) postFeishuAppMessageWithUUID(ctx context.Context, token, chatID, rootMessageID, msgType, content, uuid string) (string, error) {
 	var apiURL string
 	var payload map[string]any
 	if strings.TrimSpace(rootMessageID) != "" {
@@ -965,6 +1006,9 @@ func (g *Gateway) postFeishuAppMessage(ctx context.Context, token, chatID, rootM
 	} else {
 		apiURL = feishuAPIBase + "/open-apis/im/v1/messages?receive_id_type=chat_id"
 		payload = map[string]any{"receive_id": chatID, "msg_type": msgType, "content": content}
+	}
+	if strings.TrimSpace(uuid) != "" {
+		payload["uuid"] = strings.TrimSpace(uuid)
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -984,6 +1028,87 @@ func (g *Gateway) postFeishuAppMessage(ctx context.Context, token, chatID, rootM
 		return "", fmt.Errorf("feishu im error code %d: %s", code, msg)
 	}
 	return feishuMessageID(respBody), nil
+}
+
+// PostThreadImage uploads a PNG and posts it once under the loop's existing Feishu
+// thread. Feishu's uuid is the visible-message idempotency authority; a crash may
+// repeat the invisible upload, but cannot duplicate the visible image message.
+func (g *Gateway) PostThreadImage(ctx context.Context, loopID, pngPath, dedupeUUID string) (string, error) {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" || strings.TrimSpace(pngPath) == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+		return "", nil
+	}
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	if appID == "" || appSecret == "" {
+		return "", nil
+	}
+	root := g.threadRootForLoop(ctx, loopID)
+	if root == "" || strings.TrimSpace(cfg.ChatID) == "" {
+		return "", nil
+	}
+	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return "", err
+	}
+	imageKey, err := g.uploadFeishuImage(ctx, token, pngPath)
+	if err != nil {
+		return "", err
+	}
+	content, err := json.Marshal(map[string]string{"image_key": imageKey})
+	if err != nil {
+		return "", err
+	}
+	return g.postFeishuAppMessageWithUUID(ctx, token, cfg.ChatID, root, "image", string(content), dedupeUUID)
+}
+
+func (g *Gateway) uploadFeishuImage(ctx context.Context, token, pngPath string) (string, error) {
+	file, err := os.Open(pngPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 10<<20 {
+		return "", fmt.Errorf("feishu image must be a regular file between 1 byte and 10 MiB")
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("image_type", "message"); err != nil {
+		return "", err
+	}
+	part, err := writer.CreateFormFile("image", filepath.Base(pngPath))
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(part, file); err != nil {
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	status, response, err := g.feishuAppHTTP(ctx, http.MethodPost, feishuAPIBase+"/open-apis/im/v1/images", map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  writer.FormDataContentType(),
+	}, body.Bytes())
+	if err != nil {
+		return "", err
+	}
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("feishu image upload responded with status %d", status)
+	}
+	var parsed struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			ImageKey string `json:"image_key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response, &parsed); err != nil || parsed.Code != 0 || strings.TrimSpace(parsed.Data.ImageKey) == "" {
+		return "", fmt.Errorf("feishu image upload failed: code=%d msg=%s", parsed.Code, parsed.Msg)
+	}
+	return strings.TrimSpace(parsed.Data.ImageKey), nil
 }
 
 // ensureFeishuThreadRoot returns the Feishu root message id a loop's notifications
@@ -1284,6 +1409,7 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	}
 	noteParts = append(noteParts, "展开话题看实时进度 →")
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
+	elements = append(elements, feishuLooperOwnerNote(g.ownerOpenID(loop.ProjectID)))
 	// One-command local takeover of the agent session (runs on the daemon host).
 	// Offered only while the loop is live; dropped once it reaches a terminal state.
 	if !feishuLoopStatusTerminal(loop.Status) {
@@ -1453,6 +1579,12 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 	// header stops resting on a generic "编写技术方案中" through grill + review.
 	if role == "planner" {
 		switch strings.ToLower(strings.TrimSpace(nodeHPhase)) {
+		case "awaiting_product_spec":
+			return "orange", "📄 等待产品 Spec"
+		case "awaiting_product":
+			return "orange", "🙋 等待产品拍板"
+		case "awaiting_downstream":
+			return "orange", "🎨 等待设计/研发拍板"
 		case "grilling":
 			return "blue", "🔬 方案拷问中"
 		case "reviewing":
@@ -1878,7 +2010,13 @@ func (g *Gateway) updateLiveFeedComment(ctx context.Context, token, loopID strin
 	if strings.TrimSpace(root) == "" {
 		return // anchor not posted yet — nothing to thread under
 	}
-	cardJSON, ok := feishuLiveFeedCard(tail, elapsedSec)
+	ownerOpenID := ""
+	if g.repositories.Loops != nil {
+		if loop, err := g.repositories.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
+			ownerOpenID = g.ownerOpenID(loop.ProjectID)
+		}
+	}
+	cardJSON, ok := feishuLiveFeedCardWithOwner(tail, elapsedSec, ownerOpenID)
 	if !ok {
 		return
 	}
@@ -2001,6 +2139,16 @@ func (g *Gateway) PostTaskClosedFollowup(ctx context.Context, loopID string) err
 // and the grill transcript after GRILL. No-op unless the app transport is configured
 // or the loop has no thread root yet.
 func (g *Gateway) PostThreadNote(ctx context.Context, loopID, text string, mentionOpenIDs []string) error {
+	return g.postThreadNote(ctx, loopID, text, mentionOpenIDs, "")
+}
+
+// PostThreadNoteWithUUID is the idempotent form used by revisioned decision
+// notifications. Repeating the same UUID returns the same Feishu message.
+func (g *Gateway) PostThreadNoteWithUUID(ctx context.Context, loopID, text string, mentionOpenIDs []string, uuid string) error {
+	return g.postThreadNote(ctx, loopID, text, mentionOpenIDs, uuid)
+}
+
+func (g *Gateway) postThreadNote(ctx context.Context, loopID, text string, mentionOpenIDs []string, uuid string) error {
 	loopID = strings.TrimSpace(loopID)
 	if loopID == "" || strings.TrimSpace(text) == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
 		return nil
@@ -2032,7 +2180,7 @@ func (g *Gateway) PostThreadNote(ctx context.Context, loopID, text string, menti
 	if err != nil {
 		return err
 	}
-	if _, err := g.postFeishuAppMessage(ctx, token, chatID, root, "text", string(raw)); err != nil {
+	if _, err := g.postFeishuAppMessageWithUUID(ctx, token, chatID, root, "text", string(raw), uuid); err != nil {
 		return err
 	}
 	// Refresh the anchor card so its phase title tracks the loop — a node H post lands
@@ -2282,6 +2430,10 @@ func feishuPhaseFromTail(tail []string) string {
 // as the first reply INSIDE the thread — the real-time status sync surface, kept
 // separate from the human-scannable anchor.
 func feishuLiveFeedCard(tail []string, elapsedSec int64) (string, bool) {
+	return feishuLiveFeedCardWithOwner(tail, elapsedSec, "")
+}
+
+func feishuLiveFeedCardWithOwner(tail []string, elapsedSec int64, ownerOpenID string) (string, bool) {
 	if len(tail) == 0 {
 		return "", false
 	}
@@ -2291,6 +2443,7 @@ func feishuLiveFeedCard(tail []string, elapsedSec int64) (string, bool) {
 		note = "⏱ " + humanizeElapsedSeconds(elapsedSec) + " · 实时更新中"
 	}
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": note}}})
+	elements = append(elements, feishuLooperOwnerNote(ownerOpenID))
 	// No header — the body already leads with "🔧 实时进度"; a separate "实时进度同步"
 	// title just repeats it. Feishu renders a header-less card fine.
 	cardObj := map[string]any{

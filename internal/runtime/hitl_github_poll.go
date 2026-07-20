@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -176,6 +177,12 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	if err != nil || loop == nil {
 		return false, err
 	}
+	// Plane decision pipeline V2 is notification-only on Feishu/GitHub thread
+	// messages. Its barriers may only be released by audited Plane comments/specs;
+	// never write a generic humanInbox entry that another requeue path could consume.
+	if planeDecisionV2Planner(loop) {
+		return false, nil
+	}
 	// Record the message no matter what — it is never silently dropped. Even a
 	// terminal loop keeps it in metadata (visible in the dashboard, and read by any
 	// later legitimate resume of the loop).
@@ -244,11 +251,26 @@ func loopSafelyReactivatable(ctx context.Context, repos *storage.Repositories, l
 	if loop.Type != "worker" && loop.Type != "planner" {
 		return false
 	}
+	if planeDecisionV2Planner(loop) {
+		return false
+	}
 	exec, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil || exec == nil || exec.NativeSessionID == nil {
 		return false
 	}
 	return strings.TrimSpace(*exec.NativeSessionID) != ""
+}
+
+func planeDecisionV2Planner(loop *storage.LoopRecord) bool {
+	if loop == nil || !strings.EqualFold(strings.TrimSpace(loop.Type), "planner") || loop.MetadataJSON == nil {
+		return false
+	}
+	var metadata map[string]any
+	if json.Unmarshal([]byte(*loop.MetadataJSON), &metadata) != nil {
+		return false
+	}
+	value, ok := metadata["plannerPipelineVersion"].(float64)
+	return ok && int(value) >= 2
 }
 
 // ensureQueueItemForReactivation makes sure a loop being reactivated has an active

@@ -299,6 +299,9 @@ type ToolPathsConfig struct {
 	// PlanePath is the `plane` CLI used to read/write Plane spec documents (§8.2).
 	// Optional; auto-detected on PATH when unset.
 	PlanePath *string `json:"planePath,omitempty"`
+	// BrowserPath optionally pins Chrome/Chromium for restricted design-prototype
+	// screenshots. When unset the renderer probes supported local installations.
+	BrowserPath *string `json:"browserPath,omitempty"`
 }
 
 type ToolDetectionStatus string
@@ -491,9 +494,10 @@ type FixerRoleTriggersConfig struct {
 }
 
 type PlannerRoleConfig struct {
-	AutoDiscovery bool                    `json:"autoDiscovery"`
-	Triggers      IssueRoleTriggersConfig `json:"triggers"`
-	Instructions  string                  `json:"instructions,omitempty"`
+	AutoDiscovery        bool                    `json:"autoDiscovery"`
+	PreSpecDecisionGrill bool                    `json:"preSpecDecisionGrill,omitempty"`
+	Triggers             IssueRoleTriggersConfig `json:"triggers"`
+	Instructions         string                  `json:"instructions,omitempty"`
 }
 
 type WorkerRoleConfig struct {
@@ -586,6 +590,9 @@ type ProjectRefConfig struct {
 	Webhook      ProjectWebhookConfig `json:"webhook,omitempty"`
 	Roles        *PartialRoleConfigs  `json:"roles,omitempty"`
 	ProductOwner *ProductOwnerConfig  `json:"productOwner,omitempty"`
+	// DesignOwner owns user-interface and interaction decisions surfaced before the
+	// technical spec. PlaneID is the answer authority; FeishuOpenID is notification-only.
+	DesignOwner *FeishuActorConfig `json:"designOwner,omitempty"`
 	// QA is the project's QA validator — @-mentioned in the task thread when a PR the
 	// shepherd is driving carries `needs-validation` and hasn't been `validated` yet.
 	// Project-level (unified across every deploy of this project).
@@ -613,6 +620,9 @@ type ProductOwnerConfig struct {
 type FeishuActorConfig struct {
 	// FeishuOpenID is the actor's Feishu open_id (ou_...).
 	FeishuOpenID string `json:"feishuOpenId,omitempty"`
+	// PlaneID is the actor's Plane member UUID. It is the authority for role answers
+	// and, for owner, technical-spec approval.
+	PlaneID string `json:"planeId,omitempty"`
 }
 
 type ProjectWebhookConfig struct {
@@ -633,6 +643,7 @@ type PartialProjectRefConfig struct {
 	Instructions map[string]string            `json:"instructions,omitempty"`
 	Roles        *PartialRoleConfigs          `json:"roles,omitempty"`
 	ProductOwner *ProductOwnerConfig          `json:"productOwner,omitempty"`
+	DesignOwner  *FeishuActorConfig           `json:"designOwner,omitempty"`
 	QA           *FeishuActorConfig           `json:"qa,omitempty"`
 	Owner        *FeishuActorConfig           `json:"owner,omitempty"`
 }
@@ -832,6 +843,7 @@ type PartialToolPathsConfig struct {
 	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
 	PlanePath     *string `json:"planePath,omitempty"`
+	BrowserPath   *string `json:"browserPath,omitempty"`
 }
 
 type PartialDaemonConfig struct {
@@ -1010,9 +1022,10 @@ type PartialFixerRoleTriggersConfig struct {
 }
 
 type PartialPlannerRoleConfig struct {
-	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
-	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
-	Instructions  *string                         `json:"instructions,omitempty"`
+	AutoDiscovery        *bool                           `json:"autoDiscovery,omitempty"`
+	PreSpecDecisionGrill *bool                           `json:"preSpecDecisionGrill,omitempty"`
+	Triggers             *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
+	Instructions         *string                         `json:"instructions,omitempty"`
 }
 
 type PartialWorkerRoleConfig struct {

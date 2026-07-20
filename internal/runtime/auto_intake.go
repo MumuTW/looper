@@ -65,10 +65,10 @@ const (
 //
 //	out-of-scope                        → mark, stop
 //	unclear                             → hold, @human       (拿不准 → HITL 问人)
-//	valid + feature + no product spec   → hold, @product     (node E: 补 product spec)
+//	valid + feature + no product spec   → V2 planner research; V1 hold @product
 //	valid + dispatch/implement          → worker directly    (简单 bug: 直接修)
 //	valid + dispatch/plan (or default)  → planner writes spec (需求 / 复杂 bug)
-func decideAutoIntakeRoute(decision triage.Decision, hasProductSpec bool) intakeRoute {
+func decideAutoIntakeRoute(decision triage.Decision, hasProductSpec, preSpecDecisionGrill bool) intakeRoute {
 	if decision.NoOp {
 		return intakeSkip
 	}
@@ -78,7 +78,7 @@ func decideAutoIntakeRoute(decision triage.Decision, hasProductSpec bool) intake
 	case triage.DispositionUnclear:
 		return intakeHoldUnclear
 	}
-	if labelsContainFold(decision.ApplyLabels, kindFeatureLabel) && !hasProductSpec {
+	if labelsContainFold(decision.ApplyLabels, kindFeatureLabel) && !hasProductSpec && !preSpecDecisionGrill {
 		return intakeHoldForProductSpec
 	}
 	if labelsContainFold(decision.ApplyLabels, dispatchImplementLabel) {
@@ -154,12 +154,23 @@ func (r *Runtime) reconcileAutoIntake(ctx context.Context) {
 		if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindPlane {
 			continue
 		}
+		if !autoIntakeProjectEnabled(cfg, project.ID) {
+			// A planner-only manual run or an isolated E2E project must not mutate
+			// unrelated Plane items merely because the process inherited the global
+			// LOOPER_PLANE_AUTO_INTAKE=1 environment variable.
+			continue
+		}
 		plane++
 		r.reconcileAutoIntakeProject(ctx, &cfg, project, llm, logger, now)
 	}
 	if logger != nil {
 		logger.Info("auto-intake: tick", map[string]any{"planeProjects": plane, "totalProjects": len(cfg.Projects)})
 	}
+}
+
+func autoIntakeProjectEnabled(cfg config.Config, projectID string) bool {
+	roles := config.ProjectRoleConfigs(cfg, projectID)
+	return roles.Planner.AutoDiscovery || roles.Worker.AutoDiscovery
 }
 
 func (r *Runtime) reconcileAutoIntakeProject(ctx context.Context, cfg *config.Config, project config.ProjectRefConfig, llm triage.LLM, logger bootstrap.Logger, now func() time.Time) {
@@ -199,12 +210,13 @@ func (r *Runtime) reconcileAutoIntakeProject(ctx context.Context, cfg *config.Co
 	}
 	// Bound fresh classifications this tick; leftovers drain on the next one.
 	classifyBudget := maxAutoIntakeClassificationsPerTick
+	preSpecDecisionGrill := config.ProjectRoleConfigs(*cfg, project.ID).Planner.PreSpecDecisionGrill
 	for _, item := range items {
-		r.reconcileAutoIntakeItem(ctx, gateway, client, planeProjectID, project, item, llm, logger, now, &classifyBudget)
+		r.reconcileAutoIntakeItem(ctx, gateway, client, planeProjectID, project, item, llm, logger, now, &classifyBudget, preSpecDecisionGrill)
 	}
 }
 
-func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc.Gateway, client *forge.PlaneClient, planeProjectID string, project config.ProjectRefConfig, item forge.Issue, llm triage.LLM, logger bootstrap.Logger, now func() time.Time, classifyBudget *int) {
+func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc.Gateway, client *forge.PlaneClient, planeProjectID string, project config.ProjectRefConfig, item forge.Issue, llm triage.LLM, logger bootstrap.Logger, now func() time.Time, classifyBudget *int, preSpecDecisionGrill bool) {
 	names := labelNames(item.Labels)
 	// Already routed into the pipeline — nothing to do.
 	if labelsContainFold(names, planTriggerLabel) || labelsContainFold(names, workerReadyLabel) {
@@ -238,6 +250,14 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	// already know it is a feature). When the spec appears, drop the hold and route
 	// to the planner.
 	if labelsContainFold(names, intakeAwaitingProductLabel) {
+		if preSpecDecisionGrill {
+			// Upgrade recovery: a V1 item may already carry the old product-spec hold.
+			// V2 deliberately researches first, so retire the hold without requiring a
+			// product document and let the planner's product barrier make that decision.
+			_ = gateway.RemoveWorkItemLabel(ctx, planeProjectID, workItemID, intakeAwaitingProductLabel)
+			r.routeIntake(ctx, gateway, planeProjectID, workItemID, planTriggerLabel, "<p>🔬 已启用技术 Spec 前的需求调研/GRILL；先进入 planner，由调研结果判断是否真正需要正式产品 Spec。</p>", logger, project.ID, item.Number)
+			return
+		}
 		present, _, err := gateway.HasProductSpec(ctx, planeProjectID, workItemID)
 		if err != nil || !present {
 			return
@@ -288,7 +308,7 @@ func (r *Runtime) reconcileAutoIntakeItem(ctx context.Context, gateway *planedoc
 	})
 
 	present, _, _ := gateway.HasProductSpec(ctx, planeProjectID, workItemID)
-	route = decideAutoIntakeRoute(decision, present)
+	route = decideAutoIntakeRoute(decision, present, preSpecDecisionGrill)
 
 	// Post the verdict + reasoning into the shared task thread BEFORE routing, so
 	// "why simple bug / why no spec" is transparent and interruptible (HITL).

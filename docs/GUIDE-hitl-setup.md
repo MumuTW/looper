@@ -170,6 +170,16 @@ falls back to label-only discovery (every looper watching that project grabs eve
 Each teammate should use **their own** Plane API key (correct attribution + `plane api me` gives their UUID), not a
 shared one. Full Plane setup: [`skills/looper/references/plane.md`](../skills/looper/references/plane.md).
 
+For the opt-in Plane pre-Spec decision flow, configure all three authorities on the project:
+
+```jsonc
+"productOwner": { "feishuOpenId": "ou_...", "planeId": "<product UUID>" },
+"designOwner":  { "feishuOpenId": "ou_...", "planeId": "<design UUID>" },
+"owner":        { "feishuOpenId": "ou_...", "planeId": "<your UUID from plane api me>" }
+```
+
+Requirement answers are posted as new Plane work-item comments. If Looper requires a formal product Spec, link a non-empty native Plane page from the work item with title `looper:product-spec`; an external URL, blank page or normal comment does not satisfy the formal gate. Final technical-Spec approval is posted on the Plane Spec page. Feishu is notification-only for these decisions. A user's `open_id` can still be mentioned if they are not in the notification group (it may render grey); group membership is not validated. Generic mid-coding HITL below remains a separate transport and can still be bidirectional when explicitly enabled.
+
 ### looper's own data
 - **`storage` / `daemon` paths** — anywhere you like; default `~/.looper` (`looper.sqlite`, `backups/`, `logs/`).
 
