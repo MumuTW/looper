@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -50,20 +51,23 @@ type RecoverySummary struct {
 }
 
 type StaleRunReconcileSummary struct {
-	Mode                 string   `json:"mode"`
-	StartedAt            string   `json:"startedAt,omitempty"`
-	CompletedAt          string   `json:"completedAt,omitempty"`
-	CandidateRuns        int64    `json:"candidateRuns"`
-	InterruptedRuns      int64    `json:"interruptedRuns"`
-	LoopsRequeued        int64    `json:"loopsRequeued"`
-	QueueItemsRequeued   int64    `json:"queueItemsRequeued"`
-	QueueItemsCancelled  int64    `json:"queueItemsCancelled"`
-	CleanedExecutions    int64    `json:"cleanedExecutions"`
-	SkippedUncertainRuns int64    `json:"skippedUncertainRuns"`
-	EventsWritten        int64    `json:"eventsWritten"`
-	RunIDs               []string `json:"runIds,omitempty"`
-	LoopIDs              []string `json:"loopIds,omitempty"`
-	ExecutionIDs         []string `json:"executionIds,omitempty"`
+	Mode                string `json:"mode"`
+	StartedAt           string `json:"startedAt,omitempty"`
+	CompletedAt         string `json:"completedAt,omitempty"`
+	CandidateRuns       int64  `json:"candidateRuns"`
+	InterruptedRuns     int64  `json:"interruptedRuns"`
+	LoopsRequeued       int64  `json:"loopsRequeued"`
+	QueueItemsRequeued  int64  `json:"queueItemsRequeued"`
+	QueueItemsCancelled int64  `json:"queueItemsCancelled"`
+	CleanedExecutions   int64  `json:"cleanedExecutions"`
+	// QuarantinedExecutions counts executions parked via quarantineRecoveryEvidence
+	// (still-running evidence + manual_intervention). Never report these as cleaned.
+	QuarantinedExecutions int64    `json:"quarantinedExecutions"`
+	SkippedUncertainRuns  int64    `json:"skippedUncertainRuns"`
+	EventsWritten         int64    `json:"eventsWritten"`
+	RunIDs                []string `json:"runIds,omitempty"`
+	LoopIDs               []string `json:"loopIds,omitempty"`
+	ExecutionIDs          []string `json:"executionIds,omitempty"`
 }
 
 type staleRunReconcileMode string
@@ -75,13 +79,31 @@ const (
 )
 
 type RecoveryOrphanAgentCleanup struct {
-	Attempted    bool   `json:"attempted"`
-	CleanedCount int64  `json:"cleanedCount"`
-	Warning      string `json:"warning,omitempty"`
+	Attempted        bool  `json:"attempted"`
+	CleanedCount     int64 `json:"cleanedCount"`
+	QuarantinedCount int64 `json:"quarantinedCount"`
+	// Classification counts for active execution evidence (ADR-0015 R8 / #581).
+	// ConfirmedDead requires durable terminal finalization or current-daemon drain;
+	// PID absence never increments ConfirmedDead.
+	ConfirmedDeadCount int64  `json:"confirmedDeadCount"`
+	ObservedLiveCount  int64  `json:"observedLiveCount"`
+	UncertainCount     int64  `json:"uncertainCount"`
+	Warning            string `json:"warning,omitempty"`
 }
 
 type Options struct {
-	Config                      config.Config
+	Config config.Config
+	// InitialConfig and ReloadConfig are supplied by bootstrap so hot reloads
+	// replay the daemon's exact startup precedence (file, environment, and CLI).
+	// Tests and embedders that omit ReloadConfig simply run without a watcher.
+	InitialConfig        config.LoadedFileConfig
+	ReloadConfig         func() (config.LoadedFileConfig, error)
+	LoadConfigAt         func(string) (config.LoadedFileConfig, error)
+	ConfigReloadInterval time.Duration
+	// ConfigPath is the daemon-loaded config file path (from --config /
+	// LOOPER_CONFIG resolution). Runtime config management patches this source;
+	// trusted review-submit children receive a separate sanitized run snapshot.
+	ConfigPath                  string
 	Logger                      bootstrap.Logger
 	Now                         func() time.Time
 	ShutdownTimeout             time.Duration
@@ -106,18 +128,34 @@ type Services struct {
 type WebhookForwarder interface {
 	Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error)
 	Stats() webhookforward.Stats
+	// CancelExecute aborts in-flight webhook discovery without waiting for drain.
+	// BeginShutdown and MarkDegraded call this so admission-closed races cannot
+	// still enqueue after a one-time AllowExecute pass.
+	CancelExecute()
 	Close()
 }
 
 type Runtime struct {
-	config config.Config
-	logger bootstrap.Logger
-	now    func() time.Time
+	config     config.Config
+	configPath string
+	logger     bootstrap.Logger
+	now        func() time.Time
+
 	// Injectable only to exercise the full Plane reconciliation state machines
 	// without a real CLI/network. Production uses planeDocForProject.
 	planeDocFactory planeDocFactory
 	// Test seam for the approval classifier; production builds the configured agent.
 	specApprovalJudge specApprovalJudgeFunc
+
+	configReloadMu       sync.Mutex
+	configBoundary       sync.RWMutex
+	loadedConfig         config.LoadedFileConfig
+	reloadConfig         func() (config.LoadedFileConfig, error)
+	loadConfigAt         func(string) (config.LoadedFileConfig, error)
+	configReloadInterval time.Duration
+	configReloadStop     chan struct{}
+	configReloadDone     chan struct{}
+	configReloadStatus   ConfigReloadStatus
 
 	openSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	syncConfiguredProjects SyncConfiguredProjectsFunc
@@ -154,15 +192,34 @@ type Runtime struct {
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
 	activeExecutions            *ActiveExecutionRegistry
+	projectCatalog              *projects.Catalog
 	githubGateway               *githubinfra.Gateway
 	webhook                     *webhookRuntime
 	webhookDaemonLock           *daemonLock
 	webhookForwarder            WebhookForwarder
-	networkManager              *networkclient.Manager
+	networkManager              runtimeNetworkManager
 	schedulerDisabled           bool
 	startupReadyOnce            sync.Once
 	startupReadyErr             error
-	ownershipAcquired           bool
+	// ownershipAcquired remains true after CompleteStartup succeeds so stop
+	// still writes looperd.stopped. Admission is the sole ready Authority;
+	// this flag is not a mutation/claim gate.
+	ownershipAcquired bool
+	admission         *Admission
+
+	// shutdownDrainErr is set by BeginShutdown when producer/handle drain fails.
+	// Stop retains SQLite when non-nil (ADR-0015 / #577).
+	shutdownDrainErr error
+	// storageRetained is true when Stop skipped coordinator.Close after a
+	// drain failure so undrained ownership is not closed under SQLite.
+	storageRetained bool
+}
+
+type runtimeNetworkManager interface {
+	Start(context.Context) error
+	Stop()
+	Status() networkclient.Status
+	UpdateConfig(config.Config)
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -204,10 +261,25 @@ func New(options Options) *Runtime {
 		shutdownTimeout = time.Second
 	}
 
+	projectCatalog := projects.NewCatalog(options.Config)
+	loadedConfig := options.InitialConfig
+	if reflect.DeepEqual(loadedConfig.Config, config.Config{}) {
+		loadedConfig.Config = options.Config
+		loadedConfig.Metadata.ConfigPath = strings.TrimSpace(options.ConfigPath)
+	}
+	reloadInterval := options.ConfigReloadInterval
+	if reloadInterval <= 0 {
+		reloadInterval = time.Second
+	}
 	rt := &Runtime{
 		config:                      options.Config,
+		configPath:                  strings.TrimSpace(options.ConfigPath),
 		logger:                      options.Logger,
 		now:                         now,
+		loadedConfig:                loadedConfig,
+		reloadConfig:                options.ReloadConfig,
+		loadConfigAt:                options.LoadConfigAt,
+		configReloadInterval:        reloadInterval,
 		openSQLiteCoordinator:       openSQLiteCoordinator,
 		syncConfiguredProjects:      syncConfiguredProjects,
 		runSchedulerTick:            runSchedulerTick,
@@ -220,10 +292,37 @@ func New(options Options) *Runtime {
 		recovery:                    createEmptyRecoverySummary(),
 		shutdownCh:                  make(chan struct{}),
 		activeExecutions:            NewActiveExecutionRegistry(),
+		projectCatalog:              projectCatalog,
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
+		admission:                   NewAdmission(),
 	}
+	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
+	// while starting/stopping/degraded (#576 + #575).
+	rt.activeExecutions.SetAllowSpawn(rt.AllowClaim)
+	// Hard agent_executions observation failures close admission until process
+	// restart (#578 / ADR-0015 R5). Prefer split-brain stop over silent continue.
+	rt.activeExecutions.SetOnHardPersistFailure(func(err error) {
+		reason := "agent execution persistence hard failure"
+		if err != nil {
+			reason = reason + ": " + err.Error()
+		}
+		if markErr := rt.MarkDegraded(reason); markErr != nil && rt.logger != nil {
+			rt.logger.Warn("failed to mark admission degraded after persistence failure", map[string]any{
+				"error":  markErr.Error(),
+				"reason": reason,
+			})
+		} else if rt.logger != nil {
+			rt.logger.Error("daemon admission degraded after agent execution persistence failure", map[string]any{
+				"reason": reason,
+			})
+		}
+	})
 	if rt.webhook != nil {
 		rt.webhook.forwarder = rt.WebhookForwarder
+		// Tunnel listener is not behind the API mutation gate; consult the same
+		// admission Authority before accepting deliveries (#583). Worker-side
+		// discovery rechecks via webhookforward.Options.AllowExecute.
+		rt.webhook.allowForward = rt.AllowMutations
 	}
 	if !customSchedulerTick {
 		rt.runSchedulerTick = rt.executeDefaultSchedulerTick
@@ -233,8 +332,11 @@ func New(options Options) *Runtime {
 
 func Start(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
 	rt := New(Options{
-		Config: deps.Config,
-		Logger: deps.Logger,
+		Config:        deps.Config,
+		InitialConfig: deps.InitialConfig,
+		ReloadConfig:  deps.ReloadConfig,
+		LoadConfigAt:  deps.LoadConfigAt,
+		Logger:        deps.Logger,
 	})
 	if err := rt.Start(ctx); err != nil {
 		return nil, err
@@ -257,10 +359,28 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
 
+		// Close admission and cancel work-producing contexts before draining
+		// producers (ADR-0015 shutdown order). Use BeginShutdown so direct
+		// Runtime.Stop matches the daemon path: scheduler, deferred recovery,
+		// and in-flight webhook discovery are canceled before any waits.
+		r.BeginShutdown(reason)
+
+		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
 		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
 		r.stopWebhookRuntime()
+
+		// Re-collect non-agent containment drain failures reported while
+		// producers finished after BeginShutdown (shell validation / trusted
+		// review cancel paths). Agent failures were already joined above.
+		if r.activeExecutions != nil {
+			if err := r.activeExecutions.NonAgentDrainErr(); err != nil {
+				r.mu.Lock()
+				r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, err)
+				r.mu.Unlock()
+			}
+		}
 
 		r.mu.Lock()
 		r.stopped = true
@@ -271,6 +391,7 @@ func (r *Runtime) Stop(reason string) {
 		coordinator := r.services.Coordinator
 		repositories := r.services.Repositories
 		ownershipAcquired := r.ownershipAcquired
+		drainErr := r.shutdownDrainErr
 		r.mu.Unlock()
 
 		if ownershipAcquired && repositories != nil {
@@ -279,16 +400,35 @@ func (r *Runtime) Stop(reason string) {
 			}
 		}
 
-		r.mu.Lock()
-		r.services = Services{}
-		r.mu.Unlock()
-
+		// Independent infra (forwarder/network) still stop on drain failure;
+		// they are not Supervisor domain and must not block retain-storage.
 		if forwarder != nil {
 			forwarder.Close()
 		}
 		if networkManager != nil {
 			networkManager.Stop()
 		}
+
+		// #577: retain SQLite when containment drain failed. Never report
+		// graceful success with undrained ownership under a closed DB.
+		if drainErr != nil {
+			r.mu.Lock()
+			r.storageRetained = true
+			r.mu.Unlock()
+			close(r.shutdownCh)
+			if r.logger != nil {
+				r.logger.Error("looperd runtime stop retained storage after drain failure", map[string]any{
+					"reason": reason,
+					"error":  drainErr.Error(),
+				})
+			}
+			return
+		}
+
+		r.mu.Lock()
+		r.services = Services{}
+		r.mu.Unlock()
+
 		if coordinator != nil {
 			if err := coordinator.Close(); err != nil && r.logger != nil {
 				r.logger.Warn("looperd runtime close failed", map[string]any{"error": err.Error()})
@@ -301,6 +441,185 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopped", map[string]any{"reason": reason})
 		}
 	})
+}
+
+// BeginShutdown transitions admission to stopping without closing storage.
+// Daemon stop drains HTTP ingress after this so mutations/claims stop first.
+// Also cancels the scheduler context so an in-flight full tick observes
+// cancellation during the HTTP drain window before Runtime.Stop closes the
+// loop; work-producing lanes still recheck AllowClaim as the Authority.
+// Cancels deferred reviewer recovery so a post-ready recovery goroutine cannot
+// still requeue loops/queue items after admission is already stopping; the
+// wait for recovery exit remains in Runtime.Stop via stopDeferredReviewerRecovery.
+// Cancels webhook-forward discovery so process exit can abort in-flight
+// CreateOrGetActiveByDedupe promptly (sticky MarkDegraded does not cancel
+// webhook execute — accepted/202 deliveries must still complete).
+//
+// Shutdown order (ADR-0015 / #577): close admission → cancel producers →
+// confirmed-drain handles (agents + tracked non-agent shell/trusted-review).
+// Producer cancel must run before ActiveExecutionRegistry.BeginShutdown waits
+// on tracked non-agent handles: validation shell.Run only enters Kill after its
+// owner ctx is canceled. Waiting first would burn the full kill budget then
+// force-kill instead of cancel/drain promptly.
+// SQLite close happens only in Stop after drain succeeds; drain failure is
+// recorded for retain-storage. Non-agent Kill/Drain failures that finish after
+// this returns are re-collected in Stop via NonAgentDrainErr.
+func (r *Runtime) BeginShutdown(reason string) {
+	if r == nil {
+		return
+	}
+	// Snapshot cancel targets under r.mu first, then flip stopping + invoke
+	// cancels under admission.mu. Do not take r.mu while holding admission.mu
+	// (other paths lock r.mu then read admission — that order would deadlock).
+	cancels := r.snapshotWorkProducerCancels()
+	_ = r.admission.BeginShutdownThen(reason, cancels.invokeForShutdown)
+	// Close agent spawn admission and confirmed-drain live handles — agents and
+	// tracked Supervisor-owned non-agents (#576/#577). Agent leases cancel via
+	// registry; non-agent owners were canceled above.
+	if r.activeExecutions != nil {
+		if err := r.activeExecutions.BeginShutdown(reason); err != nil {
+			r.mu.Lock()
+			r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, err)
+			r.mu.Unlock()
+		}
+	}
+}
+
+// workProducerCancels is a lock-free snapshot of cancel targets so
+// MarkDegraded/BeginShutdown can invoke them while holding admission.mu
+// without re-entering r.mu (lock-order safety).
+type workProducerCancels struct {
+	scheduler context.CancelFunc
+	recovery  context.CancelFunc
+	cleanup   context.CancelFunc
+	forwarder interface{ CancelExecute() }
+}
+
+// invokeForDegrade cancels sticky-degrade producers but leaves webhook execute
+// live: Forward may already have returned accepted/202 for queued discovery,
+// and GitHub will not retry that delivery while the daemon stays up.
+func (c workProducerCancels) invokeForDegrade() {
+	if c.scheduler != nil {
+		c.scheduler()
+	}
+	if c.recovery != nil {
+		c.recovery()
+	}
+	if c.cleanup != nil {
+		c.cleanup()
+	}
+}
+
+// invokeForShutdown cancels all work producers including webhook discovery so
+// process exit can abort in-flight CreateOrGetActiveByDedupe promptly.
+func (c workProducerCancels) invokeForShutdown() {
+	c.invokeForDegrade()
+	if c.forwarder != nil {
+		c.forwarder.CancelExecute()
+	}
+}
+
+func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
+	if r == nil {
+		return workProducerCancels{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return workProducerCancels{
+		scheduler: r.schedulerCancel,
+		recovery:  r.recoveryCancel,
+		cleanup:   r.worktreeCleanupCancel,
+		forwarder: r.webhookForwarder,
+	}
+}
+
+// cancelWorkProducers aborts in-flight scheduler ticks, deferred recovery,
+// worktree cleanup, and (for process-exit paths) webhook discovery. Prefer
+// invokeForDegrade vs invokeForShutdown at the call site: sticky degrade must
+// not CancelExecute accepted webhook work.
+func (r *Runtime) cancelWorkProducers() {
+	r.snapshotWorkProducerCancels().invokeForShutdown()
+}
+
+// StorageRetained reports whether Stop skipped SQLite close after a drain
+// failure (ADR-0015 / #577). Operators must not treat stop as graceful success.
+func (r *Runtime) StorageRetained() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.storageRetained
+}
+
+// ShutdownDrainError returns the drain failure recorded during BeginShutdown,
+// if any.
+func (r *Runtime) ShutdownDrainError() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.shutdownDrainErr
+}
+
+// AdmissionState returns the authoritative live admission state.
+func (r *Runtime) AdmissionState() AdmissionState {
+	if r == nil || r.admission == nil {
+		return AdmissionStopping
+	}
+	return r.admission.State()
+}
+
+// AllowMutations is the HTTP mutation readiness projection of admission.
+func (r *Runtime) AllowMutations() error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.AllowMutations()
+}
+
+// AllowClaim is the scheduler work-producing projection of admission
+// (full tick + durable claims).
+func (r *Runtime) AllowClaim() error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.AllowClaim()
+}
+
+// WithAllowClaim runs fn only while claim admission is open, holding the
+// admission mutex for the full duration of fn so MarkDegraded/BeginShutdown
+// cannot interleave with the critical section (webhook accept + enqueue).
+func (r *Runtime) WithAllowClaim(fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.WithAllowWork(fn)
+}
+
+// MarkDegraded sticks admission until process restart and cancels work-producing
+// contexts (scheduler, recovery, cleanup) so new discovery/claims/cleanup that
+// already passed AllowClaim cannot complete after the transition. Unlike
+// BeginShutdown, this does not drain active agent handles and does not
+// CancelExecute webhook workers: Forward may already have returned accepted/202
+// for in-memory queue entries, and sticky degrade leaves the daemon up with no
+// GitHub retry. New webhook accepts are still refused via AllowExecute /
+// AllowExecuteWhile. There is no clear-and-resume path: canceled producer
+// contexts are not recreated; operators must restart looperd.
+func (r *Runtime) MarkDegraded(reason string) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	// Snapshot cancel targets under r.mu, then hold admission.mu across the
+	// degraded transition + cancel invoke so there is no window where admission
+	// is already closed but cleanup/scheduler contexts are still live. A
+	// point-in-time AllowClaim winner must either start remove while still
+	// ready, or observe cancel after close — never start git worktree remove
+	// after close with a live context. Webhook execCtx stays live so accepted
+	// deliveries can still finish CreateOrGetActiveByDedupe.
+	cancels := r.snapshotWorkProducerCancels()
+	return r.admission.TransitionThen(AdmissionDegraded, reason, cancels.invokeForDegrade)
 }
 
 func (r *Runtime) WaitForShutdown() {
@@ -319,6 +638,17 @@ func (r *Runtime) Services() Services {
 	defer r.mu.RUnlock()
 
 	return r.services
+}
+
+// Config returns the current runtime configuration with Projects materialized
+// from the authoritative Project Catalog.
+func (r *Runtime) Config() config.Config {
+	if r.projectCatalog != nil {
+		return r.projectCatalog.Snapshot()
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.config
 }
 
 func (r *Runtime) StartedAt() (time.Time, bool) {
@@ -354,13 +684,6 @@ func runtimeHomeDirOrEmpty() string {
 		return ""
 	}
 	return homeDir
-}
-
-func (r *Runtime) Config() config.Config {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.config
 }
 
 func (r *Runtime) RecoverySummary() RecoverySummary {
@@ -547,17 +870,19 @@ func (r *Runtime) start(ctx context.Context) error {
 	repositories := storage.NewRepositories(coordinator.DB())
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
 	var githubGateway *githubinfra.Gateway
-	if runtimeConfigHasGitHubProjects(r.config) {
+	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
 		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	}
 	projectService := &projects.Service{
-		DB:     coordinator.DB(),
-		Repos:  repositories,
-		Logger: r.logger,
-		Config: r.config,
-		Now:    r.now,
-		DetectRepo: func(ctx context.Context, repoPath string) (string, error) {
-			return gitGateway.DetectGitHubRepo(ctx, repoPath)
+		DB:             coordinator.DB(),
+		Repos:          repositories,
+		Logger:         r.logger,
+		Config:         r.config,
+		ConfigSource:   r.projectCatalog,
+		ConfigBoundary: &r.configBoundary,
+		Now:            r.now,
+		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
+			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.Snapshot(), repoPath)
 		},
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
 			if githubGateway == nil {
@@ -603,14 +928,31 @@ func (r *Runtime) start(ctx context.Context) error {
 			return githubGateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 		},
 		AsyncSnapshotQueueEnabled: func() bool {
-			return r.customSchedulerTick || r.config.Agent.Vendor != nil
+			return asyncSnapshotQueueEnabled(r.customSchedulerTick, r.Config())
 		},
+		PublishProjects: func(projects []config.ProjectRefConfig) {
+			r.publishProjectsSnapshot(projects)
+		},
+		AfterPublishProjects: r.afterProjectsPublished,
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	runService := &runs.Service{DB: coordinator.DB(), Repos: repositories, Loops: loopService, Now: r.now}
 	startedAt := r.now().UTC()
 	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
 		return err
+	}
+	// Project import is already committed. Materialize that durable state even
+	// when the startup request is canceled; CompleteStartup still observes ctx.
+	if err := r.reloadProjectCatalog(context.Background(), repositories); err != nil {
+		return err
+	}
+	r.config = r.projectCatalog.Snapshot()
+	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
+		if githubGateway == nil {
+			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+		}
+	} else {
+		githubGateway = nil
 	}
 	r.mu.Lock()
 	if r.stopped {
@@ -628,15 +970,15 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		handlers := buildDefaultSchedulerHandlers(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
+		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, &r.configBoundary, r.configPath, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
-		schedulerDisabled = r.config.Agent.Vendor == nil
+		schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
 	}
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
@@ -713,24 +1055,44 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			}
 		}
 		if schedulerDisabled && r.logger != nil {
-			r.logger.Warn("looperd scheduler disabled", map[string]any{"reason": "config.agent.vendor is not set"})
+			r.logger.Warn("looperd scheduler waiting for agent configuration", map[string]any{"reason": "no coding role agent is configured"})
 		}
-		if !schedulerDisabled {
-			r.startSchedulerLoop()
-		}
+		// The scheduler's handlers snapshot the current config for each operation.
+		// Keep the loop alive even without an initial vendor so configuring one can
+		// take effect without restarting looperd.
+		r.startSchedulerLoop()
 		if r.config.Daemon.WorktreeCleanup.Enabled {
 			r.startWorktreeCleanupLoop()
 		}
+		r.startConfigReloadLoop()
+
+		// Open admission only after recovery and producer loops are assembled.
+		// HTTP mutations and scheduler claims are projections of this state.
+		if err := r.admission.MarkReady("complete startup"); err != nil {
+			r.startupReadyErr = err
+			return
+		}
+		// Deferred reviewer recovery requeues failed loops without the scheduler
+		// claim path; start it only after admission is ready, and only while
+		// admission remains ready (startDeferredReviewerRecovery rechecks under
+		// the shutdown race where BeginShutdown may have already missed a nil
+		// recoveryCancel between MarkReady and registration).
 		r.startDeferredReviewerRecovery(githubGateway)
+		// startSchedulerLoop already fired an immediate full tick while admission
+		// was still starting (gate no-op). Wake full + claim pumps now that
+		// admission is ready so discovery/HITL do not wait a full poll interval.
+		r.TriggerSchedulerTick()
 
 		if r.logger != nil {
+			catalog := r.Config()
 			r.logger.Info("looperd runtime assembled", map[string]any{
 				"dbPath":                 r.config.Storage.DBPath,
-				"projectCount":           len(r.config.Projects),
+				"projectCount":           len(catalog.Projects),
 				"autoMigrate":            r.config.Package.AutoMigrateOnStartup,
 				"backupRequired":         r.config.Package.RequireBackupBeforeMigrate,
 				"recoverySummary":        recoverySummary,
 				"schedulerDefaultActive": !r.customSchedulerTick && !schedulerDisabled,
+				"admissionState":         string(r.admission.State()),
 			})
 		}
 	})
@@ -746,11 +1108,12 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 	if err != nil {
 		return err
 	}
+	catalog := r.Config()
 	for _, project := range projectsList {
 		if project.Archived {
 			continue
 		}
-		roleCfg := config.ProjectRoleConfigs(r.config, project.ID).Coordinator
+		roleCfg := config.ProjectRoleConfigs(catalog, project.ID).Coordinator
 		if !roleCfg.Enabled || !roleCfg.Dependencies.Enabled {
 			continue
 		}
@@ -808,6 +1171,20 @@ func runtimeProjectRepo(metadataJSON *string) string {
 	return strings.TrimSpace(value)
 }
 
+// defaultSchedulerAgentsConfigured reports whether the default scheduler has at
+// least one coding-role agent vendor (global or role/profile). This is the same
+// gate as buildDefaultSchedulerHandlersWithOptions.
+func defaultSchedulerAgentsConfigured(cfg config.Config) bool {
+	return config.AnyCodingRoleAgentConfigured(cfg)
+}
+
+// asyncSnapshotQueueEnabled reports whether project import can enqueue async PR
+// snapshots for the scheduler to process. Role-only agent installs count as
+// scheduler-enabled so import does not fall back to full synchronous capture.
+func asyncSnapshotQueueEnabled(customSchedulerTick bool, cfg config.Config) bool {
+	return customSchedulerTick || defaultSchedulerAgentsConfigured(cfg)
+}
+
 func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 	for _, project := range cfg.Projects {
 		switch config.ResolvedProjectProviderKind(cfg, project) {
@@ -823,12 +1200,105 @@ func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 }
 
 func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
-	for _, project := range cfg.Projects {
-		if project.ID == projectID {
-			return config.ResolvedProjectProviderKind(cfg, project)
-		}
+	project, ok := runtimeProjectBinding(cfg, projectID)
+	if ok {
+		return config.ResolvedProjectProviderKind(cfg, project)
 	}
 	return config.ProviderKindGitHub
+}
+
+func runtimeProjectBinding(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
+	for _, project := range cfg.Projects {
+		if project.ID == projectID {
+			return project, true
+		}
+	}
+	return config.ProjectRefConfig{}, false
+}
+
+func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg config.Config, repoPath string) (projects.DetectedRepo, error) {
+	if gitGateway == nil {
+		return projects.DetectedRepo{}, fmt.Errorf("git gateway is not configured")
+	}
+	remote, err := gitGateway.DetectOriginRemote(ctx, repoPath)
+	if err != nil {
+		return projects.DetectedRepo{}, err
+	}
+	if strings.TrimSpace(remote.Repo) == "" {
+		return projects.DetectedRepo{}, nil
+	}
+	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, remote.Host); ok {
+		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.ID}, nil
+	}
+	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
+		return projects.DetectedRepo{Repo: remote.Repo}, nil
+	}
+	return projects.DetectedRepo{}, nil
+}
+
+func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repositories) error {
+	if r.projectCatalog == nil || repos == nil || repos.Projects == nil {
+		return fmt.Errorf("project catalog dependencies are not configured")
+	}
+	records, err := repos.Projects.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list projects for runtime catalog: %w", err)
+	}
+	global := r.projectCatalog.Snapshot()
+	materialized, err := projects.MaterializeCatalog(global, records)
+	if err != nil {
+		return fmt.Errorf("materialize runtime project catalog: %w", err)
+	}
+	r.publishProjects(materialized)
+	return nil
+}
+
+func (r *Runtime) publishProjects(materialized []config.ProjectRefConfig) {
+	r.publishProjectsSnapshot(materialized)
+	r.afterProjectsPublished()
+}
+
+// publishProjectsSnapshot is the atomic in-memory half of project
+// publication. Project mutations call it while holding configBoundary so a
+// concurrent config reload cannot validate or publish a mixed catalog.
+func (r *Runtime) publishProjectsSnapshot(materialized []config.ProjectRefConfig) {
+	if r == nil || r.projectCatalog == nil {
+		return
+	}
+	r.projectCatalog.Publish(materialized)
+	r.publishCatalogConsumers(r.projectCatalog.Snapshot())
+}
+
+// publishCatalogConsumers keeps long-lived consumers on the same coherent
+// globals-plus-projects snapshot used for new scheduler claims.
+func (r *Runtime) publishCatalogConsumers(next config.Config) {
+	r.mu.RLock()
+	webhook := r.webhook
+	networkManager := r.networkManager
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.updateConfig(next)
+	}
+	if networkManager != nil {
+		networkManager.UpdateConfig(next)
+	}
+}
+
+// afterProjectsPublished deliberately runs outside configBoundary. Webhook
+// reconciliation can invoke gh and other external operations; those must not
+// block config publication or new claim snapshots.
+func (r *Runtime) afterProjectsPublished() {
+	if r == nil {
+		return
+	}
+	r.mu.RLock()
+	started := r.startedAt != nil
+	r.mu.RUnlock()
+	if started {
+		r.TriggerSchedulerTick()
+		r.TriggerSchedulerClaim()
+		r.ReconcileWebhookForwarders()
+	}
 }
 
 func runtimeDependencyTimeout(seconds int) time.Duration {
@@ -984,12 +1454,36 @@ func (r *Runtime) startDeferredReviewerRecovery(githubGateway *githubinfra.Gatew
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	r.mu.Lock()
+	// Refuse to arm recovery once shutdown has begun or admission is no longer
+	// ready. BeginShutdown may already have observed recoveryCancel==nil; starting
+	// a live goroutine afterward would let requeue persist work while stopping
+	// (and stopDeferredReviewerRecovery may already have passed).
+	if r.stopped || r.admission == nil || r.admission.State() != AdmissionReady {
+		r.mu.Unlock()
+		cancel()
+		return
+	}
 	r.recoveryCancel = cancel
 	r.recoveryDone = done
 	r.mu.Unlock()
 
+	// Publish-then-recheck: if BeginShutdown raced between the ready check and
+	// assigning recoveryCancel, it missed cancel. If admission is no longer
+	// ready, cancel immediately so the goroutine is born canceled.
+	if err := r.AllowClaim(); err != nil {
+		cancel()
+	}
+
 	go func(repositories *storage.Repositories) {
 		defer close(done)
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		// Deferred recovery requeues without AllowClaim on the scheduler path;
+		// refuse when admission already closed after MarkReady/shutdown race.
+		if err := r.AllowClaim(); err != nil {
+			return
+		}
 		requeued, err := r.runDeferredReviewerRecovery(ctx, repositories, githubGateway, r.now().UTC())
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -1028,6 +1522,43 @@ func (r *Runtime) stopDeferredReviewerRecovery() {
 		if r.logger != nil {
 			r.logger.Warn("looperd stop timed out waiting for deferred reviewer recovery", map[string]any{"timeoutMs": r.shutdownTimeout.Milliseconds()})
 		}
+	}
+}
+
+// admissionRefusesDeferredRequeue reports whether deferred recovery must not
+// persist queue/loop requeues. Stopping and degraded are hard refusals;
+// starting is allowed only for direct unit-test helpers (production arms
+// deferred recovery only after MarkReady via startDeferredReviewerRecovery).
+func (r *Runtime) admissionRefusesDeferredRequeue() bool {
+	if r == nil || r.admission == nil {
+		return true
+	}
+	switch r.admission.State() {
+	case AdmissionStopping, AdmissionDegraded:
+		return true
+	default:
+		return false
+	}
+}
+
+// WaitForDeferredReviewerRecovery blocks until the post-ready deferred
+// reviewer recovery goroutine exits, or until ctx is canceled. It returns
+// immediately when deferred recovery was never started (for example when no
+// GitHub gateway is configured). Test fixtures call this after CompleteStartup
+// so later inserts of terminal reviewer metadata cannot race
+// normalizeTerminalReviewerLoopForRecovery.
+func (r *Runtime) WaitForDeferredReviewerRecovery(ctx context.Context) error {
+	r.mu.RLock()
+	done := r.recoveryDone
+	r.mu.RUnlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -1099,6 +1630,10 @@ func (r *Runtime) executeDefaultSchedulerTick(ctx context.Context, services Serv
 }
 
 func (r *Runtime) executeSchedulerClaimPass(ctx context.Context) {
+	// Claim is a projection of admission — refuse before any durable claim.
+	if err := r.AllowClaim(); err != nil {
+		return
+	}
 	r.mu.RLock()
 	services := r.services
 	claim := r.defaultSchedulerClaim
@@ -1271,64 +1806,83 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary.OrphanAgentCleanup.Attempted = true
 	uncertainAgentRunIDs := make(map[string]struct{})
 	uncertainExecutionIDs := make(map[string]struct{})
+	quarantinedLoopIDs := make(map[string]struct{})
 	if repositories.AgentExecutions != nil {
 		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
 		if err != nil {
 			return RecoverySummary{}, err
 		}
 		for _, execution := range activeExecutions {
-			if execution.PID == nil || *execution.PID <= 0 {
-				continue
+			// ADR-0015 R8 / #581: classify containment. PID/PGID is drift
+			// evidence only. Never SIGTERM/SIGKILL raw PID/PGID, never mark
+			// terminal from PID absence/leader exit, never requeue from
+			// observed_live or uncertain. Pre-crash handles do not exist after
+			// restart (currentDaemonHandle = nil).
+			classification, classErr := r.classifyStartupExecution(ctx, execution, nil)
+			if classErr != nil {
+				return RecoverySummary{}, classErr
 			}
-			pid := int(*execution.PID)
-			matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
-			if err != nil {
-				if r.logger != nil {
-					r.logger.Warn("failed to verify orphan agent execution identity", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
-				}
-				continue
+			switch classification.Class {
+			case ContainmentConfirmedDead:
+				summary.OrphanAgentCleanup.ConfirmedDeadCount += 1
+			case ContainmentObservedLive:
+				summary.OrphanAgentCleanup.ObservedLiveCount += 1
+			default:
+				summary.OrphanAgentCleanup.UncertainCount += 1
+				classification.Class = ContainmentUncertain
 			}
-			if running && !matches {
-				if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
-					uncertainAgentRunIDs[*execution.RunID] = struct{}{}
+
+			wroteClass, classEventErr := r.appendContainmentClassificationEvent(ctx, repositories, execution, classification, "orphan_cleanup", nowISO)
+			if classEventErr != nil {
+				return RecoverySummary{}, classEventErr
+			}
+			if wroteClass {
+				eventsWritten += 1
+			}
+
+			// Legacy process-identity uncertain events for probe mismatch/error
+			// (kept for operator tooling that already keys on this event type).
+			if classification.Reason == "process_probe_error" || classification.Reason == "process_identity_mismatch" {
+				if r.logger != nil && classification.Reason == "process_probe_error" {
+					r.logger.Warn("failed to verify orphan agent execution identity", map[string]any{
+						"executionId": execution.ID, "pid": classification.PID, "class": string(classification.Class),
+					})
 				}
-				if _, ok := uncertainExecutionIDs[execution.ID]; !ok {
-					uncertainExecutionIDs[execution.ID] = struct{}{}
-				}
-				written, err := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, "orphan_cleanup", nowISO)
-				if err != nil {
-					return RecoverySummary{}, err
+				written, appendErr := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, classification.PID, "orphan_cleanup", nowISO)
+				if appendErr != nil {
+					return RecoverySummary{}, appendErr
 				}
 				if written {
 					eventsWritten += 1
 				}
-				continue
 			}
-			if running {
-				if err := r.signalAgentProcessGroup(pid, syscall.SIGTERM); err != nil {
-					if errors.Is(err, syscall.ESRCH) {
-						running = false
-					} else {
-						if r.logger != nil {
-							r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
-						}
-						continue
+
+			// Active ListActive rows cannot be confirmed-dead from durable
+			// terminal status (they would not be active). After restart there is
+			// no current-daemon handle. Quarantine observed_live and uncertain.
+			if classificationRequiresQuarantine(classification.Class) || !classificationAllowsTerminalOrRequeue(classification.Class) {
+				if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
+					uncertainAgentRunIDs[*execution.RunID] = struct{}{}
+				}
+				uncertainExecutionIDs[execution.ID] = struct{}{}
+				reason := "startup recovery: " + string(classification.Class) + " (" + classification.Reason + "); no PID Authority"
+				quarantined, wrote, err := r.quarantineRecoveryEvidence(ctx, repositories, execution, nowISO, reason)
+				if err != nil {
+					return RecoverySummary{}, err
+				}
+				if quarantined {
+					summary.OrphanAgentCleanup.QuarantinedCount += 1
+					if execution.LoopID != nil && strings.TrimSpace(*execution.LoopID) != "" {
+						quarantinedLoopIDs[*execution.LoopID] = struct{}{}
 					}
 				}
-				if running {
-					go func(pid int) {
-						timer := time.NewTimer(5 * time.Second)
-						defer timer.Stop()
-						<-timer.C
-						_ = r.signalAgentProcessGroup(pid, syscall.SIGKILL)
-					}(pid)
+				if wrote {
+					eventsWritten += 1
 				}
 			}
-			if err := r.markRecoveredExecutionTerminal(ctx, repositories, execution, pid, nowISO, "Killed during looperd recovery"); err != nil {
-				return RecoverySummary{}, err
-			}
-			summary.OrphanAgentCleanup.CleanedCount += 1
-			eventsWritten += 1
+		}
+		if summary.OrphanAgentCleanup.QuarantinedCount > 0 {
+			summary.OrphanAgentCleanup.Warning = "active executions were quarantined without process kill; containment is not confirmed"
 		}
 	}
 
@@ -1393,6 +1947,10 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if _, wasRequeued := requeuedLoopIDs[loop.ID]; wasRequeued {
 			continue
 		}
+		// Quarantined work must not requeue or auto-recover as if cleaned.
+		if _, quarantined := quarantinedLoopIDs[loop.ID]; quarantined {
+			continue
+		}
 		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
 			return RecoverySummary{}, err
@@ -1415,23 +1973,13 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			continue
 		}
 		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
-			failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), derefString(latestQueue.LastError))
-			recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO, policy, failureSummary)
+			// Share discard/retry exclusion with deferred recovery and discovery.
+			didRequeue, recoveredQueueItems, err := requeueFailedReviewerWithSharedGuards(ctx, repositories, loop, latestQueue, nowISO, policy, latestRun)
 			if err != nil {
 				return RecoverySummary{}, err
 			}
-			if recoveredQueueItems == 0 {
-				active, activeErr := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
-				if activeErr != nil {
-					return RecoverySummary{}, activeErr
-				}
-				if active == nil {
-					return RecoverySummary{}, fmt.Errorf("reviewer recovery did not requeue failed queue item %s for loop %s", latestQueue.ID, loop.ID)
-				}
-			}
-			requeuedLoop := autoRecoveredReviewerLoop(loop, nowISO)
-			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
-				return RecoverySummary{}, err
+			if !didRequeue {
+				continue
 			}
 			requeuedLoopIDs[loop.ID] = struct{}{}
 			summary.LoopsRequeued += 1
@@ -1543,7 +2091,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				return RecoverySummary{}, err
 			}
 			if recoveredQueueItems == 0 {
-				if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.config.Scheduler.RetryMaxAttempts)); err != nil {
+				if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.Config().Scheduler.RetryMaxAttempts)); err != nil {
 					return RecoverySummary{}, err
 				}
 			}
@@ -1662,6 +2210,12 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 	if repositories == nil || githubGateway == nil {
 		return 0, nil
 	}
+	// Refuse up front when admission already closed for shutdown/degraded.
+	// (startDeferredReviewerRecovery only arms after ready; unit tests may call
+	// this helper while still starting.)
+	if r.admissionRefusesDeferredRequeue() {
+		return 0, nil
+	}
 	nowISO := formatJavaScriptISOString(now)
 	loops, err := repositories.Loops.List(ctx)
 	if err != nil {
@@ -1672,6 +2226,11 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 	for _, loop := range loops {
 		if err := ctx.Err(); err != nil {
 			return requeued, err
+		}
+		// Recheck before each durable requeue so BeginShutdown cannot leave a
+		// still-running recovery path persisting queued loop/queue state.
+		if r.admissionRefusesDeferredRequeue() {
+			return requeued, nil
 		}
 		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
@@ -1710,23 +2269,20 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		if currentLoop == nil || !shouldAutoRecoverFailedReviewerLoop(*currentLoop, latestRun, latestQueue, policy) {
 			continue
 		}
-		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), derefString(latestQueue.LastError))
-		recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO, policy, failureSummary)
+		// Final admission gate immediately before lock+persist: matches the
+		// shutdown race where cancel registration was missed after MarkReady.
+		if r.admissionRefusesDeferredRequeue() {
+			return requeued, nil
+		}
+		// Share discard/retry exclusion: recovery requeue of a PR reviewer must
+		// not interleave with operator discard of a sibling loop on the same
+		// managed worktree between preflight and git reset.
+		didRequeue, recoveredQueueItems, err := requeueFailedReviewerWithSharedGuards(ctx, repositories, *currentLoop, latestQueue, nowISO, policy, latestRun)
 		if err != nil {
 			return requeued, err
 		}
-		if recoveredQueueItems == 0 {
-			active, activeErr := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
-			if activeErr != nil {
-				return requeued, activeErr
-			}
-			if active == nil {
-				return requeued, fmt.Errorf("reviewer deferred recovery did not requeue failed queue item %s for loop %s", latestQueue.ID, loop.ID)
-			}
-		}
-		requeuedLoop := autoRecoveredReviewerLoop(*currentLoop, nowISO)
-		if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
-			return requeued, err
+		if !didRequeue {
+			continue
 		}
 		requeued += 1
 		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
@@ -1825,6 +2381,10 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			activeExecutionsByRunID[*execution.RunID] = append(activeExecutionsByRunID[*execution.RunID], execution)
 		}
 	}
+	// Loops whose work was parked via quarantineRecoveryEvidence must not be
+	// requeued by the post-interrupt repair pass or the later interrupted-loop
+	// sweep while agent_executions remain running evidence (#575).
+	quarantinedLoopIDs := make(map[string]struct{})
 	for _, run := range runningRuns {
 		if err := ctx.Err(); err != nil {
 			return StaleRunReconcileSummary{}, err
@@ -1864,17 +2424,36 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		summary.RunIDs = append(summary.RunIDs, run.ID)
 		summary.LoopIDs = append(summary.LoopIDs, run.LoopID)
 
+		quarantinedAny := false
 		for _, execution := range decision.CleanupExecutions {
-			pid := 0
-			if execution.PID != nil && *execution.PID > 0 {
-				pid = int(*execution.PID)
+			// #575: do not mark terminal as "cleaned" from PID evidence alone.
+			// Quarantine affected work; leave agent_executions as evidence.
+			message := decision.ExecutionMessage
+			if strings.TrimSpace(message) == "" {
+				message = "stale-run reconciliation: execution evidence without containment confirmation"
 			}
-			if err := r.markRecoveredExecutionTerminal(ctx, repositories, execution, pid, nowISO, decision.ExecutionMessage); err != nil {
+			quarantined, wrote, err := r.quarantineRecoveryEvidence(ctx, repositories, execution, nowISO, message)
+			if err != nil {
 				return StaleRunReconcileSummary{}, err
 			}
-			summary.CleanedExecutions += 1
-			summary.EventsWritten += 1
-			summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
+			if quarantined {
+				quarantinedAny = true
+				// Quarantine is not cleanup: agent_executions stay active evidence.
+				summary.QuarantinedExecutions += 1
+				summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
+			}
+			if wrote {
+				summary.EventsWritten += 1
+			}
+		}
+		// Dead/nil-PID cleanup paths leave agent_executions as running evidence and
+		// may have just parked the loop/queue. Do not continue into queue repair
+		// with the pre-quarantine loop/latestRun snapshot — that can flip
+		// paused/manual_intervention back to interrupted/queued and create an
+		// active queue item, defeating the safety floor.
+		if quarantinedAny || len(decision.CleanupExecutions) > 0 {
+			quarantinedLoopIDs[run.LoopID] = struct{}{}
+			continue
 		}
 
 		latestRunBlocksRequeue := false
@@ -1901,6 +2480,9 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			return StaleRunReconcileSummary{}, err
 		}
 		for _, loop := range loops {
+			if _, quarantined := quarantinedLoopIDs[loop.ID]; quarantined {
+				continue
+			}
 			queueRepair, err := r.repairInterruptedLoopQueueIfNeeded(ctx, repositories, loop, nowISO)
 			if err != nil {
 				return StaleRunReconcileSummary{}, err
@@ -1960,25 +2542,22 @@ func (r *Runtime) evaluateStaleRunCandidate(ctx context.Context, repositories *s
 	if mode == staleRunReconcileModeStartup {
 		decision.Candidate = true
 		if latestRun != nil && latestRun.ID == run.ID && len(activeExecutions) > 0 {
+			// Active execution evidence is never Authority to kill, mark terminal,
+			// or requeue as cleaned (#575/#581). Classify for events; orphan
+			// cleanup quarantines observed_live/uncertain. Leader exit / PID
+			// absence alone cannot confirm dead or interrupt for requeue.
 			verification, err := r.verifyRunExecutionLiveness(ctx, repositories, activeExecutions, now, "startup_stale_run")
 			if err != nil {
 				return staleRunCandidateDecision{}, err
 			}
 			decision.EventsWritten += verification.EventsWritten
-			if verification.Uncertain {
-				decision.Uncertain = true
-				return decision, nil
-			}
-			if verification.Live {
-				return staleRunCandidateDecision{}, nil
-			}
+			decision.Uncertain = true
+			return decision, nil
 		}
+		// No active agent_execution rows: no process evidence to mis-handle.
+		// Interrupt orphan running runs only; queue repair uses durable
+		// finalize/lease semantics (not PID inference).
 		decision.Interrupt = latestRun == nil || latestRun.ID != run.ID || len(activeExecutions) == 0
-		if latestRun != nil && latestRun.ID == run.ID && len(activeExecutions) > 0 {
-			decision.Interrupt = true
-			decision.CleanupExecutions = append(decision.CleanupExecutions, activeExecutions...)
-			decision.ExecutionMessage = "Killed during stale-run recovery"
-		}
 		decision.Message = "Interrupted stale/orphaned running run during looperd recovery"
 		return decision, nil
 	}
@@ -2019,53 +2598,71 @@ func (r *Runtime) evaluateStaleRunCandidate(ctx context.Context, repositories *s
 }
 
 type executionLivenessResult struct {
-	Live           bool
-	Uncertain      bool
+	Live bool
+	// Uncertain is true when any execution cannot be treated as confirmed-dead
+	// Authority (including PID absent / not running after restart rules).
+	Uncertain bool
+	// DeadExecutions holds rows whose PID probe found no matching live process.
+	// These are NOT confirmed-dead Authority (#581): callers may quarantine
+	// evidence but must not mark terminal, signal, or requeue from this alone.
+	// Name retained for call-site compatibility; treat as "no live match".
 	DeadExecutions []storage.AgentExecutionRecord
 	EventsWritten  int64
 }
 
 func (r *Runtime) verifyRunExecutionLiveness(ctx context.Context, repositories *storage.Repositories, executions []storage.AgentExecutionRecord, now time.Time, scope string) (executionLivenessResult, error) {
 	result := executionLivenessResult{}
+	nowISO := formatJavaScriptISOString(now)
 	for _, execution := range executions {
-		if execution.PID == nil || *execution.PID <= 0 {
-			result.DeadExecutions = append(result.DeadExecutions, execution)
-			continue
-		}
-		pid := int(*execution.PID)
-		matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
+		// Shared classification: PID/PGID is evidence only (#581). Confirmed-dead
+		// never comes from PID absence. Live reconcile still uses DeadExecutions
+		// to quarantine "no live match" rows without requeue or SIGKILL.
+		classification, err := r.classifyStartupExecution(ctx, execution, nil)
 		if err != nil {
-			if r.logger != nil {
-				r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error(), "scope": scope})
-			}
-			nowISO := formatJavaScriptISOString(now)
-			written, appendErr := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, scope, nowISO)
-			if appendErr != nil {
-				return executionLivenessResult{}, appendErr
-			}
-			result.Uncertain = true
-			if written {
-				result.EventsWritten += 1
-			}
-			continue
+			return executionLivenessResult{}, err
 		}
-		if running && !matches {
-			nowISO := formatJavaScriptISOString(now)
-			written, err := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, scope, nowISO)
-			if err != nil {
-				return executionLivenessResult{}, err
-			}
-			result.Uncertain = true
-			if written {
-				result.EventsWritten += 1
-			}
-			continue
+		wroteClass, classErr := r.appendContainmentClassificationEvent(ctx, repositories, execution, classification, scope, nowISO)
+		if classErr != nil {
+			return executionLivenessResult{}, classErr
 		}
-		if running && matches {
+		if wroteClass {
+			result.EventsWritten += 1
+		}
+		switch classification.Class {
+		case ContainmentConfirmedDead:
+			// Durable terminal or current-daemon drain — not expected for active
+			// ListActive rows without a handle.
+			continue
+		case ContainmentObservedLive:
 			result.Live = true
 			continue
+		default:
+			// Uncertain classes:
+			// - identity probe error / mismatch → skip automatic interrupt (ambiguous)
+			// - pid absent / not running → not confirmed-dead; still list for
+			//   quarantine-only cleanup (no signal, no agent_execution terminal)
+			if classification.Reason == "process_probe_error" || classification.Reason == "process_identity_mismatch" {
+				if r.logger != nil && classification.Reason == "process_probe_error" {
+					r.logger.Warn("failed to verify active agent execution identity", map[string]any{
+						"executionId": execution.ID, "pid": classification.PID, "error": classification.Reason, "scope": scope,
+					})
+				}
+				written, appendErr := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, classification.PID, scope, nowISO)
+				if appendErr != nil {
+					return executionLivenessResult{}, appendErr
+				}
+				if written {
+					result.EventsWritten += 1
+				}
+				result.Uncertain = true
+				continue
+			}
+			// pid_absent / pid_not_running_not_confirmed_dead / other uncertain:
+			// "no live match" evidence for quarantine paths. Do not set Uncertain
+			// alone here — that would skip quarantine in live reconcile. Callers
+			// must still treat DeadExecutions as non-Authority for terminal/requeue.
+			result.DeadExecutions = append(result.DeadExecutions, execution)
 		}
-		result.DeadExecutions = append(result.DeadExecutions, execution)
 	}
 	return result, nil
 }
@@ -2137,7 +2734,7 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 		}
 		createdQueue := int64(0)
 		if requeuedCount == 0 {
-			if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.config.Scheduler.RetryMaxAttempts)); err != nil {
+			if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.Config().Scheduler.RetryMaxAttempts)); err != nil {
 				return staleRunQueueRepairSummary{}, err
 			}
 			activeQueue, err = repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
@@ -2281,13 +2878,63 @@ func (r *Runtime) appendUncertainProcessIdentityEvent(ctx context.Context, repos
 	return true, nil
 }
 
+// appendContainmentClassificationEvent records confirmed_dead / observed_live /
+// uncertain for an execution observation. Dedupes identical class+reason+scope.
+func (r *Runtime) appendContainmentClassificationEvent(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, classification ContainmentClassification, scope, nowISO string) (bool, error) {
+	payload := map[string]any{
+		"class":  string(classification.Class),
+		"reason": classification.Reason,
+		"scope":  scope,
+	}
+	if classification.PID > 0 {
+		payload["pid"] = classification.PID
+	}
+	payloadJSON := mustMarshalJSON(payload)
+	if repositories != nil && repositories.Events != nil {
+		events, err := repositories.Events.ListByEntity(ctx, "agent_execution", execution.ID)
+		if err != nil {
+			return false, err
+		}
+		for _, event := range events {
+			if event.EventType == "looperd.recovery.containment_classified" && event.PayloadJSON == payloadJSON {
+				return false, nil
+			}
+		}
+	}
+	if r.logger != nil {
+		r.logger.Info("startup recovery classified containment evidence", map[string]any{
+			"executionId": execution.ID,
+			"class":       string(classification.Class),
+			"reason":      classification.Reason,
+			"scope":       scope,
+			"pid":         classification.PID,
+		})
+	}
+	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		ID:          newRuntimeEventID(),
+		EventType:   "looperd.recovery.containment_classified",
+		ProjectID:   execution.ProjectID,
+		LoopID:      execution.LoopID,
+		RunID:       execution.RunID,
+		EntityType:  stringPtr("agent_execution"),
+		EntityID:    stringPtr(execution.ID),
+		PayloadJSON: payloadJSON,
+		CreatedAt:   nowISO,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (r *Runtime) markRecoveredExecutionTerminal(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, pid int, nowISO string, message string) error {
+	// Retained for any non-recovery callers; startup recovery must not use this
+	// to invent cleanliness from raw PID probes (#575).
 	cleaned := execution
 	cleaned.Status = "killed"
 	if cleaned.ErrorMessage == nil {
 		cleaned.ErrorMessage = stringPtr(message)
 	}
-	if r.config.Agent.NativeResume.Enabled && runtimeNativeResumeSupported(cleaned.Vendor) && cleaned.NativeSessionID != nil && strings.TrimSpace(*cleaned.NativeSessionID) != "" {
+	if r.Config().Agent.NativeResume.Enabled && runtimeNativeResumeSupported(cleaned.Vendor) && cleaned.NativeSessionID != nil && strings.TrimSpace(*cleaned.NativeSessionID) != "" {
 		cleaned.NativeResumeMode = stringPtr("native_resume")
 		cleaned.NativeResumeStatus = stringPtr("pending")
 		if r.logger != nil {
@@ -2316,6 +2963,109 @@ func (r *Runtime) markRecoveredExecutionTerminal(ctx context.Context, repositori
 		PayloadJSON: mustMarshalJSON(payload),
 		CreatedAt:   nowISO,
 	})
+}
+
+// quarantineRecoveryEvidence parks work tied to uncertain/orphan execution
+// evidence using existing manual_intervention / paused states. It does not
+// signal processes or mark agent_executions terminal.
+//
+// Returns (didQuarantine, wroteEvent, err).
+func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, nowISO, reason string) (bool, bool, error) {
+	if repositories == nil {
+		return false, false, nil
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "recovery quarantine: execution evidence without containment confirmation"
+	}
+	did := false
+	wrote := false
+
+	if execution.LoopID != nil && strings.TrimSpace(*execution.LoopID) != "" && repositories.Loops != nil {
+		loop, err := repositories.Loops.GetByID(ctx, *execution.LoopID)
+		if err != nil {
+			return false, false, err
+		}
+		if loop != nil {
+			switch loop.Status {
+			case "paused", "completed", "failed", "terminated", "stopped", "human_takeover":
+				// Already non-actionable for claim/requeue. human_takeover is a
+				// deliberate park (interactive handback); do not rewrite to paused.
+			default:
+				updated := *loop
+				updated.Status = "paused"
+				updated.NextRunAt = nil
+				updated.UpdatedAt = nowISO
+				if err := repositories.Loops.Upsert(ctx, updated); err != nil {
+					return false, false, err
+				}
+				did = true
+			}
+		}
+	}
+
+	if execution.LoopID != nil && strings.TrimSpace(*execution.LoopID) != "" && repositories.Queue != nil {
+		var items []storage.QueueItemRecord
+		if active, err := repositories.Queue.FindActiveByLoopID(ctx, *execution.LoopID); err != nil {
+			return false, false, err
+		} else if active != nil {
+			items = append(items, *active)
+		}
+		if latest, err := repositories.Queue.GetLatestByLoopID(ctx, *execution.LoopID); err != nil {
+			return false, false, err
+		} else if latest != nil && (len(items) == 0 || items[0].ID != latest.ID) {
+			items = append(items, *latest)
+		}
+		for _, item := range items {
+			if item.Status != "queued" && item.Status != "running" {
+				continue
+			}
+			msg := reason
+			if err := repositories.Queue.Fail(ctx, storage.QueueFailInput{
+				ID:           item.ID,
+				FinishedAt:   nowISO,
+				UpdatedAt:    nowISO,
+				ErrorMessage: &msg,
+				ErrorKind:    "manual_intervention",
+			}); err != nil {
+				return false, false, err
+			}
+			did = true
+		}
+	}
+
+	payload := map[string]any{
+		"reason":      reason,
+		"recoveredAt": nowISO,
+		"executionId": execution.ID,
+		"status":      execution.Status,
+	}
+	if execution.PID != nil && *execution.PID > 0 {
+		payload["pid"] = *execution.PID
+	}
+	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		ID:          newRuntimeEventID(),
+		EventType:   "looperd.recovery.execution_quarantined",
+		ProjectID:   execution.ProjectID,
+		LoopID:      execution.LoopID,
+		RunID:       execution.RunID,
+		EntityType:  stringPtr("agent_execution"),
+		EntityID:    stringPtr(execution.ID),
+		PayloadJSON: mustMarshalJSON(payload),
+		CreatedAt:   nowISO,
+	}); err != nil {
+		return did, false, err
+	}
+	wrote = true
+	if r.logger != nil {
+		r.logger.Warn("recovery quarantined execution evidence without process kill", map[string]any{
+			"executionId": execution.ID,
+			"loopId":      execution.LoopID,
+			"runId":       execution.RunID,
+			"reason":      reason,
+		})
+	}
+	return did || wrote, wrote, nil
 }
 
 func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string, maxAttempts int64) error {
@@ -2448,11 +3198,12 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 			}
 			return storage.QueueItemRecord{}, false, err
 		}
-		lockKey := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+		lockKey := storage.IssueLockKey(loop.ProjectID, repo, issueNumber)
+		targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 		payload := map[string]any{"issueNumber": issueNumber}
 		payloadJSON := mustMarshalJSON(payload)
 		queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = nil
 		queueRecord.DedupeKey = fmt.Sprintf("planner:%s:%s:%s:%d", loop.ProjectID, loop.ID, repo, issueNumber)
@@ -2465,9 +3216,10 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 			return storage.QueueItemRecord{}, false, fmt.Errorf("reviewer loop requires repo and pull request target")
 		}
 		prNumber := *loop.PRNumber
-		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		lockKey := storage.PullRequestLockKey(loop.ProjectID, repo, prNumber)
+		targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = &prNumber
 		queueRecord.DedupeKey = fmt.Sprintf("reviewer:%s:%s:%s:%d", loop.ProjectID, loop.ID, repo, prNumber)
@@ -2479,9 +3231,10 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 			return storage.QueueItemRecord{}, false, fmt.Errorf("fixer loop requires repo and pull request target")
 		}
 		prNumber := *loop.PRNumber
-		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		lockKey := storage.PullRequestLockKey(loop.ProjectID, repo, prNumber)
+		targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = &prNumber
 		queueRecord.DedupeKey = fmt.Sprintf("fixer:%s", loop.ID)
@@ -2504,9 +3257,10 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 				}
 				return storage.QueueItemRecord{}, false, err
 			}
-			lockKey = fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+			lockKey = storage.IssueLockKey(loop.ProjectID, repo, issueNumber)
+			targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 			queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
-			queueRecord.TargetID = lockKey
+			queueRecord.TargetID = targetID
 			queueRecord.Repo = &repo
 			queueRecord.PRNumber = nil
 			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", loop.ProjectID, repo, issueNumber)
@@ -2516,9 +3270,10 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 				return storage.QueueItemRecord{}, false, fmt.Errorf("worker loop requires repo and prNumber")
 			}
 			prNumber := *loop.PRNumber
-			lockKey = fmt.Sprintf("pr:%s:%d", repo, prNumber)
+			lockKey = storage.PullRequestLockKey(loop.ProjectID, repo, prNumber)
+			targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 			queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-			queueRecord.TargetID = lockKey
+			queueRecord.TargetID = targetID
 			queueRecord.Repo = &repo
 			queueRecord.PRNumber = &prNumber
 			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", loop.ProjectID, repo, prNumber)
@@ -2754,7 +3509,7 @@ type runtimeReviewerRecoveryPolicy struct {
 }
 
 func (r *Runtime) reviewerRecoveryPolicyForProject(projectID string) runtimeReviewerRecoveryPolicy {
-	roles := config.ProjectRoleConfigs(r.config, projectID)
+	roles := config.ProjectRoleConfigs(r.Config(), projectID)
 	return runtimeReviewerRecoveryPolicy{
 		includeDrafts:    roles.Reviewer.Discovery.Triggers.IncludeDrafts,
 		stopOnApproved:   roles.Reviewer.Behavior.Loop.StopOnApproved,
@@ -2866,6 +3621,47 @@ func requeueFailedReviewerQueueItemForRecovery(ctx context.Context, repositories
 		return 0, nil
 	}
 	return repositories.Queue.RequeueFailedByID(ctx, loopID, latestQueue.ID, queuedAt)
+}
+
+// requeueFailedReviewerWithSharedGuards requeues a failed reviewer under the
+// same per-loop + same-target locks as API discard+retry, so deferred/startup
+// recovery cannot activate a PR worktree sibling between discard preflight and
+// git reset/clean. didRequeue is false when eligibility no longer holds under
+// the lock (no error).
+func requeueFailedReviewerWithSharedGuards(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, latestQueue *storage.QueueItemRecord, nowISO string, policy runtimeReviewerRecoveryPolicy, latestRun *storage.RunRecord) (didRequeue bool, recoveredQueueItems int64, err error) {
+	unlock := LockLoopRequeue(loop.ID)
+	defer unlock()
+	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(loop))
+	defer unlockTarget()
+
+	// Re-check eligibility under the lock: discard/retry may have already
+	// requeued or otherwise changed status while we waited.
+	current, err := repositories.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return false, 0, err
+	}
+	if current == nil || !shouldAutoRecoverFailedReviewerLoop(*current, latestRun, latestQueue, policy) {
+		return false, 0, nil
+	}
+	failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), derefString(latestQueue.LastError))
+	recoveredQueueItems, err = requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO, policy, failureSummary)
+	if err != nil {
+		return false, 0, err
+	}
+	if recoveredQueueItems == 0 {
+		active, activeErr := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
+		if activeErr != nil {
+			return false, 0, activeErr
+		}
+		if active == nil {
+			return false, 0, fmt.Errorf("reviewer recovery did not requeue failed queue item %s for loop %s", latestQueue.ID, loop.ID)
+		}
+	}
+	requeuedLoop := autoRecoveredReviewerLoop(*current, nowISO)
+	if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+		return false, 0, err
+	}
+	return true, recoveredQueueItems, nil
 }
 
 func isRuntimeRetryableTransientWithRemainingAttempts(queue storage.QueueItemRecord) bool {

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -17,11 +18,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mattn/go-sqlite3"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// ErrExecutionPersistence is returned when a hard agent_executions observation
+// write fails (initial ownership, mid-life heartbeat/output, or terminal).
+// Soft/transient failures (cancel, conflict after terminal won, one busy retry)
+// do not produce this error alone.
+var ErrExecutionPersistence = errors.New("agent execution persistence failed")
 
 const (
 	defaultMaxOutputBytes    = 256 * 1024
@@ -50,6 +60,39 @@ var unsafeAgentEnvKeys = []string{
 
 var malformedProductAskPattern = regexp.MustCompile(`(?s)^\s*\{\s*"summary"\s*:\s*("(?:\\.|[^"\\])*")\s*,\s*"productAsk"\s*:\s*"(.*)"\s*\}\s*$`)
 
+var inheritedAgentEnvKeys = []string{
+	"PATH",
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"SHELL",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
+	"LANG",
+	"TERM",
+	"COLORTERM",
+	"NO_COLOR",
+	"FORCE_COLOR",
+	"XDG_CONFIG_HOME",
+	"XDG_CACHE_HOME",
+	"XDG_DATA_HOME",
+	"XDG_STATE_HOME",
+	"SSH_AUTH_SOCK",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+	"NODE_EXTRA_CA_CERTS",
+	"GIT_SSL_CAINFO",
+	"CODEX_HOME",
+	"CLAUDE_CONFIG_DIR",
+	"OPENCODE_CONFIG_DIR",
+	// Config path selector for trusted wrappers (looper review submit, etc.)
+	// that load via LOOPER_CONFIG when --config is not passed.
+	"LOOPER_CONFIG",
+	// Capability socket for daemon-side review submit (not a secret).
+	forge.TrustedReviewSockEnv,
+}
+
 type ExecutorConfig struct {
 	Vendor              config.AgentVendor
 	Model               *string
@@ -75,6 +118,24 @@ type ExecutorOptions struct {
 	Repos  *storage.Repositories
 	LogDir string
 	Now    func() time.Time
+	// ParamsOwnerVendor marks Config.Params as global agent.params owned by that
+	// vendor (typically agent.vendor). effectiveConfig always filters command/args
+	// via ParamsForRoleVendor against the effective identity (role or sticky
+	// snapshot): matching owner keeps wrappers, diverged or nil owner strips
+	// vendor-owned command/args so orphan global wrappers cannot ride a role-only
+	// vendor. Tests that intentionally pre-bind params.command should set the
+	// owner to Config.Vendor so the same-vendor path preserves them.
+	ParamsOwnerVendor *config.AgentVendor
+	// Owner, when set, admits every agent spawn under the Execution Supervisor
+	// before cmd.Start and binds the process containment handle before Start
+	// returns (ADR-0015 / #576). Daemon producers must wire Owner; unit tests
+	// may leave it nil and still get containment without Supervisor lease.
+	Owner SpawnOwner
+	// OnHardPersistFailure is invoked on the first hard agent_executions write
+	// failure for an execution path (heartbeat/output or terminal storage
+	// broken). Daemon wiring must map this to sticky admission degraded
+	// (ADR-0015 R5 / #578). Soft/transient errors and pure cancel do not call it.
+	OnHardPersistFailure func(error)
 	// OnProgress, when set, is called (throttled) while an agent run streams
 	// output, so a transport can surface live progress. Vendor-agnostic: it works
 	// off the subprocess's stdout tail, whatever agent (codex/opencode/claude) runs.
@@ -107,6 +168,18 @@ type RunInput struct {
 	IdempotencyKey     string
 	Env                map[string]string
 	NativeSessionID    string
+	// UseSnapshot, when true with a non-empty SnapshotVendor, overrides the
+	// executor's configured vendor/model for this start only (spawn, native
+	// resume vendor checks, and persisted execution vendor). Env and
+	// NativeResumeEnabled still come from the executor config. Identity-bearing
+	// params are filtered against the frozen vendor: wrappers are kept when the
+	// snapshot matches the params owner (or pre-bound base vendor), and model
+	// flags in args are stripped so SnapshotModel wins.
+	UseSnapshot    bool
+	SnapshotVendor string
+	// SnapshotModel is used only when UseSnapshot is true. nil means no model
+	// flag; a non-nil value (including empty) sets the model override.
+	SnapshotModel *string
 }
 
 type Result struct {
@@ -162,11 +235,14 @@ type Execution interface {
 }
 
 type ConfiguredExecutor struct {
-	config     ExecutorConfig
-	repos      *storage.Repositories
-	logDir     string
-	now        func() time.Time
-	onProgress func(context.Context, ProgressUpdate)
+	config               ExecutorConfig
+	paramsOwner          *config.AgentVendor
+	repos                *storage.Repositories
+	logDir               string
+	now                  func() time.Time
+	owner                SpawnOwner
+	onHardPersistFailure func(error)
+	onProgress           func(context.Context, ProgressUpdate)
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
@@ -174,7 +250,16 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 	if now == nil {
 		now = time.Now
 	}
-	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now, onProgress: options.OnProgress}
+	return &ConfiguredExecutor{
+		config:               options.Config,
+		paramsOwner:          options.ParamsOwnerVendor,
+		repos:                options.Repos,
+		logDir:               options.LogDir,
+		now:                  now,
+		owner:                options.Owner,
+		onHardPersistFailure: options.OnHardPersistFailure,
+		onProgress:           options.OnProgress,
+	}
 }
 
 // liveProgressInterval throttles OnProgress so a chatty agent doesn't hammer the
@@ -192,12 +277,142 @@ type nativeResumeInfo struct {
 	SourceExecutionID string
 }
 
+// effectiveConfig returns the executor config for this start, applying run
+// snapshot identity overrides when UseSnapshot is set.
+func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
+	cfg := e.config
+
+	if input.UseSnapshot {
+		if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
+			cfg.Vendor = config.AgentVendor(vendor)
+			cfg.Model = input.SnapshotModel
+		}
+	}
+
+	// Always filter global agent.params against the effective identity (role
+	// vendor or sticky snapshot). Construction must not pre-strip against the
+	// live role alone: a failed Codex run that still owns params.command would
+	// otherwise lose its wrapper after the role is hot-switched and sticky
+	// retry restores the snapshot vendor. Nil paramsOwner (agent.vendor unset)
+	// still runs ParamsForRoleVendor so orphan command/args cannot launch the
+	// wrong binary for a role-only vendor.
+	cfg.Params = ParamsForRoleVendor(e.config.Params, e.paramsOwner, cfg.Vendor, cfg.Model)
+	return cfg
+}
+
+// ParamsForRoleVendor returns executor params for an effective coding-role vendor.
+// Global agent.params are owned by agent.vendor. When the effective vendor
+// (resolved role or sticky snapshot) differs from that owner — or the owner is
+// unset while a role still resolves — command and args are dropped so
+// vendor-specific wrappers/flags cannot launch the wrong binary or inject
+// foreign CLI shape. Same-vendor identity keeps command and args; model flags
+// in args are stripped whenever roleModel is non-nil so roles.*.agent.model /
+// profile / global agent.model can win via prependModelFlag, and so an
+// explicit empty model binding (suppress → vendor default) does not leave
+// params --model/-m in place. When roleModel is nil (unset), params.args
+// --model/-m are preserved so existing params-only model configs do not
+// silently fall back to vendor defaults.
+func ParamsForRoleVendor(params map[string]any, globalVendor *config.AgentVendor, roleVendor config.AgentVendor, roleModel *string) map[string]any {
+	if params == nil {
+		return nil
+	}
+	if globalVendor != nil && *globalVendor == roleVendor {
+		// Clone so role resolution cannot mutate the shared global params map.
+		// Strip model flags when a resolved model binding is present — including
+		// non-nil empty (explicit suppress to vendor default).
+		if roleModel != nil {
+			return cloneParamsForSnapshot(params, false)
+		}
+		return maps.Clone(params)
+	}
+	return cloneParamsForSnapshot(params, true)
+}
+
+// cloneParamsForSnapshot copies params and strips identity-bearing overrides.
+// When stripVendorOwned is true (diverged vendor), params.command and
+// params.args are removed entirely — global args are vendor-shaped and must
+// not follow a different binary. When false (same vendor), only model flags
+// in args are removed so SnapshotModel / role model can win.
+func cloneParamsForSnapshot(params map[string]any, stripVendorOwned bool) map[string]any {
+	if params == nil {
+		return nil
+	}
+	out := maps.Clone(params)
+	if stripVendorOwned {
+		delete(out, "command")
+		delete(out, "args")
+		return out
+	}
+	if args, ok := out["args"]; ok {
+		out["args"] = stripModelFlagsFromArgs(args)
+	}
+	return out
+}
+
+// stripModelFlagsFromArgs removes -m / --model and --model=* style flags (and
+// their values when separate) from params args. Supports []string and []any.
+func stripModelFlagsFromArgs(args any) any {
+	switch typed := args.(type) {
+	case []string:
+		return stripModelFlags(typed)
+	case []any:
+		asStrings := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				// Preserve non-string entries by converting via stringArgs path later;
+				// only strip when the whole list is string-compatible.
+				return args
+			}
+			asStrings = append(asStrings, text)
+		}
+		stripped := stripModelFlags(asStrings)
+		out := make([]any, len(stripped))
+		for i, s := range stripped {
+			out[i] = s
+		}
+		return out
+	default:
+		return args
+	}
+}
+
+func stripModelFlags(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(args))
+	skipNext := false
+	for i, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if arg == "-m" || arg == "--model" {
+			if i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "-m=") {
+			continue
+		}
+		// Attached short form: -mMODEL (not -m=MODEL, already handled).
+		if strings.HasPrefix(arg, "-m") && !strings.HasPrefix(arg, "-m=") && arg != "-m" {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
 func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunInput) (nativeResumeInfo, error) {
-	if !e.config.NativeResumeEnabled {
+	cfg := e.effectiveConfig(input)
+	if !cfg.NativeResumeEnabled {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "disabled"}, nil
 	}
 	if sessionID := strings.TrimSpace(input.NativeSessionID); sessionID != "" {
-		if nativeResumeSupported(e.config.Vendor) {
+		if nativeResumeSupported(cfg.Vendor) {
 			return nativeResumeInfo{Enabled: true, SessionID: sessionID, Mode: "native_resume", Status: "started"}, nil
 		}
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unsupported"}, nil
@@ -212,7 +427,7 @@ func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunI
 	if latest == nil || latest.NativeSessionID == nil || strings.TrimSpace(*latest.NativeSessionID) == "" {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
 	}
-	if latest.Vendor != string(e.config.Vendor) || !nativeResumeSupported(e.config.Vendor) || !isRecoverableNativeResumeSource(latest.Status, latest.NativeResumeStatus) {
+	if latest.Vendor != string(cfg.Vendor) || !nativeResumeSupported(cfg.Vendor) || !isRecoverableNativeResumeSource(latest.Status, latest.NativeResumeStatus) {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
 	}
 	return nativeResumeInfo{Enabled: true, SessionID: strings.TrimSpace(*latest.NativeSessionID), Mode: "native_resume", Status: "started", SourceExecutionID: latest.ID}, nil
@@ -268,24 +483,58 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	}
 	startedAt := e.now().UTC()
 	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
+	cfg := e.effectiveConfig(input)
 	resume, err := e.resolveNativeResume(ctx, input)
 	if err != nil {
 		return nil, err
 	}
+
+	// Supervisor lease before cmd.Start (#576). When Owner is nil (unit tests),
+	// containment still binds but there is no live registry entry for stop.
+	var lease SpawnLease
+	if e.owner != nil {
+		lease, err = e.owner.AdmitSpawn(ctx, SpawnMeta{
+			LoopID:      input.LoopID,
+			RunID:       input.RunID,
+			ExecutionID: executionID,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	releaseLease := func() {
+		if lease != nil {
+			lease.Release()
+			lease = nil
+		}
+	}
+	// If Start returns success, the execution owns release on terminal Wait.
+	// On any failure path below, release immediately.
+	defer func() {
+		if lease != nil {
+			// Only still set when we failed before transferring ownership to x.
+			releaseLease()
+		}
+	}()
+
 	spawnPrompt := input.Prompt
 	if resume.Enabled && strings.TrimSpace(input.NativeResumePrompt) != "" {
 		spawnPrompt = input.NativeResumePrompt
 	}
-	command, args := ResolveSpawnWithNativeResume(e.config, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
+	command, args := ResolveSpawnWithNativeResume(cfg, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, e.config.Env, input.Env)
+	processcontainment.Configure(cmd)
+	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, cfg.Env, input.Env)
 
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
 		maxOutputBytes = defaultMaxOutputBytes
+	}
+	grace := input.GracefulShutdown
+	if grace <= 0 {
+		grace = 5 * time.Second
 	}
 
 	x := &execution{
@@ -299,7 +548,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		process:            cmd,
 		timeout:            input.Timeout,
 		heartbeatTimeout:   input.HeartbeatTimeout,
-		gracefulShutdown:   input.GracefulShutdown,
+		gracefulShutdown:   grace,
 		maxOutputBytes:     maxOutputBytes,
 		lastHeartbeatAtISO: startedAtISO,
 		lastOutputAt:       startedAt,
@@ -309,21 +558,35 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		nativeResumeStatus: resume.Status,
 		killCh:             make(chan string, 1),
 		doneCh:             make(chan execOutcome, 1),
+		lease:              lease,
 	}
 	x.stdoutLogPath, x.stderrLogPath = e.executionLogPaths(input, executionID)
 	x.initializePersistedLogs()
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
+
+	spawnCtx := ctx
+	if lease != nil {
+		spawnCtx = lease.Context()
+	}
+	if err := spawnCtx.Err(); err != nil {
+		return nil, err
+	}
+
 	if err := cmd.Start(); err != nil {
 		if resume.Enabled {
+			// Cancellation must not start a fallback process (#576).
+			if err := spawnCtx.Err(); err != nil {
+				return nil, err
+			}
 			if markErr := e.markNativeResumeFailed(ctx, resume.SourceExecutionID, err.Error()); markErr == nil && e.logDir != "" {
 				// best-effort marker only; command fallback is the important recovery behavior
 			}
-			command, args = ResolveSpawn(e.config, input.WorkingDirectory, input.Prompt)
+			command, args = ResolveSpawn(cfg, input.WorkingDirectory, input.Prompt)
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
-			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, e.config.Env, input.Env)
+			processcontainment.Configure(cmd)
+			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, cfg.Env, input.Env)
 			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 			x.mu.Lock()
@@ -335,6 +598,9 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			x.nativeResumeStatus = "fallback_started"
 			x.nativeResumeError = err.Error()
 			x.mu.Unlock()
+			if err := spawnCtx.Err(); err != nil {
+				return nil, err
+			}
 			if startErr := cmd.Start(); startErr != nil {
 				return nil, fmt.Errorf("start agent command: %w (native resume fallback after: %v)", startErr, err)
 			}
@@ -343,12 +609,58 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		}
 	}
 
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  grace,
+		DrainTimeout: grace + 15*time.Second,
+	})
+	if err != nil {
+		_ = killStartedCmd(cmd)
+		return nil, fmt.Errorf("bind agent containment handle: %w", err)
+	}
+	x.handle = handle
+
+	if lease != nil {
+		if err := lease.BindHandle(handle, x.Kill); err != nil {
+			// BindHandle already confirmed-drained on stop race.
+			return nil, err
+		}
+	}
+
+	// Initial ownership observation is hard: fail Start loud and do not leave
+	// an unowned live process (#578). Persist before transferring lease so the
+	// deferred Release still drains Supervisor ownership when reap confirms dead.
+	if err := x.persistStatus(ctx, "running", nil, nil, nil); err != nil {
+		outErr := x.reapOnOwnershipPersistFailure(cmd, grace, err, "persist initial agent execution ownership")
+		// When Kill cannot confirm death, keep the registry handle: dropping the
+		// lease here would leave a still-live agent with neither a durable row
+		// nor an owner (Start returns no Execution).
+		if x.handle != nil && !x.handle.ConfirmedDead() {
+			lease = nil
+		}
+		return nil, outErr
+	}
+
+	// Transfer lease ownership to execution; defer must not Release on success.
+	lease = nil
+
 	resumeSessionID, resumeMode, resumeStatus, _ := x.nativeResumeSnapshot()
-	x.persistStatus("running", nil, nil, nil)
 	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory, "nativeResumeMode": resumeMode, "nativeResumeStatus": resumeStatus, "nativeSessionId": resumeSessionID}, startedAtISO)
 
 	go x.run(ctx)
 	return x, nil
+}
+
+func killStartedCmd(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	pid := cmd.Process.Pid
+	if pid > 0 {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+	return nil
 }
 
 type execOutcome struct {
@@ -365,6 +677,8 @@ type execution struct {
 	args               []string
 	startedAtISO       string
 	process            *exec.Cmd
+	handle             *processcontainment.Handle
+	lease              SpawnLease
 	timeout            time.Duration
 	heartbeatTimeout   time.Duration
 	gracefulShutdown   time.Duration
@@ -374,6 +688,9 @@ type execution struct {
 	lastProgressAt     time.Time
 
 	mu                      sync.Mutex
+	persistMu               sync.Mutex // one ordered writer per execution (#578)
+	terminalPersisted       bool
+	hardPersistReported     bool
 	status                  string
 	stdout                  []byte
 	stderr                  []byte
@@ -385,6 +702,7 @@ type execution struct {
 	nativeResumeMode        string
 	nativeResumeStatus      string
 	nativeResumeError       string
+	leaseReleased           bool
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -414,7 +732,10 @@ func (x *execution) Kill(reason string) error {
 }
 
 func (x *execution) signalProcessGroup(signal syscall.Signal) error {
-	if x.process.Process == nil {
+	if x.handle != nil {
+		return x.handle.SignalGroup(signal)
+	}
+	if x.process == nil || x.process.Process == nil {
 		return os.ErrProcessDone
 	}
 	pid := x.process.Process.Pid
@@ -431,7 +752,12 @@ func (x *execution) signalProcessGroup(signal syscall.Signal) error {
 }
 
 func (x *execution) killProcessGroup() error {
-	if x.process.Process == nil {
+	if x.handle != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), x.gracefulShutdown+15*time.Second)
+		defer cancel()
+		return x.handle.Kill(ctx)
+	}
+	if x.process == nil || x.process.Process == nil {
 		return os.ErrProcessDone
 	}
 	pid := x.process.Process.Pid
@@ -443,9 +769,55 @@ func (x *execution) killProcessGroup() error {
 	return x.process.Process.Kill()
 }
 
+func (x *execution) releaseLease() {
+	x.mu.Lock()
+	if x.leaseReleased || x.lease == nil {
+		x.mu.Unlock()
+		return
+	}
+	// Prefer a durable registry orphan over an unowned live process: do not drop
+	// Supervisor ownership while containment may still be live (e.g. Kill timeout
+	// after failed ownership persist on native-resume fallback).
+	if x.handle != nil && !x.handle.ConfirmedDead() {
+		x.mu.Unlock()
+		return
+	}
+	x.leaseReleased = true
+	lease := x.lease
+	x.mu.Unlock()
+	lease.Release()
+}
+
+func (x *execution) waitLeader() error {
+	if x.handle != nil {
+		return x.handle.Wait(context.Background())
+	}
+	if x.process == nil {
+		return os.ErrProcessDone
+	}
+	return x.process.Wait()
+}
+
 func (x *execution) run(ctx context.Context) {
+	defer x.releaseLease()
+
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- x.process.Wait() }()
+	go func() { waitCh <- x.waitLeader() }()
+
+	// Merge caller ctx with lease cancellation so stop during run is observed.
+	runCtx := ctx
+	if x.lease != nil {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-x.lease.Context().Done():
+				cancel()
+			case <-runCtx.Done():
+			}
+		}()
+		defer cancel()
+	}
 
 	var (
 		waitErr         error
@@ -460,7 +832,7 @@ func (x *execution) run(ctx context.Context) {
 		terminateOnce   sync.Once
 		terminateSignal = func() {
 			terminateOnce.Do(func() {
-				if x.process.Process == nil {
+				if x.handle == nil && (x.process == nil || x.process.Process == nil) {
 					return
 				}
 				if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
@@ -541,10 +913,14 @@ func (x *execution) run(ctx context.Context) {
 			}
 			x.setStatus("killed")
 			terminateSignal()
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			killed = true
 			if killReason == "" {
-				killReason = ctx.Err().Error()
+				if runCtx.Err() != nil {
+					killReason = runCtx.Err().Error()
+				} else {
+					killReason = context.Canceled.Error()
+				}
 			}
 			x.setStatus("killed")
 			terminateSignal()
@@ -649,20 +1025,47 @@ func (x *execution) run(ctx context.Context) {
 		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               lastProgressAt,
-		PID:                          pidOrZero(x.process.Process),
+		PID:                          x.leaderPID(),
 		Interrupted:                  x.hitlInterrupted,
 	}
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
-		if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
-			result = fallbackResult
-			status = fallbackResult.Status
-			timeoutType = fallbackResult.TimeoutType
-			errorMessage = fallbackErrorMessage
-			endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+		// Cancellation / stop must not spawn a second process (#576).
+		if runCtx.Err() == nil && (x.lease == nil || x.lease.Context().Err() == nil) {
+			if fallbackResult, fallbackErrorMessage, ok, fallbackErr := x.runCheckpointFallback(runCtx, errorMessage); ok {
+				result = fallbackResult
+				status = fallbackResult.Status
+				timeoutType = fallbackResult.TimeoutType
+				errorMessage = fallbackErrorMessage
+				endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+			} else if fallbackErr != nil {
+				// Fallback ownership persist failed; process reaped only when
+				// Kill confirmed dead (releaseLease keeps ownership otherwise).
+				x.doneCh <- execOutcome{result: result, err: fallbackErr}
+				return
+			}
 		}
 	}
 
-	x.persistFinal(status, result, errorMessage, endedAtISO)
+	// No terminal observation before containment is confirmed dead for owned
+	// executions (ties to #574/#576 / ADR-0015 R5).
+	if err := x.ensureConfirmedDeadBeforeTerminal(); err != nil {
+		x.reportHardPersistFailure(err)
+		x.doneCh <- execOutcome{
+			result: result,
+			err:    errors.Join(ErrExecutionPersistence, fmt.Errorf("containment not confirmed dead before terminal observation: %w", err)),
+		}
+		return
+	}
+
+	persistErr := x.persistFinal(status, result, errorMessage, endedAtISO)
+	if hard := x.classifyPersistError(persistErr); hard != nil {
+		x.reportHardPersistFailure(hard)
+		persistErr = errors.Join(ErrExecutionPersistence, fmt.Errorf("persist terminal agent execution: %w", hard))
+	} else if persistErr != nil {
+		// Soft terminal write issues still fail loud (do not report success).
+		persistErr = errors.Join(ErrExecutionPersistence, fmt.Errorf("persist terminal agent execution: %w", persistErr))
+	}
+
 	eventType := "agent.completed"
 	if status == "timeout" {
 		switch timeoutType {
@@ -676,19 +1079,21 @@ func (x *execution) run(ctx context.Context) {
 	} else if status == "killed" {
 		eventType = "agent.killed"
 	}
-	x.executor.appendLifecycleEvent(eventType, x.input, x.executionID, map[string]any{
-		"status":                       status,
-		"timeoutType":                  timeoutType,
-		"configuredIdleTimeoutSeconds": result.ConfiguredIdleTimeoutSeconds,
-		"configuredMaxRuntimeSeconds":  result.ConfiguredMaxRuntimeSeconds,
-		"elapsedRuntimeSeconds":        result.ElapsedRuntimeSeconds,
-		"lastProgressAt":               result.LastProgressAt,
-		"parseStatus":                  result.ParseStatus,
-		"heartbeatCount":               result.HeartbeatCount,
-		"summary":                      result.Summary,
-	}, endedAtISO)
+	if persistErr == nil {
+		x.executor.appendLifecycleEvent(eventType, x.input, x.executionID, map[string]any{
+			"status":                       status,
+			"timeoutType":                  timeoutType,
+			"configuredIdleTimeoutSeconds": result.ConfiguredIdleTimeoutSeconds,
+			"configuredMaxRuntimeSeconds":  result.ConfiguredMaxRuntimeSeconds,
+			"elapsedRuntimeSeconds":        result.ElapsedRuntimeSeconds,
+			"lastProgressAt":               result.LastProgressAt,
+			"parseStatus":                  result.ParseStatus,
+			"heartbeatCount":               result.HeartbeatCount,
+			"summary":                      result.Summary,
+		}, endedAtISO)
+	}
 
-	x.doneCh <- execOutcome{result: result, err: nil}
+	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
 func (x *execution) shouldFallbackNativeResume(status string, stdout string, stderr string) bool {
@@ -725,12 +1130,48 @@ func normalizeNativeResumeErrorLine(line string) string {
 	return strings.TrimSpace(line)
 }
 
-func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
-	command, args := ResolveSpawn(x.executor.config, x.input.WorkingDirectory, x.input.Prompt)
+func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool, error) {
+	// Stop/cancel must not spawn a second process after the first failed attach.
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return Result{}, "", false, nil
+		}
+	}
+	if x.lease != nil {
+		if err := x.lease.Context().Err(); err != nil {
+			return Result{}, "", false, nil
+		}
+	}
+
+	// Atomic rebind admission with the Supervisor registry: BeginRebind under
+	// the registry lock, then Start/Bind/RebindHandle. BeginLoopStop waits for
+	// this window so stop cannot return while a second process is live outside
+	// the registry between Start and RebindHandle.
+	type rebindLease interface {
+		BeginRebind() error
+		AbortRebind()
+		RebindHandle(*processcontainment.Handle, SoftKillFunc) error
+	}
+	var rebind rebindLease
+	if x.lease != nil {
+		if r, ok := x.lease.(rebindLease); ok {
+			if err := r.BeginRebind(); err != nil {
+				return Result{}, "", false, nil
+			}
+			rebind = r
+			defer func() {
+				// No-op if RebindHandle already ended the window.
+				rebind.AbortRebind()
+			}()
+		}
+	}
+
+	cfg := x.executor.effectiveConfig(x.input)
+	command, args := ResolveSpawn(cfg, x.input.WorkingDirectory, x.input.Prompt)
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, x.executor.config.Env, x.input.Env)
+	processcontainment.Configure(cmd)
+	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, cfg.Env, x.input.Env)
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 
@@ -750,8 +1191,6 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
 	x.mu.Unlock()
-	x.persistStatus("running", nil, nil, nil)
-	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
 
 	if err := cmd.Start(); err != nil {
 		x.mu.Lock()
@@ -759,11 +1198,69 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		x.nativeResumeStatus = "fallback_failed"
 		x.nativeResumeError = firstNonEmpty(err.Error(), nativeError)
 		x.mu.Unlock()
-		return Result{}, "", false
+		return Result{}, "", false, nil
 	}
 
+	grace := x.gracefulShutdown
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  grace,
+		DrainTimeout: grace + 15*time.Second,
+	})
+	if err != nil {
+		_ = killStartedCmd(cmd)
+		x.mu.Lock()
+		x.status = "failed"
+		x.nativeResumeStatus = "fallback_failed"
+		x.nativeResumeError = firstNonEmpty(err.Error(), nativeError)
+		x.mu.Unlock()
+		return Result{}, "", false, nil
+	}
+	// Prior handle already Wait'd in the outer run loop; replace for stop-kill.
+	x.mu.Lock()
+	x.handle = handle
+	x.mu.Unlock()
+	if rebind != nil {
+		// Re-bind so haltLoop finds the live fallback process. Prior entry was
+		// released only on full execution end; update handle in place via a
+		// second BindHandle is not valid (lease left pending).
+		if err := rebind.RebindHandle(handle, x.Kill); err != nil {
+			// Registry already killUnowned'd on stop/admission refuse; ensure
+			// local cleanup and surface killed so persistFinal does not keep
+			// the stale native-resume attach "failed" over markExecutionCancelling.
+			_ = handle.Kill(context.Background())
+			errMsg := firstNonEmpty(err.Error(), nativeError)
+			x.mu.Lock()
+			x.status = "killed"
+			x.nativeResumeStatus = "fallback_failed"
+			x.nativeResumeError = errMsg
+			x.mu.Unlock()
+			return Result{
+				Status:                       "killed",
+				Summary:                      firstNonEmpty(errMsg, "native resume fallback refused during stop"),
+				ParseStatus:                  "missing",
+				HeartbeatCount:               x.heartbeatCountValue(),
+				ConfiguredIdleTimeoutSeconds: durationSeconds(x.heartbeatTimeout),
+				ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
+				ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
+				LastProgressAt:               x.lastProgressAtISO(),
+				PID:                          x.leaderPID(),
+			}, errMsg, true, nil
+		}
+	}
+
+	// Ownership observation after spawn+bind: fail loud and reap if storage is broken.
+	// Join Kill failures and keep registry ownership unless ConfirmedDead so a
+	// deferred run releaseLease cannot drop the only live handle on drain timeout.
+	if err := x.persistStatus(ctx, "running", nil, nil, nil); err != nil {
+		return Result{}, "", false, x.reapOnOwnershipPersistFailure(cmd, grace, err, "persist fallback agent execution ownership")
+	}
+	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
+
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
+	go func() { waitCh <- handle.Wait(context.Background()) }()
 	var (
 		waitErr        error
 		timedOut       bool
@@ -787,20 +1284,18 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		defer idleTicker.Stop()
 	}
 	terminate := func() {
-		if cmd.Process == nil {
+		if handle == nil {
 			return
 		}
-		if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
+		if err := handle.SignalGroup(syscall.SIGTERM); err != nil {
 			if err != os.ErrProcessDone {
-				_ = x.killProcessGroup()
+				ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+				_ = handle.Kill(ctx)
+				cancel()
 			}
 			return
 		}
 		termDelivered = true
-		grace := x.gracefulShutdown
-		if grace <= 0 {
-			grace = 5 * time.Second
-		}
 		graceKillTimer = time.After(grace)
 	}
 	waiting := true
@@ -837,11 +1332,15 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			terminate()
 		case <-graceKillTimer:
 			graceKillTimer = nil
-			_ = x.killProcessGroup()
+			ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+			_ = handle.Kill(ctx)
+			cancel()
 		}
 	}
 	if termDelivered && (killed || timedOut) {
-		_ = x.killProcessGroup()
+		ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+		_ = handle.Kill(ctx)
+		cancel()
 	}
 	stdout := x.stdoutString()
 	stderr := x.stderrString()
@@ -903,9 +1402,9 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
-		PID:                          pidOrZero(cmd.Process),
+		PID:                          x.leaderPID(),
 		Interrupted:                  x.hitlInterrupted,
-	}, errorMessage, true
+	}, errorMessage, true, nil
 }
 
 func (x *execution) onOutput(stream string, chunk []byte) {
@@ -961,7 +1460,16 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	x.mu.Unlock()
 
 	outputJSON := x.outputJSON(stdout, stderr)
-	x.persistStatus(x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON)
+	// Mid-life output must not publish terminal observations: timeout/kill may
+	// already be set in-memory while the process group is still draining, and
+	// terminal rows are immutable (ADR-0015 R5 / ensureConfirmedDeadBeforeTerminal).
+	if err := x.persistStatus(context.Background(), x.liveObservationStatus(), &heartbeatCount, &nowISO, &outputJSON); err != nil {
+		if hard := x.classifyPersistError(err); hard != nil {
+			// First hard mid-life failure closes admission (degraded). Soft
+			// cancel/conflict/busy-after-retry do not sticky-degrade.
+			x.reportHardPersistFailure(hard)
+		}
+	}
 	x.bumpRunHeartbeat(nowISO)
 	x.maybeEmitProgress(now, stdout, stderr)
 }
@@ -1013,7 +1521,11 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 
 // jsonMode reports whether this run is a codex `--json` run (structured events).
 func (x *execution) jsonMode() bool {
-	return x.executor != nil && x.executor.config.LiveToolEvents && x.executor.config.Vendor == config.AgentVendorCodex
+	if x.executor == nil {
+		return false
+	}
+	cfg := x.executor.effectiveConfig(x.input)
+	return cfg.LiveToolEvents && cfg.Vendor == config.AgentVendorCodex
 }
 
 // openCodeJSONMode reports whether this run is an opencode `run --format json` run.
@@ -1097,20 +1609,32 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 	_ = x.executor.repos.Runs.Upsert(ctx, updated)
 }
 
-func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbeatAt *string, outputJSON *string) {
+// persistStatus writes a live (or initial) observation. One ordered writer per
+// execution (persistMu). After a terminal observation is recorded, live writes
+// are no-ops so a stale heartbeat cannot race terminal immutability.
+func (x *execution) persistStatus(ctx context.Context, status string, heartbeatCount *int64, heartbeatAt *string, outputJSON *string) error {
+	x.persistMu.Lock()
+	defer x.persistMu.Unlock()
+	if x.terminalPersisted {
+		return nil
+	}
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
-		return
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
 	metadata := mustJSON(x.executionMetadata(""))
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
 	pid := int64(pidOrZero(x.process.Process))
+	cfg := x.executor.effectiveConfig(x.input)
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,
 		ProjectID:          emptyToNil(x.input.ProjectID),
 		LoopID:             emptyToNil(x.input.LoopID),
 		RunID:              emptyToNil(x.input.RunID),
-		Vendor:             string(x.executor.config.Vendor),
+		Vendor:             string(cfg.Vendor),
 		Status:             status,
 		PID:                int64PtrIfPositive(pid),
 		CommandJSON:        &commandJSON,
@@ -1134,12 +1658,17 @@ func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbea
 	if outputJSON != nil {
 		record.OutputJSON = outputJSON
 	}
-	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
+	return x.upsertAgentExecutionWithRetry(ctx, record)
 }
 
-func (x *execution) persistFinal(status string, result Result, errorMessage, endedAtISO string) {
+// persistFinal writes the terminal observation after containment is confirmed
+// dead. Failures must surface to Wait; callers degrade on hard storage errors.
+func (x *execution) persistFinal(status string, result Result, errorMessage, endedAtISO string) error {
+	x.persistMu.Lock()
+	defer x.persistMu.Unlock()
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
-		return
+		x.terminalPersisted = true
+		return nil
 	}
 	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
@@ -1170,12 +1699,13 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	if nativeSessionID != "" && (nativeResumeStatus == "" || nativeResumeStatus == "unavailable") {
 		nativeResumeStatus = "captured"
 	}
+	cfg := x.executor.effectiveConfig(x.input)
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,
 		ProjectID:          emptyToNil(x.input.ProjectID),
 		LoopID:             emptyToNil(x.input.LoopID),
 		RunID:              emptyToNil(x.input.RunID),
-		Vendor:             string(x.executor.config.Vendor),
+		Vendor:             string(cfg.Vendor),
 		Status:             status,
 		PID:                int64PtrIfPositive(pid),
 		CommandJSON:        &commandJSON,
@@ -1197,13 +1727,160 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 		CreatedAt:          x.startedAtISO,
 		UpdatedAt:          endedAtISO,
 	}
-	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
+	err := x.upsertAgentExecutionWithRetry(context.Background(), record)
+	// Mark terminal attempted so live writers stop; conflict after another
+	// terminal observation also counts as terminal settled for mid-life writes.
+	if err == nil || errors.Is(err, storage.ErrAgentExecutionConflict) {
+		x.terminalPersisted = true
+	}
+	// Surface terminal conflicts: a competing terminal with a different status
+	// is not durable finalize success (storage contract / #578). Callers fail
+	// loud without sticky-degrade (classifyPersistError treats conflict as soft).
+	return err
+}
+
+// upsertAgentExecutionWithRetry performs one soft retry on SQLITE_BUSY /
+// locked storage. Cancel/deadline are not retried.
+func (x *execution) upsertAgentExecutionWithRetry(ctx context.Context, record storage.AgentExecutionRecord) error {
+	err := x.executor.repos.AgentExecutions.Upsert(ctx, record)
+	if err == nil || !isSQLiteBusyPersistError(err) {
+		return err
+	}
+	// Soft/transient: single retry only. Do not sticky-degrade on pure busy.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(25 * time.Millisecond):
+	}
+	return x.executor.repos.AgentExecutions.Upsert(ctx, record)
+}
+
+// classifyPersistError returns a non-nil hard error when infrastructure must
+// fail loud and/or degrade. Soft errors (cancel, deadline, conflict after
+// terminal won) return nil so callers do not sticky-degrade.
+func (x *execution) classifyPersistError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil
+	}
+	if errors.Is(err, storage.ErrAgentExecutionConflict) {
+		return nil
+	}
+	return err
+}
+
+func isSQLiteBusyPersistError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "sqlite_busy")
+}
+
+func (x *execution) reportHardPersistFailure(err error) {
+	if err == nil || x == nil || x.executor == nil {
+		return
+	}
+	x.mu.Lock()
+	if x.hardPersistReported {
+		x.mu.Unlock()
+		return
+	}
+	x.hardPersistReported = true
+	fn := x.executor.onHardPersistFailure
+	x.mu.Unlock()
+	if fn != nil {
+		fn(err)
+	}
+}
+
+// reapOnOwnershipPersistFailure kills the just-started process after a failed
+// initial/fallback ownership observation, joins drain errors into the return,
+// and sticky-degrades on hard storage failure. Soft persist errors still fail
+// Start/fallback loud without degrade. Callers must keep Supervisor ownership
+// when the containment handle is not ConfirmedDead after this returns.
+func (x *execution) reapOnOwnershipPersistFailure(cmd *exec.Cmd, grace time.Duration, persistErr error, msg string) error {
+	hard := x.classifyPersistError(persistErr)
+	var base error
+	if hard != nil {
+		x.reportHardPersistFailure(hard)
+		base = errors.Join(ErrExecutionPersistence, fmt.Errorf("%s: %w", msg, hard))
+	} else {
+		base = errors.Join(ErrExecutionPersistence, fmt.Errorf("%s: %w", msg, persistErr))
+	}
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	killCtx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+	defer cancel()
+	var killErr error
+	if x.handle != nil {
+		killErr = x.handle.Kill(killCtx)
+	} else if cmd != nil {
+		killErr = killStartedCmd(cmd)
+	}
+	if killErr != nil {
+		return errors.Join(base, killErr)
+	}
+	return base
+}
+
+// ensureConfirmedDeadBeforeTerminal drains the containment handle when the
+// leader has exited but descendants may still be runnable. Terminal status is
+// not published until ConfirmedDead for owned handles (#574/#578).
+func (x *execution) ensureConfirmedDeadBeforeTerminal() error {
+	if x == nil || x.handle == nil {
+		return nil
+	}
+	if x.handle.ConfirmedDead() {
+		return nil
+	}
+	grace := x.gracefulShutdown
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+	defer cancel()
+	if err := x.handle.Drain(ctx); err != nil && !x.handle.ConfirmedDead() {
+		return err
+	}
+	if !x.handle.ConfirmedDead() {
+		return processcontainment.ErrNotConfirmedDead
+	}
+	return nil
 }
 
 func (x *execution) currentStatus() string {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	return x.status
+}
+
+// liveObservationStatus maps in-memory lifecycle status to a non-terminal
+// durable observation for mid-life heartbeat/output writes. Terminal values
+// stay in memory for finalStatus/persistFinal after containment is confirmed
+// dead; publishing them early would freeze the durable row while the process
+// group can still be live.
+func (x *execution) liveObservationStatus() string {
+	status := x.currentStatus()
+	if !storage.IsTerminalAgentExecutionStatus(status) {
+		if status == "" {
+			return "running"
+		}
+		return status
+	}
+	switch status {
+	case "timeout", "killed":
+		return "cancelling"
+	default:
+		return "running"
+	}
 }
 
 func (x *execution) setStatus(status string) {
@@ -1424,6 +2101,8 @@ func resolveCommand(cfg ExecutorConfig) string {
 		return "claude"
 	case config.AgentVendorCursorCLI:
 		return "agent"
+	case config.AgentVendorGrokBuild:
+		return "grok"
 	default:
 		return string(cfg.Vendor)
 	}
@@ -1440,6 +2119,8 @@ func resolveArgs(cfg ExecutorConfig, workingDirectory string, prompt string) []s
 		return resolveOpenCodeArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	case config.AgentVendorCursorCLI:
 		return resolveCursorArgs(cfg, resolvedArgs, prompt)
+	case config.AgentVendorGrokBuild:
+		return resolveGrokArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	default:
 		return append([]string{}, resolvedArgs...)
 	}
@@ -1512,6 +2193,29 @@ func resolveCursorArgs(cfg ExecutorConfig, args []string, prompt string) []strin
 	return append(resolved, "--print", prompt)
 }
 
+func resolveGrokArgs(cfg ExecutorConfig, args []string, workingDirectory string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"-m", "--model"})
+	if !hasAnyFlag(resolved, []string{"-p", "--single"}) {
+		resolved = append(resolved, "-p", prompt)
+	}
+	if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--cwd"}) {
+		resolved = append(resolved, "--cwd", workingDirectory)
+	}
+	if !hasAnyFlag(resolved, []string{"--output-format"}) {
+		resolved = append(resolved, "--output-format", "plain")
+	}
+	if !hasAnyFlag(resolved, []string{"--always-approve", "--yolo", "--dangerously-skip-permissions", "--permission-mode"}) {
+		resolved = append(resolved, "--always-approve")
+	}
+	if !hasAnyFlag(resolved, []string{"--sandbox"}) {
+		resolved = append(resolved, "--sandbox", "off")
+	}
+	if !hasAnyFlag(resolved, []string{"--no-auto-update"}) {
+		resolved = append(resolved, "--no-auto-update")
+	}
+	return resolved
+}
+
 func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args []string, sessionID string, prompt string) []string {
 	switch cfg.Vendor {
 	case config.AgentVendorClaudeCode:
@@ -1570,10 +2274,27 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args [
 }
 
 func buildCommandEnv(workingDirectory string, prompt string, envSources ...map[string]string) []string {
-	envMap := envSliceToMap(os.Environ())
+	inherited := envSliceToMap(os.Environ())
+	envMap := make(map[string]string, len(inheritedAgentEnvKeys))
+	for _, key := range inheritedAgentEnvKeys {
+		if value, ok := inherited[key]; ok {
+			envMap[key] = value
+		}
+	}
+	for key, value := range inherited {
+		if strings.HasPrefix(key, "LC_") {
+			envMap[key] = value
+		}
+	}
+	// Never expose the trusted-env file path to agent processes. Provider tokens
+	// for `looper review submit` stay on the daemon-side trusted review proxy;
+	// agents may only receive TrustedReviewSockEnv (a non-secret capability path).
+	delete(envMap, forge.TrustedEnvFileEnv)
 	for _, source := range envSources {
 		maps.Copy(envMap, source)
 	}
+	// Re-delete after source merge so caller env maps cannot reintroduce it.
+	delete(envMap, forge.TrustedEnvFileEnv)
 	for _, key := range unsafeAgentEnvKeys {
 		delete(envMap, key)
 	}
@@ -2148,6 +2869,7 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 	if e.repos == nil || e.repos.Events == nil {
 		return
 	}
+	vendor := string(e.effectiveConfig(input).Vendor)
 	_ = e.repos.Events.Append(context.Background(), storage.EventLogRecord{
 		ID:               eventlog.NewEventID("event"),
 		EventType:        eventType,
@@ -2157,8 +2879,8 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 		EntityType:       stringPtr("agent_execution"),
 		EntityID:         &executionID,
 		ActorType:        stringPtr("agent"),
-		ActorID:          stringPtr(string(e.config.Vendor)),
-		ActorDisplayName: stringPtr(string(e.config.Vendor)),
+		ActorID:          stringPtr(vendor),
+		ActorDisplayName: stringPtr(vendor),
 		PayloadJSON:      mustJSON(payload),
 		CreatedAt:        createdAt,
 	})
@@ -2190,6 +2912,19 @@ func int64PtrIfPositive(value int64) *int64 {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+func (x *execution) leaderPID() int {
+	if x == nil {
+		return 0
+	}
+	if x.handle != nil {
+		return x.handle.PID()
+	}
+	if x.process != nil {
+		return pidOrZero(x.process.Process)
+	}
+	return 0
 }
 
 func pidOrZero(process *os.Process) int {

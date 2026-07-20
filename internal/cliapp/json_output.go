@@ -156,11 +156,15 @@ func (r *commandRuntime) projectList(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
+	repoPath := strings.TrimSpace(getStringFlag(cmd, "repo-path"))
+	if repoPath == "" && len(args) > 0 {
+		repoPath = strings.TrimSpace(args[0])
+	}
+	resolvedProvider, resolvedRepo, err := r.prepareProjectAddProvider(cmd, repoPath)
+	if err != nil {
+		return err
+	}
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
-		repoPath := strings.TrimSpace(getStringFlag(cmd, "repo-path"))
-		if repoPath == "" && len(args) > 0 {
-			repoPath = strings.TrimSpace(args[0])
-		}
 		repoPath, err := absolutePathIfSet(repoPath)
 		if err != nil {
 			return nil, fmt.Errorf("resolve repo path: %w", err)
@@ -177,7 +181,8 @@ func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
 		setString(body, "name", getStringFlag(cmd, "name"))
 		setString(body, "baseBranch", getStringFlag(cmd, "base-branch"))
 		setString(body, "worktreeRoot", worktreeRoot)
-		setString(body, "repo", getStringFlag(cmd, "repo"))
+		setString(body, "repo", resolvedRepo)
+		setString(body, "provider", resolvedProvider)
 		setString(body, "snapshotMode", getStringFlag(cmd, "snapshot-mode"))
 
 		return r.postJSON(ctx, "/api/v1/projects", body)
@@ -302,14 +307,14 @@ func (r *commandRuntime) loopRetry(cmd *cobra.Command, args []string) error {
 		if getBoolFlag(cmd, "discard-worktree-changes") && !getBoolFlag(cmd, "confirm") {
 			return nil, fmt.Errorf("--discard-worktree-changes requires --confirm")
 		}
-		if getBoolFlag(cmd, "discard-worktree-changes") {
-			return nil, fmt.Errorf("--discard-worktree-changes is not supported yet; fix or reset the worktree manually, then retry without this flag")
-		}
 		mode := strings.TrimSpace(getStringFlag(cmd, "mode"))
 		if mode == "" {
 			mode = "auto"
 		}
 		body := map[string]any{"mode": mode, "resetAttempts": true}
+		if getBoolFlag(cmd, "discard-worktree-changes") {
+			body["discardWorktreeChanges"] = true
+		}
 		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(selector)+"/retry", body)
 	}, writeHumanLoopRetried)
 }
@@ -337,7 +342,7 @@ func (r *commandRuntime) pullRequestShow(cmd *cobra.Command, args []string) erro
 		if err != nil {
 			return nil, err
 		}
-		return r.getJSON(ctx, pullRequestPath(repo, prNumber))
+		return r.getJSON(ctx, withProjectQuery(pullRequestPath(repo, prNumber), getStringFlag(cmd, "project")))
 	}, writeHumanPullRequestShow)
 }
 
@@ -347,7 +352,7 @@ func (r *commandRuntime) pullRequestStatus(cmd *cobra.Command, args []string) er
 		if err != nil {
 			return nil, err
 		}
-		return r.getJSON(ctx, pullRequestPath(repo, prNumber)+"/status")
+		return r.getJSON(ctx, withProjectQuery(pullRequestPath(repo, prNumber)+"/status", getStringFlag(cmd, "project")))
 	}, writeHumanPullRequestStatus)
 }
 
@@ -401,6 +406,7 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 			"prNumber":   prNumber,
 			"status":     "running",
 			"metadata":   metadata,
+			"force":      getBoolFlag(cmd, "force"),
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops", body)
@@ -450,6 +456,7 @@ func (r *commandRuntime) fixCreate(cmd *cobra.Command, args []string) error {
 			"repo":       repo,
 			"prNumber":   prNumber,
 			"status":     "running",
+			"force":      getBoolFlag(cmd, "force"),
 			"metadata": map[string]any{
 				"manual":        true,
 				"followUpdates": loopEnabled,
@@ -563,10 +570,12 @@ func (r *commandRuntime) stopLoop(cmd *cobra.Command, args []string) error {
 		} else if err := writeHumanStopAll(cmd.OutOrStdout(), payload); err != nil {
 			return err
 		}
-		if failed, err := stopAllFailedCount(payload); err != nil {
+		if failed, pausedOnly, err := stopAllResultCounts(payload); err != nil {
 			return err
 		} else if failed > 0 {
 			return fmt.Errorf("failed to stop %d running task(s)", failed)
+		} else if pausedOnly > 0 {
+			return fmt.Errorf("paused %d task(s) without signaling a verified process", pausedOnly)
 		}
 		return nil
 	}
@@ -585,16 +594,17 @@ func (r *commandRuntime) closeLoop(cmd *cobra.Command, args []string) error {
 	}, writeHumanCloseLoop)
 }
 
-func stopAllFailedCount(payload json.RawMessage) (int, error) {
+func stopAllResultCounts(payload json.RawMessage) (int, int, error) {
 	var data struct {
 		Summary struct {
-			Failed int `json:"failed"`
+			Failed     int `json:"failed"`
+			PausedOnly int `json:"pausedOnly"`
 		} `json:"summary"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
-		return 0, fmt.Errorf("decode stop-all response: %w", err)
+		return 0, 0, fmt.Errorf("decode stop-all response: %w", err)
 	}
-	return data.Summary.Failed, nil
+	return data.Summary.Failed, data.Summary.PausedOnly, nil
 }
 
 func (r *commandRuntime) runList(cmd *cobra.Command, args []string) error {
@@ -660,6 +670,7 @@ func (r *commandRuntime) workCreate(cmd *cobra.Command, args []string) error {
 		}
 
 		setString(body, "projectId", resolvedProjectID)
+		body["force"] = getBoolFlag(cmd, "force")
 
 		if issueNumberValue != "" && strings.TrimSpace(getStringFlag(cmd, "title")) != "" {
 			setString(body, "title", getStringFlag(cmd, "title"))
@@ -694,6 +705,7 @@ func (r *commandRuntime) planCreate(cmd *cobra.Command, args []string) error {
 		}
 
 		setString(body, "projectId", resolvedProjectID)
+		body["force"] = getBoolFlag(cmd, "force")
 
 		return r.postJSON(ctx, "/api/v1/planners", body)
 	}, writeHumanPlannerCreate)
@@ -774,6 +786,16 @@ func writeJSON(w io.Writer, payload any) error {
 
 func pullRequestPath(repo string, prNumber int64) string {
 	return "/api/v1/pull-requests/" + url.PathEscape(repo) + "/" + strconv.FormatInt(prNumber, 10)
+}
+
+func withProjectQuery(path, projectID string) string {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return path
+	}
+	query := url.Values{}
+	query.Set("projectId", projectID)
+	return path + "?" + query.Encode()
 }
 
 type activeRunDetailOutput struct {

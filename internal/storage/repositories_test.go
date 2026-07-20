@@ -13,6 +13,151 @@ import (
 	"time"
 )
 
+func TestAgentExecutionTerminalObservationCannotRegressToActive(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-16T12:00:00.000Z"
+	endedAt := "2026-07-16T12:01:00.000Z"
+	terminal := AgentExecutionRecord{
+		ID: "agent_terminal_monotonic", Vendor: "codex", Status: "completed",
+		StartedAt: startedAt, EndedAt: &endedAt, CreatedAt: startedAt, UpdatedAt: endedAt,
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, terminal); err != nil {
+		t.Fatalf("Upsert(terminal) error = %v", err)
+	}
+
+	staleLive := terminal
+	staleLive.Status = "running"
+	staleLive.EndedAt = nil
+	staleLive.UpdatedAt = startedAt
+	err := repos.AgentExecutions.Upsert(ctx, staleLive)
+	if !errors.Is(err, ErrAgentExecutionConflict) {
+		t.Fatalf("Upsert(stale live) error = %v, want ErrAgentExecutionConflict", err)
+	}
+
+	got, err := repos.AgentExecutions.GetByID(ctx, terminal.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.Status != "completed" || got.EndedAt == nil {
+		t.Fatalf("execution = %#v, want completed terminal observation", got)
+	}
+}
+
+func TestAgentExecutionTerminalToDifferentTerminalIsConflict(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-16T12:00:00.000Z"
+	endedAt := "2026-07-16T12:01:00.000Z"
+	terminal := AgentExecutionRecord{
+		ID: "agent_terminal_to_terminal", Vendor: "codex", Status: "completed",
+		StartedAt: startedAt, EndedAt: &endedAt, CreatedAt: startedAt, UpdatedAt: endedAt,
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, terminal); err != nil {
+		t.Fatalf("Upsert(completed) error = %v", err)
+	}
+
+	otherTerminal := terminal
+	otherTerminal.Status = "killed"
+	otherTerminal.UpdatedAt = "2026-07-16T12:02:00.000Z"
+	err := repos.AgentExecutions.Upsert(ctx, otherTerminal)
+	if !errors.Is(err, ErrAgentExecutionConflict) {
+		t.Fatalf("Upsert(killed over completed) error = %v, want ErrAgentExecutionConflict", err)
+	}
+
+	got, err := repos.AgentExecutions.GetByID(ctx, terminal.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.Status != "completed" {
+		t.Fatalf("status = %q, want completed (first terminal wins)", got.Status)
+	}
+}
+
+func TestAgentExecutionSameTerminalFieldEnrichmentAllowed(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-16T12:00:00.000Z"
+	endedAt := "2026-07-16T12:01:00.000Z"
+	terminal := AgentExecutionRecord{
+		ID: "agent_terminal_enrich", Vendor: "codex", Status: "completed",
+		StartedAt: startedAt, EndedAt: &endedAt, CreatedAt: startedAt, UpdatedAt: endedAt,
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, terminal); err != nil {
+		t.Fatalf("Upsert(completed) error = %v", err)
+	}
+
+	enriched := terminal
+	resumeStatus := "failed"
+	resumeErr := "native resume unavailable"
+	enriched.NativeResumeStatus = &resumeStatus
+	enriched.NativeResumeError = &resumeErr
+	enriched.UpdatedAt = "2026-07-16T12:02:00.000Z"
+	if err := repos.AgentExecutions.Upsert(ctx, enriched); err != nil {
+		t.Fatalf("Upsert(same terminal enrichment) error = %v", err)
+	}
+
+	got, err := repos.AgentExecutions.GetByID(ctx, terminal.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.Status != "completed" {
+		t.Fatalf("status = %#v, want completed", got)
+	}
+	if got.NativeResumeStatus == nil || *got.NativeResumeStatus != "failed" {
+		t.Fatalf("NativeResumeStatus = %#v, want failed", got.NativeResumeStatus)
+	}
+}
+
+func TestAgentExecutionActiveToTerminalAndCancellingAllowed(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-16T12:00:00.000Z"
+	live := AgentExecutionRecord{
+		ID: "agent_active_transitions", Vendor: "codex", Status: "running",
+		StartedAt: startedAt, CreatedAt: startedAt, UpdatedAt: startedAt,
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, live); err != nil {
+		t.Fatalf("Upsert(running) error = %v", err)
+	}
+
+	cancelling := live
+	cancelling.Status = "cancelling"
+	cancelling.UpdatedAt = "2026-07-16T12:00:30.000Z"
+	if err := repos.AgentExecutions.Upsert(ctx, cancelling); err != nil {
+		t.Fatalf("Upsert(cancelling) error = %v", err)
+	}
+
+	endedAt := "2026-07-16T12:01:00.000Z"
+	killed := cancelling
+	killed.Status = "killed"
+	killed.EndedAt = &endedAt
+	killed.UpdatedAt = endedAt
+	if err := repos.AgentExecutions.Upsert(ctx, killed); err != nil {
+		t.Fatalf("Upsert(killed) error = %v", err)
+	}
+
+	got, err := repos.AgentExecutions.GetByID(ctx, live.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.Status != "killed" {
+		t.Fatalf("status = %#v, want killed", got)
+	}
+}
+
 func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -308,7 +453,6 @@ func TestLoopsGetByTargetIDResolvesPRToWorkerLoop(t *testing.T) {
 	coordinator := openMigratedCoordinatorForRepositories(t)
 	ctx := context.Background()
 	repos := NewRepositories(coordinator.DB())
-
 	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -394,6 +538,78 @@ func TestFeishuThreadsRootByTaskSharesOneCardAcrossLoops(t *testing.T) {
 	if root, err := repos.FeishuThreads.RootByLoop(ctx, "loop_pr"); err != nil || root != "om_root_pr" {
 		t.Fatalf("RootByLoop(loop_pr) = %q, %v; want om_root_pr", root, err)
 	}
+}
+
+func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	const repo = "acme/looper"
+	const prNumber int64 = 42
+
+	for _, projectID := range []string{"github", "forgejo", "unrelated"} {
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{
+			ID:        projectID,
+			Name:      projectID,
+			RepoPath:  "/tmp/" + projectID,
+			CreatedAt: "2026-07-13T09:00:00.000Z",
+			UpdatedAt: "2026-07-13T09:00:00.000Z",
+		}); err != nil {
+			t.Fatalf("Projects.Upsert(%q) error = %v", projectID, err)
+		}
+	}
+
+	snapshots := []PullRequestSnapshotRecord{
+		{ID: "github-old", ProjectID: "github", Repo: repo, PRNumber: prNumber, HeadSHA: "github-old", CapturedAt: "2026-07-13T09:00:00.000Z", CreatedAt: "2026-07-13T09:00:00.000Z"},
+		{ID: "github-new", ProjectID: "github", Repo: repo, PRNumber: prNumber, HeadSHA: "github-new", CapturedAt: "2026-07-13T10:00:00.000Z", CreatedAt: "2026-07-13T10:00:00.000Z"},
+		{ID: "forgejo-new", ProjectID: "forgejo", Repo: repo, PRNumber: prNumber, HeadSHA: "forgejo-new", CapturedAt: "2026-07-13T11:00:00.000Z", CreatedAt: "2026-07-13T11:00:00.000Z"},
+		{ID: "other-pr", ProjectID: "unrelated", Repo: repo, PRNumber: 99, HeadSHA: "other-pr", CapturedAt: "2026-07-13T12:00:00.000Z", CreatedAt: "2026-07-13T12:00:00.000Z"},
+		{ID: "other-repo", ProjectID: "unrelated", Repo: "acme/other", PRNumber: prNumber, HeadSHA: "other-repo", CapturedAt: "2026-07-13T13:00:00.000Z", CreatedAt: "2026-07-13T13:00:00.000Z"},
+	}
+	for _, snapshot := range snapshots {
+		if err := repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
+			t.Fatalf("PullRequestSnapshots.Upsert(%q) error = %v", snapshot.ID, err)
+		}
+	}
+
+	gotSnapshots, err := repos.PullRequestSnapshots.ListLatestByRepoAndPR(ctx, "Acme/Looper", prNumber)
+	if err != nil {
+		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() error = %v", err)
+	}
+	if got := snapshotIDs(gotSnapshots); !reflect.DeepEqual(got, []string{"forgejo-new", "github-new"}) {
+		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() IDs = %v, want [forgejo-new github-new]", got)
+	}
+
+	matchingRepo := "Acme/Looper"
+	matchingPR := prNumber
+	otherPR := int64(99)
+	for _, loop := range []LoopRecord{
+		{ID: "github-loop", Seq: 1, ProjectID: "github", Type: "reviewer", TargetType: "pull_request", Repo: &matchingRepo, PRNumber: &matchingPR, Status: "idle", CreatedAt: "2026-07-13T09:00:00.000Z", UpdatedAt: "2026-07-13T09:00:00.000Z"},
+		{ID: "other-loop", Seq: 2, ProjectID: "unrelated", Type: "reviewer", TargetType: "pull_request", Repo: &matchingRepo, PRNumber: &otherPR, Status: "idle", CreatedAt: "2026-07-13T09:00:00.000Z", UpdatedAt: "2026-07-13T09:00:00.000Z"},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%q) error = %v", loop.ID, err)
+		}
+	}
+
+	gotLoops, err := repos.Loops.ListByRepoAndPR(ctx, repo, prNumber)
+	if err != nil {
+		t.Fatalf("Loops.ListByRepoAndPR() error = %v", err)
+	}
+	if len(gotLoops) != 1 || gotLoops[0].ID != "github-loop" {
+		t.Fatalf("Loops.ListByRepoAndPR() = %#v, want github-loop", gotLoops)
+	}
+}
+
+func snapshotIDs(records []PullRequestSnapshotRecord) []string {
+	ids := make([]string, 0, len(records))
+	for _, record := range records {
+		ids = append(ids, record.ID)
+	}
+	return ids
 }
 
 func TestRepositoriesStatusAggregates(t *testing.T) {
@@ -1441,6 +1657,46 @@ func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 		t.Fatalf("Queue.GetByID(qi_retry) after markRetry = %#v, want queued attempts=2 unclaimed", gotRetry)
 	}
 
+	// MarkRetryIfRunning must not resurrect a terminal cancellation.
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID:          "qi_retry_cancelled",
+		LoopID:      &loopID,
+		Type:        "planner",
+		TargetType:  "project",
+		TargetID:    "project_tr",
+		DedupeKey:   "d_retry_cancelled",
+		Priority:    1,
+		Status:      "cancelled",
+		AvailableAt: now,
+		Attempts:    1,
+		MaxAttempts: 3,
+		CreatedAt:   now,
+		UpdatedAt:   claimedAt,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(qi_retry_cancelled) error = %v", err)
+	}
+	if err := repos.Queue.MarkRetryIfRunning(ctx, QueueMarkRetryInput{ID: "qi_retry_cancelled", AvailableAt: retryAt, Attempts: 2, ErrorMessage: &errMsg, ErrorKind: "retryable_transient", UpdatedAt: retryAt}); err != nil {
+		t.Fatalf("Queue.MarkRetryIfRunning(cancelled) error = %v", err)
+	}
+	gotCancelled, err := repos.Queue.GetByID(ctx, "qi_retry_cancelled")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(qi_retry_cancelled) error = %v", err)
+	}
+	if gotCancelled == nil || gotCancelled.Status != "cancelled" {
+		t.Fatalf("Queue.MarkRetryIfRunning on cancelled = %#v, want status still cancelled (zero-row no-op)", gotCancelled)
+	}
+	// Unrestricted MarkRetry remains runner authority: may requeue after mid-run pause cancel.
+	if err := repos.Queue.MarkRetry(ctx, QueueMarkRetryInput{ID: "qi_retry_cancelled", AvailableAt: retryAt, Attempts: 2, ErrorMessage: &errMsg, ErrorKind: "retryable_transient", UpdatedAt: retryAt}); err != nil {
+		t.Fatalf("Queue.MarkRetry(cancelled) error = %v", err)
+	}
+	gotResurrected, err := repos.Queue.GetByID(ctx, "qi_retry_cancelled")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(qi_retry_cancelled) after MarkRetry error = %v", err)
+	}
+	if gotResurrected == nil || gotResurrected.Status != "queued" || gotResurrected.Attempts != 2 {
+		t.Fatalf("Queue.MarkRetry on cancelled = %#v, want queued attempts=2", gotResurrected)
+	}
+
 	finished := "2026-04-11T12:06:00.000Z"
 	if err := repos.Queue.Complete(ctx, "qi_retry", finished); err != nil {
 		t.Fatalf("Queue.Complete() error = %v", err)
@@ -1618,6 +1874,24 @@ func TestTargetedListRepositories(t *testing.T) {
 	sort.Strings(latestQueueIDs)
 	if want := []string{"queue_manual", "queue_queued"}; !reflect.DeepEqual(latestQueueIDs, want) {
 		t.Fatalf("Queue.ListLatestByLoopStatuses() ids = %#v, want %#v", latestQueueIDs, want)
+	}
+
+	latestQueueByIDs, err := repos.Queue.ListLatestByLoopIDs(ctx, []string{loopManual, loopDone, loopQueued})
+	if err != nil {
+		t.Fatalf("Queue.ListLatestByLoopIDs() error = %v", err)
+	}
+	if len(latestQueueByIDs) != 3 {
+		t.Fatalf("len(Queue.ListLatestByLoopIDs()) = %d, want 3", len(latestQueueByIDs))
+	}
+	latestByLoop := map[string]string{}
+	for _, item := range latestQueueByIDs {
+		if item.LoopID == nil {
+			t.Fatalf("Queue.ListLatestByLoopIDs() item missing loop id: %#v", item)
+		}
+		latestByLoop[*item.LoopID] = item.ID
+	}
+	if latestByLoop[loopManual] != "queue_manual" || latestByLoop[loopQueued] != "queue_queued" || latestByLoop[loopDone] != "queue_done" {
+		t.Fatalf("Queue.ListLatestByLoopIDs() by loop = %#v, want latest ids per loop", latestByLoop)
 	}
 
 	latestRuns, err := repos.Runs.ListLatestByLoopIDs(ctx, []string{loopManual, loopDone})
@@ -1871,6 +2145,158 @@ func TestQueueClaimNextSkipsArchivedProjects(t *testing.T) {
 	}
 }
 
+func TestQueueClaimNextRefusesAlreadyCancelledContextWithoutMutating(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-19T12:00:00.000Z"
+	projectID := "project_claim_cancel"
+	loopID := "loop_claim_cancel"
+	queueID := "queue_claim_cancel"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "ClaimCancel", RepoPath: "/tmp/claim-cancel", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:claim_cancel", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert: %v", err)
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	claimed, err := repos.Queue.ClaimNext(cancelCtx, now, "scheduler")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ClaimNext error = %v, want context.Canceled", err)
+	}
+	if claimed != nil {
+		t.Fatalf("ClaimNext = %#v, want nil when context already cancelled", claimed)
+	}
+	got, err := repos.Queue.GetByID(ctx, queueID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got == nil || got.Status != "queued" {
+		t.Fatalf("queue item = %#v, want still queued (no durable claim)", got)
+	}
+
+	// Live context still claims successfully (detached path returns the row).
+	claimed, err = repos.Queue.ClaimNext(ctx, now, "scheduler")
+	if err != nil || claimed == nil || claimed.ID != queueID {
+		t.Fatalf("ClaimNext live = (%#v, %v), want %s", claimed, err, queueID)
+	}
+}
+
+func TestClaimCtxForDurableClaimPreservesDeadlineAndDetachesCancel(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Now().Add(150 * time.Millisecond)
+	parent, cancelParent := context.WithDeadline(context.Background(), deadline)
+	defer cancelParent()
+
+	claimCtx, stop, err := claimCtxForDurableClaim(parent)
+	if err != nil {
+		t.Fatalf("claimCtxForDurableClaim: %v", err)
+	}
+	defer stop()
+
+	gotDeadline, ok := claimCtx.Deadline()
+	if !ok {
+		t.Fatal("claim context must retain the caller deadline")
+	}
+	if !gotDeadline.Equal(deadline) {
+		t.Fatalf("deadline = %v, want %v", gotDeadline, deadline)
+	}
+
+	// Parent cancel must not cancel the claim context (committed-but-unscanned case).
+	cancelParent()
+	if err := claimCtx.Err(); err != nil {
+		t.Fatalf("claimCtx.Err after parent cancel = %v, want nil", err)
+	}
+
+	// Deadline must still fire on the detached claim context.
+	select {
+	case <-claimCtx.Done():
+		if !errors.Is(claimCtx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("claimCtx.Err = %v, want DeadlineExceeded", claimCtx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("claim context did not honor retained deadline")
+	}
+}
+
+func TestClaimCtxForDurableClaimNoDeadlineWithoutParentDeadline(t *testing.T) {
+	t.Parallel()
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	claimCtx, stop, err := claimCtxForDurableClaim(parent)
+	if err != nil {
+		t.Fatalf("claimCtxForDurableClaim: %v", err)
+	}
+	defer stop()
+	if _, ok := claimCtx.Deadline(); ok {
+		t.Fatal("claim context must not invent a deadline when parent has none")
+	}
+	cancelParent()
+	if err := claimCtx.Err(); err != nil {
+		t.Fatalf("claimCtx.Err after parent cancel = %v, want nil", err)
+	}
+}
+
+func TestQueueListRunningClaimedBy(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-19T12:00:00.000Z"
+	projectID := "project_list_claimed"
+	loopID := "loop_list_claimed"
+	claimedBy := "scheduler"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "ListClaimed", RepoPath: "/tmp/list-claimed", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+	for _, id := range []string{"qi_list_a", "qi_list_b"} {
+		if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+			ID: id, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+			DedupeKey: id, Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3,
+			ClaimedBy: &claimedBy, ClaimedAt: &now, StartedAt: &now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("Queue.Upsert(%s): %v", id, err)
+		}
+	}
+	// Different claimed_at must not match.
+	otherAt := "2026-07-19T11:00:00.000Z"
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID: "qi_list_other", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "qi_list_other", Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3,
+		ClaimedBy: &claimedBy, ClaimedAt: &otherAt, StartedAt: &otherAt, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(other): %v", err)
+	}
+
+	items, err := repos.Queue.ListRunningClaimedBy(ctx, claimedBy, now)
+	if err != nil {
+		t.Fatalf("ListRunningClaimedBy: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len = %d, want 2; items=%#v", len(items), items)
+	}
+	if items[0].ID != "qi_list_a" || items[1].ID != "qi_list_b" {
+		t.Fatalf("order = %s,%s want qi_list_a,qi_list_b", items[0].ID, items[1].ID)
+	}
+}
+
 func TestQueueStatsAndCleanupStaleQueued(t *testing.T) {
 	t.Parallel()
 
@@ -1938,6 +2364,174 @@ func TestQueueStatsAndCleanupStaleQueued(t *testing.T) {
 		if item == nil || item.Status != "cancelled" || item.LastErrorKind == nil || *item.LastErrorKind != "non_retryable" {
 			t.Fatalf("Queue.GetByID(%s) after cleanup = %#v, want cancelled non_retryable", id, item)
 		}
+	}
+}
+
+func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+
+	for _, project := range []ProjectRecord{
+		{ID: "project_a", Name: "A", RepoPath: "/tmp/a", CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "project_b", Name: "B", RepoPath: "/tmp/b", CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"},
+	} {
+		if err := repos.Projects.Upsert(ctx, project); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", project.ID, err)
+		}
+	}
+
+	// Distinct updated_at so ORDER BY updated_at DESC, seq DESC is deterministic.
+	loops := []LoopRecord{
+		{ID: "loop_1", Seq: 1, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:01.000Z", UpdatedAt: "2026-04-11T12:00:01.000Z"},
+		{ID: "loop_2", Seq: 2, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "paused", CreatedAt: "2026-04-11T12:00:02.000Z", UpdatedAt: "2026-04-11T12:00:02.000Z"},
+		{ID: "loop_3", Seq: 3, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:03.000Z", UpdatedAt: "2026-04-11T12:00:03.000Z"},
+		{ID: "loop_4", Seq: 4, ProjectID: "project_b", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:04.000Z", UpdatedAt: "2026-04-11T12:00:04.000Z"},
+		{ID: "loop_5", Seq: 5, ProjectID: "project_b", Type: "worker", TargetType: "project", Status: "failed", CreatedAt: "2026-04-11T12:00:05.000Z", UpdatedAt: "2026-04-11T12:00:05.000Z"},
+	}
+	for _, loop := range loops {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	all, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{})
+	if err != nil {
+		t.Fatalf("ListFiltered(unlimited) error = %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("ListFiltered(unlimited) len = %d, want 5", len(all))
+	}
+	if all[0].ID != "loop_5" || all[4].ID != "loop_1" {
+		t.Fatalf("ListFiltered(unlimited) order = %v, want newest-first", loopIDs(all))
+	}
+
+	total, err := repos.Loops.CountFiltered(ctx, ListLoopsOptions{})
+	if err != nil {
+		t.Fatalf("CountFiltered(all) error = %v", err)
+	}
+	if total != 5 {
+		t.Fatalf("CountFiltered(all) = %d, want 5", total)
+	}
+
+	page, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Limit: 2, Offset: 1})
+	if err != nil {
+		t.Fatalf("ListFiltered(limit/offset) error = %v", err)
+	}
+	if got := loopIDs(page); !reflect.DeepEqual(got, []string{"loop_4", "loop_3"}) {
+		t.Fatalf("ListFiltered(limit=2,offset=1) = %v, want [loop_4 loop_3]", got)
+	}
+
+	// Offset without limit must still skip rows (SQLite LIMIT -1 OFFSET n).
+	offsetOnly, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Offset: 2})
+	if err != nil {
+		t.Fatalf("ListFiltered(offset-only) error = %v", err)
+	}
+	if got := loopIDs(offsetOnly); !reflect.DeepEqual(got, []string{"loop_3", "loop_2", "loop_1"}) {
+		t.Fatalf("ListFiltered(offset=2) = %v, want [loop_3 loop_2 loop_1]", got)
+	}
+
+	running, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Status: "running"})
+	if err != nil {
+		t.Fatalf("ListFiltered(status) error = %v", err)
+	}
+	if got := loopIDs(running); !reflect.DeepEqual(got, []string{"loop_4", "loop_3", "loop_1"}) {
+		t.Fatalf("ListFiltered(status=running) = %v, want [loop_4 loop_3 loop_1]", got)
+	}
+	runningTotal, err := repos.Loops.CountFiltered(ctx, ListLoopsOptions{Status: "running"})
+	if err != nil {
+		t.Fatalf("CountFiltered(status) error = %v", err)
+	}
+	if runningTotal != 3 {
+		t.Fatalf("CountFiltered(status=running) = %d, want 3", runningTotal)
+	}
+
+	projectB, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{ProjectID: "project_b"})
+	if err != nil {
+		t.Fatalf("ListFiltered(projectId) error = %v", err)
+	}
+	if got := loopIDs(projectB); !reflect.DeepEqual(got, []string{"loop_5", "loop_4"}) {
+		t.Fatalf("ListFiltered(projectId=project_b) = %v, want [loop_5 loop_4]", got)
+	}
+
+	combined, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Status: "running", ProjectID: "project_a", Limit: 1, Offset: 0})
+	if err != nil {
+		t.Fatalf("ListFiltered(combined) error = %v", err)
+	}
+	if got := loopIDs(combined); !reflect.DeepEqual(got, []string{"loop_3"}) {
+		t.Fatalf("ListFiltered(status+project+limit) = %v, want [loop_3]", got)
+	}
+	combinedTotal, err := repos.Loops.CountFiltered(ctx, ListLoopsOptions{Status: "running", ProjectID: "project_a"})
+	if err != nil {
+		t.Fatalf("CountFiltered(combined) error = %v", err)
+	}
+	if combinedTotal != 2 {
+		t.Fatalf("CountFiltered(status+project) = %d, want 2", combinedTotal)
+	}
+}
+
+func loopIDs(items []LoopRecord) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+func TestRunsUpsertPreservesAgentSnapshotOnUpdate(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-18T12:00:00.000Z"
+	baseBranch := "main"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{
+		ID: "project_snapshot", Name: "Snapshot", RepoPath: "/tmp/snapshot", BaseBranch: &baseBranch,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{
+		ID: "loop_snapshot", Seq: 1, ProjectID: "project_snapshot", Type: "worker",
+		TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	snapshot := `{"vendor":"codex","model":"gpt-5","profileId":"fast"}`
+	if err := repos.Runs.Upsert(ctx, RunRecord{
+		ID: "run_snapshot", LoopID: "loop_snapshot", Status: "running",
+		StartedAt: now, CreatedAt: now, UpdatedAt: now, AgentSnapshotJSON: &snapshot,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(insert) error = %v", err)
+	}
+	got, err := repos.Runs.GetByID(ctx, "run_snapshot")
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.AgentSnapshotJSON == nil || *got.AgentSnapshotJSON != snapshot {
+		t.Fatalf("after insert AgentSnapshotJSON = %#v, want %q", got, snapshot)
+	}
+
+	// Subsequent upsert without snapshot must not clobber the insert-only column.
+	if err := repos.Runs.Upsert(ctx, RunRecord{
+		ID: "run_snapshot", LoopID: "loop_snapshot", Status: "success",
+		StartedAt: now, CreatedAt: now, UpdatedAt: now, Summary: strPtr("done"),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(update) error = %v", err)
+	}
+	got, err = repos.Runs.GetByID(ctx, "run_snapshot")
+	if err != nil {
+		t.Fatalf("GetByID() after update error = %v", err)
+	}
+	if got == nil || got.Status != "success" {
+		t.Fatalf("after update status = %#v, want success", got)
+	}
+	if got.AgentSnapshotJSON == nil || *got.AgentSnapshotJSON != snapshot {
+		t.Fatalf("after update AgentSnapshotJSON = %#v, want preserved %q", got.AgentSnapshotJSON, snapshot)
 	}
 }
 

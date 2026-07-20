@@ -420,6 +420,21 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "repository mismatch", http.StatusBadRequest)
 		return
 	}
+	// Work-producing deliveries must consult admission. The tunnel listener
+	// starts before MarkReady and remains up during BeginShutdown→Stop drain,
+	// so without this gate Forward can enqueue discovery while admission is
+	// starting/stopping/degraded.
+	if err := s.runtime.allowTunnelForward(); err != nil {
+		if s.runtime.logger != nil {
+			s.runtime.logger.Warn("webhook.tunnel.admission_refused", map[string]any{
+				"repo":        repo,
+				"delivery_id": r.Header.Get("X-GitHub-Delivery"),
+				"error":       err.Error(),
+			})
+		}
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	forwarder := s.runtime.currentForwarder()
 	if forwarder == nil {
 		http.Error(w, "webhook forwarder unavailable", http.StatusServiceUnavailable)
@@ -427,7 +442,13 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Post-gate admission refusal (race after allowTunnelForward) is temporary
+		// unavailability; do not treat as an invalid delivery (400).
+		status := http.StatusBadRequest
+		if errors.Is(err, webhookforward.ErrAdmissionRefused) {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	if strings.EqualFold(result.Status, "accepted") || result.WorkItems > 0 {
@@ -442,6 +463,15 @@ func (w *webhookRuntime) currentForwarder() WebhookForwarder {
 		return nil
 	}
 	return w.forwarder()
+}
+
+// allowTunnelForward is the atomic admission gate for tunnel Forward.
+// Nil allowForward keeps open behavior for isolated unit tests.
+func (w *webhookRuntime) allowTunnelForward() error {
+	if w == nil || w.allowForward == nil {
+		return nil
+	}
+	return w.allowForward()
 }
 
 func (w *webhookRuntime) currentTunnelStore() *storage.WebhookTunnelHooksRepository {
@@ -505,14 +535,14 @@ func (w *webhookRuntime) updateTunnelDegradedReasons(states []WebhookTunnelState
 	}
 }
 
-func (w *webhookRuntime) configuredWebhookReposForMode(projects []storage.ProjectRecord, mode config.WebhookMode) []string {
+func configuredWebhookReposForMode(cfg config.Config, mode config.WebhookMode) []string {
 	seen := map[string]struct{}{}
-	repos := make([]string, 0, len(projects))
-	for _, project := range projects {
-		if project.Archived || w.webhookModeForProject(project.ID) != mode {
+	repos := make([]string, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		if config.ResolvedProjectProviderKind(cfg, project) == config.ProviderKindForgejo || webhookModeForProject(cfg, project.ID) != mode {
 			continue
 		}
-		repo := repoFromProjectMetadata(project.MetadataJSON)
+		repo := strings.TrimSpace(project.Repo)
 		if repo == "" {
 			continue
 		}
@@ -526,9 +556,9 @@ func (w *webhookRuntime) configuredWebhookReposForMode(projects []storage.Projec
 	return repos
 }
 
-func (w *webhookRuntime) webhookModeForProject(projectID string) config.WebhookMode {
-	mode := w.cfg.Webhook.Mode
-	for _, project := range w.cfg.Projects {
+func webhookModeForProject(cfg config.Config, projectID string) config.WebhookMode {
+	mode := cfg.Webhook.Mode
+	for _, project := range cfg.Projects {
 		if project.ID == projectID && project.Webhook.Mode != "" {
 			mode = project.Webhook.Mode
 			break

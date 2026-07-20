@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +40,162 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 	if result.Project.MetadataJSON == nil || *result.Project.MetadataJSON != `{"repo":null,"worktreeRoot":null,"source":"api"}` {
 		t.Fatalf("AddProject().Project.MetadataJSON = %v, want api metadata", result.Project.MetadataJSON)
+	}
+}
+
+func TestServiceAddForgejoProjectActivatesProviderBinding(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	tokenEnv := "LOOPER_FORGEJO_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
+	catalog := NewCatalog(cfg)
+	service := &Service{
+		DB:           coordinator.DB(),
+		Repos:        repos,
+		Config:       cfg,
+		ConfigSource: catalog,
+		Now:          time.Now,
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{Repo: "core/odcrew", Provider: "forgejo-main"}, nil
+		},
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			t.Fatal("ListOpenPullRequests should not run for a Forgejo project")
+			return nil, nil
+		},
+		PublishProjects: catalog.Publish,
+	}
+
+	result, err := service.AddProject(context.Background(), AddInput{
+		ID: "odcrew", Name: "odcrew", RepoPath: "/tmp/odcrew", BaseBranch: "main", Provider: stringPointer("forgejo-main"),
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.Provider == nil || *result.Provider != "forgejo-main" {
+		t.Fatalf("AddProject().Provider = %v, want forgejo-main", result.Provider)
+	}
+	metadata := parseMetadata(result.Project.MetadataJSON)
+	if metadataString(metadata, "provider") != "forgejo-main" || metadataString(metadata, "repo") != "core/odcrew" {
+		t.Fatalf("metadata = %v, want persisted provider binding", result.Project.MetadataJSON)
+	}
+	if _, ok := metadata["roles"]; !ok {
+		t.Fatalf("metadata = %v, want persisted Forgejo role profile", result.Project.MetadataJSON)
+	}
+	snapshot := catalog.Snapshot()
+	if len(snapshot.Projects) != 1 || snapshot.Projects[0].Provider != "forgejo-main" || snapshot.Projects[0].Repo != "core/odcrew" {
+		t.Fatalf("catalog projects = %#v, want published Forgejo binding", snapshot.Projects)
+	}
+	triggers := snapshot.Projects[0].Roles.Reviewer.Discovery.Triggers
+	if triggers.RequireReviewRequest != nil || triggers.Labels != nil {
+		t.Fatalf("catalog reviewer triggers = %#v, want inherited native Forgejo review-request profile", triggers)
+	}
+}
+
+func TestServiceConcurrentAddsPublishCommittedCatalog(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	firstPublishStarted := make(chan struct{})
+	releaseFirstPublish := make(chan struct{})
+	var publishMu sync.Mutex
+	var published []config.ProjectRefConfig
+	publishCount := 0
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   time.Now,
+		PublishProjects: func(projects []config.ProjectRefConfig) {
+			publishMu.Lock()
+			publishCount++
+			count := publishCount
+			published = append([]config.ProjectRefConfig(nil), projects...)
+			publishMu.Unlock()
+			if count == 1 {
+				close(firstPublishStarted)
+				<-releaseFirstPublish
+			}
+		},
+	}
+
+	errorsCh := make(chan error, 2)
+	go func() {
+		_, err := service.AddProject(ctx, AddInput{ID: "a", Name: "A", RepoPath: "/tmp/a", BaseBranch: "main"})
+		errorsCh <- err
+	}()
+	<-firstPublishStarted
+	go func() {
+		_, err := service.AddProject(ctx, AddInput{ID: "b", Name: "B", RepoPath: "/tmp/b", BaseBranch: "main"})
+		errorsCh <- err
+	}()
+
+	close(releaseFirstPublish)
+	for range 2 {
+		if err := <-errorsCh; err != nil {
+			t.Fatalf("AddProject() error = %v", err)
+		}
+	}
+
+	publishMu.Lock()
+	got := append([]config.ProjectRefConfig(nil), published...)
+	publishMu.Unlock()
+	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
+		t.Fatalf("last published projects = %#v, want a and b", got)
+	}
+	stored, err := service.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("len(List()) = %d, want 2", len(stored))
+	}
+}
+
+func TestServiceProjectPostPublicationRunsOutsideConfigBoundary(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	boundary := &sync.RWMutex{}
+	publishCount := 0
+	afterPublishCount := 0
+	service := &Service{
+		DB:             coordinator.DB(),
+		Repos:          repos,
+		ConfigBoundary: boundary,
+		Now:            time.Now,
+		PublishProjects: func([]config.ProjectRefConfig) {
+			publishCount++
+			if boundary.TryLock() {
+				boundary.Unlock()
+				t.Fatal("PublishProjects ran without ConfigBoundary held")
+			}
+		},
+		AfterPublishProjects: func() {
+			afterPublishCount++
+			if !boundary.TryLock() {
+				t.Fatal("AfterPublishProjects ran while ConfigBoundary was held")
+			}
+			boundary.Unlock()
+		},
+	}
+
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main"}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if _, err := service.RemoveProject(ctx, "looper"); err != nil {
+		t.Fatalf("RemoveProject() error = %v", err)
+	}
+	if publishCount != 2 || afterPublishCount != 2 {
+		t.Fatalf("publication callbacks = (%d, %d), want (2, 2)", publishCount, afterPublishCount)
 	}
 }
 
@@ -83,7 +240,7 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 		DB:         coordinator.DB(),
 		Repos:      repos,
 		Now:        func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) { return "nexu-io/looper", nil },
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) { return DetectedRepo{Repo: "nexu-io/looper"}, nil },
 		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
 			return []WorktreeListEntry{{Path: "/tmp/looper", Branch: "main", HeadSHA: "abc123"}, {Path: "/tmp/looper-pr-1", Branch: "pr-1", HeadSHA: "def456"}}, nil
 		},
@@ -490,8 +647,8 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 	service := &Service{
 		Repos: repos,
 		Now:   func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) {
-			return "nexu-io/looper", nil
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{Repo: "nexu-io/looper"}, nil
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -529,8 +686,8 @@ func TestServiceSyncConfiguredPreservesRepoMetadataWhenDetectionReturnsEmpty(t *
 	service := &Service{
 		Repos: repos,
 		Now:   func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) {
-			return "", nil
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{}, nil
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -568,8 +725,8 @@ func TestServiceSyncConfiguredLeavesRepoMetadataNilWhenDetectionReturnsEmptyWith
 	service := &Service{
 		Repos: repos,
 		Now:   func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) {
-			return "", nil
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{}, nil
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -607,8 +764,8 @@ func TestServiceSyncConfiguredPreservesRepoMetadataWhenDetectionFails(t *testing
 	service := &Service{
 		Repos: repos,
 		Now:   func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) {
-			return "", errors.New("git unavailable")
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{}, errors.New("git unavailable")
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -665,6 +822,110 @@ func TestServiceSyncConfiguredDoesNotDeleteUnlistedProjects(t *testing.T) {
 	}
 	if other == nil || other.Name != "Other" {
 		t.Fatalf("other = %#v, want configured project upserted", other)
+	}
+}
+
+func TestServiceSyncConfiguredArchivesConfigProjectsRemovedFromConfig(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 12, 10, 0, 0, 0, time.UTC)
+	createdAt := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	configMetadata := `{"repo":"nexu-io/removed","source":"config"}`
+	apiMetadata := `{"repo":"nexu-io/api","source":"api"}`
+	baseBranch := "main"
+	for _, project := range []storage.ProjectRecord{
+		{ID: "removed", Name: "Removed", RepoPath: "/tmp/removed", BaseBranch: &baseBranch, MetadataJSON: &configMetadata, CreatedAt: createdAt, UpdatedAt: createdAt},
+		{ID: "api-project", Name: "API", RepoPath: "/tmp/api", BaseBranch: &baseBranch, MetadataJSON: &apiMetadata, CreatedAt: createdAt, UpdatedAt: createdAt},
+	} {
+		if err := repos.Projects.Upsert(context.Background(), project); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", project.ID, err)
+		}
+	}
+	targetID := "pr:nexu-io/removed:531"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_removed", Seq: 1, ProjectID: "removed", Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &targetID, Status: string(domain.LoopStatusQueued), CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_removed", ProjectID: stringPointer("removed"), LoopID: stringPointer("loop_removed"), Type: "reviewer", TargetType: "pull_request", TargetID: targetID, DedupeKey: "reviewer:removed:loop_removed", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: createdAt, MaxAttempts: 3, CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Projects = nil
+
+	if err := service.SyncConfigured(context.Background(), cfg, now); err != nil {
+		t.Fatalf("SyncConfigured() error = %v", err)
+	}
+	removed, err := repos.Projects.GetByID(context.Background(), "removed")
+	if err != nil {
+		t.Fatalf("Projects.GetByID(removed) error = %v", err)
+	}
+	if removed == nil || !removed.Archived || removed.UpdatedAt != currentISO(func() time.Time { return now }) {
+		t.Fatalf("removed = %#v, want archived config project at import time", removed)
+	}
+	removedLoop, err := repos.Loops.GetByID(context.Background(), "loop_removed")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if removedLoop == nil || removedLoop.Status != string(domain.LoopStatusTerminated) {
+		t.Fatalf("removed loop = %#v, want terminated", removedLoop)
+	}
+	removedQueue, err := repos.Queue.GetByID(context.Background(), "queue_removed")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if removedQueue == nil || removedQueue.Status != "cancelled" || removedQueue.LastError == nil || *removedQueue.LastError != "project archived" {
+		t.Fatalf("removed queue = %#v, want cancelled with archive reason", removedQueue)
+	}
+	apiProject, err := repos.Projects.GetByID(context.Background(), "api-project")
+	if err != nil {
+		t.Fatalf("Projects.GetByID(api-project) error = %v", err)
+	}
+	if apiProject == nil || apiProject.Archived || apiProject.UpdatedAt != createdAt {
+		t.Fatalf("api project = %#v, want untouched active API project", apiProject)
+	}
+}
+
+func TestServiceSyncConfiguredRejectsAPIManagedIDCollision(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 12, 10, 0, 0, 0, time.UTC)
+	createdAt := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	baseBranch := "main"
+	metadata := `{"repo":"nexu-io/api","source":"api"}`
+	existing := storage.ProjectRecord{ID: "shared", Name: "API Project", RepoPath: "/tmp/api", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: createdAt, UpdatedAt: createdAt}
+	if err := repos.Projects.Upsert(context.Background(), existing); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "shared", Name: "Configured Project", RepoPath: "/tmp/config"}}
+
+	err = service.SyncConfigured(context.Background(), cfg, now)
+	var validationErr ProjectValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("SyncConfigured() error = %T %v, want ProjectValidationError", err, err)
+	}
+	if !strings.Contains(err.Error(), "conflicts with an API-managed project") {
+		t.Fatalf("SyncConfigured() error = %q, want API ownership conflict", err)
+	}
+	stored, getErr := repos.Projects.GetByID(context.Background(), "shared")
+	if getErr != nil {
+		t.Fatalf("Projects.GetByID() error = %v", getErr)
+	}
+	if stored == nil || stored.Name != existing.Name || stored.RepoPath != existing.RepoPath || stored.UpdatedAt != existing.UpdatedAt || stored.MetadataJSON == nil || *stored.MetadataJSON != metadata {
+		t.Fatalf("stored = %#v, want API project unchanged", stored)
 	}
 }
 
@@ -1074,6 +1335,32 @@ func TestServiceRemoveProjectRejectsConfigManagedProject(t *testing.T) {
 	}
 	if stored == nil || stored.Archived {
 		t.Fatalf("stored project = %#v, want non-archived project", stored)
+	}
+}
+
+func TestServiceAddProjectRejectsConfigManagedProject(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	metadata := `{"repo":"acme/configured","source":"config"}`
+	nowISO := "2026-07-12T10:00:00.000Z"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "configured", Name: "Configured", RepoPath: "/repos/configured", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	service := &Service{DB: coordinator.DB(), Repos: repos}
+	_, err := service.AddProject(context.Background(), AddInput{ID: "configured", IDSource: "derived", Name: "Changed", RepoPath: "/repos/changed"})
+	if err == nil || !strings.Contains(err.Error(), "managed by config") {
+		t.Fatalf("AddProject() error = %v, want config authority rejection", err)
+	}
+	stored, getErr := repos.Projects.GetByID(context.Background(), "configured")
+	if getErr != nil {
+		t.Fatalf("GetByID() error = %v", getErr)
+	}
+	if stored == nil || stored.Name != "Configured" || stored.RepoPath != "/repos/configured" {
+		t.Fatalf("stored project = %#v, want unchanged config project", stored)
 	}
 }
 

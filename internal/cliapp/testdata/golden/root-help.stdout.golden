@@ -6,12 +6,14 @@ Version:
 
 Subcommands:
   status     Show service status
+  dashboard  Open the local operator dashboard
   network    Network membership commands
   netadmin   Network repo operator commands
   webhook    Webhook configuration and status
   bootstrap  Run first-time setup
   login      Log in to Feishu to capture the owner open_id
   version    Show Looper version
+  provider   Provider commands
   project    Project commands
   config     Config commands
   prompt     Prompt inspection commands
@@ -29,6 +31,7 @@ Subcommands:
   takeover   Continuously review and fix a pull request until it merges
   feedback   Submit feedback as a GitHub issue
   ps         Show running loops
+  describe   Show loop diagnostics detail
   jump       Print shell command for a loop worktree
   logs       Show logs for a loop
   pause      Pause a loop by sequence number

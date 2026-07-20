@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,13 +21,17 @@ type capturedFeishuCall struct {
 	body    []byte
 }
 
-func newFeishuAppGateway(t *testing.T, cfg config.WebhookNotificationConfig, calls *[]capturedFeishuCall) *Gateway {
+func newFeishuAppGateway(t *testing.T, cfg config.WebhookNotificationConfig, calls *[]capturedFeishuCall, states ...*GatewayState) *Gateway {
 	t.Helper()
 
 	rootDir := t.TempDir()
 	coordinator := openNotifyCoordinator(t, rootDir)
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC)
+	var state *GatewayState
+	if len(states) > 0 {
+		state = states[0]
+	}
 
 	return NewGateway(Options{
 		Config: config.NotificationConfig{
@@ -35,6 +40,7 @@ func newFeishuAppGateway(t *testing.T, cfg config.WebhookNotificationConfig, cal
 			Webhook:   cfg,
 		},
 		Repositories: repos,
+		State:        state,
 		Now:          func() time.Time { return now },
 		FeishuAppHTTP: func(_ context.Context, method, url string, headers map[string]string, body []byte) (int, []byte, error) {
 			*calls = append(*calls, capturedFeishuCall{method: method, url: url, headers: headers, body: append([]byte(nil), body...)})
@@ -633,7 +639,11 @@ func TestLiveStatusHelpers(t *testing.T) {
 		}
 	}
 	// In-memory live tail store (kept off the loop record to avoid DB races).
-	g := &Gateway{liveTails: map[string]liveTailEntry{"loop_x": {lines: []string{"a", "b"}, elapsedSec: 90}}}
+	g := &Gateway{state: &GatewayState{
+		liveTails: map[string]liveTailEntry{
+			"loop_x": {lines: []string{"a", "b"}, elapsedSec: 90},
+		},
+	}}
 	lines, el := g.liveTailFor("loop_x")
 	if len(lines) != 2 || lines[0] != "a" || el != 90 {
 		t.Fatalf("liveTailFor = %v, %d", lines, el)
@@ -888,6 +898,52 @@ func TestFeishuThreadHeaderCardLinksCheckpointIssueURL(t *testing.T) {
 	want := `[Issue #582](https://plane.example/open-design/browse/OPEND-582)`
 	if !strings.Contains(card, want) {
 		t.Fatalf("checkpoint issue reference is not clickable; want %q in %s", want, card)
+	}
+}
+
+func TestGatewayStateSurvivesConfigSpecificGatewaySnapshots(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+	state := NewGatewayState()
+	var firstCalls, secondCalls []capturedFeishuCall
+	first := newFeishuAppGateway(t, appModeConfig(), &firstCalls, state)
+	second := newFeishuAppGateway(t, appModeConfig(), &secondCalls, state)
+	if err := first.SendHITLAsk(context.Background(), HITLAskCard{
+		LoopID: "loop_shared", LoopSeq: 42, Question: "Redis or Postgres?", Options: []string{"redis", "postgres"}, SourceURL: "https://plane.example/issues/42",
+	}); err != nil {
+		t.Fatalf("first snapshot SendHITLAsk() error = %v", err)
+	}
+
+	second.MarkAskAnswered(context.Background(), "loop_shared", "postgres")
+	if len(secondCalls) != 1 || secondCalls[0].method != "PATCH" || !strings.Contains(secondCalls[0].url, "/messages/om_msg") || !strings.Contains(string(secondCalls[0].body), "postgres") {
+		t.Fatalf("second snapshot calls = %#v, want one answer-card PATCH", secondCalls)
+	}
+	state.liveMu.Lock()
+	_, retained := state.askCards["loop_shared"]
+	state.liveMu.Unlock()
+	if retained {
+		t.Fatal("answered ask card remained in shared state")
+	}
+}
+
+func TestGatewayStateBoundsLoopTransportEntries(t *testing.T) {
+	state := NewGatewayState()
+	state.liveMu.Lock()
+	state.liveTails = make(map[string]liveTailEntry)
+	for index := 0; index <= gatewayStateLoopLimit; index++ {
+		loopID := fmt.Sprintf("loop_%05d", index)
+		state.touchLoopLocked(loopID)
+		state.liveTails[loopID] = liveTailEntry{lines: []string{"active"}}
+	}
+	tracked := len(state.loopLastUsed)
+	tails := len(state.liveTails)
+	_, oldestRetained := state.liveTails["loop_00000"]
+	_, newestRetained := state.liveTails[fmt.Sprintf("loop_%05d", gatewayStateLoopLimit)]
+	state.liveMu.Unlock()
+
+	if tracked != gatewayStateLoopLimit || tails != gatewayStateLoopLimit || oldestRetained || !newestRetained {
+		t.Fatalf("bounded state = tracked %d tails %d oldest %v newest %v", tracked, tails, oldestRetained, newestRetained)
 	}
 }
 

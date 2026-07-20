@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 )
@@ -53,6 +54,36 @@ type statusOutput struct {
 		GH        bool `json:"gh"`
 		Osascript bool `json:"osascript"`
 	} `json:"tools"`
+	Providers []statusProviderOutput `json:"providers"`
+}
+
+type statusProviderOutput struct {
+	ProviderID     string `json:"providerId"`
+	Kind           string `json:"kind"`
+	Reachability   string `json:"reachability"`
+	Authentication string `json:"authentication"`
+	Identity       *struct {
+		Login string `json:"login"`
+	} `json:"identity"`
+	Version      string                            `json:"version"`
+	VersionState string                            `json:"versionState"`
+	Capabilities map[string]statusCapabilityOutput `json:"capabilities"`
+	Projects     []statusProviderProjectOutput     `json:"projects"`
+}
+
+type statusCapabilityOutput struct {
+	Configured      string `json:"configured"`
+	ConfiguredScope string `json:"configuredScope"`
+	Observed        string `json:"observed"`
+	Effective       string `json:"effective"`
+	Degraded        bool   `json:"degraded"`
+	Reason          string `json:"reason"`
+}
+
+type statusProviderProjectOutput struct {
+	ProjectID  string `json:"projectId"`
+	Repository string `json:"repository"`
+	Access     string `json:"access"`
 }
 
 type statusAgentOutput struct {
@@ -92,6 +123,7 @@ type projectOutput struct {
 	RepoPath               string   `json:"repoPath"`
 	BaseBranch             string   `json:"baseBranch"`
 	Archived               bool     `json:"archived"`
+	Provider               string   `json:"provider"`
 	Repo                   *string  `json:"repo"`
 	UpdatedAt              string   `json:"updatedAt"`
 	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
@@ -117,11 +149,20 @@ type loopOutput struct {
 	Status     string  `json:"status"`
 }
 
+type loopRetryWorktreeDiscardOutput struct {
+	WorktreePath *string `json:"worktreePath"`
+	Discarded    bool    `json:"discarded"`
+	NoOp         bool    `json:"noOp"`
+	Reason       string  `json:"reason"`
+}
+
 type loopRetryOutput struct {
-	Loop          loopOutput `json:"loop"`
-	QueueItemID   *string    `json:"queueItemId"`
-	Mode          string     `json:"mode"`
-	ResetAttempts bool       `json:"resetAttempts"`
+	Loop                   loopOutput                      `json:"loop"`
+	QueueItemID            *string                         `json:"queueItemId"`
+	Mode                   string                          `json:"mode"`
+	ResetAttempts          bool                            `json:"resetAttempts"`
+	DiscardWorktreeChanges bool                            `json:"discardWorktreeChanges"`
+	WorktreeDiscard        *loopRetryWorktreeDiscardOutput `json:"worktreeDiscard"`
 }
 
 type reviewRepairOutput struct {
@@ -188,13 +229,26 @@ type pullRequestOutput struct {
 	LoopStatus            struct {
 		LatestRunStatus *string `json:"latestRunStatus"`
 	} `json:"loopStatus"`
-	Stopped     bool    `json:"stopped"`
-	Reused      bool    `json:"reused"`
-	LoopID      string  `json:"loopId"`
-	RunID       *string `json:"runId"`
-	ExecutionID *string `json:"executionId"`
-	Vendor      *string `json:"vendor"`
-	PID         *int64  `json:"pid"`
+	Stopped           bool    `json:"stopped"`
+	Reused            bool    `json:"reused"`
+	LoopID            string  `json:"loopId"`
+	RunID             *string `json:"runId"`
+	ExecutionID       *string `json:"executionId"`
+	Vendor            *string `json:"vendor"`
+	PID               *int64  `json:"pid"`
+	Outcome           string  `json:"outcome"`
+	ProcessSkipReason *string `json:"processSkipReason"`
+}
+
+type stopLoopOutput struct {
+	Stopped           bool    `json:"stopped"`
+	LoopID            string  `json:"loopId"`
+	RunID             *string `json:"runId"`
+	ExecutionID       *string `json:"executionId"`
+	Vendor            *string `json:"vendor"`
+	PID               *int64  `json:"pid"`
+	Outcome           string  `json:"outcome"`
+	ProcessSkipReason *string `json:"processSkipReason"`
 }
 
 type activeRunsOutput struct {
@@ -205,6 +259,7 @@ type stopAllOutput struct {
 	Summary struct {
 		Total           int `json:"total"`
 		Stopped         int `json:"stopped"`
+		PausedOnly      int `json:"pausedOnly"`
 		AlreadyFinished int `json:"alreadyFinished"`
 		AlreadyStopping int `json:"alreadyStopping"`
 		Failed          int `json:"failed"`
@@ -219,6 +274,8 @@ type stopAllOutput struct {
 		PreviousRunStatus       string `json:"previousRunStatus"`
 		PreviousExecutionStatus string `json:"previousExecutionStatus"`
 		Result                  string `json:"result"`
+		Outcome                 string `json:"outcome"`
+		ProcessSkipReason       string `json:"processSkipReason"`
 		Error                   string `json:"error"`
 	} `json:"items"`
 }
@@ -270,17 +327,18 @@ type runsListOutput struct {
 }
 
 type runReconcileStaleOutput struct {
-	Mode                 string   `json:"mode"`
-	CandidateRuns        int64    `json:"candidateRuns"`
-	InterruptedRuns      int64    `json:"interruptedRuns"`
-	LoopsRequeued        int64    `json:"loopsRequeued"`
-	QueueItemsRequeued   int64    `json:"queueItemsRequeued"`
-	QueueItemsCancelled  int64    `json:"queueItemsCancelled"`
-	CleanedExecutions    int64    `json:"cleanedExecutions"`
-	SkippedUncertainRuns int64    `json:"skippedUncertainRuns"`
-	RunIDs               []string `json:"runIds"`
-	LoopIDs              []string `json:"loopIds"`
-	ExecutionIDs         []string `json:"executionIds"`
+	Mode                  string   `json:"mode"`
+	CandidateRuns         int64    `json:"candidateRuns"`
+	InterruptedRuns       int64    `json:"interruptedRuns"`
+	LoopsRequeued         int64    `json:"loopsRequeued"`
+	QueueItemsRequeued    int64    `json:"queueItemsRequeued"`
+	QueueItemsCancelled   int64    `json:"queueItemsCancelled"`
+	CleanedExecutions     int64    `json:"cleanedExecutions"`
+	QuarantinedExecutions int64    `json:"quarantinedExecutions"`
+	SkippedUncertainRuns  int64    `json:"skippedUncertainRuns"`
+	RunIDs                []string `json:"runIds"`
+	LoopIDs               []string `json:"loopIds"`
+	ExecutionIDs          []string `json:"executionIds"`
 }
 
 type runOutput struct {
@@ -302,6 +360,41 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	printSection(w, "Storage", [][2]any{{"dbPath", data.Storage.DBPath}, {"schemaVersion", data.Storage.SchemaVersion}, {"healthy", data.Storage.Healthy}, {"pendingMigrations", joinOrNone(data.Storage.PendingMigrations)}})
 	fmt.Fprintln(w)
 	printSection(w, "Scheduler", [][2]any{{"healthy", data.Scheduler.Healthy}, {"queuedItems", data.Scheduler.QueuedItems}, {"runningItems", data.Scheduler.RunningItems}})
+	if len(data.Providers) > 0 {
+		fmt.Fprintln(w)
+		providerRows := make([]tableRow, 0, len(data.Providers))
+		for _, provider := range data.Providers {
+			identity := "none"
+			if provider.Identity != nil && strings.TrimSpace(provider.Identity.Login) != "" {
+				identity = provider.Identity.Login
+			}
+			providerRows = append(providerRows, tableRow{"provider": provider.ProviderID, "kind": provider.Kind, "endpoint": provider.Reachability, "auth": provider.Authentication, "identity": identity, "version": firstNonEmptyStatus(provider.Version, provider.VersionState)})
+		}
+		printTable(w, []string{"provider", "kind", "endpoint", "auth", "identity", "version"}, providerRows)
+		projectRows := make([]tableRow, 0)
+		for _, provider := range data.Providers {
+			for _, project := range provider.Projects {
+				projectRows = append(projectRows, tableRow{"provider": provider.ProviderID, "project": project.ProjectID, "repository": project.Repository, "access": project.Access})
+			}
+		}
+		if len(projectRows) > 0 {
+			fmt.Fprintln(w)
+			printTable(w, []string{"provider", "project", "repository", "access"}, projectRows)
+		}
+		capabilityRows := make([]tableRow, 0)
+		for _, provider := range data.Providers {
+			for name, capability := range provider.Capabilities {
+				capabilityRows = append(capabilityRows, tableRow{"provider": provider.ProviderID, "capability": name, "configured": capability.Configured, "scope": firstNonEmptyStatus(capability.ConfiguredScope, "n/a"), "observed": capability.Observed, "effective": capability.Effective, "degraded": capability.Degraded})
+			}
+		}
+		if len(capabilityRows) > 0 {
+			sort.Slice(capabilityRows, func(i, j int) bool {
+				return fmt.Sprint(capabilityRows[i]["provider"], capabilityRows[i]["capability"]) < fmt.Sprint(capabilityRows[j]["provider"], capabilityRows[j]["capability"])
+			})
+			fmt.Fprintln(w)
+			printTable(w, []string{"provider", "capability", "configured", "scope", "observed", "effective", "degraded"}, capabilityRows)
+		}
+	}
 	if data.Agent != nil {
 		fmt.Fprintln(w)
 		printSection(w, "Agent", [][2]any{{"vendor", data.Agent.Vendor}, {"model", data.Agent.Model}, {"nativeResumeEnabled", data.Agent.NativeResumeEnabled}, {"plannerIdleTimeoutSeconds", data.Agent.Timeouts.Planner.IdleTimeoutSeconds}, {"plannerMaxRuntimeSeconds", data.Agent.Timeouts.Planner.MaxRuntimeSeconds}, {"workerIdleTimeoutSeconds", data.Agent.Timeouts.Worker.IdleTimeoutSeconds}, {"workerMaxRuntimeSeconds", data.Agent.Timeouts.Worker.MaxRuntimeSeconds}, {"reviewerIdleTimeoutSeconds", data.Agent.Timeouts.Reviewer.IdleTimeoutSeconds}, {"reviewerMaxRuntimeSeconds", data.Agent.Timeouts.Reviewer.MaxRuntimeSeconds}, {"fixerIdleTimeoutSeconds", data.Agent.Timeouts.Fixer.IdleTimeoutSeconds}, {"fixerMaxRuntimeSeconds", data.Agent.Timeouts.Fixer.MaxRuntimeSeconds}})
@@ -317,6 +410,15 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	return nil
 }
 
+func firstNonEmptyStatus(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return "unknown"
+}
+
 func writeHumanProjectList(w io.Writer, payload json.RawMessage) error {
 	var data projectsListOutput
 	if err := json.Unmarshal(payload, &data); err != nil {
@@ -325,9 +427,21 @@ func writeHumanProjectList(w io.Writer, payload json.RawMessage) error {
 
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, project := range data.Items {
-		rows = append(rows, tableRow{"id": project.ID, "name": project.Name, "repoPath": project.RepoPath, "baseBranch": project.BaseBranch, "repo": project.Repo, "updatedAt": project.UpdatedAt})
+		provider := strings.TrimSpace(project.Provider)
+		if provider == "" {
+			provider = "github"
+		}
+		rows = append(rows, tableRow{
+			"id":         project.ID,
+			"name":       project.Name,
+			"repoPath":   project.RepoPath,
+			"baseBranch": project.BaseBranch,
+			"provider":   provider,
+			"repo":       project.Repo,
+			"updatedAt":  project.UpdatedAt,
+		})
 	}
-	printTable(w, []string{"id", "name", "repoPath", "baseBranch", "repo", "updatedAt"}, rows)
+	printTable(w, []string{"id", "name", "repoPath", "baseBranch", "provider", "repo", "updatedAt"}, rows)
 	return nil
 }
 
@@ -337,7 +451,11 @@ func writeHumanProjectAdd(w io.Writer, payload json.RawMessage) error {
 		return fmt.Errorf("decode project response: %w", err)
 	}
 
-	printSection(w, "Project added", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}, {"baseBranch", data.BaseBranch}, {"repo", data.Repo}, {"discoveredPullRequests", data.DiscoveredPullRequests}, {"discoveredWorktrees", data.DiscoveredWorktrees}, {"queuedSnapshots", data.PendingSnapshots}, {"capturedSnapshots", data.CapturedSnapshots}})
+	provider := strings.TrimSpace(data.Provider)
+	if provider == "" {
+		provider = "github"
+	}
+	printSection(w, "Project added", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}, {"baseBranch", data.BaseBranch}, {"provider", provider}, {"repo", data.Repo}, {"discoveredPullRequests", data.DiscoveredPullRequests}, {"discoveredWorktrees", data.DiscoveredWorktrees}, {"queuedSnapshots", data.PendingSnapshots}, {"capturedSnapshots", data.CapturedSnapshots}})
 	if len(data.Warnings) > 0 {
 		fmt.Fprintln(w)
 		entries := make([][2]any, 0, len(data.Warnings))
@@ -400,7 +518,24 @@ func writeHumanLoopRetried(w io.Writer, payload json.RawMessage) error {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode loop retry response: %w", err)
 	}
-	printSection(w, "Loop retry queued", [][2]any{{"id", data.Loop.ID}, {"seq", data.Loop.Seq}, {"status", data.Loop.Status}, {"mode", data.Mode}, {"queueItem", formatScalar(data.QueueItemID)}})
+	fields := [][2]any{
+		{"id", data.Loop.ID},
+		{"seq", data.Loop.Seq},
+		{"status", data.Loop.Status},
+		{"mode", data.Mode},
+		{"queueItem", formatScalar(data.QueueItemID)},
+	}
+	if data.DiscardWorktreeChanges {
+		fields = append(fields, [2]any{"discardWorktreeChanges", true})
+		if data.WorktreeDiscard != nil {
+			fields = append(fields,
+				[2]any{"worktreePath", formatScalar(data.WorktreeDiscard.WorktreePath)},
+				[2]any{"worktreeDiscardNoOp", data.WorktreeDiscard.NoOp},
+				[2]any{"worktreeDiscardReason", data.WorktreeDiscard.Reason},
+			)
+		}
+	}
+	printSection(w, "Loop retry queued", fields)
 	return nil
 }
 
@@ -412,9 +547,9 @@ func writeHumanPullRequestList(w io.Writer, payload json.RawMessage) error {
 
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, item := range data.Items {
-		rows = append(rows, tableRow{"pr": fmt.Sprintf("%s#%d", item.Repo, item.PRNumber), "title": item.Title, "mergeability": item.Mergeability, "blocker": item.BlockingReason, "reviewState": item.ReviewState, "checks": item.ChecksSummary, "reviewer": item.Reviewer, "fixer": item.Fixer})
+		rows = append(rows, tableRow{"project": item.ProjectID, "pr": fmt.Sprintf("%s#%d", item.Repo, item.PRNumber), "title": item.Title, "mergeability": item.Mergeability, "blocker": item.BlockingReason, "reviewState": item.ReviewState, "checks": item.ChecksSummary, "reviewer": item.Reviewer, "fixer": item.Fixer})
 	}
-	printTable(w, []string{"pr", "title", "mergeability", "blocker", "reviewState", "checks", "reviewer", "fixer"}, rows)
+	printTable(w, []string{"project", "pr", "title", "mergeability", "blocker", "reviewState", "checks", "reviewer", "fixer"}, rows)
 	return nil
 }
 
@@ -423,7 +558,7 @@ func writeHumanPullRequestShow(w io.Writer, payload json.RawMessage) error {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode pull request response: %w", err)
 	}
-	printSection(w, "Pull request", [][2]any{{"repo", data.Repo}, {"prNumber", data.PRNumber}, {"title", data.Title}, {"reviewState", data.ReviewState}, {"checksSummary", data.ChecksSummary}})
+	printSection(w, "Pull request", [][2]any{{"projectId", data.ProjectID}, {"repo", data.Repo}, {"prNumber", data.PRNumber}, {"title", data.Title}, {"reviewState", data.ReviewState}, {"checksSummary", data.ChecksSummary}})
 	return nil
 }
 
@@ -432,7 +567,7 @@ func writeHumanPullRequestStatus(w io.Writer, payload json.RawMessage) error {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode pull request status response: %w", err)
 	}
-	printSection(w, "Pull request status", [][2]any{{"pr", fmt.Sprintf("%s#%d", data.Repo, data.PRNumber)}, {"reviewState", data.ReviewState}, {"checksSummary", data.ChecksSummary}, {"unresolvedThreads", data.UnresolvedThreadCount}, {"latestRunStatus", data.LoopStatus.LatestRunStatus}})
+	printSection(w, "Pull request status", [][2]any{{"projectId", data.ProjectID}, {"pr", fmt.Sprintf("%s#%d", data.Repo, data.PRNumber)}, {"reviewState", data.ReviewState}, {"checksSummary", data.ChecksSummary}, {"unresolvedThreads", data.UnresolvedThreadCount}, {"latestRunStatus", data.LoopStatus.LatestRunStatus}})
 	return nil
 }
 
@@ -506,10 +641,38 @@ func writeHumanActiveRuns(w io.Writer, payload json.RawMessage) error {
 		if strings.TrimSpace(item.DisplayStatus) != "" {
 			status = item.DisplayStatus
 		}
-		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt))})
+		reason := ""
+		if item.LastFailureReason != nil {
+			reason = truncateCLIText(*item.LastFailureReason, 48)
+		}
+		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt)), "reason": reason})
 	}
-	printTable(w, []string{"#", "type", "target", "step", "agent", "pid", "status", "age"}, rows)
+	printTable(w, []string{"#", "type", "target", "step", "agent", "pid", "status", "age", "reason"}, rows)
 	return nil
+}
+
+func truncateCLIText(value string, max int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if value == "" {
+		return ""
+	}
+	value = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return -1
+		}
+		return r
+	}, value)
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	if max <= 3 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-3]) + "..."
 }
 
 func writeHumanRunReconcileStale(w io.Writer, payload json.RawMessage) error {
@@ -517,7 +680,7 @@ func writeHumanRunReconcileStale(w io.Writer, payload json.RawMessage) error {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode reconcile stale response: %w", err)
 	}
-	printSection(w, "Stale runs reconciled", [][2]any{{"mode", data.Mode}, {"candidates", data.CandidateRuns}, {"interruptedRuns", data.InterruptedRuns}, {"loopsRequeued", data.LoopsRequeued}, {"queueItemsRequeued", data.QueueItemsRequeued}, {"queueItemsCancelled", data.QueueItemsCancelled}, {"cleanedExecutions", data.CleanedExecutions}, {"skippedUncertainRuns", data.SkippedUncertainRuns}, {"runIds", joinOrNone(data.RunIDs)}, {"loopIds", joinOrNone(data.LoopIDs)}, {"executionIds", joinOrNone(data.ExecutionIDs)}})
+	printSection(w, "Stale runs reconciled", [][2]any{{"mode", data.Mode}, {"candidates", data.CandidateRuns}, {"interruptedRuns", data.InterruptedRuns}, {"loopsRequeued", data.LoopsRequeued}, {"queueItemsRequeued", data.QueueItemsRequeued}, {"queueItemsCancelled", data.QueueItemsCancelled}, {"cleanedExecutions", data.CleanedExecutions}, {"quarantinedExecutions", data.QuarantinedExecutions}, {"skippedUncertainRuns", data.SkippedUncertainRuns}, {"runIds", joinOrNone(data.RunIDs)}, {"loopIds", joinOrNone(data.LoopIDs)}, {"executionIds", joinOrNone(data.ExecutionIDs)}})
 	return nil
 }
 
@@ -694,11 +857,12 @@ func writeLoopLogContent(w io.Writer, content string) error {
 }
 
 func writeHumanStopLoop(w io.Writer, payload json.RawMessage) error {
-	var data pullRequestOutput
+	var data stopLoopOutput
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode stop response: %w", err)
 	}
-	printSection(w, "Loop stopped", [][2]any{{"loopId", data.LoopID}, {"runId", data.RunID}, {"executionId", data.ExecutionID}, {"vendor", data.Vendor}, {"pid", data.PID}, {"stopped", data.Stopped}})
+	title := stopOutcomeTitle(data.Outcome)
+	printSection(w, title, [][2]any{{"loopId", data.LoopID}, {"runId", data.RunID}, {"executionId", data.ExecutionID}, {"vendor", data.Vendor}, {"pid", data.PID}, {"outcome", data.Outcome}, {"processSkipReason", data.ProcessSkipReason}, {"stopped", data.Stopped}})
 	if !data.Stopped {
 		return fmt.Errorf("Loop %s could not be stopped", data.LoopID)
 	}
@@ -726,22 +890,43 @@ func writeHumanStopAll(w io.Writer, payload json.RawMessage) error {
 		_, err := fmt.Fprintln(w, "No running tasks to stop.")
 		return err
 	}
-	printSection(w, "Stopped running tasks", [][2]any{
+	title := "Stop results"
+	if data.Summary.Failed == 0 && data.Summary.PausedOnly == 0 && data.Summary.AlreadyFinished == 0 && data.Summary.AlreadyStopping == 0 {
+		title = "Stopped running tasks"
+	}
+	printSection(w, title, [][2]any{
 		{"total", data.Summary.Total},
 		{"stopped", data.Summary.Stopped},
+		{"pausedOnly", data.Summary.PausedOnly},
 		{"alreadyFinished", data.Summary.AlreadyFinished},
 		{"alreadyStopping", data.Summary.AlreadyStopping},
 		{"failed", data.Summary.Failed},
 	})
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, item := range data.Items {
-		rows = append(rows, tableRow{"seq": item.Seq, "type": item.Type, "loopId": item.LoopID, "runId": item.RunID, "executionId": item.ExecutionID, "result": item.Result, "error": item.Error})
+		rows = append(rows, tableRow{"seq": item.Seq, "type": item.Type, "loopId": item.LoopID, "runId": item.RunID, "executionId": item.ExecutionID, "result": item.Result, "outcome": item.Outcome, "processSkipReason": item.ProcessSkipReason, "error": item.Error})
 	}
-	printTable(w, []string{"seq", "type", "loopId", "runId", "executionId", "result", "error"}, rows)
+	printTable(w, []string{"seq", "type", "loopId", "runId", "executionId", "result", "outcome", "processSkipReason", "error"}, rows)
 	if data.Summary.Failed > 0 {
 		return fmt.Errorf("failed to stop %d running task(s)", data.Summary.Failed)
 	}
+	if data.Summary.PausedOnly > 0 {
+		return fmt.Errorf("paused %d task(s) without signaling a verified process", data.Summary.PausedOnly)
+	}
 	return nil
+}
+
+func stopOutcomeTitle(outcome string) string {
+	switch outcome {
+	case "paused_only":
+		return "Loop paused only"
+	case "already_stopping":
+		return "Loop already stopping"
+	case "already_finished":
+		return "Loop already finished"
+	default:
+		return "Loop stopped"
+	}
 }
 
 func writeHumanRunList(w io.Writer, payload json.RawMessage) error {
@@ -825,6 +1010,10 @@ func printTable(w io.Writer, headers []string, rows []tableRow) {
 	writeTableLine := func(values []string) {
 		parts := make([]string, len(values))
 		for index, value := range values {
+			if index == len(values)-1 {
+				parts[index] = value
+				continue
+			}
 			parts[index] = fmt.Sprintf("%-*s", widths[index], value)
 		}
 		_, _ = fmt.Fprintln(w, strings.Join(parts, "  "))

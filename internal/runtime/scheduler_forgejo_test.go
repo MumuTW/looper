@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -35,6 +36,14 @@ func TestPlannerGitHubAdapterForgejoCreatePullRequestAndLabels(t *testing.T) {
 				t.Fatalf("decode labels body: %v", err)
 			}
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "name": "looper:spec-reviewing"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/101":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 101, "title": "Spec: add forgejo", "body": "Body", "state": "open",
+				"html_url": serverURL(r) + "/acme/looper/pulls/101",
+				"head":     map[string]any{"ref": "feature", "sha": "abc"},
+				"base":     map[string]any{"ref": "main", "sha": "def"},
+				"labels":   []map[string]any{{"id": 1, "name": "looper:hold"}},
+			})
 		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -67,40 +76,112 @@ func TestPlannerGitHubAdapterForgejoCreatePullRequestAndLabels(t *testing.T) {
 	if len(labelBody["labels"]) != 1 || labelBody["labels"][0] != "looper:spec-reviewing" {
 		t.Fatalf("label body = %#v, want reviewing label", labelBody)
 	}
+	detail, err := adapter.ViewPullRequest(context.Background(), planner.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 101, CWD: repoPath})
+	if err != nil {
+		t.Fatalf("ViewPullRequest() error = %v", err)
+	}
+	if len(detail.Labels) != 1 || detail.Labels[0] != "looper:hold" {
+		t.Fatalf("detail.Labels = %#v, want Forgejo PR labels", detail.Labels)
+	}
 	if body, _ := createdBody["body"].(string); !strings.Contains(body, "Body") {
 		t.Fatalf("create PR body = %q, want stamped body content", body)
 	}
 }
 
-func TestWorkerGitHubAdapterForgejoCreatePullRequestQueuesReviewerDiscoveryLabel(t *testing.T) {
+func TestPlannerAdapterRoutesSameRepoSlugByProjectPath(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+
+	serverFor := func(title string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/app/issues" {
+				t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 1, "title": title, "state": "open"}})
+		}))
+	}
+	first := serverFor("first")
+	defer first.Close()
+	second := serverFor("second")
+	defer second.Close()
+
+	root := t.TempDir()
+	firstPath := filepath.Join(root, "first")
+	secondPath := filepath.Join(root, "second")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{
+			{ID: "forgejo-one", Kind: config.ProviderKindForgejo, BaseURL: first.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")},
+			{ID: "forgejo-two", Kind: config.ProviderKindForgejo, BaseURL: second.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")},
+		},
+		Projects: []config.ProjectRefConfig{
+			{ID: "one", Provider: "forgejo-one", Repo: "acme/app", RepoPath: firstPath},
+			{ID: "two", Provider: "forgejo-two", Repo: "acme/app", RepoPath: secondPath},
+		},
+	}
+	adapter := plannerGitHubAdapter{config: &cfg}
+	for _, testCase := range []struct {
+		cwd  string
+		want string
+	}{{cwd: firstPath, want: "first"}, {cwd: secondPath, want: "second"}} {
+		issues, err := adapter.ListOpenIssues(context.Background(), planner.ListOpenIssuesInput{Repo: "acme/app", CWD: testCase.cwd})
+		if err != nil {
+			t.Fatalf("ListOpenIssues(%s) error = %v", testCase.want, err)
+		}
+		if len(issues) != 1 || issues[0].Title != testCase.want {
+			t.Fatalf("ListOpenIssues(%s) = %#v", testCase.want, issues)
+		}
+	}
+
+	if _, _, err := forgejoClientForRepo(&cfg, "acme/app"); err == nil || !strings.Contains(err.Error(), "multiple projects") {
+		t.Fatalf("forgejoClientForRepo() error = %v, want ambiguous bare-repo rejection", err)
+	}
+}
+
+func TestForgeRoutingRejectsOverlappingWorktreeRoots(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	outerRoot := filepath.Join(root, "worktrees")
+	innerRoot := filepath.Join(outerRoot, "nested")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{
+			{ID: "forgejo-one", Kind: config.ProviderKindForgejo},
+			{ID: "forgejo-two", Kind: config.ProviderKindForgejo},
+		},
+		Projects: []config.ProjectRefConfig{
+			{ID: "outer", Provider: "forgejo-one", Repo: "acme/outer", RepoPath: filepath.Join(root, "outer"), WorktreeRoot: &outerRoot},
+			{ID: "inner", Provider: "forgejo-two", Repo: "acme/inner", RepoPath: filepath.Join(root, "inner"), WorktreeRoot: &innerRoot},
+		},
+	}
+	_, _, ok, err := forgejoProjectProviderForCWD(&cfg, filepath.Join(innerRoot, "feature"))
+	if err == nil || !strings.Contains(err.Error(), "matches multiple projects") {
+		t.Fatalf("forgejoProjectProviderForCWD() = ok %v, error %v; want ambiguous root rejection", ok, err)
+	}
+}
+
+func TestWorkerGitHubAdapterForgejoCreatePullRequestRequestsNativeReviewer(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	var createdBody map[string]any
+	var reviewerBody map[string][]string
 	var labelBody map[string][]string
-	currentLabels := []map[string]any{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}}}}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
 			if err := json.NewDecoder(r.Body).Decode(&createdBody); err != nil {
 				t.Fatalf("decode create PR body: %v", err)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"number": 201, "html_url": serverURL(r) + "/acme/looper/pulls/201", "head": map[string]any{"ref": "worker-branch", "sha": "abc"}, "base": map[string]any{"ref": "main", "sha": "def"}, "labels": currentLabels})
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 201, "html_url": serverURL(r) + "/acme/looper/pulls/201", "head": map[string]any{"ref": "worker-branch", "sha": "abc"}, "base": map[string]any{"ref": "main", "sha": "def"}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/201/requested_reviewers":
+			if err := json.NewDecoder(r.Body).Decode(&reviewerBody); err != nil {
+				t.Fatalf("decode reviewers body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/201/labels":
 			if err := json.NewDecoder(r.Body).Decode(&labelBody); err != nil {
 				t.Fatalf("decode labels body: %v", err)
 			}
-			currentLabels = currentLabels[:0]
-			for i, label := range labelBody["labels"] {
-				currentLabels = append(currentLabels, map[string]any{"id": i + 1, "name": label})
-			}
-			_ = json.NewEncoder(w).Encode(currentLabels)
-		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{
-				"number": 201, "title": "Implement worker", "body": "Body", "state": "open",
-				"head":   map[string]any{"ref": "worker-branch", "sha": "abc"},
-				"base":   map[string]any{"ref": "main", "sha": "def"},
-				"user":   map[string]any{"login": "worker", "id": 1},
-				"labels": currentLabels,
-			}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "name": "team-review"}})
 		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -134,16 +215,154 @@ func TestWorkerGitHubAdapterForgejoCreatePullRequestQueuesReviewerDiscoveryLabel
 	if createdBody["head"] != "worker-branch" || createdBody["base"] != "main" {
 		t.Fatalf("create body = %#v, want worker-branch->main", createdBody)
 	}
+	if got := reviewerBody["reviewers"]; len(got) != 1 || got[0] != "reviewer" {
+		t.Fatalf("reviewer body = %#v, want native reviewer request", reviewerBody)
+	}
 	if got := labelBody["labels"]; len(got) != 1 || got[0] != "team-review" {
-		t.Fatalf("label body = %#v, want configured reviewer discovery label", labelBody)
+		t.Fatalf("label body = %#v, want configured reviewer discovery label fallback", labelBody)
 	}
-	reviewerAdapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
-	prs, err := reviewerAdapter.ListOpenPullRequests(context.Background(), reviewer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath, Labels: []string{"team-review"}})
-	if err != nil {
-		t.Fatalf("ListOpenPullRequests() error = %v", err)
+}
+
+func TestWorkerGitHubAdapterForgejoAddReviewersFallsBackToLabelsWhenNativeUnavailable(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	var labelBody map[string][]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
+			// No requested_reviewers capability advertised.
+			_, _ = w.Write([]byte(`{"paths":{}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/201/requested_reviewers":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/201/labels":
+			if err := json.NewDecoder(r.Body).Decode(&labelBody); err != nil {
+				t.Fatalf("decode labels body: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "name": "team-review"}})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Roles: config.RoleConfigs{
+			Reviewer: config.ReviewerRoleConfig{
+				Discovery: config.ReviewerRoleDiscoveryConfig{
+					Triggers: config.ReviewerRoleTriggersConfig{Labels: []string{"team-review"}},
+				},
+			},
+		},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}
-	if len(prs) != 1 || prs[0].Number != 201 {
-		t.Fatalf("prs = %#v, want worker-created PR rediscovered by reviewer label", prs)
+	adapter := workerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	if err := adapter.AddPullRequestReviewers(context.Background(), worker.PullRequestReviewersInput{Repo: "acme/looper", PRNumber: 201, Reviewers: []string{"reviewer"}, CWD: repoPath}); err != nil {
+		t.Fatalf("AddPullRequestReviewers() error = %v", err)
+	}
+	if got := labelBody["labels"]; len(got) != 1 || got[0] != "team-review" {
+		t.Fatalf("label body = %#v, want configured reviewer discovery label fallback", labelBody)
+	}
+}
+
+func TestWorkerGitHubAdapterForgejoAddReviewersIgnoresLabelFailureAfterNativeSuccess(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	var reviewerBody map[string][]string
+	var labelAttempted bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}}}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/201/requested_reviewers":
+			if err := json.NewDecoder(r.Body).Decode(&reviewerBody); err != nil {
+				t.Fatalf("decode reviewers body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/201/labels":
+			labelAttempted = true
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"label missing"}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Roles: config.RoleConfigs{
+			Reviewer: config.ReviewerRoleConfig{
+				Discovery: config.ReviewerRoleDiscoveryConfig{
+					// Native-request-triggered: labels are optional discovery aids.
+					Triggers: config.ReviewerRoleTriggersConfig{RequireReviewRequest: true, Labels: []string{"team-review"}},
+				},
+			},
+		},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := workerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	if err := adapter.AddPullRequestReviewers(context.Background(), worker.PullRequestReviewersInput{Repo: "acme/looper", PRNumber: 201, Reviewers: []string{"reviewer"}, CWD: repoPath}); err != nil {
+		t.Fatalf("AddPullRequestReviewers() error = %v, want nil after native success despite label failure", err)
+	}
+	if got := reviewerBody["reviewers"]; len(got) != 1 || got[0] != "reviewer" {
+		t.Fatalf("reviewer body = %#v, want native reviewer request", reviewerBody)
+	}
+	if !labelAttempted {
+		t.Fatal("expected label application attempt after native success")
+	}
+}
+
+func TestWorkerGitHubAdapterForgejoAddReviewersFailsLabelTriggeredWhenLabelMissingAfterNativeSuccess(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	var reviewerBody map[string][]string
+	var labelAttempted bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}}}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/201/requested_reviewers":
+			if err := json.NewDecoder(r.Body).Decode(&reviewerBody); err != nil {
+				t.Fatalf("decode reviewers body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/201/labels":
+			labelAttempted = true
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"label missing"}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Roles: config.RoleConfigs{
+			Reviewer: config.ReviewerRoleConfig{
+				Discovery: config.ReviewerRoleDiscoveryConfig{
+					// Label-triggered discovery: native request alone is not enough.
+					Triggers: config.ReviewerRoleTriggersConfig{RequireReviewRequest: false, Labels: []string{"team-review"}},
+				},
+			},
+		},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := workerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	err := adapter.AddPullRequestReviewers(context.Background(), worker.PullRequestReviewersInput{Repo: "acme/looper", PRNumber: 201, Reviewers: []string{"reviewer"}, CWD: repoPath})
+	if err == nil {
+		t.Fatal("AddPullRequestReviewers() error = nil, want label failure to keep label-triggered handoff retryable")
+	}
+	if !strings.Contains(err.Error(), "label missing") && !strings.Contains(err.Error(), "500") {
+		t.Fatalf("AddPullRequestReviewers() error = %v, want label application failure", err)
+	}
+	if got := reviewerBody["reviewers"]; len(got) != 1 || got[0] != "reviewer" {
+		t.Fatalf("reviewer body = %#v, want native reviewer request before label failure", reviewerBody)
+	}
+	if !labelAttempted {
+		t.Fatal("expected label application attempt after native success")
 	}
 }
 
@@ -156,6 +375,8 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	var comparePath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
 			listLabels = r.URL.Query().Get("labels")
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
@@ -208,6 +429,7 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 
 	repoPath := filepath.Join(t.TempDir(), "repo")
 	cfg := config.Config{
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSummaryComment}}},
 		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
 		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}
@@ -272,6 +494,75 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	}
 	if comparePath != "/api/v1/repos/acme/looper/compare/main...feature%2Freview-me" {
 		t.Fatalf("comparePath = %q, want encoded Forgejo compare path", comparePath)
+	}
+}
+
+func TestReviewerGitHubAdapterForgejoThreadResolutionShortCircuits(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSummaryComment}}},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+
+	threads, err := adapter.ListReviewThreads(context.Background(), reviewer.ListReviewThreadsInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReviewThreads() error = %v", err)
+	}
+	if len(threads) != 0 {
+		t.Fatalf("threads = %#v, want empty Forgejo thread list", threads)
+	}
+	if err := adapter.AddReviewThreadReply(context.Background(), reviewer.AddReviewThreadReplyInput{Repo: "acme/looper", ThreadID: "thread-1", Body: "reply", CWD: repoPath}); err != nil {
+		t.Fatalf("AddReviewThreadReply() error = %v", err)
+	}
+	if err := adapter.ResolveReviewThread(context.Background(), reviewer.ResolveReviewThreadInput{Repo: "acme/looper", ThreadID: "thread-1", CWD: repoPath}); err != nil {
+		t.Fatalf("ResolveReviewThread() error = %v", err)
+	}
+}
+
+func TestReviewerGitHubAdapterForgejoFindReviewMarkerUsesIssueComments(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/issues/42/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id":         77,
+				"body":       "ignored\n<!-- looper:review id=reviewer:other:abc123 head=abc123 outcome=clean -->",
+				"html_url":   serverURL(r) + "/acme/looper/issues/42#issuecomment-77",
+				"updated_at": "2026-07-07T00:00:00Z",
+				"user":       map[string]any{"login": "other-bot", "id": 8},
+			}, {
+				"id":         78,
+				"body":       "looks good\n<!-- looper:review id=reviewer:loop-1:abc123 head=abc123 outcome=clean -->",
+				"html_url":   serverURL(r) + "/acme/looper/issues/42#issuecomment-78",
+				"updated_at": "2026-07-07T00:01:00Z",
+				"user":       map[string]any{"login": "reviewer-bot", "id": 9},
+			}})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSummaryComment}}},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+
+	marker, err := adapter.FindReviewMarker(context.Background(), reviewer.VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=reviewer:loop-1:abc123 head=abc123", AllowedReviewEvents: []reviewer.ReviewEvent{reviewer.ReviewEventApprove}, AuthorLogin: "reviewer-bot", AllowCleanComment: true})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.Event != reviewer.ReviewEventComment || marker.Outcome != "clean" || marker.AuthorLogin != "reviewer-bot" {
+		t.Fatalf("marker = %#v, want Forgejo comment-backed marker result", marker)
+	}
+	if !strings.Contains(marker.Body, "looper:review id=reviewer:loop-1:abc123") {
+		t.Fatalf("marker.Body = %q, want matched marker body", marker.Body)
 	}
 }
 
@@ -358,8 +649,8 @@ func TestFixerGitHubAdapterForgejoSummaryCommentNoResolveFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewPullRequest() error = %v", err)
 	}
-	if len(detail.IssueComments) != 1 || detail.Comments != nil {
-		t.Fatalf("detail = %#v, want top-level issue comments only", detail)
+	if len(detail.IssueComments) != 1 || len(detail.Comments) != 0 {
+		t.Fatalf("detail = %#v, want reviewer summary comments and no native items", detail)
 	}
 	created, err := adapter.CreateIssueComment(ctx, fixer.IssueCommentInput{Repo: "acme/looper", IssueNumber: 42, Body: "fixer summary", CWD: repoPath})
 	if err != nil {
@@ -398,6 +689,163 @@ func TestFixerGitHubAdapterForgejoSummaryCommentNoResolveFlow(t *testing.T) {
 	}
 	if !strings.Contains(removedLabelPath, "/issues/42/labels/looper:fix") {
 		t.Fatalf("removedLabelPath = %q, want Forgejo label removal", removedLabelPath)
+	}
+}
+
+func TestFixerGitHubAdapterForgejoListNativeReviewComments(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 201}, {"id": 202}, {"id": 203}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews/201/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id": 101, "body": "Open comment", "html_url": serverURL(r) + "/acme/looper/pulls/42#discussion_r101", "updated_at": "2026-07-01T00:00:00Z",
+				"user": map[string]any{"login": "alice", "id": 1}, "path": "internal/runtime/scheduler.go", "diff_hunk": "@@ -1 +1 @@",
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews/202/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id": 102, "body": "Explicit unresolved", "html_url": serverURL(r) + "/acme/looper/pulls/42#discussion_r102", "updated_at": "2026-07-02T00:00:00Z",
+				"user": map[string]any{"login": "bob", "id": 2}, "path": "internal/fixer/runner.go", "diff_hunk": "@@ -2 +2 @@", "resolver": nil,
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews/203/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id": 103, "body": "Resolved", "html_url": serverURL(r) + "/acme/looper/pulls/42#discussion_r103", "updated_at": "2026-07-03T00:00:00Z",
+				"user": map[string]any{"login": "carol", "id": 3}, "path": "internal/forge/forgejo.go", "diff_hunk": "@@ -3 +3 @@", "resolver": map[string]any{"login": "maintainer", "id": 9},
+			}})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := fixerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+
+	comments, err := adapter.ListNativeReviewComments(context.Background(), fixer.ListNativeReviewCommentsInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath})
+	if err != nil {
+		t.Fatalf("ListNativeReviewComments() error = %v", err)
+	}
+	if len(comments) != 3 {
+		t.Fatalf("comments = %#v, want 3", comments)
+	}
+	if got := comments[0]; got.ObservedFingerprint != fixer.NativeReviewCommentFingerprint(101, "2026-07-01T00:00:00Z") || got.ResolverPresent || got.IsResolved {
+		t.Fatalf("comments[0] = %#v, want absent resolver preserved as open", got)
+	}
+	if got := comments[1]; !got.ResolverPresent || got.IsResolved {
+		t.Fatalf("comments[1] = %#v, want explicit resolver presence without resolution", got)
+	}
+	if got := comments[2]; !got.ResolverPresent || !got.IsResolved || got.Author != "carol" {
+		t.Fatalf("comments[2] = %#v, want resolved comment with author preserved", got)
+	}
+}
+
+func TestFixerGitHubAdapterForgejoFiltersAuthorBeforeLimit(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		pulls := []map[string]any{{"number": 1, "state": "open", "user": map[string]any{"login": "other"}, "head": map[string]any{"ref": "one", "sha": "head-1"}, "base": map[string]any{"ref": "main", "sha": "base"}}}
+		for number := 2; number <= 36; number++ {
+			pulls = append(pulls, map[string]any{"number": number, "state": "open", "user": map[string]any{"login": "Looper"}, "head": map[string]any{"ref": fmt.Sprintf("pr-%d", number), "sha": fmt.Sprintf("head-%d", number)}, "base": map[string]any{"ref": "main", "sha": "base"}})
+		}
+		_ = json.NewEncoder(w).Encode(pulls)
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := fixerGitHubAdapter{config: &cfg}
+
+	prs, err := adapter.ListOpenPullRequests(context.Background(), fixer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath, Author: "looper", Limit: 1})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 2 {
+		t.Fatalf("pull requests = %#v, want matching author after provider result filtering", prs)
+	}
+
+	prs, err = adapter.ListOpenPullRequests(context.Background(), fixer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath, Author: "looper"})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests(default limit) error = %v", err)
+	}
+	if len(prs) != 30 || prs[0].Number != 2 || prs[29].Number != 31 {
+		t.Fatalf("pull requests = %#v, want first 30 matching authors at the default limit", prs)
+	}
+}
+
+func TestFixerGitHubAdapterForgejoBoundsUnfilteredDefaultLimit(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.URL.Query().Get("limit"); got != "30" {
+			t.Fatalf("limit = %q, want default discovery limit 30", got)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 1, "state": "open", "user": map[string]any{"login": "looper"}, "head": map[string]any{"ref": "one", "sha": "head-1"}, "base": map[string]any{"ref": "main", "sha": "base"}}})
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := fixerGitHubAdapter{config: &cfg}
+
+	prs, err := adapter.ListOpenPullRequests(context.Background(), fixer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 1 {
+		t.Fatalf("pull requests = %#v, want bounded provider result", prs)
+	}
+}
+
+func TestForgejoSupportsFixerDiscoveryWithoutOpeningCoordinatorLane(t *testing.T) {
+	if !providerSupportsFixerDiscovery(config.ProviderKindForgejo) {
+		t.Fatal("providerSupportsFixerDiscovery(forgejo) = false, want true")
+	}
+	if providerHasGitHubPullRequests(config.ProviderKindForgejo) {
+		t.Fatal("providerHasGitHubPullRequests(forgejo) = true, coordinator lane must remain disabled")
+	}
+}
+
+func TestFixerGitHubAdapterForgejoResolveNativeReviewComment(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	var calledPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/comments/101/resolve":
+			calledPath = r.URL.Path
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := fixerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+
+	if err := adapter.ResolveNativeReviewComment(context.Background(), fixer.ResolveNativeReviewCommentInput{Repo: "acme/looper", PRNumber: 42, ProviderCommentID: 101, CWD: repoPath}); err != nil {
+		t.Fatalf("ResolveNativeReviewComment() error = %v", err)
+	}
+	if calledPath != "/api/v1/repos/acme/looper/pulls/comments/101/resolve" {
+		t.Fatalf("calledPath = %q, want resolve endpoint", calledPath)
 	}
 }
 

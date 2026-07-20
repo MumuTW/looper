@@ -425,7 +425,7 @@ func (r *Runner) ensureDecisionRequest(ctx context.Context, input stepInput, sta
 		}
 	}
 	body := renderDecisionRequest(marker, state.Brief.Summary, role, questions)
-	created, err := gateway.CreateWorkItemComment(ctx, planeProjectID, workItemID, planedoc.SignComment(body, "requirement-router", r.agentModel))
+	created, err := gateway.CreateWorkItemComment(ctx, planeProjectID, workItemID, planedoc.SignComment(body, "requirement-router", derefString(r.agentModel)))
 	if err != nil {
 		return &loopError{message: "create decision request: " + err.Error(), kind: FailureRetryableTransient}
 	}

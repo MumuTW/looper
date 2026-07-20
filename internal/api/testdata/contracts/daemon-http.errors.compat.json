@@ -46,6 +46,10 @@
       "status": 500
     },
     {
+      "code": "CONFIG_CONFLICT",
+      "status": 409
+    },
+    {
       "code": "INTERNAL_ERROR",
       "status": 500
     },
@@ -90,6 +94,10 @@
       "status": 409
     },
     {
+      "code": "REQUEST_TOO_LARGE",
+      "status": 413
+    },
+    {
       "code": "ROUTE_NOT_FOUND",
       "status": 404
     },
@@ -100,6 +108,10 @@
     {
       "code": "RUNTIME_CONTROL_UNAVAILABLE",
       "status": 501
+    },
+    {
+      "code": "SERVICE_UNAVAILABLE",
+      "status": 503
     },
     {
       "code": "UNAUTHORIZED",

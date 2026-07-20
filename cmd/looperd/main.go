@@ -16,6 +16,7 @@ import (
 	looperdapi "github.com/nexu-io/looper/internal/api"
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/dashboard"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/loops"
@@ -90,13 +91,32 @@ type daemonRuntime struct {
 }
 
 type stopLoopResult struct {
-	Stopped     bool   `json:"stopped"`
-	LoopID      string `json:"loopId"`
-	RunID       string `json:"runId,omitempty"`
-	ExecutionID string `json:"executionId,omitempty"`
-	Vendor      string `json:"vendor,omitempty"`
-	PID         int64  `json:"pid,omitempty"`
+	Stopped           bool   `json:"stopped"`
+	LoopID            string `json:"loopId"`
+	RunID             string `json:"runId,omitempty"`
+	ExecutionID       string `json:"executionId,omitempty"`
+	Vendor            string `json:"vendor,omitempty"`
+	PID               int64  `json:"pid,omitempty"`
+	Outcome           string `json:"outcome,omitempty"`
+	ProcessSkipReason string `json:"processSkipReason,omitempty"`
 }
+
+const (
+	stopOutcomeProcessSignaled = "process_signaled"
+	stopOutcomePausedOnly      = "paused_only"
+	stopOutcomeAlreadyStopping = "already_stopping"
+	stopOutcomeAlreadyFinished = "already_finished"
+
+	processSkipNoRuns              = "no_running_run"
+	processSkipNoExecution         = "no_execution"
+	processSkipAlreadyFinished     = "execution_already_finished"
+	processSkipAlreadyStopping     = "execution_already_stopping"
+	processSkipNoPID               = "pid_unavailable"
+	processSkipNoLiveHandle        = "live_handle_unavailable"
+	processSkipNoSignal            = "signal_unavailable"
+	processSkipVerifierNotRunning  = "pid_not_running"
+	processSkipVerifierRejectedPID = "pid_verification_rejected"
+)
 
 type signalProcessFunc func(int, syscall.Signal) error
 
@@ -105,6 +125,10 @@ type executionMatchesProcessFunc func(context.Context, storage.AgentExecutionRec
 func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
 	rt := looperdruntime.New(looperdruntime.Options{
 		Config:        deps.Config,
+		InitialConfig: deps.InitialConfig,
+		ReloadConfig:  deps.ReloadConfig,
+		LoadConfigAt:  deps.LoadConfigAt,
+		ConfigPath:    deps.Metadata.ConfigPath,
 		Logger:        deps.Logger,
 		DeferRecovery: true,
 	})
@@ -112,8 +136,15 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		return nil, err
 	}
 
-	handler := looperdapi.NewHandler(looperdapi.Context{
-		Config:  deps.Config,
+	apiHandler := looperdapi.NewHandler(looperdapi.Context{
+		Config: deps.Config,
+		ConfigSnapshot: func() (config.Config, looperdapi.ConfigMetadata) {
+			cfg, status := rt.ConfigSnapshot()
+			return cfg, runtimeConfigMetadataFromStatus(status)
+		},
+		PatchConfig: func(ctx context.Context, patch looperdapi.ConfigPatchRequest) error {
+			return patchRuntimeConfig(ctx, rt, patch)
+		},
 		Runtime: rt,
 		ReconcileStaleRuns: func(ctx context.Context) (looperdruntime.StaleRunReconcileSummary, error) {
 			return rt.ReconcileStaleRunningRuns(ctx)
@@ -134,7 +165,8 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 			rt.TriggerSchedulerTick()
 		},
 	})
-	server := looperdapi.NewServer(deps.Config, handler)
+	root := looperdapi.NewRootHandler(apiHandler, dashboard.Handler())
+	server := looperdapi.NewServer(deps.Config, root)
 	if err := server.Start(); err != nil {
 		if deps.Logger != nil {
 			deps.Logger.Warn("looperd recovery aborted because instance did not acquire ownership", map[string]any{"error": err.Error()})
@@ -163,6 +195,174 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 	}, nil
 }
 
+func runtimeConfigMetadata(rt *looperdruntime.Runtime) looperdapi.ConfigMetadata {
+	_, status := rt.ConfigSnapshot()
+	return runtimeConfigMetadataFromStatus(status)
+}
+
+func runtimeConfigMetadataFromStatus(status looperdruntime.ConfigReloadStatus) looperdapi.ConfigMetadata {
+	rejectedPaths := publicConfigRejectedPaths(status.RejectedPaths)
+	lastError := sanitizeConfigDiagnostic(status.LastError, status.RejectedPaths)
+	metadata := looperdapi.ConfigMetadata{
+		ConfigPath:    status.ConfigPath,
+		Format:        status.Format,
+		FilePresent:   status.FilePresent,
+		Revision:      status.Revision,
+		LastAttemptAt: status.LastAttemptAt,
+		LastAppliedAt: status.LastAppliedAt,
+		RejectedPaths: rejectedPaths,
+		Fields:        make(map[string]looperdapi.ConfigFieldMetadata, len(status.FieldSources)),
+	}
+	if lastError != "" {
+		metadata.LastError = &lastError
+	}
+	for path, source := range status.FieldSources {
+		if path == "projects" || strings.HasPrefix(path, "projects.") || isSensitiveConfigMetadataPath(path) || config.IsHotReloadCompatibilityPath(path) {
+			continue
+		}
+		hot := config.IsHotEditablePath(path)
+		fieldLevel := config.IsFieldLevelConfigPath(path) || path == "agent.env"
+		editable := hot && fieldLevel && source != config.ValueSourceEnv && source != config.ValueSourceCLI
+		applyMode := "restart"
+		if hot {
+			applyMode = "hot"
+		}
+		metadata.Fields[path] = looperdapi.ConfigFieldMetadata{
+			Source:    string(source),
+			Editable:  editable,
+			ApplyMode: applyMode,
+		}
+	}
+	return metadata
+}
+
+var sensitiveConfigMetadataRoots = []string{
+	"server.localToken",
+	"agent.params",
+	"daemon.environment",
+}
+
+func isSensitiveConfigMetadataPath(path string) bool {
+	for _, root := range sensitiveConfigMetadataRoots {
+		if path == root || strings.HasPrefix(path, root+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func publicConfigPath(path string) string {
+	for _, root := range sensitiveConfigMetadataRoots {
+		if path == root || strings.HasPrefix(path, root+".") {
+			return root
+		}
+	}
+	return path
+}
+
+func publicConfigRejectedPaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = publicConfigPath(path)
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sanitizeConfigDiagnostic(message string, paths []string) string {
+	if message != "" && len(paths) == 0 {
+		// Field-less parser errors can embed the rejected YAML/TOML scalar. Keep
+		// the API defensive even if a caller supplies status not produced by the
+		// runtime's own sanitized diagnostic path.
+		return "configuration reload rejected: config file could not be decoded or validated"
+	}
+	hasSensitive := false
+	for _, path := range paths {
+		if isSensitiveConfigMetadataPath(path) {
+			hasSensitive = true
+			break
+		}
+	}
+	if hasSensitive {
+		prefix := "configuration reload rejected"
+		if strings.Contains(strings.ToLower(message), "restart") {
+			prefix = "configuration changes require a daemon restart"
+		}
+		return prefix + "; sensitive field details are hidden"
+	}
+	return message
+}
+
+func patchRuntimeConfig(ctx context.Context, rt *looperdruntime.Runtime, patch looperdapi.ConfigPatchRequest) error {
+	err := rt.PatchConfig(ctx, looperdruntime.ConfigPatch{Revision: patch.Revision, Set: patch.Set, Unset: patch.Unset})
+	if err == nil {
+		return nil
+	}
+
+	requestError := looperdapi.ConfigRequestError{
+		Kind:    looperdapi.ConfigRequestErrorKindValidation,
+		Message: err.Error(),
+	}
+	var patchError *looperdruntime.ConfigPatchError
+	if errors.As(err, &patchError) {
+		switch patchError.Kind {
+		case "conflict":
+			requestError.Kind = looperdapi.ConfigRequestErrorKindConflict
+		case "unsupported":
+			requestError.Kind = looperdapi.ConfigRequestErrorKindUnsupported
+		case "validation":
+			requestError.Kind = looperdapi.ConfigRequestErrorKindValidation
+		default:
+			// Filesystem and bootstrap failures are server errors, not user input
+			// failures. Preserve the untyped error so the API returns 500.
+			return err
+		}
+		for _, path := range patchError.Paths {
+			requestError.Issues = append(requestError.Issues, looperdapi.ConfigPatchIssue{
+				Path:    path,
+				Code:    configPatchIssueCode(patchError.Kind),
+				Message: patchError.Error(),
+			})
+		}
+	}
+
+	var validationError *config.ConfigValidationError
+	if errors.As(err, &validationError) {
+		requestError.Issues = requestError.Issues[:0]
+		for _, issue := range validationError.Issues {
+			requestError.Issues = append(requestError.Issues, looperdapi.ConfigPatchIssue{
+				Path:    issue.Path,
+				Code:    "invalid_value",
+				Message: issue.Message,
+			})
+		}
+	}
+	if len(requestError.Issues) == 0 {
+		requestError.Issues = []looperdapi.ConfigPatchIssue{{
+			Code:    configPatchIssueCode(string(requestError.Kind)),
+			Message: err.Error(),
+		}}
+	}
+	return requestError
+}
+
+func configPatchIssueCode(kind string) string {
+	switch kind {
+	case "conflict":
+		return "file_changed"
+	case "unsupported":
+		return "field_not_editable"
+	default:
+		return "invalid_value"
+	}
+}
+
 func stopServerWithTimeout(stop func(context.Context) error, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -171,13 +371,32 @@ func stopServerWithTimeout(stop func(context.Context) error, timeout time.Durati
 
 func (d *daemonRuntime) Stop(reason string) {
 	d.stopOnce.Do(func() {
+		// Admission → HTTP ingress drain → cancel/drain producers → SQLite close
+		// (or retain storage on drain timeout) — ADR-0015 / #575 / #577.
+		if d.runtime != nil {
+			d.runtime.BeginShutdown(reason)
+		}
 		if d.server != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), d.shutdownTimeout)
-			_ = d.server.Stop(ctx)
+			err := d.server.Stop(ctx)
 			cancel()
+			if err != nil {
+				// Fail loud when ingress drain is incomplete; Runtime.Stop still
+				// decides storage close vs retain based on producer drain.
+				_, _ = fmt.Fprintf(os.Stderr, "looperd: HTTP ingress drain incomplete during shutdown: %v\n", err)
+			}
 		}
 		if d.runtime != nil {
 			d.runtime.Stop(reason)
+			if d.runtime.StorageRetained() {
+				// No false graceful success: undrained ownership keeps SQLite open.
+				drainErr := d.runtime.ShutdownDrainError()
+				if drainErr != nil {
+					_, _ = fmt.Fprintf(os.Stderr, "looperd: shutdown drain incomplete; storage retained: %v\n", drainErr)
+				} else {
+					_, _ = fmt.Fprintf(os.Stderr, "looperd: shutdown drain incomplete; storage retained\n")
+				}
+			}
 		}
 	})
 }
@@ -228,7 +447,7 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 }
 
 func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc, terminal bool) (any, error) {
-	result := stopLoopResult{Stopped: false, LoopID: loopID}
+	result := stopLoopResult{Stopped: false, LoopID: loopID, Outcome: stopOutcomePausedOnly}
 	if services.Loops == nil {
 		return nil, fmt.Errorf("loops service is not configured")
 	}
@@ -247,6 +466,10 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return result, nil
 	}
 
+	// Durable pause must succeed before lease cancel. BeginLoopStop cancels
+	// lease contexts wired into execution.run and cannot be undone; doing it
+	// before Pause would half-kill agents when a transient Pause error leaves
+	// the loop still running. Terminal close has no pre-kill status transition.
 	if !terminal {
 		paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
 		if err != nil {
@@ -256,21 +479,82 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		result.LoopID = paused.Loop.ID
 	}
 
-	if services.Repositories == nil || services.Repositories.Runs == nil {
-		return complete()
+	// Close spawn admission for this loop before kill so stop-vs-spawn races
+	// cannot return a live process after halt begins (#576). After a durable
+	// stop (successful pause/terminate), keep the gate closed: in-flight
+	// runners that already claimed work may still reach AgentExecutor.Start
+	// without re-reading loop status. ClearLoopStop runs only on intentional
+	// re-activation (API unpause/retry/handback).
+	//
+	// BeginLoopStop is irreversible for live agents (lease cancel + bound-handle
+	// drain). Non-terminal already paused, so open the gate immediately after
+	// Pause. Terminal close defers the gate until after abortable run/execution
+	// preflight: a transient lookup error must not kill agents while the loop
+	// stays open. releaseLoopStop reopens admission only and cannot undo a
+	// canceled lease.
+	//
+	// Terminal close has no durable status transition until complete(); if a
+	// later Kill/signal/terminate aborts after the gate opens, release the gate
+	// so the still-running loop can AdmitSpawn again. Non-terminal already
+	// paused durably, so the gate stays sticky even when later steps fail.
+	var releaseLoopStop func()
+	var loopStopDrainErr error
+	beginLoopStop := func() {
+		if releaseLoopStop != nil || services.ActiveExecutions == nil {
+			return
+		}
+		var err error
+		releaseLoopStop, err = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+		if err != nil {
+			loopStopDrainErr = err
+		}
+	}
+	if !terminal {
+		beginLoopStop()
+		if loopStopDrainErr != nil {
+			return nil, loopStopDrainErr
+		}
+	}
+	keepStopGateSticky := !terminal
+	defer func() {
+		if releaseLoopStop != nil && !keepStopGateSticky {
+			releaseLoopStop()
+		}
+	}()
+	finish := func() (any, error) {
+		// Ensure admission is closed before durable terminate (terminal) so the
+		// sticky gate applies even when there was no process to kill.
+		beginLoopStop()
+		if loopStopDrainErr != nil {
+			return nil, loopStopDrainErr
+		}
+		out, err := complete()
+		if err == nil {
+			keepStopGateSticky = true
+		}
+		return out, err
 	}
 
+	if services.Repositories == nil || services.Repositories.Runs == nil {
+		result.ProcessSkipReason = processSkipNoRuns
+		return finish()
+	}
+
+	// Abortable preflight for terminal close: do not BeginLoopStop yet.
 	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
 	if err != nil {
 		return nil, err
 	}
 	if latestRun == nil || latestRun.Status != "running" {
-		return complete()
+		result.Outcome = stopOutcomeAlreadyFinished
+		result.ProcessSkipReason = processSkipNoRuns
+		return finish()
 	}
 	result.RunID = latestRun.ID
 
 	if services.Repositories.AgentExecutions == nil {
-		return complete()
+		result.ProcessSkipReason = processSkipNoExecution
+		return finish()
 	}
 
 	latestExecution, err := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
@@ -278,13 +562,25 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return nil, err
 	}
 	if latestExecution == nil {
-		return complete()
+		result.ProcessSkipReason = processSkipNoExecution
+		return finish()
 	}
 
 	result.ExecutionID = latestExecution.ID
 	result.Vendor = latestExecution.Vendor
 	if !isStoppableExecutionStatus(latestExecution.Status) {
-		return complete()
+		result.Outcome = stopOutcomeAlreadyFinished
+		result.ProcessSkipReason = processSkipAlreadyFinished
+		return finish()
+	}
+	if latestExecution.Status == "cancelling" {
+		result.Outcome = stopOutcomeAlreadyStopping
+		result.ProcessSkipReason = processSkipAlreadyStopping
+	}
+	// Past abortable preflight: close admission and drain leases before kill.
+	beginLoopStop()
+	if loopStopDrainErr != nil {
+		return nil, loopStopDrainErr
 	}
 	if services.ActiveExecutions != nil {
 		killed, err := services.ActiveExecutions.Kill(result.LoopID, latestRun.ID, latestExecution.ID, reason)
@@ -292,14 +588,31 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			return nil, err
 		}
 		if killed {
+			result.Outcome = stopOutcomeProcessSignaled
+			result.ProcessSkipReason = ""
 			if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
 				return nil, err
 			}
-			return complete()
+			return finish()
 		}
+		// #576: agent live PID fallback removed after full in-scope agent coverage.
+		// In-scope agents are owned at the common executor boundary; do not
+		// reconstruct stop/kill from SQLite PID while the daemon is live.
+		// A stoppable execution with a persisted PID but no registry entry is an
+		// ownership invariant violation: fail loudly so stop/close cannot report
+		// success while leaving a live agent process behind.
+		if latestExecution.PID != nil && *latestExecution.PID > 0 {
+			result.PID = *latestExecution.PID
+			return nil, looperdruntime.ErrAgentLiveHandleMissing
+		}
+		result.ProcessSkipReason = processSkipNoLiveHandle
+		return finish()
 	}
+	// ActiveExecutions unavailable (misconfigured daemon): keep historical PID
+	// signal path so stop does not silently lose the ability to kill.
 	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
-		return complete()
+		result.ProcessSkipReason = processSkipNoPID
+		return finish()
 	}
 
 	pid := int(*latestExecution.PID)
@@ -309,7 +622,13 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			return nil, err
 		}
 		if !running || !matches {
-			return complete()
+			if !running {
+				result.Outcome = stopOutcomeAlreadyFinished
+				result.ProcessSkipReason = processSkipVerifierNotRunning
+			} else {
+				result.ProcessSkipReason = processSkipVerifierRejectedPID
+			}
+			return finish()
 		}
 	}
 	result.PID = *latestExecution.PID
@@ -317,19 +636,25 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		if err := signalAgentProcessGroup(pid, signal, 5*time.Second); err != nil {
 			return nil, err
 		}
+		result.Outcome = stopOutcomeProcessSignaled
+		result.ProcessSkipReason = ""
+	} else {
+		result.ProcessSkipReason = processSkipNoSignal
+		return finish()
 	}
 
 	if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
 		return nil, err
 	}
 
-	return complete()
+	return finish()
 }
 
 type stopAllResult string
 
 const (
 	stopAllResultStopped         stopAllResult = "stopped"
+	stopAllResultPausedOnly      stopAllResult = "pausedOnly"
 	stopAllResultAlreadyFinished stopAllResult = "alreadyFinished"
 	stopAllResultAlreadyStopping stopAllResult = "alreadyStopping"
 	stopAllResultFailed          stopAllResult = "failed"
@@ -338,6 +663,7 @@ const (
 type stopAllSummary struct {
 	Total           int `json:"total"`
 	Stopped         int `json:"stopped"`
+	PausedOnly      int `json:"pausedOnly"`
 	AlreadyFinished int `json:"alreadyFinished"`
 	AlreadyStopping int `json:"alreadyStopping"`
 	Failed          int `json:"failed"`
@@ -353,6 +679,8 @@ type stopAllItem struct {
 	PreviousRunStatus       string `json:"previousRunStatus,omitempty"`
 	PreviousExecutionStatus string `json:"previousExecutionStatus,omitempty"`
 	Result                  string `json:"result"`
+	Outcome                 string `json:"outcome,omitempty"`
+	ProcessSkipReason       string `json:"processSkipReason,omitempty"`
 	Error                   string `json:"error,omitempty"`
 }
 
@@ -405,11 +733,11 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 			continue
 		}
 
-		_, err := stopLoop(ctx, services, candidate.Loop.ID, reason, now, signal, executionMatchesProcess)
+		stopResultValue, err := stopLoop(ctx, services, candidate.Loop.ID, reason, now, signal, executionMatchesProcess)
 		if err != nil {
 			stopErr := err
 			if candidate.Execution != nil && candidate.Execution.Status == "running" {
-				if fallbackErr := stopCandidateExecution(ctx, services, candidate, reason, now, signal, executionMatchesProcess); fallbackErr != nil {
+				if _, fallbackErr := stopCandidateExecution(ctx, services, candidate, reason, now, signal, executionMatchesProcess); fallbackErr != nil {
 					err = errors.Join(stopErr, fallbackErr)
 				} else {
 					err = stopErr
@@ -428,15 +756,26 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 				item.Error = err.Error()
 			}
 		} else {
+			if stopResult, ok := stopResultValue.(stopLoopResult); ok {
+				item.Outcome = stopResult.Outcome
+				item.ProcessSkipReason = stopResult.ProcessSkipReason
+				item.Result = classifyStopAllItemResult(stopResult)
+			}
 			for _, execution := range candidate.Executions {
 				if execution.Status != "running" {
 					continue
 				}
 				execCandidate := candidate
 				execCandidate.Execution = &execution
-				if execErr := stopCandidateExecution(ctx, services, execCandidate, reason, now, signal, executionMatchesProcess); execErr != nil && item.Error == "" {
+				execResult, execErr := stopCandidateExecution(ctx, services, execCandidate, reason, now, signal, executionMatchesProcess)
+				if execErr != nil && item.Error == "" {
 					item.Result = string(stopAllResultFailed)
 					item.Error = execErr.Error()
+					continue
+				}
+				item = mergeStopAllItemExecutionOutcome(item, execResult)
+				if item.Result == string(stopAllResultPausedOnly) && item.Outcome == stopOutcomeProcessSignaled {
+					item.Outcome = stopOutcomePausedOnly
 				}
 			}
 		}
@@ -456,6 +795,8 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 		switch stopAllResult(item.Result) {
 		case stopAllResultStopped:
 			response.Summary.Stopped++
+		case stopAllResultPausedOnly:
+			response.Summary.PausedOnly++
 		case stopAllResultAlreadyFinished:
 			response.Summary.AlreadyFinished++
 		case stopAllResultAlreadyStopping:
@@ -466,6 +807,59 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 	}
 
 	return response, nil
+}
+
+func classifyStopAllItemResult(result stopLoopResult) string {
+	switch result.Outcome {
+	case stopOutcomeProcessSignaled:
+		return string(stopAllResultStopped)
+	case stopOutcomePausedOnly:
+		return string(stopAllResultPausedOnly)
+	case stopOutcomeAlreadyStopping:
+		return string(stopAllResultAlreadyStopping)
+	case stopOutcomeAlreadyFinished:
+		return string(stopAllResultAlreadyFinished)
+	default:
+		return string(stopAllResultStopped)
+	}
+}
+
+func mergeStopAllItemExecutionOutcome(item stopAllItem, result stopLoopResult) stopAllItem {
+	nextResult := classifyStopAllItemResult(result)
+	nextWins := stopAllResultRank(nextResult) > stopAllResultRank(item.Result)
+	mergedResult, mergedOutcome := mergeStopOutcomes(item.Result, item.Outcome, nextResult, result.Outcome)
+	item.Result = mergedResult
+	item.Outcome = mergedOutcome
+	if nextWins {
+		item.ProcessSkipReason = result.ProcessSkipReason
+	} else if item.ProcessSkipReason == "" && result.ProcessSkipReason != "" {
+		item.ProcessSkipReason = result.ProcessSkipReason
+	}
+	return item
+}
+
+func mergeStopOutcomes(currentResult, currentOutcome, nextResult, nextOutcome string) (string, string) {
+	if stopAllResultRank(nextResult) > stopAllResultRank(currentResult) {
+		return nextResult, nextOutcome
+	}
+	return currentResult, currentOutcome
+}
+
+func stopAllResultRank(result string) int {
+	switch stopAllResult(result) {
+	case stopAllResultFailed:
+		return 4
+	case stopAllResultPausedOnly:
+		return 3
+	case stopAllResultStopped:
+		return 2
+	case stopAllResultAlreadyStopping:
+		return 1
+	case stopAllResultAlreadyFinished:
+		return 0
+	default:
+		return 0
+	}
 }
 
 func collectStopAllCandidates(ctx context.Context, repos *storage.Repositories) ([]stopAllCandidate, error) {
@@ -662,9 +1056,17 @@ func classifyStopAllResult(candidate stopAllCandidate) stopAllResult {
 	return stopAllResultStopped
 }
 
-func stopCandidateExecution(ctx context.Context, services looperdruntime.Services, candidate stopAllCandidate, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) error {
+func stopCandidateExecution(ctx context.Context, services looperdruntime.Services, candidate stopAllCandidate, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (stopLoopResult, error) {
+	result := stopLoopResult{LoopID: candidate.Loop.ID, Outcome: stopOutcomePausedOnly}
 	if candidate.Execution == nil {
-		return nil
+		result.Outcome = stopOutcomeAlreadyFinished
+		result.ProcessSkipReason = processSkipNoExecution
+		return result, nil
+	}
+	result.ExecutionID = candidate.Execution.ID
+	result.Vendor = candidate.Execution.Vendor
+	if candidate.Execution.RunID != nil {
+		result.RunID = *candidate.Execution.RunID
 	}
 	runID := ""
 	if candidate.Execution.RunID != nil {
@@ -672,35 +1074,75 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 	}
 	if runID == "" && candidate.Run != nil {
 		runID = candidate.Run.ID
+		result.RunID = candidate.Run.ID
 	}
 	if services.ActiveExecutions != nil && runID != "" {
+		// Close loop spawn admission only for the kill window so a concurrent
+		// Start cannot return unowned. Always release on return: this helper
+		// does not perform durable pause/terminate. When haltLoop already kept
+		// a sticky gate (successful pause), BeginLoopStop is refcounted so our
+		// release leaves that sticky gate in place. When stopAll falls back
+		// here after a Pause failure, releasing reopens AdmitSpawn for the
+		// still-running loop (ClearLoopStop would never run otherwise).
+		releaseLoopStop, drainErr := services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID, reason)
+		defer releaseLoopStop()
+		if drainErr != nil {
+			return result, drainErr
+		}
 		killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
 		if err != nil {
-			return err
+			return result, err
 		}
 		if killed {
-			return markExecutionCancelling(ctx, services, *candidate.Execution, reason, now)
+			result.Outcome = stopOutcomeProcessSignaled
+			if err := markExecutionCancelling(ctx, services, *candidate.Execution, reason, now); err != nil {
+				return result, err
+			}
+			return result, nil
 		}
+		// #576: no live SQLite-PID fallback when Supervisor registry is present.
+		// Missing handle with a persisted PID is an ownership invariant violation.
+		if candidate.Execution.PID != nil && *candidate.Execution.PID > 0 {
+			result.PID = *candidate.Execution.PID
+			return result, looperdruntime.ErrAgentLiveHandleMissing
+		}
+		result.ProcessSkipReason = processSkipNoLiveHandle
+		return result, nil
 	}
 	if candidate.Execution.PID == nil || *candidate.Execution.PID <= 0 {
-		return nil
+		result.ProcessSkipReason = processSkipNoPID
+		return result, nil
 	}
+	result.PID = *candidate.Execution.PID
 	pid := int(*candidate.Execution.PID)
 	if executionMatchesProcess != nil {
 		matches, running, err := executionMatchesProcess(ctx, *candidate.Execution, pid)
 		if err != nil {
-			return err
+			return result, err
 		}
 		if !running || !matches {
-			return nil
+			if !running {
+				result.Outcome = stopOutcomeAlreadyFinished
+				result.ProcessSkipReason = processSkipVerifierNotRunning
+			} else {
+				result.ProcessSkipReason = processSkipVerifierRejectedPID
+			}
+			return result, nil
 		}
 	}
-	if signal != nil {
-		if err := signalAgentProcessGroup(pid, signal, 5*time.Second); err != nil {
-			return err
-		}
+	if signal == nil {
+		result.ProcessSkipReason = processSkipNoSignal
+		return result, nil
 	}
-	return markExecutionCancelling(ctx, services, *candidate.Execution, reason, now)
+	if err := signalAgentProcessGroup(pid, signal, 5*time.Second); err != nil {
+		return result, err
+	}
+	result.Outcome = stopOutcomeProcessSignaled
+	result.ProcessSkipReason = ""
+	if err := markExecutionCancelling(ctx, services, *candidate.Execution, reason, now); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func isStoppableExecutionStatus(status string) bool {
@@ -753,7 +1195,14 @@ func markExecutionCancelling(ctx context.Context, services looperdruntime.Servic
 	if updated.ErrorMessage == nil {
 		updated.ErrorMessage = &reason
 	}
-	return services.Repositories.AgentExecutions.Upsert(ctx, updated)
+	if err := services.Repositories.AgentExecutions.Upsert(ctx, updated); err != nil {
+		// Terminal already won: stop path must not invent success-over-conflict.
+		if errors.Is(err, storage.ErrAgentExecutionConflict) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func hasVersionArg(args []string) bool {

@@ -7,6 +7,7 @@ const (
 	AgentVendorCodex      AgentVendor = "codex"
 	AgentVendorOpenCode   AgentVendor = "opencode"
 	AgentVendorCursorCLI  AgentVendor = "cursor-cli"
+	AgentVendorGrokBuild  AgentVendor = "grok-build"
 )
 
 type LogLevel string
@@ -81,7 +82,8 @@ const (
 type ReviewerPublishMode string
 
 const (
-	ReviewerPublishModeSingleReview ReviewerPublishMode = "single_review"
+	ReviewerPublishModeSingleReview   ReviewerPublishMode = "single_review"
+	ReviewerPublishModeSummaryComment ReviewerPublishMode = "summary_comment"
 )
 
 type ReviewerThreadResolutionMode string
@@ -184,25 +186,56 @@ const (
 	ProviderKindPlane ProviderKind = "plane"
 )
 
+// ProviderAuthMode selects how a forgejo provider authenticates API calls.
+// token-env uses a native HTTP client with a token from the named environment
+// variable. tea reuses an explicitly selected tea CLI login as transport and
+// never extracts or stores the underlying token.
+type ProviderAuthMode string
+
+const (
+	ProviderAuthTokenEnv ProviderAuthMode = "token-env"
+	ProviderAuthTea      ProviderAuthMode = "tea"
+)
+
 type ProviderConfig struct {
-	ID       string       `json:"id"`
-	Kind     ProviderKind `json:"kind"`
-	BaseURL  string       `json:"baseUrl,omitempty"`
-	GHPath   *string      `json:"ghPath,omitempty"`
-	TokenEnv *string      `json:"tokenEnv,omitempty"`
+	ID       string           `json:"id"`
+	Kind     ProviderKind     `json:"kind"`
+	BaseURL  string           `json:"baseUrl,omitempty"`
+	GHPath   *string          `json:"ghPath,omitempty"`
+	Auth     ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv *string          `json:"tokenEnv,omitempty"`
+	// TeaLogin is the explicit tea CLI login name used when Auth is "tea".
+	// Required for tea-backed Forgejo providers; never inferred from tea's default.
+	TeaLogin *string `json:"teaLogin,omitempty"`
+	// TeaPath optionally overrides the tea executable path (otherwise PATH lookup).
+	TeaPath *string `json:"teaPath,omitempty"`
 	// Workspace and ProjectID identify the Plane project a plane provider reads
 	// its work-items from. Ignored for github/forgejo providers.
 	Workspace *string `json:"workspace,omitempty"`
 	ProjectID *string `json:"projectId,omitempty"`
 }
 
+// AgentBindingConfig is vendor+model only (profiles).
+type AgentBindingConfig struct {
+	Vendor *AgentVendor `json:"vendor,omitempty"`
+	Model  *string      `json:"model,omitempty"` // nil=inherit; non-nil empty=suppress model
+}
+
+// RoleAgentConfig is optional per-role overlay (planner/worker/reviewer/fixer only).
+type RoleAgentConfig struct {
+	Profile *string      `json:"profile,omitempty"`
+	Vendor  *AgentVendor `json:"vendor,omitempty"`
+	Model   *string      `json:"model,omitempty"`
+}
+
 type AgentConfig struct {
-	Vendor       *AgentVendor            `json:"vendor,omitempty"`
-	Model        *string                 `json:"model,omitempty"`
-	Params       map[string]any          `json:"params"`
-	Env          map[string]string       `json:"env"`
-	Timeouts     AgentTimeoutConfig      `json:"timeouts"`
-	NativeResume AgentNativeResumeConfig `json:"nativeResume"`
+	Vendor       *AgentVendor                  `json:"vendor,omitempty"`
+	Model        *string                       `json:"model,omitempty"`
+	Profiles     map[string]AgentBindingConfig `json:"profiles,omitempty"`
+	Params       map[string]any                `json:"params"`
+	Env          map[string]string             `json:"env"`
+	Timeouts     AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume AgentNativeResumeConfig       `json:"nativeResume"`
 }
 
 type AgentNativeResumeConfig struct {
@@ -513,12 +546,14 @@ type PlannerRoleConfig struct {
 	PreSpecDecisionGrill bool                    `json:"preSpecDecisionGrill,omitempty"`
 	Triggers             IssueRoleTriggersConfig `json:"triggers"`
 	Instructions         string                  `json:"instructions,omitempty"`
+	Agent                *RoleAgentConfig        `json:"agent,omitempty"`
 }
 
 type WorkerRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
 }
 
 type ReviewerRoleConfig struct {
@@ -526,12 +561,14 @@ type ReviewerRoleConfig struct {
 	Behavior     ReviewerConfig              `json:"behavior"`
 	AutoMerge    ReviewerAutoMergeConfig     `json:"autoMerge"`
 	Instructions string                      `json:"instructions,omitempty"`
+	Agent        *RoleAgentConfig            `json:"agent,omitempty"`
 }
 
 type FixerRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      FixerRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
 }
 
 type CoordinatorTriageDispositionConfig struct {
@@ -672,13 +709,16 @@ type PartialProjectWebhookConfig struct {
 }
 
 type PartialProviderConfig struct {
-	ID        string        `json:"id"`
-	Kind      *ProviderKind `json:"kind,omitempty"`
-	BaseURL   *string       `json:"baseUrl,omitempty"`
-	GHPath    *string       `json:"ghPath,omitempty"`
-	TokenEnv  *string       `json:"tokenEnv,omitempty"`
-	Workspace *string       `json:"workspace,omitempty"`
-	ProjectID *string       `json:"projectId,omitempty"`
+	ID        string            `json:"id"`
+	Kind      *ProviderKind     `json:"kind,omitempty"`
+	BaseURL   *string           `json:"baseUrl,omitempty"`
+	GHPath    *string           `json:"ghPath,omitempty"`
+	Auth      *ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv  *string           `json:"tokenEnv,omitempty"`
+	TeaLogin  *string           `json:"teaLogin,omitempty"`
+	TeaPath   *string           `json:"teaPath,omitempty"`
+	Workspace *string           `json:"workspace,omitempty"`
+	ProjectID *string           `json:"projectId,omitempty"`
 }
 
 type Config struct {
@@ -762,6 +802,7 @@ type PartialWebhookConfig struct {
 type PartialAgentConfig struct {
 	Vendor       *AgentVendor                    `json:"vendor,omitempty"`
 	Model        *string                         `json:"model,omitempty"`
+	Profiles     map[string]AgentBindingConfig   `json:"profiles,omitempty"`
 	Params       map[string]any                  `json:"params,omitempty"`
 	Env          map[string]string               `json:"env,omitempty"`
 	Timeouts     *PartialAgentTimeoutConfig      `json:"timeouts,omitempty"`
@@ -1024,12 +1065,14 @@ type PartialPlannerRoleConfig struct {
 	PreSpecDecisionGrill *bool                           `json:"preSpecDecisionGrill,omitempty"`
 	Triggers             *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions         *string                         `json:"instructions,omitempty"`
+	Agent                *RoleAgentConfig                `json:"agent,omitempty"`
 }
 
 type PartialWorkerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
 }
 
 type PartialReviewerRoleConfig struct {
@@ -1037,6 +1080,7 @@ type PartialReviewerRoleConfig struct {
 	Behavior     *PartialReviewerConfig              `json:"behavior,omitempty"`
 	AutoMerge    *PartialReviewerAutoMergeConfig     `json:"autoMerge,omitempty"`
 	Instructions *string                             `json:"instructions,omitempty"`
+	Agent        *RoleAgentConfig                    `json:"agent,omitempty"`
 
 	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
@@ -1047,6 +1091,7 @@ type PartialFixerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
 }
 
 type PartialCoordinatorTriageDispositionConfig struct {

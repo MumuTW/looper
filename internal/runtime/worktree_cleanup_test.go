@@ -334,6 +334,11 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 	}
 	t.Cleanup(func() { _ = coordinator.Close() })
 	rt := New(Options{Config: cfg, Now: func() time.Time { return now }, WorktreeCleanupInitialDelay: -1})
+	// Mid-pass AllowClaim rechecks require ready admission; unit tests exercise
+	// candidate mutations, not the starting-state no-op path.
+	if err := rt.admission.MarkReady("worktree cleanup fixture"); err != nil {
+		t.Fatalf("admission.MarkReady() error = %v", err)
+	}
 	return worktreeCleanupFixture{
 		runtime: rt,
 		config:  cfg,
@@ -424,6 +429,14 @@ func (f *fakeWorktreeCleanupGit) WorktreeClean(_ context.Context, worktreePath s
 
 func (f *fakeWorktreeCleanupGit) CleanupWorktree(_ context.Context, input gitinfra.CleanupWorktreeInput) error {
 	f.cleanupCalls = append(f.cleanupCalls, input)
+	// Mirror production: AdmitStart gates process Start only; the long remove
+	// body (onCleanup) runs outside the admission hold so MarkDegraded can
+	// cancel while remove is in flight.
+	if input.AdmitStart != nil {
+		if err := input.AdmitStart(func() error { return nil }); err != nil {
+			return err
+		}
+	}
 	if f.onCleanup != nil {
 		return f.onCleanup(input)
 	}

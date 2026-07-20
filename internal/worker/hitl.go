@@ -119,7 +119,7 @@ func asAwaitingHumanError(err error) (*awaitingHumanError, bool) {
 // human drove during an interactive takeover that has since been handed back, so
 // the daemon's next worker run resumes THAT session and sees their turns. Empty
 // when no takeover resume is pending. Independent of hitl.enabled.
-func (r *Runner) pendingTakeoverResume(loop *storage.LoopRecord) (string, string) {
+func (r *Runner) pendingTakeoverResume(ctx context.Context, loop *storage.LoopRecord, agentVendor string) (string, string) {
 	tr, ok := loops.ReadTakeoverResume(loop.MetadataJSON)
 	if !ok || strings.TrimSpace(tr.SessionID) == "" {
 		return "", ""
@@ -128,18 +128,36 @@ func (r *Runner) pendingTakeoverResume(loop *storage.LoopRecord) (string, string
 	if prompt == "" {
 		prompt = "A human took this task's agent session over directly and has handed it back. Review the whole conversation so far — including their turns — and continue from where they left off; do not restart from scratch."
 	}
-	return prompt, tr.SessionID
+	if r.repos == nil || r.repos.AgentExecutions == nil {
+		return takeoverCheckpointRestartPrompt(), ""
+	}
+	if strings.TrimSpace(agentVendor) == "" {
+		agentVendor = r.agentRuntime
+	}
+	execution, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil || execution == nil || execution.NativeSessionID == nil || strings.TrimSpace(*execution.NativeSessionID) != strings.TrimSpace(tr.SessionID) || strings.TrimSpace(execution.Vendor) != strings.TrimSpace(agentVendor) {
+		return takeoverCheckpointRestartPrompt(), ""
+	}
+	return prompt, strings.TrimSpace(tr.SessionID)
+}
+
+func takeoverCheckpointRestartPrompt() string {
+	return "A human took this task over directly and has handed it back. The configured agent vendor no longer matches the captured session, so start a fresh session, inspect the current worktree and task state, and continue without trying to attach to the old conversation."
 }
 
 // latestNativeSessionID returns the loop's most recent captured agent session id,
 // so a mailbox-driven turn can native-resume the SAME session and have the full
-// conversation context. Empty when none is recorded.
-func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) string {
+// conversation context. Empty when none is recorded. agentVendor is the run's
+// execution-authority vendor (snapshot when present).
+func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor string) string {
 	if r.repos == nil || r.repos.AgentExecutions == nil {
 		return ""
 	}
+	if strings.TrimSpace(agentVendor) == "" {
+		agentVendor = r.agentRuntime
+	}
 	execution, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
-	if err != nil || execution == nil || execution.NativeSessionID == nil {
+	if err != nil || execution == nil || execution.NativeSessionID == nil || strings.TrimSpace(execution.Vendor) != strings.TrimSpace(agentVendor) {
 		return ""
 	}
 	return strings.TrimSpace(*execution.NativeSessionID)
@@ -169,13 +187,19 @@ func (r *Runner) markTakeoverResumeConsumed(ctx context.Context, loop *storage.L
 	}
 }
 
-func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecord) (string, string) {
+func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecord, agentVendor string) (string, string) {
 	ask, ok := r.readFreshHITLAsk(ctx, loop)
 	if !ok || ask.Status != "answered" || strings.TrimSpace(ask.Answer) == "" {
 		return "", ""
 	}
+	if strings.TrimSpace(agentVendor) == "" {
+		agentVendor = r.agentRuntime
+	}
 	resumePrompt := fmt.Sprintf("A human answered the question you asked earlier (%q). Their decision: %s\nContinue the task using this decision; do not ask the same question again.", ask.Question, ask.Answer)
-	return resumePrompt, ask.SessionID
+	if strings.TrimSpace(ask.Vendor) != strings.TrimSpace(agentVendor) {
+		return resumePrompt + "\nThe configured agent vendor changed after the question was asked, so continue in a fresh session rather than trying to attach to the prior vendor's session.", ""
+	}
+	return resumePrompt, strings.TrimSpace(ask.SessionID)
 }
 
 // markHumanAnswerConsumed flips a delivered human answer from "answered" to
@@ -434,7 +458,8 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkp
 	}
 
 	body := buildGitHubAskComment(input.Loop.Seq, awaiting.question, awaiting.options, r.hitlGitHub.MentionLogins)
-	res, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: prNumber, Body: body, CWD: cwd})
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	res, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: prNumber, Body: body, CWD: cwd, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 	if err != nil {
 		return err
 	}
@@ -480,14 +505,17 @@ func (r *Runner) ensureDraftPRForAsk(ctx context.Context, input stepInput, check
 	if err := r.git.Push(ctx, PushInput{RepoPath: cwd, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: compactStrings([]string{base})}); err != nil {
 		return 0, err
 	}
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	created, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{
-		Repo:       repo,
-		HeadBranch: checkpoint.Worktree.Branch,
-		BaseBranch: base,
-		Title:      title,
-		Body:       "🚧 Draft opened by looper to ask a mid-run question — see the comment below. Not ready for review.",
-		Draft:      true,
-		CWD:        cwd,
+		Repo:            repo,
+		HeadBranch:      checkpoint.Worktree.Branch,
+		BaseBranch:      base,
+		Title:           title,
+		Body:            "🚧 Draft opened by looper to ask a mid-run question — see the comment below. Not ready for review.",
+		Draft:           true,
+		CWD:             cwd,
+		DisclosureAgent: disclosureAgent,
+		DisclosureModel: disclosureModel,
 	})
 	if err != nil {
 		return 0, err

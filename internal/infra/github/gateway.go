@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -16,8 +17,10 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -40,19 +43,43 @@ var (
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
 
-var ErrDiffTooLarge = errors.New("github pull request diff is too large")
+var (
+	// ErrDiffTooLarge is returned when GitHub itself refuses a PR diff as oversized
+	// (for example HTTP 406 too_large / 20k-line limit).
+	ErrDiffTooLarge = errors.New("github pull request diff is too large")
+	// ErrLocalCaptureTruncated is returned when Looper's local shell buffer truncated
+	// otherwise-available command output. This is not a GitHub oversized-diff response.
+	ErrLocalCaptureTruncated = errors.New("local shell capture truncated PR diff output")
+	// ErrAnchorValidationUnavailable is returned when review submit cannot establish a
+	// complete base/head diff authority for inline comment anchors.
+	ErrAnchorValidationUnavailable = errors.New("pull request diff anchor validation authority is unavailable")
+	// ErrReviewBaseHeadMismatch is returned when local git objects do not match the
+	// refreshed PR base/head SHAs required for path-targeted anchor authority.
+	ErrReviewBaseHeadMismatch = errors.New("local repository base/head does not match refreshed PR metadata")
+)
+
+// Diagnostic / snapshot reason codes for diff capture and anchor authority.
+const (
+	DiffTruncationReasonLocalCapture   = "local_capture_truncated"
+	DiffTruncationReasonGitHubTooLarge = "github_diff_too_large"
+	AnchorOutsideCompleteDiffReason    = "anchor_outside_complete_diff"
+	AnchorValidationUnavailableReason  = "anchor_validation_unavailable"
+)
 
 type Options struct {
 	GHPath                 string
+	GitPath                string
 	CWD                    string
 	Now                    func() time.Time
 	DiscoveryCacheTTL      time.Duration
 	GHRun                  func(context.Context, shell.Options) (shell.Result, error)
+	GitRun                 func(context.Context, shell.Options) (shell.Result, error)
 	ReviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
 type Gateway struct {
 	ghPath                 string
+	gitPath                string
 	cwd                    string
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
@@ -61,6 +88,7 @@ type Gateway struct {
 	discoveryReviewPRCache map[string]discoveryPullRequestListCacheEntry
 	discoveryIssueCache    map[string]discoveryIssueListCacheEntry
 	ghRun                  func(context.Context, shell.Options) (shell.Result, error)
+	gitRun                 func(context.Context, shell.Options) (shell.Result, error)
 	reviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
@@ -384,15 +412,17 @@ type PullRequestCheckRunsInput struct {
 }
 
 type SubmitReviewInput struct {
-	Repo       string
-	PRNumber   int64
-	Event      string
-	Body       string
-	CommitID   string
-	Comments   []ReviewComment
-	Anchors    *diffanchor.Index
-	Disclosure config.DisclosureConfig
-	CWD        string
+	Repo            string
+	PRNumber        int64
+	Event           string
+	Body            string
+	CommitID        string
+	Comments        []ReviewComment
+	Anchors         *diffanchor.Index
+	Disclosure      config.DisclosureConfig
+	DisclosureAgent string
+	DisclosureModel string
+	CWD             string
 }
 
 type ReviewComment struct {
@@ -657,6 +687,10 @@ func New(options Options) *Gateway {
 	if ghPath == "" {
 		ghPath = "gh"
 	}
+	gitPath := strings.TrimSpace(options.GitPath)
+	if gitPath == "" {
+		gitPath = "git"
+	}
 	now := options.Now
 	if now == nil {
 		now = time.Now
@@ -665,7 +699,23 @@ func New(options Options) *Gateway {
 	if ghRun == nil {
 		ghRun = shell.Run
 	}
-	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
+	gitRun := options.GitRun
+	if gitRun == nil {
+		gitRun = shell.Run
+	}
+	return &Gateway{
+		ghPath:                 ghPath,
+		gitPath:                gitPath,
+		cwd:                    options.CWD,
+		now:                    now,
+		discoveryCacheTTL:      options.DiscoveryCacheTTL,
+		discoveryPRCache:       map[string]discoveryPullRequestListCacheEntry{},
+		discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{},
+		discoveryIssueCache:    map[string]discoveryIssueListCacheEntry{},
+		ghRun:                  ghRun,
+		gitRun:                 gitRun,
+		reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic,
+	}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -1106,10 +1156,20 @@ func (g *Gateway) listDependencyIssues(ctx context.Context, input ViewIssueInput
 	return out, nil
 }
 
+// findAnyIssueNumberJQ projects each issues page down to number + PR marker only.
+// Full issue bodies easily exceed the shell capture cap on busy sandbox repos;
+// gh applies this filter before writing to the bounded stdout buffer.
+const findAnyIssueNumberJQ = `[.[] | {number, pull_request}]`
+
 func (g *Gateway) FindAnyIssueNumber(ctx context.Context, repo string, cwd string) (int64, error) {
 	hostname, repoName := splitRepoHostname(repo)
 	for page := 1; ; page++ {
-		args := []string{"api", fmt.Sprintf("repos/%s/issues?state=all&per_page=100&page=%d", repoName, page)}
+		args := []string{
+			"api",
+			fmt.Sprintf("repos/%s/issues?state=all&per_page=100&page=%d", repoName, page),
+			"--jq",
+			findAnyIssueNumberJQ,
+		}
 		if hostname != "" {
 			args = append(args, "--hostname", hostname)
 		}
@@ -1146,6 +1206,28 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 		return nil, err
 	}
 	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return extractCommentInfos(rows), nil
+}
+
+// listPullRequestAutomationComments keeps PR discovery independent of the size
+// of the full issue conversation. gh applies this projection to each page
+// before writing to the shell capture buffer, so only comments consumed by the
+// fixer/reviewer protocols cross that bounded boundary.
+func (g *Gateway) listPullRequestAutomationComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	filter := `.[] | select((.body // "") | (contains("looper:forgejo-reviewer-summary") or contains("looper:fixer-round") or contains("looper:conflict-notice") or contains("looper:reviewer:automerge-refused") or contains("looper:forgejo-fixer-summary"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--jq", filter}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONObjects(result.Stdout)
 	if err != nil {
 		return nil, err
 	}
@@ -1211,6 +1293,9 @@ func (g *Gateway) AddIssueReaction(ctx context.Context, input CreateIssueReactio
 }
 
 func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
+		return IssueCommentResult{}, err
+	}
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--method", "POST", "-f", "body=" + input.Body}
 	if hostname != "" {
@@ -1228,6 +1313,9 @@ func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInpu
 }
 
 func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
+		return err
+	}
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s/issues/comments/%d", repo, input.CommentID), "--method", "PATCH", "-f", "body=" + input.Body}
 	if hostname != "" {
@@ -1460,7 +1548,7 @@ func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullR
 	}
 	issueComments := []CommentInfo(nil)
 	if includeIssueComments {
-		issueComments, err = g.ListIssueComments(ctx, ViewIssueInput{Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD})
+		issueComments, err = g.listPullRequestAutomationComments(ctx, ViewIssueInput{Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD})
 		if err != nil {
 			return PullRequestDetail{}, err
 		}
@@ -1795,6 +1883,9 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 }
 
 func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThreadReplyInput) error {
+	if err := outboundguard.ValidateReviewThreadReply(input.Body, input.ThreadID); err != nil {
+		return err
+	}
 	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
 		"mutation($threadId: ID!, $body: String!) {",
 		"  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {",
@@ -1839,6 +1930,11 @@ func (g *Gateway) CompareCommits(ctx context.Context, input CompareCommitsInput)
 
 func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDiffInput) (string, error) {
 	result, err := g.runGhWithTimeout(ctx, input.CWD, "", prDiffGhCommandTimeout, "pr", "diff", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo)
+	// Never treat a truncated local capture as a complete diff authority, and never
+	// collapse it into GitHub's true oversized-diff signal.
+	if result.StdoutTruncated {
+		return "", ErrLocalCaptureTruncated
+	}
 	if err != nil {
 		if isDiffTooLargeError(err) {
 			return "", ErrDiffTooLarge
@@ -1850,14 +1946,27 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
 	request := g.reviewSubmitRequest(input)
+	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
+		// Always redact paths on validation_failed: pre-publish diagnostics must
+		// not echo secret-shaped path fields even when the rejection reason is
+		// not path-related (and for content-safety rejections of the path itself).
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
+		return err
+	}
 	if marker, ok := findReviewIdempotencyMarker(input.Body, ""); ok && marker.Outcome == "clean" && len(input.Comments) > 0 {
 		err := fmt.Errorf("clean review marker cannot be submitted with review comments")
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
 		return err
 	}
 	var flags []reviewQualityFlag
 	var processing reviewCommentProcessing
 	input.Body, input.Comments, flags, processing = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
+	// Re-validate after normalization: FallbackBody / retarget prefixes embed agent path
+	// into the top-level review body, which was not present in the pre-normalize fields.
+	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
+		return err
+	}
 	request = g.reviewSubmitRequest(input)
 	request["comment_processing"] = map[string]any{
 		"original_count":   processing.OriginalCount,
@@ -1869,12 +1978,12 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	}
 	gateApplies, err := reviewQualityGateApplies(input.Event, input.Body)
 	if err != nil {
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
 		return err
 	}
 	if gateApplies && len(flags) > 0 {
 		err := fmt.Errorf("review quality gate failed: %s", formatReviewQualityFlags(flags))
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error(), "quality_flags": reviewQualityFlagsSummary(flags)})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error(), "quality_flags": reviewQualityFlagsSummary(flags)})
 		return err
 	}
 	comments := input.Comments[:0]
@@ -1968,6 +2077,27 @@ func (g *Gateway) emitReviewSubmitDiagnostic(event string, fields map[string]any
 	}
 }
 
+// validateReviewOutboundContent checks review body, inline comment bodies, and
+// anchor paths. Paths are included because normalizeReviewAnchors can embed
+// them into the published top-level body via FallbackBody / retarget prefixes,
+// and kept comments publish path on the GitHub review API.
+func validateReviewOutboundContent(body string, comments []ReviewComment) error {
+	fields := []outboundguard.Field{{Name: "review body", Text: body}}
+	for i, comment := range comments {
+		fields = append(fields, outboundguard.Field{
+			Name: fmt.Sprintf("inline review comment %d", i+1),
+			Text: comment.Body,
+		})
+		if path := strings.TrimSpace(comment.Path); path != "" {
+			fields = append(fields, outboundguard.Field{
+				Name: fmt.Sprintf("inline review comment %d path", i+1),
+				Text: path,
+			})
+		}
+	}
+	return outboundguard.Validate(fields...)
+}
+
 func (g *Gateway) reviewSubmitRequest(input SubmitReviewInput) map[string]any {
 	endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber)
 	request := map[string]any{
@@ -1993,15 +2123,137 @@ func reviewSubmitBodyMarkerSummary(body string) map[string]any {
 }
 
 func reviewSubmitCommentsSummary(comments []ReviewComment) []map[string]any {
+	return reviewSubmitCommentsSummaryWithPaths(comments, true)
+}
+
+func reviewSubmitCommentsSummaryWithPaths(comments []ReviewComment, includePaths bool) []map[string]any {
 	summary := make([]map[string]any, 0, len(comments))
 	for idx, comment := range comments {
 		entry := map[string]any{"index": reviewCommentDiagnosticIndex(comment, idx)}
 		for key, value := range reviewCommentAnchorMap(comment) {
+			if key == "path" && !includePaths {
+				if strings.TrimSpace(comment.Path) != "" {
+					entry["path_present"] = true
+				}
+				continue
+			}
 			entry[key] = value
 		}
 		summary = append(summary, entry)
 	}
 	return summary
+}
+
+// redactReviewSubmitRequestPaths returns a diagnostic-safe request summary for
+// validation_failed events. Raw comment paths and nested processing anchors are
+// replaced with path_present so secret-shaped path values cannot leak into
+// logs/stderr while publication is rejected.
+func redactReviewSubmitRequestPaths(request map[string]any) map[string]any {
+	if request == nil {
+		return nil
+	}
+	sanitized := make(map[string]any, len(request))
+	for key, value := range request {
+		sanitized[key] = value
+	}
+	if payload, ok := sanitized["payload"].(map[string]any); ok {
+		payloadCopy := make(map[string]any, len(payload))
+		for key, value := range payload {
+			payloadCopy[key] = value
+		}
+		payloadCopy["comments"] = redactDiagnosticCommentList(payloadCopy["comments"])
+		sanitized["payload"] = payloadCopy
+	}
+	if processing, ok := sanitized["comment_processing"].(map[string]any); ok {
+		processingCopy := make(map[string]any, len(processing))
+		for key, value := range processing {
+			processingCopy[key] = value
+		}
+		processingCopy["comments"] = redactDiagnosticProcessingCommentList(processingCopy["comments"])
+		sanitized["comment_processing"] = processingCopy
+	}
+	return sanitized
+}
+
+func redactDiagnosticCommentList(raw any) any {
+	switch comments := raw.(type) {
+	case []map[string]any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, entry := range comments {
+			redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	case []any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, rawEntry := range comments {
+			entry, ok := rawEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	default:
+		return raw
+	}
+}
+
+func redactDiagnosticProcessingCommentList(raw any) any {
+	switch comments := raw.(type) {
+	case []map[string]any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, entry := range comments {
+			redacted = append(redacted, redactProcessingCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	case []any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, rawEntry := range comments {
+			entry, ok := rawEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			redacted = append(redacted, redactProcessingCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	default:
+		return raw
+	}
+}
+
+func redactReviewCommentDiagnosticEntry(entry map[string]any) map[string]any {
+	if entry == nil {
+		return nil
+	}
+	out := make(map[string]any, len(entry))
+	for key, value := range entry {
+		if key == "path" {
+			if path, ok := value.(string); ok && strings.TrimSpace(path) != "" {
+				out["path_present"] = true
+			}
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func redactProcessingCommentDiagnosticEntry(entry map[string]any) map[string]any {
+	if entry == nil {
+		return nil
+	}
+	out := make(map[string]any, len(entry))
+	for key, value := range entry {
+		switch key {
+		case "original_anchor", "final_anchor":
+			if anchor, ok := value.(map[string]any); ok {
+				out[key] = redactReviewCommentDiagnosticEntry(anchor)
+				continue
+			}
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func reviewCommentDiagnosticIndex(comment ReviewComment, fallback int) int {
@@ -2111,6 +2363,9 @@ func containsVisibleInlineReviewDisclosure(body string) bool {
 }
 
 func (g *Gateway) AddPullRequestComment(ctx context.Context, input PullRequestCommentInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "pull request comment body", Text: input.Body}); err != nil {
+		return err
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "comment", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--body", input.Body)
 	return err
 }
@@ -2532,6 +2787,9 @@ func (g *Gateway) DismissReview(ctx context.Context, input DismissReviewInput) e
 	if message == "" {
 		message = "Dismissed by looper."
 	}
+	if err := outboundguard.Validate(outboundguard.Field{Name: "review dismissal message", Text: message}); err != nil {
+		return err
+	}
 	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/reviews/%d/dismissals", repo, input.PRNumber, input.ReviewID), "--method", "PUT", "-f", "message=" + message, "-f", "event=DISMISS"}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
@@ -2541,6 +2799,12 @@ func (g *Gateway) DismissReview(ctx context.Context, input DismissReviewInput) e
 }
 
 func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (CreatePullRequestResult, error) {
+	if err := outboundguard.Validate(
+		outboundguard.Field{Name: "pull request title", Text: input.Title},
+		outboundguard.Field{Name: "pull request body", Text: input.Body},
+	); err != nil {
+		return CreatePullRequestResult{}, err
+	}
 	args := []string{"pr", "create", "--repo", input.Repo, "--head", input.HeadBranch, "--base", input.BaseBranch, "--title", input.Title, "--body", input.Body}
 	if input.Draft {
 		args = append(args, "--draft")
@@ -2580,11 +2844,17 @@ func (g *Gateway) CompareBranches(ctx context.Context, input CompareBranchesInpu
 }
 
 func (g *Gateway) UpdatePullRequestTitle(ctx context.Context, input UpdatePullRequestTitleInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "pull request title", Text: input.Title}); err != nil {
+		return err
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--title", input.Title)
 	return err
 }
 
 func (g *Gateway) UpdatePullRequestBody(ctx context.Context, input UpdatePullRequestBodyInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "pull request body", Text: input.Body}); err != nil {
+		return err
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--body", input.Body)
 	return err
 }
@@ -2753,7 +3023,7 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	}
 	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		if !errors.Is(err, ErrDiffTooLarge) {
+		if !errors.Is(err, ErrDiffTooLarge) && !errors.Is(err, ErrLocalCaptureTruncated) {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
 	}
@@ -2764,7 +3034,11 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	payloadMap := map[string]any{"detail": detail, "diff": diff}
 	if errors.Is(err, ErrDiffTooLarge) {
 		payloadMap["diffTruncated"] = true
-		payloadMap["diffTruncationReason"] = "github_too_large"
+		payloadMap["diffTruncationReason"] = DiffTruncationReasonGitHubTooLarge
+	}
+	if errors.Is(err, ErrLocalCaptureTruncated) {
+		payloadMap["diffTruncated"] = true
+		payloadMap["diffTruncationReason"] = DiffTruncationReasonLocalCapture
 	}
 	payload, err := json.Marshal(payloadMap)
 	if err != nil {
@@ -3138,6 +3412,20 @@ func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) 
 
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
 	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+	if result.StdoutTruncated || result.StderrTruncated {
+		streams := make([]string, 0, 2)
+		if result.StdoutTruncated {
+			streams = append(streams, fmt.Sprintf("stdout after %d bytes", len(result.Stdout)))
+		}
+		if result.StderrTruncated {
+			streams = append(streams, fmt.Sprintf("stderr after %d bytes", len(result.Stderr)))
+		}
+		message := "GitHub command output truncated: " + strings.Join(streams, ", ")
+		if err != nil {
+			message += "; command error: " + err.Error()
+		}
+		return result, &shell.CommandExecutionError{Message: message, Result: result}
+	}
 	if err != nil && isTransientGitHubMessage(strings.Join([]string{err.Error(), result.Stdout, result.Stderr}, "\n")) {
 		return result, &TransientError{Err: err}
 	}
@@ -3455,6 +3743,8 @@ func resolveLabelColor(label string) string {
 		return "0e8a16"
 	case specpr.NeedsHumanLabel:
 		return "d93f0b"
+	case domain.HoldLabelGlobal, domain.HoldLabelWorker, domain.HoldLabelFixer, domain.HoldLabelReviewer:
+		return "b60205"
 	default:
 		return "5319e7"
 	}
@@ -3472,6 +3762,14 @@ func resolveLabelDescription(label string) string {
 		return "Spec PR is ready for implementation"
 	case specpr.NeedsHumanLabel:
 		return "Looper requires manual intervention"
+	case domain.HoldLabelGlobal:
+		return "Block all automatic Looper activity for this issue or PR"
+	case domain.HoldLabelWorker:
+		return "Block automatic worker activity for this issue or PR"
+	case domain.HoldLabelFixer:
+		return "Block automatic fixer activity for this issue or PR"
+	case domain.HoldLabelReviewer:
+		return "Block automatic reviewer activity for this issue or PR"
 	default:
 		return "Managed by looper"
 	}
@@ -3484,6 +3782,10 @@ func StandardLooperLabels() []LabelDefinition {
 		{Name: specpr.ReviewingLabel, Color: resolveLabelColor(specpr.ReviewingLabel), Description: resolveLabelDescription(specpr.ReviewingLabel)},
 		{Name: specpr.ReadyLabel, Color: resolveLabelColor(specpr.ReadyLabel), Description: resolveLabelDescription(specpr.ReadyLabel)},
 		{Name: specpr.NeedsHumanLabel, Color: resolveLabelColor(specpr.NeedsHumanLabel), Description: resolveLabelDescription(specpr.NeedsHumanLabel)},
+		{Name: domain.HoldLabelGlobal, Color: resolveLabelColor(domain.HoldLabelGlobal), Description: resolveLabelDescription(domain.HoldLabelGlobal)},
+		{Name: domain.HoldLabelWorker, Color: resolveLabelColor(domain.HoldLabelWorker), Description: resolveLabelDescription(domain.HoldLabelWorker)},
+		{Name: domain.HoldLabelFixer, Color: resolveLabelColor(domain.HoldLabelFixer), Description: resolveLabelDescription(domain.HoldLabelFixer)},
+		{Name: domain.HoldLabelReviewer, Color: resolveLabelColor(domain.HoldLabelReviewer), Description: resolveLabelDescription(domain.HoldLabelReviewer)},
 	}
 }
 
@@ -3542,6 +3844,34 @@ func decodeJSONArrayOrPages(value string) ([]map[string]any, error) {
 		return []map[string]any{}, nil
 	}
 	return rows, nil
+}
+
+func decodeJSONObjects(value string) ([]map[string]any, error) {
+	decoder := json.NewDecoder(strings.NewReader(value))
+	rows := make([]map[string]any, 0)
+	for {
+		var item any
+		if err := decoder.Decode(&item); err != nil {
+			if errors.Is(err, io.EOF) {
+				return rows, nil
+			}
+			return nil, invalidJSONError(value, err)
+		}
+		switch typed := item.(type) {
+		case map[string]any:
+			rows = append(rows, typed)
+		case []any:
+			for _, entry := range typed {
+				row, ok := entry.(map[string]any)
+				if !ok {
+					return nil, invalidJSONError(value, fmt.Errorf("expected JSON object in array, got %T", entry))
+				}
+				rows = append(rows, row)
+			}
+		default:
+			return nil, invalidJSONError(value, fmt.Errorf("expected JSON object or array, got %T", item))
+		}
+	}
 }
 
 func invalidJSONError(stdout string, err error) error {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/spf13/cobra"
 )
 
@@ -744,6 +745,12 @@ func splitLogLines(content string) []string {
 }
 
 func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
+	if loaded, configured, err := forge.LoadTrustedReviewConfigSnapshot(); configured {
+		if err != nil {
+			return config.LoadedFileConfig{}, err
+		}
+		return loaded, nil
+	}
 	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv)})
 	if err != nil {
 		return config.LoadedFileConfig{}, err
@@ -861,14 +868,22 @@ func (r *commandRuntime) apiClientFromLoaded(loaded config.LoadedFileConfig) *Da
 	if loaded.Config.Server.BaseURL != nil && strings.TrimSpace(*loaded.Config.Server.BaseURL) != "" {
 		baseURL = strings.TrimSpace(*loaded.Config.Server.BaseURL)
 	} else {
-		baseURL = fmt.Sprintf("http://%s:%d", loaded.Config.Server.Host, loaded.Config.Server.Port)
+		// Bracket IPv6 literals (net.JoinHostPort) so dial works for hosts like ::1.
+		// Map wildcard binds (0.0.0.0 / ::) to loopback so request Host matches the
+		// browser Host guard allowlist (same mapping as dashboardAPIClient).
+		host := browserHostForDashboard(loaded.Config.Server.Host)
+		baseURL = dashboardHTTPBaseURL(host, loaded.Config.Server.Port)
 	}
 
 	return r.newAPIClientForLoaded(loaded, baseURL)
 }
 
 func (r *commandRuntime) localAPIClientFromLoaded(loaded config.LoadedFileConfig) *DaemonAPIClient {
-	baseURL := fmt.Sprintf("http://%s:%d", loaded.Config.Server.Host, loaded.Config.Server.Port)
+	// Reuse dashboardHTTPBaseURL so daemonStart readiness polling brackets IPv6
+	// hosts the same way as `looper dashboard` probe/mint clients. Map wildcard
+	// binds to loopback so Host is allowlisted by the browser guard.
+	host := browserHostForDashboard(loaded.Config.Server.Host)
+	baseURL := dashboardHTTPBaseURL(host, loaded.Config.Server.Port)
 	return r.newAPIClientForLoaded(loaded, baseURL)
 }
 

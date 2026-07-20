@@ -1,6 +1,6 @@
 # Looper Quick User Guide
 
-This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support is currently limited to planner, worker, and summary-comment reviewer/fixer flows.
+This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, native reviewer requests/reviews, summary-comment compatibility, and the manual/direct native-review-comment fixer path.
 
 ## 1. Prerequisites
 
@@ -32,10 +32,18 @@ Also make sure:
 - `looperd` is running
 - your local repo can `git fetch` and `git push`
 - GitHub projects: `gh` is authenticated with the target GitHub account
-- Forgejo projects: the configured provider `tokenEnv` is exported in the daemon environment
-- `config.agent.vendor` is set (for example via `looper bootstrap --agent-vendor opencode`)
+- Forgejo projects: for `token-env` auth, the configured provider `tokenEnv` is exported in the daemon environment; for `tea` auth, the selected tea login must already be available to the daemon user
+- each coding role you want to run can resolve a vendor: either set global `config.agent.vendor` (for example via `looper bootstrap --agent-vendor opencode`), or supply vendor via `agent.profiles` / `roles.<role>.agent` as described in [Multi-role agent vendor and model](configuration.md#multi-role-agent-vendor-and-model). A single global vendor is the zero-diff default that covers planner, worker, reviewer, and fixer until you add per-role bindings. Coordinator triage always uses the global agent only and is skipped when global vendor is unset.
 
-Forgejo projects are added in config, not by `looper project add` autodetection. Add a `[[providers]]` entry with `kind = "forgejo"`, `baseUrl`, and `tokenEnv`, then set the project `provider` and explicit `repo` (`owner/name`). See [configuration](configuration.md#provider-support).
+Forgejo projects can be onboarded with `looper bootstrap --provider forgejo`, managed with `looper provider add|list|test|remove`, or added to a running installation with `looper project add --forgejo-url ...` plus either `--forgejo-token-env` or `--auth tea --tea-login`. Tea-backed providers reuse an explicit `tea` login for the provider host and do not require a second token environment variable. For configured providers, pass the provider id explicitly; `--provider forgejo` selects it only when the origin has one unambiguous match. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
+
+`looper status` probes each configured Forgejo provider with bounded, read-only requests. Human and JSON output distinguish endpoint reachability, token authentication, current identity, server version, per-project read/write access, and configured versus observed capabilities. An unavailable OpenAPI contract is reported as `unknown`, never as supported. Status output omits provider URLs, token environment names, tokens, and raw network errors.
+
+### Grok Build (xAI)
+
+For xAI Grok Build, configure `agent.vendor = "grok-build"`; Looper runs the `grok` executable. Authenticate the daemon with `grok login --device-auth` or by providing `XAI_API_KEY` in its environment—never commit an API-key value. Looper defaults to `--always-approve --sandbox off` so Grok can update Git metadata outside a linked worktree; configure `--sandbox` explicitly if a stricter profile works with your repository layout.
+
+Configured Grok arguments take precedence: `--permission-mode` can prompt or fail unattended work, a non-`plain` `--output-format` can break direct completion-marker parsing, and `-p`/`--single` replaces Looper's generated task prompt. Grok Build has no daemon native resume or interactive `looper resume` takeover. Retries start with a fresh checkpoint prompt; Looper never uses ambient `--continue`.
 
 ## 1a. Local-only vs Routed projects
 
@@ -96,9 +104,9 @@ If no project matches the current directory, or multiple projects match, pass `-
 Forgejo MVP role support:
 
 - Planner and Worker are supported over the Forgejo REST API.
-- Reviewer is supported through a top-level Reviewer Summary PR comment. The machine-readable summary is the authority for Forgejo Fixer input.
-- Fixer is supported through a no-resolve summary protocol: it consumes open items from the Reviewer Summary and publishes a top-level Fixer Summary PR comment. Reviewer closes, reopens, or supersedes items on the next review round.
-- Coordinator, auto-merge, native reviews, review requests, review-thread resolution, routed network mode, and webhook modes are GitHub-only for now.
+- Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level Reviewer Summary compatibility protocol.
+- Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and manual/direct `looper fix` runs also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
+- Coordinator, auto-merge, routed network mode, and webhook modes remain unsupported for Forgejo.
 - A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
 ## 4. Recommended flow
@@ -266,7 +274,7 @@ For the default review-requested path, Looper asks GitHub for PRs requested from
 
 For spec PRs, `looper:spec-reviewing` marks the review phase, but it does not by itself authorize other users' Looper instances to run. Request review from the intended GitHub user to trigger that user's automatic reviewer.
 
-For Forgejo projects, reviewer auto-discovery uses labels instead of review requests. The provider profile defaults normal PR discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Forgejo reviewer publishes a top-level Reviewer Summary comment and does not create native `APPROVE` or `REQUEST_CHANGES` reviews. Forgejo fixer consumes only `open` items from that Reviewer Summary and publishes a Fixer Summary comment; it does not resolve native review threads.
+For Forgejo projects, reviewer auto-discovery defaults to review requests. Configured labels can be used independently or combined with review requests; combined results are deduplicated deterministically. Reviewer publishes native `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` reviews according to configuration and preserves Looper disclosure/idempotency markers. Self-authored PRs are skipped by default; when self-review is enabled, an attempted clean approval is explicitly downgraded to `COMMENT`. Set reviewer `publishMode` to `summary_comment` to keep the legacy Reviewer Summary/Fixer Summary workflow.
 
 ### What happens after reviewer finishes
 
@@ -329,6 +337,13 @@ Fixer will:
 - push back to the same PR branch
 - after validation and push succeed, try to resolve only the review threads that were both verified by Looper and explicitly confirmed by the fixer agent
 
+For Forgejo projects, automatic Fixer runs are summary-only because Forgejo's public REST API does not currently expose a native review-comment resolve mutation:
+
+- reviewer-summary items still come from the top-level Reviewer Summary comment
+- native Forgejo PR review comments do not trigger automatic Fixer runs, even when their response includes a `resolver` field
+- the `resolver` response field describes state; it is not treated as proof that a resolve mutation exists
+- explicit manual Fixer runs may inspect native comments, but stop with a manual-intervention error when the provider cannot resolve them
+
 If the PR is still in the spec review phase and the review becomes clean, fixer can also move the labels from:
 
 - `looper:spec-reviewing` → `looper:spec-ready`
@@ -389,6 +404,10 @@ These are the most important labels right now:
 | `looper:spec-reviewing` | PR | This PR is in the spec review phase |
 | `looper:spec-ready` | PR | The spec is approved and ready for worker |
 | `looper:needs-human` | PR | Reserved for manual intervention cases |
+| `looper:hold` | issue or PR | Block all automatic Looper activity on that item |
+| `looper:hold:worker` | issue or PR | Block automatic worker activity on that item |
+| `looper:hold:fixer` | issue or PR | Block automatic fixer activity on that item |
+| `looper:hold:reviewer` | issue or PR | Block automatic reviewer activity on that item |
 
 Treat these as stage signals, not just descriptive labels.
 
@@ -416,7 +435,30 @@ Reviewer automatically pays attention to:
 
 The `looper:spec-reviewing` label is a phase marker; automatic review still requires a review request unless the loop was explicitly started locally.
 
-## 12. Common GitHub / PR commands
+## 12. Hold labels
+
+Looper's official hold labels are:
+
+- `looper:hold`
+- `looper:hold:worker`
+- `looper:hold:fixer`
+- `looper:hold:reviewer`
+
+Semantics:
+
+- `looper:hold` blocks all automatic Looper activity for the labeled issue or PR.
+- `looper:hold:worker` blocks only automatic worker activity.
+- `looper:hold:fixer` blocks only automatic fixer activity.
+- `looper:hold:reviewer` blocks only automatic reviewer activity.
+- planner is special: only `looper:hold` blocks planner.
+- there is no issue/PR inheritance.
+- Looper never adds or removes hold labels.
+- removing a hold takes effect on the next normal scan.
+- only explicit manual `looper work/review/fix --force` or API create requests with `force=true` can bypass hold.
+
+Create-time CLI/API hold validation is best-effort only when the local project repo path or configured `gh` path is unavailable. If those are present but remote `gh` inspection fails, creation fails fast. Automatic discovery and runtime checks still use live remote labels as authority whenever Looper can fetch them.
+
+## 13. Common GitHub / PR commands
 
 Inspect PRs:
 
@@ -440,10 +482,11 @@ Start fixer for an existing PR:
 looper loop start --type fixer --pr owner/repo#42
 ```
 
-## 12. How to inspect current activity
+## 14. How to inspect current activity
 
 ```bash
 looper ps
+looper describe 12
 looper logs 12 --follow
 looper jump 12
 looper stop 12
@@ -452,14 +495,15 @@ looper run reconcile-stale
 
 Typical usage:
 
-- `looper ps`: see which loops are currently running
+- `looper ps`: see which loops are currently running (includes a truncated failure reason when present)
+- `looper describe <id>`: show why a loop is blocked (manual intervention reason, diagnosis); same as `looper loop inspect`
 - `looper logs <id> --follow`: stream logs live
 - `looper jump <id>`: print the shell command for the loop's worktree; use `eval "$(looper jump 12)"` to actually change directories, or pass `--print-path` to print just the path
 - `looper worktree cleanup`: inspect Looper-managed worktree cleanup candidates without deleting anything; add `--confirm` for one immediate cleanup pass or `--json` for structured output
 - `looper stop <id>`: stop an active loop
 - `looper run reconcile-stale`: interrupt stale running runs, repair blocked queue state, and requeue eligible loops after sleep/wake or other local process loss; `looper daemon restart` is still a reasonable fallback if you want a full daemon restart
 
-## 13. Minimal end-to-end example
+## 15. Minimal end-to-end example
 
 ### Option A: start from an issue
 
@@ -518,7 +562,7 @@ looper takeover owner/repo#42 --merge   # also auto-merge once approved + green
 3. starts a continuous reviewer loop and fixer loop on the target PR (skip the fixer with `--no-fix`);
 4. with `--merge`, sets `roles.reviewer.autoMerge.enabled` for the project so the reviewer enables GitHub auto-merge once the PR is approved and checks are green.
 
-Agent selection: `takeover` reuses the vendor already in your config; otherwise it auto-detects an installed `claude` / `codex` / `opencode` CLI, prompts when the choice is ambiguous, and accepts `--agent-vendor` plus `--yes` for non-interactive runs. Auto-merge still depends on the repository allowing it (and, by default, on branch protection with required checks); when GitHub refuses, the reviewer keeps reviewing and reports why instead.
+Agent selection: `takeover` reuses the vendor already in your config; otherwise it auto-detects an installed `claude` / `codex` / `grok` / `opencode` CLI, prompts when the choice is ambiguous, and accepts `--agent-vendor` plus `--yes` for non-interactive runs. Auto-merge still depends on the repository allowing it (and, by default, on branch protection with required checks); when GitHub refuses, the reviewer keeps reviewing and reports why instead.
 
 Manage and stop takeovers:
 
@@ -530,7 +574,7 @@ looper takeover stop --all           # stop every takeover
 
 `takeover list` / `stop` are backed by a local index at `~/.looper/takeovers.json`; stopping closes the underlying loops by id (so it works even while they are idle/waiting between commits).
 
-## 14. Quick decision guide
+## 16. Quick decision guide
 
 - You have an issue but no spec yet: use `planner`
 - You have a PR that needs review: use `reviewer`
@@ -544,7 +588,7 @@ As a rule of thumb:
 - use `--project` when you are outside the repo, or when Looper cannot infer the project uniquely
 - for `plan`, prefer passing `--project`
 
-## 15. Authentication
+## 17. Authentication
 
 Looper uses `gh` for GitHub access, so `gh auth status` should succeed before you start planner / reviewer / fixer / worker workflows.
 
@@ -559,7 +603,7 @@ looper status
 
 This is separate from GitHub authentication.
 
-## 16. Webhook delivery status
+## 18. Webhook delivery status
 
 When webhook mode is enabled, `looper webhook status --json` reports the active delivery mode.
 
@@ -595,7 +639,7 @@ looper webhook delete owner/repo --confirm
 - `rotate` changes the per-repo HMAC secret and updates the existing hook by id.
 - `delete --confirm` is the only command that removes a Looper-managed tunnel hook from GitHub.
 
-## 17. One important clarification
+## 19. One important clarification
 
 In the current implementation, "automatic triggering" is closer to:
 

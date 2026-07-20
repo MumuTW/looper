@@ -3,10 +3,15 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -192,8 +197,8 @@ func TestForgejoClientContract(t *testing.T) {
 	if got := client.Repository().BaseURL; got != server.URL+"/forge" {
 		t.Fatalf("Repository().BaseURL = %q, want %q", got, server.URL+"/forge")
 	}
-	if got := client.Capabilities().ReviewPublish; got != ReviewPublishCommentOnly {
-		t.Fatalf("Capabilities().ReviewPublish = %q, want %q", got, ReviewPublishCommentOnly)
+	if got := client.Capabilities().ReviewPublish; got != ReviewPublishNative {
+		t.Fatalf("Capabilities().ReviewPublish = %q, want %q", got, ReviewPublishNative)
 	}
 	if len(requests) == 0 || requests[0].Auth != "token super-secret" {
 		t.Fatalf("Authorization header = %#v, want token auth", requests)
@@ -214,6 +219,62 @@ func TestNewForgejoClientFromConfigReadsTokenEnv(t *testing.T) {
 	}
 	if client.Repository().ProviderID != "fj" || client.Repository().Repo != "acme/looper" {
 		t.Fatalf("Repository() = %#v", client.Repository())
+	}
+}
+
+func TestNewForgejoClientFromConfigReadsTrustedEnvFile(t *testing.T) {
+	// Clear ambient token so only the trusted file can supply auth.
+	t.Setenv("FORGEJO_TOKEN", "")
+	path, err := WriteTrustedEnvFile(map[string]string{"FORGEJO_TOKEN": "file-token"})
+	if err != nil {
+		t.Fatalf("WriteTrustedEnvFile() error = %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	t.Setenv(TrustedEnvFileEnv, path)
+
+	client, err := NewForgejoClientFromConfig(config.ProviderConfig{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}, "acme/looper")
+	if err != nil {
+		t.Fatalf("NewForgejoClientFromConfig() error = %v", err)
+	}
+	if client.token != "file-token" {
+		t.Fatalf("client.token = %q, want file-token from trusted env file", client.token)
+	}
+}
+
+func TestWriteTrustedLooperWrapperInjectsEnvOnlyIntoChild(t *testing.T) {
+	realLooper := filepath.Join(t.TempDir(), "real-looper")
+	// Print whether LOOPER_TRUSTED_ENV_FILE is set and whether the token is readable.
+	script := "#!/bin/sh\nif [ -n \"$LOOPER_TRUSTED_ENV_FILE\" ]; then printf 'path=%s\\n' \"$LOOPER_TRUSTED_ENV_FILE\"; fi\nif [ -n \"$LOOPER_TRUSTED_ENV_FILE\" ] && [ -f \"$LOOPER_TRUSTED_ENV_FILE\" ]; then grep '^FORGEJO_TOKEN=' \"$LOOPER_TRUSTED_ENV_FILE\"; fi\n"
+	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+
+	wrapperPath, cleanup, err := WriteTrustedLooperWrapper(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"})
+	if err != nil {
+		t.Fatalf("WriteTrustedLooperWrapper() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+	if wrapperPath == "" || wrapperPath == realLooper {
+		t.Fatalf("wrapperPath = %q, want distinct shim path", wrapperPath)
+	}
+
+	// Parent process must not see the trusted env file path.
+	if got := os.Getenv(TrustedEnvFileEnv); got != "" {
+		t.Fatalf("parent %s = %q, want empty", TrustedEnvFileEnv, got)
+	}
+
+	cmd := exec.Command(wrapperPath)
+	// Ensure the child does not inherit a leaked trusted-env path from the test process.
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper exec error = %v, out=%s", err, out)
+	}
+	if !strings.Contains(string(out), "FORGEJO_TOKEN=secret-token") {
+		t.Fatalf("wrapper child output = %q, want trusted token via LOOPER_TRUSTED_ENV_FILE", string(out))
+	}
+	if !strings.Contains(string(out), "path=") {
+		t.Fatalf("wrapper child output = %q, want LOOPER_TRUSTED_ENV_FILE path set for child", string(out))
 	}
 }
 
@@ -358,6 +419,222 @@ func TestForgejoPullRequestDiffRejectsOversizedResponses(t *testing.T) {
 	}
 }
 
+func TestForgejoListPullRequestReviewCommentsContract(t *testing.T) {
+	t.Parallel()
+
+	var requests []recordedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests = append(requests, recordedRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Auth: r.Header.Get("Authorization"), Body: string(body)})
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		switch r.URL.Path {
+		case "/api/v1/repos/acme/looper/pulls/42/reviews":
+			switch r.URL.Query().Get("page") {
+			case "1":
+				w.Header().Set("X-Total-Pages", "2")
+				writeJSON(t, w, http.StatusOK, []map[string]any{{"id": 201}})
+			case "2":
+				writeJSON(t, w, http.StatusOK, []map[string]any{{"id": 202}, {"id": 203}})
+			default:
+				t.Fatalf("unexpected reviews page %q", r.URL.Query().Get("page"))
+			}
+		case "/api/v1/repos/acme/looper/pulls/42/reviews/201/comments":
+			writeJSON(t, w, http.StatusOK, []map[string]any{{
+				"id": 101, "body": "resolver absent", "path": "app.go", "commit_id": "head1", "original_commit_id": "base1",
+				"position": 4, "original_position": 4, "diff_hunk": "@@ -1 +1 @@", "html_url": "https://example.test/comments/101",
+				"pull_request_review_id": 201, "updated_at": "2026-07-07T01:00:00Z", "user": map[string]any{"id": 1, "login": "octo"},
+			}})
+		case "/api/v1/repos/acme/looper/pulls/42/reviews/202/comments":
+			writeJSON(t, w, http.StatusOK, []map[string]any{{
+				"id": 102, "body": "resolver null", "path": "app.go", "commit_id": "head2", "original_commit_id": "base2",
+				"position": 8, "original_position": 7, "diff_hunk": "@@ -2 +2 @@", "html_url": "https://example.test/comments/102",
+				"pull_request_review_id": 202, "updated_at": "2026-07-07T02:00:00Z", "user": map[string]any{"id": 2, "login": "marge"}, "resolver": nil,
+			}})
+		case "/api/v1/repos/acme/looper/pulls/42/reviews/203/comments":
+			writeJSON(t, w, http.StatusOK, []map[string]any{{
+				"id": 103, "body": "resolver object", "path": "app.go", "commit_id": "head3", "original_commit_id": "base3",
+				"position": 9, "original_position": 9, "diff_hunk": "@@ -3 +3 @@", "html_url": "https://example.test/comments/103",
+				"pull_request_review_id": 203, "updated_at": "2026-07-07T03:00:00Z", "user": map[string]any{"id": 3, "login": "lisa"}, "resolver": map[string]any{"id": 9, "login": "ralph"},
+			}})
+		default:
+			t.Fatalf("unexpected request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer server.Close()
+
+	client := newForgejoTestClient(t, server.URL)
+	comments, err := client.ListPullRequestReviewComments(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ListPullRequestReviewComments() error = %v", err)
+	}
+	if len(comments) != 3 {
+		t.Fatalf("len(comments) = %d, want 3", len(comments))
+	}
+	if comments[0].Resolver.Present {
+		t.Fatalf("comments[0].Resolver = %#v, want absent resolver", comments[0].Resolver)
+	}
+	if !comments[1].Resolver.Present || comments[1].Resolver.Value != nil {
+		t.Fatalf("comments[1].Resolver = %#v, want explicit null resolver", comments[1].Resolver)
+	}
+	if !comments[2].Resolver.Present || comments[2].Resolver.Value == nil || comments[2].Resolver.Value.Login != "ralph" {
+		t.Fatalf("comments[2].Resolver = %#v, want resolver object", comments[2].Resolver)
+	}
+	if comments[2].PullRequestReviewID != 203 || comments[2].OriginalPosition != 9 {
+		t.Fatalf("comments[2] = %#v, want decoded review comment fields", comments[2])
+	}
+	if len(requests) != 5 {
+		t.Fatalf("requests = %#v, want review pagination plus per-review comment fetches", requests)
+	}
+}
+
+func TestForgejoListPullRequestReviewCommentsEmptyList(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls/42/reviews" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		writeJSON(t, w, http.StatusOK, []map[string]any{})
+	}))
+	defer server.Close()
+
+	client := newForgejoTestClient(t, server.URL)
+	comments, err := client.ListPullRequestReviewComments(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ListPullRequestReviewComments() error = %v", err)
+	}
+	if len(comments) != 0 {
+		t.Fatalf("comments = %#v, want empty list", comments)
+	}
+}
+
+func TestForgejoResolvePullRequestReviewCommentContract(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/repos/acme/looper/pulls/comments/101/resolve" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := newForgejoTestClient(t, server.URL)
+	if err := client.ResolvePullRequestReviewComment(context.Background(), 42, 101); err != nil {
+		t.Fatalf("ResolvePullRequestReviewComment() error = %v", err)
+	}
+}
+
+func TestForgejoResolvePullRequestReviewCommentClassifiesHTTPStatusErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed} {
+		status := status
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(http.StatusText(status)))
+			}))
+			defer server.Close()
+
+			client := newForgejoTestClient(t, server.URL)
+			err := client.ResolvePullRequestReviewComment(context.Background(), 42, 101)
+			if err == nil {
+				t.Fatal("ResolvePullRequestReviewComment() error = nil, want HTTP error")
+			}
+			var httpErr *ForgejoHTTPError
+			if !errors.As(err, &httpErr) {
+				t.Fatalf("error type = %T, want *ForgejoHTTPError", err)
+			}
+			if httpErr.StatusCode != status {
+				t.Fatalf("StatusCode = %d, want %d", httpErr.StatusCode, status)
+			}
+		})
+	}
+}
+
+func TestForgejoResolvePullRequestReviewCommentSanitizesErrors(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("token super-secret rejected"))
+	}))
+	defer server.Close()
+
+	client := newForgejoTestClient(t, server.URL)
+	err := client.ResolvePullRequestReviewComment(context.Background(), 42, 101)
+	if err == nil || strings.Contains(err.Error(), "super-secret") || !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("sanitized error = %v, want redacted token", err)
+	}
+}
+
+func TestForgejoResolverFieldDecodingDistinguishesAbsentNullAndObject(t *testing.T) {
+	t.Parallel()
+
+	var absent forgejoPullRequestReviewComment
+	if err := json.Unmarshal([]byte(`{"id":1}`), &absent); err != nil {
+		t.Fatalf("unmarshal absent resolver: %v", err)
+	}
+	if absent.Resolver.Present {
+		t.Fatalf("absent resolver = %#v, want not present", absent.Resolver)
+	}
+
+	var explicitNull forgejoPullRequestReviewComment
+	if err := json.Unmarshal([]byte(`{"id":2,"resolver":null}`), &explicitNull); err != nil {
+		t.Fatalf("unmarshal null resolver: %v", err)
+	}
+	if !explicitNull.Resolver.Present || explicitNull.Resolver.Value != nil {
+		t.Fatalf("null resolver = %#v, want present nil", explicitNull.Resolver)
+	}
+
+	var object forgejoPullRequestReviewComment
+	if err := json.Unmarshal([]byte(`{"id":3,"resolver":{"id":9,"login":"ralph"}}`), &object); err != nil {
+		t.Fatalf("unmarshal object resolver: %v", err)
+	}
+	if !object.Resolver.Present || object.Resolver.Value == nil || object.Resolver.Value.Login != "ralph" {
+		t.Fatalf("object resolver = %#v, want present user", object.Resolver)
+	}
+}
+
+func newForgejoTestClient(tb testing.TB, baseURL string) *ForgejoClient {
+	tb.Helper()
+	client, err := NewForgejoClient(RepositoryRef{ProviderID: "fj", Kind: ProviderKindForgejo, BaseURL: baseURL, Repo: "acme/looper"}, "super-secret")
+	if err != nil {
+		tb.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	return client
+}
+
+func TestForgejoHTTPErrorStatusCodeMethod(t *testing.T) {
+	t.Parallel()
+	var nilErr *ForgejoHTTPError
+	if nilErr.HTTPStatusCode() != 0 {
+		t.Fatalf("nil HTTPStatusCode() = %d, want 0", nilErr.HTTPStatusCode())
+	}
+	if (&ForgejoHTTPError{StatusCode: http.StatusNotFound}).HTTPStatusCode() != http.StatusNotFound {
+		t.Fatal("HTTPStatusCode() did not return status code")
+	}
+}
+
+func TestForgejoAPIURLPreservesReviewCommentResolvePathEscaping(t *testing.T) {
+	t.Parallel()
+	client := newForgejoTestClient(t, "https://forgejo.example.test/root")
+	apiURL, err := client.apiURL(client.repoPath("pulls", "comments", "101", "resolve"))
+	if err != nil {
+		t.Fatalf("apiURL() error = %v", err)
+	}
+	if got, want := apiURL.Path, "/root/api/v1/repos/acme/looper/pulls/comments/101/resolve"; got != want {
+		t.Fatalf("apiURL.Path = %q, want %q", got, want)
+	}
+	if _, err := url.Parse(apiURL.String()); err != nil {
+		t.Fatalf("apiURL string parse error = %v", err)
+	}
+}
+
 func writeJSON(tb testing.TB, w http.ResponseWriter, status int, payload any) {
 	tb.Helper()
 	w.Header().Set("Content-Type", "application/json")
@@ -377,6 +654,43 @@ func containsRequest(requests []recordedRequest, method string, path string, bod
 }
 
 func stringPtr(value string) *string { return &value }
+
+func TestForgejoPublicationMethodsRejectUnsafeContentBeforeRequest(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	client, err := NewForgejoClient(RepositoryRef{ProviderID: "forgejo-test", Kind: ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token", WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	unsafe := "SERVICE_TOKEN=secret-value"
+	operations := []func() error{
+		func() error {
+			_, err := client.CreatePullRequest(context.Background(), CreatePullRequestInput{Title: "Feature", Body: unsafe, Head: "feature", Base: "main"})
+			return err
+		},
+		func() error {
+			_, err := client.UpdatePullRequest(context.Background(), UpdatePullRequestInput{Number: 1, Title: &unsafe, Body: &unsafe})
+			return err
+		},
+		func() error {
+			_, err := client.CreateIssueComment(context.Background(), CreateCommentInput{IssueNumber: 1, Body: unsafe})
+			return err
+		},
+		func() error {
+			_, err := client.UpdateIssueComment(context.Background(), UpdateCommentInput{CommentID: 1, Body: unsafe})
+			return err
+		},
+	}
+	for _, operation := range operations {
+		if err := operation(); err == nil || !strings.Contains(err.Error(), "outbound content safety gate") {
+			t.Fatalf("publication error = %v, want content safety rejection", err)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("publication methods made %d HTTP requests after content safety failures", requests)
+	}
+}
 
 func TestSanitizeForgejoErrorBodyDefaults(t *testing.T) {
 	t.Parallel()

@@ -25,6 +25,7 @@ const (
 	envForgejoBaseURL        = "LOOPER_E2E_FORGEJO_BASE_URL"
 	envForgejoSandboxRepo    = "LOOPER_E2E_FORGEJO_SANDBOX_REPO"
 	envForgejoToken          = "LOOPER_E2E_FORGEJO_TOKEN"
+	envForgejoReviewerToken  = "LOOPER_E2E_FORGEJO_REVIEWER_TOKEN"
 	forgejoSandboxLabelName  = "looper-e2e"
 )
 
@@ -111,6 +112,79 @@ func TestForgejoSandboxWorkerCreatesPullRequest(t *testing.T) {
 	proc.Stop(context.Background())
 }
 
+func TestForgejoSandboxNativeReviewRequestDiscoveryPublishAndRetry(t *testing.T) {
+	sb := requireForgejoSandboxConfig(t)
+	reviewerToken := strings.TrimSpace(os.Getenv(envForgejoReviewerToken))
+	if reviewerToken == "" {
+		t.Skipf("%s is required for a non-self-authored native review lifecycle", envForgejoReviewerToken)
+	}
+	reviewerClient, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo-sandbox-reviewer", Kind: forge.ProviderKindForgejo, BaseURL: sb.BaseURL, Repo: sb.Repo}, reviewerToken)
+	if err != nil {
+		t.Fatalf("create native reviewer client: %v", err)
+	}
+	reviewer, err := reviewerClient.CurrentUser(context.Background())
+	if err != nil {
+		t.Fatalf("lookup native reviewer identity: %v", err)
+	}
+	if strings.EqualFold(reviewer.Login, sb.CurrentUser.Login) {
+		t.Fatalf("%s must authenticate a user other than the PR author", envForgejoReviewerToken)
+	}
+	repo := ensureForgejoSandboxProjectRepo(t, sb)
+	pr := createForgejoSandboxPR(t, sb, repo, "native review lifecycle")
+	defer cleanupForgejoSandboxPR(t, sb, pr.Number, pr.HeadBranch)
+	ctx := context.Background()
+	if err := sb.Client.AddPullRequestReviewers(ctx, pr.Number, []string{reviewer.Login}); err != nil {
+		t.Fatalf("request native Forgejo reviewer: %v", err)
+	}
+	discovered, err := reviewerClient.ListReviewRequestedPullRequests(ctx, reviewer.Login, 100)
+	if err != nil {
+		t.Fatalf("discover native Forgejo review request: %v", err)
+	}
+	foundPR := false
+	for _, candidate := range discovered {
+		if candidate.Number == pr.Number {
+			foundPR = true
+			break
+		}
+	}
+	if !foundPR {
+		t.Fatalf("review-request discovery omitted PR %s", pr.URL)
+	}
+	marker := fmt.Sprintf("<!-- looper:review id=forgejo-sandbox:%s:%d head=%s outcome=non_blocking -->", sb.RunID, pr.Number, pr.HeadSHA)
+	reviews, err := reviewerClient.ListPullRequestReviews(ctx, pr.Number)
+	if err != nil {
+		t.Fatalf("list native Forgejo reviews before publish: %v", err)
+	}
+	if !forgejoSandboxReviewMarkerExists(reviews, marker) {
+		if _, err := reviewerClient.CreatePullRequestReview(ctx, forge.CreatePullRequestReviewInput{Number: pr.Number, Event: "COMMENT", CommitID: pr.HeadSHA, Body: "Looper sandbox native review\n\n" + marker}); err != nil {
+			t.Fatalf("publish native Forgejo review: %v", err)
+		}
+	}
+	// Retry follows the same marker-first contract and must not create another review.
+	reviews, err = reviewerClient.ListPullRequestReviews(ctx, pr.Number)
+	if err != nil {
+		t.Fatalf("list native Forgejo reviews after publish: %v", err)
+	}
+	count := 0
+	for _, review := range reviews {
+		if strings.Contains(review.Body, marker) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("native marker review count = %d, want 1 (pr=%s)", count, pr.URL)
+	}
+}
+
+func forgejoSandboxReviewMarkerExists(reviews []forge.PullRequestReview, marker string) bool {
+	for _, review := range reviews {
+		if strings.Contains(review.Body, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestForgejoSandboxFixerResolvesReviewThread(t *testing.T) {
 	bins := harness.MustBinaries(t)
 	sb := requireForgejoSandboxConfig(t)
@@ -136,7 +210,7 @@ func TestForgejoSandboxFixerResolvesReviewThread(t *testing.T) {
 
 	fixerHome := harness.NewTempHome(t)
 	fixerCfg := forgejoFixerSandboxConfig(t, bins, fixerHome, repo, harness.NewFakeAgent(t, bins), harness.MustFreePort(t), sb, "commit")
-	fixerRun := runForgejoSandboxLoop(t, bins, fixerHome, sb, fixerCfg, map[string]any{"projectId": "project_1", "type": "fixer", "targetType": "pull_request", "repo": sb.Repo, "prNumber": pr.Number}, 90*time.Second)
+	fixerRun := runForgejoSandboxDiscoveredFixer(t, bins, fixerHome, sb, fixerCfg, 90*time.Second)
 	if fixerRun.Status != "success" {
 		t.Fatalf("fixer status = %s, want success (pr=%s error=%q checkpoint=%s)", fixerRun.Status, pr.URL, stringValue(fixerRun.ErrorMessage), stringValue(fixerRun.CheckpointJSON))
 	}
@@ -394,6 +468,8 @@ func forgejoReviewerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, hom
 	cfg.Roles.Reviewer.Discovery.Triggers.LabelMode = config.LabelModeAll
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = config.ReviewerReviewEventComment
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
+	cfg.Roles.Fixer.AutoDiscovery = false
 	return cfg
 }
 
@@ -402,6 +478,9 @@ func forgejoFixerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home h
 	cfg := forgejoWorkerSandboxConfig(tb, bins, home, repo, fakeAgent, port, sb, agentMode)
 	cfg.Defaults.OpenPRStrategy = config.OpenPRStrategyManual
 	cfg.Defaults.AllowRiskyFixes = true
+	cfg.Scheduler.PollIntervalSeconds = 10
+	cfg.Roles.Reviewer.Discovery.AutoDiscovery = false
+	cfg.Roles.Fixer.AutoDiscovery = true
 	cfg.Roles.Fixer.Triggers.AuthorFilter = config.FixerAuthorFilterAny
 	return cfg
 }
@@ -522,6 +601,32 @@ func runForgejoSandboxLoop(tb testing.TB, bins harness.BuiltBinaries, home harne
 	}
 	client.post(tb, "/api/v1/loops", payload, &created)
 	return waitForRunTerminal(tb, client, created.ID, timeout)
+}
+
+func runForgejoSandboxDiscoveredFixer(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, sb forgejoSandboxConfig, cfg config.Config, timeout time.Duration) runView {
+	tb.Helper()
+	harness.WriteConfig(tb, home.ConfigPath, cfg, nil)
+	proc := harness.StartLooperd(tb, bins, home, home.ConfigPath, forgejoSandboxEnvMap(sb), cfg.Server.Host, cfg.Server.Port)
+	defer proc.Stop(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := proc.WaitForReady(ctx); err != nil {
+		tb.Fatalf("wait for ready: %v", err)
+	}
+	client := newAPIClient(proc.BaseURL())
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var loops loopsListResponse
+		client.get(tb, "/api/v1/loops", &loops)
+		for _, loop := range loops.Items {
+			if loop.ProjectID == "project_1" {
+				return waitForRunTerminal(tb, client, loop.ID, time.Until(deadline))
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	tb.Fatal("timed out waiting for automatically discovered Forgejo fixer loop")
+	panic("unreachable")
 }
 
 func listForgejoSandboxPRComments(tb testing.TB, sb forgejoSandboxConfig, prNumber int64) []forge.Comment {

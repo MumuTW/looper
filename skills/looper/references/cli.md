@@ -51,7 +51,7 @@ Before bootstrap:
 - Confirm the target repo path is absolute and points to a Git repository.
 - Confirm the intended `agent.vendor` (for example `opencode`).
 - For GitHub projects, check `gh auth status` and ensure `git`/`gh` resolve in the environment that will run `looperd`.
-- For Forgejo-only configs, ensure `git` resolves and the configured provider `tokenEnv` is exported in the daemon environment; `gh` is not required.
+- For Forgejo-only configs, ensure `git` resolves and either the provider `tokenEnv` is exported or the configured `teaLogin` works for the daemon user; `gh` is not required.
 - If a required `git` or `gh` binary is missing, ask before installing it. On macOS with Homebrew, the usual repair is `brew install git gh`; otherwise use the user's OS/package manager.
 - Ask before using `--yes`; bootstrap may create config, install or reuse the managed daemon, register a project, and start the daemon.
 - If `~/.looper/config.json` already exists, inspect targeted fields first and avoid overwriting user configuration.
@@ -213,7 +213,29 @@ looper status
 
 After a project is registered, Looper can often infer it from commands run inside that repo. If no project matches the current directory, or multiple projects match, pass `--project <id>` explicitly.
 
-Forgejo projects are config-driven in the MVP. Do not use GitHub autodetection for them; add a `[[providers]]` entry with `kind = "forgejo"`, `baseUrl`, and `tokenEnv`, then add a project with `provider` and explicit `repo = "owner/name"`.
+For Forgejo, select an existing provider explicitly:
+
+```bash
+looper project add /absolute/path/to/repo --provider forgejo-main
+```
+
+The repository slug is detected from an origin matching the selected provider when possible; otherwise pass `--repo owner/name`. The binding is saved and activated immediately through the runtime Project Catalog, so background automation may begin as soon as the command succeeds.
+
+To create the provider and bind the project non-interactively in the same flow:
+
+```bash
+export FORGEJO_TOKEN=<forgejo-token>
+looper project add /absolute/path/to/repo \
+  --provider forgejo-main \
+  --forgejo-url https://code.example.com \
+  --forgejo-token-env FORGEJO_TOKEN
+
+# Or reuse an explicit tea login (no tokenEnv):
+# looper project add /absolute/path/to/repo \
+#   --provider forgejo-main \
+#   --forgejo-url https://code.example.com \
+#   --auth tea --tea-login powerformer-code
+```
 
 Daemon lifecycle commands:
 
@@ -230,10 +252,13 @@ Loop inspection commands:
 
 ```bash
 looper ps
+looper describe <id>
 looper logs <id> --follow
 looper jump <id>
 looper stop <id>
 ```
+
+`looper describe` is the top-level alias for `looper loop inspect` and shows diagnosis detail for blocked or failed loops.
 
 Manual fixer trigger:
 

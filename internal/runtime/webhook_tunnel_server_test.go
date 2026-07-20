@@ -185,4 +185,74 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 			t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
 		}
 	})
+
+	t.Run("admission closed refuses forward without calling forwarder", func(t *testing.T) {
+		forwarder.reset()
+		rt.setAllowedTunnelRepos(map[string]struct{}{repoName: {}})
+		rt.allowForward = func() error { return ErrAdmissionStopping }
+		t.Cleanup(func() { rt.allowForward = nil })
+
+		body := []byte(`{"repository":{"full_name":"acme/looper"}}`)
+		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", bytes.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("X-GitHub-Delivery", "delivery-admission-closed")
+		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, body))
+		resp := httptest.NewRecorder()
+
+		server.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusServiceUnavailable {
+			t.Fatalf("ServeHTTP() status = %d, want %d", resp.Code, http.StatusServiceUnavailable)
+		}
+		if forwarder.calls != 0 {
+			t.Fatalf("forwarder calls = %d, want 0 when admission closed", forwarder.calls)
+		}
+	})
+
+	t.Run("ping still succeeds when admission is closed", func(t *testing.T) {
+		forwarder.reset()
+		rt.setAllowedTunnelRepos(map[string]struct{}{repoName: {}})
+		rt.allowForward = func() error { return ErrAdmissionNotReady }
+		t.Cleanup(func() { rt.allowForward = nil })
+
+		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", http.NoBody)
+		req.Header.Set("X-GitHub-Event", "ping")
+		req.Header.Set("X-GitHub-Delivery", "delivery-ping-admission")
+		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, nil))
+		resp := httptest.NewRecorder()
+
+		server.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusOK {
+			t.Fatalf("ServeHTTP() status = %d, want %d", resp.Code, http.StatusOK)
+		}
+		if forwarder.calls != 0 {
+			t.Fatalf("forwarder calls = %d, want 0", forwarder.calls)
+		}
+	})
+
+	// Outer allowTunnelForward passed, but Forward's own AllowExecute race returns
+	// ErrAdmissionRefused — must be 503, not 400 invalid delivery.
+	t.Run("post-gate forward admission refusal returns 503", func(t *testing.T) {
+		forwarder.reset()
+		rt.setAllowedTunnelRepos(map[string]struct{}{repoName: {}})
+		rt.allowForward = nil
+		forwarder.err = webhookforward.ErrAdmissionRefused
+
+		body := []byte(`{"repository":{"full_name":"acme/looper"}}`)
+		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", bytes.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("X-GitHub-Delivery", "delivery-post-gate-admission")
+		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, body))
+		resp := httptest.NewRecorder()
+
+		server.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusServiceUnavailable {
+			t.Fatalf("ServeHTTP() status = %d body=%s, want %d", resp.Code, resp.Body.String(), http.StatusServiceUnavailable)
+		}
+		if forwarder.calls != 1 {
+			t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
+		}
+	})
 }

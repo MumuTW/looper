@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
@@ -288,10 +289,12 @@ type PullRequestReactionInput struct {
 }
 
 type IssueCommentInput struct {
-	Repo        string
-	IssueNumber int64
-	Body        string
-	CWD         string
+	Repo            string
+	IssueNumber     int64
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type IssueCommentResult struct {
@@ -305,10 +308,12 @@ type IssueComment struct {
 }
 
 type UpdateIssueCommentInput struct {
-	Repo      string
-	CommentID int64
-	Body      string
-	CWD       string
+	Repo            string
+	CommentID       int64
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type PullRequestLabelsInput struct {
@@ -348,10 +353,12 @@ type ReviewThreadComment struct {
 }
 
 type AddReviewThreadReplyInput struct {
-	Repo     string
-	ThreadID string
-	Body     string
-	CWD      string
+	Repo            string
+	ThreadID        string
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type ResolveReviewThreadInput struct {
@@ -404,6 +411,11 @@ type AgentRunInput struct {
 	HeartbeatTimeout   time.Duration
 	Metadata           map[string]any
 	IdempotencyKey     string
+	// UseSnapshot + SnapshotVendor/Model override the executor config for this
+	// start when the run has a durable agent snapshot (execution authority).
+	UseSnapshot    bool
+	SnapshotVendor string
+	SnapshotModel  *string
 }
 
 type AgentResult struct {
@@ -463,6 +475,7 @@ type Options struct {
 	CustomInstructions      *config.Config
 	CriteriaVerifier        criteria.Verifier
 	AgentRuntime            string
+	AgentProfileID          string
 	AgentModel              *string
 	LooperCLIPath           string
 	RetryBaseDelay          time.Duration
@@ -487,6 +500,7 @@ type DiscoveryPolicy struct {
 	// APPROVE review (plan §8.6) instead of the reviewer self-approving.
 	SpecReviewRequireHumanApproval bool
 	RoutedClaimPolicy              networkpolicy.ProjectPolicy
+	MatchAnyTrigger                bool
 }
 
 type Runner struct {
@@ -513,7 +527,8 @@ type Runner struct {
 	projectRoleConfig       *config.Config
 	criteriaVerifier        criteria.Verifier
 	agentRuntime            string
-	agentModel              string
+	agentProfileID          string
+	agentModel              *string
 	looperCLIPath           string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -658,6 +673,10 @@ type loopError struct {
 	interrupted bool
 }
 
+type holdSkipError struct{ summary string }
+
+func (e *holdSkipError) Error() string { return e.summary }
+
 func (e *loopError) Error() string { return e.message }
 
 func New(options Options) *Runner {
@@ -748,7 +767,8 @@ func New(options Options) *Runner {
 		projectRoleConfig:       options.CustomInstructions,
 		criteriaVerifier:        options.CriteriaVerifier,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
-		agentModel:              derefString(options.AgentModel),
+		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
+		agentModel:              cloneStringPtr(options.AgentModel),
 		looperCLIPath:           normalizeLooperCLIPath(options.LooperCLIPath),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
@@ -829,6 +849,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range openPRs {
 		pr = resolveAuthor(pr)
+		if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, pr.Labels) {
+			result.Skipped++
+			continue
+		}
 		if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
 			result.Skipped++
 			continue
@@ -850,6 +874,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range specPRs {
 		pr = resolveAuthor(pr)
+		if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, pr.Labels) {
+			result.Skipped++
+			continue
+		}
 		if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
 			result.Skipped++
 			continue
@@ -883,6 +911,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 		detail, viewErr := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath})
 		if viewErr != nil {
+			result.Skipped++
+			continue
+		}
+		if !isManualReviewerLoop(loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
 			result.Skipped++
 			continue
 		}
@@ -929,14 +961,21 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		}
 		currentLogin = normalizeLogin(currentLogin)
 	}
-	pr := summaryFromDetail(detail)
 	result := DiscoveryResult{}
 	existingLoops, err := r.findReviewerLoopsByPR(ctx, project.ID, input.Repo, input.PRNumber)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	if len(existingLoops) > 0 {
+		manualLoopSeen := false
 		for _, loop := range existingLoops {
+			if isManualReviewerLoop(loop) {
+				manualLoopSeen = true
+			}
+			if !isManualReviewerLoop(loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+				result.Skipped++
+				continue
+			}
 			queuedBefore := len(result.QueueItems)
 			if err := r.discoverExistingReviewerLoop(ctx, *project, input.Repo, policy, &currentLogin, loop, detail, &result); err != nil {
 				return DiscoveryResult{}, err
@@ -945,6 +984,14 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 				return result, nil
 			}
 		}
+		if manualLoopSeen {
+			return result, nil
+		}
+		return result, nil
+	}
+	pr := summaryFromDetail(detail)
+	if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, pr.Labels) {
+		result.Skipped++
 		return result, nil
 	}
 	if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
@@ -970,6 +1017,17 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 }
 
 func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, pr PullRequestSummary, existing *storage.LoopRecord, allowThreadResolutionFollowUp bool, result *DiscoveryResult) error {
+	// Share the PR worktree target mutex with API discard+retry so discovery
+	// cannot create/requeue a reviewer for the same PR between discard
+	// preflight and git reset (managed worktree is shared across loop types).
+	// When an existing loop is known, take the per-loop lock first (API order).
+	if existing != nil && strings.TrimSpace(existing.ID) != "" {
+		unlock := loops.LockLoopRequeue(existing.ID)
+		defer unlock()
+	}
+	unlockTarget := loops.LockLoopTarget(loops.PullRequestTargetGuardKey(project.ID, repo, pr.Number))
+	defer unlockTarget()
+
 	loopResult, loopErr := r.ensureLoopForPullRequest(ctx, project, repo, pr.Number, existing)
 	if loopErr != nil {
 		return loopErr
@@ -1065,7 +1123,7 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		result.Skipped++
 		return nil
 	}
-	requireReviewRequest := requireReviewRequestForLoop(loop, policy.RequireReviewRequest, detail.HeadSHA)
+	requireReviewRequest := requireReviewRequestForLoop(loop, reviewRequestRequiredForCandidate(policy, detail.Labels), detail.HeadSHA)
 	allowThreadResolutionFollowUp := false
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, *currentLogin) {
 		allowThreadResolutionFollowUp = r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin)
@@ -1074,7 +1132,7 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 			return nil
 		}
 	}
-	if !isManualReviewerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !isManualReviewerLoop(loop) && !policy.MatchAnyTrigger && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		result.Skipped++
 		return nil
 	}
@@ -1110,6 +1168,22 @@ func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd
 
 func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context, repo, cwd string, limit int, policy DiscoveryPolicy, currentLogin string) ([]PullRequestSummary, error) {
 	labels := prQueryLabels(policy.Labels)
+	if policy.MatchAnyTrigger && policy.RequireReviewRequest && strings.TrimSpace(currentLogin) != "" && len(labels) > 0 && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		labelPolicy := policy
+		labelPolicy.RequireReviewRequest = false
+		labelPolicy.MatchAnyTrigger = false
+		labelPulls, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, labelPolicy, currentLogin)
+		if err != nil {
+			return nil, err
+		}
+		requestedPulls, err := r.github.ListReviewRequestedPullRequests(ctx, ListReviewRequestedPullRequestsInput{Repo: repo, CWD: cwd, Limit: defaultDiscoveryLimit(limit), Reviewer: currentLogin})
+		if err != nil {
+			return nil, err
+		}
+		// Reserve capacity for requested-review matches so a full label page
+		// cannot starve explicitly assigned PRs on every discovery tick.
+		return mergeLabelAndRequestedPullRequests(labelPulls, requestedPulls, defaultDiscoveryLimit(limit)), nil
+	}
 	if policy.RequireReviewRequest && strings.TrimSpace(currentLogin) != "" && len(labels) == 0 && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		return r.github.ListReviewRequestedPullRequests(ctx, ListReviewRequestedPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Reviewer: currentLogin})
 	}
@@ -1148,6 +1222,60 @@ func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context,
 	return result, nil
 }
 
+func dedupePullRequestSummaries(pulls []PullRequestSummary, limit int) []PullRequestSummary {
+	result := make([]PullRequestSummary, 0, len(pulls))
+	seen := map[int64]struct{}{}
+	for _, pull := range pulls {
+		if _, exists := seen[pull.Number]; exists {
+			continue
+		}
+		seen[pull.Number] = struct{}{}
+		result = append(result, pull)
+		if limit > 0 && len(result) >= limit {
+			break
+		}
+	}
+	return result
+}
+
+// mergeLabelAndRequestedPullRequests unions label and review-request discovery
+// results without letting the label source exhaust the limit first. Requested
+// reviews are reserved first; remaining slots are filled from label matches.
+func mergeLabelAndRequestedPullRequests(labelPulls, requestedPulls []PullRequestSummary, limit int) []PullRequestSummary {
+	if limit <= 0 {
+		return dedupePullRequestSummaries(append(requestedPulls, labelPulls...), 0)
+	}
+	requested := dedupePullRequestSummaries(requestedPulls, 0)
+	labels := dedupePullRequestSummaries(labelPulls, 0)
+	reserved := len(requested)
+	if reserved > limit {
+		reserved = limit
+	}
+	result := make([]PullRequestSummary, 0, limit)
+	seen := map[int64]struct{}{}
+	for _, pull := range requested {
+		if len(result) >= reserved {
+			break
+		}
+		if _, exists := seen[pull.Number]; exists {
+			continue
+		}
+		seen[pull.Number] = struct{}{}
+		result = append(result, pull)
+	}
+	for _, pull := range labels {
+		if len(result) >= limit {
+			break
+		}
+		if _, exists := seen[pull.Number]; exists {
+			continue
+		}
+		seen[pull.Number] = struct{}{}
+		result = append(result, pull)
+	}
+	return result
+}
+
 func defaultDiscoveryLimit(limit int) int {
 	if limit <= 0 {
 		return 30
@@ -1182,10 +1310,10 @@ func prEligibleForDiscoveryPreclaim(pr PullRequestSummary, currentLogin string, 
 	if isSelfAuthoredPR(pr.Author, currentLogin, policy) {
 		return false
 	}
-	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireReviewRequest && reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && reviewRequestRequiredForCandidate(policy, pr.Labels) && reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
 		return false
 	}
-	if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
+	if !policy.MatchAnyTrigger && !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
 		return false
 	}
 	return true
@@ -1196,7 +1324,28 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, SpecReviewRequireHumanApproval: roles.Reviewer.Discovery.SpecReview.RequireHumanApproval, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+	labels := append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...)
+	matchAnyTrigger := r.forgejoProject(projectID) && roles.Reviewer.Discovery.Triggers.RequireReviewRequest && len(prQueryLabels(labels)) > 0
+	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: labels, LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, SpecReviewRequireHumanApproval: roles.Reviewer.Discovery.SpecReview.RequireHumanApproval, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+}
+
+func (r *Runner) forgejoProject(projectID string) bool {
+	if r.projectRoleConfig == nil {
+		return false
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if strings.TrimSpace(project.ID) == strings.TrimSpace(projectID) {
+			return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project) == config.ProviderKindForgejo
+		}
+	}
+	return false
+}
+
+func reviewRequestRequiredForCandidate(policy DiscoveryPolicy, labels []string) bool {
+	if !policy.RequireReviewRequest {
+		return false
+	}
+	return !(policy.MatchAnyTrigger && len(prQueryLabels(policy.Labels)) > 0 && labelsMatch(labels, policy.Labels, policy.LabelMode))
 }
 
 func (r *Runner) reviewerAutoMergeConfigForProject(projectID string) config.ReviewerAutoMergeConfig {
@@ -1260,6 +1409,14 @@ func (r *Runner) commentOnlyPublishForProject(projectID string) bool {
 	if r.commentOnlyPublish {
 		return true
 	}
+	return r.forgejoCommentOnlyPublishForProject(projectID)
+}
+
+func (r *Runner) commentOnlyCompletionForProject(projectID string, reviewEvents config.ReviewerReviewEventsConfig) bool {
+	return r.forgejoCommentOnlyPublishForProject(projectID) || (r.commentOnlyPublishForProject(projectID) && reviewEvents.Clean != config.ReviewerReviewEventApprove)
+}
+
+func (r *Runner) forgejoCommentOnlyPublishForProject(projectID string) bool {
 	if r.projectRoleConfig == nil {
 		return false
 	}
@@ -1268,7 +1425,7 @@ func (r *Runner) commentOnlyPublishForProject(projectID string) bool {
 		if strings.TrimSpace(project.ID) != projectID {
 			continue
 		}
-		return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project) == config.ProviderKindForgejo
+		return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project) == config.ProviderKindForgejo && config.ProjectRoleConfigs(*r.projectRoleConfig, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
 	}
 	return false
 }
@@ -1446,6 +1603,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
 	if err := r.revalidateRoutedReviewerClaim(ctx, *project, queueItem); err != nil {
+		var holdErr *holdSkipError
+		if errors.As(err, &holdErr) {
+			return r.finishHeldReviewerQueueItem(ctx, *loop, nil, queueItem, reviewerCheckpoint{}, holdErr.summary)
+		}
 		return ProcessResult{}, err
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
@@ -1484,17 +1645,22 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}
 	}()
-	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
 		updated.NextRunAt = nil
-		metadataJSON, metaErr := r.recordLoopRunStartMetadata(updated.MetadataJSON)
+		metadataJSON, metaErr := r.recordLoopRunStartMetadata(updated.MetadataJSON, project.ID)
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
 		}
-	}); err != nil {
+	})
+	if err != nil {
 		return ProcessResult{}, err
 	}
+	// The runner is the immutable claim snapshot. Carry the just-persisted
+	// policy into every step so stale loop metadata from an earlier queued run
+	// cannot override configuration published before this claim.
+	loop = &updatedLoop
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("reviewer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
@@ -1507,6 +1673,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "startedAt": eventlog.FormatJavaScriptISOString(stepStartedAt.UTC())}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
+			var holdErr *holdSkipError
+			if errors.As(err, &holdErr) {
+				return r.finishHeldReviewerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
+			}
 			stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
 			failure := r.classifyFailureForProjectAndBoundary(project.ID, err, reviewerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
@@ -1625,7 +1795,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		return ProcessResult{}, err
 	}
-	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	updatedLoop, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		metadataJSON, metaErr := r.recordLoopSuccessMetadata(updated.MetadataJSON, checkpoint, summary)
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
@@ -1651,9 +1821,18 @@ func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project stor
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) || r.github == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
 		return nil
 	}
+	if queueItem.LoopID != nil {
+		loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
+		if err == nil && loop != nil && isManualReviewerLoop(*loop) {
+			return nil
+		}
+	}
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, CWD: project.RepoPath})
 	if err != nil {
 		return err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", *queueItem.Repo, *queueItem.PRNumber)}
 	}
 	decision := routedReviewerClaimDecision(policy, "", detail.Author, detail.Labels, detail.ReviewRequestUsers)
 	if !decision.Allowed && policy.EnableSelfReview && decision.Reason == "local GitHub identity is not requested for review" {
@@ -1801,6 +1980,9 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		return checkpoint, nil
 	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, checkpoint.Detail.Labels) {
+		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	currentLogin := ""
 	ensureCurrentLogin := func() error {
 		if currentLogin != "" {
@@ -1871,8 +2053,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipKind = "already_published_head"
 		return checkpoint, nil
 	}
-	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Detail.HeadSHA)
-	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Detail.HeadSHA)
+	if !isManualReviewerLoop(input.Loop) && networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		decision, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Project.RepoPath, policy, currentLogin, checkpoint.Detail.Author, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -1970,7 +2152,8 @@ func (r *Runner) notifyConflictedPullRequest(ctx context.Context, input stepInpu
 		return r.repos.Notifications.Upsert(ctx, sent)
 	}
 
-	comment, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath})
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	comment, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 	if err != nil {
 		failed := pending
 		failed.Status = "failed"
@@ -2227,9 +2410,13 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, strings.TrimSpace(decision.Decision), strings.TrimSpace(decision.Evidence), thread.ID, "skipped", skippedReason)
 				continue
 			}
+			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
 			body := r.buildThreadResolutionReply(thread.ID, checkpoint.Snapshot.HeadSHA, decision, policy)
-			if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: thread.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+			disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+			if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: thread.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 			}
 			result.Commented++
@@ -2244,6 +2431,9 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			if latestThread == nil {
 				skippedReason = "candidate_no_longer_eligible"
 				continue
+			}
+			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
 			if !hasObjectiveThreadResolutionAuditForHead(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA) && !commented {
@@ -2373,7 +2563,18 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
 		prompt = nativeResumeContinuationPrompt("thread-resolution", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	}
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	if err != nil {
+		return nil, fmt.Errorf("resolve run agent identity: %w", err)
+	}
+	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
+		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+		Metadata:       map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber},
+		IdempotencyKey: idempotencyKey,
+		UseSnapshot:    useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2643,18 +2844,48 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Snapshot.HeadSHA)
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Snapshot.HeadSHA)
 	reviewRequestBypassReason := ""
 	if !requireReviewRequest && policy.RequireReviewRequest && reviewerFollowUpHasNewHead(input.Loop, checkpoint.Snapshot.HeadSHA) {
 		reviewRequestBypassReason = "follow_up_new_head"
 	}
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, r.commentOnlyPublishForProject(input.Project.ID))
+	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
+	commentOnlyCompletion := r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents)
+	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	if err != nil {
+		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+	}
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
-	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
+	metadata := map[string]any{
+		"loopType":            "reviewer",
+		"phase":               "review",
+		"repo":                input.Repo,
+		"prNumber":            input.PRNumber,
+		"cleanReviewEvent":    string(reviewEvents.Clean),
+		"blockingReviewEvent": string(reviewEvents.Blocking),
+		"expectedCommitID":    checkpoint.Snapshot.HeadSHA,
+		"reviewerManual":      isManualReviewerLoop(input.Loop),
+		"reviewerRunID":       input.Run.ID,
+	}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
+	if freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath}); err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
+	} else {
+		checkpoint.Detail.Labels = cloneStrings(freshDetail.Labels)
+		if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
+			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		}
+	}
+	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
+		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
+		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey,
+		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+	})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -2736,7 +2967,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
-		if r.commentOnlyPublishForProject(input.Project.ID) {
+		if commentOnlyCompletion {
 			completion, err := parseReviewerCommentOnlyCompletion(result)
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2749,13 +2980,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
-		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
-		if policy.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
-		if policy.Clean == config.ReviewerReviewEventApprove {
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			} else if cleanReviewMarkerSatisfiesCleanPolicy(found, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})) {
@@ -2772,7 +3002,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
-	if r.commentOnlyPublishForProject(input.Project.ID) {
+	if commentOnlyCompletion {
 		completion, err := parseReviewerCommentOnlyCompletion(result)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2815,11 +3045,14 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 			return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
 		}
+		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		}
 		if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		policy := r.discoveryPolicyForProject(input.Project.ID)
-		requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
+		requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
 		if requireReviewRequest {
 			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
@@ -2830,6 +3063,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 				return checkpoint, nil
 			}
 		}
+		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		}
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
 			return checkpoint, err
 		} else if criteriaResult != nil {
@@ -2838,7 +3074,17 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 			return checkpoint, nil
 		}
-		if r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove {
+		reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
+		if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
+			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
+				return checkpoint, err
+			}
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
+		}
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2863,15 +3109,6 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 			return checkpoint, nil
 		}
-		if r.commentOnlyPublishForProject(input.Project.ID) {
-			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
-				return checkpoint, err
-			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
-				return checkpoint, err
-			}
-			return checkpoint, nil
-		}
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
 		}
@@ -2892,6 +3129,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 		return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
 	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
 		return markReviewerRunStale(checkpoint, reason), nil
 	}
@@ -2899,7 +3139,26 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
 		return next, err
 	}
-	if r.commentOnlyPublishForProject(input.Project.ID) {
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
+	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
+	if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
+		// Mirror the clean-noop path: recheck review request before publishing
+		// a summary_comment review so a request removed mid-run cannot still
+		// create/update the top-level Reviewer Summary.
+		policy := r.discoveryPolicyForProject(input.Project.ID)
+		requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
+		if requireReviewRequest {
+			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			if reviewRequestsKnownAbsent(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
+				return checkpoint, nil
+			}
+		}
 		if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
 			return checkpoint, err
 		}
@@ -2921,7 +3180,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
 	if requireReviewRequest && !markerResult.Found {
 		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, checkpoint, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
 		if staleReason != "" {
@@ -2968,7 +3227,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		checkpoint.ResumePolicy = "rerun_review"
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
-	reviewPolicy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	reviewPolicy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	if cleanReviewNoopSummary(pending.Summary) && reviewPolicy.Clean == config.ReviewerReviewEventApprove && !cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail)) {
 		return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker or a self-authored clean COMMENT fallback with a valid human approval body; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
 	}
@@ -2990,6 +3249,31 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, err
 	}
 	return checkpoint, nil
+}
+
+func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint reviewerCheckpoint, summary string) (ProcessResult, error) {
+	checkpoint.SkipReason = summary
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	if run != nil {
+		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	if run != nil {
+		result.RunID = run.ID
+	}
+	return result, nil
 }
 
 func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (bool, reviewerCheckpoint, error) {
@@ -3040,7 +3324,7 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return ReviewMarkerResult{}, err
 	}
 	marker := agentNativeReviewMarker(input.Loop.ID, headSHA, idempotencyKey)
-	allowedEvents := r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Loop.MetadataJSON))
+	allowedEvents := r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON))
 	allowCleanComment := sameReviewAuthorLogin(currentLogin, prAuthorLogin)
 	found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
@@ -3208,6 +3492,13 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 	if !marker.Found {
 		return &loopError{message: "Cannot apply review side effects without a verified review marker", kind: FailureRetryableAfterResume}
 	}
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before applying review side effects: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	outcome := strings.ToLower(strings.TrimSpace(marker.Outcome))
 	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
 	switch outcome {
@@ -3215,7 +3506,7 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
-		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+		policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 		shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, marker.Event, outcome)
 		if err := r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels); err != nil {
 			return err
@@ -3231,11 +3522,18 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 }
 
 func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail) error {
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before applying clean review side effects: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
 	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 	}
-	policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, cleanReviewEventForPolicy(policy), "clean")
 	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels)
 }
@@ -3304,6 +3602,9 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
 	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
 		return &loopError{message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume}
 	}
@@ -3348,6 +3649,17 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 	return nil
 }
 
+func (r *Runner) reviewerPublishFreshDetailForMutation(ctx context.Context, input stepInput, action string) (PullRequestDetail, error) {
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return PullRequestDetail{}, &loopError{message: fmt.Sprintf("Failed to refresh pull request before %s: %v", action, err), kind: FailureRetryableAfterResume}
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+		return PullRequestDetail{}, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
+	return freshDetail, nil
+}
+
 type linkedIssueReference struct {
 	Repo    string
 	Number  int64
@@ -3370,7 +3682,7 @@ func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, in
 	if resolvePullRequestPhase(detail.Labels) == "spec" {
 		return nil, nil
 	}
-	if r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean != config.ReviewerReviewEventApprove {
+	if r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON).Clean != config.ReviewerReviewEventApprove {
 		return nil, nil
 	}
 	autoMergeCfg := r.reviewerAutoMergeConfigForProject(input.Project.ID)
@@ -3399,7 +3711,7 @@ func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, in
 }
 
 func (r *Runner) publishCleanReviewWithoutCriteria(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint, detail PullRequestDetail) (*criteriaPublishResult, error) {
-	policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	if policy.Clean != config.ReviewerReviewEventApprove {
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return nil, err
@@ -3434,6 +3746,9 @@ func (r *Runner) publishCriteriaApprovedReview(ctx context.Context, input stepIn
 		return nil, err
 	}
 	if decision.Reason == "" {
+		if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "enabling auto-merge"); err != nil {
+			return nil, err
+		}
 		if err := r.github.EnableAutoMerge(ctx, githubinfra.EnableAutoMergeInput{Repo: input.Repo, PRNumber: input.PRNumber, Strategy: decision.Strategy, HeadSHA: pending.HeadSHA, CWD: input.Project.RepoPath}); err != nil && !isAlreadyEnabledAutoMergeError(err) {
 			return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -3451,7 +3766,17 @@ func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInp
 	if err != nil {
 		return nil, err
 	}
-	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(issue.Labels), CWD: input.Project.RepoPath}); err != nil {
+	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "applying criteria failure side effects"); err != nil {
+		return nil, err
+	}
+	freshIssue, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, CWD: input.Project.RepoPath})
+	if err != nil {
+		return nil, &loopError{message: fmt.Sprintf("Failed to refresh linked issue before applying criteria failure side effects: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshIssue.Labels) {
+		return nil, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", issueRef.Repo, issueRef.Number)}
+	}
+	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(freshIssue.Labels), CWD: input.Project.RepoPath}); err != nil {
 		return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}); err != nil {
@@ -3544,7 +3869,11 @@ func (r *Runner) submitOrReuseReview(ctx context.Context, input stepInput, detai
 	if selfApprovalFallback {
 		submitEvent = ReviewEventComment
 	}
-	if err := r.github.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(submitEvent), Body: body, CommitID: pending.HeadSHA, Disclosure: r.disclosure, CWD: input.Project.RepoPath}); err != nil {
+	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "submitting review"); err != nil {
+		return ReviewMarkerResult{}, err
+	}
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	if err := r.github.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(submitEvent), Body: body, CommitID: pending.HeadSHA, Disclosure: r.disclosure, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel, CWD: input.Project.RepoPath}); err != nil {
 		return ReviewMarkerResult{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	marker, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(reviewerCheckpoint{Detail: checkpointDetailFromDetail(detail)}, detail))
@@ -3573,8 +3902,12 @@ func (r *Runner) postStampedPRCommentIfMissing(ctx context.Context, input stepIn
 	if stampedCommentAlreadyPosted(detail.IssueComments, marker) {
 		return nil
 	}
+	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "posting PR comment"); err != nil {
+		return err
+	}
 	body := stampIssueComment(r.disclosure, visible+"\n\n"+marker, "reviewer")
-	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath}); err != nil {
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	return nil
@@ -3607,13 +3940,20 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	body = stampIssueComment(r.disclosure, body, "reviewer")
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	if existingComment.ID != 0 {
-		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingComment.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+		if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "updating comment-only review"); err != nil {
+			return err
+		}
+		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingComment.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 			return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		return nil
 	}
-	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath}); err != nil {
+	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "creating comment-only review"); err != nil {
+		return err
+	}
+	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	return nil
@@ -4202,8 +4542,28 @@ func (r *Runner) allowedReviewEventsForPolicy(policy config.ReviewerReviewEvents
 	return events
 }
 
-func (r *Runner) effectiveReviewEvents(metadataJSON *string) config.ReviewerReviewEventsConfig {
+// reviewEventsForProject returns the effective clean/blocking review-events policy
+// for a project, consulting ProjectRoleConfigs so project-level APPROVE /
+// REQUEST_CHANGES overrides are not lost under a global COMMENT default.
+func (r *Runner) reviewEventsForProject(projectID string) config.ReviewerReviewEventsConfig {
 	policy := r.reviewEvents
+	if r.projectRoleConfig == nil {
+		return policy
+	}
+	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
+	if roles.Reviewer.Behavior.ReviewEvents.Clean != "" {
+		policy.Clean = roles.Reviewer.Behavior.ReviewEvents.Clean
+	}
+	if roles.Reviewer.Behavior.ReviewEvents.Blocking != "" {
+		policy.Blocking = roles.Reviewer.Behavior.ReviewEvents.Blocking
+	}
+	return policy
+}
+
+func (r *Runner) effectiveReviewEvents(projectID string, metadataJSON *string) config.ReviewerReviewEventsConfig {
+	// Prefer snapshotted loop metadata when present; otherwise use the live
+	// per-project policy so newly auto-discovered loops honor project overrides.
+	policy := r.reviewEventsForProject(projectID)
 	meta := parseJSONObject(metadataJSON)
 	if reviewEvents, ok := meta["reviewEvents"].(map[string]any); ok {
 		if clean, ok := stringFromAny(reviewEvents["clean"]); ok && strings.TrimSpace(clean) != "" {
@@ -4307,6 +4667,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		restartFromDiscover = true
 	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepDiscover
+	// stickySnapshot: any continuation of a failed/interrupted predecessor, including first-step retries.
+	stickySnapshot := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted")
 	initialCheckpoint := reviewerCheckpoint{ResumePolicy: "replay_step"}
 	if resumed {
 		initialCheckpoint = checkpoint
@@ -4321,6 +4683,14 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), CheckpointJSON: stringPtr(mustMarshalJSON(initialCheckpoint)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot)
+	if err != nil {
+		return resumedRunContext{}, err
+	}
+	if snapshotJSON == nil && strings.TrimSpace(r.agentRuntime) != "" {
+		return resumedRunContext{}, fmt.Errorf("agent snapshot required for vendor %q but was not produced", r.agentRuntime)
+	}
+	run.AgentSnapshotJSON = snapshotJSON
 	if resumed && !restartFromDiscover && lastCompleted != "" {
 		run.LastCompletedStep = stringPtr(string(lastCompleted))
 	}
@@ -4438,7 +4808,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			text := string(encoded)
 			metadataJSONSource = &text
 		}
-		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, repo, prNumber)
+		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, project.ID, repo, prNumber)
 		if err != nil {
 			return loopUpsertResult{}, err
 		}
@@ -4458,7 +4828,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		return loopUpsertResult{}, err
 	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
-	metadataJSON, err := r.ensureLoopMetadataJSON(nil, repo, prNumber)
+	metadataJSON, err := r.ensureLoopMetadataJSON(nil, project.ID, repo, prNumber)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
@@ -4815,7 +5185,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	}
 	nowISO := r.nowISO()
 	targetID := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
-	lockKey := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
+	lockKey := storage.PullRequestLockKey(input.ProjectID, input.Repo, input.PRNumber)
 	projectID := input.ProjectID
 	loopID := input.LoopID
 	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: availableAt, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}
@@ -5044,6 +5414,13 @@ func (r *Runner) markAgentExecutionNativeResumePendingForHeadChange(ctx context.
 		return false
 	}
 	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
+	if record.RunID != nil {
+		if run, runErr := r.repos.Runs.GetByID(ctx, *record.RunID); runErr == nil && run != nil {
+			if vendor, _, _, fromSnapshot, idErr := r.identityFromRun(*run); idErr == nil && fromSnapshot {
+				currentVendor = config.AgentVendor(strings.TrimSpace(vendor))
+			}
+		}
+	}
 	if currentVendor != "" && (!nativeResumeSupportedForReviewer(currentVendor) || record.Vendor != string(currentVendor)) {
 		return false
 	}
@@ -5159,6 +5536,13 @@ func (r *Runner) isResumableNativeSession(latest *storage.AgentExecutionRecord) 
 		return false
 	}
 	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
+	if latest.RunID != nil && r.repos != nil && r.repos.Runs != nil {
+		if run, err := r.repos.Runs.GetByID(context.Background(), *latest.RunID); err == nil && run != nil {
+			if vendor, _, _, fromSnapshot, idErr := r.identityFromRun(*run); idErr == nil && fromSnapshot {
+				currentVendor = config.AgentVendor(strings.TrimSpace(vendor))
+			}
+		}
+	}
 	if currentVendor == "" {
 		return true
 	}
@@ -5661,7 +6045,7 @@ func loopEnabledMetadataMissing(meta map[string]any) bool {
 	return true
 }
 
-func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber int64) (string, error) {
+func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string, prNumber int64) (string, error) {
 	meta := parseJSONObject(current)
 	loopMeta, _ := meta["loop"].(map[string]any)
 	if loopMeta == nil {
@@ -5697,6 +6081,10 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 	if reviewEventsMeta == nil {
 		reviewEventsMeta = map[string]any{}
 	}
+	// Snapshot the per-project policy (not only the runner-wide global default)
+	// so Forgejo projects with clean=APPROVE / blocking=REQUEST_CHANGES keep
+	// those outcomes in loop metadata and the trusted proxy policy.
+	projectReviewEvents := r.reviewEventsForProject(projectID)
 	if cleanRaw, present := reviewEventsMeta["clean"]; present {
 		clean, ok := cleanRaw.(string)
 		if !ok {
@@ -5706,7 +6094,7 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 			return "", fmt.Errorf("reviewEvents.clean must be COMMENT or APPROVE")
 		}
 	} else {
-		reviewEventsMeta["clean"] = string(r.reviewEvents.Clean)
+		reviewEventsMeta["clean"] = string(projectReviewEvents.Clean)
 	}
 	if blockingRaw, present := reviewEventsMeta["blocking"]; present {
 		blocking, ok := blockingRaw.(string)
@@ -5717,7 +6105,7 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 			return "", fmt.Errorf("reviewEvents.blocking must be COMMENT or REQUEST_CHANGES")
 		}
 	} else {
-		reviewEventsMeta["blocking"] = string(r.reviewEvents.Blocking)
+		reviewEventsMeta["blocking"] = string(projectReviewEvents.Blocking)
 	}
 	meta["reviewEvents"] = reviewEventsMeta
 	meta["loop"] = loopMeta
@@ -5725,11 +6113,22 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 	return string(encoded), err
 }
 
-func (r *Runner) recordLoopRunStartMetadata(current *string) (string, error) {
+func (r *Runner) recordLoopRunStartMetadata(current *string, projectID string) (string, error) {
 	meta := parseJSONObject(current)
 	loopMeta := reviewerLoopMetadata(meta)
 	loopMeta["status"] = "active"
 	loopMeta["lastStatus"] = "running"
+	// Manual loops may carry explicit CLI review-event overrides and remain
+	// authoritative for that loop. Auto-discovered loop metadata is inherited
+	// policy, so refresh it from this claim's immutable runner snapshot.
+	manual, _ := meta["manual"].(bool)
+	if !manual {
+		reviewEvents := r.reviewEventsForProject(projectID)
+		meta["reviewEvents"] = map[string]any{
+			"clean":    string(reviewEvents.Clean),
+			"blocking": string(reviewEvents.Blocking),
+		}
+	}
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
@@ -6071,10 +6470,10 @@ func reviewRequestsKnownAbsent(requested []string, currentLogin string) bool {
 }
 
 func buildPullRequestLockKey(item storage.QueueItemRecord) string {
-	if item.Repo == nil || item.PRNumber == nil {
+	if item.ProjectID == nil || item.Repo == nil || item.PRNumber == nil {
 		return ""
 	}
-	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
+	return storage.PullRequestLockKey(*item.ProjectID, *item.Repo, *item.PRNumber)
 }
 
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
@@ -6152,6 +6551,16 @@ func reviewerAgentSideGitHubFetchContract() string {
 	}, "\n")
 }
 
+func reviewerProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
+	projectID = strings.TrimSpace(projectID)
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.ID) == projectID {
+			return config.ResolvedProjectProviderKind(cfg, project)
+		}
+	}
+	return config.ProviderKindGitHub
+}
+
 func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
@@ -6160,7 +6569,12 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	publishInstruction := "For actionable findings, you must publish the GitHub review yourself by calling looper's enforced review-submit wrapper from the shell. For no-actionable-finding results, follow the clean-result publishing instructions for this run. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you after the agent exits."
+	forgejoNative := reviewerProjectProviderKind(instructionConfig, projectID) == config.ProviderKindForgejo && !commentOnlyPublish
+	forgeName := "GitHub"
+	if forgejoNative {
+		forgeName = "Forgejo"
+	}
+	publishInstruction := fmt.Sprintf("For actionable findings, you must publish the %s review yourself by calling looper's enforced review-submit wrapper from the shell. For no-actionable-finding results, follow the clean-result publishing instructions for this run. Do not return review JSON for looper to parse; looper will not parse review content or post forge comments for you after the agent exits.", forgeName)
 	if looperCLIPath == "" {
 		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so fail closed: do not publish any GitHub review, do not add or remove any GitHub reaction, and exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 	}
@@ -6171,6 +6585,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		cleanResultCompletionInstruction = "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not finish successfully or add a clean signal because the trusted wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`. Do not invent feedback."
 	}
 	fetchContract := reviewerAgentSideGitHubFetchContract()
+	if forgejoNative {
+		fetchContract = "Provider-supplied Forgejo review context: Looper fetched the native PR metadata, review decision/history, requested reviewers, and diff before invoking you. Use the prepared local worktree plus this supplied context; Forgejo-only runs do not require `gh`. Publish only through the trusted Looper review-submit wrapper."
+	}
 	if commentOnlyPublish {
 		publishInstruction = "This provider is comment-only. Looper supplied the PR metadata and diff in this prompt/context and will publish exactly one top-level PR comment from your final completion summary after re-checking local idempotency. Do not publish anything yourself or attempt native review features."
 		outcomeInstruction = "If there are actionable findings, finish successfully with a concise markdown summary and set the final `__LOOPER_RESULT__` JSON fields to include: `summary` (same human summary), `outcome` (`non_blocking` or `blocking`), and `findings` (an array of actionable issues only). Each finding object MUST contain `title`, `body`, and optional `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no actionable findings, set `outcome` to `clean`, keep `findings` empty, and start `summary` with `No actionable findings`. Do not include terminal logs, extra JSON payloads, or publishing commands."
@@ -6214,17 +6631,21 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	blockingInstruction := "Submit blocking and non-blocking finding reviews as COMMENT."
 	specLabelInstruction := "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after it validates a matching APPROVED clean review marker for the current head."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
-	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+	reviewerModeFlag := ""
+	if manual {
+		reviewerModeFlag = fmt.Sprintf(" --reviewer-manual --reviewer-run-id %s", runID)
+	}
+	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove && looperCLIPath != "" && !(autoMergeEnabled && phase != "spec") {
-		cleanInstruction = fmt.Sprintf("For no-actionable-finding results when the clean review policy is APPROVE, submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment: `%s review submit %s#%d --event APPROVE --commit-id %s %s`. The APPROVE review body must not be empty or disclosure-only: the visible body must start with `%s`, briefly summarize what changed or what you verified, and include a warm, friendly, encouraging acknowledgement of the author's work. Then include exactly one clean review marker and any required Looper disclosure. Do not use a bare LGTM or marker/disclosure-only body; the wrapper rejects clean APPROVE reviews that do not start with an @mention or lack enough human-written summary text. If the authenticated GitHub user authored the pull request, the wrapper will downgrade the submission to a COMMENT because GitHub rejects self-approval. After Looper validates the matching APPROVED clean review marker, or the self-authored clean COMMENT fallback, the runner will reconcile the clean-signal +1 reaction and any eligible spec label transition.", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, cleanReviewAuthorMention)
+		cleanInstruction = fmt.Sprintf("For no-actionable-finding results when the clean review policy is APPROVE, submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment: `%s review submit %s#%d --event APPROVE --commit-id %s%s %s`. The APPROVE review body must not be empty or disclosure-only: the visible body must start with `%s`, briefly summarize what changed or what you verified, and include a warm, friendly, encouraging acknowledgement of the author's work. Then include exactly one clean review marker and any required Looper disclosure. Do not use a bare LGTM or marker/disclosure-only body; the wrapper rejects clean APPROVE reviews that do not start with an @mention or lack enough human-written summary text. If the authenticated GitHub user authored the pull request, the wrapper will downgrade the submission to a COMMENT because GitHub rejects self-approval. After Looper validates the matching APPROVED clean review marker, or the self-authored clean COMMENT fallback, the runner will reconcile the clean-signal +1 reaction and any eligible spec label transition.", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags, cleanReviewAuthorMention)
 		specLabelInstruction = "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after a new matching APPROVED clean review is validated for this head, or when idempotency finds an existing matching APPROVED clean review for this head."
 	}
 	if reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
 		blockingInstruction = "If the review has blocking findings, submit REQUEST_CHANGES with outcome=blocking. If findings are non-blocking, submit COMMENT with outcome=non_blocking. Never submit REQUEST_CHANGES for non-blocking findings."
-		actionableReviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for non-blocking findings or `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s %s` for blocking findings", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+		actionableReviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s` for non-blocking findings or `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s%s %s` for blocking findings", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	}
 	existingMarkerEventInstruction := "Idempotency outcome matching is strict: only treat an existing `outcome=clean` marker as satisfied when it is on a COMMENTED review if clean policy is COMMENT, or on an APPROVED review if clean policy is APPROVE. A COMMENTED `outcome=clean` marker is also valid when the authenticated GitHub user authored the pull request and the trusted wrapper downgraded self-approval. Only treat an existing `outcome=blocking` marker as satisfied when it is on a CHANGES_REQUESTED review if blocking policy is REQUEST_CHANGES. Treat `outcome=non_blocking` or legacy `outcome=actionable` markers as satisfied only when they are on a COMMENTED review. Ignore matching markers on disallowed review states and publish the correct review for this run instead."
-	reviewRequestInstruction := "Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`."
+	reviewRequestInstruction := fmt.Sprintf("Before posting, confirm the current %s user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`.", forgeName)
 	if manual {
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
 	} else if !requireReviewRequest && reviewRequestBypassReason == "follow_up_new_head" {
@@ -6247,24 +6668,36 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	}
 	githubOperationContract := fmt.Sprintf("GitHub operation contract: when there are actionable findings, submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", actionableReviewSubmitCommand, repo, prNumber)
 	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand)
+	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
+	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`."
+	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor."
+	if forgejoNative {
+		githubOperationContract = fmt.Sprintf("Forgejo operation contract: submit exactly one native PR review for this run through the trusted Looper CLI at %s, with review JSON on stdin. The wrapper validates the expected head, current review request, content safety, provider capability, and idempotency marker before it calls Forgejo. Do not call the Forgejo review API directly.", actionableReviewSubmitCommand)
+		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), and `body`; the wrapper maps validated anchors to Forgejo positions.", looperCLICommand)
+		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
+		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and the head SHA still matches. If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
+		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors; downgrade unanchorable feedback to a top-level review-body item with an exact file/section/symbol reference."
+	}
 	if looperCLIPath == "" {
 		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 		submitPayloadInstruction = ""
 	}
 	parts = append(parts,
-		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead.",
+		idempotencyInstruction,
 		existingMarkerEventInstruction,
 		githubOperationContract,
 		"Review pass contract: complete one full review pass before publishing. Collect PR metadata, changed-file list, live diffs, prior unresolved feedback, and necessary surrounding context; then scan every changed file/range in scope. Do not stop after the first issue. If a blocking issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass.",
 		"Finding accumulator contract: accumulate candidate findings internally before publishing. For each candidate, track location, severity, evidence, why it matters, and a suggested fix. Before submitting, deduplicate, merge same-root-cause findings, group repeated patterns into systemic comments with representative examples, and prefer fewer deep comments over many shallow ones. If there are more than 15 blocking findings or more than 25 total comments, avoid comment flooding by publishing grouped systemic blockers instead of many repetitive inline comments.",
 		"Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.",
 		"Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed blocking findings are included, repeated patterns are consolidated, non-blocking/nit feedback is not escalated, every published finding has concrete evidence and a suggested fix, and the review outcome matches the highest published severity.",
-		"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
+		freshnessInstruction,
 		reviewRequestInstruction,
 		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you have actionable findings but do not have concrete actionable prose yet, exit non-zero instead of posting logs. For a clean APPROVE review, write the required author mention, change/verification summary, and warm acknowledgement; never use an LGTM, empty, or disclosure-only clean body as a fallback.",
+		"Shell payload safety contract: never build review JSON inside a double-quoted shell string because Markdown backticks and dollar expressions can execute or expand. Serialize the payload with a JSON-aware tool or pass a literal single-quoted heredoc to the trusted review-submit wrapper.",
+		"Content safety recovery contract: if `looper review submit` fails with an outbound content safety gate rejection, rewrite the rejected body/comments/paths in plain prose without secret-shaped env assignments, credential URLs, env dumps, or high-entropy tokens, then resubmit in the same session; do not exit non-zero solely because of that rejection, and never paste the rejected value into logs, prompts, or the next payload.",
 		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|non_blocking|blocking -->`.",
 		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
-		"Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor.",
+		anchorInstruction,
 		"Do not add or remove the PR main-conversation +1 reaction yourself. After Looper validates the resulting review marker or accepted clean no-op outcome for this run, the runner will reconcile clean-signal reactions automatically.",
 		specLabelInstruction,
 		cleanInstruction,
@@ -6679,7 +7112,63 @@ func optionalString(value string) *string {
 	return &value
 }
 
+func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky bool) (*string, error) {
+	var previousSnapshot *string
+	if previous != nil {
+		previousSnapshot = previous.AgentSnapshotJSON
+	}
+	snapshotJSON, legacyResume, err := config.ResolveRunAgentSnapshotJSON(previousSnapshot, sticky, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		return nil, err
+	}
+	if legacyResume && r.logger != nil && previous != nil {
+		r.logger.Warn("resuming run without agent_snapshot_json; using current runner agent identity", map[string]any{
+			"loopId": previous.LoopID,
+			"runId":  previous.ID,
+			"vendor": r.agentRuntime,
+			"model":  derefString(r.agentModel),
+		})
+	}
+	return snapshotJSON, nil
+}
+
+// identityFromRun returns the vendor/model/profile that must drive this run.
+// When the run has AgentSnapshotJSON, that identity is execution authority.
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+}
+
+// disclosureIdentity returns agent/model for disclosure stamps from the run
+// snapshot when present; falls back to runner identity on empty snapshot or
+// parse errors (stamp-only paths must not fail the run).
+func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
+	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		// Present but invalid snapshot must not fall back to live runner identity.
+		return "", ""
+	}
+	return vendor, derefString(modelPtr)
+}
+
+func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+	if !useSnapshot {
+		return false, "", nil
+	}
+	// Pass through including non-nil empty suppress so SnapshotModel stays
+	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
+	return true, vendor, model
+}
+
 func stringPtr(value string) *string { return &value }
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
 
 func derefString(value *string) string {
 	if value == nil {

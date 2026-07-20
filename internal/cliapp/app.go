@@ -45,6 +45,10 @@ type Deps struct {
 	// need to exercise the upgrade path with mock binaries inject "stable"
 	// here so the dev-build channel guard does not short-circuit them.
 	CLIChannel string
+
+	// OpenURL opens a URL in the operator's browser. Tests inject a stub.
+	// When nil, the platform default opener is used (open / xdg-open).
+	OpenURL func(string) error
 }
 
 type App struct {
@@ -107,10 +111,23 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "network", description: "Network membership commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "login", description: "Log in to Feishu to capture the owner open_id"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "dashboard", description: "Open the local operator dashboard"}, {name: "network", description: "Network membership commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "login", description: "Log in to Feishu to capture the owner open_id"}, {name: "version", description: "Show Looper version"}, {name: "provider", description: "Provider commands"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "describe", description: "Show loop diagnostics detail"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
+			newCommand(commandSpec{
+				use:   "dashboard",
+				short: "Open the local operator dashboard",
+				args:  cobra.NoArgs,
+				runE:  runtime.dashboard,
+				localFlags: []flagSpec{
+					boolFlag("no-open", "Print the dashboard URL without opening a browser"),
+				},
+				exampleLines: []string{
+					"$ looper dashboard",
+					"$ looper dashboard --no-open",
+				},
+			}),
 			newCommand(commandSpec{
 				use:             "network",
 				short:           "Network membership commands",
@@ -160,7 +177,12 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("project-path", "path", "Add a default project from a local repository path"),
 					boolFlag("enable-local-token", "Enable server.authMode=local-token for generated config"),
 					boolFlag("disable-osascript", "Disable osascript notifications for generated config"),
-					stringFlag("provider", "kind", "Task-source provider for the generated project: github (default) or plane"),
+					stringFlag("provider", "kind", "Task-source provider for the generated project: github (default), forgejo, or plane"),
+					stringFlag("forgejo-url", "url", "Forgejo server base URL (required for --provider forgejo)"),
+					stringFlag("auth", "mode", "Forgejo auth strategy: token-env or tea"),
+					stringFlag("forgejo-token-env", "ENV", "Env var holding the Forgejo token (token-env auth)"),
+					stringFlag("tea-login", "name", "Explicit tea login name (tea auth)"),
+					stringFlag("forgejo-provider-id", "id", "Provider id for Forgejo config (default forgejo)"),
 					stringFlag("code-repo", "owner/repo", "GitHub code repo for pull requests (plane provider); defaults to the --project-path git origin"),
 					stringFlag("trigger-label", "label", "Issue label that triggers planner/worker discovery (plane provider; default looper:plan)"),
 					stringFlag("plane-base-url", "url", "Plane REST API base URL (plane provider; default https://plane.powerformer.net/api/v1)"),
@@ -172,6 +194,8 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				exampleLines: []string{
 					"$ looper bootstrap",
 					"$ looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode",
+					"$ looper bootstrap --yes --provider forgejo --project-path /path/to/repo --forgejo-url https://code.example.com --forgejo-token-env FORGEJO_TOKEN",
+					"$ looper bootstrap --yes --provider forgejo --project-path /path/to/repo --forgejo-url https://code.example.com --auth tea --tea-login powerformer-code",
 					"$ looper bootstrap --yes --provider plane --project-path /path/to/repo --plane-workspace acme --plane-project <uuid> --feishu-webhook-env LOOPER_FEISHU_WEBHOOK_URL",
 				},
 			}),
@@ -194,6 +218,25 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			}),
 			newCommand(commandSpec{use: "version", short: "Show Looper version", runE: runtime.version}),
 			newCommand(commandSpec{
+				use:             "provider",
+				short:           "Provider commands",
+				helpSubcommands: []helpSubcommand{{name: "add", description: "Add a Forgejo provider"}, {name: "list", description: "List providers"}, {name: "test", description: "Test Forgejo access"}, {name: "remove", description: "Remove a provider"}},
+				helpWhenNoArgs:  true,
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "add", short: "Add a Forgejo provider", args: cobra.NoArgs, runE: runtime.providerAdd, localFlags: []flagSpec{
+						stringFlag("id", "id", "Provider id"),
+						stringFlag("forgejo-url", "url", "Forgejo server base URL"),
+						stringFlag("auth", "mode", "Auth strategy: token-env or tea"),
+						stringFlag("forgejo-token-env", "ENV", "Env var holding the Forgejo token (token-env auth)"),
+						stringFlag("tea-login", "name", "Explicit tea login name (tea auth)"),
+						boolFlag("yes", "Confirm discovered tea login without prompting"),
+					}}),
+					newCommand(commandSpec{use: "list", short: "List providers", args: cobra.NoArgs, runE: runtime.providerList}),
+					newCommand(commandSpec{use: "test [id]", short: "Test Forgejo access and current identity", args: cobra.MaximumNArgs(1), runE: runtime.providerTest, localFlags: []flagSpec{stringFlag("repo", "owner/name", "Repository to verify")}}),
+					newCommand(commandSpec{use: "remove <id>", short: "Remove a provider", args: cobra.ExactArgs(1), runE: runtime.providerRemove, localFlags: []flagSpec{boolFlag("force", "Remove without prompting; still rejects bound projects")}}),
+				},
+			}),
+			newCommand(commandSpec{
 				use:             "project",
 				short:           "Project commands",
 				helpSubcommands: []helpSubcommand{{name: "list", description: "List projects"}, {name: "add", description: "Add a project"}, {name: "remove", description: "Remove a project"}},
@@ -204,12 +247,18 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("name", "name", "Project name"),
 					stringFlag("base-branch", "branch", "Base branch"),
 					stringFlag("worktree-root", "path", "Worktree root"),
-					stringFlag("repo", "repo", "Repository slug"),
+					stringFlag("repo", "repo", "Repository slug (owner/name)"),
+					stringFlag("provider", "id", "Provider id for non-GitHub projects (required to confirm a detected Forgejo host)"),
+					stringFlag("forgejo-url", "url", "Create a Forgejo provider before adding the project"),
+					stringFlag("auth", "mode", "Auth strategy when creating a Forgejo provider: token-env or tea"),
+					stringFlag("forgejo-token-env", "ENV", "Env var holding the token for a created Forgejo provider (token-env auth)"),
+					stringFlag("tea-login", "name", "Explicit tea login when creating a Forgejo provider (tea auth)"),
 					stringFlag("snapshot-mode", "mode", "Snapshot mode for project add: async, full, or off"),
 				},
 				exampleLines: []string{
 					"$ looper project list",
 					"$ looper project add /path/to/repo",
+					"$ looper project add /path/to/forgejo-repo --provider forgejo-main --repo owner/name",
 					"$ looper project remove project_1 --force",
 				},
 				subcommands: []*cobra.Command{
@@ -378,6 +427,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("spec", "path", "Spec path"),
 					stringFlag("repo", "repo", "Repository slug"),
 					stringFlag("base-branch", "branch", "Base branch"),
+					boolFlag("force", "Bypass hold labels for this manual run"),
 				},
 				exampleLines: []string{
 					"$ looper work --project project_1 --title \"Ship CLI\" --spec specs/ship-cli.md",
@@ -391,6 +441,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
 					stringFlag("issue", "number", "Issue number"),
+					boolFlag("force", "Bypass hold labels for this manual run"),
 				},
 				exampleLines: []string{"$ looper plan --project project_1 --issue 123"},
 			}),
@@ -405,8 +456,8 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "list", short: "List pull requests", runE: runtime.pullRequestList}),
-					newCommand(commandSpec{use: "show", short: "Show a pull request", args: cobra.ExactArgs(1), runE: runtime.pullRequestShow}),
-					newCommand(commandSpec{use: "status", short: "Show pull request status", args: cobra.ExactArgs(1), runE: runtime.pullRequestStatus}),
+					newCommand(commandSpec{use: "show", short: "Show a pull request", args: cobra.ExactArgs(1), runE: runtime.pullRequestShow, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id")}}),
+					newCommand(commandSpec{use: "status", short: "Show pull request status", args: cobra.ExactArgs(1), runE: runtime.pullRequestStatus, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id")}}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -418,6 +469,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep fixing when new PR comments arrive"),
 					boolFlag("no-loop", "Run only one fixer pass"),
+					boolFlag("force", "Bypass hold labels for this manual run"),
 				},
 				exampleLines: []string{
 					"$ looper fix 42",
@@ -435,11 +487,12 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep reviewing when new commits are pushed"),
 					boolFlag("no-loop", "Run only one review pass"),
+					boolFlag("force", "Bypass hold labels for this manual run"),
 					stringFlag("clean-review-event", "event", "Clean review event override: COMMENT or APPROVE"),
 					stringFlag("blocking-review-event", "event", "Blocking review event override: COMMENT or REQUEST_CHANGES"),
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT, APPROVE, or REQUEST_CHANGES"), stringFlag("commit-id", "sha", "Expected PR head commit SHA"), stringFlag("clean-review-event", "event", "Effective clean review event policy"), stringFlag("blocking-review-event", "event", "Effective blocking review event policy")}}),
+					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT, APPROVE, or REQUEST_CHANGES"), stringFlag("commit-id", "sha", "Expected PR head commit SHA"), stringFlag("clean-review-event", "event", "Effective clean review event policy"), stringFlag("blocking-review-event", "event", "Effective blocking review event policy"), hiddenBoolFlag("reviewer-manual", "Allow held manual reviewer submissions"), hiddenStringFlag("reviewer-run-id", "runId", "Trusted reviewer run id for held manual submissions")}}),
 					newCommand(commandSpec{use: "repair <pr>", short: "Diagnose and repair reviewer local state", args: cobra.ExactArgs(1), runE: runtime.reviewRepair, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id"), boolFlag("apply", "Apply planned local repair actions")}}),
 				},
 				exampleLines: []string{
@@ -457,7 +510,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				runE:            runtime.takeover,
 				helpSubcommands: []helpSubcommand{{name: "list", description: "List active takeovers"}, {name: "stop", description: "Stop a takeover's reviewer and fixer loops"}},
 				localFlags: []flagSpec{
-					stringFlag("agent-vendor", "vendor", "Agent vendor to run loops (claude-code, codex, opencode, cursor-cli)"),
+					stringFlag("agent-vendor", "vendor", "Agent vendor to run loops (claude-code, codex, opencode, cursor-cli, grok-build)"),
 					boolFlag("merge", "Let the reviewer enable auto-merge once the PR is approved and green"),
 					boolFlag("no-fix", "Only run the reviewer loop; skip the fixer loop"),
 					boolFlag("yes", "Run non-interactively; fail instead of prompting for the agent vendor"),
@@ -503,6 +556,17 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper ps --status completed --type worker",
 					"$ looper ps --all",
 					"$ looper ps --type reviewer --project project_1",
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "describe <seq|loopId|runId>",
+				short: "Show loop diagnostics detail",
+				args:  cobra.ExactArgs(1),
+				runE:  runtime.loopInspect,
+				exampleLines: []string{
+					"$ looper describe 12",
+					"$ looper describe 12 --json",
+					"$ looper loop inspect 12",
 				},
 			}),
 			newCommand(commandSpec{

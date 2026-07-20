@@ -29,6 +29,12 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
 	normalized := normalizeLayerPartial(clonePartialConfig(partial))
 	normalized.LegacyReviewer = nil
+	if normalized.Agent != nil && normalized.Agent.Timeouts != nil {
+		normalized.Agent.Timeouts.PlannerSeconds = nil
+		normalized.Agent.Timeouts.WorkerSeconds = nil
+		normalized.Agent.Timeouts.ReviewerSeconds = nil
+		normalized.Agent.Timeouts.FixerSeconds = nil
+	}
 
 	if normalized.Defaults != nil {
 		normalized.Defaults.AllowAutoApprove = nil
@@ -60,6 +66,24 @@ func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
 
 func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 	normalized := partial
+	if normalized.Agent != nil && normalized.Agent.Timeouts != nil {
+		agent := *normalized.Agent
+		timeouts := *agent.Timeouts
+		agent.Timeouts = &timeouts
+		normalized.Agent = &agent
+		if timeouts.PlannerMaxRuntimeSeconds == nil {
+			timeouts.PlannerMaxRuntimeSeconds = timeouts.PlannerSeconds
+		}
+		if timeouts.WorkerMaxRuntimeSeconds == nil {
+			timeouts.WorkerMaxRuntimeSeconds = timeouts.WorkerSeconds
+		}
+		if timeouts.ReviewerMaxRuntimeSeconds == nil {
+			timeouts.ReviewerMaxRuntimeSeconds = timeouts.ReviewerSeconds
+		}
+		if timeouts.FixerMaxRuntimeSeconds == nil {
+			timeouts.FixerMaxRuntimeSeconds = timeouts.FixerSeconds
+		}
+	}
 
 	if normalized.LegacyReviewer != nil {
 		reviewer := ensureReviewerRoleConfig(&normalized)
@@ -69,7 +93,7 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 	if normalized.Roles != nil && normalized.Roles.Reviewer != nil {
 		normalizeReviewerRoleLegacyShape(normalized.Roles.Reviewer)
 	}
-
+	canonicalizePartialRoleAgentBindings(normalized.Roles)
 	if normalized.Projects != nil {
 		projects := *normalized.Projects
 		for i := range projects {
@@ -88,6 +112,7 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 			if projects[i].Roles != nil && projects[i].Roles.Reviewer != nil {
 				normalizeReviewerRoleLegacyShape(projects[i].Roles.Reviewer)
 			}
+			canonicalizePartialRoleAgentBindings(projects[i].Roles)
 		}
 		normalized.Projects = &projects
 	}
@@ -95,7 +120,18 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 		providers := cloneProviderConfigs(*normalized.Providers)
 		partials := make([]PartialProviderConfig, len(providers))
 		for i, provider := range providers {
-			partials[i] = PartialProviderConfig{ID: provider.ID, Kind: &provider.Kind, BaseURL: &provider.BaseURL, GHPath: provider.GHPath, TokenEnv: provider.TokenEnv, Workspace: provider.Workspace, ProjectID: provider.ProjectID}
+			partials[i] = PartialProviderConfig{
+				ID:        provider.ID,
+				Kind:      &provider.Kind,
+				BaseURL:   &provider.BaseURL,
+				GHPath:    provider.GHPath,
+				Auth:      providerAuthModePtr(provider.Auth),
+				TokenEnv:  provider.TokenEnv,
+				TeaLogin:  provider.TeaLogin,
+				TeaPath:   provider.TeaPath,
+				Workspace: provider.Workspace,
+				ProjectID: provider.ProjectID,
+			}
 		}
 		normalized.Providers = &partials
 	}
@@ -349,7 +385,7 @@ func applyProviderProfiles(config *Config, partials ...PartialConfig) error {
 		if resolvedProjectProviderKind(*config, *project) != ProviderKindForgejo {
 			continue
 		}
-		applyForgejoProjectProfile(project)
+		ApplyForgejoProjectProfile(project)
 	}
 	return nil
 }
@@ -380,7 +416,9 @@ func ResolvedProjectProviderKind(config Config, project ProjectRefConfig) Provid
 	return resolvedProjectProviderKind(config, project)
 }
 
-func applyForgejoProjectProfile(project *ProjectRefConfig) {
+// ApplyForgejoProjectProfile fills provider-specific role defaults without
+// replacing explicit project overrides.
+func ApplyForgejoProjectProfile(project *ProjectRefConfig) {
 	roles := project.Roles
 	if roles == nil {
 		roles = &PartialRoleConfigs{}
@@ -395,24 +433,8 @@ func applyForgejoProjectProfile(project *ProjectRefConfig) {
 	if roles.Reviewer.Discovery.Triggers == nil {
 		roles.Reviewer.Discovery.Triggers = &PartialReviewerRoleTriggersConfig{}
 	}
-	if roles.Reviewer.Discovery.Triggers.RequireReviewRequest == nil {
-		roles.Reviewer.Discovery.Triggers.RequireReviewRequest = boolPtr(false)
-	}
-	if roles.Reviewer.Discovery.Triggers.Labels == nil {
-		labels := []string{"looper:review"}
-		roles.Reviewer.Discovery.Triggers.Labels = &labels
-	}
 	if roles.Reviewer.Behavior == nil {
 		roles.Reviewer.Behavior = &PartialReviewerConfig{}
-	}
-	if roles.Reviewer.Behavior.ReviewEvents == nil {
-		roles.Reviewer.Behavior.ReviewEvents = &PartialReviewerReviewEventsConfig{}
-	}
-	if roles.Reviewer.Behavior.ReviewEvents.Clean == nil {
-		roles.Reviewer.Behavior.ReviewEvents.Clean = reviewerReviewEventPtr(ReviewerReviewEventComment)
-	}
-	if roles.Reviewer.Behavior.ReviewEvents.Blocking == nil {
-		roles.Reviewer.Behavior.ReviewEvents.Blocking = reviewerReviewEventPtr(ReviewerReviewEventComment)
 	}
 	if roles.Reviewer.Behavior.ThreadResolution == nil {
 		roles.Reviewer.Behavior.ThreadResolution = &PartialReviewerThreadResolutionConfig{}
@@ -429,19 +451,35 @@ func applyForgejoProjectProfile(project *ProjectRefConfig) {
 	if roles.Fixer == nil {
 		roles.Fixer = &PartialFixerRoleConfig{}
 	}
-	if roles.Fixer.AutoDiscovery == nil {
-		roles.Fixer.AutoDiscovery = boolPtr(false)
+	if roles.Coordinator == nil {
+		roles.Coordinator = &PartialCoordinatorRoleConfig{}
+	}
+	if roles.Coordinator.Enabled == nil {
+		roles.Coordinator.Enabled = boolPtr(false)
+	}
+	if roles.Coordinator.Dependencies == nil {
+		roles.Coordinator.Dependencies = &PartialCoordinatorDependenciesConfig{}
+	}
+	if roles.Coordinator.Dependencies.Enabled == nil {
+		roles.Coordinator.Dependencies.Enabled = boolPtr(false)
 	}
 }
 
 func normalizeProviderConfig(provider *ProviderConfig) {
 	provider.ID = strings.TrimSpace(provider.ID)
 	provider.BaseURL = normalizeBaseURL(provider.BaseURL)
+	provider.Auth = ProviderAuthMode(strings.TrimSpace(string(provider.Auth)))
 	if provider.GHPath != nil {
 		provider.GHPath = stringPtr(strings.TrimSpace(*provider.GHPath))
 	}
 	if provider.TokenEnv != nil {
 		provider.TokenEnv = stringPtr(strings.TrimSpace(*provider.TokenEnv))
+	}
+	if provider.TeaLogin != nil {
+		provider.TeaLogin = stringPtr(strings.TrimSpace(*provider.TeaLogin))
+	}
+	if provider.TeaPath != nil {
+		provider.TeaPath = stringPtr(strings.TrimSpace(*provider.TeaPath))
 	}
 	if provider.Workspace != nil {
 		provider.Workspace = stringPtr(strings.TrimSpace(*provider.Workspace))
@@ -449,6 +487,34 @@ func normalizeProviderConfig(provider *ProviderConfig) {
 	if provider.ProjectID != nil {
 		provider.ProjectID = stringPtr(strings.TrimSpace(*provider.ProjectID))
 	}
+}
+
+// EffectiveProviderAuth resolves the authentication strategy for a provider.
+// Explicit auth wins; otherwise teaLogin alone implies tea, tokenEnv alone
+// implies token-env. Both set without auth is invalid and left empty for
+// validation to reject.
+func EffectiveProviderAuth(provider ProviderConfig) ProviderAuthMode {
+	if provider.Auth != "" {
+		return provider.Auth
+	}
+	hasTea := provider.TeaLogin != nil && strings.TrimSpace(*provider.TeaLogin) != ""
+	hasToken := provider.TokenEnv != nil && strings.TrimSpace(*provider.TokenEnv) != ""
+	switch {
+	case hasTea && !hasToken:
+		return ProviderAuthTea
+	case hasToken && !hasTea:
+		return ProviderAuthTokenEnv
+	default:
+		return ""
+	}
+}
+
+func providerAuthModePtr(value ProviderAuthMode) *ProviderAuthMode {
+	if value == "" {
+		return nil
+	}
+	cloned := value
+	return &cloned
 }
 
 func normalizeBaseURL(value string) string {
@@ -581,6 +647,10 @@ func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {
 		config.Model = stringPtr(*partial.Model)
 	}
 
+	if partial.Profiles != nil {
+		config.Profiles = mergeAgentProfiles(config.Profiles, partial.Profiles)
+	}
+
 	if partial.Params != nil {
 		config.Params = mergeAnyMap(config.Params, partial.Params)
 	}
@@ -596,6 +666,111 @@ func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {
 	if partial.NativeResume != nil && partial.NativeResume.Enabled != nil {
 		config.NativeResume.Enabled = *partial.NativeResume.Enabled
 	}
+}
+
+func mergeAgentProfiles(base map[string]AgentBindingConfig, override map[string]AgentBindingConfig) map[string]AgentBindingConfig {
+	if override == nil {
+		return base
+	}
+	merged := make(map[string]AgentBindingConfig, len(base)+len(override))
+	for id, binding := range base {
+		merged[id] = cloneAgentBindingConfig(binding)
+	}
+	for id, binding := range override {
+		existing := merged[id]
+		if binding.Vendor != nil {
+			vendor := *binding.Vendor
+			existing.Vendor = &vendor
+		}
+		if binding.Model != nil {
+			existing.Model = stringPtr(*binding.Model)
+		}
+		merged[id] = existing
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func cloneAgentBindingConfig(binding AgentBindingConfig) AgentBindingConfig {
+	cloned := AgentBindingConfig{}
+	if binding.Vendor != nil {
+		vendor := *binding.Vendor
+		cloned.Vendor = &vendor
+	}
+	if binding.Model != nil {
+		cloned.Model = stringPtr(*binding.Model)
+	}
+	return cloned
+}
+
+func mergeRoleAgentConfig(config **RoleAgentConfig, partial *RoleAgentConfig) {
+	if partial == nil {
+		return
+	}
+	if *config == nil {
+		*config = &RoleAgentConfig{}
+	}
+	if partial.Profile != nil {
+		(*config).Profile = stringPtr(*partial.Profile)
+	}
+	if partial.Vendor != nil {
+		vendor := *partial.Vendor
+		(*config).Vendor = &vendor
+	}
+	if partial.Model != nil {
+		(*config).Model = stringPtr(*partial.Model)
+	}
+	if isEmptyRoleAgentConfig(*config) {
+		*config = nil
+	}
+}
+
+// isEmptyRoleAgentConfig reports whether a role agent binding has no semantic fields.
+// Empty/whitespace profile text is non-semantic; a non-nil empty model is intentional
+// suppression and keeps the binding non-empty.
+func isEmptyRoleAgentConfig(agent *RoleAgentConfig) bool {
+	if agent == nil {
+		return true
+	}
+	profileEmpty := agent.Profile == nil || strings.TrimSpace(*agent.Profile) == ""
+	return profileEmpty && agent.Vendor == nil && agent.Model == nil
+}
+
+// canonicalizePartialRoleAgentBindings nils empty agent objects on coding roles
+// (including project role partials) so `{}` does not linger as a non-nil pointer.
+func canonicalizePartialRoleAgentBindings(roles *PartialRoleConfigs) {
+	if roles == nil {
+		return
+	}
+	if roles.Planner != nil && isEmptyRoleAgentConfig(roles.Planner.Agent) {
+		roles.Planner.Agent = nil
+	}
+	if roles.Worker != nil && isEmptyRoleAgentConfig(roles.Worker.Agent) {
+		roles.Worker.Agent = nil
+	}
+	if roles.Reviewer != nil && isEmptyRoleAgentConfig(roles.Reviewer.Agent) {
+		roles.Reviewer.Agent = nil
+	}
+	if roles.Fixer != nil && isEmptyRoleAgentConfig(roles.Fixer.Agent) {
+		roles.Fixer.Agent = nil
+	}
+}
+
+func cloneRoleAgentConfig(agent *RoleAgentConfig) *RoleAgentConfig {
+	if agent == nil {
+		return nil
+	}
+	cloned := &RoleAgentConfig{
+		Profile: cloneStringPtr(agent.Profile),
+		Model:   cloneStringPtr(agent.Model),
+	}
+	if agent.Vendor != nil {
+		vendor := *agent.Vendor
+		cloned.Vendor = &vendor
+	}
+	return cloned
 }
 
 func mergeAgentTimeoutConfig(config *AgentTimeoutConfig, partial PartialAgentTimeoutConfig) {
@@ -1206,6 +1381,9 @@ func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRol
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
+	if partial.Agent != nil {
+		mergeRoleAgentConfig(&config.Agent, partial.Agent)
+	}
 }
 
 func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleConfig) {
@@ -1217,6 +1395,9 @@ func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleCo
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
+	}
+	if partial.Agent != nil {
+		mergeRoleAgentConfig(&config.Agent, partial.Agent)
 	}
 }
 
@@ -1239,6 +1420,9 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
+	}
+	if partial.Agent != nil {
+		mergeRoleAgentConfig(&config.Agent, partial.Agent)
 	}
 }
 
@@ -1281,6 +1465,9 @@ func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfi
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
+	}
+	if partial.Agent != nil {
+		mergeRoleAgentConfig(&config.Agent, partial.Agent)
 	}
 }
 
@@ -1435,6 +1622,9 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 		network := *partial.Network
 		cloned.Network = &network
 	}
+	if partial.Agent != nil {
+		cloned.Agent = clonePartialAgentConfig(partial.Agent)
+	}
 	if partial.Defaults != nil {
 		defaults := *partial.Defaults
 		cloned.Defaults = &defaults
@@ -1464,7 +1654,10 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 			providers[i].Kind = cloneProviderKindPtr(providers[i].Kind)
 			providers[i].BaseURL = cloneStringPtr(providers[i].BaseURL)
 			providers[i].GHPath = cloneStringPtr(providers[i].GHPath)
+			providers[i].Auth = cloneProviderAuthModePtr(providers[i].Auth)
 			providers[i].TokenEnv = cloneStringPtr(providers[i].TokenEnv)
+			providers[i].TeaLogin = cloneStringPtr(providers[i].TeaLogin)
+			providers[i].TeaPath = cloneStringPtr(providers[i].TeaPath)
 			providers[i].Workspace = cloneStringPtr(providers[i].Workspace)
 			providers[i].ProjectID = cloneStringPtr(providers[i].ProjectID)
 		}
@@ -1573,6 +1766,7 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 	cloned := make([]ProjectRefConfig, len(projects))
 	for index, project := range projects {
 		roles := mergeLegacyProjectInstructionsIntoRoles(clonePartialRoleConfigs(project.Roles), project.Instructions)
+		canonicalizePartialRoleAgentBindings(roles)
 		repoPath := firstNonEmpty(project.RepoPath, project.Path)
 
 		cloned[index] = ProjectRefConfig{
@@ -1635,8 +1829,13 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 			Kind:      kind,
 			GHPath:    cloneStringPtr(provider.GHPath),
 			TokenEnv:  cloneStringPtr(provider.TokenEnv),
+			TeaLogin:  cloneStringPtr(provider.TeaLogin),
+			TeaPath:   cloneStringPtr(provider.TeaPath),
 			Workspace: cloneStringPtr(provider.Workspace),
 			ProjectID: cloneStringPtr(provider.ProjectID),
+		}
+		if provider.Auth != nil {
+			cloned[index].Auth = *provider.Auth
 		}
 		if provider.BaseURL != nil {
 			cloned[index].BaseURL = normalizeBaseURL(*provider.BaseURL)
@@ -1644,6 +1843,14 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 		normalizeProviderConfig(&cloned[index])
 	}
 	return cloned
+}
+
+func cloneProviderAuthModePtr(value *ProviderAuthMode) *ProviderAuthMode {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func cloneProjectNetworkConfig(config *ProjectNetworkConfig) *ProjectNetworkConfig {
@@ -1696,6 +1903,46 @@ func mergeLegacyProjectInstructionsIntoRoles(roles *PartialRoleConfigs, instruct
 	return roles
 }
 
+func clonePartialAgentConfig(agent *PartialAgentConfig) *PartialAgentConfig {
+	if agent == nil {
+		return nil
+	}
+	cloned := *agent
+	cloned.Vendor = nil
+	if agent.Vendor != nil {
+		vendor := *agent.Vendor
+		cloned.Vendor = &vendor
+	}
+	cloned.Model = cloneStringPtr(agent.Model)
+	cloned.Profiles = cloneAgentProfiles(agent.Profiles)
+	if agent.Params != nil {
+		cloned.Params = mergeAnyMap(nil, agent.Params)
+	}
+	if agent.Env != nil {
+		cloned.Env = cloneStringMap(agent.Env)
+	}
+	if agent.Timeouts != nil {
+		timeouts := *agent.Timeouts
+		cloned.Timeouts = &timeouts
+	}
+	if agent.NativeResume != nil {
+		nativeResume := *agent.NativeResume
+		cloned.NativeResume = &nativeResume
+	}
+	return &cloned
+}
+
+func cloneAgentProfiles(profiles map[string]AgentBindingConfig) map[string]AgentBindingConfig {
+	if profiles == nil {
+		return nil
+	}
+	cloned := make(map[string]AgentBindingConfig, len(profiles))
+	for id, binding := range profiles {
+		cloned[id] = cloneAgentBindingConfig(binding)
+	}
+	return cloned
+}
+
 func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 	if configs == nil {
 		return nil
@@ -1711,6 +1958,7 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			}
 			planner.Triggers = &triggers
 		}
+		planner.Agent = cloneRoleAgentConfig(configs.Planner.Agent)
 		cloned.Planner = &planner
 	}
 	if configs.Worker != nil {
@@ -1723,6 +1971,7 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			}
 			worker.Triggers = &triggers
 		}
+		worker.Agent = cloneRoleAgentConfig(configs.Worker.Agent)
 		cloned.Worker = &worker
 	}
 	if configs.Coordinator != nil {
@@ -1815,6 +2064,7 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			}
 			reviewer.Behavior = &behavior
 		}
+		reviewer.Agent = cloneRoleAgentConfig(configs.Reviewer.Agent)
 		cloned.Reviewer = &reviewer
 	}
 	if configs.Fixer != nil {
@@ -1827,6 +2077,7 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			}
 			fixer.Triggers = &triggers
 		}
+		fixer.Agent = cloneRoleAgentConfig(configs.Fixer.Agent)
 		cloned.Fixer = &fixer
 	}
 	return &cloned

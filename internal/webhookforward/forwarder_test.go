@@ -2,9 +2,12 @@ package webhookforward
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +16,364 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// Contract (#580): Forward refuses accept-time enqueue when admission is already closed.
+func TestForwardRefusesWhenAllowExecuteClosedAtAccept(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var executeCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute: func() error {
+			executeCalls.Add(1)
+			return errors.New("daemon admission is stopping")
+		},
+	})
+	defer forwarder.Close()
+
+	_, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-closed-accept",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) || !strings.Contains(err.Error(), "admission is stopping") {
+		t.Fatalf("Forward() error = %v, want ErrAdmissionRefused wrapping admission refusal", err)
+	}
+	if executeCalls.Load() == 0 {
+		t.Fatal("AllowExecute was not consulted at Forward accept time")
+	}
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 0 || stats.QueueEnqueued != 0 {
+		t.Fatalf("stats = %#v, want no accept/enqueue while admission closed", stats)
+	}
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertCallCount(t, 0)
+}
+
+// Contract (#592 review): Forward may accept while admission is open; once
+// accepted/202, worker discovery must still complete even if AllowExecute later
+// refuses. Post-accept admission recheck would drop work GitHub will not retry.
+func TestWorkerCompletesDiscoveryWhenAdmissionClosesAfterAccept(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var executeCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute: func() error {
+			// Accept-time calls succeed; any later worker recheck would refuse
+			// (and must not be consulted after accepted/202).
+			if executeCalls.Add(1) <= 2 {
+				return nil
+			}
+			return errors.New("daemon admission is degraded")
+		},
+	})
+	defer forwarder.Close()
+
+	result, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-closed-exec",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	if result.Status != "accepted" || result.WorkItems != 1 {
+		t.Fatalf("Forward() = %#v, want accepted with work", result)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stats := forwarder.Stats()
+		if stats.ExecutionsSucceeded >= 1 && stats.InFlight == 0 && stats.Queued == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stats := forwarder.Stats()
+	if stats.ExecutionsSucceeded < 1 {
+		t.Fatalf("ExecutionsSucceeded = %d, want >= 1 after post-accept admission close", stats.ExecutionsSucceeded)
+	}
+	if stats.ExecutionsFailed != 0 {
+		t.Fatalf("ExecutionsFailed = %d, want 0 when accepted work still discovers", stats.ExecutionsFailed)
+	}
+	// Only accept-time AllowExecute calls (pre-lock + under-lock fallback path).
+	if executeCalls.Load() != 2 {
+		t.Fatalf("AllowExecute calls = %d, want 2 (accept only; no worker recheck)", executeCalls.Load())
+	}
+	reviewerRunner.assertCallCount(t, 1)
+	fixerRunner.assertCallCount(t, 1)
+}
+
+// Contract (#580 review): admission closed after the pre-lock allowExecute pass
+// but before enqueue must refuse with ErrAdmissionRefused (503), not accept (202).
+func TestForwardRefusesWhenAllowExecuteClosesBeforeEnqueue(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var executeCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute: func() error {
+			// Pre-lock pass succeeds; under-enqueue-lock recheck refuses.
+			if executeCalls.Add(1) == 1 {
+				return nil
+			}
+			return errors.New("daemon admission is degraded")
+		},
+	})
+	defer forwarder.Close()
+
+	_, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-race-enqueue",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) || !strings.Contains(err.Error(), "degraded") {
+		t.Fatalf("Forward() error = %v, want ErrAdmissionRefused wrapping degraded", err)
+	}
+	if executeCalls.Load() < 2 {
+		t.Fatalf("AllowExecute calls = %d, want >= 2 (pre-lock + under-lock recheck)", executeCalls.Load())
+	}
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 0 || stats.QueueEnqueued != 0 {
+		t.Fatalf("stats = %#v, want no accept/enqueue after under-lock admission refuse", stats)
+	}
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertCallCount(t, 0)
+}
+
+// Contract (#580/#592 review): AllowExecuteWhile must hold admission across
+// enqueue AND delivery bookkeeping so MarkDegraded cannot interleave between
+// the gate and the accepted-delivery record (202 without a retryable record).
+// A concurrent closer blocked on the same mutex cannot flip state mid-section.
+func TestForwardAllowExecuteWhileHoldsAdmissionAcrossEnqueue(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+
+	var mu sync.Mutex
+	ready := true
+	var whileEntered atomic.Bool
+	// Unbuffered handoff: close(started) is observed by the concurrent closer
+	// only after AllowExecuteWhile holds mu. Do not use select+default on a
+	// send — under CI load the receiver may not be scheduled yet and the
+	// signal is lost, leaving degradeDone forever open (CI flake).
+	started := make(chan struct{})
+	degradeDone := make(chan struct{})
+
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute:  func() error { return nil },
+		AllowExecuteWhile: func(fn func()) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if !ready {
+				return errors.New("daemon admission is degraded")
+			}
+			whileEntered.Store(true)
+			// Concurrent MarkDegraded must block on mu until fn returns
+			// (including delivery bookkeeping written inside fn).
+			close(started)
+			select {
+			case <-degradeDone:
+				t.Error("admission flipped to not-ready while AllowExecuteWhile held the mutex")
+			case <-time.After(30 * time.Millisecond):
+			}
+			fn()
+			if !ready {
+				t.Error("admission flipped to not-ready while AllowExecuteWhile held the mutex")
+			}
+			return nil
+		},
+	})
+	defer forwarder.Close()
+
+	go func() {
+		<-started
+		mu.Lock()
+		ready = false
+		mu.Unlock()
+		close(degradeDone)
+	}()
+
+	result, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-while-atomic",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v, want accept under held admission", err)
+	}
+	if result.Status != "accepted" || result.WorkItems != 1 {
+		t.Fatalf("Forward() = %#v, want accepted with work under held admission", result)
+	}
+	if !whileEntered.Load() {
+		t.Fatal("AllowExecuteWhile was not used for accept-time enqueue")
+	}
+	// Accepted outcome implies delivery bookkeeping completed inside While fn
+	// (recordAcceptedLocked runs before AllowExecuteWhile returns).
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 1 {
+		t.Fatalf("DeliveriesAccepted = %d, want 1 after atomic accept record", stats.DeliveriesAccepted)
+	}
+	// Duplicate of the same delivery must be observed as deduped (record written).
+	dup, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-while-atomic",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	// After concurrent degrade flipped ready=false, further While calls refuse.
+	// Dedup is checked before AllowExecuteWhile, so this still returns duplicate
+	// when the delivery was recorded inside the first While hold.
+	if err != nil {
+		// If degrade flipped the pre-lock AllowExecute path... we only set While.
+		// Pre-lock AllowExecute is always nil-error here; While refuses new IDs.
+		// Same delivery ID hits dedup before While.
+		t.Fatalf("duplicate Forward() error = %v, want deduped success after recorded accept", err)
+	}
+	if dup.Status != "duplicate" {
+		t.Fatalf("duplicate Forward() = %#v, want duplicate after accept recorded under hold", dup)
+	}
+	select {
+	case <-degradeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent degrade did not complete after AllowExecuteWhile released")
+	}
+	// After release, further accepts must refuse.
+	_, err = forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-while-after-degrade",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 100),
+	})
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) {
+		t.Fatalf("Forward() after degrade error = %v, want ErrAdmissionRefused", err)
+	}
+}
+
+// Contract: AllowExecuteWhile refusal at accept refuses with ErrAdmissionRefused
+// without enqueueing (503 path), even when pre-lock AllowExecute still passes.
+func TestForwardRefusesWhenAllowExecuteWhileRefuses(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var whileCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute:  func() error { return nil },
+		AllowExecuteWhile: func(fn func()) error {
+			whileCalls.Add(1)
+			return errors.New("daemon admission is degraded")
+		},
+	})
+	defer forwarder.Close()
+
+	_, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-while-refuse",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) || !strings.Contains(err.Error(), "degraded") {
+		t.Fatalf("Forward() error = %v, want ErrAdmissionRefused wrapping degraded", err)
+	}
+	if whileCalls.Load() != 1 {
+		t.Fatalf("AllowExecuteWhile calls = %d, want 1", whileCalls.Load())
+	}
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 0 || stats.QueueEnqueued != 0 {
+		t.Fatalf("stats = %#v, want no accept/enqueue when While refuses", stats)
+	}
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertCallCount(t, 0)
+}
+
+// Contract: CancelExecute aborts in-flight discovery that already passed
+// AllowExecute so BeginShutdown cannot leave a Background() discovery enqueueing.
+func TestWorkerDiscoveryCanceledByCancelExecute(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	block := make(chan struct{})
+	reviewerRunner := newFakeTargetedRunner(block)
+	fixerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute:  func() error { return nil },
+	})
+	defer forwarder.Close()
+
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "cancel-mid-discovery",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 77),
+	}); err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	reviewerRunner.waitForCall(t, 1)
+
+	// Cancel without unblocking the runner: discovery must exit via ctx.Done
+	// rather than completing CreateOrGetActiveByDedupe after admission closes.
+	forwarder.CancelExecute()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stats := forwarder.Stats()
+		if stats.ExecutionsFailed >= 1 && stats.InFlight == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stats := forwarder.Stats()
+	if stats.ExecutionsFailed < 1 {
+		t.Fatalf("ExecutionsFailed = %d, want >= 1 after CancelExecute", stats.ExecutionsFailed)
+	}
+	if stats.ExecutionsSucceeded != 0 {
+		t.Fatalf("ExecutionsSucceeded = %d, want 0 when discovery is canceled mid-flight", stats.ExecutionsSucceeded)
+	}
+	if len(stats.RecentOutcomes) == 0 {
+		t.Fatal("expected a failed outcome after CancelExecute")
+	}
+	errText := stats.RecentOutcomes[len(stats.RecentOutcomes)-1].Error
+	if errText != context.Canceled.Error() {
+		t.Fatalf("outcome error = %q, want %q", errText, context.Canceled.Error())
+	}
+}
 
 func TestForwardDedupesDeliveriesWithinTTLAndExpiresAfterAnHour(t *testing.T) {
 	repos := newTestRepositories(t)
@@ -54,6 +415,36 @@ func TestForwardDedupesDeliveriesWithinTTLAndExpiresAfterAnHour(t *testing.T) {
 	if stats.DeliveriesDeduped != 1 {
 		t.Fatalf("DeliveriesDeduped = %d, want 1", stats.DeliveriesDeduped)
 	}
+}
+
+func TestForwardCapturesCurrentProjectCatalog(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	cfg := testConfig(t)
+	cfg.Roles.Reviewer.Discovery.AutoDiscovery = false
+	source := &mutableConfigSource{cfg: cfg}
+	reviewerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: cfg, ConfigSource: source, Reviewer: reviewerRunner, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	first, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "before", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 42)})
+	if err != nil {
+		t.Fatalf("first Forward() error = %v", err)
+	}
+	if first.Status != "ignored" {
+		t.Fatalf("first status = %q, want ignored", first.Status)
+	}
+
+	cfg.Roles.Reviewer.Discovery.AutoDiscovery = true
+	source.Store(cfg)
+	second, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "after", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 42)})
+	if err != nil {
+		t.Fatalf("second Forward() error = %v", err)
+	}
+	if second.Status != "accepted" {
+		t.Fatalf("second status = %q, want accepted", second.Status)
+	}
+	reviewerRunner.waitForCalls(t, 1)
 }
 
 func TestForwardIgnoresUnsupportedAndIssueComments(t *testing.T) {
@@ -176,6 +567,39 @@ func TestForwardFansOutToMultipleProjectsForSameRepo(t *testing.T) {
 	reviewerRunner.waitForCalls(t, 2)
 	reviewerRunner.assertProjects(t, []string{"project_1", "project_2"})
 	reviewerRunner.assertRepos(t, []string{"acme/looper", "acme/looper"})
+}
+
+func TestForwardDoesNotRouteGitHubWebhookToSameSlugForgejoProject(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "github", "acme/looper")
+	seedProject(t, repos, "plane", "acme/looper")
+	forgejoMetadata := `{"provider":"forgejo-main","repo":"acme/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "forgejo", Name: "forgejo", RepoPath: "/tmp/forgejo", MetadataJSON: &forgejoMetadata, CreatedAt: "2026-05-16T12:00:00.000Z", UpdatedAt: "2026-05-16T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert(forgejo) error = %v", err)
+	}
+	cfg := testConfig(t)
+	cfg.Providers = []config.ProviderConfig{
+		{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.test"},
+		{ID: "plane-main", Kind: config.ProviderKindPlane},
+	}
+	cfg.Projects = []config.ProjectRefConfig{
+		{ID: "github", Repo: "acme/looper", RepoPath: "/tmp/github"},
+		{ID: "forgejo", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: "/tmp/forgejo"},
+		{ID: "plane", Provider: "plane-main", Repo: "acme/looper", RepoPath: "/tmp/plane"},
+	}
+	reviewerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: cfg, Reviewer: reviewerRunner, Fixer: targetedFixerAdapter{runner: newFakeTargetedRunner(nil)}, MaxConcurrent: 2, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	result, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "github-only", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 55)})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	if result.WorkItems != 2 {
+		t.Fatalf("WorkItems = %d, want GitHub and Plane projects", result.WorkItems)
+	}
+	reviewerRunner.waitForCalls(t, 2)
+	reviewerRunner.assertProjects(t, []string{"github", "plane"})
 }
 
 func TestForwardCoalescesQueuedWorkAndUnionsLanes(t *testing.T) {
@@ -395,11 +819,11 @@ func newFakeTargetedRunner(block chan struct{}) *fakeTargetedRunner {
 	return &fakeTargetedRunner{block: block, activeByKey: map[string]int{}, maxConcurrentByKey: map[string]int{}, failuresRemaining: map[string]int{}}
 }
 
-func (f *fakeTargetedRunner) DiscoverPullRequest(_ context.Context, input reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
-	return f.run(input.ProjectID, input.Repo, input.PRNumber)
+func (f *fakeTargetedRunner) DiscoverPullRequest(ctx context.Context, input reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
+	return f.run(ctx, input.ProjectID, input.Repo, input.PRNumber)
 }
 
-func (f *fakeTargetedRunner) run(projectID, repo string, prNumber int64) (reviewer.DiscoveryResult, error) {
+func (f *fakeTargetedRunner) run(ctx context.Context, projectID, repo string, prNumber int64) (reviewer.DiscoveryResult, error) {
 	key := runnerKey(projectID, repo, prNumber)
 	f.mu.Lock()
 	f.calls = append(f.calls, targetedCall{ProjectID: projectID, Repo: repo, PRNumber: prNumber})
@@ -418,7 +842,15 @@ func (f *fakeTargetedRunner) run(projectID, repo string, prNumber int64) (review
 	block := f.block
 	f.mu.Unlock()
 	if block != nil {
-		<-block
+		select {
+		case <-block:
+		case <-ctx.Done():
+			f.mu.Lock()
+			f.active--
+			f.activeByKey[key]--
+			f.mu.Unlock()
+			return reviewer.DiscoveryResult{}, ctx.Err()
+		}
 	}
 	f.mu.Lock()
 	f.active--
@@ -430,13 +862,17 @@ func (f *fakeTargetedRunner) run(projectID, repo string, prNumber int64) (review
 	return reviewer.DiscoveryResult{}, nil
 }
 
-func (f *fakeTargetedRunner) runBaseBranch(projectID, repo, baseBranch string) error {
+func (f *fakeTargetedRunner) runBaseBranch(ctx context.Context, projectID, repo, baseBranch string) error {
 	f.mu.Lock()
 	f.calls = append(f.calls, targetedCall{ProjectID: projectID, Repo: repo, BaseBranch: baseBranch})
 	block := f.block
 	f.mu.Unlock()
 	if block != nil {
-		<-block
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return nil
 }
@@ -556,6 +992,23 @@ func testConfig(t *testing.T) config.Config {
 	return cfg
 }
 
+type mutableConfigSource struct {
+	mu  sync.RWMutex
+	cfg config.Config
+}
+
+func (s *mutableConfigSource) Snapshot() config.Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+func (s *mutableConfigSource) Store(cfg config.Config) {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+}
+
 func newTestRepositories(t *testing.T) *storage.Repositories {
 	t.Helper()
 	root := t.TempDir()
@@ -625,11 +1078,11 @@ var _ TargetedFixer = targetedFixerAdapter{}
 
 type targetedFixerAdapter struct{ runner *fakeTargetedRunner }
 
-func (a targetedFixerAdapter) DiscoverPullRequest(_ context.Context, input fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
-	_, err := a.runner.run(input.ProjectID, input.Repo, input.PRNumber)
+func (a targetedFixerAdapter) DiscoverPullRequest(ctx context.Context, input fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
+	_, err := a.runner.run(ctx, input.ProjectID, input.Repo, input.PRNumber)
 	return fixer.DiscoveryResult{}, err
 }
 
-func (a targetedFixerAdapter) DiscoverPullRequestsForBaseBranchUpdate(_ context.Context, input fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error) {
-	return fixer.DiscoveryResult{}, a.runner.runBaseBranch(input.ProjectID, input.Repo, input.BaseRefName)
+func (a targetedFixerAdapter) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, input fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error) {
+	return fixer.DiscoveryResult{}, a.runner.runBaseBranch(ctx, input.ProjectID, input.Repo, input.BaseRefName)
 }

@@ -50,6 +50,11 @@ type ForwardResult struct {
 	WorkItems int    `json:"workItems"`
 }
 
+// ErrAdmissionRefused is returned when AllowExecute refuses at Forward accept
+// time. HTTP and tunnel callers must map this to 503 SERVICE_UNAVAILABLE, not
+// 400 validation failure — temporary admission closed is not an invalid delivery.
+var ErrAdmissionRefused = errors.New("webhook forward admission refused")
+
 type Outcome struct {
 	At         string   `json:"at"`
 	ProjectID  string   `json:"projectId"`
@@ -87,6 +92,13 @@ type Stats struct {
 type Forwarder interface {
 	Forward(context.Context, DeliveryRequest) (ForwardResult, error)
 	Stats() Stats
+	// CancelExecute aborts in-flight discovery without waiting for workers to
+	// exit. BeginShutdown / Runtime.Stop should call this so process exit can
+	// abort discovery promptly. MarkDegraded must NOT call this: Forward may
+	// already have returned accepted/202 for in-memory queue entries, and
+	// sticky degrade leaves the daemon up with no GitHub retry for that
+	// delivery.
+	CancelExecute()
 	Close()
 }
 
@@ -105,9 +117,14 @@ type TargetedShepherd interface {
 	ReconcilePullRequest(ctx context.Context, projectID, repo string, prNumber int64) error
 }
 
+type ConfigSource interface {
+	Snapshot() config.Config
+}
+
 type Options struct {
 	Repos              *storage.Repositories
 	Config             config.Config
+	ConfigSource       ConfigSource
 	Reviewer           TargetedReviewer
 	Fixer              TargetedFixer
 	Shepherd           TargetedShepherd
@@ -118,6 +135,21 @@ type Options struct {
 	DeliveryTTL        time.Duration
 	RetryDelay         time.Duration
 	RecentOutcomeLimit int
+	// AllowExecute, when set, is checked at Forward accept time only (#580).
+	// Accept-time refuse prevents in-memory discovery enqueue while admission is
+	// closed (HTTP/tunnel map ErrAdmissionRefused to 503 so GitHub can retry).
+	// Worker discovery does not recheck AllowExecute: once Forward returns
+	// accepted/202 the delivery is committed and must reach CreateOrGetActiveByDedupe
+	// even if admission later degrades. BeginShutdown aborts via CancelExecute
+	// (execCtx). Nil means ungated (tests).
+	AllowExecute func() error
+	// AllowExecuteWhile, when set, runs the accept-time enqueue + delivery
+	// bookkeeping critical section only while admission remains held (wire to
+	// Admission.WithAllowWork). Holding the same mutex as MarkDegraded/
+	// BeginShutdown makes check+enqueue+record atomic so Forward cannot return
+	// 202 while admission is already closed. When nil, Accept falls back to a
+	// point-in-time AllowExecute recheck then enqueue (tests).
+	AllowExecuteWhile func(fn func()) error
 }
 
 type deliveryRecord struct {
@@ -207,6 +239,7 @@ type checkRunEnvelope struct {
 type forwarder struct {
 	repos              *storage.Repositories
 	cfg                config.Config
+	configSource       ConfigSource
 	reviewer           TargetedReviewer
 	fixer              TargetedFixer
 	shepherd           TargetedShepherd
@@ -217,6 +250,13 @@ type forwarder struct {
 	deliveryTTL        time.Duration
 	retryDelay         time.Duration
 	recentOutcomeLimit int
+	allowExecute       func() error
+	allowExecuteWhile  func(fn func()) error
+	// execCtx is canceled by CancelExecute / Close so process-exit shutdown can
+	// abort in-flight discovery. Sticky MarkDegraded must not cancel this —
+	// accepted deliveries still need to complete under a live daemon.
+	execCtx    context.Context
+	execCancel context.CancelFunc
 
 	mu              sync.Mutex
 	cond            *sync.Cond
@@ -255,9 +295,11 @@ func New(options Options) Forwarder {
 	if recentOutcomeLimit <= 0 {
 		recentOutcomeLimit = defaultRecentOutcomeSize
 	}
+	execCtx, execCancel := context.WithCancel(context.Background())
 	f := &forwarder{
 		repos:              options.Repos,
 		cfg:                options.Config,
+		configSource:       options.ConfigSource,
 		reviewer:           options.Reviewer,
 		fixer:              options.Fixer,
 		shepherd:           options.Shepherd,
@@ -268,6 +310,10 @@ func New(options Options) Forwarder {
 		deliveryTTL:        deliveryTTL,
 		retryDelay:         retryDelay,
 		recentOutcomeLimit: recentOutcomeLimit,
+		allowExecute:       options.AllowExecute,
+		allowExecuteWhile:  options.AllowExecuteWhile,
+		execCtx:            execCtx,
+		execCancel:         execCancel,
 		works:              map[string]*workItem{},
 		deliveries:         map[string]deliveryRecord{},
 	}
@@ -282,6 +328,15 @@ func New(options Options) Forwarder {
 func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (ForwardResult, error) {
 	if f.repos == nil || f.repos.Projects == nil {
 		return ForwardResult{}, fmt.Errorf("webhook forwarder repositories are not configured")
+	}
+	// Refuse new discovery enqueue while admission is closed. HTTP and tunnel
+	// listeners also project AllowMutations, but Forward is the shared enqueue
+	// boundary for both paths (#580). Wrap as ErrAdmissionRefused so post-gate
+	// callers map temporary refusal to 503 rather than 400 validation.
+	if f.allowExecute != nil {
+		if err := f.allowExecute(); err != nil {
+			return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
+		}
 	}
 	now := f.now().UTC()
 	deliveryID := strings.TrimSpace(request.DeliveryID)
@@ -317,17 +372,55 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	if projectErr != nil {
 		return ForwardResult{}, projectErr
 	}
-	workItems, enqueueErr := f.enqueueLocked(projects, routed, workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID})
+	// Accept-time enqueue + delivery bookkeeping must be atomic with admission.
+	// allowExecute only holds the Admission mutex while reading state, and
+	// MarkDegraded does not take f.mu — so a point-in-time recheck under f.mu
+	// still races before the delivery is recorded. Prefer AllowExecuteWhile
+	// (Admission.WithAllowWork) so check+enqueue+record share the admission
+	// mutex; MarkDegraded blocks until the accepted-delivery outcome is written.
+	// After this section returns accepted/202, worker discovery must still run
+	// even if admission later degrades (no GitHub retry for 202). Fall back to
+	// point-in-time AllowExecute for ungated tests.
+	meta := workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID}
+	var result ForwardResult
+	var enqueueErr error
+	recordAcceptedLocked := func(workItems int) {
+		f.deliveries[deliveryID] = deliveryRecord{expiresAt: now.Add(f.deliveryTTL)}
+		if workItems == 0 {
+			f.stats.DeliveriesIgnored++
+			result = ForwardResult{Status: "ignored", Reason: "no_matching_projects", WorkItems: 0}
+			return
+		}
+		f.stats.DeliveriesAccepted++
+		result = ForwardResult{Status: "accepted", WorkItems: workItems}
+	}
+	if f.allowExecuteWhile != nil {
+		if err := f.allowExecuteWhile(func() {
+			workItems, err := f.enqueueLocked(projects, routed, meta)
+			enqueueErr = err
+			if enqueueErr != nil {
+				return
+			}
+			recordAcceptedLocked(workItems)
+		}); err != nil {
+			return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
+		}
+	} else {
+		if f.allowExecute != nil {
+			if err := f.allowExecute(); err != nil {
+				return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
+			}
+		}
+		workItems, err := f.enqueueLocked(projects, routed, meta)
+		enqueueErr = err
+		if enqueueErr == nil {
+			recordAcceptedLocked(workItems)
+		}
+	}
 	if enqueueErr != nil {
 		return ForwardResult{}, enqueueErr
 	}
-	f.deliveries[deliveryID] = deliveryRecord{expiresAt: now.Add(f.deliveryTTL)}
-	if workItems == 0 {
-		f.stats.DeliveriesIgnored++
-		return ForwardResult{Status: "ignored", Reason: "no_matching_projects", WorkItems: 0}, nil
-	}
-	f.stats.DeliveriesAccepted++
-	return ForwardResult{Status: "accepted", WorkItems: workItems}, nil
+	return result, nil
 }
 
 func (f *forwarder) Stats() Stats {
@@ -342,7 +435,20 @@ func (f *forwarder) Stats() Stats {
 	return stats
 }
 
+// CancelExecute aborts in-flight worker discovery without waiting for drain.
+// Runtime.BeginShutdown / Runtime.Stop call this for process-exit promptness.
+// Runtime.MarkDegraded must not call this: accepted/202 deliveries still need
+// discovery under a live daemon (GitHub will not retry). Safe to call multiple
+// times; Close also cancels.
+func (f *forwarder) CancelExecute() {
+	if f == nil || f.execCancel == nil {
+		return
+	}
+	f.execCancel()
+}
+
 func (f *forwarder) Close() {
+	f.CancelExecute()
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
@@ -362,15 +468,22 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 	candidates := make([]candidate, 0, len(projects))
 	newQueueEntries := 0
 	matched := 0
+	cfg := f.cfg
+	if f.configSource != nil {
+		cfg = f.configSource.Snapshot()
+	}
 	for _, project := range projects {
 		if project.Archived {
+			continue
+		}
+		if configured, ok := configuredProjectByID(cfg, project.ID); ok && config.ResolvedProjectProviderKind(cfg, configured) == config.ProviderKindForgejo {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
 		if !strings.EqualFold(repo, routed.repo) {
 			continue
 		}
-		lanes := enabledLanesForProject(f.cfg, project.ID, routed.lanes)
+		lanes := enabledLanesForProject(cfg, project.ID, routed.lanes)
 		if len(lanes) == 0 {
 			continue
 		}
@@ -428,6 +541,15 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 	return matched, nil
 }
 
+func configuredProjectByID(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
+	for _, project := range cfg.Projects {
+		if project.ID == projectID {
+			return project, true
+		}
+	}
+	return config.ProjectRefConfig{}, false
+}
+
 func (f *forwarder) worker() {
 	defer f.workersDone.Done()
 	for {
@@ -435,7 +557,9 @@ func (f *forwarder) worker() {
 		if !ok {
 			return
 		}
-		outcome := f.executeWithRetry(context.Background(), key, item)
+		// Use the cancelable exec context so BeginShutdown/Stop can abort
+		// discovery on process exit. MarkDegraded must not cancel execCtx.
+		outcome := f.executeWithRetry(f.execCtx, key, item)
 		f.finishWork(key, outcome)
 	}
 }
@@ -539,6 +663,13 @@ func (f *forwarder) executeWithRetry(ctx context.Context, key workKey, item work
 }
 
 func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem) error {
+	// Admission was already checked at Forward accept time. Do not recheck
+	// AllowExecute here: dropping queued work after accepted/202 loses the
+	// delivery (in-memory dedupe only; GitHub will not retry). Process-exit
+	// shutdown aborts via canceled execCtx from CancelExecute.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, ok := item.lanes[LaneReviewer]; ok {
 		if f.reviewer == nil {
 			return fmt.Errorf("reviewer targeted discovery is not configured")
@@ -546,6 +677,9 @@ func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem)
 		if _, err := f.reviewer.DiscoverPullRequest(ctx, reviewer.TargetedDiscoveryInput{ProjectID: key.ProjectID, Repo: key.Repo, PRNumber: key.Number}); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if _, ok := item.lanes[LaneFixer]; ok {
 		if f.fixer == nil {

@@ -11,6 +11,23 @@
   ],
   "routes": [
     {
+      "id": "config.patch",
+      "method": "PATCH",
+      "path": "/api/v1/config",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "revision": "sha256:observed-config-revision",
+          "set": {
+            "scheduler.maxConcurrentRuns": 4
+          },
+          "unset": []
+        }
+      }
+    },
+    {
       "id": "loops.create",
       "method": "POST",
       "path": "/api/v1/loops",
@@ -69,6 +86,56 @@
           "repoPath": "/tmp/repos/looper",
           "id": "looper",
           "name": "Looper"
+        }
+      }
+    },
+    {
+      "id": "loop.retry",
+      "method": "POST",
+      "path": "/api/v1/loops/loop_1/retry",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "mode": "auto",
+          "resetAttempts": true
+        }
+      }
+    },
+    {
+      "id": "loop.handback",
+      "method": "POST",
+      "path": "/api/v1/loops/loop_1/handback",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "mode": "auto",
+          "resetAttempts": true
+        }
+      }
+    },
+    {
+      "id": "dashboard.bootstrap.code",
+      "method": "POST",
+      "path": "/api/v1/dashboard/bootstrap/code",
+      "request": {
+        "headers": {},
+        "body": {}
+      }
+    },
+    {
+      "id": "dashboard.bootstrap.exchange",
+      "method": "POST",
+      "path": "/api/v1/dashboard/bootstrap/exchange",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "code": "0123456789abcdef0123456789abcdef"
         }
       }
     }

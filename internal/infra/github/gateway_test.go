@@ -12,6 +12,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/shell"
 )
 
@@ -66,8 +67,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: `[[{"id":14,"number":14,"title":"sub issue","url":"https://api.example.test/issues/14","html_url":"https://example.test/issues/14","repository_url":"https://api.example.test/repos/acme/looper","state":"open","state_reason":"","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]]`}, nil
 		case args == "api --paginate --slurp repos/acme/looper/issues/8/comments":
 			return shell.Result{Stdout: `[[{"id":91,"body":"First human follow-up","html_url":"https://example.test/issues/8#issuecomment-91","created_at":"2026-05-03T13:00:00Z","updated_at":"2026-05-03T13:00:00Z","user":{"login":"reviewer"},"author_association":"MEMBER"}]]`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
-			return shell.Result{Stdout: `[[{"id":92,"body":"conversation notice","html_url":"https://example.test/issues/42#issuecomment-92","created_at":"2026-05-04T13:00:00Z","updated_at":"2026-05-04T13:00:00Z","user":{"login":"reviewer"},"author_association":"MEMBER"}]]`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			return shell.Result{Stdout: `{"id":92,"body":"<!-- looper:fixer-round head=abc -->","html_url":"https://example.test/issues/42#issuecomment-92","updated_at":"2026-05-04T13:00:00Z","user":{"login":"reviewer"}}`}, nil
 		case args == "api repos/acme/looper/issues/8/comments --method POST -f body=Looper started":
 			return shell.Result{Stdout: `{"id":91,"html_url":"https://example.test/issues/8#issuecomment-91"}`}, nil
 		case args == "api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished":
@@ -285,8 +286,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if len(detail.Comments) != 1 || detail.Comments[0]["id"] != "comment-1" || detail.Comments[0]["threadId"] != "thread-1" || detail.Comments[0]["state"] != "UNRESOLVED" || detail.Comments[0]["body"] != "Fix this" {
 		t.Fatalf("detail.Comments = %#v, want normalized review thread", detail.Comments)
 	}
-	if len(detail.IssueComments) != 1 || detail.IssueComments[0].Body != "conversation notice" {
-		t.Fatalf("detail.IssueComments = %#v, want PR conversation comments", detail.IssueComments)
+	if len(detail.IssueComments) != 1 || !strings.Contains(detail.IssueComments[0].Body, "looper:fixer-round") {
+		t.Fatalf("detail.IssueComments = %#v, want projected Looper automation comments", detail.IssueComments)
 	}
 	if login != "reviewer" {
 		t.Fatalf("login = %q, want reviewer", login)
@@ -409,8 +410,8 @@ func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(
 			}
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","createdAt":"2026-05-03T12:00:00Z","updatedAt":"2026-05-04T12:00:00Z","closedAt":"","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":[{"name":"ready"}],"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		}
-		if args == "api --paginate --slurp repos/acme/looper/issues/42/comments" {
-			return shell.Result{Stdout: `[[]]`}, nil
+		if strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq ") {
+			return shell.Result{}, nil
 		}
 		if strings.Contains(args, "reviewThreads") {
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
@@ -465,10 +466,10 @@ func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
 				t.Fatalf("reviewer profile fields = %q, want reviews, checks, and review requests", fields)
 			}
 			return shell.Result{Stdout: `{"number":44,"title":"Review me","body":"Body","url":"https://example.test/pull/44","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"login":"reviewer"}}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[]}`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/43/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/44/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/43/comments --jq "):
+			return shell.Result{}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/44/comments --jq "):
+			return shell.Result{}, nil
 		case strings.Contains(args, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		default:
@@ -486,6 +487,73 @@ func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
 	}
 	if _, err := gateway.ViewPullRequestForReviewer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 44}); err != nil {
 		t.Fatalf("ViewPullRequestForReviewer() error = %v", err)
+	}
+}
+
+func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.T) {
+	t.Parallel()
+
+	rawHistory := strings.Repeat(`{"id":1,"body":"`+strings.Repeat("x", 1024)+`"}`, 300)
+	if len(rawHistory) <= 256*1024 {
+		t.Fatalf("fixture bytes = %d, want more than the generic shell cap", len(rawHistory))
+	}
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			return shell.Result{Stdout: `{"number":42,"state":"OPEN","headRefOid":"head-42"}`}, nil
+		case strings.Contains(args, "reviewThreads"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			if strings.Contains(args, "--slurp") {
+				t.Fatalf("comment command = %q, want page-wise projection without --slurp", args)
+			}
+			for _, required := range []string{"looper:forgejo-reviewer-summary", "looper:fixer-round", "looper:conflict-notice", "looper:reviewer:automerge-refused", "looper:forgejo-fixer-summary", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
+				if !strings.Contains(args, required) {
+					t.Fatalf("comment command = %q, want projection %q", args, required)
+				}
+			}
+			if strings.Contains(args, `contains("looper:")`) || strings.Contains(args, "looper:stamp") {
+				t.Fatalf("comment command = %q, want only consumed protocol markers", args)
+			}
+			if options.MaxCapturedBytes != 0 {
+				t.Fatalf("MaxCapturedBytes = %d, want unchanged generic default", options.MaxCapturedBytes)
+			}
+			return shell.Result{Stdout: "{\"id\":101,\"body\":\"<!-- looper:forgejo-reviewer-summary payload -->\",\"user\":{\"login\":\"reviewer\"}}\n" +
+				"{\"id\":202,\"body\":\"<!-- looper:fixer-round head=head-42 -->\",\"html_url\":\"https://example.test/pull/42#issuecomment-202\",\"user\":{\"login\":\"looper\"}}\n" +
+				"{\"id\":303,\"body\":\"<!-- looper:conflict-notice id=notice-1 -->\",\"user\":{\"login\":\"looper\"}}\n" +
+				"{\"id\":404,\"body\":\"<!-- looper:reviewer:automerge-refused -->\",\"user\":{\"login\":\"looper\"}}\n" +
+				"{\"id\":505,\"body\":\"<!-- looper:forgejo-fixer-summary payload -->\",\"user\":{\"login\":\"looper\"}}\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestForFixer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ViewPullRequestForFixer() error = %v", err)
+	}
+	if len(detail.IssueComments) != 5 || detail.IssueComments[4].ID != 505 {
+		t.Fatalf("IssueComments = %#v, want all projected Looper marker comments", detail.IssueComments)
+	}
+}
+
+func TestGatewayReportsTruncatedOutputBeforeJSONParsing(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: `[[{"id":1}`, StdoutTruncated: true}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	_, err := gateway.ListIssueComments(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 42})
+	if err == nil || !strings.Contains(err.Error(), "GitHub command output truncated: stdout after") {
+		t.Fatalf("ListIssueComments() error = %v, want explicit truncation error", err)
+	}
+	if strings.Contains(err.Error(), "Invalid gh JSON payload") {
+		t.Fatalf("ListIssueComments() error = %v, must report truncation before parsing", err)
 	}
 }
 
@@ -760,6 +828,145 @@ func TestSubmitReviewRejectsQualityFlagsBeforePublishing(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("SubmitReview() made gh calls after quality failure: %#v", runner.calls)
+	}
+}
+
+func TestSubmitReviewRejectsEnvironmentDumpBeforePublishing(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	body := "Database transaction feedback.\nHOME=/Users/reviewer\nPATH=/usr/bin\nSHELL=/bin/zsh\nLANG=en_US.UTF-8\nTERM=xterm-256color"
+
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: body, CommitID: "abc123"})
+	if err == nil || !strings.Contains(err.Error(), "environment-dump-shaped block") {
+		t.Fatalf("SubmitReview() error = %v, want environment dump rejection", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+}
+
+func TestSubmitReviewRejectsCredentialAssignmentInInlineCommentBeforePublishing(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{
+		Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Please address the inline finding.", CommitID: "abc123",
+		Comments: []ReviewComment{{Body: "The command printed this:\nOPENAI_API_KEY=sk-sensitive", Path: "app.go", Line: 1, Side: "RIGHT"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "credential-shaped environment assignment") {
+		t.Fatalf("SubmitReview() error = %v, want credential assignment rejection", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+}
+
+func TestSubmitReviewRejectsCredentialInCommentPathAfterNormalization(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	var events []reviewSubmitDiagnosticEvent
+	gateway := New(Options{
+		GHPath: "gh", GHRun: runner.run,
+		ReviewSubmitDiagnostic: func(event string, fields map[string]any) {
+			events = append(events, reviewSubmitDiagnosticEvent{Name: event, Fields: fields})
+		},
+	})
+	anchors := diffanchor.Index{Ranges: []diffanchor.Range{{Path: "app.go", Side: "RIGHT", Start: 1, End: 1}}}
+	secretPath := "SERVICE_TOKEN=secret-value"
+
+	// Secret lives only in Path; body is safe. Without post-normalize / path
+	// guarding, FallbackBody would publish "Location: SERVICE_TOKEN=secret-value ...".
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{
+		Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Please address the findings.", CommitID: "abc123",
+		Comments: []ReviewComment{{Body: "Null check is missing here.", Path: secretPath, Line: 99, Side: "RIGHT"}},
+		Anchors:  &anchors,
+	})
+	if err == nil || !strings.Contains(err.Error(), "credential-shaped environment assignment") {
+		t.Fatalf("SubmitReview() error = %v, want credential assignment rejection for path", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+	if len(events) != 1 || events[0].Name != "github_review_submit_validation_failed" {
+		t.Fatalf("diagnostic events = %#v, want one validation failure", events)
+	}
+	// Diagnostics must not echo the rejected path (no-echo contract).
+	if encoded := fmt.Sprintf("%#v", events[0].Fields); strings.Contains(encoded, secretPath) {
+		t.Fatalf("diagnostic fields echoed rejected path: %s", encoded)
+	}
+	request, _ := events[0].Fields["request"].(map[string]any)
+	payload, _ := request["payload"].(map[string]any)
+	comments, _ := payload["comments"].([]map[string]any)
+	if len(comments) != 1 {
+		t.Fatalf("diagnostic comments = %#v, want one sanitized comment", comments)
+	}
+	if _, hasPath := comments[0]["path"]; hasPath {
+		t.Fatalf("diagnostic comment still has raw path: %#v", comments[0])
+	}
+	if comments[0]["path_present"] != true {
+		t.Fatalf("diagnostic comment = %#v, want path_present=true", comments[0])
+	}
+}
+
+func TestOutboundPublicationMethodsRejectUnsafeContentBeforePublishing(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	unsafe := "SERVICE_TOKEN=secret-value"
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "create issue comment", run: func() error {
+			_, err := gateway.CreateIssueComment(context.Background(), IssueCommentInput{Repo: "acme/looper", IssueNumber: 1, Body: unsafe})
+			return err
+		}},
+		{name: "update issue comment", run: func() error {
+			return gateway.UpdateIssueComment(context.Background(), UpdateIssueCommentInput{Repo: "acme/looper", CommentID: 1, Body: unsafe})
+		}},
+		{name: "review thread reply", run: func() error {
+			return gateway.AddReviewThreadReply(context.Background(), AddReviewThreadReplyInput{ThreadID: "thread-1", Body: unsafe})
+		}},
+		{name: "pull request comment", run: func() error {
+			return gateway.AddPullRequestComment(context.Background(), PullRequestCommentInput{Repo: "acme/looper", PRNumber: 1, Body: unsafe})
+		}},
+		{name: "create pull request", run: func() error {
+			_, err := gateway.CreatePullRequest(context.Background(), CreatePullRequestInput{Repo: "acme/looper", HeadBranch: "feature", BaseBranch: "main", Title: "Feature", Body: unsafe})
+			return err
+		}},
+		{name: "update pull request title", run: func() error {
+			return gateway.UpdatePullRequestTitle(context.Background(), UpdatePullRequestTitleInput{Repo: "acme/looper", PRNumber: 1, Title: unsafe})
+		}},
+		{name: "update pull request body", run: func() error {
+			return gateway.UpdatePullRequestBody(context.Background(), UpdatePullRequestBodyInput{Repo: "acme/looper", PRNumber: 1, Body: unsafe})
+		}},
+		{name: "dismiss review", run: func() error {
+			return gateway.DismissReview(context.Background(), DismissReviewInput{Repo: "acme/looper", PRNumber: 1, ReviewID: 1, Message: unsafe})
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); err == nil || !strings.Contains(err.Error(), "outbound content safety gate") {
+				t.Fatalf("publication error = %v, want content safety rejection", err)
+			}
+		})
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("publication methods made gh calls after content safety failures: %#v", runner.calls)
 	}
 }
 
@@ -1144,8 +1351,8 @@ func TestGatewayViewPullRequestPaginatesReviewThreads(t *testing.T) {
 		switch {
 		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			return shell.Result{}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && strings.Contains(args, "-F after=thread-cursor-1"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-2","isResolved":true,"comments":{"nodes":[{"id":"comment-2","body":"second page"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && !strings.Contains(args, "-F after="):
@@ -1666,7 +1873,7 @@ func TestFindAnyIssueNumberSkipsPullRequests(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
-		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues?state=all&per_page=100&page=1" {
+		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues?state=all&per_page=100&page=1 --jq "+findAnyIssueNumberJQ {
 			t.Fatalf("unexpected gh args: %q", got)
 		}
 		return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}},{"number":7}]`}, nil
@@ -1686,9 +1893,9 @@ func TestFindAnyIssueNumberChecksLaterPages(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		switch got := strings.Join(options.Args, " "); got {
-		case "api repos/acme/looper/issues?state=all&per_page=100&page=1":
+		case "api repos/acme/looper/issues?state=all&per_page=100&page=1 --jq " + findAnyIssueNumberJQ:
 			return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}}]`}, nil
-		case "api repos/acme/looper/issues?state=all&per_page=100&page=2":
+		case "api repos/acme/looper/issues?state=all&per_page=100&page=2 --jq " + findAnyIssueNumberJQ:
 			return shell.Result{Stdout: `[{"number":7}]`}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", got)
@@ -1705,6 +1912,28 @@ func TestFindAnyIssueNumberChecksLaterPages(t *testing.T) {
 	}
 	if len(runner.calls) != 2 {
 		t.Fatalf("FindAnyIssueNumber() calls = %d, want two paged requests", len(runner.calls))
+	}
+}
+
+func TestFindAnyIssueNumberProjectsPayloadBeforeShellCapture(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if !strings.Contains(args, "--jq "+findAnyIssueNumberJQ) {
+			t.Fatalf("FindAnyIssueNumber must project issue pages with --jq before shell capture; got %q", args)
+		}
+		// Projected rows stay tiny even when the underlying page would exceed the
+		// 256 KiB shell capture cap used by runGh.
+		return shell.Result{Stdout: `[{"number":7,"pull_request":null}]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	issueNumber, err := gateway.FindAnyIssueNumber(context.Background(), "acme/looper", "")
+	if err != nil {
+		t.Fatalf("FindAnyIssueNumber() error = %v", err)
+	}
+	if issueNumber != 7 {
+		t.Fatalf("FindAnyIssueNumber() = %d, want 7", issueNumber)
 	}
 }
 
@@ -1906,8 +2135,8 @@ func TestGatewayCapturePullRequestSnapshotPreservesFullDetails(t *testing.T) {
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"FAILURE"}]}`}, nil
 		case strings.Contains(args, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"comments":{"nodes":[{"id":"comment-1","body":"Fix this"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			return shell.Result{}, nil
 		case strings.HasPrefix(args, "pr diff"):
 			return shell.Result{Stdout: "diff --git a/a.go b/a.go\n"}, nil
 		default:
@@ -1931,32 +2160,60 @@ func TestGatewayCapturePullRequestSnapshotPreservesFullDetails(t *testing.T) {
 
 func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		switch {
-		case strings.HasPrefix(args, "pr view"):
-			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","headRefOid":"abc123"}`}, nil
-		case strings.Contains(args, "reviewThreads"):
-			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
-		case strings.HasPrefix(args, "pr diff"):
-			result := shell.Result{ExitCode: 1, Stderr: "HTTP 406: diff exceeded maximum number of lines too_large"}
-			return result, &shell.CommandExecutionError{Message: result.Stderr, Result: result}
-		default:
-			t.Fatalf("unexpected gh args: %q", args)
-			return shell.Result{}, nil
-		}
-	}
-	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	for _, tc := range []struct {
+		name           string
+		diffResult     shell.Result
+		diffErr        error
+		wantReason     string
+		wantGetDiffErr error
+	}{
+		{
+			name:           "GitHub rejects oversized diff",
+			diffResult:     shell.Result{ExitCode: 1, Stderr: "HTTP 406: diff exceeded maximum number of lines too_large"},
+			diffErr:        &shell.CommandExecutionError{Message: "HTTP 406: diff exceeded maximum number of lines too_large"},
+			wantReason:     DiffTruncationReasonGitHubTooLarge,
+			wantGetDiffErr: ErrDiffTooLarge,
+		},
+		{
+			name:           "shell capture truncates diff",
+			diffResult:     shell.Result{Stdout: strings.Repeat("x", 256*1024), StdoutTruncated: true},
+			wantReason:     DiffTruncationReasonLocalCapture,
+			wantGetDiffErr: ErrLocalCaptureTruncated,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeGHRunner{t: t}
+			runner.respond = func(options shell.Options) (shell.Result, error) {
+				args := strings.Join(options.Args, " ")
+				switch {
+				case strings.HasPrefix(args, "pr view"):
+					return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","headRefOid":"abc123"}`}, nil
+				case strings.Contains(args, "reviewThreads"):
+					return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
+				case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+					return shell.Result{}, nil
+				case strings.HasPrefix(args, "pr diff"):
+					return tc.diffResult, tc.diffErr
+				default:
+					t.Fatalf("unexpected gh args: %q", args)
+					return shell.Result{}, nil
+				}
+			}
+			gateway := New(Options{GHPath: "gh", GHRun: runner.run})
 
-	snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
-	if err != nil {
-		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
-	}
-	if snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncated":true`) || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncationReason":"github_too_large"`) {
-		t.Fatalf("PayloadJSON = %v, want truncated marker", snapshot.PayloadJSON)
+			_, getErr := gateway.GetPullRequestDiff(context.Background(), GetPullRequestDiffInput{Repo: "acme/looper", PRNumber: 42})
+			if !errors.Is(getErr, tc.wantGetDiffErr) {
+				t.Fatalf("GetPullRequestDiff() error = %v, want %v", getErr, tc.wantGetDiffErr)
+			}
+
+			snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+			if err != nil {
+				t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
+			}
+			if snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncated":true`) || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncationReason":"`+tc.wantReason+`"`) {
+				t.Fatalf("PayloadJSON = %v, want truncated marker with reason %q", snapshot.PayloadJSON, tc.wantReason)
+			}
+		})
 	}
 }
 
@@ -2057,6 +2314,14 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
 			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold --repo acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:worker --repo acme/looper --color b60205 --description Block automatic worker activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:fixer --repo acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:reviewer --repo acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -2068,8 +2333,8 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels() error = %v", err)
 	}
-	if result.Summary.Created != 3 || result.Summary.Updated != 1 || result.Summary.Skipped != 1 || result.Summary.Failed != 0 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=3 updated=1 skipped=1 failed=0", result.Summary)
+	if result.Summary.Created != 7 || result.Summary.Updated != 1 || result.Summary.Skipped != 1 || result.Summary.Failed != 0 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=7 updated=1 skipped=1 failed=0", result.Summary)
 	}
 
 	log := strings.Join(runner.calls, "\n")
@@ -2078,6 +2343,10 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 		"label edit looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review",
 		"label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation",
 		"label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention",
+		"label create looper:hold --repo acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR",
+		"label create looper:hold:worker --repo acme/looper --color b60205 --description Block automatic worker activity for this issue or PR",
+		"label create looper:hold:fixer --repo acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR",
+		"label create looper:hold:reviewer --repo acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR",
 	} {
 		if !strings.Contains(log, needle) {
 			t.Fatalf("gh log missing %q\n%s", needle, log)
@@ -2103,6 +2372,14 @@ func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:needs-human --repo github.example.com/acme/looper --color d93f0b --description Looper requires manual intervention":
 			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold --repo github.example.com/acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:worker --repo github.example.com/acme/looper --color b60205 --description Block automatic worker activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:fixer --repo github.example.com/acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:reviewer --repo github.example.com/acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -2114,8 +2391,8 @@ func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels() error = %v", err)
 	}
-	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 5 {
-		t.Fatalf("InitializeLabels() result = %#v, want host-qualified repo and created=5", result)
+	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 9 {
+		t.Fatalf("InitializeLabels() result = %#v, want host-qualified repo and created=9", result)
 	}
 }
 
@@ -2136,8 +2413,8 @@ func TestGatewayDryRunInitializesLooperLabelsWithoutMutating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels(dry run) error = %v", err)
 	}
-	if result.Summary.Created != 5 || len(runner.calls) != 1 {
-		t.Fatalf("dry run result = %#v, calls = %#v; want five planned creates and only label list", result.Summary, runner.calls)
+	if result.Summary.Created != 9 || len(runner.calls) != 1 {
+		t.Fatalf("dry run result = %#v, calls = %#v; want nine planned creates and only label list", result.Summary, runner.calls)
 	}
 }
 
@@ -2152,11 +2429,19 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 		case "label create looper:auto --repo acme/looper --color 0052cc --description Run fully autonomously: plan → implement":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
-			result := shell.Result{ExitCode: 1, Stderr: "permission denied"}
-			return result, &shell.CommandExecutionError{Message: "gh exited with code 1: permission denied", Result: result}
+			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold --repo acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:worker --repo acme/looper --color b60205 --description Block automatic worker activity for this issue or PR":
+			result := shell.Result{ExitCode: 1, Stderr: "permission denied"}
+			return result, &shell.CommandExecutionError{Message: "gh exited with code 1: permission denied", Result: result}
+		case "label create looper:hold:fixer --repo acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:reviewer --repo acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR":
 			return shell.Result{Stdout: "{}"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
@@ -2169,10 +2454,16 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 	if err == nil {
 		t.Fatalf("InitializeLabels() error = nil, want failure")
 	}
-	if result.Summary.Failed != 1 || result.Summary.Created != 3 || result.Summary.Skipped != 1 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=3 skipped=1 failed=1", result.Summary)
+	if result.Summary.Failed != 1 || result.Summary.Created != 7 || result.Summary.Skipped != 1 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=7 skipped=1 failed=1", result.Summary)
 	}
-	if got := result.Labels[2].Error; !strings.Contains(got, "permission denied") {
+	got := ""
+	for _, label := range result.Labels {
+		if label.Name == domain.HoldLabelWorker {
+			got = label.Error
+		}
+	}
+	if !strings.Contains(got, "permission denied") {
 		t.Fatalf("failed label error = %q, want stderr details", got)
 	}
 }
@@ -2499,8 +2790,9 @@ func TestSubmitReviewLogsValidationFailureDiagnostics(t *testing.T) {
 		t.Fatalf("body marker = %#v, want marker fields", marker)
 	}
 	comments, _ := payload["comments"].([]map[string]any)
-	if len(comments) != 1 || comments[0]["path"] != "app.go" || comments[0]["line"] != int64(1) || comments[0]["side"] != "RIGHT" {
-		t.Fatalf("payload comments = %#v, want inline anchor summary", comments)
+	// validation_failed diagnostics always redact paths (path may be secret-shaped).
+	if len(comments) != 1 || comments[0]["path_present"] != true || comments[0]["path"] != nil || comments[0]["line"] != int64(1) || comments[0]["side"] != "RIGHT" {
+		t.Fatalf("payload comments = %#v, want redacted path_present + line/side", comments)
 	}
 }
 

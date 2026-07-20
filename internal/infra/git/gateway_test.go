@@ -1008,6 +1008,229 @@ func TestGatewayRemoteBranchExistsUsesFetchedTrackingRef(t *testing.T) {
 	}
 }
 
+func TestGatewayDiscardWorktreeChangesResetsTrackedAndUntracked(t *testing.T) {
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+	ctx := context.Background()
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/fixer",
+		BaseBranch:   "main",
+		PRNumber:     42,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	originalREADME := readFile(t, filepath.Join(worktree.WorktreePath, "README.md"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "README.md"), "dirty tracked\n")
+	writeFile(t, filepath.Join(worktree.WorktreePath, "untracked.txt"), "dirty untracked\n")
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, "untracked-dir"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "untracked-dir", "nested.txt"), "nested\n")
+
+	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+	})
+	if err != nil {
+		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
+	}
+	if result.NoOp || !result.WasDirty || result.WorktreePath != worktree.WorktreePath {
+		t.Fatalf("DiscardWorktreeChanges() = %#v, want dirty discard of managed path", result)
+	}
+	if got := readFile(t, filepath.Join(worktree.WorktreePath, "README.md")); got != originalREADME {
+		t.Fatalf("README.md after discard = %q, want %q", got, originalREADME)
+	}
+	if _, err := os.Stat(filepath.Join(worktree.WorktreePath, "untracked.txt")); !os.IsNotExist(err) {
+		t.Fatalf("untracked.txt still exists after discard: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(worktree.WorktreePath, "untracked-dir")); !os.IsNotExist(err) {
+		t.Fatalf("untracked-dir still exists after discard: %v", err)
+	}
+	if _, err := os.Stat(worktree.WorktreePath); err != nil {
+		t.Fatalf("worktree directory missing after discard: %v", err)
+	}
+	clean, err := gateway.WorktreeClean(ctx, worktree.WorktreePath)
+	if err != nil || !clean {
+		t.Fatalf("WorktreeClean() = %v, %v, want clean", clean, err)
+	}
+
+	// Second call is a no-op when already clean.
+	second, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+	})
+	if err != nil {
+		t.Fatalf("DiscardWorktreeChanges(clean) error = %v", err)
+	}
+	if !second.NoOp || second.WasDirty {
+		t.Fatalf("DiscardWorktreeChanges(clean) = %#v, want no-op", second)
+	}
+}
+
+func TestGatewayDiscardWorktreeChangesRemovesNestedRepositories(t *testing.T) {
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+	ctx := context.Background()
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/fixer",
+		BaseBranch:   "main",
+		PRNumber:     42,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	// Tracked dirt so discard does real work (not the clean no-op path).
+	writeFile(t, filepath.Join(worktree.WorktreePath, "README.md"), "dirty tracked\n")
+
+	// Untracked nested Git checkout: single-force git clean -fd leaves these
+	// behind; double-force -ffd is required to remove them.
+	nestedPath := filepath.Join(worktree.WorktreePath, "vendor-checkout")
+	mustMkdirAll(t, nestedPath)
+	runGit(t, nestedPath, "init")
+	writeFile(t, filepath.Join(nestedPath, "nested.txt"), "nested repo content\n")
+	runGit(t, nestedPath, "add", "nested.txt")
+	runGit(t, nestedPath, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "nested")
+
+	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+	})
+	if err != nil {
+		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
+	}
+	if result.NoOp || !result.WasDirty {
+		t.Fatalf("DiscardWorktreeChanges() = %#v, want dirty discard including nested repo", result)
+	}
+	if _, err := os.Stat(nestedPath); !os.IsNotExist(err) {
+		t.Fatalf("nested repository still exists after discard: %v", err)
+	}
+	clean, err := gateway.WorktreeClean(ctx, worktree.WorktreePath)
+	if err != nil || !clean {
+		t.Fatalf("WorktreeClean() = %v, %v, want clean after nested-repo discard", clean, err)
+	}
+}
+
+func TestGatewayDiscardWorktreeChangesResetsDirtySubmodules(t *testing.T) {
+	// Tracked submodule dirt is invisible to top-level git clean -ffd and to
+	// reset --hard without --recurse-submodules. Discard must recurse so the
+	// post-clean check can pass after top-level edits are discarded.
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+	ctx := context.Background()
+	gateway := fixture.gateway()
+
+	// Build a bare submodule remote, commit it into the feature branch, then
+	// create a managed worktree from that branch so discard runs under safety.
+	// Pin bare HEAD to main: CI often has init.defaultBranch=master, so a push of
+	// only main leaves HEAD on an unborn branch and `submodule add` fails with
+	// "You are on a branch yet to be born".
+	subRemote := filepath.Join(fixture.rootDir, "submodule.git")
+	subWork := filepath.Join(fixture.rootDir, "submodule-work")
+	mustMkdirAll(t, subRemote)
+	runGit(t, fixture.rootDir, "init", "--bare", "-b", "main", subRemote)
+	runGit(t, fixture.rootDir, "clone", subRemote, subWork)
+	configureRepo(t, subWork)
+	writeFile(t, filepath.Join(subWork, "module.txt"), "module-v1\n")
+	runGit(t, subWork, "add", "module.txt")
+	runGit(t, subWork, "commit", "-m", "submodule init")
+	runGit(t, subWork, "push", "origin", "HEAD:main")
+	runGit(t, subRemote, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	runGit(t, fixture.repoPath, "checkout", "feature/fixer")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", "-b", "main", subRemote, "vendor")
+	runGit(t, fixture.repoPath, "commit", "-m", "add vendor submodule")
+	runGit(t, fixture.repoPath, "push", "origin", "feature/fixer")
+	runGit(t, fixture.repoPath, "checkout", "main")
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/fixer",
+		BaseBranch:   "main",
+		PRNumber:     42,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	// Worktrees do not always materialize submodule checkouts; ensure vendor is present.
+	vendorPath := filepath.Join(worktree.WorktreePath, "vendor")
+	if _, err := os.Stat(filepath.Join(vendorPath, ".git")); err != nil {
+		runGit(t, worktree.WorktreePath, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+	}
+	if _, err := os.Stat(filepath.Join(vendorPath, "module.txt")); err != nil {
+		t.Fatalf("submodule content missing after init: %v", err)
+	}
+	originalModule := readFile(t, filepath.Join(vendorPath, "module.txt"))
+
+	// Top-level tracked dirt + dirty submodule (modified tracked + untracked).
+	writeFile(t, filepath.Join(worktree.WorktreePath, "README.md"), "dirty tracked\n")
+	writeFile(t, filepath.Join(vendorPath, "module.txt"), "dirty submodule tracked\n")
+	writeFile(t, filepath.Join(vendorPath, "untracked-in-sub.txt"), "sub untracked\n")
+
+	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+	})
+	if err != nil {
+		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
+	}
+	if result.NoOp || !result.WasDirty {
+		t.Fatalf("DiscardWorktreeChanges() = %#v, want dirty discard including submodule", result)
+	}
+	if got := readFile(t, filepath.Join(vendorPath, "module.txt")); got != originalModule {
+		t.Fatalf("submodule module.txt after discard = %q, want %q", got, originalModule)
+	}
+	if _, err := os.Stat(filepath.Join(vendorPath, "untracked-in-sub.txt")); !os.IsNotExist(err) {
+		t.Fatalf("submodule untracked file still exists after discard: %v", err)
+	}
+	clean, err := gateway.WorktreeClean(ctx, worktree.WorktreePath)
+	if err != nil || !clean {
+		t.Fatalf("WorktreeClean() = %v, %v, want clean after submodule discard", clean, err)
+	}
+}
+
+func TestGatewayDiscardWorktreeChangesRejectsUnsafePaths(t *testing.T) {
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	ctx := context.Background()
+	gateway := fixture.gateway()
+
+	if _, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: fixture.repoPath,
+	}); err == nil {
+		t.Fatal("DiscardWorktreeChanges(repoPath) error = nil, want safety rejection")
+	}
+
+	outside := filepath.Join(fixture.rootDir, "outside-wt")
+	mustMkdirAll(t, outside)
+	if _, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: outside,
+	}); err == nil {
+		t.Fatal("DiscardWorktreeChanges(outside) error = nil, want safety rejection")
+	}
+}
+
 func TestGatewayRestoreWorktreePropagatesHealthCheckFailureForStoredWorktree(t *testing.T) {
 	t.Parallel()
 

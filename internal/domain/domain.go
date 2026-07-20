@@ -17,6 +17,13 @@ const (
 	LoopTypeCoordinator LoopType = "coordinator"
 )
 
+const (
+	HoldLabelGlobal   = "looper:hold"
+	HoldLabelWorker   = "looper:hold:worker"
+	HoldLabelFixer    = "looper:hold:fixer"
+	HoldLabelReviewer = "looper:hold:reviewer"
+)
+
 var LoopTypes = []LoopType{
 	LoopTypePlanner,
 	LoopTypeReviewer,
@@ -191,6 +198,37 @@ func AssertKnownLoopType(loopType LoopType) error {
 		}
 	}
 	return fmt.Errorf("loop.type must be one of: %s, %s, %s, %s, %s", LoopTypePlanner, LoopTypeReviewer, LoopTypeWorker, LoopTypeFixer, LoopTypeCoordinator)
+}
+
+func IsAutoLaneHeld(loopType LoopType, labels []string) bool {
+	if hasExactLabel(labels, HoldLabelGlobal) {
+		return true
+	}
+	switch loopType {
+	case LoopTypePlanner:
+		return false
+	case LoopTypeWorker:
+		return hasExactLabel(labels, HoldLabelWorker)
+	case LoopTypeFixer:
+		return hasExactLabel(labels, HoldLabelFixer)
+	case LoopTypeReviewer:
+		return hasExactLabel(labels, HoldLabelReviewer)
+	default:
+		return false
+	}
+}
+
+func IsAutomaticLoopHeld(loopType LoopType, manual bool, labels []string) bool {
+	return !manual && IsAutoLaneHeld(loopType, labels)
+}
+
+func hasExactLabel(labels []string, want string) bool {
+	for _, label := range labels {
+		if label == want {
+			return true
+		}
+	}
+	return false
 }
 
 func AssertKnownLoopStatus(status LoopStatus) error {

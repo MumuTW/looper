@@ -12,6 +12,36 @@ import (
 
 var ErrQueueItemNotActive = errors.New("queue item not active")
 
+// ErrAgentExecutionConflict is returned when an agent_executions upsert is
+// rejected by the terminal-observation immutability guard (zero rows updated).
+// Callers must not treat this as success.
+var ErrAgentExecutionConflict = errors.New("agent execution observation conflict")
+
+// IsActiveAgentExecutionStatus reports whether status is a live (non-terminal)
+// observation. Active statuses may be updated freely; terminal rows cannot
+// regress back into these values.
+func IsActiveAgentExecutionStatus(status string) bool {
+	switch status {
+	case "running", "cancelling":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsTerminalAgentExecutionStatus reports whether status is a durable terminal
+// observation. Terminal status is immutable once written: no terminal→active
+// and no terminal→other-terminal transitions. Same-terminal field enrichment
+// (e.g. native resume metadata) is allowed; see AgentExecutionsRepository.Upsert.
+func IsTerminalAgentExecutionStatus(status string) bool {
+	switch status {
+	case "completed", "failed", "timeout", "killed", "success":
+		return true
+	default:
+		return false
+	}
+}
+
 type sqliteQuerier interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
@@ -132,6 +162,7 @@ type RunRecord struct {
 	EndedAt           *string
 	CreatedAt         string
 	UpdatedAt         string
+	AgentSnapshotJSON *string // durable agent identity; set on create, immutable after insert
 }
 
 type AgentExecutionRecord struct {
@@ -689,10 +720,78 @@ func (r *LoopsRepository) AllocateSeq(ctx context.Context) (int64, error) {
 	return next, nil
 }
 
+// ListLoopsOptions filters and paginates loop listings.
+// Empty Status/ProjectID match all. Limit 0 means no limit (full list).
+// Offset is always applied when > 0, including when Limit == 0 (SQLite LIMIT -1 OFFSET n).
+type ListLoopsOptions struct {
+	Status    string
+	ProjectID string
+	Limit     int64
+	Offset    int64
+}
+
 func (r *LoopsRepository) List(ctx context.Context) ([]LoopRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops ORDER BY updated_at DESC, seq DESC`)
+	return r.ListFiltered(ctx, ListLoopsOptions{})
+}
+
+func (r *LoopsRepository) ListFiltered(ctx context.Context, opts ListLoopsOptions) ([]LoopRecord, error) {
+	query, args := buildLoopsListQuery(`SELECT * FROM loops`, opts, true)
+	rows, err := r.q.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list loops: %w", err)
+		return nil, fmt.Errorf("list loops filtered: %w", err)
+	}
+	defer rows.Close()
+
+	return scanLoops(rows)
+}
+
+func (r *LoopsRepository) CountFiltered(ctx context.Context, opts ListLoopsOptions) (int64, error) {
+	query, args := buildLoopsListQuery(`SELECT COUNT(*) FROM loops`, opts, false)
+	var total int64
+	if err := r.q.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count loops filtered: %w", err)
+	}
+	return total, nil
+}
+
+func buildLoopsListQuery(base string, opts ListLoopsOptions, withOrderAndLimit bool) (string, []any) {
+	var clauses []string
+	var args []any
+	if status := strings.TrimSpace(opts.Status); status != "" {
+		clauses = append(clauses, "status = ?")
+		args = append(args, status)
+	}
+	if projectID := strings.TrimSpace(opts.ProjectID); projectID != "" {
+		clauses = append(clauses, "project_id = ?")
+		args = append(args, projectID)
+	}
+
+	query := base
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	if withOrderAndLimit {
+		query += " ORDER BY updated_at DESC, seq DESC"
+		if opts.Limit > 0 {
+			query += " LIMIT ?"
+			args = append(args, opts.Limit)
+			if opts.Offset > 0 {
+				query += " OFFSET ?"
+				args = append(args, opts.Offset)
+			}
+		} else if opts.Offset > 0 {
+			// SQLite: LIMIT -1 means no upper bound, so OFFSET-only paging is honest.
+			query += " LIMIT -1 OFFSET ?"
+			args = append(args, opts.Offset)
+		}
+	}
+	return query, args
+}
+
+func (r *LoopsRepository) ListByRepoAndPR(ctx context.Context, repo string, prNumber int64) ([]LoopRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY updated_at DESC, seq DESC`, repo, prNumber)
+	if err != nil {
+		return nil, fmt.Errorf("list loops by repository and pull request: %w", err)
 	}
 	defer rows.Close()
 
@@ -818,9 +917,10 @@ type LocksRepository struct {
 const agentExecutionColumns = `id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at`
 
 func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
+	// agent_snapshot_json is insert-only: ON CONFLICT must not overwrite an existing snapshot.
 	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at, agent_snapshot_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			status=excluded.status,
 			current_step=excluded.current_step,
@@ -832,7 +932,7 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 			last_heartbeat_at=excluded.last_heartbeat_at,
 			ended_at=excluded.ended_at,
 			updated_at=excluded.updated_at
-	`, record.ID, record.LoopID, record.Status, record.CurrentStep, record.LastCompletedStep, record.CheckpointJSON, record.Summary, record.ErrorMessage, record.StartedAt, record.LastHeartbeatAt, record.EndedAt, record.CreatedAt, record.UpdatedAt)
+	`, record.ID, record.LoopID, record.Status, record.CurrentStep, record.LastCompletedStep, record.CheckpointJSON, record.Summary, record.ErrorMessage, record.StartedAt, record.LastHeartbeatAt, record.EndedAt, record.CreatedAt, record.UpdatedAt, record.AgentSnapshotJSON)
 	if err != nil {
 		return fmt.Errorf("upsert run: %w", err)
 	}
@@ -1040,8 +1140,22 @@ func (r *RunsRepository) ListByLoop(ctx context.Context, loopID string) ([]RunRe
 	return scanRuns(rows)
 }
 
+// Upsert writes a durable agent_executions observation (ADR-0015 R5 / #578).
+//
+// Terminal immutability policy (status column):
+//   - Active statuses: running, cancelling.
+//   - Terminal statuses: completed, failed, timeout, killed, success (legacy).
+//   - Active → active and active → terminal are allowed.
+//   - Terminal → active is forbidden (stale live writer cannot regress).
+//   - Terminal → different terminal is forbidden (first terminal wins).
+//   - Terminal → same terminal is allowed for non-status field enrichment
+//     (e.g. native-resume metadata) without changing the terminal outcome.
+//
+// Zero-row / rejected conflict updates return ErrAgentExecutionConflict, never
+// nil success. Callsites must surface conflict and must not treat it as durable
+// success for finalize/release paths.
 func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExecutionRecord) error {
-	_, err := r.q.ExecContext(ctx, `
+	result, err := r.q.ExecContext(ctx, `
 		INSERT INTO agent_executions (id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -1068,9 +1182,21 @@ func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExec
 			ended_at=excluded.ended_at,
 			metadata_json=excluded.metadata_json,
 			updated_at=excluded.updated_at
+		WHERE agent_executions.status IN ('running', 'cancelling')
+		   OR (
+				agent_executions.status NOT IN ('running', 'cancelling')
+				AND excluded.status = agent_executions.status
+		   )
 	`, record.ID, record.ProjectID, record.LoopID, record.RunID, record.Vendor, record.Status, record.PID, record.CommandJSON, record.CWD, record.Summary, record.ParseStatus, record.CompletionSignal, record.HeartbeatCount, record.LastHeartbeatAt, record.OutputJSON, record.ErrorMessage, record.NativeSessionID, record.NativeResumeMode, record.NativeResumeStatus, record.NativeResumeError, record.StartedAt, record.EndedAt, record.MetadataJSON, record.CreatedAt, record.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("upsert agent execution: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("upsert agent execution rows affected: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("%w: id=%s status=%s", ErrAgentExecutionConflict, record.ID, record.Status)
 	}
 
 	return nil
@@ -1195,21 +1321,49 @@ func (r *PullRequestSnapshotsRepository) List(ctx context.Context) ([]PullReques
 	return scanPullRequestSnapshots(rows)
 }
 
-func (r *PullRequestSnapshotsRepository) GetLatest(ctx context.Context, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM pull_request_snapshots WHERE repo = ? AND pr_number = ? ORDER BY captured_at DESC LIMIT 1`, repo, prNumber)
-	record, err := scanPullRequestSnapshot(row)
+func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Context, repo string, prNumber int64) ([]PullRequestSnapshotRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		WITH ranked AS (
+			SELECT id, ROW_NUMBER() OVER (
+				PARTITION BY project_id
+				ORDER BY captured_at DESC, created_at DESC, id DESC
+			) AS row_number
+			FROM pull_request_snapshots
+			WHERE repo = ? COLLATE NOCASE AND pr_number = ?
+		)
+		SELECT snapshots.*
+		FROM pull_request_snapshots snapshots
+		JOIN ranked ON ranked.id = snapshots.id
+		WHERE ranked.row_number = 1
+		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.id DESC
+	`, repo, prNumber)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
+		return nil, fmt.Errorf("list latest pull request snapshots by repository and pull request: %w", err)
+	}
+	defer rows.Close()
+
+	return scanPullRequestSnapshots(rows)
+}
+
+func (r *PullRequestSnapshotsRepository) GetLatest(ctx context.Context, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
+	records, err := r.ListLatestByRepoAndPR(ctx, repo, prNumber)
+	if err != nil {
 		return nil, fmt.Errorf("get latest pull request snapshot: %w", err)
 	}
-
-	return &record, nil
+	if len(records) == 0 {
+		return nil, nil
+	}
+	projectID := records[0].ProjectID
+	for _, record := range records[1:] {
+		if record.ProjectID != projectID {
+			return nil, fmt.Errorf("get latest pull request snapshot: repository %s#%d matches multiple projects; use GetLatestByProject", repo, prNumber)
+		}
+	}
+	return &records[0], nil
 }
 
 func (r *PullRequestSnapshotsRepository) GetLatestByProject(ctx context.Context, projectID, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM pull_request_snapshots WHERE project_id = ? AND repo = ? AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
 	record, err := scanPullRequestSnapshot(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1232,7 +1386,7 @@ func (r *LocksRepository) SetNow(now func() time.Time) {
 
 func (r *LocksRepository) Acquire(ctx context.Context, record LockRecord) (bool, error) {
 	nowISO := r.now().UTC().Format(javaScriptISOStringLayout)
-	result, err := r.q.ExecContext(ctx, `
+	query := `
 		INSERT INTO locks (key, owner, reason, expires_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
@@ -1241,7 +1395,37 @@ func (r *LocksRepository) Acquire(ctx context.Context, record LockRecord) (bool,
 			expires_at=excluded.expires_at,
 			updated_at=excluded.updated_at
 		WHERE locks.expires_at <= ?
-	`, record.Key, record.Owner, record.Reason, record.ExpiresAt, record.CreatedAt, record.UpdatedAt, nowISO)
+	`
+	args := []any{record.Key, record.Owner, record.Reason, record.ExpiresAt, record.CreatedAt, record.UpdatedAt, nowISO}
+	legacyKey, scopedSuffix, kind, scoped, transitionKey := lockTransitionAlias(record.Key)
+	if transitionKey {
+		aliasPredicate := "key = ?"
+		aliasArgs := []any{legacyKey}
+		if !scoped {
+			aliasPredicate = "key LIKE ? AND lower(substr(key, -?)) = lower(?)"
+			aliasArgs = []any{kind + ":%", len(scopedSuffix), scopedSuffix}
+		} else {
+			aliasPredicate = "lower(key) = lower(?)"
+		}
+		query = `
+			INSERT INTO locks (key, owner, reason, expires_at, created_at, updated_at)
+			SELECT ?, ?, ?, ?, ?, ?
+			WHERE NOT EXISTS (
+				SELECT 1 FROM locks
+				WHERE key != ? AND expires_at > ? AND (` + aliasPredicate + `)
+			)
+			ON CONFLICT(key) DO UPDATE SET
+				owner=excluded.owner,
+				reason=excluded.reason,
+				expires_at=excluded.expires_at,
+				updated_at=excluded.updated_at
+			WHERE locks.expires_at <= ?
+		`
+		args = []any{record.Key, record.Owner, record.Reason, record.ExpiresAt, record.CreatedAt, record.UpdatedAt, record.Key, nowISO}
+		args = append(args, aliasArgs...)
+		args = append(args, nowISO)
+	}
+	result, err := r.q.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, fmt.Errorf("acquire lock: %w", err)
 	}
@@ -1433,6 +1617,54 @@ func (r *QueueRepository) GetLatestByLoopID(ctx context.Context, loopID string) 
 	}
 
 	return &record, nil
+}
+
+// ListLatestByLoopIDs returns the latest queue item per loop_id for the given IDs.
+// Ordering within a loop matches GetLatestByLoopID: updated_at, created_at, id DESC.
+func (r *QueueRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []string) ([]QueueItemRecord, error) {
+	if len(loopIDs) == 0 {
+		return []QueueItemRecord{}, nil
+	}
+	chunks := chunkStrings(loopIDs, sqliteMaxVariables)
+	items := make([]QueueItemRecord, 0, len(loopIDs))
+	for _, chunk := range chunks {
+		args := make([]any, 0, len(chunk))
+		for _, loopID := range chunk {
+			args = append(args, loopID)
+		}
+		rows, err := r.q.QueryContext(ctx, `
+			SELECT
+				id, project_id, loop_id, type, target_type, target_id, repo, pr_number, dedupe_key,
+				priority, status, available_at, attempts, max_attempts, claimed_by, claimed_at,
+				started_at, finished_at, lock_key, payload_json, last_error, last_error_kind,
+				created_at, updated_at
+			FROM (
+				SELECT
+					queue_items.*,
+					ROW_NUMBER() OVER (
+						PARTITION BY loop_id
+						ORDER BY updated_at DESC, created_at DESC, id DESC
+					) AS row_num
+				FROM queue_items
+				WHERE loop_id IN (`+sqlPlaceholders(len(chunk))+`)
+			)
+			WHERE row_num = 1
+			ORDER BY updated_at DESC, created_at DESC, id DESC
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list latest queue items by loop ids: %w", err)
+		}
+		chunkItems, scanErr := scanQueueItems(rows)
+		closeErr := rows.Close()
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close list latest queue items by loop ids rows: %w", closeErr)
+		}
+		items = append(items, chunkItems...)
+	}
+	return items, nil
 }
 
 func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
@@ -1657,7 +1889,7 @@ func (r *QueueRepository) Stats(ctx context.Context, nowISO string) (QueueStats,
 				AND EXISTS (
 					SELECT 1
 					FROM queue_items lock_blocker
-					WHERE lock_blocker.lock_key = qi.lock_key
+					WHERE ` + queueLockConflictPredicate + `
 						AND lock_blocker.status = 'running'
 						AND lock_blocker.id != qi.id
 				)
@@ -1676,6 +1908,7 @@ func (r *QueueRepository) Stats(ctx context.Context, nowISO string) (QueueStats,
 					WHERE blocker.type = 'reviewer'
 						AND blocker.repo = qi.repo
 						AND blocker.pr_number = qi.pr_number
+						AND (blocker.project_id = qi.project_id OR blocker.project_id IS NULL OR qi.project_id IS NULL)
 						AND blocker.status IN ('queued', 'running')
 						AND blocker.id != qi.id
 				)
@@ -1732,8 +1965,130 @@ func (r *QueueRepository) ClaimNextLongTermRetry(ctx context.Context, nowISO, cl
 	`, []any{QueueLongTermRetryAttemptThreshold})
 }
 
+// claimCtxForDurableClaim refuses already-cancelled callers, then detaches
+// cancellation from the UPDATE...RETURNING while preserving any caller
+// deadline. If the parent context is cancelled after SQLite commits the claim
+// but before the row is scanned, QueryRowContext would return ctx.Err without
+// the claimed item and strand a durable running row with no owner
+// (ADR-0015 R6 / #579). context.WithoutCancel also strips Deadline, so a
+// WithTimeout caller would otherwise hang indefinitely on a blocked SQLite
+// claim; re-apply the deadline on the detached context. The returned cancel
+// must be deferred by the caller to free the deadline timer.
+func claimCtxForDurableClaim(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	noop := func() {}
+	if ctx == nil {
+		return context.Background(), noop, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	detached := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		// WithoutCancel strips Deadline; re-apply so QueryRowContext still bounds.
+		withDeadline, cancel := context.WithDeadline(detached, deadline)
+		return withDeadline, cancel, nil
+	}
+	return detached, noop, nil
+}
+
+// ClaimNextNonLongTermRetryAmongTypes claims the next non-long-term-retry item
+// whose type is in types. Empty types claims nothing.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypes(ctx context.Context, nowISO, claimedBy string, types []string) (*QueueItemRecord, error) {
+	return r.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, types, nil)
+}
+
+// ClaimNextLongTermRetryAmongTypes claims the next long-term-retry item whose
+// type is in types. Empty types claims nothing.
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypes(ctx context.Context, nowISO, claimedBy string, types []string) (*QueueItemRecord, error) {
+	return r.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, types, nil)
+}
+
+// ClaimNextNonLongTermRetryAmongTypeSets claims the next non-long-term-retry item
+// that is either unrestricted by type or sticky-snapshot-only (latest run is
+// failed/interrupted with a non-empty agent_snapshot_json vendor). Both type
+// slices empty claims nothing.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSets(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+	if typePred == "" {
+		return nil, nil
+	}
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
+	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND NOT (`+longTermRetryPredicateParam+`)
+		`+typePred+`
+	`, extraArgs)
+}
+
+// ClaimNextLongTermRetryAmongTypeSets is the long-term-retry counterpart of
+// ClaimNextNonLongTermRetryAmongTypeSets.
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSets(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+	if typePred == "" {
+		return nil, nil
+	}
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
+	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND (`+longTermRetryPredicateParam+`)
+		`+typePred+`
+	`, extraArgs)
+}
+
+func queueTypeInClause(types []string) (placeholders string, args []any) {
+	parts := make([]string, 0, len(types))
+	args = make([]any, 0, len(types))
+	for _, t := range types {
+		parts = append(parts, "?")
+		args = append(args, t)
+	}
+	return strings.Join(parts, ", "), args
+}
+
+// queueClaimTypePredicate builds the AND (...) filter for unrestricted types
+// and sticky-snapshot-only types. Sticky types require the loop's latest run
+// (started_at DESC, created_at DESC — matching Runs.GetLatestByLoopID) to be
+// failed/interrupted with a non-empty agent_snapshot_json vendor so fresh work
+// for unconfigured roles is never claimed while sticky retries still are.
+func queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes []string) (predicate string, args []any) {
+	parts := make([]string, 0, 2)
+	if len(unrestrictedTypes) > 0 {
+		placeholders, typeArgs := queueTypeInClause(unrestrictedTypes)
+		parts = append(parts, "qi.type IN ("+placeholders+")")
+		args = append(args, typeArgs...)
+	}
+	if len(stickySnapshotTypes) > 0 {
+		placeholders, typeArgs := queueTypeInClause(stickySnapshotTypes)
+		// EXISTS over the single latest run row for the queue item's loop.
+		parts = append(parts, `(qi.type IN (`+placeholders+`)
+			AND qi.loop_id IS NOT NULL
+			AND EXISTS (
+				SELECT 1
+				FROM (
+					SELECT status, agent_snapshot_json
+					FROM runs
+					WHERE loop_id = qi.loop_id
+					ORDER BY started_at DESC, created_at DESC
+					LIMIT 1
+				) latest
+				WHERE latest.status IN ('failed', 'interrupted')
+					AND latest.agent_snapshot_json IS NOT NULL
+					AND length(trim(latest.agent_snapshot_json)) > 0
+					AND length(trim(coalesce(json_extract(latest.agent_snapshot_json, '$.vendor'), ''))) > 0
+			))`)
+		args = append(args, typeArgs...)
+	}
+	if len(parts) == 0 {
+		return "", nil
+	}
+	return "AND (" + strings.Join(parts, " OR ") + ")", args
+}
+
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
+	claimCtx, cancel, err := claimCtxForDurableClaim(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	row := r.q.QueryRowContext(claimCtx, `
 		WITH candidate AS (
 			`+scheduledQueueBaseQuery+extraPredicate+scheduledQueueOrderBy+`
 			LIMIT 1
@@ -1761,7 +2116,12 @@ func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimed
 }
 
 func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy, queueType string) (*QueueItemRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
+	claimCtx, cancel, err := claimCtxForDurableClaim(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	row := r.q.QueryRowContext(claimCtx, `
 		WITH candidate AS (
 			`+scheduledQueueBaseQuery+`
 			AND qi.type = ?
@@ -1788,6 +2148,29 @@ func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy
 	}
 
 	return &record, nil
+}
+
+// ListRunningClaimedBy returns running queue items claimed by claimedBy at
+// claimedAt. Used to recover from ambiguous ClaimNext failures after context
+// cancellation when the durable UPDATE may have committed without returning
+// the row to the caller.
+func (r *QueueRepository) ListRunningClaimedBy(ctx context.Context, claimedBy, claimedAt string) ([]QueueItemRecord, error) {
+	if claimedBy == "" {
+		return []QueueItemRecord{}, nil
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT * FROM queue_items
+		WHERE status = 'running'
+			AND claimed_by = ?
+			AND claimed_at = ?
+		ORDER BY id ASC
+	`, claimedBy, claimedAt)
+	if err != nil {
+		return nil, fmt.Errorf("list running queue items by claimed_by: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
 }
 
 func (r *QueueRepository) Complete(ctx context.Context, id, finishedAt string) error {
@@ -1824,6 +2207,9 @@ func (r *QueueRepository) UpdateLockKey(ctx context.Context, id, lockKey, update
 }
 
 func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInput) error {
+	// Runner authority after processing: may requeue even when concurrent pause
+	// CancelByLoop already terminalized the claim mid-run (resume later). Do not
+	// status-guard here — stop/bind refuse uses MarkRetryIfRunning instead.
 	_, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
 		SET status = 'queued',
@@ -1844,6 +2230,36 @@ func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInp
 	`, input.AvailableAt, input.Attempts, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
 	if err != nil {
 		return fmt.Errorf("mark queue item for retry: %w", err)
+	}
+
+	return nil
+}
+
+// MarkRetryIfRunning requeues only while status is still running. Zero rows
+// (already cancelled/completed/failed) is a no-op success so stop/bind refuse
+// cannot resurrect terminal cancellation. Prefer MarkRetry for runner finalize.
+func (r *QueueRepository) MarkRetryIfRunning(ctx context.Context, input QueueMarkRetryInput) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'queued',
+			available_at = ?,
+			attempts = ?,
+			last_error = ?,
+			last_error_kind = ?,
+			claimed_by = NULL,
+			claimed_at = NULL,
+			finished_at = NULL,
+			updated_at = ?
+		WHERE id = ?
+			AND status = 'running'
+			AND NOT EXISTS (
+				SELECT 1
+				FROM projects p
+				WHERE p.id = queue_items.project_id AND p.archived = 1
+			)
+	`, input.AvailableAt, input.Attempts, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
+	if err != nil {
+		return fmt.Errorf("mark queue item for retry if running: %w", err)
 	}
 
 	return nil
@@ -2295,6 +2711,16 @@ func chunkStrings(values []string, chunkSize int) [][]string {
 	return chunks
 }
 
+const queueLockConflictPredicate = `(
+	lock_blocker.lock_key = qi.lock_key
+	OR (
+		lock_blocker.repo = qi.repo
+		AND lock_blocker.target_type = qi.target_type
+		AND lock_blocker.target_id = qi.target_id
+		AND (lock_blocker.lock_key = lock_blocker.target_id OR qi.lock_key = qi.target_id)
+	)
+)`
+
 const scheduledQueueBaseQuery = `
 	SELECT qi.*
 	FROM queue_items qi
@@ -2309,7 +2735,7 @@ const scheduledQueueBaseQuery = `
 			OR NOT EXISTS (
 				SELECT 1
 				FROM queue_items lock_blocker
-				WHERE lock_blocker.lock_key = qi.lock_key
+				WHERE ` + queueLockConflictPredicate + `
 					AND lock_blocker.status = 'running'
 					AND lock_blocker.id != qi.id
 			)
@@ -2324,6 +2750,7 @@ const scheduledQueueBaseQuery = `
 				WHERE blocker.type = 'reviewer'
 					AND blocker.repo = qi.repo
 					AND blocker.pr_number = qi.pr_number
+					AND (blocker.project_id = qi.project_id OR blocker.project_id IS NULL OR qi.project_id IS NULL)
 					AND blocker.status IN ('queued', 'running')
 					AND blocker.id != qi.id
 			)
@@ -2550,9 +2977,10 @@ func scanRun(row interface{ Scan(...any) error }) (RunRecord, error) {
 		errorMessage      sql.NullString
 		lastHeartbeatAt   sql.NullString
 		endedAt           sql.NullString
+		agentSnapshotJSON sql.NullString
 	)
 
-	err := row.Scan(&record.ID, &record.LoopID, &record.Status, &currentStep, &lastCompletedStep, &checkpointJSON, &summary, &errorMessage, &record.StartedAt, &lastHeartbeatAt, &endedAt, &record.CreatedAt, &record.UpdatedAt)
+	err := row.Scan(&record.ID, &record.LoopID, &record.Status, &currentStep, &lastCompletedStep, &checkpointJSON, &summary, &errorMessage, &record.StartedAt, &lastHeartbeatAt, &endedAt, &record.CreatedAt, &record.UpdatedAt, &agentSnapshotJSON)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2563,6 +2991,7 @@ func scanRun(row interface{ Scan(...any) error }) (RunRecord, error) {
 	record.ErrorMessage = nullableString(errorMessage)
 	record.LastHeartbeatAt = nullableString(lastHeartbeatAt)
 	record.EndedAt = nullableString(endedAt)
+	record.AgentSnapshotJSON = nullableString(agentSnapshotJSON)
 
 	return record, nil
 }

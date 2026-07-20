@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -25,6 +26,9 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
 	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	loopengine "github.com/nexu-io/looper/internal/loops/engine"
@@ -42,6 +46,7 @@ const (
 	requestIDHeaderName        = "x-request-id"
 	apiBasePath                = "/api/v1"
 	webhookForwardPath         = "/webhook/forward"
+	maxConfigPatchBodyBytes    = 1 << 20
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
 	activeRunHeartbeatTTL      = 30 * time.Minute
@@ -60,8 +65,70 @@ type activeRunExecutionVerifier interface {
 	ExecutionMatchesProcess(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error)
 }
 
+// ConfigFieldMetadata describes where an effective field came from and whether
+// the dashboard may change it without restarting looperd.
+type ConfigFieldMetadata struct {
+	Source    string `json:"source"`
+	Editable  bool   `json:"editable"`
+	ApplyMode string `json:"applyMode"`
+}
+
+// ConfigMetadata describes the effective configuration source and the most
+// recent file reload attempt. Fields is keyed by canonical dotted config path.
+type ConfigMetadata struct {
+	ConfigPath    string                         `json:"configPath"`
+	Format        string                         `json:"format"`
+	FilePresent   bool                           `json:"filePresent"`
+	Revision      string                         `json:"revision"`
+	LastAttemptAt *time.Time                     `json:"lastAttemptAt,omitempty"`
+	LastAppliedAt *time.Time                     `json:"lastAppliedAt,omitempty"`
+	LastError     *string                        `json:"lastError,omitempty"`
+	RejectedPaths []string                       `json:"rejectedPaths"`
+	Fields        map[string]ConfigFieldMetadata `json:"fields"`
+}
+
+// ConfigPatchRequest is the dashboard's field-level mutation contract. Set
+// values stay as raw JSON so the configuration authority performs all typing
+// and validation; Unset removes values from the file layer.
+type ConfigPatchRequest struct {
+	Revision string                     `json:"revision"`
+	Set      map[string]json.RawMessage `json:"set"`
+	Unset    []string                   `json:"unset"`
+}
+
+type ConfigRequestErrorKind string
+
+const (
+	ConfigRequestErrorKindValidation  ConfigRequestErrorKind = "validation"
+	ConfigRequestErrorKindConflict    ConfigRequestErrorKind = "conflict"
+	ConfigRequestErrorKindUnsupported ConfigRequestErrorKind = "unsupported"
+	ConfigRequestErrorKindTooLarge    ConfigRequestErrorKind = "too_large"
+)
+
+// ConfigPatchIssue identifies one rejected field-level mutation.
+type ConfigPatchIssue struct {
+	Path    string `json:"path,omitempty"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// ConfigRequestError lets the configuration authority report stable field
+// issues while the HTTP layer owns status codes and envelope formatting.
+type ConfigRequestError struct {
+	Kind    ConfigRequestErrorKind
+	Message string
+	Issues  []ConfigPatchIssue
+}
+
+func (e ConfigRequestError) Error() string {
+	return e.Message
+}
+
 type Context struct {
 	Config             config.Config
+	ConfigMetadata     func() ConfigMetadata
+	ConfigSnapshot     func() (config.Config, ConfigMetadata)
+	PatchConfig        func(context.Context, ConfigPatchRequest) error
 	Runtime            RuntimeState
 	WebhookForwarder   webhookforward.Forwarder
 	ProjectsService    projectService
@@ -94,6 +161,26 @@ type Handler struct {
 	now              func() time.Time
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
+	bootstrap        *bootstrapCodes
+	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
+	// and immediately before git reset/clean so tests can inject a requeue race
+	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
+	discardBeforeGitHook func(loopID string)
+	// retryAfterClearStopGateHook is test-only: invoked after ClearLoopStop and
+	// before the requeue transaction so tests can inject a TX-time conflict
+	// after the sticky stop gate was already cleared.
+	retryAfterClearStopGateHook func(loopID string)
+}
+
+// effectiveConfig returns the live config when ConfigSnapshot is wired, else
+// the request/handler context config. Agent gates (create/start/retry) must use
+// this so role bindings reloaded after daemon start are visible.
+func (h *Handler) effectiveConfig() config.Config {
+	if h.context.ConfigSnapshot != nil {
+		cfg, _ := h.context.ConfigSnapshot()
+		return cfg
+	}
+	return h.context.Config
 }
 
 func NewHandler(context Context) *Handler {
@@ -125,19 +212,74 @@ func NewHandler(context Context) *Handler {
 		}
 	}
 
+	bootstrap := newBootstrapCodes()
+	bootstrap.now = now
+
 	return &Handler{
 		context:          context,
 		now:              now,
 		recoverySummary:  recoverySummary,
 		webhookForwarder: forwarder,
+		bootstrap:        bootstrap,
 	}
 }
 
+// lockLoopRetry acquires the process-wide per-loop requeue mutex shared by
+// retryLoop, start/requeue (mutateLoopStatus → Running), issue-worker reuse
+// (POST /workers), and runtime HITL free-text / answer requeues
+// (looperdruntime.LockLoopRequeue). Without this shared exclusion, runtime
+// inbox delivery can requeue after discard preflight and before git reset,
+// wiping the worktree for the message-driven continuation when the retry TX
+// then conflicts.
+func (h *Handler) lockLoopRetry(loopID string) func() {
+	return looperdruntime.LockLoopRequeue(loopID)
+}
+
+// lockLoopTarget acquires the process-wide same-target mutex so discard retry,
+// same-target requeue (regular retry / start), active loop creation, and runtime
+// HITL requeues cannot race. Concurrent project-scoped workers are exempt
+// (assertUniqueActiveLoopCompat allows them). Pull-request targets omit loop
+// type so fixer/reviewer/worker share one key for the shared PR worktree.
+// Call order with lockLoopRetry: take the per-loop lock first, then the target
+// lock, so retry/start/reuse paths share a consistent order with discard.
+func (h *Handler) lockLoopTarget(projectID string, loopType domain.LoopType, target domain.LoopTarget) func() {
+	key := looperdruntime.LoopTargetGuardKey(projectID, string(loopType), string(target.TargetType), loopTargetKeyCompat(target))
+	return looperdruntime.LockLoopTarget(key)
+}
+
+// lockLoopTargetForStatus is a no-op when the candidate status is not a
+// uniqueness-conflicting active status (create of failed/completed/etc.).
+func (h *Handler) lockLoopTargetForStatus(projectID string, loopType domain.LoopType, target domain.LoopTarget, status domain.LoopStatus) func() {
+	if !domain.IsConflictingActiveLoopStatus(status) {
+		return func() {}
+	}
+	return h.lockLoopTarget(projectID, loopType, target)
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestHandler := *h
+	requestHandler.context = h.context
+	// The config endpoint needs one coherent config-and-metadata snapshot.
+	// Other routes use the current in-memory runtime config for authorization
+	// and policy without constructing dashboard metadata.
+	if normalizePath(r.URL.Path) == apiBasePath+"/config" && h.context.ConfigSnapshot != nil {
+		cfg, metadata := h.context.ConfigSnapshot()
+		requestHandler.context.Config = cfg
+		requestHandler.context.ConfigMetadata = func() ConfigMetadata { return metadata }
+	} else if runtimeConfig, ok := any(h.context.Runtime).(interface{ Config() config.Config }); ok {
+		requestHandler.context.Config = runtimeConfig.Config()
+	}
+	requestHandler.serveHTTP(w, r)
+}
+
+func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	path := normalizePath(r.URL.Path)
 	requestID := strings.TrimSpace(r.Header.Get(requestIDHeaderName))
 	if requestID == "" {
 		requestID = generateRequestID()
+	}
+	if path == apiBasePath+"/config" {
+		w.Header().Set("Cache-Control", "no-store")
 	}
 
 	if err := authorizeRequest(r, path, h.context.Config); err != nil {
@@ -145,11 +287,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !asAPIError(err, &typed) {
 			typed = internalServerError(err)
 		}
+		// Bootstrap paths must never be cached, including auth/Host/Origin failures.
+		if isDashboardBootstrapPath(path) {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		h.writeError(w, requestID, typed)
 		return
 	}
 
+	// Mutation readiness is a projection of the single admission Authority
+	// (ADR-0015 / #575). Reads remain available while starting/stopping/degraded.
+	// Feishu url_verification is a non-mutating challenge echo and is gated
+	// inside handleFeishuCardActionRoute after the handshake branch.
+	if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) && path != apiBasePath+"/hitl/feishu" {
+		if typed, denied := h.admissionMutationDenial(); denied {
+			h.writeError(w, requestID, typed)
+			return
+		}
+	}
+
 	switch path {
+	case dashboardBootstrapCodePath:
+		h.handleBootstrapMint(w, r, requestID)
+		return
+	case dashboardBootstrapExchangePath:
+		h.handleBootstrapExchange(w, r, requestID)
+		return
 	case webhookForwardPath:
 		payload, err := h.buildWebhookForwardResponse(r)
 		if err != nil {
@@ -196,11 +359,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeSuccess(w, requestID, h.buildVersionResponse())
 		return
 	case apiBasePath + "/config":
-		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
-			return
-		}
-
-		h.writeSuccess(w, requestID, h.buildConfigResponse())
+		h.handleConfigRoute(w, r, requestID)
 		return
 	case apiBasePath + "/webhook/status":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
@@ -454,7 +613,15 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	if !isLoopbackRequest(r) {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding is limited to loopback callers"}
 	}
-	if h.webhookForwarder == nil {
+	forwarder := h.webhookForwarder
+	if runtimeWithForwarder, ok := any(h.context.Runtime).(interface {
+		WebhookForwarder() looperdruntime.WebhookForwarder
+	}); ok {
+		if current := runtimeWithForwarder.WebhookForwarder(); current != nil {
+			forwarder = current
+		}
+	}
+	if forwarder == nil {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Webhook forwarding is not configured"}
 	}
 	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
@@ -471,17 +638,24 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	}
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 	eventType := r.Header.Get("X-GitHub-Event")
-	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
+	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
 	if err != nil {
 		status := http.StatusBadRequest
 		code := pkgapi.ErrorCodeValidationFailed
 		message := err.Error()
-		lower := strings.ToLower(message)
-		if strings.Contains(lower, "not configured") {
-			status = http.StatusInternalServerError
-			code = pkgapi.ErrorCodeInternalError
-		} else if strings.Contains(lower, "queue is full") {
+		// Post-gate admission refusal (race after outer AllowMutations) is temporary
+		// unavailability, not a bad delivery payload.
+		if errors.Is(err, webhookforward.ErrAdmissionRefused) {
 			status = http.StatusServiceUnavailable
+			code = pkgapi.ErrorCodeServiceUnavailable
+		} else {
+			lower := strings.ToLower(message)
+			if strings.Contains(lower, "not configured") {
+				status = http.StatusInternalServerError
+				code = pkgapi.ErrorCodeInternalError
+			} else if strings.Contains(lower, "queue is full") {
+				status = http.StatusServiceUnavailable
+			}
 		}
 		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
 	}
@@ -504,8 +678,12 @@ func isLoopbackRequest(r *http.Request) bool {
 }
 
 func hasForwardingProxyHeaders(headers http.Header) bool {
-	for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-Ip", "X-Real-IP"} {
-		for _, value := range headers.Values(name) {
+	for name, values := range headers {
+		normalized := strings.ToLower(strings.TrimSpace(name))
+		if normalized != "forwarded" && normalized != "x-real-ip" && !strings.HasPrefix(normalized, "x-forwarded-") {
+			continue
+		}
+		for _, value := range values {
 			if strings.TrimSpace(value) != "" {
 				return true
 			}
@@ -572,12 +750,84 @@ func assertMethod(method, allowed, path string, w http.ResponseWriter, requestID
 	return false
 }
 
+func isMutatingHTTPMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// isAdmissionExemptMutationPath lists mutation routes that must stay available
+// before admission is ready (dashboard bootstrap) or are not work-producing.
+func isAdmissionExemptMutationPath(path string) bool {
+	switch path {
+	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) admissionMutationDenial() (apiError, bool) {
+	runtimeValue := h.context.Runtime
+	if runtimeValue == nil {
+		// Tests and embedders without a runtime keep prior open-admission behavior.
+		return apiError{}, false
+	}
+	gate, ok := any(runtimeValue).(interface{ AllowMutations() error })
+	if !ok {
+		return apiError{}, false
+	}
+	if err := gate.AllowMutations(); err != nil {
+		return apiError{
+			code:    pkgapi.ErrorCodeServiceUnavailable,
+			status:  http.StatusServiceUnavailable,
+			message: err.Error(),
+		}, true
+	}
+	return apiError{}, false
+}
+
+// admissionStateString projects the single admission Authority for status
+// surfaces. Missing/partial runtimes report "ready" so embedders and older
+// test doubles keep open-admission behavior (same as AllowMutations).
+func (h *Handler) admissionStateString() string {
+	runtimeValue := h.context.Runtime
+	if runtimeValue == nil {
+		return string(looperdruntime.AdmissionReady)
+	}
+	if typed, ok := any(runtimeValue).(interface {
+		AdmissionState() looperdruntime.AdmissionState
+	}); ok {
+		return string(typed.AdmissionState())
+	}
+	return string(looperdruntime.AdmissionReady)
+}
+
 func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
 		if !hasForwardingProxyHeaders(r.Header) {
 			return nil
 		}
 	}
+
+	// Browser foundation: Host allowlist + Origin match against config-derived
+	// authorities when Origin is present (reads and mutations). CLI without Origin OK.
+	// Non-browser callbacks (e.g. Feishu) with no Origin skip Host allowlist so a
+	// public Host on 0.0.0.0 without server.baseUrl still reaches token verification.
+	if err := validateBrowserRequestForPath(r, cfg, path); err != nil {
+		return err
+	}
+	if path == apiBasePath+"/config" && r.Method == http.MethodPatch && cfg.Server.AuthMode != config.AuthModeLocalToken && !isDirectLoopbackConfigMutation(r, cfg) {
+		return apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "Configuration updates without token authentication are limited to direct loopback clients",
+		}
+	}
+
 	if cfg.Server.AuthMode != config.AuthModeLocalToken {
 		return nil
 	}
@@ -590,6 +840,11 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 		}
 	}
 
+	// Public one-shot exception: SPA exchanges bootstrap code without Bearer.
+	if isDashboardBootstrapExchange(path, r.Method) {
+		return nil
+	}
+
 	if r.Header.Get("Authorization") != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {
 		return apiError{
 			code:    pkgapi.ErrorCodeUnauthorized,
@@ -599,6 +854,17 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 	}
 
 	return nil
+}
+
+func isDirectLoopbackConfigMutation(r *http.Request, cfg config.Config) bool {
+	if r == nil || !isLoopbackRemoteAddr(r.RemoteAddr) || hasForwardingProxyHeaders(r.Header) {
+		return false
+	}
+	// RemoteAddr alone identifies a local reverse proxy, not the original
+	// caller. Requiring a literal loopback request authority closes the common
+	// stripped-forwarding-header proxy path while retaining direct CLI/browser
+	// access through localhost, 127.0.0.1, or ::1.
+	return isLoopbackAuthority(effectiveRequestHost(r, cfg))
 }
 
 func isLoopbackRemoteAddr(remoteAddr string) bool {
@@ -715,17 +981,18 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 }
 
 type statusResponse struct {
-	Service         statusService       `json:"service"`
-	Storage         statusStorage       `json:"storage"`
-	Scheduler       statusScheduler     `json:"scheduler"`
-	Agent           statusAgent         `json:"agent"`
-	WorktreeCleanup any                 `json:"worktreeCleanup"`
-	Webhook         statusWebhook       `json:"webhook"`
-	Loops           statusLoops         `json:"loops"`
-	Network         any                 `json:"network,omitempty"`
-	Safety          statusSafety        `json:"safety"`
-	Notifications   statusNotifications `json:"notifications"`
-	Tools           statusTools         `json:"tools"`
+	Service         statusService                 `json:"service"`
+	Storage         statusStorage                 `json:"storage"`
+	Scheduler       statusScheduler               `json:"scheduler"`
+	Agent           statusAgent                   `json:"agent"`
+	WorktreeCleanup any                           `json:"worktreeCleanup"`
+	Webhook         statusWebhook                 `json:"webhook"`
+	Loops           statusLoops                   `json:"loops"`
+	Network         any                           `json:"network,omitempty"`
+	Safety          statusSafety                  `json:"safety"`
+	Notifications   statusNotifications           `json:"notifications"`
+	Tools           statusTools                   `json:"tools"`
+	Providers       []forge.ForgejoProviderHealth `json:"providers"`
 }
 
 type statusService struct {
@@ -733,9 +1000,12 @@ type statusService struct {
 	Version    string                `json:"version"`
 	Build      version.BuildMetadata `json:"build"`
 	DaemonMode config.DaemonMode     `json:"daemonMode"`
-	StartedAt  *string               `json:"startedAt,omitempty"`
-	Recovery   any                   `json:"recovery"`
-	Binary     statusBinary          `json:"binary"`
+	// AdmissionState is the single live admission Authority (ADR-0015 R1).
+	// HTTP mutations and scheduler claims open only when this is "ready".
+	AdmissionState string       `json:"admissionState"`
+	StartedAt      *string      `json:"startedAt,omitempty"`
+	Recovery       any          `json:"recovery"`
+	Binary         statusBinary `json:"binary"`
 }
 
 type statusBinary struct {
@@ -866,28 +1136,282 @@ type statusTools struct {
 	Osascript bool `json:"osascript"`
 }
 
+func (h *Handler) handleConfigRoute(w http.ResponseWriter, r *http.Request, requestID string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.writeSuccess(w, requestID, h.buildConfigResponse())
+	case http.MethodPatch:
+		patch, err := decodeConfigPatchRequest(w, r)
+		if err != nil {
+			h.writeError(w, requestID, configRequestAPIError(err))
+			return
+		}
+		if h.context.PatchConfig == nil {
+			h.writeError(w, requestID, configRequestAPIError(ConfigRequestError{
+				Kind:    ConfigRequestErrorKindUnsupported,
+				Message: "Dynamic configuration updates are unavailable",
+				Issues: []ConfigPatchIssue{{
+					Code:    "config_patch_unsupported",
+					Message: "This daemon does not support field-level configuration updates",
+				}},
+			}))
+			return
+		}
+		if err := h.context.PatchConfig(r.Context(), patch); err != nil {
+			h.writeError(w, requestID, configRequestAPIError(err))
+			return
+		}
+
+		// A mutation establishes a new snapshot boundary. Refresh once after the
+		// callback so the PATCH response projects the configuration just applied.
+		if h.context.ConfigSnapshot != nil {
+			cfg, metadata := h.context.ConfigSnapshot()
+			h.context.Config = cfg
+			h.context.ConfigMetadata = func() ConfigMetadata { return metadata }
+		} else if runtimeConfig, ok := any(h.context.Runtime).(interface{ Config() config.Config }); ok {
+			h.context.Config = runtimeConfig.Config()
+		}
+		h.writeSuccess(w, requestID, h.buildConfigResponse())
+	default:
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeMethodNotAllowed,
+			status:  http.StatusMethodNotAllowed,
+			message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/config"),
+		})
+	}
+}
+
+func decodeConfigPatchRequest(w http.ResponseWriter, r *http.Request) (ConfigPatchRequest, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxConfigPatchBodyBytes)
+	raw, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(readErr, &maxBytesError) {
+			return ConfigPatchRequest{}, ConfigRequestError{
+				Kind:    ConfigRequestErrorKindTooLarge,
+				Message: "Configuration patch is too large",
+				Issues:  []ConfigPatchIssue{{Code: "request_too_large", Message: fmt.Sprintf("Request body exceeds %d bytes", maxConfigPatchBodyBytes)}},
+			}
+		}
+		return ConfigPatchRequest{}, ConfigRequestError{Kind: ConfigRequestErrorKindValidation, Message: "Invalid configuration patch", Issues: []ConfigPatchIssue{{Code: "invalid_json", Message: readErr.Error()}}}
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if err := config.ValidateUniqueJSONNames(raw); err != nil {
+			return ConfigPatchRequest{}, ConfigRequestError{
+				Kind:    ConfigRequestErrorKindValidation,
+				Message: "Invalid configuration patch",
+				Issues:  []ConfigPatchIssue{{Code: "duplicate_json_name", Message: err.Error()}},
+			}
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+
+	var decoded *ConfigPatchRequest
+	if err := decoder.Decode(&decoded); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			return ConfigPatchRequest{}, ConfigRequestError{
+				Kind:    ConfigRequestErrorKindTooLarge,
+				Message: "Configuration patch is too large",
+				Issues: []ConfigPatchIssue{{
+					Code:    "request_too_large",
+					Message: fmt.Sprintf("Request body exceeds %d bytes", maxConfigPatchBodyBytes),
+				}},
+			}
+		}
+		message := "Request body must be a JSON object"
+		code := "invalid_json"
+		if errors.Is(err, io.EOF) {
+			message = "Request body is required"
+			code = "request_body_required"
+		}
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  []ConfigPatchIssue{{Code: code, Message: message}},
+		}
+	}
+	if decoded == nil {
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  []ConfigPatchIssue{{Code: "invalid_json", Message: "Request body must be a JSON object"}},
+		}
+	}
+	patch := *decoded
+	if strings.TrimSpace(patch.Revision) == "" {
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  []ConfigPatchIssue{{Path: "revision", Code: "missing_revision", Message: "revision is required; refresh configuration and try again"}},
+		}
+	}
+
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err != nil {
+			var maxBytesError *http.MaxBytesError
+			if errors.As(err, &maxBytesError) {
+				return ConfigPatchRequest{}, ConfigRequestError{
+					Kind:    ConfigRequestErrorKindTooLarge,
+					Message: "Configuration patch is too large",
+					Issues:  []ConfigPatchIssue{{Code: "request_too_large", Message: fmt.Sprintf("Request body exceeds %d bytes", maxConfigPatchBodyBytes)}},
+				}
+			}
+		}
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  []ConfigPatchIssue{{Code: "trailing_json", Message: "Request body must contain exactly one JSON object"}},
+		}
+	}
+
+	issues := validateConfigPatchRequest(patch)
+	if len(issues) > 0 {
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  issues,
+		}
+	}
+	if patch.Set == nil {
+		patch.Set = map[string]json.RawMessage{}
+	}
+	if patch.Unset == nil {
+		patch.Unset = []string{}
+	}
+	return patch, nil
+}
+
+func validateConfigPatchRequest(patch ConfigPatchRequest) []ConfigPatchIssue {
+	issues := make([]ConfigPatchIssue, 0)
+	if len(patch.Set) == 0 && len(patch.Unset) == 0 {
+		issues = append(issues, ConfigPatchIssue{Code: "empty_patch", Message: "At least one set or unset operation is required"})
+	}
+
+	setPaths := make(map[string]struct{}, len(patch.Set))
+	for path, raw := range patch.Set {
+		setPaths[path] = struct{}{}
+		if path == "" || path != strings.TrimSpace(path) {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "invalid_path", Message: "Set paths must be non-empty and contain no surrounding whitespace"})
+		}
+		if len(raw) == 0 {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "missing_value", Message: "Set operations require a JSON value"})
+		}
+	}
+
+	unsetPaths := make(map[string]struct{}, len(patch.Unset))
+	for _, path := range patch.Unset {
+		if path == "" || path != strings.TrimSpace(path) {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "invalid_path", Message: "Unset paths must be non-empty and contain no surrounding whitespace"})
+		}
+		if _, exists := unsetPaths[path]; exists {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "duplicate_unset", Message: "Unset paths must be unique"})
+		}
+		unsetPaths[path] = struct{}{}
+		if _, exists := setPaths[path]; exists {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "conflicting_operation", Message: "A path cannot be both set and unset"})
+		}
+	}
+
+	sort.SliceStable(issues, func(i, j int) bool {
+		if issues[i].Path == issues[j].Path {
+			return issues[i].Code < issues[j].Code
+		}
+		return issues[i].Path < issues[j].Path
+	})
+	return issues
+}
+
+func configRequestAPIError(err error) apiError {
+	requestError, ok := asConfigRequestError(err)
+	if !ok {
+		return internalServerError(err)
+	}
+
+	status := http.StatusBadRequest
+	code := pkgapi.ErrorCodeValidationFailed
+	switch requestError.Kind {
+	case ConfigRequestErrorKindValidation, ConfigRequestErrorKindUnsupported:
+	case ConfigRequestErrorKindConflict:
+		status = http.StatusConflict
+		code = pkgapi.ErrorCodeConfigConflict
+	case ConfigRequestErrorKindTooLarge:
+		status = http.StatusRequestEntityTooLarge
+		code = pkgapi.ErrorCodeRequestTooLarge
+	default:
+		return internalServerError(err)
+	}
+
+	message := strings.TrimSpace(requestError.Message)
+	if message == "" {
+		message = "Configuration update failed"
+	}
+	issues := append([]ConfigPatchIssue{}, requestError.Issues...)
+	return apiError{
+		code:    code,
+		status:  status,
+		message: message,
+		details: struct {
+			Issues []ConfigPatchIssue `json:"issues"`
+		}{Issues: issues},
+	}
+}
+
+func asConfigRequestError(err error) (ConfigRequestError, bool) {
+	if err == nil {
+		return ConfigRequestError{}, false
+	}
+	var pointer *ConfigRequestError
+	if errors.As(err, &pointer) && pointer != nil {
+		return *pointer, true
+	}
+	var value ConfigRequestError
+	if errors.As(err, &value) {
+		return value, true
+	}
+	return ConfigRequestError{}, false
+}
+
 type configResponse struct {
 	Server        configServerResponse      `json:"server"`
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
 	Webhook       config.WebhookConfig      `json:"webhook"`
-	Agent         config.AgentConfig        `json:"agent"`
+	Network       config.NetworkConfig      `json:"network"`
+	Agent         configAgentResponse       `json:"agent"`
 	Logging       config.LoggingConfig      `json:"logging"`
 	Notifications config.NotificationConfig `json:"notifications"`
+	Disclosure    config.DisclosureConfig   `json:"disclosure"`
 	Tools         config.ToolPathsConfig    `json:"tools"`
 	Daemon        configDaemonResponse      `json:"daemon"`
 	Package       config.PackageConfig      `json:"package"`
 	Defaults      config.DefaultsConfig     `json:"defaults"`
+	Instructions  config.InstructionsConfig `json:"instructions"`
+	HITL          config.HITLConfig         `json:"hitl"`
 	Roles         config.RoleConfigs        `json:"roles"`
+	Providers     []config.ProviderConfig   `json:"providers"`
 	Projects      []config.ProjectRefConfig `json:"projects"`
+	Metadata      ConfigMetadata            `json:"metadata"`
 }
 
 type configServerResponse struct {
-	Host                 string          `json:"host"`
-	Port                 int             `json:"port"`
-	BaseURL              *string         `json:"baseUrl,omitempty"`
-	AuthMode             config.AuthMode `json:"authMode"`
-	LocalTokenConfigured bool            `json:"localTokenConfigured"`
+	Host     string          `json:"host"`
+	Port     int             `json:"port"`
+	BaseURL  *string         `json:"baseUrl,omitempty"`
+	AuthMode config.AuthMode `json:"authMode"`
+}
+
+type configAgentResponse struct {
+	Vendor       *config.AgentVendor                  `json:"vendor,omitempty"`
+	Model        *string                              `json:"model,omitempty"`
+	Profiles     map[string]config.AgentBindingConfig `json:"profiles,omitempty"`
+	Params       map[string]any                       `json:"params"`
+	Env          map[string]string                    `json:"env"`
+	EnvKeys      []string                             `json:"envKeys"`
+	Timeouts     config.AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume config.AgentNativeResumeConfig       `json:"nativeResume"`
 }
 
 type configDaemonResponse struct {
@@ -906,18 +1430,28 @@ func (h *Handler) buildConfigResponse() configResponse {
 
 	return configResponse{
 		Server: configServerResponse{
-			Host:                 cfg.Server.Host,
-			Port:                 cfg.Server.Port,
-			BaseURL:              cfg.Server.BaseURL,
-			AuthMode:             cfg.Server.AuthMode,
-			LocalTokenConfigured: cfg.Server.LocalToken != nil && *cfg.Server.LocalToken != "",
+			Host:     cfg.Server.Host,
+			Port:     cfg.Server.Port,
+			BaseURL:  cfg.Server.BaseURL,
+			AuthMode: cfg.Server.AuthMode,
 		},
-		Storage:       cfg.Storage,
-		Scheduler:     cfg.Scheduler,
-		Webhook:       cfg.Webhook,
-		Agent:         cfg.Agent,
+		Storage:   cfg.Storage,
+		Scheduler: cfg.Scheduler,
+		Webhook:   cfg.Webhook,
+		Network:   cfg.Network,
+		Agent: configAgentResponse{
+			Vendor:       cfg.Agent.Vendor,
+			Model:        cfg.Agent.Model,
+			Profiles:     cloneAgentProfiles(cfg.Agent.Profiles),
+			Params:       map[string]any{},
+			Env:          map[string]string{},
+			EnvKeys:      sortedMapKeys(cfg.Agent.Env),
+			Timeouts:     cfg.Agent.Timeouts,
+			NativeResume: cfg.Agent.NativeResume,
+		},
 		Logging:       cfg.Logging,
 		Notifications: cfg.Notifications,
+		Disclosure:    cfg.Disclosure,
 		Tools:         cfg.Tools,
 		Daemon: configDaemonResponse{
 			Mode:                   cfg.Daemon.Mode,
@@ -926,14 +1460,63 @@ func (h *Handler) buildConfigResponse() configResponse {
 			PlistPath:              cfg.Daemon.PlistPath,
 			LogDir:                 cfg.Daemon.LogDir,
 			WorkingDirectory:       cfg.Daemon.WorkingDirectory,
-			Environment:            cfg.Daemon.Environment,
+			Environment:            map[string]string{},
 			WorktreeCleanup:        cfg.Daemon.WorktreeCleanup,
 		},
-		Package:  cfg.Package,
-		Defaults: cfg.Defaults,
-		Roles:    cfg.Roles,
-		Projects: append([]config.ProjectRefConfig{}, cfg.Projects...),
+		Package:      cfg.Package,
+		Defaults:     cfg.Defaults,
+		Instructions: cfg.Instructions,
+		HITL:         cfg.HITL,
+		Roles:        cfg.Roles,
+		Providers:    append([]config.ProviderConfig{}, cfg.Providers...),
+		Projects:     append([]config.ProjectRefConfig{}, cfg.Projects...),
+		Metadata:     h.buildConfigMetadata(),
 	}
+}
+
+func (h *Handler) buildConfigMetadata() ConfigMetadata {
+	metadata := ConfigMetadata{}
+	if h.context.ConfigMetadata != nil {
+		metadata = h.context.ConfigMetadata()
+	}
+	metadata.RejectedPaths = append([]string{}, metadata.RejectedPaths...)
+	fields := make(map[string]ConfigFieldMetadata, len(metadata.Fields))
+	for path, field := range metadata.Fields {
+		fields[path] = field
+	}
+	metadata.Fields = fields
+	return metadata
+}
+
+func sortedMapKeys[T any](values map[string]T) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// cloneAgentProfiles copies profile bindings for the secret-safe config projection.
+// Empty maps become nil so json omitempty matches zero-diff style.
+func cloneAgentProfiles(profiles map[string]config.AgentBindingConfig) map[string]config.AgentBindingConfig {
+	if len(profiles) == 0 {
+		return nil
+	}
+	cloned := make(map[string]config.AgentBindingConfig, len(profiles))
+	for id, binding := range profiles {
+		entry := config.AgentBindingConfig{}
+		if binding.Vendor != nil {
+			vendor := *binding.Vendor
+			entry.Vendor = &vendor
+		}
+		if binding.Model != nil {
+			model := *binding.Model
+			entry.Model = &model
+		}
+		cloned[id] = entry
+	}
+	return cloned
 }
 
 func (h *Handler) buildWebhookStatusResponse() looperdruntime.WebhookStatus {
@@ -1025,12 +1608,13 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 
 	return statusResponse{
 		Service: statusService{
-			Healthy:    storageState.OK,
-			Version:    version.Current().Version,
-			Build:      version.Current().Metadata,
-			DaemonMode: h.context.Config.Daemon.Mode,
-			StartedAt:  h.startedAtISO(),
-			Recovery:   h.recoverySummary(),
+			Healthy:        storageState.OK,
+			Version:        version.Current().Version,
+			Build:          version.Current().Metadata,
+			DaemonMode:     h.context.Config.Daemon.Mode,
+			AdmissionState: h.admissionStateString(),
+			StartedAt:      h.startedAtISO(),
+			Recovery:       h.recoverySummary(),
 			Binary: statusBinary{
 				Name:             "looperd",
 				Path:             daemonExecutablePath(),
@@ -1089,7 +1673,25 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			GH:        hasValue(h.context.Config.Tools.GHPath),
 			Osascript: hasValue(h.context.Config.Tools.OsascriptPath),
 		},
+		Providers: h.buildProviderHealth(ctx),
 	}, nil
+}
+
+func (h *Handler) buildProviderHealth(ctx context.Context) []forge.ForgejoProviderHealth {
+	providers := make([]forge.ForgejoProviderHealth, 0)
+	for _, provider := range h.context.Config.Providers {
+		if provider.Kind != config.ProviderKindForgejo {
+			continue
+		}
+		projects := make([]forge.ForgejoProbeProject, 0)
+		for _, project := range h.context.Config.Projects {
+			if project.Provider == provider.ID {
+				projects = append(projects, forge.ForgejoProbeProject{ID: project.ID, Repo: project.Repo})
+			}
+		}
+		providers = append(providers, forge.ProbeForgejoProvider(ctx, provider, projects))
+	}
+	return providers
 }
 
 func (h *Handler) buildWorktreeCleanupStatusResponse() any {
@@ -1246,10 +1848,11 @@ func normalizeRecoverySummary(summary looperdruntime.RecoverySummary) map[string
 	if summary.CompletedAt != "" {
 		normalized["completedAt"] = summary.CompletedAt
 	}
-	if summary.OrphanAgentCleanup.Attempted || summary.OrphanAgentCleanup.CleanedCount != 0 || summary.OrphanAgentCleanup.Warning != "" {
+	if summary.OrphanAgentCleanup.Attempted || summary.OrphanAgentCleanup.CleanedCount != 0 || summary.OrphanAgentCleanup.QuarantinedCount != 0 || summary.OrphanAgentCleanup.Warning != "" {
 		orphan := map[string]any{
-			"attempted":    summary.OrphanAgentCleanup.Attempted,
-			"cleanedCount": summary.OrphanAgentCleanup.CleanedCount,
+			"attempted":        summary.OrphanAgentCleanup.Attempted,
+			"cleanedCount":     summary.OrphanAgentCleanup.CleanedCount,
+			"quarantinedCount": summary.OrphanAgentCleanup.QuarantinedCount,
 		}
 		if summary.OrphanAgentCleanup.Warning != "" {
 			orphan["warning"] = summary.OrphanAgentCleanup.Warning
@@ -1277,8 +1880,13 @@ type projectsListResponse struct {
 }
 
 type loopsListResponse struct {
-	Items []loopResponse `json:"items"`
+	Items  []loopResponse `json:"items"`
+	Total  int64          `json:"total"`
+	Limit  *int64         `json:"limit,omitempty"`
+	Offset int64          `json:"offset"`
 }
+
+const maxLoopsListLimit int64 = 200
 
 type eventsListResponse struct {
 	Items []eventResponse `json:"items"`
@@ -1369,6 +1977,11 @@ type loopResponse struct {
 	CreatedAt     string             `json:"createdAt"`
 	UpdatedAt     string             `json:"updatedAt"`
 	Relationships *loopRelationships `json:"relationships,omitempty"`
+	// Queue-derived diagnostics (latest queue item / run), matching looper describe / ps.
+	Attempts          *int64  `json:"attempts,omitempty"`
+	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
+	LastFailureKind   *string `json:"lastFailureKind,omitempty"`
+	LastFailureReason *string `json:"lastFailureReason,omitempty"`
 }
 
 type loopRelationships struct {
@@ -1419,11 +2032,13 @@ type loopLogsAgentPayload struct {
 }
 
 type projectResponse struct {
-	ID           string  `json:"id"`
-	Name         string  `json:"name"`
-	RepoPath     string  `json:"repoPath"`
-	BaseBranch   string  `json:"baseBranch"`
-	Archived     bool    `json:"archived"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	RepoPath   string `json:"repoPath"`
+	BaseBranch string `json:"baseBranch"`
+	Archived   bool   `json:"archived"`
+	// Provider is the resolved provider kind for display (github, forgejo, plane).
+	Provider     string  `json:"provider"`
 	Repo         *string `json:"repo"`
 	WorktreeRoot *string `json:"worktreeRoot"`
 	CreatedAt    string  `json:"createdAt"`
@@ -1481,6 +2096,8 @@ type activeRunView struct {
 	Status            string             `json:"status"`
 	LoopStatus        string             `json:"loopStatus"`
 	DisplayStatus     string             `json:"displayStatus"`
+	Attempts          *int64             `json:"attempts,omitempty"`
+	MaxAttempts       *int64             `json:"maxAttempts,omitempty"`
 	LastFailureKind   *string            `json:"lastFailureKind,omitempty"`
 	LastFailureReason *string            `json:"lastFailureReason,omitempty"`
 	ResumePolicy      *string            `json:"resumePolicy,omitempty"`
@@ -1493,15 +2110,18 @@ type activeRunView struct {
 }
 
 type retryLoopRequest struct {
-	Mode          string `json:"mode"`
-	ResetAttempts *bool  `json:"resetAttempts"`
+	Mode                   string `json:"mode"`
+	ResetAttempts          *bool  `json:"resetAttempts"`
+	DiscardWorktreeChanges *bool  `json:"discardWorktreeChanges"`
 }
 
 type retryLoopResponse struct {
-	Loop          loopResponse `json:"loop"`
-	QueueItemID   *string      `json:"queueItemId,omitempty"`
-	Mode          string       `json:"mode"`
-	ResetAttempts bool         `json:"resetAttempts"`
+	Loop                   loopResponse           `json:"loop"`
+	QueueItemID            *string                `json:"queueItemId,omitempty"`
+	Mode                   string                 `json:"mode"`
+	ResetAttempts          bool                   `json:"resetAttempts"`
+	DiscardWorktreeChanges bool                   `json:"discardWorktreeChanges"`
+	WorktreeDiscard        *worktreeDiscardResult `json:"worktreeDiscard,omitempty"`
 }
 
 type activeRunTarget struct {
@@ -1572,7 +2192,7 @@ func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
 
 		responseItems := make([]projectResponse, 0, len(items))
 		for _, item := range items {
-			responseItems = append(responseItems, serializeProject(item, h.context.Config.Defaults.BaseBranch))
+			responseItems = append(responseItems, serializeProject(item, h.context.Config, h.context.Config.Defaults.BaseBranch))
 		}
 		return projectsListResponse{Items: responseItems}, nil
 	case http.MethodPost:
@@ -1626,9 +2246,7 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
-	_ = h.refreshWebhookForwarders()
-
-	return serializeProject(removed, h.context.Config.Defaults.BaseBranch), nil
+	return serializeProject(removed, h.context.Config, h.context.Config.Defaults.BaseBranch), nil
 }
 
 func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
@@ -1639,28 +2257,106 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 
 	switch r.Method {
 	case http.MethodGet:
-		items, err := services.Repositories.Loops.List(r.Context())
+		opts, err := parseLoopsListOptions(r)
+		if err != nil {
+			return nil, err
+		}
+
+		total, err := services.Repositories.Loops.CountFiltered(r.Context(), opts)
 		if err != nil {
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+
+		items, err := services.Repositories.Loops.ListFiltered(r.Context(), opts)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+
+		loopIDs := make([]string, 0, len(items))
+		for _, item := range items {
+			loopIDs = append(loopIDs, item.ID)
+		}
+		latestQueueByLoopID := map[string]*storage.QueueItemRecord{}
+		latestRunByLoopID := map[string]*storage.RunRecord{}
+		if len(loopIDs) > 0 && services.Repositories.Queue != nil {
+			queues, qErr := services.Repositories.Queue.ListLatestByLoopIDs(r.Context(), loopIDs)
+			if qErr != nil {
+				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: qErr.Error()}
+			}
+			for i := range queues {
+				item := &queues[i]
+				if item.LoopID == nil || strings.TrimSpace(*item.LoopID) == "" {
+					continue
+				}
+				latestQueueByLoopID[*item.LoopID] = item
+			}
+		}
+		if len(loopIDs) > 0 && services.Repositories.Runs != nil {
+			runs, rErr := services.Repositories.Runs.ListLatestByLoopIDs(r.Context(), loopIDs)
+			if rErr != nil {
+				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: rErr.Error()}
+			}
+			for i := range runs {
+				run := &runs[i]
+				latestRunByLoopID[run.LoopID] = run
+			}
 		}
 
 		responseItems := make([]loopResponse, 0, len(items))
 		includeRelationships := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("include")), "relationships")
 		for _, item := range items {
-			serialized := serializeLoop(item)
+			view := serializeLoop(item)
+			decorateLoopDiagnostics(&view, latestQueueByLoopID[item.ID], latestRunByLoopID[item.ID])
 			if includeRelationships {
 				relationships := loopRelationshipsFromRecord(item)
-				serialized.Relationships = &relationships
+				view.Relationships = &relationships
 			}
-			responseItems = append(responseItems, serialized)
+			responseItems = append(responseItems, view)
 		}
 
-		return loopsListResponse{Items: responseItems}, nil
+		resp := loopsListResponse{
+			Items:  responseItems,
+			Total:  total,
+			Offset: opts.Offset,
+		}
+		if opts.Limit > 0 {
+			limit := opts.Limit
+			resp.Limit = &limit
+		}
+		return resp, nil
 	case http.MethodPost:
 		return h.buildCreateLoopResponse(r)
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/loops")}
 	}
+}
+
+func parseLoopsListOptions(r *http.Request) (storage.ListLoopsOptions, error) {
+	opts := storage.ListLoopsOptions{
+		Status:    strings.TrimSpace(r.URL.Query().Get("status")),
+		ProjectID: strings.TrimSpace(r.URL.Query().Get("projectId")),
+	}
+
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 {
+			return storage.ListLoopsOptions{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "limit must be a positive integer"}
+		}
+		if parsed > maxLoopsListLimit {
+			return storage.ListLoopsOptions{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("limit must be at most %d", maxLoopsListLimit)}
+		}
+		opts.Limit = parsed
+	}
+
+	if offsetValue := strings.TrimSpace(r.URL.Query().Get("offset")); offsetValue != "" {
+		parsed, err := strconv.ParseInt(offsetValue, 10, 64)
+		if err != nil || parsed < 0 {
+			return storage.ListLoopsOptions{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "offset must be a non-negative integer"}
+		}
+		opts.Offset = parsed
+	}
+
+	return opts, nil
 }
 
 func (h *Handler) buildRunsRouteResponse(r *http.Request) (runsListResponse, error) {
@@ -1799,13 +2495,14 @@ func (h *Handler) buildPullRequestsRouteResponse(r *http.Request) (pullRequestsL
 	identities := collectPullRequestIdentities(latestSnapshots, loops)
 	snapshotByKey := map[string]storage.PullRequestSnapshotRecord{}
 	for _, snapshot := range latestSnapshots {
-		snapshotByKey[pullRequestKey(snapshot.Repo, snapshot.PRNumber)] = snapshot
+		snapshotByKey[pullRequestKey(snapshot.ProjectID, snapshot.Repo, snapshot.PRNumber)] = snapshot
 	}
 
 	items := make([]pullRequestResponse, 0, len(identities))
 	for _, identity := range identities {
-		loopMatches := loopMatchesByPullRequest[pullRequestKey(identity.Repo, identity.PRNumber)]
-		snapshot, ok := snapshotByKey[pullRequestKey(identity.Repo, identity.PRNumber)]
+		key := pullRequestKey(identity.ProjectID, identity.Repo, identity.PRNumber)
+		loopMatches := loopMatchesByPullRequest[key]
+		snapshot, ok := snapshotByKey[key]
 		if ok {
 			items = append(items, h.serializePullRequestListItem(identity.Repo, identity.PRNumber, &snapshot, loopMatches))
 			continue
@@ -1839,7 +2536,37 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "prNumber must be a positive integer"}
 	}
 
-	snapshot, err := services.Repositories.PullRequestSnapshots.GetLatest(r.Context(), repo, prNumber)
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
+	var snapshot *storage.PullRequestSnapshotRecord
+	if projectID != "" {
+		snapshot, err = services.Repositories.PullRequestSnapshots.GetLatestByProject(r.Context(), projectID, repo, prNumber)
+	} else {
+		snapshots, listErr := services.Repositories.PullRequestSnapshots.ListLatestByRepoAndPR(r.Context(), repo, prNumber)
+		if listErr != nil {
+			err = listErr
+		} else {
+			matchedProjects := map[string]struct{}{}
+			for index := range snapshots {
+				candidate := snapshots[index]
+				matchedProjects[candidate.ProjectID] = struct{}{}
+				if snapshot == nil {
+					candidateCopy := candidate
+					snapshot = &candidateCopy
+				}
+			}
+			loops, loopErr := services.Repositories.Loops.ListByRepoAndPR(r.Context(), repo, prNumber)
+			if loopErr != nil {
+				err = loopErr
+			} else {
+				for _, loop := range loops {
+					matchedProjects[loop.ProjectID] = struct{}{}
+				}
+			}
+			if err == nil && len(matchedProjects) > 1 {
+				return nil, apiError{code: pkgapi.ErrorCodeProjectAmbiguous, status: http.StatusConflict, message: fmt.Sprintf("Multiple projects match pull request %s#%d; pass projectId explicitly", repo, prNumber)}
+			}
+		}
+	}
 	if err != nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
@@ -1861,7 +2588,7 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
 
-	loopMatches, err := h.findPullRequestLoops(r.Context(), repo, prNumber)
+	loopMatches, err := h.findPullRequestLoops(r.Context(), snapshot.ProjectID, snapshot.Repo, prNumber)
 	if err != nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
@@ -1869,7 +2596,7 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 }
 
 func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot storage.PullRequestSnapshotRecord) (pullRequestStatusResponse, error) {
-	loopMatches, err := h.findPullRequestLoops(ctx, snapshot.Repo, snapshot.PRNumber)
+	loopMatches, err := h.findPullRequestLoops(ctx, snapshot.ProjectID, snapshot.Repo, snapshot.PRNumber)
 	if err != nil {
 		return pullRequestStatusResponse{}, err
 	}
@@ -1924,14 +2651,14 @@ func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot s
 	}, nil
 }
 
-func (h *Handler) findPullRequestLoops(ctx context.Context, repo string, prNumber int64) ([]storage.LoopRecord, error) {
-	loops, err := h.context.Runtime.Services().Repositories.Loops.List(ctx)
+func (h *Handler) findPullRequestLoops(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
+	loops, err := h.context.Runtime.Services().Repositories.Loops.ListByRepoAndPR(ctx, repo, prNumber)
 	if err != nil {
 		return nil, err
 	}
 	matches := make([]storage.LoopRecord, 0)
 	for _, loop := range loops {
-		if loop.Repo != nil && loop.PRNumber != nil && *loop.Repo == repo && *loop.PRNumber == prNumber {
+		if loop.ProjectID == projectID {
 			matches = append(matches, loop)
 		}
 	}
@@ -2085,8 +2812,8 @@ func snapshotString(snapshot *storage.PullRequestSnapshotRecord, getter func(sto
 	return getter(*snapshot)
 }
 
-func pullRequestKey(repo string, prNumber int64) string {
-	return fmt.Sprintf("%s#%d", repo, prNumber)
+func pullRequestKey(projectID, repo string, prNumber int64) string {
+	return fmt.Sprintf("%s:%s#%d", projectID, repo, prNumber)
 }
 
 func groupPullRequestLoops(loops []storage.LoopRecord) map[string][]storage.LoopRecord {
@@ -2095,7 +2822,7 @@ func groupPullRequestLoops(loops []storage.LoopRecord) map[string][]storage.Loop
 		if loop.Repo == nil || loop.PRNumber == nil {
 			continue
 		}
-		key := pullRequestKey(*loop.Repo, *loop.PRNumber)
+		key := pullRequestKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
 		grouped[key] = append(grouped[key], loop)
 	}
 	return grouped
@@ -2105,7 +2832,7 @@ func dedupeLatestSnapshots(snapshots []storage.PullRequestSnapshotRecord) []stor
 	seen := map[string]struct{}{}
 	deduped := make([]storage.PullRequestSnapshotRecord, 0, len(snapshots))
 	for _, snapshot := range snapshots {
-		key := fmt.Sprintf("%s#%d", snapshot.Repo, snapshot.PRNumber)
+		key := pullRequestKey(snapshot.ProjectID, snapshot.Repo, snapshot.PRNumber)
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -2128,7 +2855,7 @@ func collectPullRequestIdentities(snapshots []storage.PullRequestSnapshotRecord,
 		if repo == nil || prNumber == nil {
 			return
 		}
-		key := fmt.Sprintf("%s#%d", *repo, *prNumber)
+		key := pullRequestKey(projectID, *repo, *prNumber)
 		if _, ok := seen[key]; ok {
 			return
 		}
@@ -2549,8 +3276,15 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		}
 		latestQueue := latestQueueByLoopID[loop.ID]
 		latestRun := latestRunsByLoopID[loop.ID]
-		if !includeInactiveLoops && !isManualInterventionQueue(latestQueue) && !hasManualInterventionResumePolicy(latestRun) {
-			continue
+		if !includeInactiveLoops {
+			// Closed loops are not actionable even when their latest queue item
+			// remains manual_intervention after looper close (issue #561).
+			if isClosedLoopStatus(loop.Status) {
+				continue
+			}
+			if !isManualInterventionQueue(latestQueue) && !hasManualInterventionResumePolicy(latestRun) {
+				continue
+			}
 		}
 		target, ok, err := h.tryBuildActiveRunTarget(loop, projectNamesByID)
 		if err != nil {
@@ -2728,23 +3462,94 @@ func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
 	return policy != nil && *policy == loops.ResumePolicyManualIntervention
 }
 
+// isClosedLoopStatus reports loop statuses that are fully finished and must not
+// appear in the default active-run listing (looper ps). Failed/interrupted loops
+// remain eligible when parked for manual intervention so operators can retry.
+func isClosedLoopStatus(status string) bool {
+	switch domain.LoopStatus(status) {
+	case domain.LoopStatusTerminated, domain.LoopStatusCompleted, domain.LoopStatusStopped:
+		return true
+	default:
+		return false
+	}
+}
+
 func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) {
 	if view.LoopStatus == "" {
 		view.LoopStatus = loop.Status
 	}
 	view.DisplayStatus = view.Status
 	if latestQueue != nil {
+		attempts := latestQueue.Attempts
+		maxAttempts := latestQueue.MaxAttempts
+		view.Attempts = &attempts
+		view.MaxAttempts = &maxAttempts
 		view.LastFailureKind = latestQueue.LastErrorKind
 		view.LastFailureReason = latestQueue.LastError
 	}
+	// Fall back to the latest run error/summary when no queue error is present
+	// (e.g. checkpoint-only manual holds or failed runs without a parked queue item).
+	// Summary is only used for failure-like runs: successful completeRun summaries
+	// must not appear as lastFailureReason on queued/running or --all listings.
+	if view.LastFailureReason == nil || strings.TrimSpace(*view.LastFailureReason) == "" {
+		if latestRun != nil {
+			if latestRun.ErrorMessage != nil && strings.TrimSpace(*latestRun.ErrorMessage) != "" {
+				view.LastFailureReason = latestRun.ErrorMessage
+			} else if shouldUseRunSummaryAsFailureReason(latestRun) && latestRun.Summary != nil && strings.TrimSpace(*latestRun.Summary) != "" {
+				view.LastFailureReason = latestRun.Summary
+			}
+		}
+	}
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
-	if isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention) {
+	// Do not override a closed loop's status with manual_intervention: the loop
+	// is no longer actionable even if the latest queue item still has that status.
+	if !isClosedLoopStatus(loop.Status) && (isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention)) {
 		view.DisplayStatus = "manual_intervention"
 	} else if isBackingOffQueue(latestQueue, now) {
 		view.DisplayStatus = "backing_off"
 	}
 	if view.DisplayStatus == "" {
 		view.DisplayStatus = view.Status
+	}
+}
+
+// decorateLoopDiagnostics attaches latest-queue attempt counts and failure reason
+// (with the same run fallback as active-run views) for dashboard list/detail.
+func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord) {
+	if view == nil {
+		return
+	}
+	if latestQueue != nil {
+		attempts := latestQueue.Attempts
+		maxAttempts := latestQueue.MaxAttempts
+		view.Attempts = &attempts
+		view.MaxAttempts = &maxAttempts
+		view.LastFailureKind = latestQueue.LastErrorKind
+		view.LastFailureReason = latestQueue.LastError
+	}
+	if view.LastFailureReason == nil || strings.TrimSpace(*view.LastFailureReason) == "" {
+		if latestRun != nil {
+			if latestRun.ErrorMessage != nil && strings.TrimSpace(*latestRun.ErrorMessage) != "" {
+				view.LastFailureReason = latestRun.ErrorMessage
+			} else if shouldUseRunSummaryAsFailureReason(latestRun) && latestRun.Summary != nil && strings.TrimSpace(*latestRun.Summary) != "" {
+				view.LastFailureReason = latestRun.Summary
+			}
+		}
+	}
+}
+
+// shouldUseRunSummaryAsFailureReason reports whether a run's Summary is safe to
+// surface as lastFailureReason. Successful completeRun summaries must not be
+// treated as failures for queued/running loops or ps --all completed rows.
+func shouldUseRunSummaryAsFailureReason(run *storage.RunRecord) bool {
+	if run == nil {
+		return false
+	}
+	switch domain.RunStatus(strings.TrimSpace(run.Status)) {
+	case domain.RunStatusFailed, domain.RunStatusInterrupted, domain.RunStatusParseFailed:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -3092,7 +3897,7 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 		if r.Method != http.MethodGet {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
-		return serializeLoop(loop), nil
+		return h.serializeLoopWithDiagnostics(r.Context(), loop)
 	}
 
 	subresource := parts[1]
@@ -3116,7 +3921,7 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 		if r.Method != http.MethodPost {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
-		return h.retryLoop(r.Context(), r, loop.ID)
+		return h.retryLoop(r.Context(), r, loop.ID, false)
 	case "respond":
 		if r.Method != http.MethodPost {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
@@ -3334,6 +4139,7 @@ type createLoopRequest struct {
 	PRNumber    *int64          `json:"prNumber"`
 	IssueNumber *int64          `json:"issueNumber"`
 	Status      *string         `json:"status"`
+	Force       *bool           `json:"force"`
 	Metadata    json.RawMessage `json:"metadata"`
 }
 
@@ -3346,11 +4152,13 @@ type createWorkerRequest struct {
 	BaseBranch  *string `json:"baseBranch"`
 	PRNumber    *int64  `json:"prNumber"`
 	IssueNumber *int64  `json:"issueNumber"`
+	Force       *bool   `json:"force"`
 }
 
 type createPlannerRequest struct {
 	ProjectID   *string `json:"projectId"`
 	IssueNumber *int64  `json:"issueNumber"`
+	Force       *bool   `json:"force"`
 }
 
 type workerCreateResponse struct {
@@ -3405,7 +4213,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
 	}
 
-	if (loopType == string(domain.LoopTypeReviewer) || loopType == string(domain.LoopTypeFixer) || loopType == string(domain.LoopTypeWorker) || loopType == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
+	if (loopType == string(domain.LoopTypeReviewer) || loopType == string(domain.LoopTypeFixer) || loopType == string(domain.LoopTypeWorker) || loopType == string(domain.LoopTypePlanner)) && !isCodingRoleAgentConfigured(h.effectiveConfig(), loopType) {
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot create %s loop without config.agent.vendor", loopType)}
 	}
 
@@ -3436,19 +4244,38 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		}
 	}
 	if domain.LoopType(loopType) == domain.LoopTypeReviewer {
-		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Roles.Reviewer.Behavior, target, nowISO)
+		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Roles.Reviewer.Behavior, target, nowISO, derefBool(body.Force))
 		if err != nil {
 			return loopResponse{}, err
 		}
 	}
+	if services.Repositories == nil || services.Repositories.Projects == nil {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	project, err := requireActiveProjectRecord(r.Context(), services.Repositories.Projects, projectID)
+	if err != nil {
+		return loopResponse{}, err
+	}
+	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
+		return loopResponse{}, err
+	}
+	if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopType(loopType), target, derefBool(body.Force)); err != nil {
+		return loopResponse{}, err
+	}
+
+	// Share the same-target lock with discard+retry so create cannot enqueue a
+	// new active loop for this target between discard preflight and requeue.
+	candidateStatusForLock := domain.LoopStatus(status)
+	if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatusForLock == domain.LoopStatusRunning {
+		candidateStatusForLock = domain.LoopStatusQueued
+	}
+	unlockTarget := h.lockLoopTargetForStatus(projectID, domain.LoopType(loopType), target, candidateStatusForLock)
+	defer unlockTarget()
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		transactionRepos := storage.NewRepositories(tx)
-		project, err := requireActiveProjectRecord(r.Context(), transactionRepos.Projects, projectID)
+		_, err := requireActiveProjectRecord(r.Context(), transactionRepos.Projects, projectID)
 		if err != nil {
-			return storage.LoopRecord{}, err
-		}
-		if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 			return storage.LoopRecord{}, err
 		}
 
@@ -3539,7 +4366,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if r.Method != http.MethodPost {
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/workers")}
 	}
-	if !isCodingAgentConfigured(h.context.Config) {
+	if !isCodingRoleAgentConfigured(h.effectiveConfig(), config.CodingRoleWorker) {
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: "Cannot create worker loop without config.agent.vendor"}
 	}
 
@@ -3632,7 +4459,6 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if title == "" {
 		title = deriveWorkerTitle(prompt, effectiveSpecPath, repo, effectivePRNumber, issueNumber)
 	}
-
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	targetType := string(domain.LoopTargetTypeProject)
 	targetID := "project:" + projectID
@@ -3645,6 +4471,22 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		targetType = string(domain.LoopTargetTypeIssue)
 		targetID = fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
 		target = domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
+	}
+	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
+		return workerCreateResponse{}, err
+	}
+	if requestedIssueTarget != nil {
+		if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), *requestedIssueTarget); err != nil {
+			return workerCreateResponse{}, err
+		}
+		if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopTypeWorker, *requestedIssueTarget, derefBool(body.Force)); err != nil {
+			return workerCreateResponse{}, err
+		}
+	}
+	if requestedIssueTarget == nil || target.TargetType != requestedIssueTarget.TargetType || target.Repo != requestedIssueTarget.Repo || target.IssueNumber != requestedIssueTarget.IssueNumber {
+		if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopTypeWorker, target, derefBool(body.Force)); err != nil {
+			return workerCreateResponse{}, err
+		}
 	}
 
 	workerPayload := struct {
@@ -3679,6 +4521,54 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	metadataJSON := string(payloadJSONBytes)
 	reusedWorkerLoop := false
 
+	// Issue-worker reuse enqueues the existing loop (same as start requeue).
+	// Take the shared per-loop retry lock before the TX so discard+retry cannot
+	// wipe the managed worktree after reuse preflight/enqueue races in.
+	// Pre-scan is best-effort identity for the lock; the TX re-evaluates reuse.
+	if issueNumber != nil && requestedIssueTarget != nil {
+		existing, listErr := services.Repositories.Loops.List(r.Context())
+		if listErr != nil {
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: listErr.Error()}
+		}
+		if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
+			return workerCreateResponse{}, reuseErr
+		} else if ok {
+			unlock := h.lockLoopRetry(existingLoop.ID)
+			defer unlock()
+		}
+	}
+	// New worker create (and non-reuse paths) share the same-target lock with
+	// discard+retry so a concurrent create for this target cannot pass unique
+	// checks after discard preflight and leave a wiped worktree.
+	unlockWorkerTarget := h.lockLoopTargetForStatus(projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued)
+	defer unlockWorkerTarget()
+
+	// Issue-worker reuse publishes claimable queue work inside the TX. Clear the
+	// sticky stop gate before that TX so a concurrent scheduler tick cannot claim
+	// the reused worker and fail AgentExecutor.Start with ErrSpawnLoopStopping.
+	// Track for restore when the TX aborts or does not queue the reused loop.
+	reuseStopGateLoopID := ""
+	reuseGateWasActive := false
+	if issueNumber != nil && requestedIssueTarget != nil {
+		existing, listErr := services.Repositories.Loops.List(r.Context())
+		if listErr == nil {
+			if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr == nil && ok {
+				reuseStopGateLoopID = existingLoop.ID
+				if services.ActiveExecutions != nil {
+					// Clear and sample under one lock so a concurrent BeginLoopStop
+					// cannot insert a gate that we delete without recording for restore.
+					reuseGateWasActive = services.ActiveExecutions.ClearLoopStop(existingLoop.ID)
+				}
+			}
+		}
+	}
+	restoreReuseStopGate := func() error {
+		if reuseGateWasActive && reuseStopGateLoopID != "" && services.ActiveExecutions != nil {
+			return services.ActiveExecutions.RestoreLoopStop(reuseStopGateLoopID)
+		}
+		return nil
+	}
+
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 
@@ -3691,7 +4581,20 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 				return storage.LoopRecord{}, reuseErr
 			} else if ok {
 				reusedWorkerLoop = true
-				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO)
+				// Ensure gate is open even when the pre-TX scan missed this loop;
+				// still before commit so the queue item is not yet claimable.
+				if services.ActiveExecutions != nil {
+					if reuseStopGateLoopID == "" {
+						reuseStopGateLoopID = existingLoop.ID
+					}
+					// Clear+report under one lock: looper stop may establish the gate
+					// after the pre-TX clear saw it inactive. Without this return
+					// value, TX abort restore would skip (flag still false).
+					if services.ActiveExecutions.ClearLoopStop(existingLoop.ID) {
+						reuseGateWasActive = true
+					}
+				}
+				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
 				if resumeErr != nil {
 					return storage.LoopRecord{}, resumeErr
 				}
@@ -3732,10 +4635,10 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		lockKey := "worker:" + loopID
 		if effectivePRNumber != nil {
 			dedupeKey = fmt.Sprintf("worker:%s:%s:%d", projectID, *repo, *effectivePRNumber)
-			lockKey = fmt.Sprintf("pr:%s:%d", *repo, *effectivePRNumber)
+			lockKey = storage.PullRequestLockKey(projectID, *repo, *effectivePRNumber)
 		} else if issueNumber != nil {
 			dedupeKey = fmt.Sprintf("worker:%s:%s:%d", projectID, *repo, *issueNumber)
-			lockKey = fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
+			lockKey = storage.IssueLockKey(projectID, *repo, *issueNumber)
 		}
 		payloadJSON := string(queuePayloadJSONBytes)
 		queueRecord := storage.QueueItemRecord{
@@ -3765,11 +4668,25 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return record, nil
 	})
 	if err != nil {
+		if restoreErr := restoreReuseStopGate(); restoreErr != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				typed.message = errors.Join(err, restoreErr).Error()
+				return workerCreateResponse{}, typed
+			}
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: errors.Join(err, restoreErr).Error()}
+		}
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return workerCreateResponse{}, typed
 		}
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	// Pre-cleared for a reuse that did not become claimable queued work: restore.
+	if !reusedWorkerLoop || record.Status != string(domain.LoopStatusQueued) {
+		if restoreErr := restoreReuseStopGate(); restoreErr != nil {
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: restoreErr.Error()}
+		}
 	}
 	if h.context.TriggerSchedulerTick != nil {
 		if !reusedWorkerLoop || record.Status == string(domain.LoopStatusQueued) {
@@ -3792,6 +4709,59 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 
 	return response, nil
+}
+
+func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, projectID string, loopType domain.LoopType, target domain.LoopTarget, force bool) error {
+	if force || (loopType != domain.LoopTypePlanner && loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeReviewer && loopType != domain.LoopTypeFixer) {
+		return nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Projects == nil {
+		return nil
+	}
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, projectID)
+	if err != nil {
+		return err
+	}
+	// Hold preflight is best-effort at create time: when we cannot reliably talk to
+	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
+	// skip validation rather than blocking manual creation for unrelated local setup.
+	if strings.TrimSpace(project.RepoPath) == "" {
+		return nil
+	}
+	if _, err := os.Stat(project.RepoPath); err != nil {
+		return nil
+	}
+	ghPath := strings.TrimSpace(derefString(h.context.Config.Tools.GHPath))
+	if ghPath == "" {
+		return nil
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, GHRun: shell.Run})
+	labels := []string(nil)
+	switch target.TargetType {
+	case domain.LoopTargetTypeIssue:
+		detail, err := gh.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+		}
+		labels = detail.Labels
+	case domain.LoopTargetTypePullRequest:
+		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+		}
+		labels = detail.Labels
+	default:
+		return nil
+	}
+	if !domain.IsAutoLaneHeld(loopType, labels) {
+		return nil
+	}
+	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+}
+
+func derefBool(value *bool) bool {
+	return value != nil && *value
 }
 
 func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, projectID string, issueTarget, effectiveTarget domain.LoopTarget) (storage.LoopRecord, domain.LoopTarget, bool, error) {
@@ -3817,8 +4787,18 @@ func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, proj
 	return storage.LoopRecord{}, domain.LoopTarget{}, false, nil
 }
 
-func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, target domain.LoopTarget, nowISO string) (storage.LoopRecord, error) {
+func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, target domain.LoopTarget, nowISO string, force bool) (storage.LoopRecord, error) {
 	status := domain.LoopStatus(loop.Status)
+	if force && status == domain.LoopStatusRunning {
+		return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: fmt.Sprintf("Cannot force reuse running worker loop %s", loop.ID)}
+	}
+	if force {
+		normalized, err := forceManualWorkerLoopStateCompat(ctx, repos, loop, nowISO)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		loop = normalized
+	}
 	shouldQueue := status == domain.LoopStatusIdle || status == domain.LoopStatusPaused || status == domain.LoopStatusQueued
 	if status == domain.LoopStatusIdle || status == domain.LoopStatusPaused {
 		if err := domain.AssertLoopStatusTransition(status, domain.LoopStatusQueued); err != nil {
@@ -3870,6 +4850,9 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 					replacement.LastErrorKind = nil
 					replacement.CreatedAt = nowISO
 					replacement.UpdatedAt = nowISO
+					if force {
+						replacement.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(replacement.PayloadJSON)
+					}
 					if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement); err != nil {
 						return storage.LoopRecord{}, err
 					}
@@ -3879,16 +4862,127 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 						return storage.LoopRecord{}, queueErr
 					}
 					if ok {
+						if force {
+							queueRecord.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(queueRecord.PayloadJSON)
+						}
 						if _, _, upsertQueueErr := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord); upsertQueueErr != nil {
 							return storage.LoopRecord{}, upsertQueueErr
 						}
 					}
+				}
+			} else if force {
+				activeQueue.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(activeQueue.PayloadJSON)
+				activeQueue.UpdatedAt = nowISO
+				if err := repos.Queue.Upsert(ctx, *activeQueue); err != nil {
+					return storage.LoopRecord{}, err
+				}
+			}
+		} else if force {
+			activeQueue, findErr := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+			if findErr != nil {
+				return storage.LoopRecord{}, findErr
+			}
+			if activeQueue != nil {
+				activeQueue.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(activeQueue.PayloadJSON)
+				activeQueue.UpdatedAt = nowISO
+				if err := repos.Queue.Upsert(ctx, *activeQueue); err != nil {
+					return storage.LoopRecord{}, err
 				}
 			}
 		}
 	}
 
 	return loop, nil
+}
+
+func forcedManualWorkerQueuePayloadJSONCompat(payloadJSON *string) *string {
+	payload := parseJSONObject(payloadJSON)
+	if len(payload) == 0 {
+		return payloadJSON
+	}
+	if payload["autoDiscovered"] != true {
+		return payloadJSON
+	}
+	delete(payload, "autoDiscovered")
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return payloadJSON
+	}
+	text := string(encoded)
+	return &text
+}
+
+func forceManualWorkerLoopStateCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
+	metadataJSON := forcedManualWorkerMetadataJSONCompat(loop.MetadataJSON)
+	if !stringPtrEqual(metadataJSON, loop.MetadataJSON) {
+		loop.MetadataJSON = metadataJSON
+		loop.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			return storage.LoopRecord{}, err
+		}
+	}
+	if repos.Runs != nil {
+		latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if latestRun != nil {
+			checkpointJSON := forcedManualWorkerCheckpointJSONCompat(latestRun.CheckpointJSON)
+			if !stringPtrEqual(checkpointJSON, latestRun.CheckpointJSON) {
+				latestRun.CheckpointJSON = checkpointJSON
+				latestRun.UpdatedAt = nowISO
+				if err := repos.Runs.Upsert(ctx, *latestRun); err != nil {
+					return storage.LoopRecord{}, err
+				}
+			}
+		}
+	}
+	return loop, nil
+}
+
+func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
+	metadata := parseJSONObject(metadataJSON)
+	if len(metadata) == 0 {
+		return metadataJSON
+	}
+	worker, _ := metadata["worker"].(map[string]any)
+	if worker["autoDiscovered"] != true {
+		return metadataJSON
+	}
+	delete(worker, "autoDiscovered")
+	metadata["worker"] = worker
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return metadataJSON
+	}
+	text := string(encoded)
+	return &text
+}
+
+func forcedManualWorkerCheckpointJSONCompat(checkpointJSON *string) *string {
+	checkpoint := parseJSONObject(checkpointJSON)
+	if len(checkpoint) == 0 {
+		return checkpointJSON
+	}
+	work, _ := checkpoint["work"].(map[string]any)
+	if work["autoDiscovered"] != true {
+		return checkpointJSON
+	}
+	delete(work, "autoDiscovered")
+	checkpoint["work"] = work
+	encoded, err := json.Marshal(checkpoint)
+	if err != nil {
+		return checkpointJSON
+	}
+	text := string(encoded)
+	return &text
+}
+
+func stringPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func reusedWorkerResponseFields(loop storage.LoopRecord, fallbackTitle string, fallbackPrompt, fallbackSpecPath, fallbackBaseBranch *string, fallbackIssueNumber *int64) (string, *string, *string, *string, *int64) {
@@ -3921,7 +5015,7 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 	if r.Method != http.MethodPost {
 		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/planners")}
 	}
-	if !isCodingAgentConfigured(h.context.Config) {
+	if !isCodingRoleAgentConfigured(h.effectiveConfig(), config.CodingRolePlanner) {
 		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: "Cannot create planner loop without config.agent.vendor"}
 	}
 
@@ -3953,6 +5047,15 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 	if repo == nil {
 		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "project repo is required"}
 	}
+	target := domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
+	if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopTypePlanner, target, derefBool(body.Force)); err != nil {
+		return plannerCreateResponse{}, err
+	}
+
+	// Share same-target lock with discard+retry so planner uniqueness races
+	// cannot interleave with requeue while discard mutates the worktree.
+	unlockPlannerTarget := h.lockLoopTargetForStatus(projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning)
+	defer unlockPlannerTarget()
 
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	targetID := fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
@@ -3969,7 +5072,6 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 			return storage.LoopRecord{}, seqErr
 		}
 
-		target := domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
 		existing, listErr := repos.Loops.List(r.Context())
 		if listErr != nil {
 			return storage.LoopRecord{}, listErr
@@ -4278,8 +5380,54 @@ func (h *Handler) resolveLoop(ctx context.Context, selector string) (storage.Loo
 }
 
 func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status domain.LoopStatus) (loopResponse, error) {
+	// Running requeues from the latest failed/cancelled/manual_intervention item
+	// and can start replacement work. Share the per-loop retry lock and the
+	// same-target lock so this cannot race discard+retry between preflight and
+	// destructive git reset — including when the requeued loop is a *different*
+	// failed loop for the same PR/issue target.
+	if status == domain.LoopStatusRunning {
+		unlock := h.lockLoopRetry(loopID)
+		defer unlock()
+	}
+
 	services := h.context.Runtime.Services()
+	if status == domain.LoopStatusRunning {
+		if services.Repositories == nil || services.Coordinator == nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+		}
+		// Resolve target outside the TX so we can hold the target mutex for the
+		// whole requeue window (same key as discard+retry / loop create).
+		preflightLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if preflightLoop != nil {
+			target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
+			if targetErr != nil {
+				return loopResponse{}, targetErr
+			}
+			unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
+			defer unlockTarget()
+		}
+	}
+
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	// Intentional re-activation (unpause / start): clear sticky stop gate before
+	// the TX publishes claimable queue work. Clearing after commit races a
+	// concurrent scheduler tick that can claim, pass parked checks, then fail
+	// AgentExecutor.Start with ErrSpawnLoopStopping. Restore on TX failure like retryLoop.
+	gateWasActive := false
+	if status == domain.LoopStatusRunning && services.ActiveExecutions != nil {
+		// Clear and report under one lock so abort restore covers any gate this
+		// call removed (including one set by concurrent BeginLoopStop).
+		gateWasActive = services.ActiveExecutions.ClearLoopStop(loopID)
+	}
+	restoreStopGate := func() error {
+		if gateWasActive && services.ActiveExecutions != nil {
+			return services.ActiveExecutions.RestoreLoopStop(loopID)
+		}
+		return nil
+	}
 	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
@@ -4295,8 +5443,15 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			}
 		}
 
-		if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start %s loop without config.agent.vendor", loop.Type)}
+		// Live vendor may have been removed while a coding loop was parked
+		// (HITL awaiting_human, pause, etc.). Allow requeue when the latest
+		// failed/interrupted run still carries a frozen agent_snapshot_json —
+		// same sticky identity rule as retryLoop — so deliverHumanAnswer and
+		// /start can resume without reconfiguring a live role agent.
+		if status == domain.LoopStatusRunning {
+			if err := h.assertCodingRoleResumeAgent(ctx, repos, *loop, "start"); err != nil {
+				return storage.LoopRecord{}, err
+			}
 		}
 		if status == domain.LoopStatusRunning && loop.Type == string(domain.LoopTypeReviewer) && isTerminalReviewerLoopRecord(*loop) {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start terminal reviewer loop: %s", loop.ID)}
@@ -4402,6 +5557,14 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		return updated, nil
 	})
 	if err != nil {
+		if restoreErr := restoreStopGate(); restoreErr != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				typed.message = errors.Join(err, restoreErr).Error()
+				return loopResponse{}, typed
+			}
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: errors.Join(err, restoreErr).Error()}
+		}
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return loopResponse{}, typed
@@ -4444,7 +5607,11 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 		WorktreePath: result.WorktreePath,
 	}
 	vendor := config.AgentVendor(strings.TrimSpace(result.Vendor))
-	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: h.context.Config.Agent.Params}, result.WorktreePath, result.SessionID)
+	// Global agent.params (especially command/args) are owned by agent.vendor.
+	// Role runs already filter via ParamsForRoleVendor; takeover must do the same
+	// so a Claude role session is not handed a global Codex wrapper resume line.
+	params := agent.ParamsForRoleVendor(h.context.Config.Agent.Params, h.context.Config.Agent.Vendor, vendor, nil)
+	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: params}, result.WorktreePath, result.SessionID)
 	resp.Supported = ok
 	if ok {
 		resp.ResumeCommand = cmdLine
@@ -4459,6 +5626,19 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 // THAT session and sees their turns), clears any queue item that survived the
 // takeover race, then re-arms via the shared retry path.
 func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID string) (any, error) {
+	// Reject discard before any handback mutation. retryLoop is shared with
+	// /retry, but handback must never wipe the human's interactive worktree edits
+	// even if an API client includes discardWorktreeChanges on the handback body.
+	if discardRequested, err := retryRequestRequestsDiscard(r); err != nil {
+		return nil, err
+	} else if discardRequested {
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
+		}
+	}
+
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (struct{}, error) {
@@ -4489,7 +5669,31 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 	if err != nil {
 		return nil, err
 	}
-	return h.retryLoop(ctx, r, loopID)
+	// Handback reuses retry re-arm; fromHandback also rejects discard if body is
+	// re-read after a client races another field in (defense in depth).
+	return h.retryLoop(ctx, r, loopID, true)
+}
+
+// retryRequestRequestsDiscard peeks at a retry/handback JSON body for
+// discardWorktreeChanges without consuming the request for a later retryLoop decode.
+func retryRequestRequestsDiscard(r *http.Request) (bool, error) {
+	if r == nil || r.Body == nil {
+		return false, nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(strings.NewReader(string(raw)))
+	if err != nil {
+		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return false, nil
+	}
+	var body retryLoopRequest
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+	}
+	return body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges, nil
 }
 
 type respondLoopRequest struct {
@@ -4570,7 +5774,10 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 	return h.mutateLoopStatus(ctx, loopID, domain.LoopStatusRunning)
 }
 
-func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string) (retryLoopResponse, error) {
+// retryLoop re-arms a loop for another scheduler pass. fromHandback is true when
+// invoked via /loops/{id}/handback so discardWorktreeChanges is rejected: that
+// path preserves human interactive edits in the worktree for the resumed session.
+func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string, fromHandback bool) (retryLoopResponse, error) {
 	var body retryLoopRequest
 	if r.Body != nil {
 		defer r.Body.Close()
@@ -4596,12 +5803,151 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 	if !resetAttempts {
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "resetAttempts=false is not supported for explicit operator retry"}
 	}
+	discardWorktreeChanges := body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges
+	if discardWorktreeChanges && fromHandback {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
+		}
+	}
+
+	// Serialize per-loop retry with start/requeue so discard cannot race another
+	// retry or /loops/{id}/start that enqueues replacement work between preflight
+	// and reset (or a scheduler-started run for that replacement).
+	unlock := h.lockLoopRetry(loopID)
+	defer unlock()
 
 	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+
+	// Always resolve the loop target and hold the same-target lock for the whole
+	// retry window — not only when discarding. Regular retry and /start for a
+	// *different* failed loop on this target would otherwise create an active
+	// queue item after discard preflight and before git reset, then the discard
+	// TX would conflict after the worktree was already wiped.
+	preflightLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if preflightLoop == nil {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+	}
+	target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
+	if targetErr != nil {
+		return retryLoopResponse{}, targetErr
+	}
+	unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
+	defer unlockTarget()
+
+	// Opt-in discard runs before requeue so git mutation stays outside the
+	// queue transaction. Every non-mutating retry blocker must pass first so a
+	// later precondition failure never leaves discarded worktree changes
+	// without creating a replacement queue item.
+	var worktreeDiscard *worktreeDiscardResult
+	if discardWorktreeChanges {
+		// Runtime HITL poll requeues awaiting_human loops without the API lock
+		// (hitl_github_poll / Feishu helpers). Refuse discard so a poll-delivered
+		// answer cannot requeue between preflight and git reset, wiping the
+		// worktree for the answered continuation when the retry TX then conflicts.
+		// human_takeover pins the same worktree for interactive human edits;
+		// /handback already rejects discard, and direct /retry must match that.
+		if err := rejectDiscardWhileParkedForHuman(preflightLoop.Status, loopID); err != nil {
+			return retryLoopResponse{}, err
+		}
+
+		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *preflightLoop, nowISO); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		// Same-type uniqueness is not enough for discard: PR worktrees are shared
+		// across fixer/reviewer/worker. An already queued/running/waiting/
+		// human_takeover sibling is not held by the target mutex (that only
+		// serializes mutations), so refuse git reset/clean while any worktree-
+		// owning sibling holds the PR checkout.
+		if err := h.assertDiscardSharedPRWorktreeClear(ctx, services.Repositories, *preflightLoop); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+
+		// Recheck immediately before git mutation as defense in depth. Runtime
+		// free-text enqueue now shares LockLoopRequeue with this path, so the
+		// common race is serialized; this snapshot still catches any unlocked
+		// requeue injected under discardBeforeGitHook in tests (or future
+		// callers that forget the shared guard).
+		if h.discardBeforeGitHook != nil {
+			h.discardBeforeGitHook(loopID)
+		}
+		freshLoop, freshErr := services.Repositories.Loops.GetByID(ctx, loopID)
+		if freshErr != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: freshErr.Error()}
+		}
+		if freshLoop == nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if err := rejectDiscardWhileParkedForHuman(freshLoop.Status, loopID); err != nil {
+			return retryLoopResponse{}, err
+		}
+		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *freshLoop, nowISO); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if err := h.assertDiscardSharedPRWorktreeClear(ctx, services.Repositories, *freshLoop); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		preflightLoop = freshLoop
+
+		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
+		if discardErr != nil {
+			var typed apiError
+			if asAPIError(discardErr, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: discardErr.Error()}
+		}
+		worktreeDiscard = &discardResult
+	}
+
 	type retryResult struct {
 		loop        storage.LoopRecord
 		queueItemID *string
+	}
+	// Clear the sticky stop gate before the queue item becomes claimable.
+	// Clearing after the TX commit races a concurrent scheduler tick that can
+	// claim the new item, pass the parked check (loop is queued), then fail
+	// AgentExecutor.Start with ErrSpawnLoopStopping and back off the retry.
+	// If the TX fails (or publishes no replacement work), restore the gate so
+	// a failed retry cannot reopen AdmitSpawn for stale pre-stop runners.
+	gateWasActive := false
+	if services.ActiveExecutions != nil {
+		// Clear and report under one lock so abort restore covers any gate this
+		// call removed (including one set by concurrent BeginLoopStop).
+		gateWasActive = services.ActiveExecutions.ClearLoopStop(loopID)
+	}
+	restoreStopGate := func() error {
+		if gateWasActive && services.ActiveExecutions != nil {
+			return services.ActiveExecutions.RestoreLoopStop(loopID)
+		}
+		return nil
+	}
+	if h.retryAfterClearStopGateHook != nil {
+		h.retryAfterClearStopGateHook(loopID)
 	}
 	result, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (retryResult, error) {
 		repos := storage.NewRepositories(tx)
@@ -4612,49 +5958,21 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		if loop == nil {
 			return retryResult{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if strings.TrimSpace(loop.ProjectID) != "" {
-			if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+		if err := h.assertLoopRetryPreconditions(ctx, repos, *loop, nowISO); err != nil {
+			return retryResult{}, err
+		}
+		// When discard already mutated the worktree, re-check shared-PR siblings
+		// inside the TX so a concurrent runtime requeue/create that raced past
+		// preflight cannot leave both an active sibling and a successful retry.
+		if discardWorktreeChanges {
+			if err := h.assertDiscardSharedPRWorktreeClear(ctx, repos, *loop); err != nil {
 				return retryResult{}, err
 			}
-		}
-		if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
-			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", loop.Status, loop.ID)}
-		}
-		if loop.Type == string(domain.LoopTypeReviewer) {
-			if terminalMetadataStatus := terminalReviewerRetryMetadataStatus(*loop); terminalMetadataStatus != "" {
-				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, loop.ID)}
-			}
-		}
-		if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
-			return retryResult{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
-		}
-		runningRuns, err := repos.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
-		if err != nil {
-			return retryResult{}, err
-		}
-		for _, run := range runningRuns {
-			if run.LoopID == loop.ID {
-				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while a run is active", loop.ID)}
-			}
-		}
-		activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
-		if err != nil {
-			return retryResult{}, err
-		}
-		if activeQueue != nil {
-			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while queue item %s is active", loop.ID, activeQueue.ID)}
 		}
 
 		target, targetErr := loopTargetFromRecordCompat(*loop)
 		if targetErr != nil {
 			return retryResult{}, targetErr
-		}
-		existing, err := repos.Loops.List(ctx)
-		if err != nil {
-			return retryResult{}, err
-		}
-		if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusQueued); uniqueErr != nil {
-			return retryResult{}, uniqueErr
 		}
 		latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
@@ -4702,6 +6020,8 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		if !ok {
 			return retryResult{loop: *loop}, nil
 		}
+		// Dedupe is already asserted by assertLoopRetryPreconditions; re-check
+		// inside the transaction for races between preflight and commit.
 		if queueRecord.DedupeKey != "" {
 			activeDedupe, err := repos.Queue.FindActiveByDedupe(ctx, queueRecord.DedupeKey)
 			if err != nil {
@@ -4723,16 +6043,37 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		return retryResult{loop: updated, queueItemID: &persisted.ID}, nil
 	})
 	if err != nil {
+		if restoreErr := restoreStopGate(); restoreErr != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				typed.message = errors.Join(err, restoreErr).Error()
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: errors.Join(err, restoreErr).Error()}
+		}
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return retryLoopResponse{}, typed
 		}
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
+	if result.queueItemID == nil {
+		// No replacement work published; keep sticky stop closed if it was.
+		if restoreErr := restoreStopGate(); restoreErr != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: restoreErr.Error()}
+		}
+	}
 	if h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
 	}
-	return retryLoopResponse{Loop: serializeLoop(result.loop), QueueItemID: result.queueItemID, Mode: mode, ResetAttempts: resetAttempts}, nil
+	return retryLoopResponse{
+		Loop:                   serializeLoop(result.loop),
+		QueueItemID:            result.queueItemID,
+		Mode:                   mode,
+		ResetAttempts:          resetAttempts,
+		DiscardWorktreeChanges: discardWorktreeChanges,
+		WorktreeDiscard:        worktreeDiscard,
+	}, nil
 }
 
 func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRecord) (loopLogsResponse, error) {
@@ -4878,6 +6219,30 @@ func loopRelationshipsFromRecord(loop storage.LoopRecord) loopRelationships {
 	return rel
 }
 
+// serializeLoopWithDiagnostics loads latest queue/run and attaches attempt/error fields.
+func (h *Handler) serializeLoopWithDiagnostics(ctx context.Context, loop storage.LoopRecord) (loopResponse, error) {
+	view := serializeLoop(loop)
+	services := h.context.Runtime.Services()
+	var latestQueue *storage.QueueItemRecord
+	var latestRun *storage.RunRecord
+	if services.Repositories != nil && services.Repositories.Queue != nil {
+		queue, err := services.Repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		latestQueue = queue
+	}
+	if services.Repositories != nil && services.Repositories.Runs != nil {
+		run, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		latestRun = run
+	}
+	decorateLoopDiagnostics(&view, latestQueue, latestRun)
+	return view, nil
+}
+
 func serializeRun(run storage.RunRecord) runResponse {
 	return runResponse{
 		ID:                run.ID,
@@ -5009,8 +6374,11 @@ func manualFixerMetadataJSON(existing *string, nowISO string) (*string, error) {
 	return &text, nil
 }
 
-func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerConfig, target domain.LoopTarget, nowISO string) (*string, error) {
+func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerConfig, target domain.LoopTarget, nowISO string, force bool) (*string, error) {
 	metadata := parseJSONObject(existing)
+	if force {
+		metadata["manual"] = true
+	}
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	if loopMeta == nil {
 		loopMeta = map[string]any{}
@@ -5138,6 +6506,178 @@ func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
 	return status == "terminated" || status == "stopped" || status == "failed"
 }
 
+// rejectDiscardWhileParkedForHuman refuses discard+retry when the loop is
+// parked for a human so interactive worktree edits stay intact. awaiting_human
+// is blocked against HITL poll requeue races; human_takeover matches /handback
+// which never honors discardWorktreeChanges.
+func rejectDiscardWhileParkedForHuman(status, loopID string) error {
+	switch status {
+	case string(domain.LoopStatusAwaitingHuman):
+		return apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusConflict,
+			message: fmt.Sprintf("Cannot discard worktree changes while loop %s is awaiting_human; answer or cancel the HITL ask first, or retry without --discard-worktree-changes", loopID),
+		}
+	case string(domain.LoopStatusHumanTakeover):
+		return apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusConflict,
+			message: fmt.Sprintf("Cannot discard worktree changes while loop %s is human_takeover; hand back without --discard-worktree-changes first, or retry without discard", loopID),
+		}
+	default:
+		return nil
+	}
+}
+
+// assertDiscardSharedPRWorktreeClear refuses discard when another loop of any
+// type already holds a worktree-owning status on the same pull-request target.
+// assertUniqueActiveLoopCompat only conflicts same-type loops; managed PR
+// worktrees (looper-fix-<project>-pr-N) are shared across fixer/reviewer/
+// worker, so a sibling that is queued, running, waiting, failed, interrupted,
+// or human_takeover would lose its checkout to git reset/clean. Non-PR targets
+// and non-discard retries are unaffected.
+func (h *Handler) assertDiscardSharedPRWorktreeClear(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) error {
+	if loop.TargetType != string(domain.LoopTargetTypePullRequest) {
+		return nil
+	}
+	existing, err := repos.Loops.List(ctx)
+	if err != nil {
+		return err
+	}
+	return assertNoActiveSiblingPRWorktreeLoops(existing, loop)
+}
+
+// isDiscardBlockingSiblingPRStatus reports whether a sibling loop's status
+// still pins the shared PR managed worktree. Includes IsConflictingActiveLoopStatus
+// plus waiting/failed/interrupted: those are intentionally excluded from
+// uniqueness conflicts (reviewer debounce can sit waiting while another type
+// fails; failed/interrupted are retryable terminals), but worktree cleanup
+// (protectsLoopStatus) and ownership still treat them as active owners whose
+// checkpointed local state must not be wiped by a sibling discard retry.
+func isDiscardBlockingSiblingPRStatus(status domain.LoopStatus) bool {
+	if domain.IsConflictingActiveLoopStatus(status) || status == domain.LoopStatusWaiting {
+		return true
+	}
+	return status == domain.LoopStatusFailed || status == domain.LoopStatusInterrupted
+}
+
+// assertNoActiveSiblingPRWorktreeLoops reports a conflict when any other
+// worktree-owning loop on the same project+PR key exists, regardless of loop
+// type. Used only for destructive discard preflight.
+func assertNoActiveSiblingPRWorktreeLoops(existing []storage.LoopRecord, candidate storage.LoopRecord) error {
+	if candidate.TargetType != string(domain.LoopTargetTypePullRequest) {
+		return nil
+	}
+	candidateKey := loopTargetKeyFromRecordCompat(candidate)
+	if candidateKey == "pull_request:" {
+		return nil
+	}
+	for _, loop := range existing {
+		if loop.ID == candidate.ID || loop.ProjectID != candidate.ProjectID {
+			continue
+		}
+		if loop.TargetType != string(domain.LoopTargetTypePullRequest) {
+			continue
+		}
+		if !isDiscardBlockingSiblingPRStatus(domain.LoopStatus(loop.Status)) {
+			continue
+		}
+		if loopTargetKeyFromRecordCompat(loop) != candidateKey {
+			continue
+		}
+		return apiError{
+			code:   pkgapi.ErrorCodeLoopConflict,
+			status: http.StatusConflict,
+			message: fmt.Sprintf(
+				"Cannot discard worktree changes for loop %s while active %s loop %s shares the same PR worktree (%s)",
+				candidate.ID, loop.Type, loop.ID, candidateKey,
+			),
+		}
+	}
+	return nil
+}
+
+// assertLoopRetryPreconditions validates non-mutating retry blockers that must
+// pass before any destructive worktree discard or requeue. Callers that discard
+// dirty worktree state must invoke this first so a failed retry never deletes
+// local changes without creating a replacement queue item.
+func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) error {
+	if strings.TrimSpace(loop.ProjectID) != "" {
+		if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+			return err
+		}
+	}
+	if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", loop.Status, loop.ID)}
+	}
+	if loop.Type == string(domain.LoopTypeReviewer) {
+		if terminalMetadataStatus := terminalReviewerRetryMetadataStatus(loop); terminalMetadataStatus != "" {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, loop.ID)}
+		}
+	}
+	if err := h.assertCodingRoleRetryAgent(ctx, repos, loop); err != nil {
+		return err
+	}
+	runningRuns, err := repos.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
+	if err != nil {
+		return err
+	}
+	for _, run := range runningRuns {
+		if run.LoopID == loop.ID {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while a run is active", loop.ID)}
+		}
+	}
+	activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if activeQueue != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while queue item %s is active", loop.ID, activeQueue.ID)}
+	}
+
+	target, targetErr := loopTargetFromRecordCompat(loop)
+	if targetErr != nil {
+		return targetErr
+	}
+	existing, err := repos.Loops.List(ctx)
+	if err != nil {
+		return err
+	}
+	if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusQueued); uniqueErr != nil {
+		return uniqueErr
+	}
+
+	latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	dedupeKey := ""
+	if latestQueue != nil {
+		dedupeKey = latestQueue.DedupeKey
+	} else {
+		// Match requeue path: when there is no prior queue row, building the
+		// replacement record can fail on target/repo requirements and must
+		// block discard just as it blocks requeue.
+		built, ok, queueErr := buildQueuedLoopQueueRecordCompat(loop, target, nowISO, loop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+		if queueErr != nil {
+			return queueErr
+		}
+		if ok {
+			dedupeKey = built.DedupeKey
+		}
+	}
+	if dedupeKey != "" {
+		activeDedupe, err := repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+		if err != nil {
+			return err
+		}
+		if activeDedupe != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while dedupe queue item %s is active", loop.ID, activeDedupe.ID)}
+		}
+	}
+	return nil
+}
+
 func terminalReviewerRetryMetadataStatus(loop storage.LoopRecord) string {
 	if loop.MetadataJSON == nil || strings.TrimSpace(*loop.MetadataJSON) == "" {
 		return ""
@@ -5207,7 +6747,8 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 		if target.TargetType != domain.LoopTargetTypeIssue || repo == "" || issueNumber <= 0 {
 			return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and issueNumber", record.Type)}
 		}
-		lockKey := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+		lockKey := storage.IssueLockKey(record.ProjectID, repo, issueNumber)
+		targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 		manual := false
 		if metadata := parseJSONObject(metadataJSON); metadata["manual"] == true {
 			if boolValue, ok := metadata["manual"].(bool); ok {
@@ -5224,7 +6765,7 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 		}
 		payloadJSON := string(payloadBytes)
 		queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = nil
 		queueRecord.DedupeKey = fmt.Sprintf("planner:%s:%s:%s:%d", record.ProjectID, record.ID, repo, issueNumber)
@@ -5237,9 +6778,10 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 			return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and prNumber", record.Type)}
 		}
 		prNumber := *record.PRNumber
-		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		lockKey := storage.PullRequestLockKey(record.ProjectID, repo, prNumber)
+		targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = &prNumber
 		queueRecord.DedupeKey = fmt.Sprintf("reviewer:%s:%s:%s:%d", record.ProjectID, record.ID, repo, prNumber)
@@ -5251,9 +6793,10 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 			return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and prNumber", record.Type)}
 		}
 		prNumber := *record.PRNumber
-		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		lockKey := storage.PullRequestLockKey(record.ProjectID, repo, prNumber)
+		targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = &prNumber
 		queueRecord.DedupeKey = fmt.Sprintf("fixer:%s", record.ID)
@@ -5273,9 +6816,10 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 			if repo == "" || issueNumber <= 0 {
 				return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and issueNumber", record.Type)}
 			}
-			lockKey = fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+			lockKey = storage.IssueLockKey(record.ProjectID, repo, issueNumber)
+			targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 			queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
-			queueRecord.TargetID = lockKey
+			queueRecord.TargetID = targetID
 			queueRecord.Repo = &repo
 			queueRecord.PRNumber = nil
 			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", record.ProjectID, repo, issueNumber)
@@ -5285,9 +6829,10 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 				return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and prNumber", record.Type)}
 			}
 			prNumber := *record.PRNumber
-			lockKey = fmt.Sprintf("pr:%s:%d", repo, prNumber)
+			lockKey = storage.PullRequestLockKey(record.ProjectID, repo, prNumber)
+			targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 			queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-			queueRecord.TargetID = lockKey
+			queueRecord.TargetID = targetID
 			queueRecord.Repo = &repo
 			queueRecord.PRNumber = &prNumber
 			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", record.ProjectID, repo, prNumber)
@@ -5583,7 +7128,51 @@ func stringPtrOrNil(value string) *string {
 }
 
 func isCodingAgentConfigured(cfg config.Config) bool {
-	return cfg.Agent.Vendor != nil && strings.TrimSpace(string(*cfg.Agent.Vendor)) != ""
+	return config.AnyCodingRoleAgentConfigured(cfg)
+}
+
+func isCodingRoleAgentConfigured(cfg config.Config, role string) bool {
+	return config.CodingRoleAgentConfigured(cfg, role)
+}
+
+// assertCodingRoleRetryAgent allows sticky retries after vendor removal when the
+// predecessor failed/interrupted run still carries a durable agent_snapshot_json.
+// New loops without a live ResolveAgent identity remain blocked at create.
+func (h *Handler) assertCodingRoleRetryAgent(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) error {
+	return h.assertCodingRoleResumeAgent(ctx, repos, loop, "retry")
+}
+
+// assertCodingRoleResumeAgent gates coding-role requeue (retry, /start, HITL
+// deliverHumanAnswer → mutateLoopStatus Running). Live config.agent / roles.*.agent
+// vendor is preferred; otherwise a failed/interrupted predecessor run with a
+// parseable agent_snapshot_json vendor is enough for sticky continuation.
+func (h *Handler) assertCodingRoleResumeAgent(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, action string) error {
+	switch loop.Type {
+	case string(domain.LoopTypeReviewer), string(domain.LoopTypeFixer), string(domain.LoopTypeWorker), string(domain.LoopTypePlanner):
+	default:
+		return nil
+	}
+	if isCodingRoleAgentConfigured(h.effectiveConfig(), loop.Type) {
+		return nil
+	}
+	if repos != nil && repos.Runs != nil {
+		latest, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return err
+		}
+		if latest != nil && (latest.Status == string(domain.RunStatusFailed) || latest.Status == string(domain.RunStatusInterrupted)) {
+			if latest.AgentSnapshotJSON != nil {
+				snapshot, parseErr := config.ParseAgentSnapshot(*latest.AgentSnapshotJSON)
+				if parseErr == nil && strings.TrimSpace(snapshot.Vendor) != "" {
+					return nil
+				}
+			}
+		}
+	}
+	if strings.TrimSpace(action) == "" {
+		action = "start"
+	}
+	return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot %s %s loop without config.agent.vendor", action, loop.Type)}
 }
 
 func urlPathSegment(parts []string, index int) (string, error) {
@@ -5608,6 +7197,7 @@ type createProjectRequest struct {
 	BaseBranch   *string `json:"baseBranch"`
 	WorktreeRoot *string `json:"worktreeRoot"`
 	Repo         *string `json:"repo"`
+	Provider     *string `json:"provider"`
 	SnapshotMode *string `json:"snapshotMode"`
 }
 
@@ -5656,13 +7246,17 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		IDSource:     idSource,
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
+		Provider:     normalizeOptionalString(body.Provider),
 		SnapshotMode: snapshotMode,
 	})
 	if err != nil {
 		var collision projects.ProjectIDCollisionError
+		var validation projects.ProjectValidationError
 		switch {
 		case errors.As(err, &collision):
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeProjectIDConflict, status: http.StatusConflict, message: err.Error()}
+		case errors.As(err, &validation):
+			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
 		case strings.HasPrefix(err.Error(), "invalid project id"):
 			message := strings.Replace(err.Error(), "invalid project id", "Invalid project id", 1)
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: message}
@@ -5670,10 +7264,8 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
-	_ = h.refreshWebhookForwarders()
-
 	return createProjectResponse{
-		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),
+		projectResponse:        serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
 		DiscoveredPullRequests: result.DiscoveredPullRequests,
 		DiscoveredWorktrees:    result.DiscoveredWorktrees,
 		PendingSnapshots:       result.PendingSnapshots,
@@ -5682,17 +7274,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 	}, nil
 }
 
-func (h *Handler) refreshWebhookForwarders() error {
-	if refresher, ok := any(h.context.Runtime).(interface{ RefreshWebhookForwarders() error }); ok {
-		return refresher.RefreshWebhookForwarders()
-	}
-	if refresher, ok := any(h.context.Runtime).(interface{ ReconcileWebhookForwarders() }); ok {
-		refresher.ReconcileWebhookForwarders()
-	}
-	return nil
-}
-
-func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) projectResponse {
+func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultBaseBranch string) projectResponse {
 	metadata := parseProjectMetadata(project.MetadataJSON)
 
 	baseBranch := defaultBaseBranch
@@ -5706,11 +7288,43 @@ func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) p
 		RepoPath:     project.RepoPath,
 		BaseBranch:   baseBranch,
 		Archived:     project.Archived,
+		Provider:     resolveProjectProviderKind(cfg, project.ID, metadata),
 		Repo:         stringMetadataPtr(metadata, "repo"),
 		WorktreeRoot: stringMetadataPtr(metadata, "worktreeRoot"),
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
 	}
+}
+
+// resolveProjectProviderKind returns the display provider kind for a project:
+// config binding first, then API metadata provider id, else github.
+func resolveProjectProviderKind(cfg config.Config, projectID string, metadata map[string]any) string {
+	for _, configured := range cfg.Projects {
+		if configured.ID != projectID {
+			continue
+		}
+		kind := config.ResolvedProjectProviderKind(cfg, configured)
+		if kind != "" {
+			return string(kind)
+		}
+		break
+	}
+	if providerID := strings.TrimSpace(stringMetadataValue(metadata, "provider")); providerID != "" {
+		for _, provider := range cfg.Providers {
+			if provider.ID == providerID && provider.Kind != "" {
+				return string(provider.Kind)
+			}
+		}
+	}
+	return string(config.ProviderKindGitHub)
+}
+
+func stringMetadataValue(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return value
 }
 
 func requireActiveProjectRecord(ctx context.Context, repo *storage.ProjectsRepository, projectID string) (*storage.ProjectRecord, error) {

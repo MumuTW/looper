@@ -139,6 +139,71 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 }
 
+func TestRunDefaultSchedulerTickDefersStaleCatalogBeforeClaimAndDiscovery(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-catalog-binding.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 13, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	forgejoMetadata := `{"provider":"forgejo-main","repo":"forgejo/new"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "rebound", Name: "Rebound", RepoPath: filepath.Join(workingDir, "rebound"), BaseBranch: &baseBranch, MetadataJSON: &forgejoMetadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	projectTarget := "project:rebound"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_rebound", Seq: 1, ProjectID: "rebound", Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("forgejo/new"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "rebound"
+	loopID := "loop_rebound"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_rebound", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectTarget, Repo: stringPtr("forgejo/new"), DedupeKey: "worker:loop_rebound", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	captured := config.Config{
+		Projects:  []config.ProjectRefConfig{{ID: "rebound", Repo: "github/old"}},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}},
+	}
+	plannerRunner := &stubPlannerScheduler{}
+	coordinatorRunner := &stubCoordinatorScheduler{}
+	workerRunner := &stubWorkerScheduler{}
+	input := defaultSchedulerTickInput{
+		Repos:                   repos,
+		Now:                     func() time.Time { return now },
+		MaxConcurrentRuns:       1,
+		Config:                  &captured,
+		Planner:                 plannerRunner,
+		Coordinator:             coordinatorRunner,
+		Worker:                  workerRunner,
+		CoordinatorEnabled:      func(string) bool { return true },
+		PlannerDiscoveryEnabled: boolPtr(true),
+	}
+	if err := runDefaultSchedulerTick(context.Background(), input); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if err := runIndependentClaimPass(context.Background(), input); err != nil {
+		t.Fatalf("runIndependentClaimPass() error = %v", err)
+	}
+
+	if len(plannerRunner.discoverCalls) != 0 {
+		t.Fatalf("planner discover calls = %#v, want stale catalog pass deferred", plannerRunner.discoverCalls)
+	}
+	if len(coordinatorRunner.discoverCalls) != 0 || workerRunner.processItemCount() != 0 {
+		t.Fatalf("coordinator calls = %#v, worker processed items = %#v; want no stale dispatch", coordinatorRunner.discoverCalls, workerRunner.processedItems)
+	}
+	queued, err := repos.Queue.GetByID(context.Background(), "queue_rebound")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queued == nil || queued.Status != "queued" {
+		t.Fatalf("queue item = %#v, want unclaimed until catalog publication", queued)
+	}
+}
+
 func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	t.Parallel()
 
@@ -536,6 +601,7 @@ func TestRunDefaultSchedulerTickLogsClaimPhasesAndSlowLanes(t *testing.T) {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Scheduler.SlowLaneWarnThresholdMS = 1
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Repo: "nexu-io/looper"}}
 
 	plannerRunner := &sleepingPlannerScheduler{delay: 5 * time.Millisecond}
 	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
@@ -585,6 +651,39 @@ func TestRunScheduledQueueItemsDispatchesEachSupportedType(t *testing.T) {
 	})
 	if plannerRunner.processItemCount() != 1 || reviewerRunner.processItemCount() != 1 || fixerRunner.processItemCount() != 1 || workerRunner.processItemCount() != 1 {
 		t.Fatalf("processed items = planner:%#v reviewer:%#v fixer:%#v worker:%#v, want planner/reviewer/fixer/worker once", plannerRunner.processedItems, reviewerRunner.processedItems, fixerRunner.processedItems, workerRunner.processedItems)
+	}
+}
+
+// Claim dispatch must not ClearLoopStop: a pre-stop claim can race past the
+// parked check, and reopening admission would let AdmitSpawn succeed after
+// looper stop. Intentional reactivation (API) is the authority that clears.
+func TestRunScheduledQueueItemsDoesNotReopenStopGate(t *testing.T) {
+	t.Parallel()
+
+	reg := NewActiveExecutionRegistry()
+	loopID := "loop-pre-stop-claim"
+	if _, err := reg.BeginLoopStop(loopID, "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
+	workerRunner := &stubWorkerScheduler{}
+
+	err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{
+		{ID: "worker-item", Type: "worker", LoopID: &loopID},
+	}, defaultSchedulerTickInput{Worker: workerRunner})
+	if err != nil {
+		t.Fatalf("runScheduledQueueItems() error = %v", err)
+	}
+	waitForSchedulerCondition(t, func() bool {
+		return workerRunner.processItemCount() == 1
+	})
+	if !reg.LoopStopActive(loopID) {
+		t.Fatal("LoopStopActive = false after claim dispatch, want sticky stop gate preserved")
+	}
+	_, err = reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: loopID, RunID: "run_late", ExecutionID: "exec_late",
+	})
+	if !errors.Is(err, agent.ErrSpawnLoopStopping) {
+		t.Fatalf("AdmitSpawn after claim dispatch error = %v, want ErrSpawnLoopStopping", err)
 	}
 }
 
@@ -681,6 +780,147 @@ func TestClaimAndRunScheduledQueueItemsUsesLongTermRetryOnlyForIdleSlots(t *test
 	}
 	if len(claimed) != 1 || claimed[0].ID != "long_retry" {
 		t.Fatalf("claimed second = %#v, want long retry after ordinary work is claimed", claimed)
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsSkipsUnconfiguredRoles(t *testing.T) {
+	t.Parallel()
+
+	// Only worker is configured. Higher-priority reviewer work must stay queued
+	// rather than being claimed and failed with "runner is not configured".
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-configured-roles.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_roles", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker", Seq: 1, ProjectID: "project_roles", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(worker) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer", Seq: 2, ProjectID: "project_roles", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	workerLoopID := "loop_worker"
+	reviewerLoopID := "loop_reviewer"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "reviewer_high_priority", LoopID: &reviewerLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "d_reviewer", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:00.000Z", UpdatedAt: nowISO},
+		{ID: "worker_lower_priority", LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project_roles", DedupeKey: "d_worker", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:01:00.000Z", UpdatedAt: nowISO},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	workerRunner := &stubWorkerScheduler{}
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+		Repos:  repos,
+		Now:    func() time.Time { return now },
+		Worker: workerRunner,
+		// Reviewer intentionally nil — unconfigured role must not be claimed.
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "worker_lower_priority" {
+		t.Fatalf("claimed = %#v, want only worker item", claimed)
+	}
+	reviewerItem, err := repos.Queue.GetByID(context.Background(), "reviewer_high_priority")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(reviewer) error = %v", err)
+	}
+	if reviewerItem == nil || reviewerItem.Status != "queued" {
+		t.Fatalf("reviewer item = %#v, want still queued", reviewerItem)
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *testing.T) {
+	t.Parallel()
+
+	// Operator unset the role vendor after a failed run left agent_snapshot_json.
+	// Fresh work for that role must stay queued; the sticky retry must claim.
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-sticky-snapshot.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	// Live worker only; reviewer has no ResolveAgent identity.
+	cfg.Agent.Vendor = nil
+	workerVendor := config.AgentVendorCodex
+	cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &workerVendor}
+
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_sticky", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_sticky", Seq: 1, ProjectID: "project_sticky", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(sticky) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_fresh", Seq: 2, ProjectID: "project_sticky", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(fresh) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_live", Seq: 3, ProjectID: "project_sticky", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(worker) error = %v", err)
+	}
+
+	snapshot := `{"vendor":"codex","model":"frozen-reviewer","profileId":"reviewer-profile"}`
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_sticky", LoopID: "loop_reviewer_sticky", Status: "failed",
+		StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, AgentSnapshotJSON: &snapshot,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(sticky) error = %v", err)
+	}
+
+	stickyLoopID := "loop_reviewer_sticky"
+	freshLoopID := "loop_reviewer_fresh"
+	workerLoopID := "loop_worker_live"
+	repo := "acme/looper"
+	prSticky := int64(10)
+	prFresh := int64(11)
+	for _, item := range []storage.QueueItemRecord{
+		// Higher priority reviewer items first: sticky should claim, fresh must not.
+		{ID: "reviewer_sticky", LoopID: &stickyLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:10", Repo: &repo, PRNumber: &prSticky, DedupeKey: "d_sticky", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:00.000Z", UpdatedAt: nowISO},
+		{ID: "reviewer_fresh", LoopID: &freshLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:11", Repo: &repo, PRNumber: &prFresh, DedupeKey: "d_fresh", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:01.000Z", UpdatedAt: nowISO},
+		{ID: "worker_live", LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project_sticky", DedupeKey: "d_worker", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:02.000Z", UpdatedAt: nowISO},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	// Simulate always-on runners with live config: worker live, reviewer sticky-only.
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 3, defaultSchedulerTickInput{
+		Repos:    repos,
+		Now:      func() time.Time { return now },
+		Config:   &cfg,
+		Worker:   &stubWorkerScheduler{},
+		Reviewer: &stubReviewerScheduler{},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed count = %d (%#v), want sticky reviewer + live worker", len(claimed), claimed)
+	}
+	gotIDs := map[string]bool{claimed[0].ID: true, claimed[1].ID: true}
+	if !gotIDs["reviewer_sticky"] || !gotIDs["worker_live"] {
+		t.Fatalf("claimed = %#v, want reviewer_sticky and worker_live", claimed)
+	}
+	freshItem, err := repos.Queue.GetByID(context.Background(), "reviewer_fresh")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(fresh) error = %v", err)
+	}
+	if freshItem == nil || freshItem.Status != "queued" {
+		t.Fatalf("fresh reviewer item = %#v, want still queued without live role agent", freshItem)
 	}
 }
 
@@ -943,6 +1183,59 @@ func TestProcessSnapshotQueueItemFailsNonRetryableInvalidItem(t *testing.T) {
 	}
 	if updated.LastError == nil || *updated.LastError != "invalid snapshot queue item" || updated.LastErrorKind == nil || *updated.LastErrorKind != "non_retryable" {
 		t.Fatalf("queue item error = (%v, %v), want non-retryable invalid-item failure", updated.LastError, updated.LastErrorKind)
+	}
+}
+
+func TestAllowedQueueTypesFromRunners_ExcludesSnapshotWhenSnapshotterNil(t *testing.T) {
+	t.Parallel()
+
+	// Typed-nil *githubinfra.Gateway must not count as a configured Snapshotter.
+	var nilGateway *githubinfra.Gateway
+	var typedNil snapshotScheduler = nilGateway
+	if typedNil == nil {
+		t.Fatal("typed-nil interface unexpectedly compared equal to nil")
+	}
+
+	// Direct nil interface excludes snapshot.
+	got := allowedQueueTypesFromRunners(defaultSchedulerTickInput{
+		Worker:      &stubWorkerScheduler{},
+		Snapshotter: nil,
+	})
+	for _, itemType := range got {
+		if itemType == "snapshot" {
+			t.Fatalf("allowed types = %v, must not include snapshot when Snapshotter is nil", got)
+		}
+	}
+
+	// Correct construction: only assign when non-nil pointer.
+	var snapshotter snapshotScheduler
+	if nilGateway != nil {
+		snapshotter = nilGateway
+	}
+	got = allowedQueueTypesFromRunners(defaultSchedulerTickInput{
+		Worker:      &stubWorkerScheduler{},
+		Snapshotter: snapshotter,
+	})
+	for _, itemType := range got {
+		if itemType == "snapshot" {
+			t.Fatalf("allowed types = %v, must not include snapshot when github gateway is nil", got)
+		}
+	}
+
+	// Real non-nil snapshotter includes snapshot.
+	got = allowedQueueTypesFromRunners(defaultSchedulerTickInput{
+		Worker:      &stubWorkerScheduler{},
+		Snapshotter: stubSnapshotScheduler{},
+	})
+	found := false
+	for _, itemType := range got {
+		if itemType == "snapshot" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("allowed types = %v, want snapshot when Snapshotter is configured", got)
 	}
 }
 
