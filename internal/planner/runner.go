@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/planner/decisions"
 	"github.com/nexu-io/looper/internal/storage"
@@ -57,6 +58,8 @@ const (
 	maxRetryDelay       = 300 * time.Second
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
+
+	awaitingProductDecisionSkipReason = "awaiting product decision on Plane"
 )
 
 var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepGrill, stepReview, stepNotify}
@@ -79,18 +82,19 @@ var plannerV2StepSequence = []PlannerStep{
 
 type PlannerStep string
 
-type QueueFailureKind string
+type QueueFailureKind = failureclass.Kind
 
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = failureclass.RetryableTransient
+	FailureRetryableAfterResume = failureclass.RetryableAfterResume
+	FailureRecoverableInfra     = failureclass.RecoverableInfra
+	FailureNonRetryable         = failureclass.NonRetryable
+	FailureManualIntervention   = failureclass.ManualIntervention
 	// FailureHITLInterrupt marks a step whose agent was deliberately killed to answer a
 	// human's mid-run @bot (强操控). It is NOT a real failure: the run completes as
 	// "interrupted" and is re-dispatched immediately so follow-up-resume answers them
 	// from the MAIN session, without counting against the retry cap.
-	FailureHITLInterrupt QueueFailureKind = "hitl_interrupt"
+	FailureHITLInterrupt = failureclass.HITLInterrupt
 )
 
 // plannerInterruptError signals that the step's agent was killed by a human mid-run
@@ -371,7 +375,14 @@ type Options struct {
 	PostThreadCard func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
 	// PostThreadImage uploads and posts one PNG with a stable Feishu message UUID.
 	PostThreadImage func(ctx context.Context, loopID, pngPath, dedupeUUID string) (string, error)
-	DiscoveryPolicy DiscoveryPolicy
+	// PostThreadApprovalCard posts the separate owner-facing tech-spec approval card.
+	// Keeping this distinct from product decisions prevents the wrong role, copy, and
+	// card dedupe key from being reused at node H.
+	PostThreadApprovalCard func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	// PostThreadProductSpecCard asks product to create or update the authoritative
+	// product spec on Plane before planning continues.
+	PostThreadProductSpecCard func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	DiscoveryPolicy           DiscoveryPolicy
 	// PlaneDoc resolves a Plane spec-document gateway + Plane project UUID for a
 	// project whose task source is Plane (§8 flowchart). nil / (…,false) → the
 	// project keeps the repo-file spec path (github/forgejo). Set for plane projects.
@@ -390,33 +401,35 @@ type DiscoveryPolicy struct {
 }
 
 type Runner struct {
-	db                      *sql.DB
-	repos                   *storage.Repositories
-	github                  GitHubGateway
-	git                     GitGateway
-	agentExecutor           AgentExecutor
-	logger                  bootstrap.Logger
-	now                     func() time.Time
-	agentTimeout            time.Duration
-	agentIdleTimeout        time.Duration
-	claimTTL                time.Duration
-	allowAutoPush           bool
-	disclosure              config.DisclosureConfig
-	agentRuntime            string
-	customInstructions      config.Config
-	projectRoleConfig       *config.Config
-	agentModel              string
-	retryBaseDelay          time.Duration
-	retryMaxAttempts        int64
-	onAgentExecutionStarted AgentExecutionStartedFunc
-	onQueueItemEnqueued     func()
-	postThreadNote          func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
-	postThreadNoteWithUUID  func(ctx context.Context, loopID, text string, mentionOpenIDs []string, uuid string) error
-	postThreadCard          func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
-	postThreadImage         func(ctx context.Context, loopID, pngPath, dedupeUUID string) (string, error)
-	decisionArtifactRoot    string
-	discoveryPolicy         DiscoveryPolicy
-	planeDoc                PlaneDocResolver
+	db                        *sql.DB
+	repos                     *storage.Repositories
+	github                    GitHubGateway
+	git                       GitGateway
+	agentExecutor             AgentExecutor
+	logger                    bootstrap.Logger
+	now                       func() time.Time
+	agentTimeout              time.Duration
+	agentIdleTimeout          time.Duration
+	claimTTL                  time.Duration
+	allowAutoPush             bool
+	disclosure                config.DisclosureConfig
+	agentRuntime              string
+	customInstructions        config.Config
+	projectRoleConfig         *config.Config
+	agentModel                string
+	retryBaseDelay            time.Duration
+	retryMaxAttempts          int64
+	onAgentExecutionStarted   AgentExecutionStartedFunc
+	onQueueItemEnqueued       func()
+	postThreadNote            func(ctx context.Context, loopID, text string, mentionOpenIDs []string) error
+	postThreadNoteWithUUID    func(ctx context.Context, loopID, text string, mentionOpenIDs []string, uuid string) error
+	postThreadCard            func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error
+	postThreadImage           func(ctx context.Context, loopID, pngPath, dedupeUUID string) (string, error)
+	postThreadApprovalCard    func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	postThreadProductSpecCard func(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error
+	decisionArtifactRoot      string
+	discoveryPolicy           DiscoveryPolicy
+	planeDoc                  PlaneDocResolver
 }
 
 type DiscoveryInput struct {
@@ -473,6 +486,8 @@ type checkpointIssue struct {
 	Labels             []string `json:"labels,omitempty"`
 	CurrentUserLogin   string   `json:"currentUserLogin,omitempty"`
 	SpecPath           string   `json:"specPath,omitempty"`
+	ProductSpecURL     string   `json:"productSpecUrl,omitempty"`
+	ProductSpec        string   `json:"productSpec,omitempty"`
 	RequestedReviewers []string `json:"requestedReviewers,omitempty"`
 }
 
@@ -630,7 +645,7 @@ func New(options Options) *Runner {
 	if options.CustomInstructions != nil && strings.TrimSpace(options.CustomInstructions.Storage.DBPath) != "" {
 		artifactRoot = filepath.Join(filepath.Dir(options.CustomInstructions.Storage.DBPath), "decision-artifacts")
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, postThreadNoteWithUUID: options.PostThreadNoteWithUUID, postThreadCard: options.PostThreadCard, postThreadImage: options.PostThreadImage, decisionArtifactRoot: artifactRoot, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, postThreadNote: options.PostThreadNote, postThreadNoteWithUUID: options.PostThreadNoteWithUUID, postThreadCard: options.PostThreadCard, postThreadImage: options.PostThreadImage, postThreadApprovalCard: options.PostThreadApprovalCard, postThreadProductSpecCard: options.PostThreadProductSpecCard, decisionArtifactRoot: artifactRoot, discoveryPolicy: policy, planeDoc: options.PlaneDoc}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -942,10 +957,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		prNumber = checkpoint.Publish.PullRequest.Number
 	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
-		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: prNumber}, nil
+		if !errors.Is(err, storage.ErrQueueItemNotActive) {
+			return ProcessResult{}, err
 		}
-		return ProcessResult{}, err
 	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		if checkpoint.Wait != nil {
@@ -954,6 +968,8 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if metadata, metaErr := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"decisionPhase": phase, "nodeHPhase": phase, "plannerPipelineVersion": checkpoint.PipelineVersion}); metaErr == nil {
 				updated.MetadataJSON = stringPtr(metadata)
 			}
+		} else if checkpoint.SkipReason == awaitingProductDecisionSkipReason {
+			updated.Status = "awaiting_human"
 		} else {
 			updated.Status = "completed"
 		}
@@ -1091,10 +1107,11 @@ func (input stepInput) CheckpointIssueLogin() string {
 }
 
 // productSpecGate implements flowchart node D/E for a Plane-provider feature: check
-// whether the work item has a product spec; if not, ask product on the work item and
-// return a hold (FailureManualIntervention) so the planner doesn't write a tech spec
-// without one. A no-op for github/forgejo projects, non-features, or when the work
-// item / spec status can't be resolved (fail open — don't wedge non-Plane flows).
+// whether the work item has a readable, non-empty product spec whose provenance
+// resolves to the configured product owner. A link created only by Looper or its
+// operator is not a product spec. If verification fails, ask product on the work
+// item and hold before any technical planning. A no-op for github/forgejo projects
+// and non-features.
 func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoint plannerCheckpoint) *loopError {
 	if r.planeDoc == nil || checkpoint.Issue == nil {
 		return nil
@@ -1107,31 +1124,63 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 	if !stringInSlice("kind/feature", issue.Labels) {
 		return nil // bugs / refactors / perf don't need a product spec
 	}
+	// Checkpoints survive retries. Never carry a formerly accepted product spec
+	// across a fresh provenance check; only repopulate these fields after the current
+	// linked document passes verification below.
+	issue.ProductSpec = ""
+	issue.ProductSpecURL = ""
 	workItemID := planedoc.WorkItemIDFromURL(issue.URL)
 	if workItemID == "" {
 		return nil
 	}
-	present, _, err := gateway.HasProductSpec(ctx, planeProjectID, workItemID)
+	productSpecURL, present, err := gateway.FindSpecLink(ctx, planeProjectID, workItemID, planedoc.ProductSpecLinkTitle)
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("check product spec on work item: %v", err), kind: FailureRetryableTransient}
 	}
+	productOwnerPlaneID := ""
+	if r.projectRoleConfig != nil {
+		productOwnerPlaneID = strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).PlaneID)
+	}
+	productSpec := strings.TrimSpace(productSpecURL)
+	verified := present && loops.ProductSpecConfirmedBy(input.Loop.MetadataJSON, productSpecURL, productOwnerPlaneID)
 	if present {
+		if pageID := planedoc.PageIDFromURL(productSpecURL); pageID != "" {
+			page, err := gateway.PageDocument(ctx, planeProjectID, pageID)
+			if err != nil {
+				return &loopError{message: fmt.Sprintf("read product spec document on work item: %v", err), kind: FailureRetryableTransient}
+			}
+			productSpec = page.ContentHTML
+			verified = verified || page.AuthoredBy(productOwnerPlaneID)
+		}
+	}
+	if present && strings.TrimSpace(productSpec) != "" && verified {
+		issue.ProductSpec = strings.TrimSpace(productSpec)
+		issue.ProductSpecURL = strings.TrimSpace(productSpecURL)
 		// A resumed planner passes here once product supplied the spec (node E2) —
 		// clear the hold marker so the card leaves "⏸ 等待产品方案".
-		r.setAwaitingProductSpecMarker(ctx, input.Loop, false)
+		r.setAwaitingProductSpecMarker(ctx, input.Loop, false, "", issue)
 		return nil // has a product spec → proceed to write the tech spec
 	}
-	if err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", issue.Title); err != nil && r.logger != nil {
-		r.logger.Warn("planner: request product spec failed", map[string]any{"projectId": input.Project.ID, "workItem": workItemID, "error": err.Error()})
+	reason := "还没有关联产品 spec"
+	if present && productOwnerPlaneID == "" {
+		reason = "已有关联页面，但项目尚未配置产品负责人的 Plane member ID，无法验证作者"
+	} else if present && strings.TrimSpace(productSpec) == "" {
+		reason = "已有关联页面，但正文为空"
+	} else if present {
+		reason = "已有关联页面，但它不是由配置的产品负责人创建、接管或明确确认的"
 	}
-	// Also @-mention the product owner in the Feishu thread — not only the Plane
-	// comment — so they see the ask where they actually watch. The open_id comes from
-	// per-project config (ProjectProductOwner), never hardcoded. Best-effort.
-	r.requestProductSpecInThread(ctx, input, issue.Title)
+	comment, err := gateway.RequestProductSpec(ctx, planeProjectID, workItemID, "产品负责人", issue.Title)
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("request product spec on Plane: %v", err), kind: FailureRetryableTransient}
+	}
 	// Mark the hold reason so the anchor card reads "⏸ 等待产品方案" (node E) rather
-	// than the generic "⏸ 等你定夺" — the header alone tells you what's blocking.
-	r.setAwaitingProductSpecMarker(ctx, input.Loop, true)
-	return &loopError{message: "awaiting product spec — asked product to supply one on the work item", kind: FailureManualIntervention}
+	// than the generic "⏸ 等你定夺". Persist this before posting the Feishu card:
+	// card delivery refreshes the anchor header from the current loop metadata.
+	r.setAwaitingProductSpecMarker(ctx, input.Loop, true, comment.ID, issue)
+	// Plane owns the response. Feishu only targets the owner and deep-links to the
+	// exact source comment; replies in the thread are intentionally ignored.
+	r.requestProductSpecInThread(ctx, input, issue.Title, reason, planedoc.WorkItemCommentURL(issue.URL, comment.ID))
+	return &loopError{message: "awaiting an actionable product spec — asked product to supply one on the work item", kind: FailureManualIntervention}
 }
 
 // requestProductSpecInThread @-mentions the project's product owner in the loop's
@@ -1139,16 +1188,16 @@ func (r *Runner) productSpecGate(ctx context.Context, input stepInput, checkpoin
 // Plane comment RequestProductSpec posts, so the ask reaches them where they watch.
 // The open_id is resolved per-project from config (never hardcoded); a missing
 // transport or an unset owner just skips the ping. Best-effort.
-func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput, workItemTitle string) {
-	if r.postThreadNote == nil || r.projectRoleConfig == nil {
+func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput, workItemTitle, reason, actionURL string) {
+	if r.postThreadProductSpecCard == nil || r.projectRoleConfig == nil || strings.TrimSpace(actionURL) == "" {
 		return
 	}
 	var mentions []string
 	if openID := strings.TrimSpace(config.ProjectProductOwner(*r.projectRoleConfig, input.Project.ID).FeishuOpenID); openID != "" {
 		mentions = []string{openID}
 	}
-	note := fmt.Sprintf("⏸ 需求「%s」还没有正式产品 Spec。请在 Plane 创建或打开非空产品方案页，并在当前 work item 的 Links 中以 looper:product-spec 作为标题关联；外部链接、空白页、普通评论和飞书回复都不会解除门禁。链接完成后 Looper 会自动读取并继续。", strings.TrimSpace(workItemTitle))
-	if err := r.postThreadNote(ctx, input.Loop.ID, note, mentions); err != nil && r.logger != nil {
+	note := fmt.Sprintf("⏸ 需求「%s」需要产品负责人先出 product spec：%s。请前往 Plane 的具体评论补充方案页链接或正文；Looper 不会代写产品范围，飞书回复不会被读取。", strings.TrimSpace(workItemTitle), strings.TrimSpace(reason))
+	if err := r.postThreadProductSpecCard(ctx, input.Loop.ID, note, actionURL, mentions); err != nil && r.logger != nil {
 		r.logger.Warn("planner: post product-spec request note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 	}
 }
@@ -1157,27 +1206,98 @@ func (r *Runner) requestProductSpecInThread(ctx context.Context, input stepInput
 // flag in the loop metadata, so the anchor card can distinguish node E's product-spec
 // wait from a generic HITL ask. Best-effort + guarded: a Runner without a loops repo
 // (e.g. a unit/live test wiring only planeDoc) silently skips it.
-func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.LoopRecord, waiting bool) {
+func (r *Runner) setAwaitingProductSpecMarker(ctx context.Context, loop storage.LoopRecord, waiting bool, askCommentID string, issue *checkpointIssue) {
 	if r.repos == nil || r.repos.Loops == nil {
 		return
 	}
-	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"awaitingProductSpec": waiting})
-	if err != nil {
-		return
+	updates := map[string]any{"awaitingProductSpec": waiting}
+	if issue != nil {
+		updates["issueUrl"] = issue.URL
+		updates["issueTitle"] = issue.Title
+		updates["issueNumber"] = issue.IssueNumber
 	}
-	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil && r.logger != nil {
+	var metadataErr error
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, updates)
+		if err == nil && waiting {
+			metadataJSON, err = loopcondition.Set(&metadataJSON, loopcondition.Record{Kind: loopcondition.ProductSpec, Since: r.nowISO(), Fingerprint: strings.TrimSpace(askCommentID)})
+		} else if err == nil {
+			metadataJSON, err = loopcondition.Clear(&metadataJSON)
+		}
+		if err != nil {
+			metadataErr = err
+			return
+		}
+		updated.MetadataJSON = stringPtr(metadataJSON)
+	}); err != nil && r.logger != nil {
 		r.logger.Warn("planner: mark awaiting product spec failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+	} else if metadataErr != nil && r.logger != nil {
+		r.logger.Warn("planner: encode awaiting product spec marker failed", map[string]any{"loopId": loop.ID, "error": metadataErr.Error()})
 	}
 }
 
-// requestProductDecisionInThread posts the agent's product-language question
-// (productAsk, node H) into the loop's Feishu thread, @-mentioning the project's
-// product owner so they see it where they watch. The message is already written in
-// product language by the agent; this only frames + @-tags it. The open_id is
-// resolved per-project from config (never hardcoded); a missing transport just skips
-// and an unset owner posts without a mention. Best-effort.
-func (r *Runner) requestProductDecisionInThread(ctx context.Context, input stepInput, productAsk string) {
-	if r.postThreadCard == nil && r.postThreadNote == nil {
+// requestProductSpecClarificationOnPlane returns a genuinely blocking product gap
+// to the work item, where product can update the authoritative spec. Feishu remains
+// a one-way notification carrying the exact comment URL. Repeated execution reuses
+// the current awaiting ask instead of creating duplicate comments.
+func (r *Runner) requestProductSpecClarificationOnPlane(ctx context.Context, input stepInput, checkpoint plannerCheckpoint, productAsk string) (string, error) {
+	if r.planeDoc == nil {
+		return "", fmt.Errorf("planner: Plane decision requires a Plane document gateway")
+	}
+	gateway, planeProjectID, ok := r.planeDoc(input.Project.ID)
+	if !ok || gateway == nil {
+		return "", fmt.Errorf("planner: Plane decision gateway is not configured for project %s", input.Project.ID)
+	}
+	issue, err := requireIssue(checkpoint)
+	if err != nil {
+		return "", err
+	}
+	workItemID := planedoc.WorkItemIDFromURL(issue.URL)
+	if workItemID == "" {
+		return "", fmt.Errorf("planner: cannot resolve Plane work item from %q", issue.URL)
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, input.Loop.ID)
+	if err != nil {
+		return "", err
+	}
+	if fresh == nil {
+		return "", fmt.Errorf("planner: loop disappeared: %s", input.Loop.ID)
+	}
+	ask, hasAsk := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !(hasAsk && ask.Transport == "plane" && ask.Status == "awaiting" && strings.TrimSpace(ask.Question) == strings.TrimSpace(productAsk) && strings.TrimSpace(ask.ActionURL) != "") {
+		body := "<p><strong>📝 产品 spec 需要补充</strong></p><p>" + strings.ReplaceAll(htmlpkg.EscapeString(strings.TrimSpace(productAsk)), "\n", "<br>") + "</p><p>请先更新本 work item 已关联的 product spec，再回复本评论说明已更新。Looper 会重新读取 product spec 后再做技术方案。</p>"
+		comment, createErr := gateway.CreateWorkItemComment(ctx, planeProjectID, workItemID, planedoc.SignComment(body, "planner", r.agentModel))
+		if createErr != nil {
+			return "", createErr
+		}
+		actionURL := planedoc.WorkItemCommentURL(issue.URL, comment.ID)
+		if actionURL == "" {
+			return "", fmt.Errorf("planner: Plane product-spec comment did not return an id")
+		}
+		ask = loops.HITLAsk{Question: strings.TrimSpace(productAsk), SessionID: r.latestNativeSessionID(ctx, input.Loop.ID), Status: "awaiting", AskedAt: r.nowISO(), Transport: "plane", ActionURL: actionURL}
+		metadata, writeErr := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
+		if writeErr != nil {
+			return "", writeErr
+		}
+		metadata, writeErr = mergeLoopMetadataJSON(&metadata, map[string]any{"awaitingProductAnswer": true})
+		if writeErr != nil {
+			return "", writeErr
+		}
+		metadata, writeErr = loopcondition.Set(&metadata, loopcondition.Record{Kind: loopcondition.HumanAnswered, Since: ask.AskedAt})
+		if writeErr != nil {
+			return "", writeErr
+		}
+		if _, writeErr = r.updateLoop(ctx, *fresh, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadata) }); writeErr != nil {
+			return "", writeErr
+		}
+	}
+
+	r.notifyProductSpecClarification(ctx, input, productAsk, ask.ActionURL)
+	return ask.ActionURL, nil
+}
+
+func (r *Runner) notifyProductSpecClarification(ctx context.Context, input stepInput, productAsk, actionURL string) {
+	if r.postThreadProductSpecCard == nil || strings.TrimSpace(actionURL) == "" {
 		return
 	}
 	var mentions []string
@@ -1186,19 +1306,23 @@ func (r *Runner) requestProductDecisionInThread(ctx context.Context, input stepI
 			mentions = []string{openID}
 		}
 	}
-	// Prefer a header-less lark_md card so the product-language body keeps its structure
-	// (bold sub-headers, blank lines, one option per line); a plain "text" message would
-	// render none of it and collapse to a wall. Fall back to a text note only when the
-	// card path isn't wired (e.g. tests).
-	if r.postThreadCard != nil {
-		if err := r.postThreadCard(ctx, input.Loop.ID, strings.TrimSpace(productAsk), mentions); err != nil && r.logger != nil {
-			r.logger.Warn("planner: post product-decision card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
-		}
+	if err := r.postThreadProductSpecCard(ctx, input.Loop.ID, strings.TrimSpace(productAsk), actionURL, mentions); err != nil && r.logger != nil {
+		r.logger.Warn("planner: post product-spec clarification card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+	}
+}
+
+func (r *Runner) notifySpecApproval(ctx context.Context, input stepInput, body, actionURL string) {
+	if r.postThreadApprovalCard == nil || strings.TrimSpace(actionURL) == "" {
 		return
 	}
-	note := "🙋 这个需求有个地方需要你来拍板 —— 直接在本 thread 回复你的选择就行,我会据此更新方案:\n\n" + strings.TrimSpace(productAsk)
-	if err := r.postThreadNote(ctx, input.Loop.ID, note, mentions); err != nil && r.logger != nil {
-		r.logger.Warn("planner: post product-decision request note failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+	var mentions []string
+	if r.projectRoleConfig != nil {
+		if openID := strings.TrimSpace(config.ProjectOwner(*r.projectRoleConfig, input.Project.ID)); openID != "" {
+			mentions = []string{openID}
+		}
+	}
+	if err := r.postThreadApprovalCard(ctx, input.Loop.ID, strings.TrimSpace(body), actionURL, mentions); err != nil && r.logger != nil {
+		r.logger.Warn("planner: post spec-approval card failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 	}
 }
 
@@ -1242,7 +1366,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (p
 		}
 	}
 	if checkpoint.Worktree != nil {
-		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err == nil {
+		if plannerCheckpointWorktreeUsable(checkpoint.Worktree.Path, input.Project.RepoPath, worktreeRoot) {
 			return checkpoint, nil
 		}
 		checkpoint.Worktree = nil
@@ -1274,7 +1398,9 @@ As you write the spec, sort every open question into PRODUCT vs TECHNICAL.
 - TECHNICAL (which library, how to structure the code, a data shape, error handling, an internal name, anything a competent engineer can just pick): DECIDE it yourself, note it in the spec, and do NOT escalate.
 - PRODUCT: a decision only the product owner can make — it changes what the user sees or can do, the product's scope/behavior, or hinges on business intent, a user-facing tradeoff, or an unstated requirement.
 
-ONLY when at least one real PRODUCT decision genuinely needs the product owner to choose, ALSO emit a "productAsk" field in your final __LOOPER_RESULT__ line: ONE message written FOR the product owner, in the product owner's own language (match the language of the issue/thread).
+The authoritative product spec has already been supplied above. Follow every explicit decision in it. Do NOT reopen or replace its phase order, scope, priority, acceptance criteria, or other user-visible decisions. Do NOT invent optional pricing, packaging, or prioritization questions merely because the product spec does not discuss them.
+
+ONLY when the product spec itself marks a required item unresolved/TBD, or omits information without which implementation is genuinely impossible, emit a "productAsk" field in your final __LOOPER_RESULT__ line. The message asks the product owner to UPDATE THE PRODUCT SPEC before planning continues. Write it in the product owner's own language (match the issue/thread).
 
 FORMATTING — this message is shown as a Feishu card, so it MUST be structured, never one long paragraph. Use lark-markdown: **bold** for every sub-header and for the recommended option; a BLANK LINE between sections; and put each option on ITS OWN line. Do NOT use "#" headers (use **bold** instead). Lay it out EXACTLY like this (keep the bold sub-headers verbatim):
 
@@ -1295,7 +1421,7 @@ FORMATTING — this message is shown as a Feishu card, so it MUST be structured,
 Hard rules for productAsk:
   - Write like a product manager briefing a business stakeholder, NOT like an engineer. Someone who cannot read code must be able to decide from it alone.
   - NO engineering jargon of ANY kind: no API/endpoint/route, component/module/package/library names, field/column/schema names, CSS/z-index, file paths, or function names. Translate every technical thing into what the user actually experiences. (e.g. "read from the brand endpoint" → "where a brand's info is pulled from"; "the design-system package" → "the brand kit they imported".)
-  - Put everything needed to decide INSIDE the message. Do NOT include a spec link or tell them to go read the spec.
+  - Put everything needed to update the product spec INSIDE the message. Do NOT include a tech-spec link.
   - If there is NO product decision (only technical questions, which you resolved yourself), set productAsk to "" — never invent one.
 
 The productAsk value is a JSON string, so encode the line breaks as \n (a blank line between sections is \n\n). Your final marker line carries the extra field:
@@ -1310,6 +1436,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		if checkpoint.Decisions == nil || checkpoint.Decisions.Stage != "grilled_final" {
 			return checkpoint, &loopError{message: "write-spec blocked: final requirement GRILL has not converged", kind: FailureNonRetryable}
 		}
+	}
+	// Re-read the product spec immediately before authoring. This covers native
+	// resume after a product clarification and makes the product page—not a stale
+	// checkpoint or the issue body—the planner's current source of truth.
+	if gateErr := r.productSpecGate(ctx, input, checkpoint); gateErr != nil {
+		return checkpoint, gateErr
 	}
 	writeSpecCompleted := checkpoint.WriteSpec != nil && strings.EqualFold(checkpoint.WriteSpec.Status, "completed")
 	productAsk := ""
@@ -1328,7 +1460,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	if rootErr != nil {
 		return checkpoint, rootErr
 	}
-	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
+	if !plannerCheckpointWorktreeUsable(worktree.Path, input.Project.RepoPath, worktreeRoot) {
 		checkpoint.Worktree = nil
 		if checkpoint.WriteSpec != nil && !checkpoint.WriteSpec.GitReconciled {
 			checkpoint.WriteSpec = nil
@@ -1367,35 +1499,11 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 				prompt += "\n\n必须用中文编写研发技术 Spec。需求阶段已经收敛；下面的 Decision Log 是用户行为和角色决策的事实源，必须逐条引用，不得重新发明产品或设计行为。若真实代码调研发现新的阻塞需求问题，不得猜测，也不得继续写 Spec；在最终结果的 productAsk 中用 `RETURN_TO_REQUIREMENTS:` 开头列出问题，让 Looper fail closed 回到需求阶段。\n\n" + decisions.DecisionLogMarkdown(*checkpoint.Decisions)
 			}
 		}
-		// Follow-up resume (线程永远可追问): drain any human thread messages queued while
-		// the spec awaited review, and native-resume the SAME planner session so the
-		// agent keeps its full spec-authoring history and revises the spec incrementally
-		// (incorporating a product decision / answering a follow-up) — never replanning
-		// from scratch. On a fresh first run the inbox is empty, so this is a no-op and
-		// the agent starts normally.
-		nativeResumePrompt := ""
-		nativeSessionID := ""
-		var drainedInbox []loops.HumanMessage
-		if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
-			drainedInbox = inbox
-			var msgs strings.Builder
-			msgs.WriteString("While this spec was awaiting review, the human sent these messages in the task thread:")
-			for _, m := range inbox {
-				if t := strings.TrimSpace(m.Text); t != "" {
-					msgs.WriteString("\n- ")
-					msgs.WriteString(t)
-				}
-			}
-			msgs.WriteString("\nRead them in context and update the spec accordingly — incorporate a product decision, answer a follow-up, or tighten an open question. Do NOT rewrite the spec from scratch: revise the existing spec file incrementally to reflect their input.")
-			msgs.WriteString("\n\nThen DECIDE whether you can proceed or still need them, and LEAN TOWARD ASKING rather than silently continuing (强操控 — the human is driving). Unless they clearly gave the go-ahead (e.g. \"继续\" / \"go ahead\", or they answered the pending decision), put your reply to them in the productAsk field: briefly state how you understood/answered them, then explicitly ask \"可以继续吗?\" so they know the ball is in their court. In THIS follow-up turn the productAsk IS your conversational reply to them (an answer + a can-I-continue check, or the surfaced decision) — not necessarily a formal product decision, so the usual \"no decision → empty\" rule does not apply here. Only when they have clearly told you to proceed, set productAsk to \"\" so the spec moves on to review.")
-			nativeResumePrompt = msgs.String()
-			prompt += "\n\n" + nativeResumePrompt
-			nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID)
-		}
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
+		nativeResumePrompt, nativeSessionID := pendingPlaneDecisionAnswer(input.Loop)
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
@@ -1429,11 +1537,10 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
-		productAsk = checkpoint.WriteSpec.ProductAsk
-		// Clear ONLY the messages this turn actually consumed (fed above). A message that
-		// arrived mid-run — after the inbox was read — was never seen by the agent, so it
-		// stays queued for a follow-up turn instead of being silently eaten here.
-		r.clearHumanInbox(ctx, &input.Loop, drainedInbox)
+		productAsk = strings.TrimSpace(result.ProductAsk)
+		if nativeResumePrompt != "" {
+			r.markPlaneDecisionAnswerConsumed(ctx, &input.Loop)
+		}
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -1484,23 +1591,27 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		}
 		return checkpoint, &loopError{message: "write-spec returned a non-empty V2 productAsk without the required RETURN_TO_REQUIREMENTS: prefix; refusing legacy product notification and technical-spec progress", kind: FailureManualIntervention}
 	}
-	// Node H product-decision hold: the spec turn surfaced a real product question
-	// only the owner can answer. Ask them in the thread (product language) and HOLD
-	// before the owner-approval gate — publish/grill/review don't run yet. The run
-	// still completes (skipReason), so the loop reaches "completed" and a thread reply
-	// reactivates it via the follow-up resume, which re-runs write-spec with the
-	// answer; once no product question remains the flow proceeds to owner approval. On
-	// a fresh first run or a resume that RESOLVED the question, productAsk is empty and
-	// any prior hold marker is cleared so the loop advances normally.
+	// Node H product-decision hold. Plane owns the answer; Feishu only notifies with
+	// the exact comment link. The blocked-condition reconciler observes a later human
+	// Plane comment, records it, and native-resumes this same authoring session.
 	if productAsk != "" && r.isPlaneProject(input.Project.ID) {
-		r.requestProductDecisionInThread(ctx, input, productAsk)
-		r.setAwaitingProductAnswerMarker(ctx, input.Loop, true)
+		if _, err := r.requestProductSpecClarificationOnPlane(ctx, input, checkpoint, productAsk); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
 		r.setNodeHPhase(ctx, input.Loop.ID, "awaiting_product_answer")
-		checkpoint.SkipReason = "awaiting product decision — asked the product owner in the thread"
+		checkpoint.SkipReason = awaitingProductDecisionSkipReason
 		return checkpoint, nil
 	}
 	r.setAwaitingProductAnswerMarker(ctx, input.Loop, false)
 	return checkpoint, nil
+}
+
+func plannerCheckpointWorktreeUsable(worktreePath, repoPath, worktreeRoot string) bool {
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktreePath, RepoPath: repoPath, WorktreeRoot: worktreeRoot}); err != nil {
+		return false
+	}
+	info, err := os.Stat(worktreePath)
+	return err == nil && info.IsDir()
 }
 
 func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
@@ -1834,8 +1945,6 @@ func (r *Runner) runGrillStep(ctx context.Context, input stepInput) (plannerChec
 		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
 			r.logger.Warn("grill: post transcript failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
-		// node H condition #2: surface the grill transcript in the Feishu thread too.
-		r.postNodeHThreadNote(ctx, input, "grillTranscript", "🔬 GRILL 拷问结论:\n"+truncateRunes(summary, 1200), false)
 	}
 	checkpoint.Publish.Grilled = true
 	r.setNodeHPhase(ctx, input.Loop.ID, "reviewing")
@@ -2069,11 +2178,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 		}
 		return checkpoint, &loopError{message: "review: Plane spec changed during independent REVIEW; re-publish and run a fresh REVIEW before approval", kind: FailureRetryableAfterResume}
 	}
-	if summary := cleanAgentSummary(result.Summary); summary != "" {
-		body := planedoc.SignComment("<p>👀 <b>REVIEW 复核结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p>", "reviewer", r.agentModel)
-		if err := gateway.CommentOnPageURL(ctx, planeProjectID, specURL, body); err != nil && r.logger != nil {
-			r.logger.Warn("review: post verdict failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
-		}
+	summary := cleanAgentSummary(result.Summary)
+	body := planedoc.SignComment("<p>👀 <b>REVIEW 复核结论</b></p><p>"+htmlEscape(truncateRunes(summary, 1500))+"</p>", "reviewer", r.agentModel)
+	_, err = gateway.CreateCommentOnPageURL(ctx, planeProjectID, specURL, body)
+	if err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("review: post verdict: %v", err), kind: FailureRetryableTransient}
 	}
 	approval, err := r.openSpecApprovalRevision(ctx, input, gateway, planeProjectID, specURL, worktree.Path, firstNonEmpty(worktree.SpecPath, issue.SpecPath), checkpoint.Publish.ReviewPlaneContentHash)
 	if err != nil {
@@ -2120,7 +2229,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (plannerChe
 			r.logger.Warn("review: retire looper:plan failed (continuing)", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
 		}
 	}
-	r.postNodeHThreadNote(ctx, input, "approvalRequest:"+approval.ContentHash, "🙋 技术方案已过 GRILL 拷问 + 独立 REVIEW，请 Looper owner 审批当前修订 v"+strconv.Itoa(approval.Revision)+" —— 无异议在方案页评论 approve / 同意 / 👍 即进入实现："+specURL, true)
+	approvalActionURL := planedoc.PageCommentURL(specURL, approval.CommentID)
+	if approvalActionURL == "" {
+		return checkpoint, &loopError{message: "review: Plane approval request did not return a comment id", kind: FailureRetryableTransient}
+	}
+	r.notifySpecApproval(ctx, input, "技术方案已过 GRILL 拷问 + 独立 REVIEW，请 Looper owner 审批当前修订 v"+strconv.Itoa(approval.Revision)+"；无异议可答 approve / 同意 / 👍，随后进入实现。", approvalActionURL)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -2247,6 +2360,7 @@ func buildGrillPrompt(issue checkpointIssue, specFilePath, decisionContext strin
 		"Adversarially interrogate it against the REAL codebase in this worktree: open the actual source at any file:line it cites; if a claim can't be verified from real code, flag it '⚠️ 未经源码验证'. Never pretend to have read code you didn't.",
 		"Hunt for: missing/weak acceptance criteria, unhandled edge cases, security/data/migration/concurrency risk, hand-wavy steps, scope creep, and anything a worker couldn't implement unambiguously.",
 		fmt.Sprintf("REVISE the spec file `%s` IN PLACE to resolve what you can (keep the structure; tighten, don't bloat). Edit ONLY that file — do NOT commit, do NOT write anything outside this worktree, do NOT run `plane`/`gh`, do NOT push or open a pull request. looper validates, commits, and publishes the file for you.", specFilePath),
+		"Keep the entire technical spec in Simplified Chinese; preserve code identifiers, file paths, commands, API names, and other exact technical tokens in their original form.",
 		"For anything you genuinely cannot decide (a real product/design/engineering ambiguity), do NOT guess and do NOT let the spec proceed with a merely-labelled open question.",
 		"Finish with a concise grill transcript as your final summary: what you challenged, what you fixed in the file, and what remains open.",
 	}
@@ -2267,6 +2381,7 @@ func buildReviewPrompt(issue checkpointIssue, specFilePath, decisionContext stri
 		fmt.Sprintf("You are an INDEPENDENT spec reviewer for %s#%d, reviewing a tech spec that already passed an adversarial grill.", issue.Repo, issue.IssueNumber),
 		fmt.Sprintf("Read the spec file `%s` in this worktree.", specFilePath),
 		"Verify against the real codebase in this worktree (open cited source; flag unverified claims). Judge whether a worker could implement it unambiguously and safely.",
+		"Verify that the technical spec itself is written in Simplified Chinese, while exact code identifiers, file paths, commands, and API names remain unchanged; treat a language mismatch as a blocker.",
 		"This is a READ-ONLY verdict pass: do NOT edit any file, do NOT run `plane`/`gh`, do NOT push or open a pull request. If you find a blocking gap, state it precisely; otherwise confirm it is implementation-ready.",
 		"Your final summary MUST begin with exactly `VERDICT: READY` when implementation is unambiguous and safe, or `VERDICT: BLOCKED` followed by the specific blockers. BLOCKED must never open human approval.",
 		agent.CompletionMarker + `={"summary":"VERDICT: READY — ... or VERDICT: BLOCKED — ..."}`,
@@ -2717,87 +2832,6 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) strin
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
-// clearHumanInbox drops ONLY the messages that were actually fed to this write-spec
-// turn (drained), so they are not re-injected on a later run. Messages that arrived
-// WHILE the agent was mid-run (never read by it) are preserved for a follow-up turn
-// rather than silently eaten. No-op when nothing was drained or the inbox is empty.
-func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord, drained []loops.HumanMessage) {
-	if r.repos == nil || r.repos.Loops == nil || len(drained) == 0 {
-		return
-	}
-	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil || fresh == nil {
-		return
-	}
-	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
-		return
-	}
-	meta, werr := loops.RemoveHumanMessages(fresh.MetadataJSON, drained)
-	if werr != nil {
-		return
-	}
-	fresh.MetadataJSON = &meta
-	fresh.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
-		loop.MetadataJSON = &meta
-	}
-}
-
-// shouldFollowupResume reports whether a finished planner loop that just received a
-// new human thread message can be safely reactivated for a single incremental
-// follow-up turn (线程永远可追问). When true, createRunContext resumes at stepWriteSpec
-// with the spec-authoring + node-H gate flags rewound so the write-spec step
-// native-resumes the SAME planner session, drains the queued message, and revises
-// the spec incrementally — then re-publishes/re-grills/re-reviews the updated spec
-// (all idempotent). It NEVER re-discovers or re-plans from scratch.
-//
-// Strict guard so the "re-plan the whole thing" path can never be taken:
-//   - the prior run must have completed successfully ("success"); and
-//   - the loop must carry at least one pending human message; and
-//   - the checkpoint must carry the issue + a worktree + a completed write-spec; and
-//   - a native agent session id must be captured. Without a session, native resume
-//     is impossible and write-spec would author a fresh spec — so we refuse and let
-//     the caller fall back to the honest closed-task ack instead.
-//
-// Only ever reachable via the follow-up reactivation path (enqueueHumanMessageToLoop,
-// which only reactivates planner loops that have a captured session); a completed
-// loop is otherwise never re-dispatched.
-func (r *Runner) shouldFollowupResume(ctx context.Context, loop storage.LoopRecord, latestRun *storage.RunRecord, checkpoint plannerCheckpoint) bool {
-	if checkpoint.PipelineVersion >= 2 {
-		return false
-	}
-	// "success" = a finished loop the human is following up on; "interrupted" = the
-	// human's mid-run @bot killed the active agent (强操控) — either way, answer them from
-	// the main write-spec session. A genuinely "failed" run still retries normally.
-	if latestRun == nil || (latestRun.Status != "success" && latestRun.Status != "interrupted") {
-		return false
-	}
-	if len(loops.ReadHumanInbox(loop.MetadataJSON)) == 0 {
-		return false
-	}
-	if checkpoint.Issue == nil || checkpoint.Worktree == nil {
-		return false
-	}
-	if checkpoint.WriteSpec == nil || !strings.EqualFold(checkpoint.WriteSpec.Status, "completed") {
-		return false
-	}
-	return strings.TrimSpace(r.latestNativeSessionID(ctx, loop.ID)) != ""
-}
-
-// rewindPlannerCheckpointForFollowup rewinds a completed planner checkpoint so a
-// follow-up turn re-enters write-spec (re-runs the agent, native-resuming the SAME
-// session with the human message so the MAIN looper — not the fresh grill critic —
-// answers). It does NOT clear Grilled/Reviewed: a follow-up is "respond then hand the
-// wheel back to the human" (强操控), so it must NOT auto-re-run the minutes-long
-// grill/review passes or re-post their thread notes on every question. The revised
-// spec re-settles at the human approval gate; the human drives any re-validation.
-// Preserves everything needed to resume: issue, worktree, lock, lifecycle, publish ref.
-func rewindPlannerCheckpointForFollowup(checkpoint plannerCheckpoint) plannerCheckpoint {
-	checkpoint.WriteSpec = nil
-	checkpoint.SkipReason = ""
-	return checkpoint
-}
-
 func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) (resumedRunContext, error) {
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
@@ -2816,14 +2850,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	if check.PipelineVersion == 0 {
 		check.PipelineVersion = 1
 	}
-	// FOLLOW-UP RESUME (线程永远可追问): a planner loop got a new human message — resume
-	// the SAME session at write-spec so the MAIN looper answers (never the fresh grill
-	// critic), for ONE incremental turn (see shouldFollowupResume). This takes PRECEDENCE
-	// over shouldResume: when a run was interrupted BY the human's message (强操控 mid-run
-	// @bot kills the active agent → interrupted), we must answer them from the main
-	// session, not silently resume the interrupted grill/review step.
-	followupResume := r.shouldFollowupResume(ctx, loop, latestRun, check)
-	waitCandidate := !followupResume && latestRun != nil && latestRun.Status == "success" && check.Wait != nil && loop.Status == "queued"
+	waitCandidate := latestRun != nil && latestRun.Status == "success" && check.Wait != nil && loop.Status == "queued"
 	waitResume := waitCandidate && (check.PipelineVersion < 2 || v2DecisionWaitResolved(check))
 	if waitCandidate && check.PipelineVersion >= 2 && !waitResume {
 		stage := "<missing>"
@@ -2832,12 +2859,24 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		}
 		return resumedRunContext{}, fmt.Errorf("planner V2 decision barrier %q is not resolved; refusing non-Plane requeue", stage)
 	}
-	requirementsReopen := !followupResume && latestRun != nil && latestRun.Status == "failed" && check.PipelineVersion >= 2 && check.Decisions != nil && check.Decisions.Stage == "requirements_reopened"
-	shouldResume := !followupResume && latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
+	requirementsReopen := latestRun != nil && latestRun.Status == "failed" && check.PipelineVersion >= 2 && check.Decisions != nil && check.Decisions.Stage == "requirements_reopened"
+	shouldResume := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
 	startStep := stepDiscoverIssues
+	_, _, hasPlaneAnswer := planeDecisionAnswer(loop)
+	planeAnswerResume := hasPlaneAnswer && latestRun != nil
 	switch {
-	case followupResume:
+	case planeAnswerResume:
+		// The previous successful run stopped after write-spec solely to await the
+		// Plane decision. Re-enter that step with its issue/worktree checkpoint.
+		shouldResume = true
 		startStep = stepWriteSpec
+		check.WriteSpec = nil
+		// The product answer can change scope and acceptance criteria. Everything
+		// derived from the prior draft must be regenerated before owner approval.
+		check.Publish = nil
+		check.Notify = nil
+		check.SkipReason = ""
+		lastCompleted = stepPrepareWorktree
 	case waitResume:
 		startStep = check.Wait.ResumeStep
 		if startStep == "" || !plannerStepInVersion(startStep, check.PipelineVersion) {
@@ -2850,15 +2889,12 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			startStep = next
 		}
 	}
-	resumed := followupResume || waitResume || requirementsReopen || (shouldResume && startStep != stepDiscoverIssues)
+	resumed := planeAnswerResume || waitResume || requirementsReopen || (shouldResume && startStep != stepDiscoverIssues)
 	// Even a brand-new run must carry the pipeline version frozen on the loop.
 	// Dropping it here makes stepsFromVersion choose V1; discover then reloads V2
 	// and write-spec correctly fails because the V2 decision gates were skipped.
 	initialCheckpoint := plannerCheckpoint{PipelineVersion: check.PipelineVersion, ResumePolicy: "replay_step"}
-	if followupResume {
-		initialCheckpoint = rewindPlannerCheckpointForFollowup(check)
-		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
-	} else if resumed {
+	if resumed {
 		initialCheckpoint = check
 		if waitResume {
 			initialCheckpoint.Wait = nil
@@ -2868,11 +2904,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
-	if followupResume {
-		if prev := previousPlannerStepForVersion(startStep, initialCheckpoint.PipelineVersion); prev != "" {
-			run.LastCompletedStep = stringPtr(string(prev))
-		}
-	} else if waitResume || requirementsReopen {
+	if waitResume || requirementsReopen {
 		if prev := previousPlannerStepForVersion(startStep, initialCheckpoint.PipelineVersion); prev != "" {
 			run.LastCompletedStep = stringPtr(string(prev))
 		}
@@ -2898,6 +2930,49 @@ func v2DecisionWaitResolved(checkpoint plannerCheckpoint) bool {
 		return checkpoint.Decisions.Stage == "downstream_resolved"
 	default:
 		return false
+	}
+}
+
+func planeDecisionAnswer(loop storage.LoopRecord) (answer, sessionID string, ok bool) {
+	ask, exists := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !exists || !strings.EqualFold(ask.Transport, "plane") || !strings.EqualFold(ask.Status, "answered") || strings.TrimSpace(ask.Answer) == "" {
+		return "", "", false
+	}
+	return strings.TrimSpace(ask.Answer), strings.TrimSpace(ask.SessionID), true
+}
+
+func pendingPlaneDecisionAnswer(loop storage.LoopRecord) (prompt, sessionID string) {
+	answer, sessionID, ok := planeDecisionAnswer(loop)
+	if !ok {
+		return "", ""
+	}
+	return "The product owner answered your pending decision in the target Plane comment thread:\n\n" + answer + "\n\nTreat this comment-thread answer as authoritative lightweight product input. Revise the tech spec to reflect it. Continue from the existing work; do not restart or ask the same question again.", sessionID
+}
+
+func (r *Runner) markPlaneDecisionAnswerConsumed(ctx context.Context, loop *storage.LoopRecord) {
+	if r.repos == nil || r.repos.Loops == nil || loop == nil {
+		return
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !ok || ask.Transport != "plane" || ask.Status != "answered" {
+		return
+	}
+	ask.Status = "consumed"
+	metadata, err := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
+	if err != nil {
+		return
+	}
+	metadata, err = mergeLoopMetadataJSON(&metadata, map[string]any{"awaitingProductAnswer": false})
+	if err != nil {
+		return
+	}
+	updated, err := r.updateLoop(ctx, *fresh, func(current *storage.LoopRecord) { current.MetadataJSON = stringPtr(metadata) })
+	if err == nil {
+		*loop = updated
 	}
 }
 
@@ -3170,6 +3245,8 @@ func plannerFailureKind(kind failureclass.Kind) QueueFailureKind {
 		return FailureRetryableTransient
 	case failureclass.RetryableAfterResume:
 		return FailureRetryableAfterResume
+	case failureclass.RecoverableInfra:
+		return FailureRecoverableInfra
 	case failureclass.ManualIntervention:
 		return FailureManualIntervention
 	default:
@@ -3322,6 +3399,13 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 	if strings.TrimSpace(issue.Body) != "" {
 		parts = append(parts, "Issue body:\n"+issue.Body)
 	}
+	if strings.TrimSpace(issue.ProductSpec) != "" {
+		productSpec := "AUTHORITATIVE PRODUCT SPEC (highest-priority source of truth):\n" + issue.ProductSpec
+		if strings.TrimSpace(issue.ProductSpecURL) != "" {
+			productSpec += "\nProduct spec URL: " + issue.ProductSpecURL
+		}
+		parts = append(parts, productSpec)
+	}
 	if strings.TrimSpace(issue.URL) != "" {
 		parts = append(parts, "Issue URL: "+issue.URL)
 	}
@@ -3336,7 +3420,10 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"Requirements:",
 		"- Create or update the spec at " + issue.SpecPath,
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
-		"- Keep the implementation scope aligned to the issue",
+		"- Write the entire technical spec in Simplified Chinese; keep code identifiers, file paths, commands, API names, and other exact technical tokens in their original form",
+		"- Treat the product spec as authoritative for user-visible scope, phase order, priorities, and acceptance criteria; the issue is supporting context only",
+		"- Do not replace an explicit product decision with your own recommendation or invent pricing, packaging, or prioritization questions that the product spec does not mark unresolved",
+		"- Keep the implementation scope aligned to the product spec",
 	}
 	if allowAutoPush {
 		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")
@@ -3792,7 +3879,7 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 }
 
 func isRetryableFailure(kind QueueFailureKind) bool {
-	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
+	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureRecoverableInfra || kind == FailureNonRetryable
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {

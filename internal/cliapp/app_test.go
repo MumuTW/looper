@@ -3426,6 +3426,22 @@ func TestStopAllWithoutJSONUsesStopAllRoute(t *testing.T) {
 	}
 }
 
+func TestLoopStopInterruptsThroughAuthenticatedControlAPI(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/runs/active/12/stop" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_stop", map[string]any{"loopId": "loop_12", "runId": "run_12", "executionId": "exec_12", "vendor": "codex", "pid": 123, "stopped": true}))
+	}))
+	defer server.Close()
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "loop", "stop", "12", "--config", configPath)
+	if exitCode != 0 || stderr != "" || !strings.Contains(stdout, "Loop stopped") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
+	}
+}
+
 func TestCloseWithoutJSONUsesCloseRoute(t *testing.T) {
 	t.Parallel()
 

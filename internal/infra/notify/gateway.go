@@ -99,10 +99,6 @@ type Gateway struct {
 	// final card still shows the last activity.
 	liveMu    sync.Mutex
 	liveTails map[string]liveTailEntry
-	// askCards remembers each loop's live ask card (message id + the card it was
-	// built from) so the card can be patched to its resolved "✅ 已选:X" state when
-	// the answer arrives — keeping the full brief for review.
-	askCards map[string]askCardState
 	// liveFeeds remembers each loop's live-progress comment (a reply threaded under
 	// the anchor). The raw tool-call feed lives HERE — inside the thread — so the
 	// outer anchor card stays a human-scannable brief. Keyed by loop id → message id;
@@ -116,12 +112,6 @@ type Gateway struct {
 	// re-checks, so exactly one anchor is created.
 	rootMu    sync.Mutex
 	rootLocks map[string]*sync.Mutex
-	// closedFollowup remembers which finished tasks already got the one "task is
-	// done, continue on the issue/PR or open a new one" reply (§F option B), so a
-	// stream of follow-up messages in the thread gets a single honest ack, not a
-	// silent drop and not a spammed one.
-	closedFollowupMu sync.Mutex
-	closedFollowup   map[string]struct{}
 	// intakeOutcomes overrides a loop's anchor header with the classification's
 	// routing outcome. The coordinator (looper:auto) anchor never re-renders itself
 	// — completeIntakeAnchor delegated that to the downstream planner/worker loop,
@@ -130,11 +120,6 @@ type Gateway struct {
 	// coordinator loop id) so the shared task card retires to a meaningful state.
 	intakeMu       sync.Mutex
 	intakeOutcomes map[string]anchorOutcomeStyle
-}
-
-type askCardState struct {
-	msgID string
-	card  HITLAskCard
 }
 
 // anchorOutcomeStyle is a header colour+label override for a retired anchor card.
@@ -546,9 +531,8 @@ func feishuNotificationText(payload SystemNotificationPayload) string {
 	return mention + body
 }
 
-// HITLAskCard is a mid-run human-in-the-loop question rendered as an interactive
-// Feishu card with one button per option. Each button's value carries the loop
-// seq + the chosen answer so a card-action callback identifies the loop + reply.
+// HITLAskCard is a one-way Feishu notification for a decision that lives in
+// Plane or GitHub. The only card action opens the exact source-of-truth comment.
 type HITLAskCard struct {
 	ProjectID      string
 	LoopID         string
@@ -585,11 +569,21 @@ type HITLAskCard struct {
 	Consequences map[string]string
 	// Confidence is the agent's self-assessed certainty ("high"/"medium"/"low").
 	Confidence string
+}
 
-	// AnsweredWith, when set, renders the card in its resolved state: the option
-	// buttons are replaced by a "✅ 已选:<answer>" line while the question, research
-	// and consequences stay intact for later review.
-	AnsweredWith string
+type feishuDecisionCardIntent struct {
+	LoopID         string   `json:"loopId"`
+	Body           string   `json:"body"`
+	ActionURL      string   `json:"actionUrl"`
+	MentionOpenIDs []string `json:"mentionOpenIds,omitempty"`
+	Purpose        string   `json:"purpose,omitempty"`
+}
+
+type feishuCardIntent struct {
+	Kind     string                    `json:"kind"`
+	HITL     *HITLAskCard              `json:"hitl,omitempty"`
+	Decision *feishuDecisionCardIntent `json:"decision,omitempty"`
+	Attempts int64                     `json:"attempts,omitempty"`
 }
 
 // feishuMentionMarkup renders Feishu open_ids as card @-mention tags, e.g.
@@ -608,6 +602,13 @@ func feishuMentionMarkup(openIDs []string) string {
 // the app-bot credentials in notifications.webhook (appIdEnv/appSecretEnv/chatId)
 // and is a no-op error when they are not configured. Best-effort; caller logs.
 func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
+	if strings.TrimSpace(card.SourceURL) == "" {
+		return fmt.Errorf("decision notification requires an exact source-of-truth URL")
+	}
+	return g.enqueueFeishuCard(ctx, "Decision needed", card.Question, card.LoopID, feishuCardIntent{Kind: "hitl", HITL: &card})
+}
+
+func (g *Gateway) deliverHITLAsk(ctx context.Context, card HITLAskCard) error {
 	cfg := g.config.Webhook
 	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
 	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
@@ -623,6 +624,7 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	if len(card.MentionOpenIds) == 0 {
 		card.MentionOpenIds = cfg.MentionOpenIds
 	}
+	card.MentionOpenIds = firstFeishuOwner(card.MentionOpenIds)
 	if strings.TrimSpace(card.OwnerOpenID) == "" {
 		card.OwnerOpenID = g.ownerOpenID(card.ProjectID)
 	}
@@ -630,65 +632,153 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	if err != nil {
 		return err
 	}
-	// Thread the ask card under the loop's root so the question lands in the same
-	// thread as the task's other updates. Card buttons still work inside a thread.
+	// Thread the notification under the loop's root; its sole button is an outbound
+	// deep link and never sends a decision back to Looper.
 	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, card.LoopID)
 	// The loop is awaiting_human now — turn the anchor card orange "等你定夺".
 	g.updateFeishuThreadHeader(ctx, token, card.LoopID)
-	msgID, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON))
-	if err != nil {
-		return err
-	}
-	// Remember the card so MarkAskAnswered can patch it in place on delivery.
-	if strings.TrimSpace(msgID) != "" && strings.TrimSpace(card.LoopID) != "" {
-		g.liveMu.Lock()
-		if g.askCards == nil {
-			g.askCards = map[string]askCardState{}
+	_, err = g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON))
+	return err
+}
+
+func firstFeishuOwner(openIDs []string) []string {
+	for _, id := range openIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			return []string{id}
 		}
-		g.askCards[card.LoopID] = askCardState{msgID: msgID, card: card}
-		g.liveMu.Unlock()
 	}
 	return nil
 }
 
-// MarkAskAnswered patches a loop's ask card to its resolved "✅ 已选:X" state,
-// keeping the question + research + consequences intact. Best-effort; a no-op if
-// no ask card is remembered for the loop or the app-bot isn't configured.
-func (g *Gateway) MarkAskAnswered(ctx context.Context, loopID, answer string) {
+func (g *Gateway) enqueueFeishuCard(ctx context.Context, title, body, loopID string, intent feishuCardIntent) error {
+	if g.repositories == nil || g.repositories.Notifications == nil || g.repositories.Events == nil {
+		return fmt.Errorf("feishu card outbox repositories are not configured")
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(g.now().UTC())
+	payload, err := json.Marshal(intent)
+	if err != nil {
+		return err
+	}
+	record := storage.NotificationRecord{
+		ID:          eventlog.NewEventID("notification"),
+		LoopID:      g.existingLoopID(ctx, loopID),
+		EntityType:  stringPointer("notification"),
+		Channel:     "feishu_card",
+		Level:       "action",
+		Title:       strings.TrimSpace(title),
+		Body:        strings.TrimSpace(body),
+		Status:      "pending",
+		PayloadJSON: stringPointer(string(payload)),
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}
+	if err := g.persistNotification(ctx, record); err != nil {
+		return err
+	}
+	return g.attemptFeishuCard(ctx, record)
+}
+
+func (g *Gateway) existingLoopID(ctx context.Context, loopID string) *string {
 	loopID = strings.TrimSpace(loopID)
-	answer = strings.TrimSpace(answer)
-	if loopID == "" || answer == "" {
-		return
+	if loopID == "" || g.repositories == nil || g.repositories.Loops == nil {
+		return nil
 	}
-	// Always log the decision to the loop's story (+ refresh the anchor), even if
-	// this process no longer holds the ask card to patch.
-	g.RecordMilestone(ctx, loopID, "🧑‍⚖️ 已定夺:"+answer)
-	g.liveMu.Lock()
-	st, ok := g.askCards[loopID]
-	g.liveMu.Unlock()
-	if !ok || strings.TrimSpace(st.msgID) == "" {
-		return
+	loop, err := g.repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return nil
 	}
-	st.card.AnsweredWith = answer
-	cardJSON, err := buildFeishuAskCard(st.card)
+	return &loopID
+}
+
+// RetryPendingCards redelivers due action-card intents. The intent is persisted
+// before the first network call, so a daemon crash or transient Feishu outage cannot
+// make an actionable request disappear silently.
+func (g *Gateway) RetryPendingCards(ctx context.Context, limit int64) (int, error) {
+	if g.repositories == nil || g.repositories.Notifications == nil {
+		return 0, nil
+	}
+	due, err := g.repositories.Notifications.ListPendingOutbox(ctx, limit)
 	if err != nil {
-		return
+		return 0, err
 	}
-	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
-		return
+	retried := 0
+	for _, record := range due {
+		if !g.feishuCardRetryDue(record) {
+			continue
+		}
+		_ = g.attemptFeishuCard(ctx, record)
+		retried++
 	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	return retried, nil
+}
+
+func (g *Gateway) feishuCardRetryDue(record storage.NotificationRecord) bool {
+	var intent feishuCardIntent
+	if record.PayloadJSON == nil || json.Unmarshal([]byte(*record.PayloadJSON), &intent) != nil || intent.Attempts <= 0 {
+		return true
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, record.UpdatedAt)
 	if err != nil {
-		return
+		return true
 	}
-	if err := g.patchFeishuAppCard(ctx, token, st.msgID, string(cardJSON)); err == nil {
-		g.liveMu.Lock()
-		delete(g.askCards, loopID)
-		g.liveMu.Unlock()
+	exponent := intent.Attempts - 1
+	if exponent > 5 {
+		exponent = 5
 	}
+	delay := time.Duration(15*(int64(1)<<exponent)) * time.Second
+	return !g.now().UTC().Before(updatedAt.Add(delay))
+}
+
+func (g *Gateway) attemptFeishuCard(ctx context.Context, record storage.NotificationRecord) error {
+	var intent feishuCardIntent
+	if record.PayloadJSON == nil || json.Unmarshal([]byte(*record.PayloadJSON), &intent) != nil {
+		intent.Attempts = 5
+		return g.finishFeishuCardAttempt(ctx, record, intent, fmt.Errorf("invalid Feishu card outbox payload"))
+	}
+	var deliveryErr error
+	switch intent.Kind {
+	case "hitl":
+		if intent.HITL == nil {
+			deliveryErr = fmt.Errorf("missing HITL card payload")
+		} else {
+			deliveryErr = g.deliverHITLAsk(ctx, *intent.HITL)
+		}
+	case "decision":
+		if intent.Decision == nil {
+			deliveryErr = fmt.Errorf("missing decision card payload")
+		} else {
+			deliveryErr = g.deliverThreadDecisionCard(ctx, *intent.Decision)
+		}
+	default:
+		deliveryErr = fmt.Errorf("unsupported Feishu card intent %q", intent.Kind)
+	}
+	return g.finishFeishuCardAttempt(ctx, record, intent, deliveryErr)
+}
+
+func (g *Gateway) finishFeishuCardAttempt(ctx context.Context, record storage.NotificationRecord, intent feishuCardIntent, deliveryErr error) error {
+	intent.Attempts++
+	now := g.now().UTC()
+	nowISO := eventlog.FormatJavaScriptISOString(now)
+	record.UpdatedAt = nowISO
+	if deliveryErr == nil {
+		record.Status = "delivered"
+		record.ErrorMessage = nil
+		record.SentAt = &nowISO
+	} else {
+		record.ErrorMessage = stringPointer(deliveryErr.Error())
+		if intent.Attempts >= 5 {
+			record.Status = "failed"
+		} else {
+			record.Status = "pending"
+		}
+	}
+	if payload, err := json.Marshal(intent); err == nil {
+		record.PayloadJSON = stringPointer(string(payload))
+	}
+	if err := g.persistNotification(ctx, record); err != nil {
+		return err
+	}
+	return deliveryErr
 }
 
 // RecordMilestone appends one human-scannable milestone to a loop's story
@@ -771,31 +861,16 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 		body = title
 	}
 	seq := strconv.FormatInt(card.LoopSeq, 10)
-	recommended := strings.TrimSpace(card.RecommendedOption)
-
-	// Option buttons — the recommended one is marked ⭐ and stays "primary"; the
-	// rest drop to "default" so the recommendation reads at a glance.
-	actions := make([]any, 0, len(card.Options))
+	options := make([]string, 0, len(card.Options))
 	for _, option := range card.Options {
 		option = strings.TrimSpace(option)
 		if option == "" {
 			continue
 		}
-		label := option
-		btnType := "primary"
-		if recommended != "" {
-			if strings.EqualFold(option, recommended) {
-				label = "⭐ " + option + " · 推荐"
-			} else {
-				btnType = "default"
-			}
+		if strings.EqualFold(option, strings.TrimSpace(card.RecommendedOption)) {
+			option = "⭐ " + option + "（推荐）"
 		}
-		actions = append(actions, map[string]any{
-			"tag":   "button",
-			"type":  btnType,
-			"text":  map[string]any{"tag": "plain_text", "content": label},
-			"value": map[string]any{"loopSeq": seq, "answer": option},
-		})
+		options = append(options, "- "+option)
 	}
 
 	elements := make([]any, 0, 8)
@@ -814,13 +889,8 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if rec := strings.TrimSpace(card.Recommendation); rec != "" {
 		elements = append(elements, larkDiv("🔎 "+rec))
 	}
-	// Options — or, once answered, the resolved selection. Buttons are removed (so
-	// it can't be re-clicked) but the question, research and consequences stay for
-	// later review.
-	if answered := strings.TrimSpace(card.AnsweredWith); answered != "" {
-		elements = append(elements, larkDiv("✅ **已选:"+answered+"** · Looper 继续处理中 →"))
-	} else if len(actions) > 0 {
-		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
+	if len(options) > 0 {
+		elements = append(elements, larkDiv("**可选项**\n"+strings.Join(options, "\n")))
 	}
 	// Per-option consequences: pick this → that happens.
 	if conseq := feishuConsequences(card); conseq != "" {
@@ -831,14 +901,17 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if c := feishuConfidenceLabel(card.Confidence); c != "" {
 		noteParts = append(noteParts, c)
 	}
-	noteParts = append(noteParts, "loop "+seq, "点选项或直接回文字")
+	noteParts = append(noteParts, "loop "+seq, "请在来源系统回答；飞书回复不会被读取")
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
 	elements = append(elements, feishuLooperOwnerNote(card.OwnerOpenID))
+	elements = append(elements, map[string]any{"tag": "action", "actions": []any{map[string]any{
+		"tag":  "button",
+		"type": "primary",
+		"text": map[string]any{"tag": "plain_text", "content": "前往回答"},
+		"url":  strings.TrimSpace(card.SourceURL),
+	}}})
 
 	header := map[string]any{"template": "orange", "title": map[string]any{"tag": "plain_text", "content": "Looper needs a decision"}}
-	if strings.TrimSpace(card.AnsweredWith) != "" {
-		header = map[string]any{"template": "green", "title": map[string]any{"tag": "plain_text", "content": "✅ 已定夺"}}
-	}
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
 		"header":   header,
@@ -1176,7 +1249,7 @@ func (g *Gateway) ensureFeishuThreadRoot(ctx context.Context, token, chatID, loo
 		return ""
 	}
 	// Persisted (not just in-memory) so the inbound callback can reverse-map a
-	// thread reply back to this loop, and so it survives a daemon restart.
+	// later outbound updates back to this loop, and so it survives a daemon restart.
 	_ = g.repositories.FeishuThreads.Upsert(ctx, msgID, loopID, taskKey, chatID, eventlog.FormatJavaScriptISOString(g.now()))
 	return msgID
 }
@@ -1280,7 +1353,8 @@ func (g *Gateway) threadRootForLoop(ctx context.Context, loopID string) string {
 }
 
 // feishuThreadHeaderText builds a loop thread's plain-text root header, e.g.
-// "🔧 开始处理 #360 · owner/repo\n<title>". Best-effort; falls back to the loop id.
+// "🔧 开始处理 #360 · owner/repo\n<title>". Best-effort; never exposes an
+// internal loop id when the record cannot be resolved.
 func (g *Gateway) feishuThreadHeaderText(ctx context.Context, loopID string) string {
 	var loop *storage.LoopRecord
 	if g.repositories != nil && g.repositories.Loops != nil {
@@ -1289,7 +1363,7 @@ func (g *Gateway) feishuThreadHeaderText(ctx context.Context, loopID string) str
 		}
 	}
 	if loop == nil {
-		return "🔧 开始处理任务 " + loopID
+		return "🔧 Looper 任务更新"
 	}
 	head := "🔧 开始处理"
 	target := ""
@@ -1327,11 +1401,13 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	// Source = where the task CAME FROM (the originating issue), kept stable even
 	// after the loop target flips to the PR it opens — so the anchor never relabels
 	// its own source line as "PR" (which mismatched the issue link before).
-	issueURL := loopWorkerString(loop.MetadataJSON, "issueUrl")
+	issueURL := g.loopIssueURL(ctx, loop)
 	sourceLabel, sourceURL := "", ""
 	if issueURL != "" {
 		sourceLabel = "Issue"
-		if n := urlTrailingNumber(issueURL); n != "" {
+		if n := loopIssueNumber(loop.MetadataJSON); n > 0 {
+			sourceLabel = fmt.Sprintf("Issue #%d", n)
+		} else if n := urlTrailingNumber(issueURL); n != "" {
 			sourceLabel = "Issue #" + n
 		}
 		sourceURL = issueURL
@@ -1453,6 +1529,35 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 		return "", false
 	}
 	return string(raw), true
+}
+
+// loopIssueURL resolves the originating issue URL for an anchor card. Current
+// loops persist it in metadata, but older or checkpoint-resumed planners may only
+// have it in their latest run checkpoint. Falling back keeps the source reference
+// clickable while those loops converge onto the current metadata shape.
+func (g *Gateway) loopIssueURL(ctx context.Context, loop *storage.LoopRecord) string {
+	if loop == nil {
+		return ""
+	}
+	if issueURL := loopWorkerString(loop.MetadataJSON, "issueUrl"); issueURL != "" {
+		return issueURL
+	}
+	if g.repositories == nil || g.repositories.Runs == nil {
+		return ""
+	}
+	run, err := g.repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil || run == nil || run.CheckpointJSON == nil {
+		return ""
+	}
+	var checkpoint struct {
+		Issue *struct {
+			URL string `json:"url"`
+		} `json:"issue"`
+	}
+	if json.Unmarshal([]byte(*run.CheckpointJSON), &checkpoint) != nil || checkpoint.Issue == nil {
+		return ""
+	}
+	return strings.TrimSpace(checkpoint.Issue.URL)
 }
 
 // feishuLoopStatusTerminal reports whether a loop has reached an end state — no
@@ -1591,7 +1696,7 @@ func feishuLoopFlowchartStyle(loopType, status string, hasPR, awaitingProductSpe
 			return "blue", "👀 spec 评审中"
 		case "awaiting_product_answer":
 			// node H product-decision hold: the spec surfaced a product question and
-			// @-mentioned the product owner; it waits for their thread reply, not the
+			// @-mentioned the product owner; it waits for their Plane answer, not the
 			// owner's approval. Distinct from 需要人类审核 spec so the card is honest.
 			return "orange", "🙋 等待产品拍板"
 		case "awaiting_human_review":
@@ -2091,49 +2196,6 @@ func (g *Gateway) updateFeishuThreadHeader(ctx context.Context, token, loopID st
 	_ = g.patchFeishuAppCard(ctx, token, root, cardJSON)
 }
 
-// PostTaskClosedFollowup posts a single honest reply in a finished task's thread
-// when a human keeps talking to it (§F option B / P5): rather than silently
-// swallowing the message on a loop that will never run again, it says the task is
-// done and where to continue. At most once per loop. App-mode + best-effort.
-func (g *Gateway) PostTaskClosedFollowup(ctx context.Context, loopID string) error {
-	loopID = strings.TrimSpace(loopID)
-	if loopID == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
-		return nil
-	}
-	g.closedFollowupMu.Lock()
-	if g.closedFollowup == nil {
-		g.closedFollowup = map[string]struct{}{}
-	}
-	if _, done := g.closedFollowup[loopID]; done {
-		g.closedFollowupMu.Unlock()
-		return nil
-	}
-	g.closedFollowup[loopID] = struct{}{}
-	g.closedFollowupMu.Unlock()
-
-	cfg := g.config.Webhook
-	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
-	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
-	if appID == "" || appSecret == "" {
-		return nil
-	}
-	token, err := g.feishuTenantToken(ctx, appID, appSecret)
-	if err != nil {
-		return err
-	}
-	root := g.threadRootForLoop(ctx, loopID)
-	chatID := strings.TrimSpace(cfg.ChatID)
-	if strings.TrimSpace(root) == "" || chatID == "" {
-		return nil
-	}
-	raw, err := json.Marshal(map[string]string{"text": "✅ 本任务已完成。如需继续,请在对应的 issue / PR 上留言,或新建一个任务 —— 这个话题不再自动接管了。"})
-	if err != nil {
-		return err
-	}
-	_, err = g.postFeishuAppMessage(ctx, token, chatID, root, "text", string(raw))
-	return err
-}
-
 // PostThreadNote posts a plain-text reply into a loop's Feishu thread, optionally
 // @-mentioning open_ids — node H's thread touchpoints: the spec-draft FYI after AUTHOR
 // and the grill transcript after GRILL. No-op unless the app transport is configured
@@ -2196,28 +2258,67 @@ func (g *Gateway) postThreadNote(ctx context.Context, loopID, text string, menti
 // markdown). The card has no title bar on purpose: it should read as a threaded note,
 // not a banner. @-mentions the product owner via the card <at id=..> form. No-op unless
 // the app transport is configured and the loop already has a thread root.
-func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body string, mentionOpenIDs []string) error {
+func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error {
+	return g.postThreadActionCard(ctx, loopID, body, actionURL, mentionOpenIDs, "decision")
+}
+
+// PostThreadApprovalCard posts the owner-facing node-H tech-spec approval card.
+// It deliberately uses distinct copy and a distinct message id from product asks.
+func (g *Gateway) PostThreadApprovalCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error {
+	return g.postThreadActionCard(ctx, loopID, body, actionURL, mentionOpenIDs, "approval")
+}
+
+// PostThreadProductSpecCard points product to the work-item comment where they can
+// create or update the authoritative product spec before planning continues.
+func (g *Gateway) PostThreadProductSpecCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string) error {
+	return g.postThreadActionCard(ctx, loopID, body, actionURL, mentionOpenIDs, "product_spec")
+}
+
+func (g *Gateway) postThreadActionCard(ctx context.Context, loopID, body, actionURL string, mentionOpenIDs []string, purpose string) error {
 	loopID = strings.TrimSpace(loopID)
-	if loopID == "" || strings.TrimSpace(body) == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+	actionURL = strings.TrimSpace(actionURL)
+	if loopID == "" || strings.TrimSpace(body) == "" || actionURL == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
 		return nil
 	}
+	intent := feishuDecisionCardIntent{LoopID: loopID, Body: strings.TrimSpace(body), ActionURL: actionURL, MentionOpenIDs: firstFeishuOwner(mentionOpenIDs), Purpose: purpose}
+	return g.enqueueFeishuCard(ctx, "Plane action needed", body, loopID, feishuCardIntent{Kind: "decision", Decision: &intent})
+}
+
+func (g *Gateway) deliverThreadDecisionCard(ctx context.Context, intent feishuDecisionCardIntent) error {
+	loopID := strings.TrimSpace(intent.LoopID)
+	body := strings.TrimSpace(intent.Body)
+	actionURL := strings.TrimSpace(intent.ActionURL)
 	cfg := g.config.Webhook
 	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
 	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
 	if appID == "" || appSecret == "" {
-		return nil
+		return fmt.Errorf("feishu app credentials are not configured")
 	}
 	token, err := g.feishuTenantToken(ctx, appID, appSecret)
 	if err != nil {
 		return err
 	}
-	root := g.threadRootForLoop(ctx, loopID)
 	chatID := strings.TrimSpace(cfg.ChatID)
-	if strings.TrimSpace(root) == "" || chatID == "" {
-		return nil
+	if chatID == "" {
+		return fmt.Errorf("feishu chat id is not configured")
 	}
-	lead := "🙋 这个需求有个地方需要你来拍板 —— 直接在本 thread 回复你的选择就行,我会据此更新方案。"
-	if mention := feishuMentionMarkup(mentionOpenIDs); mention != "" {
+	// This also creates a real anchor for run-less coordinator loops. Previously the
+	// decision delivery required an already-existing root and silently no-op'd.
+	root := g.ensureFeishuThreadRoot(ctx, token, chatID, loopID)
+	approval := strings.EqualFold(strings.TrimSpace(intent.Purpose), "approval")
+	productSpec := strings.EqualFold(strings.TrimSpace(intent.Purpose), "product_spec")
+	lead := "🙋 这个需求有个地方需要你来拍板 —— 请前往 Plane 的具体评论回答。飞书回复不会被读取。"
+	buttonText := "前往 Plane 回答"
+	messageIDKey := decisionCardMsgIDKey
+	if approval {
+		lead = "👀 技术方案已完成 GRILL + REVIEW，请前往 Plane 审核。飞书回复不会被读取。"
+		buttonText = "前往 Plane 审核"
+		messageIDKey = approvalCardMsgIDKey
+	} else if productSpec {
+		lead = "📝 请先补充产品 spec，再让 Looper 开始技术梳理。请前往 Plane work item 处理；飞书回复不会被读取。"
+		buttonText = "前往 Plane 补 spec"
+	}
+	if mention := feishuMentionMarkup(firstFeishuOwner(intent.MentionOpenIDs)); mention != "" {
 		lead = mention + " " + lead
 	}
 	card := map[string]any{
@@ -2225,7 +2326,12 @@ func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body strin
 		"elements": []any{
 			larkDiv(lead),
 			map[string]any{"tag": "hr"},
-			larkDiv(strings.TrimSpace(body)),
+			larkDiv(body),
+			map[string]any{"tag": "action", "actions": []any{map[string]any{
+				"tag": "button", "type": "primary",
+				"text": map[string]any{"tag": "plain_text", "content": buttonText},
+				"url":  actionURL,
+			}}},
 		},
 	}
 	cardJSON, err := json.Marshal(card)
@@ -2235,7 +2341,7 @@ func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body strin
 	// A follow-up (线程永远可追问) revises the ask — UPDATE the existing 拍板 card in place
 	// so the thread shows ONE evolving card, not a fresh duplicate on every question. Fall
 	// back to a new post when there's no prior card or the patch fails (e.g. it aged out).
-	if prior := g.loopMetaString(ctx, loopID, decisionCardMsgIDKey); prior != "" {
+	if prior := g.loopMetaString(ctx, loopID, messageIDKey); prior != "" {
 		if err := g.patchFeishuAppCard(ctx, token, prior, string(cardJSON)); err == nil {
 			g.updateFeishuThreadHeader(ctx, token, loopID)
 			return nil
@@ -2246,15 +2352,17 @@ func (g *Gateway) PostThreadDecisionCard(ctx context.Context, loopID, body strin
 		return err
 	}
 	if strings.TrimSpace(msgID) != "" {
-		g.setLoopMetaString(ctx, loopID, decisionCardMsgIDKey, msgID)
+		g.setLoopMetaString(ctx, loopID, messageIDKey, msgID)
 	}
 	g.updateFeishuThreadHeader(ctx, token, loopID)
 	return nil
 }
 
-// decisionCardMsgIDKey stores the node-H 拍板 card's message id in loop metadata so a
-// follow-up revision patches that card in place instead of posting a duplicate.
+// decisionCardMsgIDKey stores the product-action card's message id in loop metadata
+// so a follow-up revision patches that card in place instead of posting a duplicate.
 const decisionCardMsgIDKey = "productAskCardMsgId"
+
+const approvalCardMsgIDKey = "specApprovalCardMsgId"
 
 // loopMetaString reads a top-level string field from a loop's metadata; "" when absent
 // or unreadable.
@@ -2645,9 +2753,21 @@ func (g *Gateway) persistNotification(ctx context.Context, record storage.Notifi
 		return err
 	}
 
+	eventType := "notification.sent"
+	switch record.Status {
+	case "pending":
+		eventType = "notification.pending"
+	case "delivered", "success":
+		eventType = "notification.delivered"
+	case "failed":
+		eventType = "notification.failed"
+	}
+	if record.ErrorMessage != nil && record.Status == "pending" {
+		eventType = "notification.delivery_failed"
+	}
 	return eventlog.Append(ctx, g.repositories, eventlog.AppendInput{
 		ID:         eventlog.NewEventID("event"),
-		EventType:  "notification.sent",
+		EventType:  eventType,
 		ProjectID:  record.ProjectID,
 		LoopID:     record.LoopID,
 		RunID:      record.RunID,
@@ -2659,8 +2779,9 @@ func (g *Gateway) persistNotification(ctx context.Context, record storage.Notifi
 			"status":    record.Status,
 			"dedupeKey": record.DedupeKey,
 			"title":     record.Title,
+			"error":     record.ErrorMessage,
 		},
-		CreatedAt: mustParseJSISOString(record.CreatedAt),
+		CreatedAt: mustParseJSISOString(record.UpdatedAt),
 	})
 }
 

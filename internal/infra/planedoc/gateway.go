@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	htmlpkg "html"
+	"regexp"
 	"strings"
 	"time"
 
@@ -69,8 +70,12 @@ func New(o Options) *Gateway {
 
 // Page is a Plane spec document.
 type Page struct {
-	ID   string
-	Name string
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	ContentHTML string `json:"description_html"`
+	CreatedBy   string `json:"created_by"`
+	UpdatedBy   string `json:"updated_by"`
+	OwnedBy     string `json:"owned_by"`
 	// URL is the human-clickable page URL (constructed; Plane's page API returns no
 	// URL). The page id is embedded, so a link back to it is reverse-parseable.
 	URL string
@@ -148,6 +153,45 @@ func (g *Gateway) PageContent(ctx context.Context, projectID, pageID string) (st
 		return "", fmt.Errorf("planedoc: get page content: %w", err)
 	}
 	return strings.TrimRight(result.Stdout, "\n"), nil
+}
+
+// PageDocument returns a page's content and authorship metadata. Product-spec
+// callers use this instead of PageContent because a non-empty page is not enough:
+// the configured product owner must have created, owned, or last updated it.
+func (g *Gateway) PageDocument(ctx context.Context, projectID, pageID string) (Page, error) {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(pageID) == "" {
+		return Page{}, fmt.Errorf("planedoc: PageDocument requires project id and page id")
+	}
+	args := []string{"api", "page", "get", "--project", projectID, pageID, "--json"}
+	args = append(args, g.globalArgs()...)
+	result, err := g.runPlane(ctx, "", args...)
+	if err != nil {
+		return Page{}, fmt.Errorf("planedoc: get page document: %w", err)
+	}
+	var page Page
+	if err := json.Unmarshal([]byte(result.Stdout), &page); err != nil {
+		return Page{}, fmt.Errorf("planedoc: decode page document: %w", err)
+	}
+	if strings.TrimSpace(page.ID) == "" {
+		return Page{}, fmt.Errorf("planedoc: page document has no id")
+	}
+	page.ContentHTML = strings.TrimSpace(page.ContentHTML)
+	page.URL = g.pageWebURL(projectID, page.ID)
+	return page, nil
+}
+
+// AuthoredBy reports whether Plane attributes the page to memberID. Any one of
+// creator, owner, or latest editor is enough: product may take ownership of an
+// existing shell and complete it, but a page touched only by Looper's account is
+// never accepted as product-authored.
+func (p Page) AuthoredBy(memberID string) bool {
+	memberID = strings.TrimSpace(memberID)
+	if memberID == "" {
+		return false
+	}
+	return strings.TrimSpace(p.CreatedBy) == memberID ||
+		strings.TrimSpace(p.UpdatedBy) == memberID ||
+		strings.TrimSpace(p.OwnedBy) == memberID
 }
 
 // UpdatePageContent replaces a Plane page's body with bodyMarkdown (converted to HTML
@@ -294,7 +338,7 @@ func (g *Gateway) WriteTechSpec(ctx context.Context, projectID, workItemID, name
 // PageIDFromURL extracts a Plane page id from a page URL of the form
 // .../pages/<uuid>[/]. Returns "" when the URL isn't a Plane page link.
 func PageIDFromURL(pageURL string) string {
-	trimmed := strings.TrimRight(strings.TrimSpace(pageURL), "/")
+	trimmed := strings.TrimRight(strings.TrimSpace(strings.SplitN(pageURL, "#", 2)[0]), "/")
 	marker := "/pages/"
 	i := strings.LastIndex(trimmed, marker)
 	if i < 0 {
@@ -305,6 +349,22 @@ func PageIDFromURL(pageURL string) string {
 		return ""
 	}
 	return id
+}
+
+// PageCommentURL returns the exact browser destination for a decision comment.
+// Plane currently exposes page comments as anchors on the page, so notification
+// transports can remain one-way and still take the owner directly to the source.
+func PageCommentURL(pageURL, commentID string) string {
+	pageURL = strings.TrimRight(strings.TrimSpace(strings.SplitN(pageURL, "#", 2)[0]), "/")
+	commentID = strings.TrimSpace(commentID)
+	if pageURL == "" || commentID == "" {
+		return ""
+	}
+	return pageURL + "#comment-" + commentID
+}
+
+func WorkItemCommentURL(workItemURL, commentID string) string {
+	return PageCommentURL(workItemURL, commentID)
 }
 
 // IntakeAction is what a looper:auto feature work item needs next at the intake
@@ -343,12 +403,13 @@ func (g *Gateway) HasProductSpec(ctx context.Context, projectID, workItemID stri
 // must use Actor as its authority; display names are intentionally not part of the
 // contract returned by Plane's work-item comment API.
 type WorkItemComment struct {
-	ID          string `json:"id"`
-	Actor       string `json:"actor"`
-	CommentHTML string `json:"comment_html"`
-	Description string `json:"description"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+	ID              string `json:"id"`
+	Actor           string `json:"actor"`
+	CommentHTML     string `json:"comment_html"`
+	CommentStripped string `json:"comment_stripped"`
+	Description     string `json:"description"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
 }
 
 func (g *Gateway) workItemCommentsPath(projectID, workItemID string) (string, error) {
@@ -407,32 +468,57 @@ func (g *Gateway) ListWorkItemComments(ctx context.Context, projectID, workItemI
 	return comments, nil
 }
 
-// CommentOnWorkItem posts an HTML comment on a Plane work item.
 func (g *Gateway) CommentOnWorkItem(ctx context.Context, projectID, workItemID, commentHTML string) error {
-	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(workItemID) == "" || strings.TrimSpace(commentHTML) == "" {
-		return fmt.Errorf("planedoc: CommentOnWorkItem requires project id, work item id, and html")
-	}
-	data := fmt.Sprintf(`{"comment_html":%s}`, jsonString(commentHTML))
-	args := []string{"api", "comment", "create", "--project", projectID, "--work-item", workItemID, "--data", data}
-	args = append(args, g.globalArgs()...)
-	if _, err := g.runPlane(ctx, "", args...); err != nil {
-		return fmt.Errorf("planedoc: comment on work item: %w", err)
-	}
-	return nil
+	_, err := g.CreateWorkItemComment(ctx, projectID, workItemID, commentHTML)
+	return err
 }
 
 // RequestProductSpec asks the product owner (by an already-rendered mention/name)
 // to supply a product spec, as a comment on the work item (flowchart node E, Plane
-// side — the task-card @-mention in Feishu is a separate surface). The visible
-// instruction matches HasProductSpec exactly: only a native work-item link titled
-// looper:product-spec satisfies this formal gate.
-func (g *Gateway) RequestProductSpec(ctx context.Context, projectID, workItemID, ownerMention, workItemName string) error {
+// side — the task-card @-mention in Feishu is a separate surface). The comment
+// tells them looper will auto-associate whatever spec link/text they reply with.
+func (g *Gateway) RequestProductSpec(ctx context.Context, projectID, workItemID, ownerMention, workItemName string) (WorkItemComment, error) {
 	html := fmt.Sprintf(
-		"<p>%s 这个需求「%s」还没有正式 product spec。请在 Plane 创建或打开产品方案页，并在当前 work item 的 Links 中以 <code>looper:product-spec</code> 作为标题关联。普通评论或飞书回复不会解除这个门禁；链接完成后 Looper 会自动读取并继续。</p>",
+		"<p>%s 请先为需求「%s」补一份可执行的 product spec，再让 looper 开始技术梳理。</p><p>至少写清：用户问题与目标、首版范围和非目标、关键交互或输出、验收标准；涉及付费策略或阶段优先级，也请直接在 spec 中定下来。</p><p>请由产品负责人创建或更新方案页，或由产品负责人在这条评论下明确回复方案链接/正文。Looper 不会代写产品范围；验证产品身份后才会关联到本 work item 并继续。</p>",
 		htmlpkg.EscapeString(strings.TrimSpace(ownerMention)),
 		htmlpkg.EscapeString(strings.TrimSpace(workItemName)),
 	)
-	return g.CommentOnWorkItem(ctx, projectID, workItemID, html)
+	comments, err := g.ListWorkItemComments(ctx, projectID, workItemID)
+	if err != nil {
+		return WorkItemComment{}, err
+	}
+	for index := len(comments) - 1; index >= 0; index-- {
+		if strings.TrimSpace(comments[index].CommentHTML) == html {
+			return comments[index], nil
+		}
+	}
+	return g.CreateWorkItemComment(ctx, projectID, workItemID, html)
+}
+
+var (
+	workItemCommentHrefPattern = regexp.MustCompile(`(?i)\bhref\s*=\s*["']([^"']+)["']`)
+	workItemCommentURLPattern  = regexp.MustCompile(`https?://[^\s<>"']+`)
+	workItemCommentBreaks      = regexp.MustCompile(`(?i)<br\s*/?>|</(?:p|div|li|h[1-6])\s*>`)
+	workItemCommentTags        = regexp.MustCompile(`<[^>]+>`)
+)
+
+// DroppedSpecContent maps a reply on the exact Plane ask to the existing
+// AssociateDroppedSpec contract. A linked document stays a link; inline text is
+// captured into a Plane page before the work-item association is written.
+func DroppedSpecContent(comment WorkItemComment) (url, inlineText string) {
+	if match := workItemCommentHrefPattern.FindStringSubmatch(comment.CommentHTML); len(match) == 2 {
+		return strings.TrimSpace(htmlpkg.UnescapeString(match[1])), ""
+	}
+	text := strings.TrimSpace(comment.CommentStripped)
+	if text == "" {
+		text = workItemCommentBreaks.ReplaceAllString(comment.CommentHTML, "\n")
+		text = workItemCommentTags.ReplaceAllString(text, "")
+		text = strings.TrimSpace(htmlpkg.UnescapeString(text))
+	}
+	if match := workItemCommentURLPattern.FindString(text); match != "" {
+		return strings.TrimSpace(match), ""
+	}
+	return "", text
 }
 
 // PageComment is a Notion-style comment on a Plane page (powerformer/plane PR #11,
@@ -985,6 +1071,24 @@ func decodePageComments(stdout string) ([]PageComment, error) {
 	var bare []PageComment
 	if err := json.Unmarshal([]byte(stdout), &bare); err != nil {
 		return nil, fmt.Errorf("planedoc: decode page comments: %w", err)
+	}
+	return bare, nil
+}
+
+func decodeWorkItemComments(stdout string) ([]WorkItemComment, error) {
+	stdout = strings.TrimSpace(stdout)
+	if stdout == "" {
+		return nil, nil
+	}
+	var envelope struct {
+		Results []WorkItemComment `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err == nil && envelope.Results != nil {
+		return envelope.Results, nil
+	}
+	var bare []WorkItemComment
+	if err := json.Unmarshal([]byte(stdout), &bare); err != nil {
+		return nil, fmt.Errorf("planedoc: decode work item comments: %w", err)
 	}
 	return bare, nil
 }

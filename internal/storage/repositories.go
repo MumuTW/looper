@@ -329,6 +329,18 @@ func (r *NotificationsRepository) Upsert(ctx context.Context, record Notificatio
 	return nil
 }
 
+func (r *NotificationsRepository) ListPendingOutbox(ctx context.Context, limit int64) ([]NotificationRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM notifications WHERE channel = 'feishu_card' AND status = 'pending' ORDER BY created_at ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending notification outbox: %w", err)
+	}
+	defer rows.Close()
+	return scanNotifications(rows)
+}
+
 func (r *NotificationsRepository) GetByID(ctx context.Context, id string) (*NotificationRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM notifications WHERE id = ?`, id)
 	record, err := scanNotification(row)
@@ -377,7 +389,7 @@ type FeishuThreadsRepository struct{ q sqliteQuerier }
 // taskKey is the stable task identity (issue:repo:N) the anchor is shared under;
 // "" means the loop has no source issue and is keyed per-loop. On a repeat call
 // for an existing root (a new loop joining the same task's card) loop_id is
-// refreshed so a thread reply routes to the currently-active loop.
+// refreshed so outbound updates stay associated with the currently-active loop.
 func (r *FeishuThreadsRepository) Upsert(ctx context.Context, rootMessageID, loopID, taskKey, chatID, createdAt string) error {
 	var taskKeyArg any
 	if strings.TrimSpace(taskKey) != "" {
@@ -458,19 +470,6 @@ func (r *FeishuLiveFeedsRepository) MessageByLoop(ctx context.Context, loopID st
 		return "", fmt.Errorf("feishu live feed by loop: %w", err)
 	}
 	return messageID, nil
-}
-
-// LoopByRoot returns the loop id a thread root belongs to, or "" when unknown.
-func (r *FeishuThreadsRepository) LoopByRoot(ctx context.Context, rootMessageID string) (string, error) {
-	var loopID string
-	err := r.q.QueryRowContext(ctx, `SELECT loop_id FROM feishu_threads WHERE root_message_id = ?`, rootMessageID).Scan(&loopID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil
-		}
-		return "", fmt.Errorf("feishu thread loop by root: %w", err)
-	}
-	return loopID, nil
 }
 
 type EventsRepository struct{ q sqliteQuerier }
@@ -1264,6 +1263,14 @@ func (r *LocksRepository) Release(ctx context.Context, key string) error {
 	return nil
 }
 
+func (r *LocksRepository) ReleaseOwned(ctx context.Context, key, owner string) error {
+	_, err := r.q.ExecContext(ctx, `DELETE FROM locks WHERE key = ? AND owner = ?`, key, owner)
+	if err != nil {
+		return fmt.Errorf("release owned lock: %w", err)
+	}
+	return nil
+}
+
 func (r *LocksRepository) Get(ctx context.Context, key string) (*LockRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM locks WHERE key = ?`, key)
 	record, err := scanLock(row)
@@ -1556,6 +1563,20 @@ func (r *QueueRepository) CountByLoopIDAndStatus(ctx context.Context, loopID, st
 	var count int64
 	if err := row.Scan(&count); err != nil {
 		return 0, fmt.Errorf("count queue items by loop and status: %w", err)
+	}
+	return count, nil
+}
+
+func (r *QueueRepository) CountBlockedInfra(ctx context.Context) (int64, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM queue_items
+		WHERE status IN ('failed', 'manual_intervention')
+			AND last_error_kind = 'recoverable_infra'
+	`)
+	var count int64
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count infrastructure-blocked queue items: %w", err)
 	}
 	return count, nil
 }
@@ -2314,8 +2335,8 @@ const scheduledQueueOrderBy = `
 		qi.priority ASC, qi.available_at ASC, qi.created_at ASC
 `
 
-const longTermRetryPredicateLiteral = `qi.attempts >= 5 AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'non_retryable')`
-const longTermRetryPredicateParam = `qi.attempts >= ? AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'non_retryable')`
+const longTermRetryPredicateLiteral = `qi.attempts >= 5 AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'recoverable_infra', 'non_retryable')`
+const longTermRetryPredicateParam = `qi.attempts >= ? AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'recoverable_infra', 'non_retryable')`
 
 const scheduledQueueQuery = scheduledQueueBaseQuery + scheduledQueueOrderBy
 

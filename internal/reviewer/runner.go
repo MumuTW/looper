@@ -82,13 +82,14 @@ const (
 	reviewEventAgentNative    ReviewEvent = "AGENT_NATIVE"
 )
 
-type QueueFailureKind string
+type QueueFailureKind = failureclass.Kind
 
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = failureclass.RetryableTransient
+	FailureRetryableAfterResume = failureclass.RetryableAfterResume
+	FailureRecoverableInfra     = failureclass.RecoverableInfra
+	FailureNonRetryable         = failureclass.NonRetryable
+	FailureManualIntervention   = failureclass.ManualIntervention
 )
 
 const (
@@ -4953,6 +4954,8 @@ func reviewerFailureKind(kind failureclass.Kind) QueueFailureKind {
 		return FailureRetryableTransient
 	case failureclass.RetryableAfterResume:
 		return FailureRetryableAfterResume
+	case failureclass.RecoverableInfra:
+		return FailureRecoverableInfra
 	case failureclass.ManualIntervention:
 		return FailureManualIntervention
 	default:
@@ -6598,7 +6601,7 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 }
 
 func isRetryableFailure(kind QueueFailureKind) bool {
-	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
+	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureRecoverableInfra || kind == FailureNonRetryable
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {

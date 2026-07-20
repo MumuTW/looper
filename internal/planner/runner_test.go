@@ -17,6 +17,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/planner/decisions"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -256,6 +257,39 @@ func TestBuildPlannerPromptUsesForgejoIssueTextForForgejoProjects(t *testing.T) 
 	}
 	if strings.Contains(prompt, "GitHub issue") {
 		t.Fatalf("prompt = %q, want no GitHub-specific issue text", prompt)
+	}
+}
+
+func TestBuildPlannerPromptMakesProductSpecAuthoritative(t *testing.T) {
+	t.Parallel()
+
+	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}
+	issue := &checkpointIssue{
+		Repo:           "nexu-io/open-design",
+		IssueNumber:    582,
+		Title:          "高保真导出",
+		Body:           "建议先做 HTML",
+		SpecPath:       "specs/582.md",
+		ProductSpecURL: "https://plane.test/pages/product-582",
+		ProductSpec:    "目标：第一阶段提供 React + 独立 CSS；保留现有 HTML 入口。",
+	}
+	prompt, _ := buildPlannerPrompt(project, customInstructionConfig(nil), issue, &checkpointWorktree{Branch: "looper/582", BaseBranch: "main"}, false, config.DefaultDisclosureConfig(), "", "")
+
+	for _, want := range []string{"AUTHORITATIVE PRODUCT SPEC", "第一阶段提供 React + 独立 CSS", "highest-priority source of truth", "Do not replace an explicit product decision", "entire technical spec in Simplified Chinese"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestPlannerReviewPromptsPreserveChineseTechnicalSpec(t *testing.T) {
+	t.Parallel()
+	issue := checkpointIssue{Repo: "nexu-io/open-design", IssueNumber: 582}
+	if prompt := buildGrillPrompt(issue, "specs/582.md", ""); !strings.Contains(prompt, "entire technical spec in Simplified Chinese") {
+		t.Fatalf("grill prompt missing Chinese-spec requirement:\n%s", prompt)
+	}
+	if prompt := buildReviewPrompt(issue, "specs/582.md", ""); !strings.Contains(prompt, "technical spec itself is written in Simplified Chinese") || !strings.Contains(prompt, "VERDICT: READY") {
+		t.Fatalf("review prompt missing Chinese spec/verdict requirement:\n%s", prompt)
 	}
 }
 
@@ -565,7 +599,50 @@ func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *t
 	}
 }
 
-func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
+func TestRunWriteSpecStepRecreatesCleanedCheckpointWithinWorktreeRoot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	cleanedPath := filepath.Join(worktreeRoot, "looper-planner-42-plan-this")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_cleaned_worktree"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "restored"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{
+			Issue:    issue,
+			Worktree: &checkpointWorktree{Path: cleanedPath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runWriteSpecStep() error = %v", err)
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want cleaned checkpoint recreated", len(git.createCalls))
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path == cleanedPath {
+		t.Fatalf("checkpoint.Worktree = %#v, want replacement for cleaned path", checkpoint.Worktree)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != checkpoint.Worktree.Path {
+		t.Fatalf("agent starts = %#v, want replacement worktree cwd %q", agent.starts, checkpoint.Worktree.Path)
+	}
+}
+
+func TestProcessClaimedItemManualPlannerCompletesLoopWhenQueueAlreadyInactive(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	issue := IssueSummary{Number: 42, Title: "Plan this"}
@@ -590,6 +667,12 @@ func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	if claimed.ID != queueItem.ID {
 		t.Fatalf("claimed.ID = %q, want %q", claimed.ID, queueItem.ID)
 	}
+	// Recovery can complete the queue record while the original worker is still
+	// finishing. That benign race must not leave the successfully finished loop
+	// stuck in running forever.
+	if err := fixture.repos.Queue.Complete(context.Background(), claimed.ID, fixture.nowISO()); err != nil {
+		t.Fatalf("Queue.Complete() precondition error = %v", err)
+	}
 	result, err := runner.ProcessClaimedItem(context.Background(), *claimed)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
@@ -602,6 +685,10 @@ func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	}
 	if len(agent.starts) != 1 {
 		t.Fatalf("agent starts = %d, want 1", len(agent.starts))
+	}
+	completed, err := fixture.repos.Loops.GetByID(context.Background(), loopResult.record.ID)
+	if err != nil || completed == nil || completed.Status != "completed" {
+		t.Fatalf("loop after success = %#v, %v; want completed", completed, err)
 	}
 }
 
@@ -1536,6 +1623,9 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	if result.BaseBranch == "" {
 		result.BaseBranch = input.BaseBranch
 	}
+	if err := os.MkdirAll(result.WorktreePath, 0o755); err != nil {
+		return CreateWorktreeResult{}, err
+	}
 	f.createResult = result
 	return result, nil
 }
@@ -1636,20 +1726,13 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 	}
 }
 
-// setupCompletedPlannerLoop seeds a finished (status "completed") planner loop with
-// a pending human thread message and a "success" run whose checkpoint carries a
-// completed write-spec + node-H gate flags. Returns the loop id. withSession seeds a
-// captured native agent session (the gate for a safe follow-up resume).
+// setupCompletedPlannerLoop seeds a finished planner loop and its successful run.
 func setupCompletedPlannerLoop(t *testing.T, fixture *runnerFixture, loopID string, withSession bool) {
 	t.Helper()
 	ctx := context.Background()
 	projectID := "project_1"
 	target := "issue:acme/looper:42"
-	meta, err := loops.AppendHumanMessage(nil, loops.HumanMessage{At: fixture.nowISO(), Text: "产品答案:导出优先 PDF"})
-	if err != nil {
-		t.Fatalf("AppendHumanMessage() error = %v", err)
-	}
-	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 42, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "completed", MetadataJSON: &meta, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 42, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "completed", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if withSession {
@@ -1669,10 +1752,7 @@ func setupCompletedPlannerLoop(t *testing.T, fixture *runnerFixture, loopID stri
 	}
 }
 
-// C1 强操控: a run INTERRUPTED by a human's mid-run @bot (not a clean success) must,
-// with a pending message, resume the MAIN write-spec session — never silently resume the
-// interrupted grill/review step (which would let the fresh grill critic answer).
-func TestCreateRunContextInterruptedRunWithHumanMessageResumesMainSession(t *testing.T) {
+func TestCreateRunContextInterruptedRunResumesFromCheckpoint(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
@@ -1680,8 +1760,7 @@ func TestCreateRunContextInterruptedRunWithHumanMessageResumesMainSession(t *tes
 	loopID := "loop_planner_interrupted"
 	projectID := "project_1"
 	target := "issue:acme/looper:42"
-	meta, _ := loops.AppendHumanMessage(nil, loops.HumanMessage{At: fixture.nowISO(), Text: "背景清晰吗?"})
-	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 43, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &meta, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 43, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: stringPtr("acme/looper"), Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_" + loopID, ProjectID: &projectID, LoopID: &loopID, Vendor: "claude", Status: "killed", NativeSessionID: stringPtr("sess_1"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
@@ -1706,8 +1785,8 @@ func TestCreateRunContextInterruptedRunWithHumanMessageResumesMainSession(t *tes
 	if err != nil {
 		t.Fatalf("createRunContext() error = %v", err)
 	}
-	if !resumed.Resumed || resumed.StartStep != stepWriteSpec {
-		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want followup-resume at write-spec (main session answers), not the interrupted step", resumed.Resumed, resumed.StartStep)
+	if !resumed.Resumed || resumed.StartStep != stepPublish {
+		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want checkpoint continuation", resumed.Resumed, resumed.StartStep)
 	}
 }
 
@@ -1809,7 +1888,47 @@ func TestCreateRunContextPromotesStaleV1CheckpointFromFrozenLoopMetadata(t *test
 	}
 }
 
-func TestCreateRunContextFollowupResumesCompletedPlannerLoopWithHumanMessage(t *testing.T) {
+func TestCreateRunContextAnsweredPlaneDecisionResumesWriteSpec(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	loopID := "loop_plane_answered"
+	projectID := "project_1"
+	ask := loops.HITLAsk{Question: "A or B?", Answer: "B", Status: "answered", Transport: "plane", SessionID: "sess-plane"}
+	metadata, err := loops.WriteHITLAsk(nil, ask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: loopID, Seq: 44, ProjectID: projectID, Type: "planner", TargetType: "issue", Status: "queued", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	checkpointJSON := mustMarshalJSON(plannerCheckpoint{
+		Issue:      &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md", URL: "https://plane/x/42"},
+		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "looper/plan", BaseBranch: "main", SpecPath: "specs/42.md"},
+		WriteSpec:  &checkpointWriteSpec{Status: "completed", GitReconciled: true},
+		Publish:    &checkpointPublishState{PlaneSpecReview: true, Grilled: true, Reviewed: true},
+		Notify:     &checkpointNotify{SentAt: fixture.nowISO(), Message: "stale"},
+		SkipReason: awaitingProductDecisionSkipReason,
+	})
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_" + loopID, LoopID: loopID, Status: "success", LastCompletedStep: stringPtr(string(stepWriteSpec)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := runner.createRunContext(ctx, loop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepWriteSpec || resumed.Checkpoint.WriteSpec != nil || resumed.Checkpoint.Publish != nil || resumed.Checkpoint.Notify != nil || resumed.Checkpoint.SkipReason != "" {
+		t.Fatalf("resumed = %#v", resumed)
+	}
+	prompt, session := pendingPlaneDecisionAnswer(loop)
+	if session != "sess-plane" || !strings.Contains(prompt, "B") {
+		t.Fatalf("resume prompt/session = %q, %q", prompt, session)
+	}
+}
+
+func TestCreateRunContextDoesNotResumeCompletedPlannerLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
@@ -1823,26 +1942,8 @@ func TestCreateRunContextFollowupResumesCompletedPlannerLoopWithHumanMessage(t *
 	if err != nil {
 		t.Fatalf("createRunContext() error = %v", err)
 	}
-	// Resume the SAME session at write-spec (incremental spec revision), NOT
-	// discover-issues (a full re-plan).
-	if !resumed.Resumed || resumed.StartStep != stepWriteSpec {
-		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want a resumed write-spec follow-up (never discover-issues)", resumed.Resumed, resumed.StartStep)
-	}
-	// write-spec re-runs the agent (respond in the SAME session so the MAIN looper
-	// answers, not the fresh grill critic); Grilled/Reviewed are PRESERVED so a follow-up
-	// does NOT auto-re-run the minutes-long grill/review passes or re-post their notes
-	// (强操控: respond, then hand the wheel back to the human). Issue + worktree preserved.
-	if resumed.Checkpoint.WriteSpec != nil {
-		t.Fatalf("WriteSpec = %#v, want cleared so the write-spec agent runs again", resumed.Checkpoint.WriteSpec)
-	}
-	if resumed.Checkpoint.Publish == nil || !resumed.Checkpoint.Publish.Grilled || !resumed.Checkpoint.Publish.Reviewed {
-		t.Fatalf("Publish = %#v, want Grilled/Reviewed PRESERVED (a follow-up must not auto-re-grill/review)", resumed.Checkpoint.Publish)
-	}
-	if resumed.Checkpoint.Issue == nil || resumed.Checkpoint.Worktree == nil {
-		t.Fatalf("checkpoint = %#v, want preserved issue + worktree", resumed.Checkpoint)
-	}
-	if resumed.Run.LastCompletedStep == nil || *resumed.Run.LastCompletedStep != string(stepPrepareWorktree) {
-		t.Fatalf("run.LastCompletedStep = %#v, want prepare-worktree", resumed.Run.LastCompletedStep)
+	if resumed.Resumed || resumed.StartStep != stepDiscoverIssues {
+		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want completed loop to remain non-resumable", resumed.Resumed, resumed.StartStep)
 	}
 }
 
@@ -1894,21 +1995,51 @@ func TestSetAwaitingProductAnswerMarker(t *testing.T) {
 	}
 }
 
-func TestRequestProductDecisionInThreadMentionsProductOwner(t *testing.T) {
+func TestSetAwaitingProductSpecMarkerPreservesFreshCardMessageID(t *testing.T) {
 	t.Parallel()
-	var gotLoopID, gotText string
+	fixture := newRunnerFixture(t)
+	r := &Runner{repos: fixture.repos, now: fixture.now, logger: fixture.logger}
+	ctx := context.Background()
+	loopID := "loop_product_spec_card"
+	loop := storage.LoopRecord{ID: loopID, Seq: 8, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	stale, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	fresh, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	cardMetadata := `{"productAskCardMsgId":"om_product_spec"}`
+	fresh.MetadataJSON = &cardMetadata
+	if err := fixture.repos.Loops.Upsert(ctx, *fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	r.setAwaitingProductSpecMarker(ctx, *stale, true, "comment-product", &checkpointIssue{IssueNumber: 582, Title: "导出", URL: "https://plane.test/issues/582"})
+	after, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	metadata := parseJSONObject(after.MetadataJSON)
+	if metadata["productAskCardMsgId"] != "om_product_spec" || metadata["awaitingProductSpec"] != true {
+		t.Fatalf("metadata = %s; want fresh card id preserved with product-spec hold", derefString(after.MetadataJSON))
+	}
+	condition, ok := loopcondition.Read(after.MetadataJSON)
+	if !ok || condition.Kind != loopcondition.ProductSpec || condition.Fingerprint != "comment-product" {
+		t.Fatalf("condition = %#v, present=%v", condition, ok)
+	}
+}
+
+func TestNotifyProductSpecClarificationUsesExactPlaneURLAndMentionsProductOwner(t *testing.T) {
+	t.Parallel()
+	var gotLoopID, gotText, gotActionURL string
 	var gotMentions []string
 	roleCfg := &config.Config{Projects: []config.ProjectRefConfig{{ID: "project_1", ProductOwner: &config.ProductOwnerConfig{FeishuOpenID: "ou_sunqingyu"}}}}
 	r := &Runner{
 		logger:            &testLogger{},
 		projectRoleConfig: roleCfg,
-		postThreadNote: func(_ context.Context, loopID, text string, mentions []string) error {
-			gotLoopID, gotText, gotMentions = loopID, text, mentions
+		postThreadProductSpecCard: func(_ context.Context, loopID, text, actionURL string, mentions []string) error {
+			gotLoopID, gotText, gotActionURL, gotMentions = loopID, text, actionURL, mentions
 			return nil
 		},
 	}
 	in := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Loop: storage.LoopRecord{ID: "loop_x"}}
-	r.requestProductDecisionInThread(context.Background(), in, "① 背景:客户 A 要导出。\n③ 问题:先做 A 还是 B?建议 A。")
+	r.notifyProductSpecClarification(context.Background(), in, "① 背景:客户 A 要导出。\n③ 问题:先做 A 还是 B?建议 A。", "https://plane.test/issues/wi-1#comment-c-1")
 
 	if gotLoopID != "loop_x" {
 		t.Fatalf("loopID = %q, want loop_x", gotLoopID)
@@ -1916,7 +2047,83 @@ func TestRequestProductDecisionInThreadMentionsProductOwner(t *testing.T) {
 	if !strings.Contains(gotText, "① 背景") || !strings.Contains(gotText, "建议 A") {
 		t.Fatalf("text = %q, want the productAsk embedded", gotText)
 	}
+	if gotActionURL != "https://plane.test/issues/wi-1#comment-c-1" {
+		t.Fatalf("actionURL = %q, want exact Plane comment URL", gotActionURL)
+	}
 	if len(gotMentions) != 1 || gotMentions[0] != "ou_sunqingyu" {
 		t.Fatalf("mentions = %v, want [ou_sunqingyu] (@ product owner)", gotMentions)
+	}
+}
+
+func TestRequestProductSpecClarificationReturnsToWorkItem(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	loop := storage.LoopRecord{ID: "loop_product_clarification", Seq: 82, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	gw, calls := scriptedGateway(`{"id":"comment-product-spec"}`)
+	var notifiedURL string
+	r := &Runner{
+		repos: fixture.repos,
+		now:   fixture.now,
+		planeDoc: func(string) (*planedoc.Gateway, string, bool) {
+			return gw, "plane-project", true
+		},
+		postThreadProductSpecCard: func(_ context.Context, _, _, actionURL string, _ []string) error {
+			notifiedURL = actionURL
+			return nil
+		},
+	}
+	in := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Loop: loop}
+	checkpoint := plannerCheckpoint{Issue: &checkpointIssue{URL: "https://plane.test/open-design/projects/p/issues/work-item-582"}}
+
+	actionURL, err := r.requestProductSpecClarificationOnPlane(ctx, in, checkpoint, "请在产品 spec 明确首版范围")
+	if err != nil {
+		t.Fatalf("requestProductSpecClarificationOnPlane() error = %v", err)
+	}
+	if actionURL != "https://plane.test/open-design/projects/p/issues/work-item-582#comment-comment-product-spec" || notifiedURL != actionURL {
+		t.Fatalf("action URLs = %q, %q; want exact work-item comment", actionURL, notifiedURL)
+	}
+	joinedCall := ""
+	if len(*calls) == 1 {
+		joinedCall = strings.Join((*calls)[0], " ")
+	}
+	if len(*calls) != 1 || !strings.Contains(joinedCall, "api request workspaces/w/projects/plane-project/work-items/work-item-582/comments/ --method POST") || strings.Contains(joinedCall, " page ") {
+		t.Fatalf("Plane calls = %v, want one work-item comment and no tech-page publish", *calls)
+	}
+	if !strings.Contains(joinedCall, "产品 spec 需要补充") {
+		t.Fatalf("comment call missing product-spec guidance: %v", (*calls)[0])
+	}
+}
+
+func TestNotifySpecApprovalMentionsLooperOwner(t *testing.T) {
+	t.Parallel()
+
+	var gotActionURL string
+	var gotMentions []string
+	roleCfg := &config.Config{Projects: []config.ProjectRefConfig{{
+		ID:           "project_1",
+		ProductOwner: &config.ProductOwnerConfig{FeishuOpenID: "ou_product"},
+		Owner:        &config.FeishuActorConfig{FeishuOpenID: "ou_looper_owner"},
+	}}}
+	r := &Runner{
+		logger:            &testLogger{},
+		projectRoleConfig: roleCfg,
+		postThreadApprovalCard: func(_ context.Context, _, _, actionURL string, mentions []string) error {
+			gotActionURL, gotMentions = actionURL, mentions
+			return nil
+		},
+	}
+	in := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Loop: storage.LoopRecord{ID: "loop_x"}}
+	r.notifySpecApproval(context.Background(), in, "请审核技术方案", "https://plane.test/pages/spec#comment-review")
+
+	if gotActionURL != "https://plane.test/pages/spec#comment-review" {
+		t.Fatalf("actionURL = %q, want exact review comment URL", gotActionURL)
+	}
+	if len(gotMentions) != 1 || gotMentions[0] != "ou_looper_owner" {
+		t.Fatalf("mentions = %v, want [ou_looper_owner], not product owner", gotMentions)
 	}
 }

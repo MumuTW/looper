@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -27,6 +26,8 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
@@ -339,11 +340,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if path == apiBasePath+"/hitl/feishu" {
-		h.handleFeishuCardActionRoute(w, r, requestID)
-		return
-	}
-
 	if strings.HasPrefix(path, apiBasePath+"/loops/") {
 		if isFollowLoopLogsRequest(r, path) {
 			if err := h.streamLoopLogsRoute(w, r, path, requestID); err != nil {
@@ -649,9 +645,15 @@ func (h *Handler) writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 type healthResponse struct {
-	Healthy   bool          `json:"healthy"`
-	StartedAt *string       `json:"startedAt,omitempty"`
-	Storage   storageHealth `json:"storage"`
+	Healthy   bool            `json:"healthy"`
+	StartedAt *string         `json:"startedAt,omitempty"`
+	Storage   storageHealth   `json:"storage"`
+	Scheduler schedulerHealth `json:"scheduler"`
+}
+
+type schedulerHealth struct {
+	Healthy      bool  `json:"healthy"`
+	BlockedInfra int64 `json:"blockedInfra"`
 }
 
 type storageHealth struct {
@@ -679,9 +681,22 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 	}
 
 	startedAt := h.startedAtISO()
+	blockedInfra := int64(0)
+	schedulerHealthy := true
+	services := h.context.Runtime.Services()
+	if services.Repositories != nil && services.Repositories.Queue != nil {
+		count, countErr := services.Repositories.Queue.CountBlockedInfra(ctx)
+		if countErr != nil {
+			schedulerHealthy = false
+		} else {
+			blockedInfra = count
+			schedulerHealthy = count == 0
+		}
+	}
+	healthy := state.OK && schedulerHealthy
 
 	return healthResponse{
-		Healthy:   state.OK,
+		Healthy:   healthy,
 		StartedAt: startedAt,
 		Storage: storageHealth{
 			OK:          state.OK,
@@ -695,6 +710,7 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 				PendingCount:      len(state.PendingMigrationIDs),
 			},
 		},
+		Scheduler: schedulerHealth{Healthy: schedulerHealthy, BlockedInfra: blockedInfra},
 	}, nil
 }
 
@@ -775,6 +791,7 @@ type statusStorage struct {
 
 type statusScheduler struct {
 	Healthy        bool `json:"healthy"`
+	BlockedInfra   int  `json:"blockedInfra"`
 	QueuedItems    int  `json:"queuedItems"`
 	RunningItems   int  `json:"runningItems"`
 	CompletedItems int  `json:"completedItems"`
@@ -995,6 +1012,10 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	if err != nil {
 		return statusResponse{}, err
 	}
+	blockedInfra, err := services.Repositories.Queue.CountBlockedInfra(ctx)
+	if err != nil {
+		return statusResponse{}, err
+	}
 
 	loopCounts := countLoops(loopCountsByType)
 
@@ -1027,7 +1048,8 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Healthy:           storageState.OK,
 		},
 		Scheduler: statusScheduler{
-			Healthy:        true,
+			Healthy:        blockedInfra == 0,
+			BlockedInfra:   int(blockedInfra),
 			QueuedItems:    int(queueCounts["queued"]),
 			RunningItems:   int(queueCounts["running"]),
 			CompletedItems: int(queueCounts["completed"]),
@@ -1331,21 +1353,34 @@ type pullRequestLoopStatus struct {
 }
 
 type loopResponse struct {
-	ID           string  `json:"id"`
-	Seq          int64   `json:"seq"`
-	ProjectID    string  `json:"projectId"`
-	Type         string  `json:"type"`
-	TargetType   string  `json:"targetType"`
-	TargetID     *string `json:"targetId"`
-	Repo         *string `json:"repo"`
-	PRNumber     *int64  `json:"prNumber"`
-	Status       string  `json:"status"`
-	ConfigJSON   *string `json:"configJson"`
-	MetadataJSON *string `json:"metadataJson"`
-	LastRunAt    *string `json:"lastRunAt"`
-	NextRunAt    *string `json:"nextRunAt"`
-	CreatedAt    string  `json:"createdAt"`
-	UpdatedAt    string  `json:"updatedAt"`
+	ID            string             `json:"id"`
+	Seq           int64              `json:"seq"`
+	ProjectID     string             `json:"projectId"`
+	Type          string             `json:"type"`
+	TargetType    string             `json:"targetType"`
+	TargetID      *string            `json:"targetId"`
+	Repo          *string            `json:"repo"`
+	PRNumber      *int64             `json:"prNumber"`
+	Status        string             `json:"status"`
+	ConfigJSON    *string            `json:"configJson"`
+	MetadataJSON  *string            `json:"metadataJson"`
+	LastRunAt     *string            `json:"lastRunAt"`
+	NextRunAt     *string            `json:"nextRunAt"`
+	CreatedAt     string             `json:"createdAt"`
+	UpdatedAt     string             `json:"updatedAt"`
+	Relationships *loopRelationships `json:"relationships,omitempty"`
+}
+
+type loopRelationships struct {
+	Title          string `json:"title,omitempty"`
+	SourceURL      string `json:"sourceUrl,omitempty"`
+	PlaneURL       string `json:"planeUrl,omitempty"`
+	PullRequestURL string `json:"pullRequestUrl,omitempty"`
+	ActionURL      string `json:"actionUrl,omitempty"`
+	BlockedOn      string `json:"blockedOn,omitempty"`
+	Phase          string `json:"phase"`
+	Outcome        string `json:"outcome,omitempty"`
+	DeadReason     string `json:"deadReason,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -1610,8 +1645,14 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 		}
 
 		responseItems := make([]loopResponse, 0, len(items))
+		includeRelationships := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("include")), "relationships")
 		for _, item := range items {
-			responseItems = append(responseItems, serializeLoop(item))
+			serialized := serializeLoop(item)
+			if includeRelationships {
+				relationships := loopRelationshipsFromRecord(item)
+				serialized.Relationships = &relationships
+			}
+			responseItems = append(responseItems, serialized)
 		}
 
 		return loopsListResponse{Items: responseItems}, nil
@@ -4475,7 +4516,7 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 // deliverHumanAnswer is the shared core of the HITL respond path: it validates
 // the loop is awaiting_human, stores the answer on the loop's HITL metadata, and
 // transitions the loop back to running (requeue + scheduler tick). Both the
-// /respond API endpoint and the Feishu card-action receiver call it.
+// The authenticated /respond API endpoint calls it.
 func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnswer string) (loopResponse, error) {
 	answer := strings.TrimSpace(rawAnswer)
 	if answer == "" {
@@ -4504,6 +4545,10 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		if err != nil {
 			return storage.LoopRecord{}, err
 		}
+		metadataJSON, err = loopcondition.Clear(&metadataJSON)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
 		updated := *loop
 		updated.MetadataJSON = stringPtrOrNil(metadataJSON)
 		updated.UpdatedAt = nowISO
@@ -4523,199 +4568,6 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)
 	// so the next claim resumes the run with the stored answer.
 	return h.mutateLoopStatus(ctx, loopID, domain.LoopStatusRunning)
-}
-
-type feishuCardActionEnvelope struct {
-	Type      string `json:"type"`
-	Challenge string `json:"challenge"`
-	// Token is the Feishu app Verification Token, echoed by Feishu in every event
-	// and card-action callback. It is the shared secret that proves the request
-	// originated from Feishu rather than an arbitrary client. (v1 card-action /
-	// url_verification carry it at top level; v2 events carry it in header.token.)
-	Token  string `json:"token"`
-	Action struct {
-		Tag   string          `json:"tag"`
-		Value json.RawMessage `json:"value"`
-	} `json:"action"`
-	// v2 event envelope, used for im.message.receive_v1 (a human typing a free-text
-	// reply in the ask thread).
-	Header struct {
-		EventType string `json:"event_type"`
-		Token     string `json:"token"`
-	} `json:"header"`
-	Event struct {
-		Message struct {
-			MessageID   string `json:"message_id"`
-			RootID      string `json:"root_id"`
-			ThreadID    string `json:"thread_id"`
-			ChatID      string `json:"chat_id"`
-			MessageType string `json:"message_type"`
-			Content     string `json:"content"`
-		} `json:"message"`
-		Sender struct {
-			SenderType string `json:"sender_type"`
-			SenderID   struct {
-				OpenID string `json:"open_id"`
-			} `json:"sender_id"`
-		} `json:"sender"`
-	} `json:"event"`
-}
-
-// handleFeishuCardActionRoute is the thin Feishu listener (receive side of the
-// app-bot integration whose send side ships in the notifier). It receives a
-// card-action callback when a human clicks an option button on an ask-card, maps
-// the button value {loopSeq, answer} to the awaiting loop, and calls the shared
-// respond logic in-process. It also answers Feishu's url_verification challenge.
-// The whole route is gated by hitl.enabled.
-//
-// Transport choice: this uses the card-action WEBHOOK RECEIVER over looper's
-// existing HTTP server rather than the larksuite long-connection WS SDK, to
-// avoid a heavy new dependency. Point the Feishu app's event/card-callback URL
-// at <daemon>/api/v1/hitl/feishu. Typed free-text replies (message events) are a
-// documented future extension; button clicks are handled today.
-func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Request, requestID string) {
-	if r.Method != http.MethodPost {
-		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: "Feishu card-action route requires POST"})
-		return
-	}
-	var raw []byte
-	if r.Body != nil {
-		defer r.Body.Close()
-		raw, _ = io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	}
-	var envelope feishuCardActionEnvelope
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "invalid Feishu callback body"})
-		return
-	}
-	// Resolve the configured Feishu Verification Token (a shared secret Feishu
-	// echoes in every callback). This is the ONLY origin check on this route, and
-	// it is independent of authMode because Feishu's servers cannot send a looper
-	// Bearer token.
-	expectedToken := ""
-	if envName := strings.TrimSpace(h.context.Config.Notifications.Webhook.VerificationTokenEnv); envName != "" {
-		expectedToken = strings.TrimSpace(os.Getenv(envName))
-	}
-	// v1 card-action / url_verification carry the token at the top level; v2 events
-	// carry it in header.token.
-	presentedToken := strings.TrimSpace(envelope.Token)
-	if presentedToken == "" {
-		presentedToken = strings.TrimSpace(envelope.Header.Token)
-	}
-	tokenMatches := expectedToken != "" && subtle.ConstantTimeCompare([]byte(presentedToken), []byte(expectedToken)) == 1
-
-	// Feishu URL-verification handshake: echo the challenge verbatim. When a token
-	// is configured, require it to match even for the handshake.
-	if envelope.Type == "url_verification" {
-		if expectedToken != "" && !tokenMatches {
-			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
-		return
-	}
-	if !h.context.Config.HITL.Enabled {
-		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "hitl.enabled is false"})
-		return
-	}
-	// A card action delivers human-authored text into an agent's coding session, so
-	// it MUST be authenticated. Fail closed: require a configured, matching
-	// verification token — otherwise any client that can reach this route could
-	// inject arbitrary answers into any awaiting_human loop.
-	if expectedToken == "" {
-		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "Feishu card-action callback requires notifications.webhook.verificationTokenEnv to be configured"})
-		return
-	}
-	if !tokenMatches {
-		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
-		return
-	}
-	// A human typing a free-text reply in the ask thread arrives as a message event
-	// rather than a card action — route it to the free-text handler.
-	if envelope.Header.EventType == "im.message.receive_v1" {
-		h.handleFeishuThreadReply(w, r, requestID, envelope)
-		return
-	}
-	var value struct {
-		LoopSeq string `json:"loopSeq"`
-		Answer  string `json:"answer"`
-	}
-	if len(envelope.Action.Value) > 0 {
-		_ = json.Unmarshal(envelope.Action.Value, &value)
-	}
-	loopSeq := strings.TrimSpace(value.LoopSeq)
-	answer := strings.TrimSpace(value.Answer)
-	if loopSeq == "" || answer == "" {
-		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "card action must carry value.loopSeq and value.answer"})
-		return
-	}
-	loop, err := h.resolveLoop(r.Context(), loopSeq)
-	if err != nil {
-		var typed apiError
-		if !asAPIError(err, &typed) {
-			typed = internalServerError(err)
-		}
-		h.writeError(w, requestID, typed)
-		return
-	}
-	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer); err != nil {
-		var typed apiError
-		if !asAPIError(err, &typed) {
-			typed = internalServerError(err)
-		}
-		h.writeError(w, requestID, typed)
-		return
-	}
-	h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": true})
-}
-
-// handleFeishuThreadReply consumes a human's free-text reply typed in an ask
-// thread (a Feishu im.message.receive_v1 event). It reverse-maps the thread root
-// to the loop that asked and delivers the typed text as the answer — the lossless,
-// type-anything counterpart to clicking an option button. Ordinary thread chatter
-// (no matching awaiting_human loop) is ignored with 200 so Feishu stops retrying.
-func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request, requestID string, envelope feishuCardActionEnvelope) {
-	msg := envelope.Event.Message
-	if msg.MessageType != "text" {
-		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "non-text message"})
-		return
-	}
-	rootID := strings.TrimSpace(msg.RootID)
-	if rootID == "" {
-		rootID = strings.TrimSpace(msg.ThreadID)
-	}
-	if rootID == "" {
-		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "not a thread reply"})
-		return
-	}
-	var textContent struct {
-		Text string `json:"text"`
-	}
-	_ = json.Unmarshal([]byte(msg.Content), &textContent)
-	answer := strings.TrimSpace(textContent.Text)
-	if answer == "" {
-		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "empty text"})
-		return
-	}
-	services := h.context.Runtime.Services()
-	if services.Repositories == nil || services.Repositories.FeishuThreads == nil {
-		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "thread mapping unavailable"})
-		return
-	}
-	loopID, err := services.Repositories.FeishuThreads.LoopByRoot(r.Context(), rootID)
-	if err != nil || strings.TrimSpace(loopID) == "" {
-		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "no loop for thread"})
-		return
-	}
-	// deliverHumanAnswer only accepts an awaiting_human loop, so this naturally
-	// drops the bot's own thread posts, replies after the loop resumed, and any
-	// duplicate Feishu retries.
-	if _, err := h.deliverHumanAnswer(r.Context(), loopID, answer); err != nil {
-		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop not awaiting a human"})
-		return
-	}
-	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": true})
 }
 
 func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string) (retryLoopResponse, error) {
@@ -4980,6 +4832,50 @@ func serializeLoop(loop storage.LoopRecord) loopResponse {
 		CreatedAt:    loop.CreatedAt,
 		UpdatedAt:    loop.UpdatedAt,
 	}
+}
+
+func loopRelationshipsFromRecord(loop storage.LoopRecord) loopRelationships {
+	metadata := parseJSONObject(loop.MetadataJSON)
+	worker, _ := metadata["worker"].(map[string]any)
+	firstString := func(values ...any) string {
+		for _, value := range values {
+			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+				return strings.TrimSpace(text)
+			}
+		}
+		return ""
+	}
+	rel := loopRelationships{
+		Title:     firstString(metadata["title"], worker["title"]),
+		SourceURL: firstString(metadata["issueUrl"], worker["issueUrl"]),
+	}
+	state, ok := loopengine.Read(loop.MetadataJSON)
+	if !ok {
+		condition := ""
+		if blocked, found := loopcondition.Read(loop.MetadataJSON); found {
+			condition = string(blocked.Kind)
+		}
+		state = loopengine.FromLegacy(loop.Status, condition, loop.UpdatedAt)
+	}
+	rel.Phase, rel.Outcome, rel.DeadReason = string(state.Phase), state.Outcome, state.Reason
+	if strings.Contains(strings.ToLower(rel.SourceURL), "plane") {
+		rel.PlaneURL = rel.SourceURL
+	}
+	if hitl, ok := metadata["hitl"].(map[string]any); ok {
+		rel.ActionURL = firstString(hitl["actionUrl"])
+		if strings.Contains(strings.ToLower(rel.ActionURL), "plane") {
+			rel.PlaneURL = strings.SplitN(rel.ActionURL, "#", 2)[0]
+		}
+	}
+	if blocked, ok := metadata["blockedCondition"].(map[string]any); ok {
+		rel.BlockedOn = firstString(blocked["kind"])
+	}
+	if loop.Repo != nil && loop.PRNumber != nil && strings.TrimSpace(*loop.Repo) != "" && *loop.PRNumber > 0 {
+		rel.PullRequestURL = fmt.Sprintf("https://github.com/%s/pull/%d", strings.Trim(*loop.Repo, "/"), *loop.PRNumber)
+	} else {
+		rel.PullRequestURL = firstString(metadata["prUrl"], worker["prUrl"])
+	}
+	return rel
 }
 
 func serializeRun(run storage.RunRecord) runResponse {

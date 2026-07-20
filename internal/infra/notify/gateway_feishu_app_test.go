@@ -3,12 +3,13 @@ package notify
 import (
 	"context"
 	"encoding/json"
-	"github.com/nexu-io/looper/internal/loops"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -245,14 +246,14 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		}
 	})
 
-	t.Run("SendHITLAsk posts a card with option buttons carrying loop seq + answer", func(t *testing.T) {
+	t.Run("SendHITLAsk posts a one-way card with exact action URL", func(t *testing.T) {
 		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
 		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
 
 		var calls []capturedFeishuCall
 		gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
 
-		if err := gateway.SendHITLAsk(ctx, HITLAskCard{ProjectID: "od", LoopSeq: 71, Repo: "acme/looper", Title: "Which datastore?", Question: "Redis or Postgres for the cache?", Options: []string{"redis", "postgres"}}); err != nil {
+		if err := gateway.SendHITLAsk(ctx, HITLAskCard{ProjectID: "od", LoopSeq: 71, Repo: "acme/looper", Title: "Which datastore?", Question: "Redis or Postgres for the cache?", Options: []string{"redis", "postgres"}, SourceURL: "https://github.com/acme/looper/pull/7#issuecomment-71"}); err != nil {
 			t.Fatalf("SendHITLAsk() error = %v", err)
 		}
 		if len(calls) != 2 {
@@ -271,9 +272,8 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		if !strings.Contains(envelope.Content, "Redis or Postgres") {
 			t.Fatalf("card missing question: %s", envelope.Content)
 		}
-		// Each option becomes a button whose value carries loopSeq + answer.
-		if !strings.Contains(envelope.Content, `"loopSeq":"71"`) || !strings.Contains(envelope.Content, `"answer":"redis"`) || !strings.Contains(envelope.Content, `"answer":"postgres"`) {
-			t.Fatalf("card missing option buttons with loopSeq/answer values: %s", envelope.Content)
+		if !strings.Contains(envelope.Content, "https://github.com/acme/looper/pull/7#issuecomment-71") || strings.Contains(envelope.Content, `"answer":"redis"`) {
+			t.Fatalf("card must deep-link outward without callback values: %s", envelope.Content)
 		}
 	})
 
@@ -308,6 +308,146 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 			t.Fatalf("feishu_app error = %q, want level filtered", got)
 		}
 	})
+}
+
+func TestFeishuCardOutboxRetriesAndCreatesRunlessCoordinatorAnchor(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+	ctx := context.Background()
+	coordinator := openNotifyCoordinator(t, t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	projectID := "project_1"
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: t.TempDir(), CreatedAt: eventISO(now), UpdatedAt: eventISO(now)}); err != nil {
+		t.Fatal(err)
+	}
+	repo := "acme/looper"
+	target := "issue:acme/looper:42"
+	metadata := `{"issueNumber":42,"issueUrl":"https://plane.test/issues/42","title":"Runless intake"}`
+	loop := storage.LoopRecord{ID: "loop_coordinator", Seq: 42, ProjectID: projectID, Type: "coordinator", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "running", MetadataJSON: &metadata, CreatedAt: eventISO(now), UpdatedAt: eventISO(now)}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	messageAttempts := 0
+	gateway := NewGateway(Options{
+		Config: config.NotificationConfig{Webhook: appModeConfig()}, Repositories: repos, Now: func() time.Time { return now },
+		FeishuAppHTTP: func(_ context.Context, _ string, url string, _ map[string]string, _ []byte) (int, []byte, error) {
+			if strings.Contains(url, "/auth/v3/tenant_access_token/internal") {
+				return 200, []byte(`{"code":0,"tenant_access_token":"token","expire":7200}`), nil
+			}
+			messageAttempts++
+			if messageAttempts <= 2 {
+				return 500, []byte(`{"code":1,"msg":"temporary"}`), nil
+			}
+			return 200, []byte(`{"code":0,"data":{"message_id":"om_` + strconv.Itoa(messageAttempts) + `"}}`), nil
+		},
+	})
+	err := gateway.PostThreadDecisionCard(ctx, loop.ID, "Choose A or B", "https://plane.test/pages/p#comment-c", []string{"ou_owner", "ou_extra"})
+	if err == nil {
+		t.Fatal("first delivery error = nil, want transient failure")
+	}
+	records, _ := repos.Notifications.List(ctx, 10)
+	if len(records) != 1 || records[0].Status != "pending" {
+		t.Fatalf("outbox after failure = %#v", records)
+	}
+	now = now.Add(15 * time.Second)
+	if retried, err := gateway.RetryPendingCards(ctx, 10); err != nil || retried != 1 {
+		t.Fatalf("RetryPendingCards() = %d, %v", retried, err)
+	}
+	records, _ = repos.Notifications.List(ctx, 10)
+	if records[0].Status != "delivered" || records[0].SentAt == nil {
+		t.Fatalf("outbox after retry = %#v", records[0])
+	}
+	root, err := repos.FeishuThreads.RootByLoop(ctx, loop.ID)
+	if err != nil || root == "" {
+		t.Fatalf("run-less coordinator root = %q, %v", root, err)
+	}
+	if runs, err := repos.Runs.ListByLoop(ctx, loop.ID); err != nil || len(runs) != 0 {
+		t.Fatalf("coordinator runs = %#v, %v; anchor must not require a run", runs, err)
+	}
+}
+
+func eventISO(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
+
+func TestFeishuHeaderFallbackNeverLeaksLoopID(t *testing.T) {
+	gateway := &Gateway{}
+	text := gateway.feishuThreadHeaderText(context.Background(), "loop_secret_internal_id")
+	if strings.Contains(text, "loop_secret_internal_id") {
+		t.Fatalf("fallback leaked internal loop id: %q", text)
+	}
+}
+
+func TestPostThreadApprovalCardUsesApprovalCopyAndSeparateMessageKey(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+	var calls []capturedFeishuCall
+	gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+	ctx := context.Background()
+	now := eventISO(time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC))
+	if err := gateway.repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: "loop_approval", Seq: 42, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "completed", CreatedAt: now, UpdatedAt: now}
+	if err := gateway.repositories.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gateway.PostThreadApprovalCard(ctx, loop.ID, "方案已通过 REVIEW", "https://plane.test/pages/spec#comment-review", []string{"ou_looper_owner"}); err != nil {
+		t.Fatalf("PostThreadApprovalCard() error = %v", err)
+	}
+	var bodies strings.Builder
+	for _, call := range calls {
+		bodies.Write(call.body)
+	}
+	posted := bodies.String()
+	if !strings.Contains(posted, "技术方案已完成 GRILL + REVIEW") || !strings.Contains(posted, "前往 Plane 审核") {
+		t.Fatalf("Feishu calls missing approval-specific copy: %s", posted)
+	}
+	if strings.Contains(posted, "这个需求有个地方需要你来拍板") {
+		t.Fatalf("approval card reused product-decision copy: %s", posted)
+	}
+	if got := gateway.loopMetaString(ctx, loop.ID, approvalCardMsgIDKey); got == "" {
+		t.Fatal("approval card message id was not persisted")
+	}
+	if got := gateway.loopMetaString(ctx, loop.ID, decisionCardMsgIDKey); got != "" {
+		t.Fatalf("product decision message id = %q, want empty", got)
+	}
+}
+
+func TestPostThreadProductSpecCardPointsToPlaneSpecWork(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+	var calls []capturedFeishuCall
+	gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+	ctx := context.Background()
+	now := eventISO(time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC))
+	if err := gateway.repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: "loop_product_spec", Seq: 43, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "awaiting_human", CreatedAt: now, UpdatedAt: now}
+	if err := gateway.repositories.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gateway.PostThreadProductSpecCard(ctx, loop.ID, "请补齐首版范围", "https://plane.test/issues/582#comment-product", []string{"ou_product_owner"}); err != nil {
+		t.Fatalf("PostThreadProductSpecCard() error = %v", err)
+	}
+	var bodies strings.Builder
+	for _, call := range calls {
+		bodies.Write(call.body)
+	}
+	posted := bodies.String()
+	if !strings.Contains(posted, "请先补充产品 spec") || !strings.Contains(posted, "前往 Plane 补 spec") {
+		t.Fatalf("Feishu calls missing product-spec copy: %s", posted)
+	}
+	if strings.Contains(posted, "技术方案已完成") || strings.Contains(posted, "这个需求有个地方需要你来拍板") {
+		t.Fatalf("product-spec card reused another gate's copy: %s", posted)
+	}
+	if got := gateway.loopMetaString(ctx, loop.ID, decisionCardMsgIDKey); got == "" {
+		t.Fatal("product-spec card message id was not persisted")
+	}
 }
 
 func TestBuildFeishuAskCardRendersMention(t *testing.T) {
@@ -409,30 +549,13 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 		"https://github.com/nexu-io/synclo-test/issues/132", // clickable link
 		"由 @lefarcen 提出",                                    // trigger attribution
 		"README 都是中文",                                       // recommendation
-		"⭐ 中文 · 推荐",                                         // recommended option marked prominently
+		"⭐ 中文（推荐）",                                          // recommended option marked prominently
 		"置信度 中",                                             // confidence
 		"写\\\"Welcome",                                      // a consequence (quote json-escaped)
 	} {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("decision-brief card missing %q\ncard=%s", want, raw)
 		}
-	}
-
-	// Answered state: buttons gone, "✅ 已选" shown, brief still present for review.
-	answered, err := buildFeishuAskCard(HITLAskCard{
-		LoopSeq: 132, Title: "welcome.txt 用哪种语言?", Question: "welcome.txt 用哪种语言?",
-		Options: []string{"中文", "英文"}, Recommendation: "README 都是中文,推荐中文。",
-		AnsweredWith: "中文",
-	})
-	if err != nil {
-		t.Fatalf("buildFeishuAskCard(answered) error = %v", err)
-	}
-	ar := string(answered)
-	if !strings.Contains(ar, "已选:中文") || !strings.Contains(ar, "已定夺") || !strings.Contains(ar, "README 都是中文") {
-		t.Fatalf("answered card missing selection or brief: %s", ar)
-	}
-	if strings.Contains(ar, `"tag":"action"`) {
-		t.Fatalf("answered card should have no clickable action buttons: %s", ar)
 	}
 
 	// A bare ask (no brief) must still render — the fields are optional.
@@ -733,6 +856,38 @@ func TestLoopTaskKeyFromRecordCollapsesSiblingLoops(t *testing.T) {
 	onlyIssueMeta := `{"issueNumber":5}`
 	if k := loopTaskKeyFromRecord(&storage.LoopRecord{MetadataJSON: &onlyIssueMeta}); k != "" {
 		t.Fatalf("task key without repo = %q, want empty", k)
+	}
+}
+
+func TestFeishuThreadHeaderCardLinksCheckpointIssueURL(t *testing.T) {
+	ctx := context.Background()
+	coordinator := openNotifyCoordinator(t, t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-07-16T02:00:00.000Z"
+	projectID := "project_checkpoint_link"
+	loopID := "loop_checkpoint_link"
+	target := "issue:nexu-io/open-design:582"
+	repo := "nexu-io/open-design"
+	metadata := `{"issueNumber":582,"title":"High-fidelity export"}`
+	checkpoint := `{"issue":{"url":"https://plane.example/open-design/browse/OPEND-582"}}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "running", MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_checkpoint_link", LoopID: loopID, Status: "running", CheckpointJSON: &checkpoint, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	gateway := NewGateway(Options{Repositories: repos})
+	card, ok := gateway.feishuThreadHeaderCard(ctx, loopID)
+	if !ok {
+		t.Fatal("feishuThreadHeaderCard() did not render")
+	}
+	want := `[Issue #582](https://plane.example/open-design/browse/OPEND-582)`
+	if !strings.Contains(card, want) {
+		t.Fatalf("checkpoint issue reference is not clickable; want %q in %s", want, card)
 	}
 }
 

@@ -3422,6 +3422,19 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.DryRun = true, want false")
 	}
 
+	if !config.Daemon.DiskBackpressure.Enabled {
+		t.Fatal("DefaultConfig().Daemon.DiskBackpressure.Enabled = false, want true")
+	}
+	if config.Daemon.DiskBackpressure.Path != "" {
+		t.Fatalf("DefaultConfig().Daemon.DiskBackpressure.Path = %q, want empty", config.Daemon.DiskBackpressure.Path)
+	}
+	if config.Daemon.DiskBackpressure.HighWatermarkPercent != 85 {
+		t.Fatalf("DefaultConfig().Daemon.DiskBackpressure.HighWatermarkPercent = %v, want 85", config.Daemon.DiskBackpressure.HighWatermarkPercent)
+	}
+	if config.Daemon.DiskBackpressure.HardStopPercent != 93 {
+		t.Fatalf("DefaultConfig().Daemon.DiskBackpressure.HardStopPercent = %v, want 93", config.Daemon.DiskBackpressure.HardStopPercent)
+	}
+
 	if config.Defaults.OpenPRStrategy != OpenPRStrategyAllDone {
 		t.Fatalf("DefaultConfig().Defaults.OpenPRStrategy = %q, want %q", config.Defaults.OpenPRStrategy, OpenPRStrategyAllDone)
 	}

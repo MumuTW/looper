@@ -6717,3 +6717,42 @@ type requestArtifactRoute struct {
 		Body any `json:"body"`
 	} `json:"request"`
 }
+
+func TestLoopRelationshipsExposePlanePRAndActionState(t *testing.T) {
+	repo := "acme/looper"
+	pr := int64(42)
+	metadata := `{"title":"Implement export","issueUrl":"https://plane.example/workspaces/w/projects/p/issues/7","hitl":{"actionUrl":"https://plane.example/workspaces/w/projects/p/pages/spec-1#comment-c1"},"blockedCondition":{"kind":"human_answered"}}`
+	rel := loopRelationshipsFromRecord(storage.LoopRecord{Repo: &repo, PRNumber: &pr, MetadataJSON: &metadata})
+	if rel.Title != "Implement export" || rel.PlaneURL != "https://plane.example/workspaces/w/projects/p/pages/spec-1" || rel.PullRequestURL != "https://github.com/acme/looper/pull/42" || rel.ActionURL != "https://plane.example/workspaces/w/projects/p/pages/spec-1#comment-c1" || rel.BlockedOn != "human_answered" {
+		t.Fatalf("relationships = %#v", rel)
+	}
+}
+
+func TestLoopsListIncludesQueryableRelationshipsOnRequest(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	repos := rt.Services().Repositories
+	now := "2026-07-15T12:00:00.000Z"
+	projectID := "project_relationships"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	repo := "acme/looper"
+	pr := int64(9)
+	metadata := `{"issueUrl":"https://plane.example/issues/7","hitl":{"actionUrl":"https://plane.example/pages/p#comment-c"}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_relationships", Seq: 99, ProjectID: projectID, Type: "worker", TargetType: "pull_request", Repo: &repo, PRNumber: &pr, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?include=relationships", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	relationships := items[0].(map[string]any)["relationships"].(map[string]any)
+	assertEqual(t, relationships["actionUrl"], "https://plane.example/pages/p#comment-c")
+	assertEqual(t, relationships["pullRequestUrl"], "https://github.com/acme/looper/pull/9")
+	assertEqual(t, relationships["phase"], "blocked")
+}

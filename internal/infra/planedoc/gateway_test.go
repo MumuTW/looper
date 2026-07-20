@@ -93,6 +93,20 @@ func TestPageContentReturnsBody(t *testing.T) {
 	}
 }
 
+func TestPageDocumentReturnsContentAndProvenance(t *testing.T) {
+	f := &fakeRun{stdouts: []string{`{"id":"pg-1","name":"Product spec","description_html":"<p>Scope</p>","created_by":"owner","updated_by":"editor","owned_by":"owner"}`}}
+	page, err := newGateway(f).PageDocument(context.Background(), "proj-1", "pg-1")
+	if err != nil {
+		t.Fatalf("PageDocument error = %v", err)
+	}
+	if page.ContentHTML != "<p>Scope</p>" || !page.AuthoredBy("owner") || !page.AuthoredBy("editor") || page.AuthoredBy("someone-else") {
+		t.Fatalf("page provenance = %+v", page)
+	}
+	if !argsContain(f.calls[0], "api", "page", "get", "--json") || argsContain(f.calls[0], "--content") {
+		t.Fatalf("get args = %v", f.calls[0])
+	}
+}
+
 func TestFindSpecLinkFiltersByTitle(t *testing.T) {
 	f := &fakeRun{stdouts: []string{`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://x/pages/p9"},{"id":"l2","title":"other","url":"https://y"}]}`}}
 	g := newGateway(f)
@@ -308,13 +322,20 @@ func TestWorkItemCommentsPreserveUUIDActorAndTime(t *testing.T) {
 }
 
 func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
-	f := &fakeRun{stdouts: []string{`{"id":"c1"}`}}
+	f := &fakeRun{stdouts: []string{`{"results":[]}`, `{"id":"c1"}`}}
 	g := newGateway(f)
-	if err := g.RequestProductSpec(context.Background(), "p1", "wi-1", "@产品<x>", "登录 & 注册"); err != nil {
+	comment, err := g.RequestProductSpec(context.Background(), "p1", "wi-1", "@产品<x>", "登录 & 注册")
+	if err != nil {
 		t.Fatalf("RequestProductSpec error = %v", err)
 	}
-	args := f.calls[0]
-	if !argsContain(args, "api", "comment", "create") || !argPairPresent(args, "--work-item", "wi-1") {
+	if comment.ID != "c1" {
+		t.Fatalf("comment id = %q, want c1", comment.ID)
+	}
+	if len(f.calls) != 2 || !argsContain(f.calls[0], "api", "request", "workspaces/open-design/projects/p1/work-items/wi-1/comments/", "--method", "GET") {
+		t.Fatalf("calls = %v, want list then create", f.calls)
+	}
+	args := f.calls[1]
+	if !argsContain(args, "api", "request", "workspaces/open-design/projects/p1/work-items/wi-1/comments/", "--method", "POST") {
 		t.Fatalf("comment args = %v", args)
 	}
 	// The --data value is valid JSON whose decoded comment_html has the mention/name
@@ -328,13 +349,33 @@ func TestRequestProductSpecCommentsWithEscapedMention(t *testing.T) {
 	if !strings.Contains(data.CommentHTML, "&lt;x&gt;") || !strings.Contains(data.CommentHTML, "&amp;") {
 		t.Fatalf("comment_html not escaped: %q", data.CommentHTML)
 	}
-	for _, want := range []string{"looper:product-spec", "Links", "普通评论", "不会解除"} {
+	for _, want := range []string{"用户问题与目标", "首版范围和非目标", "验收标准", "方案链接/正文", "验证产品身份"} {
 		if !strings.Contains(data.CommentHTML, want) {
-			t.Fatalf("formal product Spec instruction missing %q: %q", want, data.CommentHTML)
+			t.Fatalf("product Spec instruction missing %q: %q", want, data.CommentHTML)
 		}
 	}
-	if strings.Contains(data.CommentHTML, "正文发在这里") || strings.Contains(data.CommentHTML, "自动把它关联") {
-		t.Fatalf("formal product Spec instruction promises unsupported comment association: %q", data.CommentHTML)
+}
+
+func TestRequestProductSpecReusesExactExistingAsk(t *testing.T) {
+	html := `<p>产品负责人 请先为需求「导出」补一份可执行的 product spec，再让 looper 开始技术梳理。</p><p>至少写清：用户问题与目标、首版范围和非目标、关键交互或输出、验收标准；涉及付费策略或阶段优先级，也请直接在 spec 中定下来。</p><p>请由产品负责人创建或更新方案页，或由产品负责人在这条评论下明确回复方案链接/正文。Looper 不会代写产品范围；验证产品身份后才会关联到本 work item 并继续。</p>`
+	f := &fakeRun{stdouts: []string{`{"results":[{"id":"existing","comment_html":` + jsonString(html) + `}]}`}}
+	comment, err := newGateway(f).RequestProductSpec(context.Background(), "p1", "wi-1", "产品负责人", "导出")
+	if err != nil {
+		t.Fatalf("RequestProductSpec error = %v", err)
+	}
+	if comment.ID != "existing" || len(f.calls) != 1 {
+		t.Fatalf("comment = %+v, calls = %v; want one list call reusing existing ask", comment, f.calls)
+	}
+}
+
+func TestDroppedSpecContentPrefersLinkAndPreservesInlineText(t *testing.T) {
+	url, inline := DroppedSpecContent(WorkItemComment{CommentHTML: `<p>方案：<a href="https://docs.example/spec?a=1&amp;b=2">查看</a></p>`})
+	if url != "https://docs.example/spec?a=1&b=2" || inline != "" {
+		t.Fatalf("linked content = (%q, %q)", url, inline)
+	}
+	url, inline = DroppedSpecContent(WorkItemComment{CommentHTML: `<p>目标：高保真导出</p><p>验收：React 与 CSS 分离</p>`})
+	if url != "" || inline != "目标：高保真导出\n验收：React 与 CSS 分离" {
+		t.Fatalf("inline content = (%q, %q)", url, inline)
 	}
 }
 

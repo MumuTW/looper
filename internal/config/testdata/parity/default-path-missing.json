@@ -34,6 +34,7 @@
         "maxConcurrentRuns": 3,
         "retryMaxAttempts": -1,
         "retryBaseDelayMs": 5000,
+        "infraRetryBudgetSeconds": 3600,
         "slowLaneWarnThresholdMs": 5000,
         "discoveryCacheTtlSeconds": 30
       },
@@ -126,6 +127,11 @@
           "maxPerTick": 50,
           "includeOrphans": true,
           "dryRun": false
+        },
+        "diskBackpressure": {
+          "enabled": true,
+          "highWatermarkPercent": 85,
+          "hardStopPercent": 93
         }
       },
       "package": {

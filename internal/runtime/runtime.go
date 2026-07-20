@@ -1201,8 +1201,8 @@ func (r *Runtime) runWakeReconcile(ctx context.Context, reason string) {
 	// (flowchart top: bug/feature → product-spec gate → looper:plan / worker-ready).
 	// Env-gated (LOOPER_PLANE_AUTO_INTAKE=1); a no-op otherwise.
 	r.reconcileAutoIntake(ctx)
-	// Resume planner loops whose product spec was supplied while they were held (E2).
-	r.reconcileAwaitingProductSpec(ctx)
+	// Resume loops whose named, externally-observed blocking condition cleared.
+	r.reconcileBlockedConditions(ctx)
 	// Resume V2 planner loops only after the configured Plane role authorities have
 	// answered the current decision revision. Feishu is notification-only.
 	r.reconcileAwaitingRoleDecisions(ctx)
@@ -1232,7 +1232,7 @@ func (r *Runtime) runSchedulerClaimLoop(ctx context.Context, stopCh <-chan struc
 	maybeReconcile := func() {
 		now := nowFn()
 		if lastHumanGateReconcile.IsZero() || now.Sub(lastHumanGateReconcile) >= humanGateReconcileInterval {
-			r.reconcileAwaitingProductSpec(ctx)
+			r.reconcileBlockedConditions(ctx)
 			r.reconcileAwaitingRoleDecisions(ctx)
 			r.reconcileSpecApproval(ctx)
 			lastHumanGateReconcile = now
@@ -1243,6 +1243,9 @@ func (r *Runtime) runSchedulerClaimLoop(ctx context.Context, stopCh <-chan struc
 		}
 		lastPass = now
 	}
+	// Reconcile named holds once at boot before claiming work. This closes the
+	// restart gap where an external answer/spec arrived while looperd was down.
+	r.reconcileBlockedConditions(ctx)
 	r.executeSchedulerClaimPass(ctx)
 	ticker := time.NewTicker(claimPumpInterval)
 	defer ticker.Stop()

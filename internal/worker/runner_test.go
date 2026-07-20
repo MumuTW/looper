@@ -940,6 +940,61 @@ func TestRunExecuteStepRecoversStaleWorktreePathBeforeAgentStart(t *testing.T) {
 	}
 }
 
+func TestRunExecuteStepRecreatesWorktreeFromBranchWhenNoneRegistered(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	stalePath := filepath.Join(t.TempDir(), "deleted-worktree")
+	branch := "looper/feature"
+	git := &fakeGitGateway{
+		// No registered worktree to restore — the checkout dir was reclaimed (disk-pressure
+		// GC / manual cleanup). Recovery must recreate one FROM THE BRANCH and continue,
+		// never park the loop for a human (the old staleWorkerWorktreeError dead-end).
+		restoreReturnsNil: true,
+		createResult:      CreateWorktreeResult{WorktreePath: "recreated", Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_recreated"},
+		inspectResult:     InspectHeadResult{HeadSHA: "def456"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_recreate_worktree", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project,
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: stalePath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteStep() error = %v, want recreate-from-branch recovery (never manual intervention)", err)
+	}
+	// Restore was tried first, found nothing, then a fresh worktree was created for the branch.
+	if len(git.restoreCalls) != 1 {
+		t.Fatalf("restoreCalls = %#v, want exactly one restore attempt before recreate", git.restoreCalls)
+	}
+	if len(git.createCalls) != 1 || git.createCalls[0].Branch != branch {
+		t.Fatalf("createCalls = %#v, want a single recreate from branch %q", git.createCalls, branch)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path == stalePath || strings.TrimSpace(checkpoint.Worktree.Path) == "" {
+		t.Fatalf("checkpoint.Worktree = %#v, want a fresh recreated worktree (not the stale path)", checkpoint.Worktree)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != checkpoint.Worktree.Path {
+		t.Fatalf("agent starts = %#v, want agent started in the recreated worktree %q", agent.starts, checkpoint.Worktree.Path)
+	}
+}
+
 func TestRunExecuteStepRecoversWorktreeOutsideWorktreeRootBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1051,101 +1106,18 @@ func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(
 	}
 }
 
-func TestCreateRunContextFollowupResumesCompletedLoopWithHumanMessage(t *testing.T) {
+func TestCreateRunContextDoesNotResumeCompletedLoop(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
 
-	// A finished worker loop (last run "success") that just got a new human thread
-	// message, with a captured native session — it should follow-up-resume at execute.
+	// Completed loops are never reactivated by chat messages now that Feishu is a
+	// one-way notification channel.
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
 	if err != nil || loop == nil {
 		t.Fatalf("Loops.GetByID() error = %v, loop = %v", err, loop)
 	}
-	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: fixture.nowISO(), Text: "能把导出按钮挪到右边吗?"})
-	if err != nil {
-		t.Fatalf("AppendHumanMessage() error = %v", err)
-	}
-	loop.MetadataJSON = &meta
-	loop.Status = "completed"
-	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-	projectID := "project_1"
-	loopID := "loop_worker_1"
-	if err := fixture.repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_done_1", ProjectID: &projectID, LoopID: &loopID, Vendor: "opencode", Status: "completed", NativeSessionID: stringPtr("sess_worker_1"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
-		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
-	}
-	checkpointJSON := mustMarshalJSON(workerCheckpoint{
-		Work:           &workerInput{Title: "Worker task", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
-		ClaimedLockKey: "issue:acme/looper:27",
-		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
-		Plan:           &checkpointPlan{Summary: "plan"},
-		Execution:      &checkpointExecution{Status: "completed", Summary: "shipped", ParseStatus: "parsed", GitReconciled: true},
-		Validation:     &ValidationResult{Passed: true, Summary: "green"},
-		PullRequest:    &checkpointPullPR{Number: 101, URL: "https://example/pr/101"},
-	})
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
-		ID:                "run_completed_ok",
-		LoopID:            loopID,
-		Status:            "success",
-		CurrentStep:       nil,
-		LastCompletedStep: stringPtr(string(stepOpenPR)),
-		CheckpointJSON:    &checkpointJSON,
-		StartedAt:         fixture.nowISO(),
-		CreatedAt:         fixture.nowISO(),
-		UpdatedAt:         fixture.nowISO(),
-	}); err != nil {
-		t.Fatalf("Runs.Upsert() error = %v", err)
-	}
-
-	refreshed, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
-	if err != nil || refreshed == nil {
-		t.Fatalf("Loops.GetByID() error = %v, loop = %v", err, refreshed)
-	}
-	resumed, err := runner.createRunContext(context.Background(), *refreshed)
-	if err != nil {
-		t.Fatalf("createRunContext() error = %v", err)
-	}
-	if !resumed.Resumed || resumed.StartStep != stepExecute {
-		t.Fatalf("resumed = {Resumed:%v StartStep:%v}, want a resumed execute follow-up", resumed.Resumed, resumed.StartStep)
-	}
-	// Execute is re-run with a fresh agent turn (native-resumed session drains the
-	// message); PR/validation checkpoints are cleared so open-pr re-resolves the
-	// existing PR idempotently. Work + worktree + plan are preserved.
-	if resumed.Checkpoint.Execution != nil {
-		t.Fatalf("Execution = %#v, want cleared so the execute step runs again", resumed.Checkpoint.Execution)
-	}
-	if resumed.Checkpoint.PullRequest != nil || resumed.Checkpoint.Validation != nil {
-		t.Fatalf("PullRequest/Validation not cleared: %#v", resumed.Checkpoint)
-	}
-	if resumed.Checkpoint.Work == nil || resumed.Checkpoint.Worktree == nil || resumed.Checkpoint.Plan == nil {
-		t.Fatalf("checkpoint = %#v, want preserved work/worktree/plan", resumed.Checkpoint)
-	}
-	if resumed.Run.LastCompletedStep == nil || *resumed.Run.LastCompletedStep != string(stepPlan) {
-		t.Fatalf("run.LastCompletedStep = %#v, want plan", resumed.Run.LastCompletedStep)
-	}
-}
-
-func TestCreateRunContextDoesNotFollowupResumeWithoutNativeSession(t *testing.T) {
-	t.Parallel()
-
-	fixture := newRunnerFixture(t)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
-
-	// Same completed loop + pending human message, but NO captured session — the
-	// follow-up bridge must refuse (native resume impossible; re-running would risk a
-	// full re-implementation). A completed run is not otherwise resumed.
-	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
-	if err != nil || loop == nil {
-		t.Fatalf("Loops.GetByID() error = %v, loop = %v", err, loop)
-	}
-	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: fixture.nowISO(), Text: "再改一版?"})
-	if err != nil {
-		t.Fatalf("AppendHumanMessage() error = %v", err)
-	}
-	loop.MetadataJSON = &meta
 	loop.Status = "completed"
 	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -1799,11 +1771,15 @@ func TestPersistPullRequestReferenceRollsBackLoopWhenQueueUpdateFails(t *testing
 	}
 }
 
-func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) {
+func TestProcessClaimedItemResumesByAdoptingPRAfterAmbiguousCreateFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
-	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, createPRErrors: []error{fmt.Errorf("temporary create pr failure")}}
+	branch := buildWorkerBranchName(workerInput{Title: "Implement worker loop", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: 27}, "loop_worker_1")
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{
+		createPRErrors:  []error{fmt.Errorf("a pull request for branch %q into branch main already exists", branch)},
+		openPRResponses: [][]PullRequestSummary{{}, {}, {{Number: 101, URL: "https://example/pr/101", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}},
+	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
 	started := make([]AgentExecutionStartedInput, 0, 1)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, OnAgentExecutionStarted: func(_ context.Context, input AgentExecutionStartedInput) error {
@@ -1843,11 +1819,35 @@ func TestProcessClaimedItemResumesFromOpenPRAfterRetryableFailure(t *testing.T) 
 	if len(git.createCalls) != 1 {
 		t.Fatalf("len(git.createCalls) = %d, want 1 (worktree should not rerun)", len(git.createCalls))
 	}
-	if len(github.createPRCalls) != 2 {
-		t.Fatalf("len(github.createPRCalls) = %d, want 2", len(github.createPRCalls))
+	if len(github.createPRCalls) != 1 {
+		t.Fatalf("len(github.createPRCalls) = %d, want 1 (resume must adopt the remotely-created PR)", len(github.createPRCalls))
 	}
 	if len(github.createIssueCommentCalls) != 1 {
 		t.Fatalf("len(github.createIssueCommentCalls) = %d, want 1 running marker across resume", len(github.createIssueCommentCalls))
+	}
+}
+
+func TestProcessClaimedItemDoesNotCreatePRWhenExistingPRLookupFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{listOpenPRErrors: []error{errors.New("github list unavailable")}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !strings.Contains(result.Summary, "could not verify") {
+		t.Fatalf("result = %#v, want retryable lookup failure", result)
+	}
+	if len(github.createPRCalls) != 0 {
+		t.Fatalf("len(github.createPRCalls) = %d, want 0 when PR existence is unknown", len(github.createPRCalls))
 	}
 }
 
@@ -3834,6 +3834,7 @@ type fakeGitHubGateway struct {
 	listIssueCalls          []ListOpenIssuesInput
 	openPRs                 []PullRequestSummary
 	openPRResponses         [][]PullRequestSummary
+	listOpenPRErrors        []error
 	openPRIndex             int
 	prDetail                PullRequestDetail
 	prDetailResponses       []PullRequestDetail
@@ -3883,9 +3884,13 @@ func (f *fakeGitHubGateway) ListOpenIssues(_ context.Context, input ListOpenIssu
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
-	if f.openPRIndex < len(f.openPRResponses) {
-		result := append([]PullRequestSummary(nil), f.openPRResponses[f.openPRIndex]...)
-		f.openPRIndex++
+	index := f.openPRIndex
+	f.openPRIndex++
+	if index < len(f.listOpenPRErrors) && f.listOpenPRErrors[index] != nil {
+		return nil, f.listOpenPRErrors[index]
+	}
+	if index < len(f.openPRResponses) {
+		result := append([]PullRequestSummary(nil), f.openPRResponses[index]...)
 		return result, nil
 	}
 	return append([]PullRequestSummary(nil), f.openPRs...), nil
@@ -3998,22 +4003,23 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 }
 
 type fakeGitGateway struct {
-	createResult   CreateWorktreeResult
-	restoreResult  *RestoreWorktreeResult
-	prepareResult  PrepareWorktreeResult
-	inspectResult  InspectHeadResult
-	inspectResults []InspectHeadResult
-	inspectErrors  []error
-	inspectIndex   int
-	commitResult   CommitResult
-	createCalls    []CreateWorktreeInput
-	restoreCalls   []RestoreWorktreeInput
-	pushCalls      []PushInput
-	prepareCalls   []PrepareWorktreeInput
-	inspectCalls   []InspectHeadInput
-	commitCalls    []CommitInput
-	pushErrors     []error
-	pushIndex      int
+	createResult      CreateWorktreeResult
+	restoreResult     *RestoreWorktreeResult
+	restoreReturnsNil bool
+	prepareResult     PrepareWorktreeResult
+	inspectResult     InspectHeadResult
+	inspectResults    []InspectHeadResult
+	inspectErrors     []error
+	inspectIndex      int
+	commitResult      CommitResult
+	createCalls       []CreateWorktreeInput
+	restoreCalls      []RestoreWorktreeInput
+	pushCalls         []PushInput
+	prepareCalls      []PrepareWorktreeInput
+	inspectCalls      []InspectHeadInput
+	commitCalls       []CommitInput
+	pushErrors        []error
+	pushIndex         int
 }
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
@@ -4036,6 +4042,9 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 
 func (f *fakeGitGateway) RestoreWorktree(_ context.Context, input RestoreWorktreeInput) (*RestoreWorktreeResult, error) {
 	f.restoreCalls = append(f.restoreCalls, input)
+	if f.restoreReturnsNil {
+		return nil, nil
+	}
 	if f.restoreResult != nil {
 		return f.restoreResult, nil
 	}

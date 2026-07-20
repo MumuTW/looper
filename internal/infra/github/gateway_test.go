@@ -366,6 +366,34 @@ func TestGatewayListOpenPullRequestsFallsBackWhenReviewRequestReviewerIsInaccess
 	}
 }
 
+func TestGatewayListOpenPullRequestsUsesRESTForWorkerDedupe(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args == "api --method GET repos/acme/looper/pulls -f state=open -f per_page=100 --jq "+prListRESTJQ {
+			return shell.Result{Stdout: `[{"number":42,"title":"Existing PR","html_url":"https://example.test/pull/42","state":"open","updated_at":"2026-07-16T11:00:00Z","draft":false,"labels":[{"name":"ready"}],"head":{"ref":"feature","sha":"abc123"},"base":{"ref":"main","sha":"def456"},"user":{"login":"octocat"},"author_association":"MEMBER","requested_reviewers":[{"login":"reviewer","id":7}]}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", args)
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListOpenPullRequests(context.Background(), ListOpenPullRequestsInput{Repo: "acme/looper", Limit: 100, BaseRefName: "main", PreferREST: true})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 42 || prs[0].HeadRefName != "feature" || prs[0].BaseRefName != "main" || prs[0].URL != "https://example.test/pull/42" {
+		t.Fatalf("ListOpenPullRequests() = %#v, want REST fallback PR", prs)
+	}
+	if !slices.Equal(prs[0].ReviewRequests, []string{"reviewer"}) {
+		t.Fatalf("ReviewRequests = %#v, want reviewer", prs[0].ReviewRequests)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("gh calls = %#v, want REST only", runner.calls)
+	}
+}
+
 func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -687,6 +715,7 @@ func TestIsTransientErrorTreatsShellCommandNetworkFailuresAsRetryable(t *testing
 		{name: "gateway-wrapped tls handshake timeout", err: &TransientError{Err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "net/http: TLS handshake timeout"}}}},
 		{name: "unexpected eof", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "Post https://api.github.com/graphql: unexpected EOF"}}},
 		{name: "graphql transient", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stdout: `{"errors":[{"message":"GraphQL: Something went wrong while executing your query."}]}`}}},
+		{name: "graphql resource limit", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "GraphQL: Resource limits for this query exceeded. (repository.pullRequests.nodes.1.labels)"}}},
 		{name: "bare http 504", err: fmt.Errorf("HTTP 504")},
 		{name: "generic rate limit", err: fmt.Errorf("rate limit exceeded")},
 	} {

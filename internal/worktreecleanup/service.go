@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -121,7 +122,7 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 			if loop.LastRunAt != nil {
 				states[index].noteTime(*loop.LastRunAt)
 			}
-			if protectsLoopStatus(loop.Status) {
+			if domain.StatusPinsWorktree(domain.LoopStatus(loop.Status)) {
 				states[index].block("referenced by protected loop status " + loop.Status)
 			}
 		}
@@ -264,17 +265,6 @@ func (s *candidateState) block(reason string) {
 	}
 	s.blocked = true
 	s.blockReason = reason
-}
-
-func protectsLoopStatus(status string) bool {
-	switch status {
-	// shepherding is a live worker loop parked between PR-driving passes; its
-	// worktree must survive so the next pass can push a fix from it.
-	case "idle", "queued", "running", "waiting", "paused", "failed", "interrupted", "shepherding":
-		return true
-	default:
-		return false
-	}
 }
 
 func fillRefFromLoop(ref worktreeRef, loop storage.LoopRecord) worktreeRef {

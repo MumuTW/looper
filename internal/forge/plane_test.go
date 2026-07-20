@@ -163,7 +163,7 @@ func TestPlaneCurrentUserIdentity(t *testing.T) {
 		t.Fatalf("CurrentUser() error = %v", err)
 	}
 	if identity.Login != "me-uuid" {
-		t.Fatalf("identity.Login = %q, want %q", identity.Login, "me-uuid")
+		t.Fatalf("identity.Login = %q, want Plane assignee UUID %q", identity.Login, "me-uuid")
 	}
 }
 

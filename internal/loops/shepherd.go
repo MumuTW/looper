@@ -36,6 +36,12 @@ type Shepherd struct {
 	// entering a phase (e.g. awaiting_validation → @QA, awaiting_merge → @owner)
 	// reports exactly once and re-reports only when the phase genuinely changes.
 	LastReportedPhase string `json:"lastReportedPhase,omitempty"`
+	// PlaneState is the last Plane work-item lifecycle state successfully synced by
+	// the shepherd reconciler. It makes the best-effort notification write durable:
+	// a transient Plane outage is retried later instead of leaving the item at Todo.
+	PlaneState string `json:"planeState,omitempty"`
+	// PlaneStateAttemptAt rate-limits retries while Plane is unavailable.
+	PlaneStateAttemptAt string `json:"planeStateAttemptAt,omitempty"`
 }
 
 // ReadShepherd returns the shepherd marker, if present.

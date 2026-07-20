@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,6 +47,8 @@ var unsafeAgentEnvKeys = []string{
 	"GIT_PREFIX",
 	"GIT_SHALLOW_FILE",
 }
+
+var malformedProductAskPattern = regexp.MustCompile(`(?s)^\s*\{\s*"summary"\s*:\s*("(?:\\.|[^"\\])*")\s*,\s*"productAsk"\s*:\s*"(.*)"\s*\}\s*$`)
 
 type ExecutorConfig struct {
 	Vendor              config.AgentVendor
@@ -1930,6 +1933,13 @@ func parseCompletion(stdout, stderr string) completionParse {
 		payload := strings.TrimPrefix(line, CompletionMarkerPrefix)
 		var parsed map[string]any
 		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+			if recovered, ok := recoverMalformedProductAsk(payload); ok {
+				if primary == nil {
+					captured := recovered
+					primary = &captured
+				}
+				continue
+			}
 			if primary != nil {
 				// A later marker already stood in; a malformed earlier echo is just
 				// noise — don't fail the whole parse over it.
@@ -1987,6 +1997,50 @@ func parseCompletion(stdout, stderr string) completionParse {
 		return *primary
 	}
 	return completionParse{ParseStatus: "missing"}
+}
+
+// recoverMalformedProductAsk preserves planner node-H asks when an agent follows
+// the completion schema but forgets to JSON-escape quotation marks inside the final
+// productAsk string. The planner marker has productAsk as its last field, which lets
+// us recover that field without treating arbitrary malformed markers as success.
+func recoverMalformedProductAsk(payload string) (completionParse, bool) {
+	fields := malformedProductAskPattern.FindStringSubmatch(payload)
+	if len(fields) != 3 {
+		return completionParse{}, false
+	}
+	var summary string
+	if err := json.Unmarshal([]byte(fields[1]), &summary); err != nil {
+		return completionParse{}, false
+	}
+	productAsk, err := strconv.Unquote(`"` + escapeLooseJSONString(fields[2]) + `"`)
+	if err != nil || strings.TrimSpace(productAsk) == "" {
+		return completionParse{}, false
+	}
+	return completionParse{
+		ParseStatus:      "parsed",
+		CompletionSignal: CompletionMarkerPrefix,
+		Summary:          summary,
+		ProductAsk:       productAsk,
+	}, true
+}
+
+func escapeLooseJSONString(value string) string {
+	var escaped strings.Builder
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\\':
+			escaped.WriteByte(value[i])
+			if i+1 < len(value) {
+				i++
+				escaped.WriteByte(value[i])
+			}
+		case '"':
+			escaped.WriteString(`\"`)
+		default:
+			escaped.WriteByte(value[i])
+		}
+	}
+	return escaped.String()
 }
 
 // completionLifecyclePopulated reports whether a parsed marker's git_pr_lifecycle

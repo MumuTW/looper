@@ -33,10 +33,14 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0020_feishu_live_feeds",
-              "latestAppliedId": "0020_feishu_live_feeds",
+              "latestAvailableId": "0021_queue_recoverable_infra",
+              "latestAppliedId": "0021_queue_recoverable_infra",
               "pendingCount": 0
             }
+          },
+          "scheduler": {
+            "healthy": true,
+            "blockedInfra": 0
           }
         },
         "requestId": "fixture-request-id"
@@ -80,12 +84,13 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0020_feishu_live_feeds",
+            "schemaVersion": "0021_queue_recoverable_infra",
             "pendingMigrations": [],
             "healthy": true
           },
           "scheduler": {
             "healthy": true,
+            "blockedInfra": 0,
             "queuedItems": 1,
             "runningItems": 0,
             "completedItems": 0,
@@ -232,6 +237,7 @@
             "maxConcurrentRuns": 3,
             "retryMaxAttempts": -1,
             "retryBaseDelayMs": 5000,
+            "infraRetryBudgetSeconds": 3600,
             "slowLaneWarnThresholdMs": 5000,
             "discoveryCacheTtlSeconds": 30
           },

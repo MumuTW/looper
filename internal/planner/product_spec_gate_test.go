@@ -11,25 +11,8 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestRequestProductSpecInThreadMatchesStrictPlaneLinkGate(t *testing.T) {
-	var got string
-	cfg := config.Config{Projects: []config.ProjectRefConfig{{ID: "project", ProductOwner: &config.ProductOwnerConfig{FeishuOpenID: "ou_product"}}}}
-	runner := &Runner{projectRoleConfig: &cfg, postThreadNote: func(_ context.Context, _ string, text string, mentions []string) error {
-		got = text
-		if len(mentions) != 1 || mentions[0] != "ou_product" {
-			t.Fatalf("mentions = %#v", mentions)
-		}
-		return nil
-	}}
-	runner.requestProductSpecInThread(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project"}, Loop: storage.LoopRecord{ID: "loop"}}, "跨页面导出")
-	for _, want := range []string{"looper:product-spec", "Links", "非空", "普通评论", "飞书回复", "不会解除"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("thread note missing %q: %s", want, got)
-		}
-	}
-	if strings.Contains(got, "发在本 thread") || strings.Contains(got, "自动关联") {
-		t.Fatalf("thread note promises unsupported association: %s", got)
-	}
+func productOwnerConfig(planeID string) *config.Config {
+	return &config.Config{Projects: []config.ProjectRefConfig{{ID: "proj-1", ProductOwner: &config.ProductOwnerConfig{PlaneID: planeID}}}}
 }
 
 // scriptedGateway builds a planedoc gateway whose plane CLI returns the given
@@ -60,8 +43,8 @@ func gateInput(labels []string) (stepInput, plannerCheckpoint) {
 }
 
 func TestProductSpecGateHoldsFeatureWithoutSpec(t *testing.T) {
-	// link list (no product-spec) → then comment create (RequestProductSpec)
-	gw, calls := scriptedGateway(`{"results":[]}`, `{"id":"c1"}`)
+	// link list (no product-spec) → exact-ask lookup → comment create
+	gw, calls := scriptedGateway(`{"results":[]}`, `{"results":[]}`, `{"id":"c1"}`)
 	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }}
 	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
 
@@ -69,25 +52,79 @@ func TestProductSpecGateHoldsFeatureWithoutSpec(t *testing.T) {
 	if gateErr == nil || gateErr.kind != FailureManualIntervention {
 		t.Fatalf("gate = %v, want a manual-intervention hold", gateErr)
 	}
-	if len(*calls) != 2 {
-		t.Fatalf("calls = %d, want link list + comment create", len(*calls))
+	if len(*calls) != 3 {
+		t.Fatalf("calls = %d, want link list + ask lookup + comment create", len(*calls))
 	}
 	// asked product on the work item
-	comment := (*calls)[1]
-	if comment[1] != "comment" || comment[2] != "create" {
-		t.Fatalf("second call = %v, want comment create", comment)
+	comment := (*calls)[2]
+	if !strings.Contains(strings.Join(comment, " "), "api request workspaces/w/projects/plane-proj-uuid/work-items/wi-9/comments/ --method POST") {
+		t.Fatalf("third call = %v, want comment create", comment)
 	}
 }
 
 func TestProductSpecGateProceedsWhenSpecPresent(t *testing.T) {
-	gw, calls := scriptedGateway(`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`, "# Product Spec")
-	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }}
+	gw, calls := scriptedGateway(
+		`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`,
+		`{"id":"pg1","description_html":"<p>目标：首版导出 React + CSS。验收：产物可独立运行。</p>","created_by":"product-owner"}`,
+	)
+	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }, projectRoleConfig: productOwnerConfig("product-owner")}
 	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
+	cp.Issue.ProductSpec = "stale content from an earlier checkpoint"
+	cp.Issue.ProductSpecURL = "https://plane.x/old"
 	if gateErr := r.productSpecGate(context.Background(), in, cp); gateErr != nil {
 		t.Fatalf("gate = %v, want nil (has product spec → proceed)", gateErr)
 	}
 	if len(*calls) != 2 {
-		t.Fatalf("calls = %d, want link list + non-empty Plane page read (no comment)", len(*calls))
+		t.Fatalf("calls = %d, want link list + product page read (no comment)", len(*calls))
+	}
+	if cp.Issue.ProductSpec == "" || cp.Issue.ProductSpecURL == "" {
+		t.Fatalf("issue product spec = %q, %q; want authoritative content + URL", cp.Issue.ProductSpec, cp.Issue.ProductSpecURL)
+	}
+}
+
+func TestProductSpecGateHoldsEmptyLinkedSpec(t *testing.T) {
+	gw, calls := scriptedGateway(
+		`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`,
+		`{"id":"pg1","description_html":" ","created_by":"product-owner"}`,
+		`{"results":[]}`,
+		`{"id":"c-empty"}`,
+	)
+	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }, projectRoleConfig: productOwnerConfig("product-owner")}
+	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
+	cp.Issue.ProductSpec = "stale content from an earlier checkpoint"
+	cp.Issue.ProductSpecURL = "https://plane.x/old"
+
+	gateErr := r.productSpecGate(context.Background(), in, cp)
+	if gateErr == nil || gateErr.kind != FailureManualIntervention {
+		t.Fatalf("gate = %v, want empty linked spec to hold", gateErr)
+	}
+	if len(*calls) != 4 {
+		t.Fatalf("calls = %d, want link read + page read + ask lookup + comment", len(*calls))
+	}
+	if cp.Issue.ProductSpec != "" || cp.Issue.ProductSpecURL != "" {
+		t.Fatalf("stale product spec survived failed revalidation: %q, %q", cp.Issue.ProductSpec, cp.Issue.ProductSpecURL)
+	}
+}
+
+func TestProductSpecGateRejectsPageAuthoredByLooperOwner(t *testing.T) {
+	gw, calls := scriptedGateway(
+		`{"results":[{"id":"l1","title":"looper:product-spec","url":"https://plane.x/w/projects/pp/pages/pg1"}]}`,
+		`{"id":"pg1","description_html":"<p>E2E draft written by Looper owner</p>","created_by":"looper-owner","updated_by":"looper-owner","owned_by":"looper-owner"}`,
+		`{"results":[]}`,
+		`{"id":"ask-product"}`,
+	)
+	r := &Runner{planeDoc: func(string) (*planedoc.Gateway, string, bool) { return gw, "plane-proj-uuid", true }, projectRoleConfig: productOwnerConfig("product-owner")}
+	in, cp := gateInput([]string{"kind/feature", "looper:plan"})
+
+	gateErr := r.productSpecGate(context.Background(), in, cp)
+	if gateErr == nil || gateErr.kind != FailureManualIntervention {
+		t.Fatalf("gate = %v, want untrusted page to hold", gateErr)
+	}
+	if len(*calls) != 4 {
+		t.Fatalf("calls = %d, want link + page provenance + ask lookup + comment", len(*calls))
+	}
+	if cp.Issue.ProductSpec != "" {
+		t.Fatalf("untrusted product spec leaked into planner prompt: %q", cp.Issue.ProductSpec)
 	}
 }
 

@@ -812,6 +812,19 @@ func TestParseCompletionExtractsProductAsk(t *testing.T) {
 	}
 }
 
+func TestParseCompletionRecoversProductAskWithUnescapedQuotes(t *testing.T) {
+	t.Parallel()
+
+	marker := CompletionMarkerPrefix + `{"summary":"wrote spec","productAsk":"① 背景：用户想导出。\n\n③ 请拍板：首版选 "HTML 优先" 还是 "React 优先"？建议 "HTML 优先"。"}`
+	parsed := parseCompletion("some work\n"+marker+"\n", "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "wrote spec" {
+		t.Fatalf("parseCompletion() = %#v, want recovered marker", parsed)
+	}
+	if !strings.Contains(parsed.ProductAsk, `"HTML 优先"`) || !strings.Contains(parsed.ProductAsk, "\n\n③ 请拍板") {
+		t.Fatalf("ProductAsk = %q, want quotes and newlines preserved", parsed.ProductAsk)
+	}
+}
+
 func TestReadPersistedExecutionLogReadsTailToPreserveCompletionMarker(t *testing.T) {
 	t.Parallel()
 

@@ -174,7 +174,7 @@ func (plane *PlaneClient) CurrentUser(ctx context.Context) (Identity, error) {
 	// Plane work-item assignees are member UUIDs. The shared forge interface calls
 	// this field Login, but returning a display name here makes manual plan/work
 	// commands PATCH an invalid assignee value (for example "mashu").
-	return Identity{Login: user.assignmentID()}, nil
+	return Identity{Login: user.login()}, nil
 }
 
 // ListOpenIssues returns Plane work-items mapped onto looper's Issue type. When
@@ -698,7 +698,12 @@ type planeUser struct {
 	FirstName   string `json:"first_name"`
 }
 
-func (u planeUser) assignmentID() string {
+func (u planeUser) login() string {
+	// Plane work-item assignees are represented by user UUIDs and PATCH expects
+	// those same UUIDs. Identity.Login is the provider-neutral string routing key
+	// used by the planner/worker adapters, so for Plane it must be the UUID rather
+	// than the human display name. Keep the readable fields only as defensive
+	// fallbacks for incomplete API fixtures/responses.
 	for _, candidate := range []string{u.ID, u.DisplayName, u.Email, u.FirstName} {
 		if strings.TrimSpace(candidate) != "" {
 			return strings.TrimSpace(candidate)

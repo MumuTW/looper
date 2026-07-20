@@ -27,6 +27,7 @@ const (
 	defaultGhCommandTimeout = 60 * time.Second
 	prListGhCommandTimeout  = 15 * time.Second
 	prDiffGhCommandTimeout  = 180 * time.Second
+	prListRESTJQ            = `[.[] | {number,title,html_url,state,updated_at,draft,labels:[.labels[]? | {name}],head:{ref:.head.ref,sha:.head.sha},base:{ref:.base.ref,sha:.base.sha},user:{login:.user.login},author_association,requested_reviewers:[.requested_reviewers[]? | {login,id}]}]`
 )
 
 var (
@@ -504,6 +505,7 @@ type ListOpenPullRequestsInput struct {
 	Author      string
 	BaseRefName string
 	Timeout     time.Duration
+	PreferREST  bool
 }
 
 type ListReviewRequestedPullRequestsInput struct {
@@ -667,6 +669,9 @@ func New(options Options) *Gateway {
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	if input.PreferREST {
+		return g.listOpenPullRequestsREST(ctx, input)
+	}
 	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
 		return snapshot.listOpenPullRequests(ctx, input)
 	}
@@ -786,6 +791,60 @@ func (g *Gateway) listOpenPullRequestsWithFields(ctx context.Context, input List
 		})
 	}
 	return out, nil
+}
+
+func (g *Gateway) listOpenPullRequestsREST(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	timeout := input.Timeout
+	if timeout <= 0 {
+		timeout = defaultGhCommandTimeout
+	}
+	result, err := g.runGhWithTimeout(
+		ctx,
+		input.CWD,
+		"",
+		timeout,
+		"api",
+		"--method",
+		"GET",
+		fmt.Sprintf("repos/%s/pulls", input.Repo),
+		"-f",
+		"state=open",
+		"-f",
+		fmt.Sprintf("per_page=%d", defaultLimit(input.Limit)),
+		"--jq",
+		prListRESTJQ,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	pullRequests := make([]PullRequestSummary, 0, len(rows))
+	for _, row := range rows {
+		head, _ := row["head"].(map[string]any)
+		base, _ := row["base"].(map[string]any)
+		requestedReviewers := extractActorUsers(row["requested_reviewers"])
+		pullRequests = append(pullRequests, PullRequestSummary{
+			Number:             asInt64(row["number"]),
+			Title:              asString(row["title"]),
+			URL:                asString(row["html_url"]),
+			State:              strings.ToUpper(asString(row["state"])),
+			UpdatedAt:          asString(row["updated_at"]),
+			IsDraft:            asBool(row["draft"]),
+			Labels:             extractLabelNames(row["labels"]),
+			HeadRefName:        asString(head["ref"]),
+			BaseRefName:        asString(base["ref"]),
+			HeadSHA:            asString(head["sha"]),
+			BaseSHA:            asString(base["sha"]),
+			Author:             extractAuthor(row["user"]),
+			AuthorAssociation:  asString(row["author_association"]),
+			ReviewRequests:     extractActorLogins(row["requested_reviewers"]),
+			ReviewRequestUsers: requestedReviewers,
+		})
+	}
+	return filterPullRequests(pullRequests, input), nil
 }
 
 func (g *Gateway) listOpenPullRequestRows(ctx context.Context, input ListOpenPullRequestsInput, fields []string) ([]map[string]any, error) {

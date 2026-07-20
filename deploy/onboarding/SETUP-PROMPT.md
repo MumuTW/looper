@@ -1,14 +1,14 @@
-# Prompt — set up and start looper (Feishu HITL)
+# Prompt — set up looper (Plane/GitHub HITL + Feishu notifications)
 
 Send the whole block below to your coding agent (Claude Code / codex / …) and run it **inside this unzipped directory**.
 
 ---
 
-You are helping me set up and start **looper** — a daemon that runs an autonomous dev agent — together with its human-in-the-loop (HITL) Feishu integration. Work **interactively**: confirm with me before any outward-facing (GitHub / Feishu) or irreversible action.
+You are helping me set up and start **looper** — a daemon that runs an autonomous dev agent. Plane/GitHub hold all decisions; Feishu is a one-way notification channel. Work **interactively**: confirm with me before any outward-facing (GitHub / Feishu) or irreversible action.
 
 ## What's in this bundle
 - `config.hitl.example.json` — the config template, with placeholders.
-- `hitl.env` — the team's **shared** Feishu / Worker secrets (already filled; **do not print it, do not commit it to git, do not paste it into chat**).
+- `hitl.env` — the team's shared Feishu app credentials (already filled; **do not print it, do not commit it to git, do not paste it into chat**).
 - `GUIDE-hitl-setup.md` — reference doc; read it first.
 
 ## Do this
@@ -40,7 +40,7 @@ You are helping me set up and start **looper** — a daemon that runs an autonom
    looper daemon start --config ~/.looper/config.json --daemon-restart-policy on-failure
    ```
    Confirm it's alive: `looper daemon status --config ~/.looper/config.json`. (The secrets come from the `hitl.env` you sourced above and get baked into the launchd service, so they survive restarts.)
-7. **Smoke test** (ask me first): create a small issue with the `looper:plan` label in my repo and confirm looper picks it up and — when there's ambiguity — posts a decision card to my Feishu group that @-mentions me.
+7. **Smoke test** (ask me first): create a small issue with the `looper:plan` label and confirm an ambiguity is written to Plane/GitHub, while Feishu only sends an @-mention and deep link to that exact location. Do not configure any Feishu callback or event subscription.
 
 ## Guardrails
 - Never commit `hitl.env` or the config into git; never paste secrets into chat.

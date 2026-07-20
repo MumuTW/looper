@@ -14,6 +14,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -27,6 +28,11 @@ const shepherdReconcileLockTTL = 20 * time.Minute
 // conflict / a human's merge promptly — independent of the slower 5-min
 // wake-reconcile.
 const shepherdReconcileInterval = 60 * time.Second
+
+// Plane state writes are best-effort and Plane can be temporarily slow or unavailable.
+// Remember failed attempts in the durable shepherd marker and retry at this cadence,
+// rather than hammering Plane on every 60-second PR reconciliation tick.
+const shepherdPlaneStateRetryInterval = 10 * time.Minute
 
 // shepherdMaxPasses caps how many agent passes one PR may consume before the
 // shepherd stops waking and leaves it for a human — a backstop against a flapping
@@ -59,12 +65,18 @@ func (r *Runtime) reconcileWorkerShepherd(ctx context.Context) {
 	if now == nil {
 		now = time.Now
 	}
-	shepherding, err := repositories.Loops.ListByStatuses(ctx, []string{"shepherding"})
+	// Completed shepherd loops are included only to retry a failed terminal Plane
+	// state write. They never touch GitHub or wake an agent again.
+	shepherding, err := repositories.Loops.ListByStatuses(ctx, []string{"shepherding", "completed"})
 	if err != nil {
 		return
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	for _, loop := range shepherding {
+		if strings.EqualFold(strings.TrimSpace(loop.Status), "completed") {
+			r.reconcileCompletedShepherdPlaneState(ctx, repositories, loop, nowISO)
+			continue
+		}
 		r.reconcileOneShepherdLoop(ctx, repositories, gateway, now, loop, nowISO, logger)
 	}
 }
@@ -117,6 +129,15 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		return
 	}
 	prNumber := *loop.PRNumber
+	// Shepherding itself proves the implementation PR exists, so keep Plane at
+	// In Review independently of the live GitHub read below. GitHub auth/network
+	// failures must not suppress Plane's own lifecycle reconciliation.
+	if r.syncShepherdPlaneState(ctx, repositories, &marker, loop, "In Review", nowISO) {
+		if metadata, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
+			r.persistLoopMetadata(ctx, repositories, loop.ID, metadata, nowISO)
+			loop.MetadataJSON = &metadata
+		}
+	}
 	cwd := ""
 	if proj, perr := repositories.Projects.GetByID(ctx, loop.ProjectID); perr == nil && proj != nil {
 		cwd = proj.RepoPath
@@ -138,15 +159,26 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		r.terminateShepherd(ctx, repositories, loop, repo, prNumber, outcome, nowISO, logger)
 		return
 	}
-	// HITL: a human thread @-mention lands in the loop's humanInbox but changes no PR
-	// field, so the folded-signal guard below would skip it and the shepherd would look
-	// unresponsive. Wake a pass now (enqueueShepherdPass is idempotent — deduped by loop
-	// id — and we honor the pass cap) so the shepherd drains + answers the thread message.
-	if len(loops.ReadHumanInbox(loop.MetadataJSON)) > 0 && marker.PassCount < shepherdMaxPasses {
-		r.enqueueShepherdPass(ctx, repositories, loop, repo, prNumber, nowISO, logger)
-	}
 	signal := foldShepherdSignal(pr)
 	if signal == marker.LastSignal {
+		// A shepherd pass stamps the durable phase to "fixing" while the agent is
+		// running. The pass can finish without changing the PR signal (for example,
+		// a final read-only sweep after approval + green CI). In that case the old
+		// early return left the Feishu card permanently stuck on 修复中 even though
+		// the live PR was already awaiting QA/merge. Always reconcile phase drift
+		// from the live PR before resting, even when the wake signal is unchanged.
+		phaseChanged := syncShepherdPhase(&marker, pr)
+		if phaseChanged {
+			r.reportShepherdPhase(ctx, &marker, loop, prNumber, prValidated(pr))
+			if newMeta, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
+				if newMeta, werr = loopcondition.Set(&newMeta, shepherdRestingCondition(pr, signal, nowISO)); werr == nil {
+					r.persistLoopMetadata(ctx, repositories, loop.ID, newMeta, nowISO)
+					r.refreshShepherdCard(ctx, loop.ID)
+				}
+			}
+			return
+		}
+		r.persistShepherdBlockedCondition(ctx, repositories, loop, shepherdRestingCondition(pr, signal, nowISO), nowISO)
 		return
 	}
 	// The folded PR signal changed → persist a fresh snapshot (best-effort, only on a
@@ -155,12 +187,20 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 	// off. No extra gh call — reuses the detail already fetched this tick.
 	r.captureShepherdSnapshot(ctx, repositories, gateway, loop, repo, prNumber, pr, nowISO)
 	marker.LastSignal = signal
-	marker.Phase = shepherdPhaseFor(pr)
-	marker.HeadSHA = pr.HeadSHA
+	syncShepherdPhase(&marker, pr)
 	// Milestone thread note + @-mention on entering a report-worthy phase, BEFORE we
 	// persist — so LastReportedPhase is saved and the next pass doesn't double-post.
 	r.reportShepherdPhase(ctx, &marker, loop, prNumber, prValidated(pr))
+	wakePass := shepherdActionable(pr) || commentedOnCurrentHead(pr)
 	if newMeta, werr := loops.WriteShepherd(loop.MetadataJSON, marker); werr == nil {
+		if wakePass {
+			newMeta, werr = loopcondition.Clear(&newMeta)
+		} else {
+			newMeta, werr = loopcondition.Set(&newMeta, shepherdRestingCondition(pr, signal, nowISO))
+		}
+		if werr != nil {
+			return
+		}
 		r.persistLoopMetadata(ctx, repositories, loop.ID, newMeta, nowISO)
 		// The folded signal changed (past the guard above), so the phase may have
 		// advanced (👀 评审中 → 🔧 修复中 → ✅ 待合并). Refresh the anchor card now: a
@@ -175,7 +215,7 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 	// feedback the pass should read + address or answer. We only reach here past the
 	// LastSignal guard, i.e. on a genuinely new signal (new review round included), so
 	// this fires once per round, not every tick.
-	if shepherdActionable(pr) || commentedOnCurrentHead(pr) {
+	if wakePass {
 		if marker.PassCount >= shepherdMaxPasses {
 			if logger != nil {
 				logger.Info("shepherd: pass cap reached — leaving PR for a human", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "passCount": marker.PassCount})
@@ -184,6 +224,72 @@ func (r *Runtime) reconcileOneShepherdLoop(ctx context.Context, repositories *st
 		}
 		r.enqueueShepherdPass(ctx, repositories, loop, repo, prNumber, nowISO, logger)
 	}
+}
+
+// syncShepherdPlaneState makes the In Review transition self-healing. The initial
+// worker-completed notification still attempts the update immediately; this durable
+// retry closes the gap when that one-shot write happened during a Plane outage.
+// It returns true when an attempt changed marker metadata and therefore needs
+// persistence by the caller.
+func (r *Runtime) syncShepherdPlaneState(ctx context.Context, repositories *storage.Repositories, marker *loops.Shepherd, loop storage.LoopRecord, desired, nowISO string) bool {
+	if marker == nil {
+		return false
+	}
+	now, err := time.Parse(time.RFC3339Nano, nowISO)
+	if err != nil || !shepherdPlaneStateSyncDue(*marker, desired, now) {
+		return false
+	}
+	marker.PlaneStateAttemptAt = nowISO
+
+	r.mu.RLock()
+	cfg := r.config
+	stateLogger := r.logger
+	r.mu.RUnlock()
+	if setPlaneWorkItemState(ctx, &cfg, repositories, stateLogger, loop.ProjectID, loop.ID, desired) {
+		marker.PlaneState = desired
+		marker.PlaneStateAttemptAt = ""
+	}
+	return true
+}
+
+func (r *Runtime) reconcileCompletedShepherdPlaneState(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string) {
+	marker, ok := loops.ReadShepherd(loop.MetadataJSON)
+	if !ok || marker.Active || !strings.EqualFold(strings.TrimSpace(marker.Outcome), "merged") {
+		return
+	}
+	if !r.syncShepherdPlaneState(ctx, repositories, &marker, loop, "Done", nowISO) {
+		return
+	}
+	if metadata, err := loops.WriteShepherd(loop.MetadataJSON, marker); err == nil {
+		r.persistLoopMetadata(ctx, repositories, loop.ID, metadata, nowISO)
+	}
+}
+
+func shepherdPlaneStateSyncDue(marker loops.Shepherd, desired string, now time.Time) bool {
+	if strings.EqualFold(strings.TrimSpace(marker.PlaneState), strings.TrimSpace(desired)) {
+		return false
+	}
+	attemptedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(marker.PlaneStateAttemptAt))
+	return err != nil || now.Sub(attemptedAt) >= shepherdPlaneStateRetryInterval
+}
+
+func shepherdRestingCondition(pr githubinfra.PullRequestDetail, signal, nowISO string) loopcondition.Record {
+	kind := loopcondition.ReviewUpdated
+	if shepherdCIPhase(pr) == "pending" {
+		kind = loopcondition.CISettled
+	}
+	return loopcondition.Record{Kind: kind, Since: nowISO, Fingerprint: signal}
+}
+
+func (r *Runtime) persistShepherdBlockedCondition(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, record loopcondition.Record, nowISO string) {
+	if current, ok := loopcondition.Read(loop.MetadataJSON); ok && current.Kind == record.Kind && current.Fingerprint == record.Fingerprint {
+		return
+	}
+	metadata, err := loopcondition.Set(loop.MetadataJSON, record)
+	if err != nil {
+		return
+	}
+	r.persistLoopMetadata(ctx, repositories, loop.ID, metadata, nowISO)
 }
 
 // captureShepherdSnapshot persists a PullRequestSnapshot from the PR detail the
@@ -408,6 +514,21 @@ func shepherdPhaseFor(pr githubinfra.PullRequestDetail) string {
 	return "reviewing"
 }
 
+// syncShepherdPhase updates the durable card phase from the current PR snapshot.
+// It intentionally runs independently of the folded wake signal: an agent pass
+// temporarily stamps "fixing", so phase can drift even while GitHub state remains
+// unchanged. Returns true only when the persisted phase needs a refresh.
+func syncShepherdPhase(marker *loops.Shepherd, pr githubinfra.PullRequestDetail) bool {
+	if marker == nil {
+		return false
+	}
+	desired := shepherdPhaseFor(pr)
+	changed := marker.Phase != desired
+	marker.Phase = desired
+	marker.HeadSHA = pr.HeadSHA
+	return changed
+}
+
 // refreshShepherdLock keeps the pr:<repo>:<n> lock alive under the stable
 // shepherd:<loopID> owner so a same-account fixer's discovery keeps skipping.
 func (r *Runtime) refreshShepherdLock(ctx context.Context, repos *storage.Repositories, loopID, repo string, prNumber int64, now func() time.Time) {
@@ -457,14 +578,9 @@ func (r *Runtime) terminateShepherd(ctx context.Context, repos *storage.Reposito
 	r.refreshShepherdCard(ctx, loop.ID)
 	if strings.EqualFold(strings.TrimSpace(outcome), "merged") {
 		r.postShepherdThreadNote(ctx, loop.ID, fmt.Sprintf("🎉 PR #%d 已合并。", prNumber), nil)
-		// Reflect the merge in Plane's own state column: In Review → Done. Plane projects
-		// only; best-effort (a failure must never disturb the terminate/merge flow).
-		r.mu.RLock()
-		cfg := r.config
-		stateRepos := r.services.Repositories
-		stateLogger := r.logger
-		r.mu.RUnlock()
-		setPlaneWorkItemState(ctx, &cfg, stateRepos, stateLogger, loop.ProjectID, loop.ID, "Done")
+		// Reflect the merge in Plane's own state column: In Review → Done. A failed
+		// best-effort write is recorded in the marker and retried by the reconciler.
+		r.reconcileCompletedShepherdPlaneState(ctx, repos, updated, nowISO)
 	}
 	if repos.Locks != nil {
 		_ = repos.Locks.Release(ctx, fmt.Sprintf("pr:%s:%d", repo, prNumber))
