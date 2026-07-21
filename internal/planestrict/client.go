@@ -93,6 +93,13 @@ type RoleRequestInput struct {
 	Questions        []RoleQuestion
 }
 
+type HandoffInput struct {
+	ApprovalActorMemberID string
+	ApprovalCommentID     string
+	SpecContentHash       string
+	SpecRevision          int
+}
+
 type RoleRequestResponse struct {
 	RoleRequest struct {
 		ID                 string    `json:"id"`
@@ -228,6 +235,30 @@ func (c *Client) Transition(ctx context.Context, dispatch Dispatch, nextState st
 	}
 	var response MutationResponse
 	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "transition"), nil, body, &signingContext{
+		dispatchID: dispatch.ID, dispatchRevision: dispatch.Revision, stateVersion: &stateVersion,
+		attemptID: dispatch.ExecutionAttemptID, fencingToken: &fencingToken,
+	}, &response)
+	return response, err
+}
+
+func (c *Client) Handoff(ctx context.Context, dispatch Dispatch, input HandoffInput) (MutationResponse, error) {
+	if dispatch.ExecutionAttemptID == nil {
+		return MutationResponse{}, errors.New("Plane strict handoff: execution attempt is missing")
+	}
+	stateVersion, fencingToken := dispatch.StateVersion, dispatch.FencingToken
+	body := map[string]any{
+		"expected_state_version":   dispatch.StateVersion,
+		"execution_attempt_id":     *dispatch.ExecutionAttemptID,
+		"fencing_token":            dispatch.FencingToken,
+		"session_id":               UUIDString(c.credentials.SessionID),
+		"instance_nonce":           base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:]),
+		"approval_actor_member_id": input.ApprovalActorMemberID,
+		"approval_comment_id":      input.ApprovalCommentID,
+		"spec_content_hash":        input.SpecContentHash,
+		"spec_revision":            input.SpecRevision,
+	}
+	var response MutationResponse
+	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "handoff"), nil, body, &signingContext{
 		dispatchID: dispatch.ID, dispatchRevision: dispatch.Revision, stateVersion: &stateVersion,
 		attemptID: dispatch.ExecutionAttemptID, fencingToken: &fencingToken,
 	}, &response)

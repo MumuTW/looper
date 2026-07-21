@@ -201,7 +201,7 @@ func (plane *PlaneClient) CurrentUser(ctx context.Context) (Identity, error) {
 // carry ALL requested label names (label UUIDs are resolved to names first).
 func (plane *PlaneClient) ListOpenIssues(ctx context.Context, input ListIssuesInput) ([]Issue, error) {
 	if plane.strictClient != nil {
-		return plane.listStrictDispatchIssues(ctx, input)
+		return plane.ListStrictDispatchIssues(ctx, input, "planner")
 	}
 	labelNames, err := plane.labelNamesByID(ctx)
 	if err != nil {
@@ -237,14 +237,14 @@ func (plane *PlaneClient) ListOpenIssues(ctx context.Context, input ListIssuesIn
 	return issues, nil
 }
 
-func (plane *PlaneClient) listStrictDispatchIssues(ctx context.Context, input ListIssuesInput) ([]Issue, error) {
+func (plane *PlaneClient) ListStrictDispatchIssues(ctx context.Context, input ListIssuesInput, activeRole string) ([]Issue, error) {
 	inbox, err := plane.strictClient.Inbox(ctx, "")
 	if err != nil {
 		return nil, err
 	}
 	issues := make([]Issue, 0, len(inbox.Dispatches))
 	for _, dispatch := range inbox.Dispatches {
-		if dispatch.ActiveRole != "planner" || dispatch.Health != "ok" {
+		if dispatch.ActiveRole != activeRole || dispatch.Health != "ok" {
 			continue
 		}
 		if dispatch.State == "queued" {
@@ -281,6 +281,26 @@ func (plane *PlaneClient) listStrictDispatchIssues(ctx context.Context, input Li
 		}
 	}
 	return issues, nil
+}
+
+func (plane *PlaneClient) HandoffStrictDispatch(ctx context.Context, dispatchID string, input planestrict.HandoffInput) error {
+	if plane.strictClient == nil {
+		return errors.New("Plane strict dispatch is not configured")
+	}
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return err
+	}
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ID == dispatchID {
+			if dispatch.ActiveRole == "worker" && (dispatch.State == "queued" || dispatch.State == "claimed" || dispatch.State == "running") {
+				return nil
+			}
+			_, err := plane.strictClient.Handoff(ctx, dispatch, input)
+			return err
+		}
+	}
+	return fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
 }
 
 func (plane *PlaneClient) workItemByID(ctx context.Context, workItemID string) (planeWorkItem, error) {

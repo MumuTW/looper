@@ -2585,13 +2585,13 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 		if err != nil {
 			return nil, err
 		}
-		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		issues, err := client.ListStrictDispatchIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, "worker")
 		if err != nil {
 			return nil, err
 		}
 		result := make([]worker.IssueSummary, 0, len(issues))
 		for _, issue := range issues {
-			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels), StrictDispatchID: issue.StrictDispatchID})
 		}
 		return result, nil
 	}
@@ -2621,6 +2621,17 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Author: issue.Author, Assignees: issue.Assignees, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels})
 	}
 	return result, nil
+}
+
+func (a workerGitHubAdapter) TransitionStrictDispatch(ctx context.Context, input worker.StrictDispatchTransitionInput) error {
+	client, ok, err := a.plane(ctx, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("strict dispatch requires a Plane provider")
+	}
+	return client.TransitionStrictDispatch(ctx, input.DispatchID, input.State, input.WaitKind)
 }
 
 func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {

@@ -15,6 +15,7 @@ import (
 	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/infra/planedoc"
+	"github.com/nexu-io/looper/internal/planestrict"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -31,6 +32,7 @@ type specApprovalState struct {
 	ContentHash      string
 	RequestCommentID string
 	RequestedAt      string
+	StrictDispatchID string
 }
 
 type specApprovalJudgeFunc func(context.Context, []planedoc.PageComment, string) (specApprovalVerdict, error)
@@ -63,6 +65,7 @@ func loopSpecApprovalState(metadataJSON *string) specApprovalState {
 	state.ContentHash, _ = meta["specApprovalContentHash"].(string)
 	state.RequestCommentID, _ = meta["specApprovalRequestCommentID"].(string)
 	state.RequestedAt, _ = meta["specApprovalRequestedAt"].(string)
+	state.StrictDispatchID, _ = meta["strictDispatchId"].(string)
 	return state
 }
 
@@ -255,9 +258,29 @@ func (r *Runtime) reconcileSpecApproval(ctx context.Context) {
 			continue
 		}
 		by := ownerPlaneID
-		// node H → I: approved. Stamp worker-ready so the worker discovers the item,
-		// drop an audit comment on the spec page, and mark dispatched (exactly once).
-		if err := gateway.AddWorkItemLabel(ctx, planeProjectID, workItemID, workerReadyLabel); err != nil {
+		// Strict dispatches use the Plane-authoritative, revision-bound handoff. Legacy
+		// projects retain the worker-ready label bridge during the migration window.
+		if state.StrictDispatchID != "" {
+			client, ok, clientErr := planeClientForCWD(&cfg, workingDir)
+			if clientErr != nil || !ok {
+				if logger != nil {
+					logger.Warn("spec approval: strict Plane client unavailable", map[string]any{"loopId": loop.ID, "error": fmt.Sprint(clientErr)})
+				}
+				continue
+			}
+			approvalCommentID := strings.TrimSpace(comments[len(comments)-1].ID)
+			if err := client.HandoffStrictDispatch(ctx, state.StrictDispatchID, planestrict.HandoffInput{
+				ApprovalActorMemberID: ownerPlaneID,
+				ApprovalCommentID:     approvalCommentID,
+				SpecContentHash:       state.ContentHash,
+				SpecRevision:          state.Revision,
+			}); err != nil {
+				if logger != nil {
+					logger.Warn("spec approval: strict planner-to-worker handoff failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+				}
+				continue
+			}
+		} else if err := gateway.AddWorkItemLabel(ctx, planeProjectID, workItemID, workerReadyLabel); err != nil {
 			if logger != nil {
 				logger.Warn("spec approval: stamp worker-ready failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
 			}

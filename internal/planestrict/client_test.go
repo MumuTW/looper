@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +79,19 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 				"request_comment_id": "comment-1", "eligible_member_id": "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
 				"eligible_member_name": "Product", "created_at": now.Format(time.RFC3339Nano), "created": true,
 			}})
+		case "/api/workspaces/open-design/projects/project-id/looper/dispatch/" + dispatchID + "/handoff/":
+			dispatch := Dispatch{ID: dispatchID, Revision: 3, StateVersion: 3, ExecutionAttemptID: &attemptID, FencingToken: 9}
+			expectedDispatch = &dispatch
+			var body map[string]any
+			if err := json.Unmarshal(rawBody, &body); err != nil {
+				t.Fatal(err)
+			}
+			if body["approval_actor_member_id"] != "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb" || body["spec_content_hash"] != strings.Repeat("a", 64) {
+				t.Fatalf("handoff body = %#v", body)
+			}
+			writeJSON(t, response, MutationResponse{Dispatch: Dispatch{
+				ID: dispatchID, Revision: 3, StateVersion: 4, State: "queued", ActiveRole: "worker",
+			}})
 		default:
 			t.Fatalf("unexpected path %s", request.URL.Path)
 		}
@@ -111,8 +125,16 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	if err != nil || roleRequest.RoleRequest.EligibleMemberName != "Product" {
 		t.Fatalf("CreateRoleRequest() = %#v, %v", roleRequest, err)
 	}
-	if requestCount != 5 {
-		t.Fatalf("requests = %d, want 5", requestCount)
+	handedOff, err := client.Handoff(context.Background(), transitioned.Dispatch, HandoffInput{
+		ApprovalActorMemberID: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+		ApprovalCommentID:     "bbbbbbbb-2222-4333-8444-cccccccccccc",
+		SpecContentHash:       strings.Repeat("a", 64), SpecRevision: 2,
+	})
+	if err != nil || handedOff.Dispatch.ActiveRole != "worker" {
+		t.Fatalf("Handoff() = %#v, %v", handedOff, err)
+	}
+	if requestCount != 6 {
+		t.Fatalf("requests = %d, want 6", requestCount)
 	}
 }
 

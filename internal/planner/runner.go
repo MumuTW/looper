@@ -867,6 +867,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	strictDispatchID := strings.TrimSpace(stringFromAnyDefault(parseJSONObject(queueItem.PayloadJSON)["strictDispatchId"]))
 	if strictDispatchID != "" {
+		metadataJSON, mergeErr := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"strictDispatchId": strictDispatchID})
+		if mergeErr != nil {
+			return ProcessResult{}, mergeErr
+		}
+		updated, updateErr := r.updateLoop(ctx, *loop, func(value *storage.LoopRecord) {
+			value.MetadataJSON = &metadataJSON
+		})
+		if updateErr != nil {
+			return ProcessResult{}, updateErr
+		}
+		loop = &updated
+	}
+	if strictDispatchID != "" {
 		gateway, ok := r.github.(strictDispatchGateway)
 		if !ok {
 			return ProcessResult{}, fmt.Errorf("strict dispatch gateway is not configured")

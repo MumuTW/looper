@@ -103,14 +103,15 @@ type PullRequestSummary struct {
 }
 
 type IssueSummary struct {
-	Number        int64
-	Title         string
-	Body          string
-	URL           string
-	Author        string
-	Assignees     []string
-	AssigneeUsers []networkpolicy.GitHubUser
-	Labels        []string
+	Number           int64
+	Title            string
+	Body             string
+	URL              string
+	Author           string
+	Assignees        []string
+	AssigneeUsers    []networkpolicy.GitHubUser
+	Labels           []string
+	StrictDispatchID string
 }
 
 type PullRequestDetail struct {
@@ -273,6 +274,18 @@ type GitHubGateway interface {
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
+}
+
+type StrictDispatchTransitionInput struct {
+	Repo       string
+	CWD        string
+	DispatchID string
+	State      string
+	WaitKind   *string
+}
+
+type strictDispatchGateway interface {
+	TransitionStrictDispatch(context.Context, StrictDispatchTransitionInput) error
 }
 
 type CreateWorktreeInput struct {
@@ -1050,15 +1063,16 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
-		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
+		strictDispatch := strings.TrimSpace(issue.StrictDispatchID) != ""
+		if !strictDispatch && domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
 			result.Skipped++
 			continue
 		}
-		if !shouldClaimWorkerIssue(issue, login, policy) {
+		if !strictDispatch && !shouldClaimWorkerIssue(issue, login, policy) {
 			result.Skipped++
 			continue
 		}
-		if requiredTargetLabel != "" && !hasLabel(issue.Labels, requiredTargetLabel) {
+		if !strictDispatch && requiredTargetLabel != "" && !hasLabel(issue.Labels, requiredTargetLabel) {
 			result.Skipped++
 			continue
 		}
@@ -1207,8 +1221,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
-	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
-		return ProcessResult{}, err
+	strictDispatchID := strings.TrimSpace(stringFromAnyDefault(parseJSONObject(queueItem.PayloadJSON)["strictDispatchId"]))
+	if strictDispatchID == "" {
+		if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
+			return ProcessResult{}, err
+		}
+	} else {
+		gateway, ok := r.github.(strictDispatchGateway)
+		if !ok {
+			return ProcessResult{}, fmt.Errorf("strict dispatch gateway is not configured")
+		}
+		if err := gateway.TransitionStrictDispatch(ctx, StrictDispatchTransitionInput{Repo: derefString(loop.Repo), CWD: project.RepoPath, DispatchID: strictDispatchID, State: "running"}); err != nil {
+			return ProcessResult{}, fmt.Errorf("start strict worker dispatch %s: %w", strictDispatchID, err)
+		}
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
@@ -1389,6 +1414,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return r.enterShepherding(ctx, project, loop, run, queueItem, checkpoint)
 	}
 	summary := r.buildSuccessSummary(*loop, checkpoint)
+	if strictDispatchID != "" {
+		gateway := r.github.(strictDispatchGateway)
+		if err := gateway.TransitionStrictDispatch(ctx, StrictDispatchTransitionInput{Repo: derefString(loop.Repo), CWD: project.RepoPath, DispatchID: strictDispatchID, State: "completed"}); err != nil {
+			return ProcessResult{}, fmt.Errorf("complete strict worker dispatch %s: %w", strictDispatchID, err)
+		}
+	}
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
@@ -3362,7 +3393,7 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	}
 	nowISO := r.nowISO()
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "labels": issue.Labels, "discoveryFingerprint": fingerprint})
+	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "labels": issue.Labels, "discoveryFingerprint": fingerprint, "strictDispatchId": issue.StrictDispatchID})
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := storage.IssueLockKey(project.ID, repo, issue.Number)
 	projectID := project.ID
