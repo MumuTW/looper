@@ -223,7 +223,7 @@ V1 不展示跨 owner 的目标下拉框。当前登录用户自己的 Looper �
 
 - **AC-1**：Guest 能查看 Looper 面板但不能派发；Project Member/Admin 只有同时具备 work-item 编辑权且本人拥有 active Node 时，才能派给自己的 Looper；任何人都不能派给其他 owner。
 - **AC-2**：角色审批权限与 Plane 端带 revision 的项目角色策略一致；Project Admin 不会天然获得产品、设计或技术审批权；不同 Node 的本地配置不能改变在途任务的角色资格。
-- **AC-3**：按钮只使用当前登录用户经过 Plane 身份 + Node credential 双向绑定、由 Project Admin 启用、项目匹配且支持所选角色的唯一 Looper，并显示 owner、Node、在线状态和当前负载；Node 自报别人的 owner UUID无效。
+- **AC-3**：按钮只使用当前登录用户经过 Plane 身份 + Node credential 双向绑定、项目匹配且支持所选角色的唯一 Looper，并显示 owner、Node、在线状态和当前负载；成员连接自己的电脑无需 Admin 审批，Project Admin 只启用项目级集成；Node 自报别人的 owner UUID无效。
 - **AC-4**：同一项目每个 owner 最多一个 active Node；V1 没有跨 owner 目标下拉或多 Node 选择器。
 - **AC-5**：派发确认文案明确说出 work item、执行方式、owner、Node 和离线影响；`直接实现` 只有最新技术 Spec 已由 owner批准，或 owner 对无待决策的小型 Bug 留下带原因 waiver 时才可用，绕过 UI 的请求同样被服务端拒绝。
 - **AC-6**：成功派发后，Plane 中存在唯一、持久、可审计且不能靠手工拼 assignee/label 伪造的执行归属；对应 owner/Node 可领取，其他 Looper 不可领取。

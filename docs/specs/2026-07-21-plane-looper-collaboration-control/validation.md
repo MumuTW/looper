@@ -139,9 +139,9 @@
 已自动验证：
 
 - Looper `go test ./...`（包含现有隔离 E2E harness）、`go vet ./...`、`go build ./...` 全部通过。
-- Plane Looper contract/unit suite 通过：双 owner/双 Node inbox 隔离、wrong-node claim、签名/replay/fencing、角色路由、owner-only 回答、实时目录降级、审批后 Planner→Worker 原子 handoff、旧 attempt 失效、termination summary 门禁、awaiting-human stop。
-- CLI 在独立临时 HOME + fake Plane + fake loopernet 中通过 `link → admin approve → project setup → owner enable`；私钥权限为 `0600`。
-- Plane Web `check:types`、18 个 locale key sync、production build 通过。
-- 在全新 PostgreSQL 临时数据库从零迁移至 `db.0125` 成功，并确认 protocol immutable trigger 已安装；临时数据库已删除。
+- Plane Looper contract/unit suite 通过；本轮连接/协作相关 17 条 contract 覆盖自助会话、10 分钟过期/取消、唯一设备、无需 Admin 审批、signed inbox 完成门禁，并继续覆盖双 owner/双 Node inbox 隔离、wrong-node claim、签名/replay/fencing、角色路由、owner-only 回答、实时目录降级、Planner→Worker 原子 handoff、旧 attempt 失效、termination summary 门禁和 awaiting-human stop。
+- CLI 在独立临时 HOME + fake Plane + fake loopernet 中通过 `Plane one-time code → identity exchange → signed link → daemon restart → signed inbox ready → complete`；无需 Admin 设备审批，私钥权限为 `0600`，并覆盖 inbox 尚未 ready 时的重试。
+- Plane Web TypeScript、Looper 面板 oxlint、19 个 locale key sync 通过；连接向导由 Claude Code 产出。因验收机磁盘已触发 97% hard-stop，本轮未重复生成大型 production build 缓存，最终浏览器视觉验收仍保留。
+- 在全新 PostgreSQL 临时数据库从零迁移至 `db.0126` 成功，新增 connection session schema 与旧 pending binding 自激活迁移均可应用；临时数据库在测试退出时删除。
 
 最终人工验收仍保留：真实 Plane/loopernet 上两个真实 owner 的浏览器点击见证、三个 viewport 的实际页面截图/键盘检查、真实 PR 产物链，以及 production feature flag/密钥/回滚演练。自动化不会替代这些上线 gate。

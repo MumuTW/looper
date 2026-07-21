@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
@@ -29,6 +30,22 @@ import (
 )
 
 const planeLinkMediaType = "application/vnd.looper.link-request+cbor;v=1"
+
+type planeAPIError struct {
+	Status int
+	Code   string
+	Detail string
+}
+
+func (e *planeAPIError) Error() string {
+	if e.Code != "" && e.Detail != "" {
+		return fmt.Sprintf("Plane returned HTTP %d (%s): %s", e.Status, e.Code, e.Detail)
+	}
+	if e.Code != "" {
+		return fmt.Sprintf("Plane returned HTTP %d (%s)", e.Status, e.Code)
+	}
+	return fmt.Sprintf("Plane returned HTTP %d", e.Status)
+}
 
 type planeLinkIdentity struct {
 	ID string `json:"id"`
@@ -40,6 +57,316 @@ type planeLinkBinding struct {
 	NodeID      string `json:"node_id"`
 	State       string `json:"state"`
 	KeyRevision uint64 `json:"revision"`
+}
+
+type planeConnectExchange struct {
+	ConnectionID string `json:"connection_id"`
+	Status       string `json:"status"`
+	Workspace    string `json:"workspace"`
+	WorkspaceID  string `json:"workspace_id"`
+	ProjectID    string `json:"project_id"`
+	MemberID     string `json:"member_id"`
+	BindingID    string `json:"binding_id"`
+	NodeID       string `json:"node_id"`
+}
+
+type planeLinkProofIdentity struct {
+	WorkspaceID string
+	ProjectID   string
+	MemberID    string
+}
+
+func (r *commandRuntime) planeConnect(cmd *cobra.Command, args []string) error {
+	connectCode := strings.TrimSpace(getStringFlag(cmd, "code"))
+	if connectCode == "" {
+		return errors.New("plane connect requires --code from the Plane connection page")
+	}
+	planeOrigin, err := planeWebOrigin(args[0])
+	if err != nil {
+		return err
+	}
+	exchangeBody, _ := json.Marshal(map[string]string{"code": connectCode})
+	exchange := planeConnectExchange{}
+	if err := r.planeRawRequest(cmd.Context(), planeOrigin, "", http.MethodPost, "/api/looper/connections/exchange/", "application/json", exchangeBody, &exchange); err != nil {
+		return fmt.Errorf("exchange Plane connection code: %w", err)
+	}
+
+	loaded, err := r.loadConfig()
+	if err != nil {
+		return err
+	}
+	providerIndex, provider, err := matchingPlaneConnectProvider(loaded.Config, planeOrigin, exchange, getStringFlag(cmd, "provider"))
+	if err != nil {
+		return err
+	}
+	homeDir, err := r.homeDir()
+	if err != nil {
+		return err
+	}
+	networkState, err := networkclient.LoadState(networkclient.DefaultStatePath(homeDir))
+	if err != nil {
+		return fmt.Errorf("plane connect requires a joined loopernet network: %w", err)
+	}
+	privateKeyFile := filepath.Join(homeDir, ".looper", "runtime", "plane-"+safeFileComponent(provider.ID)+".pem")
+	pendingPrivateKeyFile := privateKeyFile + ".pending"
+	if exchange.Status == "completed" {
+		if exchange.NodeID != networkState.NodeID || provider.StrictDispatch == nil ||
+			provider.StrictDispatch.BindingID != exchange.BindingID ||
+			provider.StrictDispatch.NodeID != exchange.NodeID {
+			return errors.New("this Plane connection is complete on a different or unconfigured local Node")
+		}
+		return r.writePlaneConnectResult(cmd, provider.ID, exchange, networkState.NodeName)
+	}
+	if exchange.Status == "binding_created" {
+		if exchange.BindingID == "" || exchange.NodeID != networkState.NodeID {
+			return errors.New("the pending Plane connection belongs to a different local Node")
+		}
+		if provider.StrictDispatch != nil && strings.TrimSpace(provider.StrictDispatch.BindingID) != "" {
+			if provider.StrictDispatch.BindingID != exchange.BindingID || provider.StrictDispatch.NodeID != exchange.NodeID {
+				return errors.New("this Plane provider is already connected to a different computer")
+			}
+			if configuredKey := strings.TrimSpace(provider.StrictDispatch.PrivateKeyFile); configuredKey != "" {
+				privateKeyFile = configuredKey
+			}
+		}
+		if _, readErr := r.readFile(privateKeyFile); readErr != nil {
+			if !os.IsNotExist(readErr) {
+				return fmt.Errorf("inspect Plane private key %s: %w", privateKeyFile, readErr)
+			}
+			if _, pendingErr := r.readFile(pendingPrivateKeyFile); pendingErr != nil {
+				return fmt.Errorf("resume Plane connection requires the existing private key %s: %w", privateKeyFile, pendingErr)
+			}
+			if err := renameFile(pendingPrivateKeyFile, privateKeyFile); err != nil {
+				return fmt.Errorf("promote pending Plane private key: %w", err)
+			}
+		}
+		strict := config.PlaneStrictDispatchConfig{
+			Enabled: true, BaseURL: planeOrigin, NodeID: exchange.NodeID,
+			BindingID: exchange.BindingID, KeyRevision: 1, PrivateKeyFile: privateKeyFile,
+		}
+		if err := r.writePlaneStrictProviderConfig(loaded, providerIndex, strict); err != nil {
+			return err
+		}
+		return r.finishPlaneConnection(cmd, planeOrigin, connectCode, provider.ID, exchange, networkState.NodeName)
+	}
+	if exchange.Status != "" && exchange.Status != "created" && exchange.Status != "cli_connected" {
+		return fmt.Errorf("Plane connection is not available (status %s)", exchange.Status)
+	}
+	if provider.StrictDispatch != nil && strings.TrimSpace(provider.StrictDispatch.BindingID) != "" {
+		return errors.New("this Plane provider is already connected to a computer")
+	}
+	if _, readErr := r.readFile(pendingPrivateKeyFile); readErr == nil {
+		if err := r.removeFile(pendingPrivateKeyFile); err != nil {
+			return fmt.Errorf("remove an uncommitted Plane private key: %w", err)
+		}
+	} else if !os.IsNotExist(readErr) {
+		return fmt.Errorf("inspect pending Plane private key: %w", readErr)
+	}
+	if _, readErr := r.readFile(privateKeyFile); readErr == nil {
+		return fmt.Errorf("refusing to replace existing Plane private key %s", privateKeyFile)
+	} else if !os.IsNotExist(readErr) {
+		return fmt.Errorf("inspect Plane private key: %w", readErr)
+	}
+	linkBody, privateKey, err := r.buildPlaneLinkRequest(
+		cmd.Context(),
+		networkState,
+		planeLinkProofIdentity{
+			WorkspaceID: exchange.WorkspaceID,
+			ProjectID:   exchange.ProjectID,
+			MemberID:    exchange.MemberID,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return err
+	}
+	if err := r.mkdirAll(filepath.Dir(privateKeyFile), 0o700); err != nil {
+		return err
+	}
+	if err := r.writeFile(pendingPrivateKeyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8}), 0o600); err != nil {
+		return err
+	}
+	linkResponse := struct {
+		ConnectionID string           `json:"connection_id"`
+		Binding      planeLinkBinding `json:"binding"`
+	}{}
+	if err := r.planeRawRequestWithHeaders(
+		cmd.Context(), planeOrigin, "", http.MethodPost, "/api/looper/connections/link/",
+		planeLinkMediaType, linkBody,
+		map[string]string{"X-Looper-Connect-Code": connectCode, "X-Looper-Node-Name": networkState.NodeName},
+		&linkResponse,
+	); err != nil {
+		var apiErr *planeAPIError
+		if errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 {
+			_ = r.removeFile(pendingPrivateKeyFile)
+			return fmt.Errorf("create self-service Plane Node binding: %w", err)
+		}
+		return fmt.Errorf("Plane may have created the binding, so the pending private key was kept at %s: %w; rerun the same Plane command to reconcile safely", pendingPrivateKeyFile, err)
+	}
+	if err := renameFile(pendingPrivateKeyFile, privateKeyFile); err != nil {
+		return fmt.Errorf("binding created and pending private key kept at %s, but promote it: %w; rerun the same Plane command to recover", pendingPrivateKeyFile, err)
+	}
+	strict := config.PlaneStrictDispatchConfig{
+		Enabled: true, BaseURL: planeOrigin, NodeID: networkState.NodeID,
+		BindingID: linkResponse.Binding.ID, KeyRevision: 1, PrivateKeyFile: privateKeyFile,
+	}
+	if err := r.writePlaneStrictProviderConfig(loaded, providerIndex, strict); err != nil {
+		return fmt.Errorf("binding created and private key kept at %s, but save provider config: %w; rerun the same Plane command to recover", privateKeyFile, err)
+	}
+	exchange.BindingID = linkResponse.Binding.ID
+	exchange.NodeID = linkResponse.Binding.NodeID
+	exchange.Status = "binding_created"
+	return r.finishPlaneConnection(cmd, planeOrigin, connectCode, provider.ID, exchange, networkState.NodeName)
+}
+
+func (r *commandRuntime) finishPlaneConnection(cmd *cobra.Command, planeOrigin, connectCode, providerID string, exchange planeConnectExchange, nodeName string) error {
+	if err := r.daemonRestartForBootstrap(cmd); err != nil {
+		if strings.Contains(err.Error(), `unknown field "strictDispatch"`) {
+			return fmt.Errorf("binding and local configuration are ready, but the installed looperd is too old for Plane dispatch: %w; run `looper upgrade --daemon`, then rerun the same Plane command", err)
+		}
+		return fmt.Errorf("binding and local configuration are ready, but restart Looper daemon: %w; rerun the same Plane command to recover", err)
+	}
+	completeBody, _ := json.Marshal(map[string]string{"code": connectCode})
+	var completeErr error
+	for attempt := 0; attempt < 31; attempt++ {
+		completeErr = r.planeRawRequest(cmd.Context(), planeOrigin, "", http.MethodPost, "/api/looper/connections/complete/", "application/json", completeBody, nil)
+		if completeErr == nil {
+			break
+		}
+		var apiErr *planeAPIError
+		if !errors.As(completeErr, &apiErr) || apiErr.Code != "node_not_ready" {
+			return fmt.Errorf("complete Plane connection: %w", completeErr)
+		}
+		if attempt < 30 {
+			r.sleep(2 * time.Second)
+		}
+	}
+	if completeErr != nil {
+		return fmt.Errorf("Looper daemon restarted, but its signed Plane inbox did not become ready within 60 seconds: %w; rerun the same Plane command to continue checking", completeErr)
+	}
+	return r.writePlaneConnectResult(cmd, providerID, exchange, nodeName)
+}
+
+func (r *commandRuntime) writePlaneConnectResult(cmd *cobra.Command, providerID string, exchange planeConnectExchange, nodeName string) error {
+	if getBoolFlag(cmd, "json") {
+		return writeJSON(cmd.OutOrStdout(), map[string]any{"providerId": providerID, "connectionId": exchange.ConnectionID, "bindingId": exchange.BindingID, "connected": true})
+	}
+	printSection(cmd.OutOrStdout(), "Plane Looper connected", [][2]any{
+		{"providerId", providerID}, {"ownerMemberId", exchange.MemberID}, {"node", nodeName},
+		{"bindingId", exchange.BindingID}, {"daemonReloaded", true}, {"next", "Return to Plane and dispatch a work item to your Looper."},
+	})
+	return nil
+}
+
+func matchingPlaneConnectProvider(cfg config.Config, planeOrigin string, exchange planeConnectExchange, wanted string) (int, config.ProviderConfig, error) {
+	matchIndex := -1
+	for index, provider := range cfg.Providers {
+		if provider.Kind != config.ProviderKindPlane || provider.Workspace == nil || provider.ProjectID == nil {
+			continue
+		}
+		origin, err := planeWebOrigin(provider.BaseURL)
+		if err != nil || origin != planeOrigin || *provider.Workspace != exchange.Workspace || *provider.ProjectID != exchange.ProjectID {
+			continue
+		}
+		if strings.TrimSpace(wanted) != "" && provider.ID != strings.TrimSpace(wanted) {
+			continue
+		}
+		if matchIndex != -1 {
+			return 0, config.ProviderConfig{}, errors.New("multiple Plane providers match this project; pass --provider")
+		}
+		matchIndex = index
+	}
+	if matchIndex == -1 {
+		return 0, config.ProviderConfig{}, errors.New("no configured Plane provider matches this connection; run `looper bootstrap` first")
+	}
+	return matchIndex, cfg.Providers[matchIndex], nil
+}
+
+func (r *commandRuntime) buildPlaneLinkRequest(
+	ctx context.Context,
+	networkState networkclient.LocalState,
+	identity planeLinkProofIdentity,
+) ([]byte, ed25519.PrivateKey, error) {
+	workspaceID, err := parsePlaneProtocolUUID(identity.WorkspaceID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Plane workspace id: %w", err)
+	}
+	projectID, err := parsePlaneProtocolUUID(identity.ProjectID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Plane project id: %w", err)
+	}
+	memberID, err := parsePlaneProtocolUUID(identity.MemberID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Plane member id: %w", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	publicHash := sha256.Sum256(publicKey)
+	audience := "plane:" + identity.WorkspaceID
+	challengeResponse, err := networkclient.New(
+		networkState.URL,
+		networkState.NodeToken,
+		r.httpClient(),
+	).LinkChallenge(ctx, protocol.LinkChallengeRequest{
+		PublicKeySHA256: base64.RawURLEncoding.EncodeToString(publicHash[:]),
+		Audience:        audience,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("request loopernet Plane challenge: %w", err)
+	}
+	challengeEnvelope, err := base64.RawURLEncoding.Strict().DecodeString(challengeResponse.Challenge)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode loopernet challenge: %w", err)
+	}
+	envelope, err := planeprotocol.DecodeEnvelope(challengeEnvelope)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode loopernet challenge envelope: %w", err)
+	}
+	challenge, err := planeprotocol.DecodeLinkChallenge(envelope.Payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	if challenge.NetworkID != networkState.NetworkID ||
+		challenge.NodeID != networkState.NodeID ||
+		challenge.PublicKeySHA256 != publicHash ||
+		challenge.Audience != audience {
+		return nil, nil, errors.New("loopernet challenge does not match this Node and Plane workspace")
+	}
+	challengeDigest, err := planeprotocol.DomainDigest(planeprotocol.LinkChallengeProfile, envelope.Payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	var publicKeyFixed [32]byte
+	copy(publicKeyFixed[:], publicKey)
+	proofPayload, err := planeprotocol.EncodeLinkProof(planeprotocol.LinkProof{
+		ChallengeSHA256: challengeDigest,
+		PlaneWorkspace:  workspaceID,
+		PlaneProject:    projectID,
+		MemberID:        memberID,
+		PublicKey:       publicKeyFixed,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	proofEnvelope, err := planeprotocol.SignEnvelope(
+		privateKey,
+		planeprotocol.LinkProofProfile,
+		0,
+		proofPayload,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	linkBody, err := planeprotocol.EncodeLinkRequest(challengeEnvelope, proofEnvelope)
+	if err != nil {
+		return nil, nil, err
+	}
+	return linkBody, privateKey, nil
 }
 
 func (r *commandRuntime) planeLink(cmd *cobra.Command, args []string) error {
@@ -65,11 +392,6 @@ func (r *commandRuntime) planeLink(cmd *cobra.Command, args []string) error {
 	} else if !os.IsNotExist(readErr) {
 		return fmt.Errorf("inspect Plane private key: %w", readErr)
 	}
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return err
-	}
-
 	user := planeLinkIdentity{}
 	if err := r.planeJSONRequest(cmd.Context(), provider.BaseURL, token, http.MethodGet, "users/me", "", nil, &user); err != nil {
 		return fmt.Errorf("read current Plane identity: %w", err)
@@ -78,65 +400,15 @@ func (r *commandRuntime) planeLink(cmd *cobra.Command, args []string) error {
 	if err := r.planeJSONRequest(cmd.Context(), provider.BaseURL, token, http.MethodGet, "workspaces/"+url.PathEscape(*provider.Workspace), "", nil, &workspace); err != nil {
 		return fmt.Errorf("read Plane workspace: %w", err)
 	}
-	workspaceID, err := parsePlaneProtocolUUID(workspace.ID)
-	if err != nil {
-		return fmt.Errorf("Plane workspace id: %w", err)
-	}
-	projectID, err := parsePlaneProtocolUUID(*provider.ProjectID)
-	if err != nil {
-		return fmt.Errorf("Plane project id: %w", err)
-	}
-	memberID, err := parsePlaneProtocolUUID(user.ID)
-	if err != nil {
-		return fmt.Errorf("Plane member id: %w", err)
-	}
-	publicHash := sha256.Sum256(publicKey)
-	challengeResponse, err := networkclient.New(networkState.URL, networkState.NodeToken, r.httpClient()).LinkChallenge(
+	linkBody, privateKey, err := r.buildPlaneLinkRequest(
 		cmd.Context(),
-		protocol.LinkChallengeRequest{
-			PublicKeySHA256: base64.RawURLEncoding.EncodeToString(publicHash[:]),
-			Audience:        "plane:" + workspace.ID,
+		networkState,
+		planeLinkProofIdentity{
+			WorkspaceID: workspace.ID,
+			ProjectID:   *provider.ProjectID,
+			MemberID:    user.ID,
 		},
 	)
-	if err != nil {
-		return fmt.Errorf("request loopernet Plane challenge: %w", err)
-	}
-	challengeEnvelope, err := base64.RawURLEncoding.Strict().DecodeString(challengeResponse.Challenge)
-	if err != nil {
-		return fmt.Errorf("decode loopernet challenge: %w", err)
-	}
-	envelope, err := planeprotocol.DecodeEnvelope(challengeEnvelope)
-	if err != nil {
-		return fmt.Errorf("decode loopernet challenge envelope: %w", err)
-	}
-	challenge, err := planeprotocol.DecodeLinkChallenge(envelope.Payload)
-	if err != nil {
-		return err
-	}
-	if challenge.NetworkID != networkState.NetworkID || challenge.NodeID != networkState.NodeID || challenge.PublicKeySHA256 != publicHash || challenge.Audience != "plane:"+workspace.ID {
-		return errors.New("loopernet challenge does not match this Node and Plane workspace")
-	}
-	challengeDigest, err := planeprotocol.DomainDigest(planeprotocol.LinkChallengeProfile, envelope.Payload)
-	if err != nil {
-		return err
-	}
-	var publicKeyFixed [32]byte
-	copy(publicKeyFixed[:], publicKey)
-	proofPayload, err := planeprotocol.EncodeLinkProof(planeprotocol.LinkProof{
-		ChallengeSHA256: challengeDigest,
-		PlaneWorkspace:  workspaceID,
-		PlaneProject:    projectID,
-		MemberID:        memberID,
-		PublicKey:       publicKeyFixed,
-	})
-	if err != nil {
-		return err
-	}
-	proofEnvelope, err := planeprotocol.SignEnvelope(privateKey, planeprotocol.LinkProofProfile, 0, proofPayload)
-	if err != nil {
-		return err
-	}
-	linkBody, err := planeprotocol.EncodeLinkRequest(challengeEnvelope, proofEnvelope)
 	if err != nil {
 		return err
 	}
@@ -160,17 +432,21 @@ func (r *commandRuntime) planeLink(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	strict := config.PlaneStrictDispatchConfig{
-		Enabled: false, BaseURL: strictBaseURL, NodeID: networkState.NodeID,
+		Enabled: binding.State == "active", BaseURL: strictBaseURL, NodeID: networkState.NodeID,
 		BindingID: binding.ID, KeyRevision: 1, PrivateKeyFile: privateKeyFile,
 	}
 	if err := r.writePlaneStrictProviderConfig(loaded, providerIndex, strict); err != nil {
 		_ = r.removeFile(privateKeyFile)
 		return err
 	}
+	next := "Run `looper daemon restart`."
+	if binding.State != "active" {
+		next = "This Plane server still uses legacy approval. Ask a project admin to approve the binding, then run `looper plane enable " + provider.ID + "`."
+	}
 	output := map[string]any{
 		"providerId": provider.ID, "bindingId": binding.ID, "bindingState": binding.State,
 		"nodeId": networkState.NodeID, "memberId": binding.MemberID, "privateKeyFile": privateKeyFile,
-		"next": "Ask a Plane project admin to approve this binding, then run `looper plane enable " + provider.ID + "`.",
+		"next": next,
 	}
 	if getBoolFlag(cmd, "json") {
 		return writeJSON(cmd.OutOrStdout(), output)
@@ -297,7 +573,7 @@ func (r *commandRuntime) planeSetup(cmd *cobra.Command, args []string) error {
 	}
 	printSection(cmd.OutOrStdout(), "Plane Looper project activated", [][2]any{
 		{"providerId", provider.ID}, {"productMemberId", args[0]}, {"designMemberId", args[1]}, {"engineeringRule", "dispatch_owner"}, {"qaMemberId", args[2]}, {"checklistRevision", checklistRevision},
-		{"next", "Each approved owner runs `looper plane enable " + provider.ID + "` and restarts the daemon."},
+		{"next", "Each owner opens a Plane work item and chooses Connect my Looper."},
 	})
 	return nil
 }
@@ -358,15 +634,24 @@ func (r *commandRuntime) planeJSONRequest(ctx context.Context, baseURL, token, m
 }
 
 func (r *commandRuntime) planeRawRequest(ctx context.Context, baseURL, token, method, path, contentType string, body []byte, output any) error {
+	return r.planeRawRequestWithHeaders(ctx, baseURL, token, method, path, contentType, body, nil, output)
+}
+
+func (r *commandRuntime) planeRawRequestWithHeaders(ctx context.Context, baseURL, token, method, path, contentType string, body []byte, headers map[string]string, output any) error {
 	request, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(baseURL, "/")+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("X-API-Key", token)
+	if token != "" {
+		request.Header.Set("X-API-Key", token)
+	}
 	request.Header.Set("User-Agent", "looper-plane-link/1.0")
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
 	}
 	httpClient := *r.httpClient()
 	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
@@ -390,13 +675,7 @@ func (r *commandRuntime) planeRawRequest(ctx context.Context, baseURL, token, me
 		_ = json.Unmarshal(raw, &failure)
 		code := strings.TrimSpace(failure.Error)
 		detail := strings.TrimSpace(failure.Detail)
-		if code != "" && detail != "" {
-			return fmt.Errorf("Plane returned HTTP %d (%s): %s", response.StatusCode, code, detail)
-		}
-		if code != "" {
-			return fmt.Errorf("Plane returned HTTP %d (%s)", response.StatusCode, code)
-		}
-		return fmt.Errorf("Plane returned HTTP %d", response.StatusCode)
+		return &planeAPIError{Status: response.StatusCode, Code: code, Detail: detail}
 	}
 	if output != nil && len(bytes.TrimSpace(raw)) > 0 {
 		if err := json.Unmarshal(raw, output); err != nil {

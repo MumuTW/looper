@@ -6,30 +6,18 @@
 
 1. 安装同一版本的 Looper，确认项目里没有旧版 daemon 或旧启动项仍在运行。
 2. 配置 Plane provider（`workspace`、`projectId`、`tokenEnv`）并加入团队 loopernet。
-3. 绑定当前 Plane 身份和本机 Node：
+3. 打开任一 Plane work item 的 Looper 面板，点击“连接我的 Looper”，复制页面给出的一次性命令并在本机执行：
 
    ```bash
-   looper plane link <provider-id>
+   looper plane connect <plane-url> --code <10-minute-code>
    ```
 
-   命令会生成仅当前用户可读的 Ed25519 私钥，并输出 `bindingId`。私钥不会上传。
-4. 把 `bindingId` 发给 Plane Project Admin。管理员执行：
-
-   ```bash
-   looper plane approve <binding-id> <provider-id>
-   ```
-
-   只有明确允许离线排队时才追加 `--allow-offline-queue`。
-5. 管理员完成项目角色与 strict rollout 配置后，研发执行：
-
-   ```bash
-   looper plane enable <provider-id>
-   looper daemon restart
-   ```
+   命令会核对当前 Plane 登录身份和项目、本机 Node 与 loopernet challenge，在本机生成 `0600` Ed25519 私钥，自动启用 strict dispatch、重启 daemon，并等待签名 inbox 建连。私钥不会上传。
+4. 页面显示六项检查全部通过后完成。无需 Project Admin 审批个人电脑；V1 每个 Plane 用户在一个项目只允许一台电脑，已有设备时不会自动替换。
 
 ## Project Admin 首次启用
 
-所有准备接入该项目的 Looper 都升级、旧进程均停止、Node 在线并完成 binding 审批后，设置产品、设计、QA 负责人并激活项目：
+先由至少一名研发完成上述自助连接；所有准备接入该项目的 Looper 都升级、旧进程均停止且 Node 在线后，设置产品、设计、QA 负责人并激活项目：
 
 ```bash
 looper plane setup \
@@ -40,7 +28,7 @@ looper plane setup \
   --checklist-revision 1
 ```
 
-研发负责人不单独配置，始终等于该 work item 的 Looper owner。任一已批准 Node 离线、未上报 strict capability 或角色成员不在项目中，激活会 fail closed。
+研发负责人不单独配置，始终等于该 work item 的 Looper owner。Project Admin 只负责项目级角色和集成开关，不审批成员自己的电脑。任一已连接 Node 离线、未上报 strict capability 或角色成员不在项目中，激活会 fail closed。
 
 ## 日常派活
 

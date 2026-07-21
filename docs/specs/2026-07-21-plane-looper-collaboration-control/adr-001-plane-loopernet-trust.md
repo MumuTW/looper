@@ -52,7 +52,7 @@ loopernet 只提供短时 signed challenge 与在线观测，不回写 `LooperDi
 3. 部署 nonce、trust-root、Node binding、project role policy 与 protocol classification 的 additive schema；所有 mutation feature flag 保持关闭。
 4. 为目标环境注入独立 trust roots/service credential，验证 Plane → loopernet 网络和时钟监控。
 5. 升级项目内全部 Looper daemon，停掉旧进程/启动项并完成凭据治理；未完成时项目保持 read-only。
-6. owner 完成 Node binding；Project Admin 签收角色策略、Node 清单和 activation checklist。
+6. owner 从 Plane 页面自助完成单台 Node binding；Project Admin 只签收项目角色策略、Node 清单和 activation checklist，不审批个人设备。
 7. 小范围开启 strict epoch 与 self-dispatch；epoch 前任务永久为 legacy，epoch 后新任务在创建事务内分类 `strict_v1`。
 8. 通过真实双 Node、旧 daemon 阳性对照、断网/重放/进程崩溃 E2E 后再扩大灰度。
 

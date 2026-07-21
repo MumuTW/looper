@@ -77,15 +77,16 @@ local looperd
 
 新增 Plane `LooperNodeBinding`，作为 `node_id ↔ Plane workspace/project/member` 的身份 Authority：
 
-- 字段：`workspace_id`、`project_id`、`member_id`、`node_id`、`node_name_snapshot`、`allowed_roles`、`allow_offline_queue`（默认 false）、`state(pending/active/revocation_pending/revoked)`、`approved_by`、`created_at/revoked_at`、`revision`。Admin pause 是独立的 project-integration health，不是 binding state。
+- 字段：`workspace_id`、`project_id`、`member_id`、`node_id`、`node_name_snapshot`、`allowed_roles`、`allow_offline_queue`（默认 false）、`state(active/revocation_pending/revoked；pending 仅兼容旧数据)`、`created_at/revoked_at`、`revision`。Admin pause 是独立的 project-integration health，不是 binding state。
+- `LooperConnectionSession(member_id,connect_code,status,expires_at,binding_id,node_id,error,completed_at)` 承载 Plane-first 的 10 分钟连接向导；只允许 session owner 从 Plane 读取或取消，CLI 只持高熵一次性 code。V1 同一 `(project_id,member_id)` 只允许一个 active binding，已有设备时明确阻止替换。
 - `LooperNodeKey(binding_id,key_revision,public_key,state,created_at,revoked_at,stop_ack_attempt_allowlist)` 保存每个 revision 的历史公钥；旧 key 只有 attempt ID 在不可扩大的 allowlist 中时才能验证 recovery/stop_ack，不能 claim、新 run 或普通 event。
 - V1 对 `(project_id, member_id)` 建 active unique constraint：一个 owner 在一个项目最多一个 active Node，不设计多 Node 选择或 actor allowlist。
 - 每个 binding 还有唯一 `LooperNodeSession(session_id, binding_id, instance_nonce, lease_expires_at, last_renewed_at, state)`。daemon 启动时先在 `<HOME>/.looper/runtime/<binding_id>.lock` 取得 OS 跨进程独占锁，再用签名请求建立/恢复 session；复制到另一 HOME 的 credential 也必须经过服务端 session CAS。binding 存在 holding dispatch 时，新 instance 不能抢占过期 session，只有原 journal 持有的 `session_id + claim_idempotency_key + attempt/fencing token` 可恢复；缺失正向记录一律等待。
 - Node **不能提交 ownerPlaneMemberId**。owner 来自创建绑定请求时 Plane 已认证的 `request.user/member`。
-- 本地执行 `looper plane link` 时同时完成两份证明：
-  1. 用该 owner 自己的 Plane personal API key 调 Plane binding endpoint；
+- 本地执行 Plane 页面给出的 `looper plane connect <origin> --code <one-time-code>` 时同时完成两份证明：
+  1. 一次性 code 对应创建它的 Plane 登录用户、workspace 和 project，CLI 不能提交或覆盖 owner ID，也无需读取用户的 Plane personal API key；
   2. Node 本地产生 Ed25519 keypair，用 loopernet node token 申请一次性短时 challenge。challenge 固定编码 `version + network_id + node_id + public_key_sha256 + audience=plane:<workspace_id> + challenge_id + nonce + issued_at + expires_at`，由 loopernet 服务端签名；Node 再用私钥对完整 binding request 签 possession proof。Plane 使用显式配置的 loopernet trust-root 公钥验 challenge，校验 audience/expiry/单次消费，再用请求中的公钥验 possession proof。
-- Project Admin 在 Plane 集成设置中批准该 Node 对本项目可用的 `planner/worker` 角色后，binding 才进入 active；管理员身份不能替代 owner 的第一次 Plane 身份证明。
+- 两份证明通过后 binding 直接以 `planner/worker` 角色进入 active；无需 Project Admin 审批成员自己的电脑。Project Admin 仍只负责项目级角色策略、strict rollout 与暂停集成，不能替代 owner 身份证明或替别人派发。
 - dispatch 强制 `request.user == binding.member_id == dispatch.owner_member_id`；Admin/Member 都不能替另一 owner 创建 dispatch。
 - claim/transition 不依赖长期保存 owner personal API key；使用 active binding 的 Node 私钥签名，并在 claim、每次新 run、受控 publish 前由 Plane 实时确认 owner 仍是 project/workspace 成员。成员移除 hook 只负责加速收敛，不能替代该检查。
 - owner 可 revoke；Project Admin 只能暂停项目集成。Admin pause 仅把 project/dispatch health 设为 `binding_suspended`，阻止新 self-dispatch/claim/run/publish，但不改变 lifecycle、不释放任何 owner 的 holding dispatch。pause/revocation_pending 期间统一 recovery-only allowlist：只接受原 session/attempt 的 reconcile、termination summary 和 stop_ack；其余 Node mutation 全拒绝。
@@ -267,8 +268,12 @@ Plane 面板 summary 按以下优先级聚合：
   - 必须携带 expected revision/state_version、claim idempotency key 或 execution attempt/fencing token，以及 Node request signature；revision/owner/node/binding/实时 membership 不匹配返回 409/403。transition 只接受状态表中的合法边。
 - `POST .../looper/dispatch/{dispatch_id}/stop-ack`
   - 只接受当前 execution attempt/fencing token；即使 binding 为 revocation_pending 仍允许一次，body 必须包含 PID/process-group、退出时间、exit status 与签名 termination summary。成功后进入 confirmed_stopped；若 binding 正在 revocation_pending 则同时完成 revoke，否则 binding 保持 active。重复 ack 幂等，dispatch 仍等待 owner 显式 release。
-- `POST .../looper/nodes/link` + `approve|revoke|rotate`
-  - link owner 取 `request.user`，不接受 body 中的 owner ID；验证 loopernet signed challenge，审批后保存 Node public key 与角色范围。
+- `POST .../looper/connections/` + `GET|DELETE .../looper/connections/{id}`
+  - Plane 登录用户创建/轮询/取消自己的短时连接会话；返回可复制命令、到期时间、现有设备和逐项检查结果，不暴露其他成员的会话。
+- `POST /api/looper/connections/exchange|link|complete`
+  - CLI 用一次性 code 换取绑定上下文，提交 loopernet challenge + 本机 possession proof；验证成功即 self-activate。`complete` 只有在该 binding 已建立未过期的签名 Node session 后才成功，避免页面把“写了配置”误报为“inbox 已连通”。
+- `POST .../looper/bindings/link` + `approve`
+  - 仅保留旧 CLI/旧服务兼容；新版服务 link 会直接 active，approve 对 active binding 返回冲突。revoke/rotate 仍由 owner 控制。
 - `POST .../looper/nodes/{binding_id}/sessions/open|renew|recover`
   - Node-signed；open 对 binding 做 session CAS，holding dispatch 存在时拒绝不同 instance_nonce。recover 只接受已绑定原 session 且与服务端 current attempt 一致的 journal 正向字段；renew 不改变 execution Authority。所有 response 含 lease/state version并写审计。
 - `PATCH .../looper/nodes/{binding_id}`
@@ -328,7 +333,7 @@ Plane 面板 summary 按以下优先级聚合：
 - target 列表结果只能作为展示缓存；POST 时必须重新验证 active Plane binding、project membership、允许角色和 loopernet presence/capability。
 - dispatch POST 必须验证 actor 的 work-item edit permission、实时 project membership，且 `request.user == binding.member_id`；不能把 `ADMIN/MEMBER` 当充分条件。
 - loopernet admin/service token 只在 Plane API 服务端；浏览器和 work item comment 不出现 token。
-- Node heartbeat 不接受 owner Plane UUID 作为身份依据；Plane owner 来自经过双向证明并由管理员启用的 binding。
+- Node heartbeat 不接受 owner Plane UUID 作为身份依据；Plane owner 来自 Plane 登录会话 + Node credential 双向证明后自激活的 binding，项目是否开放派发仍由 Admin 的集成开关控制。
 - binding challenge、request nonce 与 fencing token 按本 Spec 的固定消息格式防重放；Node 私钥仅存本机，Plane 只存 public key，loopernet node token 不进入 Plane Page/comment/log。
 - Admin suspend 只设置 `health=binding_suspended` 并继续占用归属，不得取消/release。owner 主动 revoke queued binding 时才允许事务化 `queued→released`；运行中 owner revoke 先进入 `stop_requested/revocation_pending`，阻止 Looper-managed post-run publish，但不能保证阻止黑盒 agent 的当前本地/直接远程动作。原 Node 通过受限 stop_ack、owner 再 release 前禁止新 dispatch；Node 丢失就等待恢复。
 - role-policy revision 与每条 decision/approval 一同记录；旧 revision 的未解决回答不能被新 revision 误读。
@@ -355,7 +360,7 @@ Plane 面板 summary 按以下优先级聚合：
 
 1. **S1 · Read-only 协作投影**：先实现 versioned collaboration event/role/artifact/snapshot 与只读面板；验证 AC-9～12、14～17。可由 agent 辅助编码，但不可自行合并或开启 feature flag。
 2. **S2a · loopernet trust**：Ed25519 challenge、Plane trust-root、nonce/expiry/replay 测试；没有 Plane UI，独立安全验收。
-3. **S2b · Plane Node binding**：owner Plane 身份、唯一 active Node、管理员项目启用、offline 开关、suspend/revoke/rotate；验证 AC-3/4/8/15。
+3. **S2b · Plane Node binding**：Plane-first 一次性连接、owner Plane 身份、唯一 active Node、自动 daemon 重启与 signed-inbox 完成门禁、offline 开关、suspend/revoke/rotate；验证 AC-3/4/8/15。
 4. **S2c · 项目角色策略**：role-policy revision/snapshot、本地 config drift 与 member-removal gate；验证 AC-2/11/15。
 5. **S3 · Durable dispatch 状态机**：迁移、owner-only 权限、state CAS、attempt/lease/fencing、幂等、stop/release、投影告警与审计；验证 AC-1/5～8/13/15。
 6. **S4 · Strict inbox 与恢复**：按 node_id 索引的 Planner/Worker claim、Planner→Worker handoff、项目版本门禁、崩溃/离线/Plane outage reconcile；验证 AC-5～8/13/14。
