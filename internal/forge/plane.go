@@ -312,6 +312,26 @@ func (plane *PlaneClient) TransitionStrictDispatch(ctx context.Context, dispatch
 	return fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
 }
 
+func (plane *PlaneClient) CreateStrictRoleRequest(ctx context.Context, dispatchID string, input planestrict.RoleRequestInput) (planestrict.RoleRequestResponse, error) {
+	if plane.strictClient == nil {
+		return planestrict.RoleRequestResponse{}, errors.New("Plane strict dispatch is not configured")
+	}
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return planestrict.RoleRequestResponse{}, err
+	}
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ID != dispatchID {
+			continue
+		}
+		if dispatch.State != "running" && dispatch.State != "awaiting_human" {
+			return planestrict.RoleRequestResponse{}, fmt.Errorf("strict dispatch %s is not accepting role requests", dispatchID)
+		}
+		return plane.strictClient.CreateRoleRequest(ctx, dispatch, input)
+	}
+	return planestrict.RoleRequestResponse{}, fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
+}
+
 // ViewIssue resolves a work-item by its per-project sequence_id (looper's Issue
 // number) and maps it onto the Issue type.
 func (plane *PlaneClient) ViewIssue(ctx context.Context, number int64) (Issue, error) {

@@ -136,7 +136,7 @@ func (r *Runtime) reconcileAwaitingRoleDecisions(ctx context.Context) {
 			if stage == "awaiting_downstream" || stage == "downstream_resolved" {
 				roles = []decisions.Role{decisions.RoleDesign, decisions.RoleEngineering}
 				before := answerValuesForRole(view.Decisions, decisions.RoleProduct)
-				consumeDecisionAnswers(view.Decisions, decisions.RoleProduct, decisionPlaneID(cfg, loop.ProjectID, decisions.RoleProduct), comments)
+				consumeDecisionAnswers(view.Decisions, decisions.RoleProduct, decisionPlaneIDForRequest(cfg, loop.ProjectID, view.Decisions, decisions.RoleProduct), comments)
 				productChanged = !equalStringMaps(before, answerValuesForRole(view.Decisions, decisions.RoleProduct))
 			}
 			if productChanged {
@@ -166,7 +166,7 @@ func (r *Runtime) reconcileAwaitingRoleDecisions(ctx context.Context) {
 			} else {
 				for _, role := range roles {
 					beforeRoleAnswers[role] = answerValuesForRole(view.Decisions, role)
-					consumeDecisionAnswers(view.Decisions, role, decisionPlaneID(cfg, loop.ProjectID, role), comments)
+					consumeDecisionAnswers(view.Decisions, role, decisionPlaneIDForRequest(cfg, loop.ProjectID, view.Decisions, role), comments)
 					if !equalStringMaps(beforeRoleAnswers[role], answerValuesForRole(view.Decisions, role)) {
 						stateChanged = true
 					}
@@ -317,6 +317,15 @@ func decisionPlaneID(cfg config.Config, projectID string, role decisions.Role) s
 	default:
 		return ""
 	}
+}
+
+func decisionPlaneIDForRequest(cfg config.Config, projectID string, state *decisions.State, role decisions.Role) string {
+	if state != nil {
+		if request, ok := state.Requests[role]; ok && strings.TrimSpace(request.EligibleMemberID) != "" {
+			return strings.TrimSpace(request.EligibleMemberID)
+		}
+	}
+	return decisionPlaneID(cfg, projectID, role)
 }
 
 func consumeDecisionAnswers(state *decisions.State, role decisions.Role, actorID string, comments []planedoc.WorkItemComment) {

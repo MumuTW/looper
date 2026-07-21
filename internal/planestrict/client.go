@@ -69,6 +69,43 @@ type MutationResponse struct {
 	Claimed  bool     `json:"claimed,omitempty"`
 }
 
+type RoleQuestionOption struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Impact string `json:"impact"`
+}
+
+type RoleQuestion struct {
+	ID                     string               `json:"id"`
+	Question               string               `json:"question"`
+	Context                string               `json:"context"`
+	Options                []RoleQuestionOption `json:"options,omitempty"`
+	RecommendedOption      string               `json:"recommended_option,omitempty"`
+	RecommendationReason   string               `json:"recommendation_reason,omitempty"`
+	DesignDocumentRequired bool                 `json:"design_document_required,omitempty"`
+}
+
+type RoleRequestInput struct {
+	LoopID           string
+	DecisionRevision int
+	Role             string
+	BriefSummary     string
+	Questions        []RoleQuestion
+}
+
+type RoleRequestResponse struct {
+	RoleRequest struct {
+		ID                 string    `json:"id"`
+		Role               string    `json:"role"`
+		Status             string    `json:"status"`
+		RequestCommentID   string    `json:"request_comment_id"`
+		EligibleMemberID   string    `json:"eligible_member_id"`
+		EligibleMemberName string    `json:"eligible_member_name"`
+		CreatedAt          time.Time `json:"created_at"`
+		Created            bool      `json:"created"`
+	} `json:"role_request"`
+}
+
 type APIError struct {
 	StatusCode int
 	Code       string
@@ -191,6 +228,31 @@ func (c *Client) Transition(ctx context.Context, dispatch Dispatch, nextState st
 	}
 	var response MutationResponse
 	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "transition"), nil, body, &signingContext{
+		dispatchID: dispatch.ID, dispatchRevision: dispatch.Revision, stateVersion: &stateVersion,
+		attemptID: dispatch.ExecutionAttemptID, fencingToken: &fencingToken,
+	}, &response)
+	return response, err
+}
+
+func (c *Client) CreateRoleRequest(ctx context.Context, dispatch Dispatch, input RoleRequestInput) (RoleRequestResponse, error) {
+	if dispatch.ExecutionAttemptID == nil {
+		return RoleRequestResponse{}, errors.New("Plane strict role request: execution attempt is missing")
+	}
+	stateVersion, fencingToken := dispatch.StateVersion, dispatch.FencingToken
+	body := map[string]any{
+		"expected_state_version": dispatch.StateVersion,
+		"execution_attempt_id":   *dispatch.ExecutionAttemptID,
+		"fencing_token":          dispatch.FencingToken,
+		"session_id":             UUIDString(c.credentials.SessionID),
+		"instance_nonce":         base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:]),
+		"loop_id":                input.LoopID,
+		"decision_revision":      input.DecisionRevision,
+		"role":                   input.Role,
+		"brief_summary":          input.BriefSummary,
+		"questions":              input.Questions,
+	}
+	var response RoleRequestResponse
+	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "role-requests"), nil, body, &signingContext{
 		dispatchID: dispatch.ID, dispatchRevision: dispatch.Revision, stateVersion: &stateVersion,
 		attemptID: dispatch.ExecutionAttemptID, fencingToken: &fencingToken,
 	}, &response)

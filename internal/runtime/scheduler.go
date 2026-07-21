@@ -33,6 +33,7 @@ import (
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
+	"github.com/nexu-io/looper/internal/planestrict"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/projects"
@@ -869,6 +870,40 @@ func (a plannerGitHubAdapter) TransitionStrictDispatch(ctx context.Context, inpu
 		return fmt.Errorf("strict dispatch %s is not backed by a Plane provider", input.DispatchID)
 	}
 	return client.TransitionStrictDispatch(ctx, input.DispatchID, input.State, input.WaitKind)
+}
+
+func (a plannerGitHubAdapter) CreateStrictRoleRequest(ctx context.Context, input planner.StrictRoleRequestInput) (planner.StrictRoleRequestResult, error) {
+	client, ok, err := a.plane(ctx, input.Repo, input.CWD)
+	if err != nil {
+		return planner.StrictRoleRequestResult{}, err
+	}
+	if !ok {
+		return planner.StrictRoleRequestResult{}, fmt.Errorf("strict dispatch %s is not backed by a Plane provider", input.DispatchID)
+	}
+	questions := make([]planestrict.RoleQuestion, 0, len(input.Questions))
+	for _, question := range input.Questions {
+		options := make([]planestrict.RoleQuestionOption, 0, len(question.Options))
+		for _, option := range question.Options {
+			options = append(options, planestrict.RoleQuestionOption{ID: option.ID, Label: option.Label, Impact: option.Impact})
+		}
+		questions = append(questions, planestrict.RoleQuestion{
+			ID: question.ID, Question: question.Question, Context: question.Context, Options: options,
+			RecommendedOption: question.RecommendedOption, RecommendationReason: question.RecommendationReason,
+			DesignDocumentRequired: question.DesignDocumentRequired,
+		})
+	}
+	response, err := client.CreateStrictRoleRequest(ctx, input.DispatchID, planestrict.RoleRequestInput{
+		LoopID: input.LoopID, DecisionRevision: input.DecisionRevision, Role: string(input.Role),
+		BriefSummary: input.BriefSummary, Questions: questions,
+	})
+	if err != nil {
+		return planner.StrictRoleRequestResult{}, err
+	}
+	return planner.StrictRoleRequestResult{
+		CommentID:        response.RoleRequest.RequestCommentID,
+		CreatedAt:        response.RoleRequest.CreatedAt.Format(time.RFC3339Nano),
+		EligibleMemberID: response.RoleRequest.EligibleMemberID,
+	}, nil
 }
 
 func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewIssueInput) (planner.IssueDetail, error) {

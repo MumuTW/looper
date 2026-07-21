@@ -394,6 +394,33 @@ func (r *Runner) ensureDecisionRequest(ctx context.Context, input stepInput, sta
 	if receipt, ok := state.Requests[role]; ok && receipt.Revision == state.Brief.Revision && receipt.CommentID != "" {
 		return nil
 	}
+	strictDispatchID := strings.TrimSpace(stringFromAnyDefault(parseJSONObject(input.QueueItem.PayloadJSON)["strictDispatchId"]))
+	if strictDispatchID != "" {
+		gateway, ok := r.github.(strictDispatchGateway)
+		if !ok {
+			return &loopError{message: "strict role request gateway is unavailable", kind: FailureNonRetryable}
+		}
+		created, err := gateway.CreateStrictRoleRequest(ctx, StrictRoleRequestInput{
+			Repo: derefString(input.Loop.Repo), CWD: input.Project.RepoPath,
+			DispatchID: strictDispatchID, LoopID: input.Loop.ID, DecisionRevision: state.Brief.Revision,
+			Role: role, BriefSummary: state.Brief.Summary, Questions: questions,
+		})
+		if err != nil {
+			return &loopError{message: "create strict decision request: " + err.Error(), kind: FailureRetryableTransient}
+		}
+		if strings.TrimSpace(created.CommentID) == "" || strings.TrimSpace(created.CreatedAt) == "" || strings.TrimSpace(created.EligibleMemberID) == "" {
+			return &loopError{message: "strict decision request receipt was incomplete", kind: FailureNonRetryable}
+		}
+		state.Requests[role] = decisions.RequestReceipt{
+			Role: role, Revision: state.Brief.Revision, CommentID: created.CommentID,
+			CreatedAt: created.CreatedAt, EligibleMemberID: created.EligibleMemberID,
+		}
+		issue, issueErr := requireIssue(input.Checkpoint)
+		if issueErr != nil {
+			return issueErr
+		}
+		return r.notifyDecisionRoleToMember(ctx, input, role, state.Brief.Revision, questions, issue.URL, created.EligibleMemberID)
+	}
 	if r.planeDoc == nil {
 		return &loopError{message: "decision request requires Plane", kind: FailureNonRetryable}
 	}
@@ -451,6 +478,25 @@ func decisionActor(cfg *config.Config, projectID string, role decisions.Role) co
 	default:
 		return config.FeishuActorConfig{}
 	}
+}
+
+func decisionActorForPlaneMember(cfg *config.Config, projectID, memberID string) config.FeishuActorConfig {
+	memberID = strings.TrimSpace(memberID)
+	if cfg == nil || memberID == "" {
+		return config.FeishuActorConfig{}
+	}
+	actors := []config.FeishuActorConfig{
+		decisionActor(cfg, projectID, decisions.RoleProduct),
+		decisionActor(cfg, projectID, decisions.RoleDesign),
+		decisionActor(cfg, projectID, decisions.RoleEngineering),
+		config.ProjectQAActor(*cfg, projectID),
+	}
+	for _, actor := range actors {
+		if strings.TrimSpace(actor.PlaneID) == memberID {
+			return actor
+		}
+	}
+	return config.FeishuActorConfig{PlaneID: memberID}
 }
 
 func renderDecisionRequest(marker, summary string, role decisions.Role, questions []decisions.Question) string {
@@ -516,10 +562,17 @@ func roleLabel(role decisions.Role) string {
 }
 
 func (r *Runner) notifyDecisionRole(ctx context.Context, input stepInput, role decisions.Role, revision int, questions []decisions.Question, issueURL string) error {
+	return r.notifyDecisionRoleToMember(ctx, input, role, revision, questions, issueURL, "")
+}
+
+func (r *Runner) notifyDecisionRoleToMember(ctx context.Context, input stepInput, role decisions.Role, revision int, questions []decisions.Question, issueURL, eligibleMemberID string) error {
 	if r.postThreadNote == nil && r.postThreadNoteWithUUID == nil {
 		return nil
 	}
 	actor := decisionActor(r.projectRoleConfig, input.Project.ID, role)
+	if strings.TrimSpace(eligibleMemberID) != "" {
+		actor = decisionActorForPlaneMember(r.projectRoleConfig, input.Project.ID, eligibleMemberID)
+	}
 	var mentions []string
 	if actor.FeishuOpenID != "" {
 		mentions = []string{actor.FeishuOpenID}

@@ -66,10 +66,11 @@ type Brief struct {
 }
 
 type RequestReceipt struct {
-	Role      Role   `json:"role"`
-	Revision  int    `json:"revision"`
-	CommentID string `json:"commentId"`
-	CreatedAt string `json:"createdAt"`
+	Role             Role   `json:"role"`
+	Revision         int    `json:"revision"`
+	CommentID        string `json:"commentId"`
+	CreatedAt        string `json:"createdAt"`
+	EligibleMemberID string `json:"eligibleMemberId,omitempty"`
 }
 
 type Answer struct {

@@ -63,6 +63,21 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 				ID: dispatchID, Revision: 3, StateVersion: 3, State: "running",
 				ExecutionAttemptID: &attemptID, FencingToken: 9,
 			}})
+		case "/api/workspaces/open-design/projects/project-id/looper/dispatch/" + dispatchID + "/role-requests/":
+			dispatch := Dispatch{ID: dispatchID, Revision: 3, StateVersion: 3, ExecutionAttemptID: &attemptID, FencingToken: 9}
+			expectedDispatch = &dispatch
+			var body map[string]any
+			if err := json.Unmarshal(rawBody, &body); err != nil {
+				t.Fatal(err)
+			}
+			if body["role"] != "product" || body["loop_id"] != "loop-1" {
+				t.Fatalf("role request body = %#v", body)
+			}
+			writeJSON(t, response, map[string]any{"role_request": map[string]any{
+				"id": "99999999-aaaa-4bbb-8ccc-dddddddddddd", "role": "product", "status": "open",
+				"request_comment_id": "comment-1", "eligible_member_id": "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
+				"eligible_member_name": "Product", "created_at": now.Format(time.RFC3339Nano), "created": true,
+			}})
 		default:
 			t.Fatalf("unexpected path %s", request.URL.Path)
 		}
@@ -73,7 +88,7 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	client, err := NewClient(server.URL, "open-design", "project-id", Credentials{
 		BindingID: bindingID, KeyRevision: 2, PrivateKey: privateKey, NodeID: "node-cyan",
 		SessionID: sessionID, InstanceNonce: instanceNonce,
-	}, WithClock(func() time.Time { return now }), WithRandom(bytes.NewReader(bytes.Repeat([]byte{0x11}, 64))))
+	}, WithClock(func() time.Time { return now }), WithRandom(bytes.NewReader(bytes.Repeat([]byte{0x11}, 96))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,8 +104,15 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	if err != nil || transitioned.Dispatch.State != "running" {
 		t.Fatalf("Transition() = %#v, %v", transitioned, err)
 	}
-	if requestCount != 4 {
-		t.Fatalf("requests = %d, want 4", requestCount)
+	roleRequest, err := client.CreateRoleRequest(context.Background(), transitioned.Dispatch, RoleRequestInput{
+		LoopID: "loop-1", DecisionRevision: 1, Role: "product", BriefSummary: "Export retry",
+		Questions: []RoleQuestion{{ID: "PROD-001", Question: "Retry mode?", Context: "Choose behavior."}},
+	})
+	if err != nil || roleRequest.RoleRequest.EligibleMemberName != "Product" {
+		t.Fatalf("CreateRoleRequest() = %#v, %v", roleRequest, err)
+	}
+	if requestCount != 5 {
+		t.Fatalf("requests = %d, want 5", requestCount)
 	}
 }
 

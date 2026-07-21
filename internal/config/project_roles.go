@@ -88,6 +88,15 @@ func ProjectQA(cfg Config, projectID string) string {
 	return project.QA.FeishuOpenID
 }
 
+// ProjectQAActor resolves both Plane and Feishu identities for the QA role.
+func ProjectQAActor(cfg Config, projectID string) FeishuActorConfig {
+	project := findConfiguredProject(cfg.Projects, projectID)
+	if project == nil || project.QA == nil {
+		return FeishuActorConfig{}
+	}
+	return *project.QA
+}
+
 // ProjectOwner resolves this deploy's looper owner open_id — who the shepherd
 // @-mentions to merge once a PR is approved, green, clean and (if needed) validated.
 // Per-deploy config. Unknown ids / unset config return an empty open_id.

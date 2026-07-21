@@ -231,6 +231,7 @@ type GitHubGateway interface {
 
 type strictDispatchGateway interface {
 	TransitionStrictDispatch(context.Context, StrictDispatchTransitionInput) error
+	CreateStrictRoleRequest(context.Context, StrictRoleRequestInput) (StrictRoleRequestResult, error)
 }
 
 type StrictDispatchTransitionInput struct {
@@ -239,6 +240,23 @@ type StrictDispatchTransitionInput struct {
 	DispatchID string
 	State      string
 	WaitKind   *string
+}
+
+type StrictRoleRequestInput struct {
+	Repo             string
+	CWD              string
+	DispatchID       string
+	LoopID           string
+	DecisionRevision int
+	Role             decisions.Role
+	BriefSummary     string
+	Questions        []decisions.Question
+}
+
+type StrictRoleRequestResult struct {
+	CommentID        string
+	CreatedAt        string
+	EligibleMemberID string
 }
 
 // ClosePullRequestInput closes a pull request (used to retire a stray PR an agent
