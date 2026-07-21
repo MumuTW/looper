@@ -1,6 +1,6 @@
 # ADR-001 · Plane → loopernet 信任与部署边界
 
-- 状态：**Proposed — 等待 Plane maintainer 接受**
+- 状态：**Accepted for implementation（2026-07-21）— 生产启用仍需最终人工验收**
 - 关联：OPEND-1645
 - 范围：S2a/S2b 开始前的承载模块、网络、凭据、nonce、迁移与轮换决定
 
@@ -72,11 +72,12 @@ loopernet 只提供短时 signed challenge 与在线观测，不回写 `LooperDi
 - Plane Web 不感知 loopernet credential，降低了浏览器泄露与任意目标访问风险。
 - 本 ADR 接受前，S2 只能编写 golden-vector fixture 和测试脚手架；不得实现或开启 binding、dispatch、claim、transition mutation。
 
-## Maintainer 签收项
+## 最终生产验收项
 
 - [ ] Plane integration domain 的最终包路径与维护人
 - [ ] 各环境 Plane → loopernet base URL、egress 与 TLS 方案
 - [ ] secret manager 注入形式及 credential 最小权限
 - [ ] PostgreSQL nonce 容量、清理任务与告警阈值
 - [ ] staging/production trust-root 轮换 runbook 与负责人
-- [ ] 接受本 ADR 后把状态改为 `Accepted`，记录批准人和日期
+- [x] 已获项目 owner 授权继续实现并由 agent 承担中间验证（2026-07-21）
+- [ ] 最终验收人确认后才允许打开 production feature flag

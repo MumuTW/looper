@@ -97,6 +97,17 @@ type HeartbeatResponse struct {
 	Warnings   []string  `json:"warnings,omitempty"`
 }
 
+type LinkChallengeRequest struct {
+	PublicKeySHA256 string `json:"publicKeySha256"`
+	Audience        string `json:"audience"`
+}
+
+type LinkChallengeResponse struct {
+	Challenge   string `json:"challenge"`
+	ExpiresAtMS int64  `json:"expiresAtMs"`
+	KeyRevision uint64 `json:"keyRevision"`
+}
+
 type CoordinatorLease struct {
 	Name         string     `json:"name"`
 	HolderNodeID string     `json:"holderNodeId,omitempty"`
