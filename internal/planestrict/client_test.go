@@ -20,6 +20,9 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
 	privateKey := ed25519.NewKeyFromSeed(seed)
 	bindingID := mustUUID(t, "55555555-6666-4777-8888-999999999999")
+	sessionID := mustUUID(t, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+	var instanceNonce [16]byte
+	copy(instanceNonce[:], bytes.Repeat([]byte{0x33}, 16))
 	dispatchID := "66666666-7777-4888-8999-aaaaaaaaaaaa"
 	attemptID := "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
@@ -33,8 +36,12 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 		}
 		var expectedDispatch *Dispatch
 		switch request.URL.Path {
+		case "/api/workspaces/open-design/projects/project-id/looper/nodes/session/":
+			writeJSON(t, response, map[string]any{
+				"session_id": UUIDString(sessionID), "state": "active",
+			})
 		case "/api/workspaces/open-design/projects/project-id/looper/dispatch/inbox/":
-			if request.URL.RawQuery != "cursor=&node_id=node-cyan" {
+			if request.URL.RawQuery != "cursor=&instance_nonce=MzMzMzMzMzMzMzMzMzMzMw&node_id=node-cyan&session_id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" {
 				t.Fatalf("query = %q", request.URL.RawQuery)
 			}
 			writeJSON(t, response, InboxResponse{IntegrationState: "active", Dispatches: []Dispatch{{
@@ -65,6 +72,7 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 
 	client, err := NewClient(server.URL, "open-design", "project-id", Credentials{
 		BindingID: bindingID, KeyRevision: 2, PrivateKey: privateKey, NodeID: "node-cyan",
+		SessionID: sessionID, InstanceNonce: instanceNonce,
 	}, WithClock(func() time.Time { return now }), WithRandom(bytes.NewReader(bytes.Repeat([]byte{0x11}, 64))))
 	if err != nil {
 		t.Fatal(err)
@@ -81,8 +89,8 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	if err != nil || transitioned.Dispatch.State != "running" {
 		t.Fatalf("Transition() = %#v, %v", transitioned, err)
 	}
-	if requestCount != 3 {
-		t.Fatalf("requests = %d, want 3", requestCount)
+	if requestCount != 4 {
+		t.Fatalf("requests = %d, want 4", requestCount)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,10 +24,12 @@ import (
 const maxResponseBytes = 4 << 20
 
 type Credentials struct {
-	BindingID   planeprotocol.UUID
-	KeyRevision uint64
-	PrivateKey  ed25519.PrivateKey
-	NodeID      string
+	BindingID     planeprotocol.UUID
+	KeyRevision   uint64
+	PrivateKey    ed25519.PrivateKey
+	NodeID        string
+	SessionID     planeprotocol.UUID
+	InstanceNonce [16]byte
 }
 
 type Client struct {
@@ -143,7 +146,15 @@ func NewClient(baseURL, workspace, projectID string, credentials Credentials, op
 }
 
 func (c *Client) Inbox(ctx context.Context, cursor string) (InboxResponse, error) {
-	query := url.Values{"cursor": {cursor}, "node_id": {c.credentials.NodeID}}
+	if err := c.openSession(ctx); err != nil {
+		return InboxResponse{}, err
+	}
+	query := url.Values{
+		"cursor":         {cursor},
+		"node_id":        {c.credentials.NodeID},
+		"session_id":     {UUIDString(c.credentials.SessionID)},
+		"instance_nonce": {base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:])},
+	}
 	var response InboxResponse
 	err := c.do(ctx, http.MethodGet, c.projectPath("looper", "dispatch", "inbox"), query, nil, nil, &response)
 	return response, err
@@ -154,6 +165,8 @@ func (c *Client) Claim(ctx context.Context, dispatch Dispatch, idempotencyKey st
 	body := map[string]any{
 		"expected_state_version": dispatch.StateVersion,
 		"claim_idempotency_key":  idempotencyKey,
+		"session_id":             UUIDString(c.credentials.SessionID),
+		"instance_nonce":         base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:]),
 	}
 	var response MutationResponse
 	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "claim"), nil, body, &signingContext{
@@ -173,6 +186,8 @@ func (c *Client) Transition(ctx context.Context, dispatch Dispatch, nextState st
 		"fencing_token":          dispatch.FencingToken,
 		"state":                  nextState,
 		"wait_kind":              waitKind,
+		"session_id":             UUIDString(c.credentials.SessionID),
+		"instance_nonce":         base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:]),
 	}
 	var response MutationResponse
 	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "transition"), nil, body, &signingContext{
@@ -180,6 +195,24 @@ func (c *Client) Transition(ctx context.Context, dispatch Dispatch, nextState st
 		attemptID: dispatch.ExecutionAttemptID, fencingToken: &fencingToken,
 	}, &response)
 	return response, err
+}
+
+func (c *Client) openSession(ctx context.Context) error {
+	body := map[string]any{
+		"session_id":     UUIDString(c.credentials.SessionID),
+		"instance_nonce": base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:]),
+	}
+	var response struct {
+		SessionID string `json:"session_id"`
+		State     string `json:"state"`
+	}
+	if err := c.do(ctx, http.MethodPost, c.projectPath("looper", "nodes", "session"), nil, body, nil, &response); err != nil {
+		return fmt.Errorf("open Plane Node session: %w", err)
+	}
+	if response.SessionID != UUIDString(c.credentials.SessionID) || response.State != "active" {
+		return errors.New("Plane Node session response does not match this instance")
+	}
+	return nil
 }
 
 type signingContext struct {
