@@ -233,6 +233,12 @@ func (c *Client) Transition(ctx context.Context, dispatch Dispatch, nextState st
 		"session_id":             UUIDString(c.credentials.SessionID),
 		"instance_nonce":         base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:]),
 	}
+	if nextState == "awaiting_human" || nextState == "completed" || nextState == "failed" || nextState == "confirmed_stopped" {
+		body["termination_summary"] = map[string]any{
+			"exit_status": 0, "exited_at": c.now().UTC().Format(time.RFC3339Nano),
+			"process_group_empty": true, "evidence": "looper-runner-wait",
+		}
+	}
 	var response MutationResponse
 	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "transition"), nil, body, &signingContext{
 		dispatchID: dispatch.ID, dispatchRevision: dispatch.Revision, stateVersion: &stateVersion,
@@ -281,6 +287,10 @@ func (c *Client) CreateRoleRequest(ctx context.Context, dispatch Dispatch, input
 		"role":                   input.Role,
 		"brief_summary":          input.BriefSummary,
 		"questions":              input.Questions,
+		"termination_summary": map[string]any{
+			"exit_status": 0, "exited_at": c.now().UTC().Format(time.RFC3339Nano),
+			"process_group_empty": true, "evidence": "looper-runner-wait",
+		},
 	}
 	var response RoleRequestResponse
 	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "role-requests"), nil, body, &signingContext{

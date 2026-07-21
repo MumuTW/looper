@@ -58,10 +58,24 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 				ExecutionAttemptID: &attempt, FencingToken: 9,
 			}})
 		case "/api/workspaces/open-design/projects/project-id/looper/dispatch/" + dispatchID + "/transition/":
-			dispatch := Dispatch{ID: dispatchID, Revision: 3, StateVersion: 2, ExecutionAttemptID: &attemptID, FencingToken: 9}
+			var body map[string]any
+			if err := json.Unmarshal(rawBody, &body); err != nil {
+				t.Fatal(err)
+			}
+			stateVersion := uint64(2)
+			responseState := "running"
+			if body["state"] == "awaiting_human" {
+				stateVersion = 3
+				responseState = "awaiting_human"
+				summary, _ := body["termination_summary"].(map[string]any)
+				if summary["process_group_empty"] != true || summary["evidence"] != "looper-runner-wait" {
+					t.Fatalf("termination summary = %#v", summary)
+				}
+			}
+			dispatch := Dispatch{ID: dispatchID, Revision: 3, StateVersion: stateVersion, ExecutionAttemptID: &attemptID, FencingToken: 9}
 			expectedDispatch = &dispatch
 			writeJSON(t, response, MutationResponse{Dispatch: Dispatch{
-				ID: dispatchID, Revision: 3, StateVersion: 3, State: "running",
+				ID: dispatchID, Revision: 3, StateVersion: stateVersion + 1, State: responseState,
 				ExecutionAttemptID: &attemptID, FencingToken: 9,
 			}})
 		case "/api/workspaces/open-design/projects/project-id/looper/dispatch/" + dispatchID + "/role-requests/":
@@ -102,7 +116,7 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	client, err := NewClient(server.URL, "open-design", "project-id", Credentials{
 		BindingID: bindingID, KeyRevision: 2, PrivateKey: privateKey, NodeID: "node-cyan",
 		SessionID: sessionID, InstanceNonce: instanceNonce,
-	}, WithClock(func() time.Time { return now }), WithRandom(bytes.NewReader(bytes.Repeat([]byte{0x11}, 96))))
+	}, WithClock(func() time.Time { return now }), WithRandom(bytes.NewReader(bytes.Repeat([]byte{0x11}, 112))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,6 +139,11 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	if err != nil || roleRequest.RoleRequest.EligibleMemberName != "Product" {
 		t.Fatalf("CreateRoleRequest() = %#v, %v", roleRequest, err)
 	}
+	waitKind := "technical_spec_approval"
+	awaiting, err := client.Transition(context.Background(), transitioned.Dispatch, "awaiting_human", &waitKind)
+	if err != nil || awaiting.Dispatch.State != "awaiting_human" {
+		t.Fatalf("Transition(awaiting_human) = %#v, %v", awaiting, err)
+	}
 	handedOff, err := client.Handoff(context.Background(), transitioned.Dispatch, HandoffInput{
 		ApprovalActorMemberID: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
 		ApprovalCommentID:     "bbbbbbbb-2222-4333-8444-cccccccccccc",
@@ -133,8 +152,8 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	if err != nil || handedOff.Dispatch.ActiveRole != "worker" {
 		t.Fatalf("Handoff() = %#v, %v", handedOff, err)
 	}
-	if requestCount != 6 {
-		t.Fatalf("requests = %d, want 6", requestCount)
+	if requestCount != 7 {
+		t.Fatalf("requests = %d, want 7", requestCount)
 	}
 }
 
