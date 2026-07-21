@@ -117,6 +117,27 @@ func TestPlaneLinkAndEnableCreateOwnerBoundStrictCredentials(t *testing.T) {
 				targets = append(targets, map[string]any{"id": bindingID, "member_id": memberID, "node_id": "node-owner", "state": "active", "revision": 2})
 			}
 			writePlaneCommandTestJSON(t, response, map[string]any{"targets": targets})
+		case "/api/workspaces/open-design/projects/" + projectID + "/looper/bindings/" + bindingID + "/approve/":
+			var body map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["allow_offline_queue"] != true {
+				t.Fatalf("approve body = %#v", body)
+			}
+			approved = true
+			writePlaneCommandTestJSON(t, response, map[string]any{"id": bindingID, "member_id": memberID, "node_id": "node-owner", "state": "active", "revision": 2})
+		case "/api/workspaces/open-design/projects/" + projectID + "/looper/role-policy/":
+			writePlaneCommandTestJSON(t, response, map[string]any{"policy": map[string]any{"revision": 1}})
+		case "/api/workspaces/open-design/projects/" + projectID + "/looper/integration/":
+			var body map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["activation_checklist_revision"] != float64(7) {
+				t.Fatalf("integration body = %#v", body)
+			}
+			writePlaneCommandTestJSON(t, response, map[string]any{"integration": map[string]any{"state": "active"}})
 		default:
 			http.NotFound(response, request)
 		}
@@ -159,7 +180,16 @@ func TestPlaneLinkAndEnableCreateOwnerBoundStrictCredentials(t *testing.T) {
 		t.Fatalf("private key mode=%v public=%x", keyInfo.Mode().Perm(), linkedPublic)
 	}
 
-	approved = true
+	exitCode, _, stderr = runAppWithDeps(t, app, []string{"plane", "approve", bindingID, "plane-main", "--allow-offline-queue", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("plane approve exit = %d, stderr=%s", exitCode, stderr)
+	}
+	designID := "22222222-3333-4444-8555-666666666666"
+	qaID := "33333333-4444-4555-8666-777777777777"
+	exitCode, _, stderr = runAppWithDeps(t, app, []string{"plane", "setup", memberID, designID, qaID, "plane-main", "--checklist-revision", "7", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("plane setup exit = %d, stderr=%s", exitCode, stderr)
+	}
 	exitCode, _, stderr = runAppWithDeps(t, app, []string{"plane", "enable", "plane-main", "--config", configPath})
 	if exitCode != 0 {
 		t.Fatalf("plane enable exit = %d, stderr=%s", exitCode, stderr)

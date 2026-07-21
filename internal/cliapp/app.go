@@ -143,10 +143,12 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "plane",
 				short:           "Plane strict-dispatch binding commands",
-				helpSubcommands: []helpSubcommand{{name: "link", description: "Link this Node to your Plane identity"}, {name: "enable", description: "Enable an approved Plane Node binding"}},
+				helpSubcommands: []helpSubcommand{{name: "link", description: "Link this Node to your Plane identity"}, {name: "approve", description: "Approve a pending Node binding as a Plane project admin"}, {name: "setup", description: "Configure role owners and activate strict dispatch"}, {name: "enable", description: "Enable an approved Plane Node binding"}},
 				helpWhenNoArgs:  true,
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "link [provider-id]", short: "Link this Node to your Plane identity", args: cobra.MaximumNArgs(1), runE: runtime.planeLink, localFlags: []flagSpec{stringFlag("strict-base-url", "url", "Plane web origin for strict dispatch endpoints")}}),
+					newCommand(commandSpec{use: "approve <binding-id> [provider-id]", short: "Approve a pending Node binding as a Plane project admin", args: cobra.RangeArgs(1, 2), runE: runtime.planeApprove, localFlags: []flagSpec{boolFlag("allow-offline-queue", "Allow this owner to queue work while their Node is offline")}}),
+					newCommand(commandSpec{use: "setup <product-member-id> <design-member-id> <qa-member-id> [provider-id]", short: "Configure role owners and activate strict dispatch", args: cobra.RangeArgs(3, 4), runE: runtime.planeSetup, localFlags: []flagSpec{stringFlag("checklist-revision", "revision", "Signed rollout checklist revision")}}),
 					newCommand(commandSpec{use: "enable [provider-id]", short: "Enable an approved Plane Node binding", args: cobra.MaximumNArgs(1), runE: runtime.planeEnable}),
 				},
 			}),

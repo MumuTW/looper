@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -216,6 +217,88 @@ func (r *commandRuntime) planeEnable(cmd *cobra.Command, args []string) error {
 		return writeJSON(cmd.OutOrStdout(), map[string]any{"providerId": provider.ID, "enabled": true, "restartRequired": true})
 	}
 	printSection(cmd.OutOrStdout(), "Plane strict dispatch enabled", [][2]any{{"providerId", provider.ID}, {"nodeId", strict.NodeID}, {"restartRequired", true}, {"next", "Run `looper daemon restart`."}})
+	return nil
+}
+
+func (r *commandRuntime) planeApprove(cmd *cobra.Command, args []string) error {
+	bindingID := strings.TrimSpace(args[0])
+	if _, err := parsePlaneProtocolUUID(bindingID); err != nil {
+		return fmt.Errorf("binding id: %w", err)
+	}
+	providerArgs := []string(nil)
+	if len(args) == 2 {
+		providerArgs = []string{args[1]}
+	}
+	_, _, provider, token, strictBaseURL, err := r.planeCommandContext(providerArgs, "")
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]any{
+		"allowed_roles":       []string{"planner", "worker"},
+		"allow_offline_queue": getBoolFlag(cmd, "allow-offline-queue"),
+	})
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf(
+		"/api/workspaces/%s/projects/%s/looper/bindings/%s/approve/",
+		url.PathEscape(*provider.Workspace), url.PathEscape(*provider.ProjectID), url.PathEscape(bindingID),
+	)
+	var binding planeLinkBinding
+	if err := r.planeRawRequest(cmd.Context(), strictBaseURL, token, http.MethodPost, path, "application/json", body, &binding); err != nil {
+		return fmt.Errorf("approve Plane Node binding: %w", err)
+	}
+	if getBoolFlag(cmd, "json") {
+		return writeJSON(cmd.OutOrStdout(), map[string]any{"providerId": provider.ID, "bindingId": binding.ID, "state": binding.State})
+	}
+	printSection(cmd.OutOrStdout(), "Plane Node binding approved", [][2]any{
+		{"providerId", provider.ID}, {"bindingId", binding.ID}, {"state", binding.State},
+		{"next", "Ask the binding owner to run `looper plane enable " + provider.ID + "`."},
+	})
+	return nil
+}
+
+func (r *commandRuntime) planeSetup(cmd *cobra.Command, args []string) error {
+	for index, value := range args[:3] {
+		if _, err := parsePlaneProtocolUUID(value); err != nil {
+			return fmt.Errorf("role member id %d: %w", index+1, err)
+		}
+	}
+	providerArgs := []string(nil)
+	if len(args) == 4 {
+		providerArgs = []string{args[3]}
+	}
+	_, _, provider, token, strictBaseURL, err := r.planeCommandContext(providerArgs, "")
+	if err != nil {
+		return err
+	}
+	checklistRevision, err := strconv.Atoi(strings.TrimSpace(getStringFlag(cmd, "checklist-revision")))
+	if err != nil || checklistRevision <= 0 {
+		return errors.New("--checklist-revision must be a positive signed rollout revision")
+	}
+	basePath := fmt.Sprintf("/api/workspaces/%s/projects/%s/looper", url.PathEscape(*provider.Workspace), url.PathEscape(*provider.ProjectID))
+	roleBody, _ := json.Marshal(map[string]any{
+		"product_member_id": args[0], "design_member_id": args[1], "qa_member_id": args[2],
+	})
+	var policyResponse map[string]any
+	if err := r.planeRawRequest(cmd.Context(), strictBaseURL, token, http.MethodPut, basePath+"/role-policy/", "application/json", roleBody, &policyResponse); err != nil {
+		return fmt.Errorf("configure Plane Looper role policy: %w", err)
+	}
+	activationBody, _ := json.Marshal(map[string]any{
+		"action": "activate", "activation_checklist_revision": checklistRevision,
+		"effective_legacy_trigger_label_ids": []string{},
+	})
+	var integrationResponse map[string]any
+	if err := r.planeRawRequest(cmd.Context(), strictBaseURL, token, http.MethodPut, basePath+"/integration/", "application/json", activationBody, &integrationResponse); err != nil {
+		return fmt.Errorf("activate Plane Looper integration: %w", err)
+	}
+	if getBoolFlag(cmd, "json") {
+		return writeJSON(cmd.OutOrStdout(), map[string]any{"providerId": provider.ID, "policy": policyResponse["policy"], "integration": integrationResponse["integration"]})
+	}
+	printSection(cmd.OutOrStdout(), "Plane Looper project activated", [][2]any{
+		{"providerId", provider.ID}, {"productMemberId", args[0]}, {"designMemberId", args[1]}, {"engineeringRule", "dispatch_owner"}, {"qaMemberId", args[2]}, {"checklistRevision", checklistRevision},
+		{"next", "Each approved owner runs `looper plane enable " + provider.ID + "` and restarts the daemon."},
+	})
 	return nil
 }
 
