@@ -133,3 +133,15 @@
 ## Execution mode
 
 `HITL-needs-engineer`：自动化覆盖主要行为，但真实双 owner/双 Node、升级门禁、Planner→Worker handoff、安全故障注入、视觉与角色权限必须人工见证。
+
+## 2026-07-21 实现验证记录
+
+已自动验证：
+
+- Looper `go test ./...`（包含现有隔离 E2E harness）、`go vet ./...`、`go build ./...` 全部通过。
+- Plane Looper contract/unit suite 通过：双 owner/双 Node inbox 隔离、wrong-node claim、签名/replay/fencing、角色路由、owner-only 回答、实时目录降级、审批后 Planner→Worker 原子 handoff、旧 attempt 失效、termination summary 门禁、awaiting-human stop。
+- CLI 在独立临时 HOME + fake Plane + fake loopernet 中通过 `link → admin approve → project setup → owner enable`；私钥权限为 `0600`。
+- Plane Web `check:types`、18 个 locale key sync、production build 通过。
+- 在全新 PostgreSQL 临时数据库从零迁移至 `db.0125` 成功，并确认 protocol immutable trigger 已安装；临时数据库已删除。
+
+最终人工验收仍保留：真实 Plane/loopernet 上两个真实 owner 的浏览器点击见证、三个 viewport 的实际页面截图/键盘检查、真实 PR 产物链，以及 production feature flag/密钥/回滚演练。自动化不会替代这些上线 gate。

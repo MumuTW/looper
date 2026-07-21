@@ -383,6 +383,19 @@ func (r *commandRuntime) planeRawRequest(ctx context.Context, baseURL, token, me
 		return errors.New("Plane response is too large")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		var failure struct {
+			Error  string `json:"error"`
+			Detail string `json:"detail"`
+		}
+		_ = json.Unmarshal(raw, &failure)
+		code := strings.TrimSpace(failure.Error)
+		detail := strings.TrimSpace(failure.Detail)
+		if code != "" && detail != "" {
+			return fmt.Errorf("Plane returned HTTP %d (%s): %s", response.StatusCode, code, detail)
+		}
+		if code != "" {
+			return fmt.Errorf("Plane returned HTTP %d (%s)", response.StatusCode, code)
+		}
 		return fmt.Errorf("Plane returned HTTP %d", response.StatusCode)
 	}
 	if output != nil && len(bytes.TrimSpace(raw)) > 0 {
