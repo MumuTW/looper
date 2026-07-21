@@ -105,12 +105,13 @@ func plannerInterruptError() *loopError {
 }
 
 type IssueSummary struct {
-	Number    int64
-	Title     string
-	Body      string
-	URL       string
-	Assignees []string
-	Labels    []string
+	Number           int64
+	Title            string
+	Body             string
+	URL              string
+	Assignees        []string
+	Labels           []string
+	StrictDispatchID string
 }
 
 type IssueDetail struct {
@@ -226,6 +227,18 @@ type GitHubGateway interface {
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
 	AddPullRequestReviewers(context.Context, PullRequestReviewersInput) error
 	ClosePullRequest(context.Context, ClosePullRequestInput) error
+}
+
+type strictDispatchGateway interface {
+	TransitionStrictDispatch(context.Context, StrictDispatchTransitionInput) error
+}
+
+type StrictDispatchTransitionInput struct {
+	Repo       string
+	CWD        string
+	DispatchID string
+	State      string
+	WaitKind   *string
 }
 
 // ClosePullRequestInput closes a pull request (used to retire a stray PR an agent
@@ -735,7 +748,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "title": issue.Title, "body": issue.Body, "url": issue.URL, "assignees": issue.Assignees, "labels": issue.Labels, "currentUserLogin": login, plannerQueuePayloadFPKey: fingerprint}})
+		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "title": issue.Title, "body": issue.Body, "url": issue.URL, "assignees": issue.Assignees, "labels": issue.Labels, "currentUserLogin": login, "strictDispatchId": issue.StrictDispatchID, plannerQueuePayloadFPKey: fingerprint}})
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -833,6 +846,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	strictDispatchID := strings.TrimSpace(stringFromAnyDefault(parseJSONObject(queueItem.PayloadJSON)["strictDispatchId"]))
+	if strictDispatchID != "" {
+		gateway, ok := r.github.(strictDispatchGateway)
+		if !ok {
+			return ProcessResult{}, fmt.Errorf("strict dispatch gateway is not configured")
+		}
+		if err := gateway.TransitionStrictDispatch(ctx, StrictDispatchTransitionInput{
+			Repo: derefString(loop.Repo), CWD: project.RepoPath,
+			DispatchID: strictDispatchID, State: "running",
+		}); err != nil {
+			return ProcessResult{}, fmt.Errorf("start strict dispatch %s: %w", strictDispatchID, err)
+		}
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
@@ -990,6 +1016,25 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if checkpoint.Publish != nil && checkpoint.Publish.PullRequest != nil {
 		prNumber = checkpoint.Publish.PullRequest.Number
 	}
+	if strictDispatchID != "" {
+		gateway := r.github.(strictDispatchGateway)
+		nextState := "completed"
+		var waitKind *string
+		if checkpoint.Wait != nil || checkpoint.SkipReason == awaitingProductDecisionSkipReason {
+			nextState = "awaiting_human"
+			value := "technical_spec_approval"
+			if checkpoint.SkipReason == awaitingProductDecisionSkipReason {
+				value = "role_decision"
+			}
+			waitKind = &value
+		}
+		if err := gateway.TransitionStrictDispatch(ctx, StrictDispatchTransitionInput{
+			Repo: derefString(loop.Repo), CWD: project.RepoPath,
+			DispatchID: strictDispatchID, State: nextState, WaitKind: waitKind,
+		}); err != nil {
+			return ProcessResult{}, fmt.Errorf("finish strict dispatch %s: %w", strictDispatchID, err)
+		}
+	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		if !errors.Is(err, storage.ErrQueueItemNotActive) {
 			return ProcessResult{}, err
@@ -1089,6 +1134,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		}
 	}()
 	manual := isManualPlannerQueue(payload)
+	strictDispatch := strings.TrimSpace(stringFromAnyDefault(payload["strictDispatchId"])) != ""
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if currentLogin == "" && (manual || policy.RequireAssigneeCurrentUser || hasRequestedReviewerSources(input.Project, input.Loop, detail.Assignees)) {
 		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
@@ -1100,7 +1146,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
 		}
 	}
-	if !manual && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !manual && !strictDispatch && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey
@@ -1109,7 +1155,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		releaseOnError = false
 		return checkpoint, nil
 	}
-	if !manual && policy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+	if !manual && !strictDispatch && policy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey

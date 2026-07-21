@@ -828,7 +828,7 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		}
 		result := make([]planner.IssueSummary, 0, len(issues))
 		for _, issue := range issues {
-			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels), StrictDispatchID: issue.StrictDispatchID})
 		}
 		return result, nil
 	}
@@ -858,6 +858,17 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
 	}
 	return result, nil
+}
+
+func (a plannerGitHubAdapter) TransitionStrictDispatch(ctx context.Context, input planner.StrictDispatchTransitionInput) error {
+	client, ok, err := a.plane(ctx, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("strict dispatch %s is not backed by a Plane provider", input.DispatchID)
+	}
+	return client.TransitionStrictDispatch(ctx, input.DispatchID, input.State, input.WaitKind)
 }
 
 func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewIssueInput) (planner.IssueDetail, error) {
