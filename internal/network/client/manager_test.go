@@ -41,6 +41,29 @@ func TestManagerUpdateConfigPublishesProjectCatalog(t *testing.T) {
 	}
 }
 
+func TestHasStrictDispatchProviderOnlyReportsEnabledPlaneProvider(t *testing.T) {
+	t.Parallel()
+
+	if hasStrictDispatchProvider(config.Config{Providers: []config.ProviderConfig{{
+		Kind:           config.ProviderKindPlane,
+		StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: false},
+	}}}) {
+		t.Fatal("disabled Plane strict dispatch reported as available")
+	}
+	if hasStrictDispatchProvider(config.Config{Providers: []config.ProviderConfig{{
+		Kind:           config.ProviderKindGitHub,
+		StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true},
+	}}}) {
+		t.Fatal("non-Plane strict dispatch reported as available")
+	}
+	if !hasStrictDispatchProvider(config.Config{Providers: []config.ProviderConfig{{
+		Kind:           config.ProviderKindPlane,
+		StrictDispatch: &config.PlaneStrictDispatchConfig{Enabled: true},
+	}}}) {
+		t.Fatal("enabled Plane strict dispatch was not reported")
+	}
+}
+
 func TestManagerStartWithoutRoutedProjectsPreservesProjectCounts(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "network.json")
 	if err := SaveState(statePath, LocalState{NetworkID: "net-1", NodeID: "node-1", NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}}); err != nil {

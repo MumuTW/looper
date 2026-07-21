@@ -142,7 +142,7 @@ func (m *Manager) tick(ctx context.Context, state LocalState) {
 	current, _ := m.currentGitHubIdentity(ctx)
 	cfg := m.configSnapshot()
 	routed, local := countProjectModes(cfg)
-	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(cfg), CoordinatorEligible: routed > 0 && cfg.Roles.Coordinator.Enabled, RoutedProjects: routed, RoutedProjectIDs: routedProjectIDs(cfg), ReviewerProjects: reviewerProjectCapabilities(cfg), LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
+	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(cfg), CoordinatorEligible: routed > 0 && cfg.Roles.Coordinator.Enabled, RoutedProjects: routed, RoutedProjectIDs: routedProjectIDs(cfg), ReviewerProjects: reviewerProjectCapabilities(cfg), LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx), StrictDispatchV1: hasStrictDispatchProvider(cfg)}
 	drift, reason := identityDrift(state.GitHub, current)
 	capabilities.IdentityDrift = drift
 	capabilities.DriftReason = reason
@@ -194,6 +194,15 @@ func (m *Manager) tick(ctx context.Context, state LocalState) {
 		m.status.IdentityFallback = current.Login != "" && current.NumericID == 0
 		m.mu.Unlock()
 	}
+}
+
+func hasStrictDispatchProvider(cfg config.Config) bool {
+	for _, provider := range cfg.Providers {
+		if provider.Kind == config.ProviderKindPlane && provider.StrictDispatch != nil && provider.StrictDispatch.Enabled {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) reconcileLease(ctx context.Context, api *Client, state LocalState, current protocol.GitHubIdentity, capabilities protocol.NodeCapabilities, status protocol.NodeStatusResponse) (string, string) {

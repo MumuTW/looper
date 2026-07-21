@@ -43,6 +43,7 @@ type NodeCapabilities struct {
 	DynamicLoad         int                         `json:"dynamicLoad"`
 	IdentityDrift       bool                        `json:"identityDrift"`
 	DriftReason         string                      `json:"driftReason,omitempty"`
+	StrictDispatchV1    bool                        `json:"strictDispatchV1,omitempty"`
 }
 
 type AuditEnvelope struct {
