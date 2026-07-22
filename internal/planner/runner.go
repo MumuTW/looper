@@ -814,7 +814,33 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue, failure.kind); err != nil {
 		return nil, err
 	}
+	r.transitionTerminalStrictDispatchFailure(ctx, queueItem, failedQueue)
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+}
+
+func (r *Runner) transitionTerminalStrictDispatchFailure(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord) {
+	if failedQueue == nil || (failedQueue.Status != "failed" && failedQueue.Status != "manual_intervention") {
+		return
+	}
+	dispatchID := strings.TrimSpace(stringFromAnyDefault(parseJSONObject(queueItem.PayloadJSON)["strictDispatchId"]))
+	if dispatchID == "" {
+		return
+	}
+	gateway, ok := r.github.(strictDispatchGateway)
+	if !ok {
+		return
+	}
+	cwd := ""
+	if queueItem.ProjectID != nil {
+		if project, err := r.repos.Projects.GetByID(ctx, *queueItem.ProjectID); err == nil && project != nil {
+			cwd = project.RepoPath
+		}
+	}
+	transitionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := gateway.TransitionStrictDispatch(transitionCtx, StrictDispatchTransitionInput{Repo: derefString(queueItem.Repo), CWD: cwd, DispatchID: dispatchID, State: "failed"}); err != nil && r.logger != nil {
+		r.logger.Warn("planner: mark terminal strict dispatch failed", map[string]any{"dispatchId": dispatchID, "queueItemId": queueItem.ID, "error": err.Error()})
+	}
 }
 
 func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind QueueFailureKind) error {
@@ -998,6 +1024,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}); err != nil {
 				return ProcessResult{}, err
 			}
+			r.transitionTerminalStrictDispatchFailure(ctx, queueItem, failedQueue)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
 		if step == stepDiscoverIssues {

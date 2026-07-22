@@ -94,7 +94,11 @@ func (m *Manager) Start(parent context.Context) error {
 	m.mu.Unlock()
 	cfg := m.configSnapshot()
 	routed, _ := countProjectModes(cfg)
-	if routed == 0 {
+	// Strict Plane dispatch still relies on loopernet for node presence and
+	// signed inbox delivery even when every repository keeps local routing.
+	// Keep heartbeating in that configuration so a freshly connected node does
+	// not immediately appear offline in Plane.
+	if routed == 0 && !hasStrictDispatchProvider(cfg) {
 		_, local := countProjectModes(cfg)
 		m.mu.Lock()
 		m.status.RoutedProjects = routed

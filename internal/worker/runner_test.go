@@ -2982,12 +2982,13 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	}
 	projectID := "project_1"
 	loopID := "loop_worker_running"
-	payload := `{"title":"Recover worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
+	payload := `{"title":"Recover worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main","strictDispatchId":"dispatch-terminal"}`
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_running", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_running", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	completed := make([]RunCompletedInput, 0, 1)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+	github := &fakeGitHubGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
 		completed = append(completed, input)
 		return nil
 	}})
@@ -3015,6 +3016,9 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	}
 	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
 		t.Fatalf("loop = %#v, want paused loop", loop)
+	}
+	if len(github.strictTransitions) != 1 || github.strictTransitions[0].DispatchID != "dispatch-terminal" || github.strictTransitions[0].State != "failed" {
+		t.Fatalf("strictTransitions = %#v, want terminal failed transition", github.strictTransitions)
 	}
 }
 
@@ -4599,6 +4603,12 @@ type fakeGitHubGateway struct {
 	addAssigneeCalls        []IssueAssigneesInput
 	addAssigneeErr          error
 	createPRIndex           int
+	strictTransitions       []StrictDispatchTransitionInput
+}
+
+func (f *fakeGitHubGateway) TransitionStrictDispatch(_ context.Context, input StrictDispatchTransitionInput) error {
+	f.strictTransitions = append(f.strictTransitions, input)
+	return nil
 }
 
 func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
