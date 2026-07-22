@@ -91,21 +91,17 @@ func (r *commandRuntime) planeConnect(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("exchange Plane connection code: %w", err)
 	}
 
-	loaded, err := r.loadConfig()
-	if err != nil {
-		return err
-	}
-	providerIndex, provider, err := matchingPlaneConnectProvider(loaded.Config, planeOrigin, exchange, getStringFlag(cmd, "provider"))
-	if err != nil {
-		return err
-	}
 	homeDir, err := r.homeDir()
 	if err != nil {
 		return err
 	}
 	networkState, err := networkclient.LoadState(networkclient.DefaultStatePath(homeDir))
 	if err != nil {
-		return fmt.Errorf("plane connect requires a joined loopernet network: %w", err)
+		return fmt.Errorf("plane connect requires this computer to join loopernet first: %w; run the network join command shown by your team setup, then repeat this command", err)
+	}
+	loaded, providerIndex, provider, err := r.preparePlaneConnectProvider(cmd, planeOrigin, exchange)
+	if err != nil {
+		return err
 	}
 	privateKeyFile := filepath.Join(homeDir, ".looper", "runtime", "plane-"+safeFileComponent(provider.ID)+".pem")
 	pendingPrivateKeyFile := privateKeyFile + ".pending"
@@ -220,6 +216,84 @@ func (r *commandRuntime) planeConnect(cmd *cobra.Command, args []string) error {
 	exchange.NodeID = linkResponse.Binding.NodeID
 	exchange.Status = "binding_created"
 	return r.finishPlaneConnection(cmd, planeOrigin, connectCode, provider.ID, exchange, networkState.NodeName)
+}
+
+func (r *commandRuntime) preparePlaneConnectProvider(cmd *cobra.Command, planeOrigin string, exchange planeConnectExchange) (config.LoadedFileConfig, int, config.ProviderConfig, error) {
+	wanted := strings.TrimSpace(getStringFlag(cmd, "provider"))
+	loaded, loadErr := r.loadConfig()
+	if loadErr == nil {
+		if index, provider, matchErr := matchingPlaneConnectProvider(loaded.Config, planeOrigin, exchange, wanted); matchErr == nil {
+			return loaded, index, provider, nil
+		}
+	}
+
+	cwd, err := r.getwd()
+	if err != nil {
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, fmt.Errorf("determine current directory for Plane auto-configuration: %w", err)
+	}
+	configPath, err := r.resolveBootstrapConfigPath(cwd)
+	if err != nil {
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, err
+	}
+	if loadErr != nil {
+		if _, statErr := os.Stat(configPath); statErr == nil || !os.IsNotExist(statErr) {
+			return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, loadErr
+		}
+	}
+
+	projectPath := strings.TrimSpace(getStringFlag(cmd, "project-path"))
+	if projectPath == "" {
+		projectPath = cwd
+	}
+	projectPath, err = filepath.Abs(projectPath)
+	if err != nil {
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, fmt.Errorf("resolve Plane project path: %w", err)
+	}
+	if info, statErr := os.Stat(projectPath); statErr != nil || !info.IsDir() {
+		if statErr == nil {
+			statErr = errors.New("not a directory")
+		}
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, fmt.Errorf("Plane project path %s is unavailable: %w", projectPath, statErr)
+	}
+	codeRepo := strings.TrimSpace(getStringFlag(cmd, "code-repo"))
+	if codeRepo == "" {
+		codeRepo = r.detectBootstrapOriginRepo(cmd.Context(), projectPath)
+	}
+	if codeRepo == "" {
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, fmt.Errorf("cannot auto-configure this Plane project from %s: run the command inside its GitHub checkout, or pass --project-path and --code-repo owner/repo", projectPath)
+	}
+	tokenEnv := strings.TrimSpace(getStringFlag(cmd, "plane-token-env"))
+	if tokenEnv == "" {
+		tokenEnv = defaultPlaneBootstrapToken
+	}
+	if !environmentNamePattern.MatchString(tokenEnv) {
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, fmt.Errorf("--plane-token-env %q is not a valid environment variable name", tokenEnv)
+	}
+	plan := bootstrapConfigPlan{
+		Provider: bootstrapProviderPlane, ProjectPath: projectPath, CodeRepo: codeRepo,
+		TriggerLabel: strings.TrimSpace(getStringFlag(cmd, "trigger-label")),
+		PlaneBaseURL: strings.TrimRight(planeOrigin, "/") + "/api/v1", PlaneWorkspace: exchange.Workspace,
+		PlaneProject: exchange.ProjectID, PlaneTokenEnv: tokenEnv,
+	}
+	generatedProviderID := planeBootstrapProviderID(exchange.Workspace)
+	if wanted != "" && wanted != generatedProviderID {
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, fmt.Errorf("provider %q is not configured for this Plane project; omit --provider to create %q automatically", wanted, generatedProviderID)
+	}
+	if _, _, err := r.ensureBootstrapConfig(configPath, cwd, plan); err != nil {
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, fmt.Errorf("auto-configure Plane project: %w", err)
+	}
+	loaded, err = r.loadConfig()
+	if err != nil {
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, err
+	}
+	index, provider, err := matchingPlaneConnectProvider(loaded.Config, planeOrigin, exchange, wanted)
+	if err != nil {
+		return config.LoadedFileConfig{}, 0, config.ProviderConfig{}, err
+	}
+	if strings.TrimSpace(os.Getenv(tokenEnv)) == "" && !getBoolFlag(cmd, "json") {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Configured Plane project %s. Before dispatching work, export %s with your Plane API key and restart looperd.\n", exchange.Workspace, tokenEnv)
+	}
+	return loaded, index, provider, nil
 }
 
 func (r *commandRuntime) finishPlaneConnection(cmd *cobra.Command, planeOrigin, connectCode, providerID string, exchange planeConnectExchange, nodeName string) error {

@@ -22,7 +22,18 @@ Concretely, for a `plane` project Looper maps each Plane work-item onto its inte
 
 Provider capabilities: issues, labels, comments, and assignees are supported; pull requests, diffs, and native reviews are **not** (they are delegated to GitHub). Review discovery is by label, review publishing is comment-only, and issue discovery is by polling.
 
-## One-command bootstrap
+## Recommended Plane connection
+
+For a teammate, prefer Plane's browser flow over asking them to copy workspace and project UUIDs:
+
+1. Install Looper and join the team's loopernet.
+2. Open the repository checkout.
+3. In a Plane work item, choose **Connect my Looper** and run the generated one-time command.
+4. Run `looper plane doctor` until every readiness check passes.
+
+`looper plane connect` now creates or extends the local config when the matching provider is absent. It reads the Plane workspace/project from the short-lived connection, detects `owner/repo` from the local GitHub origin, and scopes planner/worker trigger overrides to that project. Use `--project-path` and `--code-repo` when running outside the checkout. Existing matching configurations are reused unchanged.
+
+## Explicit bootstrap (automation and legacy servers)
 
 ```bash
 looper bootstrap --yes \
@@ -47,7 +58,7 @@ Flags:
 - `--trigger-label` — the issue label that triggers Planner/Worker discovery (optional; defaults to `looper:plan`).
 - `--feishu-webhook-env ENV_NAME` — when set, adds a `notifications.webhook` block (`enabled: true`, `format: "feishu"`, `levels: ["action_required", "failure"]`) pointed at that env var. Works with any provider.
 
-`--provider plane` generates a fresh config; if one already exists at the target path, remove it or pass `--config <new-path>`.
+`--provider plane` can create a fresh config. The self-service `plane connect` path can also add the Plane provider and project to an existing valid config without replacing unrelated providers or projects.
 
 ## Environment variables to export
 
@@ -86,22 +97,20 @@ The bootstrap command above produces a config equivalent to the following (defau
       "provider": "plane-acme-design",
       "repo": "acme/open-design",
       "repoPath": "/absolute/path/to/open-design",
+      "roles": {
+        "planner": {
+          "preSpecDecisionGrill": true,
+          "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false }
+        },
+        "worker": {
+          "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false }
+        }
+      },
       "productOwner": { "feishuOpenId": "ou_product", "planeId": "<product-member-uuid>" },
       "designOwner": { "feishuOpenId": "ou_design", "planeId": "<design-member-uuid>" },
       "owner": { "feishuOpenId": "ou_local-owner", "planeId": "<local-owner-member-uuid>" }
     }
   ],
-  "roles": {
-    "planner": {
-      "autoDiscovery": true,
-      "preSpecDecisionGrill": true,
-      "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false }
-    },
-    "worker": {
-      "autoDiscovery": true,
-      "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false }
-    }
-  },
   "notifications": {
     "webhook": {
       "enabled": true,

@@ -143,10 +143,18 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "plane",
 				short:           "Plane strict-dispatch binding commands",
-				helpSubcommands: []helpSubcommand{{name: "connect", description: "Connect this computer from a Plane one-time code"}, {name: "link", description: "Link this Node with a legacy Plane API token"}, {name: "approve", description: "Approve a binding on legacy Plane servers"}, {name: "setup", description: "Configure role owners and activate strict dispatch"}, {name: "enable", description: "Enable an existing Plane Node binding"}},
+				helpSubcommands: []helpSubcommand{{name: "connect", description: "Connect this computer from a Plane one-time code"}, {name: "doctor", description: "Check whether this computer can receive Plane work"}, {name: "link", description: "Link this Node with a legacy Plane API token"}, {name: "approve", description: "Approve a binding on legacy Plane servers"}, {name: "setup", description: "Configure role owners and activate strict dispatch"}, {name: "enable", description: "Enable an existing Plane Node binding"}},
 				helpWhenNoArgs:  true,
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "connect <plane-url>", short: "Connect this computer from a Plane one-time code", args: cobra.ExactArgs(1), runE: runtime.planeConnect, localFlags: []flagSpec{stringFlag("code", "code", "Short-lived connection code from Plane"), stringFlag("provider", "provider-id", "Plane provider to connect when more than one matches")}}),
+					newCommand(commandSpec{use: "connect <plane-url>", short: "Connect this computer from a Plane one-time code", args: cobra.ExactArgs(1), runE: runtime.planeConnect, localFlags: []flagSpec{
+						stringFlag("code", "code", "Short-lived connection code from Plane"),
+						stringFlag("provider", "provider-id", "Plane provider to connect when more than one matches"),
+						stringFlag("project-path", "path", "Local GitHub checkout; defaults to the current directory when auto-configuring"),
+						stringFlag("code-repo", "owner/repo", "GitHub code repository; defaults to the local origin remote"),
+						stringFlag("plane-token-env", "ENV", "Environment variable holding the Plane API key (default PLANE_API_KEY)"),
+						stringFlag("trigger-label", "label", "Work-item label used by Looper (default looper:plan)"),
+					}}),
+					newCommand(commandSpec{use: "doctor [provider-id]", short: "Check whether this computer can receive Plane work", args: cobra.MaximumNArgs(1), runE: runtime.planeDoctor}),
 					newCommand(commandSpec{use: "link [provider-id]", short: "Link this Node to your Plane identity", args: cobra.MaximumNArgs(1), runE: runtime.planeLink, localFlags: []flagSpec{stringFlag("strict-base-url", "url", "Plane web origin for strict dispatch endpoints")}}),
 					newCommand(commandSpec{use: "approve <binding-id> [provider-id]", short: "Approve a binding on legacy Plane servers", args: cobra.RangeArgs(1, 2), runE: runtime.planeApprove, localFlags: []flagSpec{boolFlag("allow-offline-queue", "Allow this owner to queue work while their Node is offline")}}),
 					newCommand(commandSpec{use: "setup <product-member-id> <design-member-id> <qa-member-id> [provider-id]", short: "Configure role owners and activate strict dispatch", args: cobra.RangeArgs(3, 4), runE: runtime.planeSetup, localFlags: []flagSpec{stringFlag("checklist-revision", "revision", "Signed rollout checklist revision")}}),
