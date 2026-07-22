@@ -900,6 +900,7 @@ func (a plannerGitHubAdapter) CreateStrictRoleRequest(ctx context.Context, input
 		return planner.StrictRoleRequestResult{}, err
 	}
 	return planner.StrictRoleRequestResult{
+		RoleRequestID:    response.RoleRequest.ID,
 		CommentID:        response.RoleRequest.RequestCommentID,
 		CreatedAt:        response.RoleRequest.CreatedAt.Format(time.RFC3339Nano),
 		EligibleMemberID: response.RoleRequest.EligibleMemberID,

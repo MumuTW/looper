@@ -113,6 +113,60 @@ type RoleRequestResponse struct {
 	} `json:"role_request"`
 }
 
+type RoleRequestMessage struct {
+	ID               string         `json:"id"`
+	ClientMessageID  string         `json:"client_message_id"`
+	Kind             string         `json:"kind"`
+	Body             string         `json:"body"`
+	DeliveryState    string         `json:"delivery_state"`
+	Evaluation       map[string]any `json:"evaluation"`
+	InReplyToMessage *string        `json:"in_reply_to_message_id"`
+	CommentID        *string        `json:"comment_id"`
+	CreatedAt        time.Time      `json:"created_at"`
+}
+
+type PendingRoleMessage struct {
+	RoleRequest struct {
+		ID                string         `json:"id"`
+		Role              string         `json:"role"`
+		Status            string         `json:"status"`
+		ConversationState string         `json:"conversation_state"`
+		Questions         []RoleQuestion `json:"questions"`
+		Resolution        map[string]any `json:"resolution"`
+	} `json:"role_request"`
+	Message RoleRequestMessage   `json:"message"`
+	History []RoleRequestMessage `json:"history"`
+}
+
+type PendingRoleMessagesResponse struct {
+	Pending []PendingRoleMessage `json:"pending"`
+}
+
+type RoleQuestionEvaluation struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Answer string `json:"answer,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type RoleMessageEvaluation struct {
+	Resolved  bool                     `json:"resolved"`
+	Questions []RoleQuestionEvaluation `json:"questions"`
+}
+
+type RoleMessageReplyInput struct {
+	ClientMessageID     string
+	InReplyToMessageID  string
+	ProcessedMessageIDs []string
+	Reply               string
+	Evaluation          RoleMessageEvaluation
+}
+
+type RoleMessageReplyResponse struct {
+	Message RoleRequestMessage `json:"message"`
+	Created bool               `json:"created"`
+}
+
 type APIError struct {
 	StatusCode int
 	Code       string
@@ -294,6 +348,51 @@ func (c *Client) CreateRoleRequest(ctx context.Context, dispatch Dispatch, input
 	}
 	var response RoleRequestResponse
 	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "role-requests"), nil, body, &signingContext{
+		dispatchID: dispatch.ID, dispatchRevision: dispatch.Revision, stateVersion: &stateVersion,
+		attemptID: dispatch.ExecutionAttemptID, fencingToken: &fencingToken,
+	}, &response)
+	return response, err
+}
+
+func (c *Client) PendingRoleMessages(ctx context.Context, dispatch Dispatch) (PendingRoleMessagesResponse, error) {
+	if dispatch.ExecutionAttemptID == nil {
+		return PendingRoleMessagesResponse{}, errors.New("Plane strict role messages: execution attempt is missing")
+	}
+	stateVersion, fencingToken := dispatch.StateVersion, dispatch.FencingToken
+	body := map[string]any{
+		"expected_state_version": dispatch.StateVersion,
+		"execution_attempt_id":   *dispatch.ExecutionAttemptID,
+		"fencing_token":          dispatch.FencingToken,
+		"session_id":             UUIDString(c.credentials.SessionID),
+		"instance_nonce":         base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:]),
+	}
+	var response PendingRoleMessagesResponse
+	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "role-requests", "messages", "pending"), nil, body, &signingContext{
+		dispatchID: dispatch.ID, dispatchRevision: dispatch.Revision, stateVersion: &stateVersion,
+		attemptID: dispatch.ExecutionAttemptID, fencingToken: &fencingToken,
+	}, &response)
+	return response, err
+}
+
+func (c *Client) ReplyRoleMessage(ctx context.Context, dispatch Dispatch, roleRequestID string, input RoleMessageReplyInput) (RoleMessageReplyResponse, error) {
+	if dispatch.ExecutionAttemptID == nil {
+		return RoleMessageReplyResponse{}, errors.New("Plane strict role message reply: execution attempt is missing")
+	}
+	stateVersion, fencingToken := dispatch.StateVersion, dispatch.FencingToken
+	body := map[string]any{
+		"expected_state_version": dispatch.StateVersion,
+		"execution_attempt_id":   *dispatch.ExecutionAttemptID,
+		"fencing_token":          dispatch.FencingToken,
+		"session_id":             UUIDString(c.credentials.SessionID),
+		"instance_nonce":         base64.RawURLEncoding.EncodeToString(c.credentials.InstanceNonce[:]),
+		"client_message_id":      input.ClientMessageID,
+		"in_reply_to_message_id": input.InReplyToMessageID,
+		"processed_message_ids":  input.ProcessedMessageIDs,
+		"reply":                  input.Reply,
+		"evaluation":             input.Evaluation,
+	}
+	var response RoleMessageReplyResponse
+	err := c.do(ctx, http.MethodPost, c.projectPath("looper", "dispatch", dispatch.ID, "role-requests", roleRequestID, "messages"), nil, body, &signingContext{
 		dispatchID: dispatch.ID, dispatchRevision: dispatch.Revision, stateVersion: &stateVersion,
 		attemptID: dispatch.ExecutionAttemptID, fencingToken: &fencingToken,
 	}, &response)

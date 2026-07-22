@@ -352,6 +352,30 @@ func (plane *PlaneClient) CreateStrictRoleRequest(ctx context.Context, dispatchI
 	return planestrict.RoleRequestResponse{}, fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
 }
 
+func (plane *PlaneClient) PendingStrictRoleMessages(ctx context.Context, dispatchID string) (planestrict.PendingRoleMessagesResponse, planestrict.Dispatch, error) {
+	if plane.strictClient == nil {
+		return planestrict.PendingRoleMessagesResponse{}, planestrict.Dispatch{}, errors.New("Plane strict dispatch is not configured")
+	}
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return planestrict.PendingRoleMessagesResponse{}, planestrict.Dispatch{}, err
+	}
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ID == dispatchID {
+			response, err := plane.strictClient.PendingRoleMessages(ctx, dispatch)
+			return response, dispatch, err
+		}
+	}
+	return planestrict.PendingRoleMessagesResponse{}, planestrict.Dispatch{}, fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
+}
+
+func (plane *PlaneClient) ReplyStrictRoleMessage(ctx context.Context, dispatch planestrict.Dispatch, roleRequestID string, input planestrict.RoleMessageReplyInput) (planestrict.RoleMessageReplyResponse, error) {
+	if plane.strictClient == nil {
+		return planestrict.RoleMessageReplyResponse{}, errors.New("Plane strict dispatch is not configured")
+	}
+	return plane.strictClient.ReplyRoleMessage(ctx, dispatch, roleRequestID, input)
+}
+
 // ViewIssue resolves a work-item by its per-project sequence_id (looper's Issue
 // number) and maps it onto the Issue type.
 func (plane *PlaneClient) ViewIssue(ctx context.Context, number int64) (Issue, error) {

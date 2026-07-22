@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/infra/planedoc"
 	"github.com/nexu-io/looper/internal/planner/decisions"
 	"github.com/nexu-io/looper/internal/storage"
@@ -51,6 +52,7 @@ func (r *Runtime) reconcileAwaitingRoleDecisions(ctx context.Context) {
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	resumeAt := formatJavaScriptISOString(now().UTC().Add(time.Second))
+	var roleDialogueLLM triage.LLM
 	for _, loop := range paused {
 		if loop.Type != "planner" {
 			continue
@@ -74,6 +76,31 @@ func (r *Runtime) reconcileAwaitingRoleDecisions(ctx context.Context) {
 		workItemID := planedoc.WorkItemIDFromURL(view.Issue.URL)
 		if workItemID == "" {
 			continue
+		}
+		strictConversation := strictDispatchID(loop.MetadataJSON) != "" && strictRoleConversationEnabled(view.Decisions)
+		if strictConversation {
+			if roleDialogueLLM == nil {
+				roleDialogueLLM = buildSpecApprovalLLM(cfg, repositories, now)
+			}
+			processed, processErr := processPendingStrictRoleMessage(ctx, cfg, loop, view.Decisions, roleDialogueLLM)
+			if processErr != nil {
+				if logger != nil {
+					logger.Warn("role dialogue: process pending reply failed", map[string]any{"loopId": loop.ID, "error": processErr.Error()})
+				}
+				continue
+			}
+			if processed {
+				if err := publishDecisionLog(ctx, gateway, planeProjectID, workItemID, loop.ID, view.Decisions); err != nil {
+					continue
+				}
+				if err := persistDecisionCheckpoint(ctx, repositories, *run, view); err != nil {
+					continue
+				}
+				if err := parkDecisionBarrier(ctx, repositories, loop, nowISO, "Waiting for Looper role dialogue to converge"); err != nil {
+					continue
+				}
+				continue
+			}
 		}
 		// Resolved stages are intentionally recoverable. persistDecisionCheckpoint,
 		// queue creation, and loop requeue are separate durable writes; a crash after
@@ -125,6 +152,23 @@ func (r *Runtime) reconcileAwaitingRoleDecisions(ctx context.Context) {
 			view.Decisions.Stage = "product_resolved"
 			ready = true
 			stateChanged = true
+		} else if strictConversation {
+			roles := []decisions.Role{decisions.RoleProduct}
+			if stage == "awaiting_downstream" || stage == "downstream_resolved" {
+				roles = []decisions.Role{decisions.RoleDesign, decisions.RoleEngineering}
+			}
+			ready = len(decisions.UnansweredBlocking(*view.Decisions, roles...)) == 0
+			if ready {
+				if stage == "awaiting_product" {
+					view.Decisions.Stage = "product_resolved"
+				} else if stage == "awaiting_downstream" {
+					view.Decisions.Stage = "downstream_resolved"
+				}
+			} else if stage == "product_resolved" {
+				view.Decisions.Stage = "awaiting_product"
+			} else if stage == "downstream_resolved" {
+				view.Decisions.Stage = "awaiting_downstream"
+			}
 		} else {
 			comments, listErr := gateway.ListWorkItemComments(ctx, planeProjectID, workItemID)
 			if listErr != nil {

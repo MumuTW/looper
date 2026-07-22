@@ -254,6 +254,7 @@ type StrictRoleRequestInput struct {
 }
 
 type StrictRoleRequestResult struct {
+	RoleRequestID    string
 	CommentID        string
 	CreatedAt        string
 	EligibleMemberID string

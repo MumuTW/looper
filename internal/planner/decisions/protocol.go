@@ -68,6 +68,7 @@ type Brief struct {
 type RequestReceipt struct {
 	Role             Role   `json:"role"`
 	Revision         int    `json:"revision"`
+	RoleRequestID    string `json:"roleRequestId,omitempty"`
 	CommentID        string `json:"commentId"`
 	CreatedAt        string `json:"createdAt"`
 	EligibleMemberID string `json:"eligibleMemberId,omitempty"`

@@ -93,6 +93,27 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 				"request_comment_id": "comment-1", "eligible_member_id": "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
 				"eligible_member_name": "Product", "created_at": now.Format(time.RFC3339Nano), "created": true,
 			}})
+		case "/api/workspaces/open-design/projects/project-id/looper/dispatch/" + dispatchID + "/role-requests/messages/pending/":
+			dispatch := Dispatch{ID: dispatchID, Revision: 3, StateVersion: 4, ExecutionAttemptID: &attemptID, FencingToken: 9}
+			expectedDispatch = &dispatch
+			writeJSON(t, response, map[string]any{"pending": []any{map[string]any{
+				"role_request": map[string]any{"id": "99999999-aaaa-4bbb-8ccc-dddddddddddd", "role": "product", "status": "open", "conversation_state": "waiting_looper", "questions": []any{map[string]any{"id": "PROD-001", "question": "Retry mode?", "context": "Choose behavior."}}},
+				"message":      map[string]any{"id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "client_message_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "kind": "human_reply", "body": "自动重试会等多久？", "delivery_state": "pending", "created_at": now.Format(time.RFC3339Nano)},
+				"history":      []any{},
+			}}})
+		case "/api/workspaces/open-design/projects/project-id/looper/dispatch/" + dispatchID + "/role-requests/99999999-aaaa-4bbb-8ccc-dddddddddddd/messages/":
+			dispatch := Dispatch{ID: dispatchID, Revision: 3, StateVersion: 4, ExecutionAttemptID: &attemptID, FencingToken: 9}
+			expectedDispatch = &dispatch
+			var body map[string]any
+			if err := json.Unmarshal(rawBody, &body); err != nil {
+				t.Fatal(err)
+			}
+			if body["reply"] != "最多增加 6 秒。" || len(body["processed_message_ids"].([]any)) != 1 {
+				t.Fatalf("role message reply body = %#v", body)
+			}
+			writeJSON(t, response, map[string]any{"created": true, "message": map[string]any{
+				"id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "client_message_id": body["client_message_id"], "kind": "looper_reply", "body": body["reply"], "delivery_state": "delivered", "created_at": now.Format(time.RFC3339Nano),
+			}})
 		case "/api/workspaces/open-design/projects/project-id/looper/dispatch/" + dispatchID + "/handoff/":
 			dispatch := Dispatch{ID: dispatchID, Revision: 3, StateVersion: 3, ExecutionAttemptID: &attemptID, FencingToken: 9}
 			expectedDispatch = &dispatch
@@ -116,7 +137,7 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	client, err := NewClient(server.URL, "open-design", "project-id", Credentials{
 		BindingID: bindingID, KeyRevision: 2, PrivateKey: privateKey, NodeID: "node-cyan",
 		SessionID: sessionID, InstanceNonce: instanceNonce,
-	}, WithClock(func() time.Time { return now }), WithRandom(bytes.NewReader(bytes.Repeat([]byte{0x11}, 112))))
+	}, WithClock(func() time.Time { return now }), WithRandom(bytes.NewReader(bytes.Repeat([]byte{0x11}, 144))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +165,18 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	if err != nil || awaiting.Dispatch.State != "awaiting_human" {
 		t.Fatalf("Transition(awaiting_human) = %#v, %v", awaiting, err)
 	}
+	pending, err := client.PendingRoleMessages(context.Background(), awaiting.Dispatch)
+	if err != nil || len(pending.Pending) != 1 || pending.Pending[0].Message.Body == "" {
+		t.Fatalf("PendingRoleMessages() = %#v, %v", pending, err)
+	}
+	replied, err := client.ReplyRoleMessage(context.Background(), awaiting.Dispatch, roleRequest.RoleRequest.ID, RoleMessageReplyInput{
+		ClientMessageID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", InReplyToMessageID: pending.Pending[0].Message.ID,
+		ProcessedMessageIDs: []string{pending.Pending[0].Message.ID}, Reply: "最多增加 6 秒。",
+		Evaluation: RoleMessageEvaluation{Resolved: false, Questions: []RoleQuestionEvaluation{{ID: "PROD-001", Status: "still_open", Reason: "尚未选择"}}},
+	})
+	if err != nil || !replied.Created || replied.Message.Kind != "looper_reply" {
+		t.Fatalf("ReplyRoleMessage() = %#v, %v", replied, err)
+	}
 	handedOff, err := client.Handoff(context.Background(), transitioned.Dispatch, HandoffInput{
 		ApprovalActorMemberID: "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
 		ApprovalCommentID:     "bbbbbbbb-2222-4333-8444-cccccccccccc",
@@ -152,8 +185,8 @@ func TestClientSignsInboxClaimAndTransition(t *testing.T) {
 	if err != nil || handedOff.Dispatch.ActiveRole != "worker" {
 		t.Fatalf("Handoff() = %#v, %v", handedOff, err)
 	}
-	if requestCount != 7 {
-		t.Fatalf("requests = %d, want 7", requestCount)
+	if requestCount != 9 {
+		t.Fatalf("requests = %d, want 9", requestCount)
 	}
 }
 

@@ -408,11 +408,11 @@ func (r *Runner) ensureDecisionRequest(ctx context.Context, input stepInput, sta
 		if err != nil {
 			return &loopError{message: "create strict decision request: " + err.Error(), kind: FailureRetryableTransient}
 		}
-		if strings.TrimSpace(created.CommentID) == "" || strings.TrimSpace(created.CreatedAt) == "" || strings.TrimSpace(created.EligibleMemberID) == "" {
+		if strings.TrimSpace(created.RoleRequestID) == "" || strings.TrimSpace(created.CommentID) == "" || strings.TrimSpace(created.CreatedAt) == "" || strings.TrimSpace(created.EligibleMemberID) == "" {
 			return &loopError{message: "strict decision request receipt was incomplete", kind: FailureNonRetryable}
 		}
 		state.Requests[role] = decisions.RequestReceipt{
-			Role: role, Revision: state.Brief.Revision, CommentID: created.CommentID,
+			Role: role, Revision: state.Brief.Revision, RoleRequestID: created.RoleRequestID, CommentID: created.CommentID,
 			CreatedAt: created.CreatedAt, EligibleMemberID: created.EligibleMemberID,
 		}
 		issue, issueErr := requireIssue(input.Checkpoint)
