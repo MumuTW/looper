@@ -697,6 +697,13 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 	// Reconcile managed excludes before cleanliness so upgraded daemons heal
 	// existing worktrees (reserved reviewer scratch, build artifacts) without MI.
 	g.applyWorktreeArtifactExcludes(ctx, input.WorktreePath)
+	// A prior agent may have staged reserved scratch under a .gitignore
+	// negation (git add -A). Status would report "A " (not "??"), so the
+	// untracked-only classifier alone leaves retry in MI. Unstage additions
+	// without deleting files so readStatus can ignore them as reserved dirt.
+	if err := g.unstageReservedReviewerScratchAdditions(ctx, input.WorktreePath); err != nil {
+		return PrepareWorktreeResult{}, err
+	}
 
 	statusBeforeReset, err := g.readStatus(ctx, input.WorktreePath)
 	if err != nil {
@@ -799,13 +806,14 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 // the same basename pattern.
 //
 // Dual classification (with isIgnorableReservedReviewerScratch in readStatus):
-// status drops only "??" root reserved names so PrepareWorktree stays clean;
-// this path drops only newly-added index entries so Commit never lands them.
-// Both must use isReservedReviewerScratchPath so Git glob, empty suffix, and
-// root-only rules stay identical. Costs: keep the two call sites in sync;
-// namespace collisions if a tracked root file uses the reserved pattern
-// (mitigated by unstaging only --diff-filter=A additions, not M/D); Git
-// ignore precedence where tracked .gitignore !/.looper-review-*.json outranks
+// PrepareWorktree and Commit both call this unstage first so prestaged reserved
+// paths become untracked; status then drops only "??" root reserved names;
+// Commit still unstages after git add -A so scratch never lands. Both classifiers
+// use isReservedReviewerScratchPath so Git glob, empty suffix, and root-only
+// rules stay identical. Costs: keep Prepare/Commit unstage + status filter in
+// sync; namespace collisions if a tracked root file uses the reserved pattern
+// (mitigated by unstaging only --diff-filter=A additions, not M/D); Git ignore
+// precedence where tracked .gitignore !/.looper-review-*.json outranks
 // info/exclude (exclude alone is insufficient — that is why classifiers exist);
 // shell capture is still bounded (256 KiB), so this query is pathspec-scoped to
 // the reserved root namespace — ordinary large commits never fail the gate;
@@ -1151,9 +1159,9 @@ func (g *Gateway) tryRemoveWorktree(ctx context.Context, repoPath, worktreePath 
 //
 // The list is intentionally conservative — never broad source globs. Patterns
 // only hide untracked matches; tracked modifications remain visible to status.
-// When exclude is overridden, readStatus ignores only untracked root reserved
-// scratch, and Commit unstages only newly-added reserved scratch so tracked
-// same-name paths still commit.
+// When exclude is overridden, PrepareWorktree/Commit unstage newly-added
+// reserved scratch (without deleting), readStatus ignores only untracked root
+// reserved scratch, and tracked same-name paths still commit.
 var worktreeArtifactExcludePatterns = []string{
 	".pnpm-store/",
 	"node_modules/",
@@ -1286,6 +1294,12 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 	if err != nil {
 		return nil, err
 	}
+	// Fail closed: shell capture is 256 KiB. If truncation drops ordinary dirt
+	// after a prefix of only reserved scratch, filtering would report clean and
+	// a later fallback commit could publish the omitted files.
+	if result.StdoutTruncated {
+		return nil, fmt.Errorf("git status output truncated after %d bytes; refuse incomplete dirt classification", len(result.Stdout))
+	}
 
 	entries := []statusEntry{}
 	for _, entry := range parsePorcelainStatusZ(result.Stdout) {
@@ -1358,10 +1372,11 @@ func splitNUL(s string) []string {
 
 // isIgnorableReservedReviewerScratch reports untracked root-level files in the
 // reserved /.looper-review-*.json namespace for dirt inspection. Nested
-// lookalikes and any tracked or staged change remain visible dirt. Paired with
-// unstageReservedReviewerScratchAdditions (index side); both share
-// isReservedReviewerScratchPath — see that function and the Commit unstage
-// comment for trade-offs and failure modes.
+// lookalikes and any tracked or staged change remain visible dirt. PrepareWorktree
+// unstages reserved additions first so prestaged scratch becomes "??" and is
+// ignored here; Commit reuses the same unstage after git add -A. Both share
+// isReservedReviewerScratchPath — see that function and the unstage comment for
+// trade-offs and failure modes.
 func isIgnorableReservedReviewerScratch(entry statusEntry) bool {
 	if entry.Code != "??" {
 		return false
