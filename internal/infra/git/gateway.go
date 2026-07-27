@@ -1006,8 +1006,10 @@ func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreeP
 		// Never relocate tracked fixtures or other index-present paths that
 		// share the reserved basename pattern. Operational probe failures
 		// (cancel, corrupt index, git start) must fail before any rename so a
-		// tracked matching file is never treated as scratch.
-		present, err := g.isIndexPathPresent(ctx, worktreePath, name)
+		// tracked matching file is never treated as scratch. When
+		// core.ignoreCase is true, match the on-disk spelling case-insensitively
+		// against the index so a case-only spelling drift is not quarantined.
+		present, err := g.isIndexPathPresent(ctx, worktreePath, name, ignoreCase)
 		if err != nil {
 			return fmt.Errorf("probe index for reserved scratch %q: %w", name, err)
 		}
@@ -1045,8 +1047,16 @@ func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreeP
 // that expected miss is returned as (false, nil). Context cancel, corrupt
 // index, and other operational failures are propagated so callers do not
 // mutate the filesystem under an unknown index state.
-func (g *Gateway) isIndexPathPresent(ctx context.Context, worktreePath, path string) (bool, error) {
-	err := g.runGit(ctx, worktreePath, nil, "ls-files", "--error-unmatch", "-z", "--", ":(literal)"+path)
+//
+// When ignoreCase is true (core.ignoreCase), the pathspec uses icase so an
+// on-disk reserved basename that differs from the index only by case still
+// counts as tracked and is never relocated as scratch.
+func (g *Gateway) isIndexPathPresent(ctx context.Context, worktreePath, path string, ignoreCase bool) (bool, error) {
+	pathspec := ":(literal)" + path
+	if ignoreCase {
+		pathspec = ":(icase,literal)" + path
+	}
+	err := g.runGit(ctx, worktreePath, nil, "ls-files", "--error-unmatch", "-z", "--", pathspec)
 	if err == nil {
 		return true, nil
 	}
@@ -1183,31 +1193,45 @@ func (g *Gateway) pruneExpiredReservedReviewScratchQuarantine(worktreeRoot strin
 	}
 }
 
-// orphanQuarantineExpired reports whether every payload file under qPath is
-// older than cutoff (or the empty directory itself is older). Any fresh or
-// unreadable entry keeps the orphan for another retention cycle.
+// orphanQuarantineExpired reports whether the orphan quarantine container is
+// older than cutoff. Retention is based on quarantine creation age (the
+// worktree-scoped dir and its relocate-created child entries), never on nested
+// payload file mtimes: os.Rename preserves source mtime, so aging scratch
+// quarantined today would otherwise expire as soon as its worktree becomes an
+// orphan outside CleanupWorktree. Any fresh or unreadable container entry keeps
+// the orphan for another retention cycle.
 func orphanQuarantineExpired(qPath string, cutoff time.Time) bool {
-	expired := true
-	sawFile := false
-	_ = filepath.WalkDir(qPath, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d == nil || d.IsDir() {
-			return nil
-		}
-		sawFile = true
-		info, infoErr := d.Info()
-		if infoErr != nil || !info.ModTime().Before(cutoff) {
-			expired = false
-		}
-		return nil
-	})
-	if sawFile {
-		return expired
-	}
-	info, err := os.Stat(qPath)
-	if err != nil {
+	newest, ok := quarantineContainerNewestModTime(qPath)
+	if !ok {
 		return false
 	}
-	return info.ModTime().Before(cutoff)
+	return newest.Before(cutoff)
+}
+
+// quarantineContainerNewestModTime returns the newest mtime among qPath and its
+// direct children (random destination subdirs created at relocate time). Nested
+// payload files are intentionally ignored so rename-preserved source mtimes
+// cannot collapse the recovery window.
+func quarantineContainerNewestModTime(qPath string) (time.Time, bool) {
+	info, err := os.Stat(qPath)
+	if err != nil {
+		return time.Time{}, false
+	}
+	newest := info.ModTime()
+	entries, err := os.ReadDir(qPath)
+	if err != nil {
+		return time.Time{}, false
+	}
+	for _, entry := range entries {
+		ei, infoErr := entry.Info()
+		if infoErr != nil {
+			return time.Time{}, false
+		}
+		if ei.ModTime().After(newest) {
+			newest = ei.ModTime()
+		}
+	}
+	return newest, true
 }
 
 // worktreePathAbsent reports whether path does not exist. Non-existence is the

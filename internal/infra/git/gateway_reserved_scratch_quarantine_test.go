@@ -55,14 +55,14 @@ func TestGatewayRelocatePropagatesIndexProbeCancelWithoutMutatingTracked(t *test
 		t.Fatalf("untracked scratch missing after canceled relocate (must not mutate): %v", err)
 	}
 	// Absent path must stay a clean miss (exit 1), not an operational error.
-	present, err := gateway.isIndexPathPresent(context.Background(), wt, ".looper-review-1061.json")
+	present, err := gateway.isIndexPathPresent(context.Background(), wt, ".looper-review-1061.json", false)
 	if err != nil {
 		t.Fatalf("isIndexPathPresent(untracked) error = %v, want nil", err)
 	}
 	if present {
 		t.Fatal("isIndexPathPresent(untracked) = true, want false")
 	}
-	present, err = gateway.isIndexPathPresent(context.Background(), wt, ".looper-review-fixture.json")
+	present, err = gateway.isIndexPathPresent(context.Background(), wt, ".looper-review-fixture.json", false)
 	if err != nil {
 		t.Fatalf("isIndexPathPresent(tracked) error = %v, want nil", err)
 	}
@@ -172,13 +172,18 @@ func TestGatewayPrunesExpiredOrphanQuarantine(t *testing.T) {
 	wt := worktree.WorktreePath
 
 	// Simulate an abandoned worktree's quarantine entry under the sibling root.
+	// Age the container (dir), not only nested payload: retention is container-based.
 	orphanDir := filepath.Join(fixture.worktreeRoot, reservedReviewScratchQuarantineDirName, "abandoned-wt")
 	mustMkdirAll(t, orphanDir)
-	orphanPath := filepath.Join(orphanDir, "old.payload")
+	orphanChild := filepath.Join(orphanDir, "deadbeefdeadbeef")
+	mustMkdirAll(t, orphanChild)
+	orphanPath := filepath.Join(orphanChild, "old.payload")
 	writeFile(t, orphanPath, "stale\n")
 	old := now.Add(-reservedReviewScratchQuarantineRetention - time.Hour)
-	if err := os.Chtimes(orphanPath, old, old); err != nil {
-		t.Fatalf("Chtimes: %v", err)
+	for _, p := range []string{orphanPath, orphanChild, orphanDir} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("Chtimes %s: %v", p, err)
+		}
 	}
 
 	writeFile(t, filepath.Join(wt, ".looper-review-1064.json"), "{}\n")
