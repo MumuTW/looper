@@ -23,7 +23,14 @@ const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
 var (
 	missingWorktreeErrorPattern = regexp.MustCompile(`(?i)is not a working tree|does not exist|not found|no such file`)
 	pushConflictErrorPattern    = regexp.MustCompile(`(?i)stale info|non-fast-forward|failed to push|rejected`)
+	// reservedReviewerScratchBaseName matches the root-only namespace reserved for
+	// ephemeral reviewer submit payloads (/.looper-review-*.json).
+	reservedReviewerScratchBaseName = regexp.MustCompile(`^\.looper-review-.+\.json$`)
 )
+
+// reservedReviewerScratchPathspecExclude keeps root-level reserved scratch out of
+// `git add -A` even when a tracked .gitignore negation outranks info/exclude.
+const reservedReviewerScratchPathspecExclude = ":(exclude,top).looper-review-*.json"
 
 var fetchRefLockRetryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
 
@@ -767,7 +774,10 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
 		return CommitResult{}, err
 	}
-	if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A"); err != nil {
+	// Explicit pathspec exclude: info/exclude alone loses to higher-precedence
+	// .gitignore negations (e.g. !/.looper-review-*.json), which would otherwise
+	// stage reserved reviewer scratch into loop fallback commits.
+	if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A", "--", ".", reservedReviewerScratchPathspecExclude); err != nil {
 		return CommitResult{}, err
 	}
 	if err := g.runGit(ctx, input.WorktreePath, nil, "commit", "-m", input.Message); err != nil {
@@ -1076,10 +1086,13 @@ func (g *Gateway) tryRemoveWorktree(ctx context.Context, repoPath, worktreePath 
 //     looper's fallback commit (e.g. .pnpm-store/ on repos whose .gitignore
 //     misses it)
 //   - reserved top-level reviewer submission scratch (/.looper-review-*.json)
-//     so leftover agent payload files do not force dirty manual_intervention
+//     as a best-effort defense when no higher-precedence .gitignore negation
+//     re-includes the path (tracked .gitignore outranks info/exclude)
 //
 // The list is intentionally conservative — never broad source globs. Patterns
 // only hide untracked matches; tracked modifications remain visible to status.
+// When exclude is overridden, readStatus and Commit apply explicit reserved-
+// namespace handling so dirt and staging still ignore root-level scratch.
 var worktreeArtifactExcludePatterns = []string{
 	".pnpm-store/",
 	"node_modules/",
@@ -1222,9 +1235,42 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 		if line[:2] == "!!" {
 			continue
 		}
-		entries = append(entries, statusEntry{Code: line[:2], Path: strings.TrimSpace(line[3:])})
+		entry := statusEntry{Code: line[:2], Path: strings.TrimSpace(line[3:])}
+		// info/exclude is lower precedence than tracked .gitignore. When a repo
+		// re-includes reserved scratch via negation, git still reports it as
+		// untracked; drop only those root-level untracked entries for dirt.
+		if isIgnorableReservedReviewerScratch(entry) {
+			continue
+		}
+		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+// isIgnorableReservedReviewerScratch reports untracked root-level files in the
+// reserved /.looper-review-*.json namespace. Nested lookalikes and any tracked
+// or staged change remain visible dirt.
+func isIgnorableReservedReviewerScratch(entry statusEntry) bool {
+	if entry.Code != "??" {
+		return false
+	}
+	return isReservedReviewerScratchPath(entry.Path)
+}
+
+func isReservedReviewerScratchPath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	// Porcelain may quote unusual names; strip a single surrounding quote pair.
+	if len(path) >= 2 && path[0] == '"' && path[len(path)-1] == '"' {
+		path = path[1 : len(path)-1]
+	}
+	// Root-anchored only: any separator means nested (outside reserved namespace).
+	if strings.Contains(path, "/") || strings.Contains(path, `\`) {
+		return false
+	}
+	return reservedReviewerScratchBaseName.MatchString(path)
 }
 
 func (g *Gateway) runGit(ctx context.Context, cwd string, env map[string]string, args ...string) error {

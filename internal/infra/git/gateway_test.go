@@ -898,6 +898,80 @@ func TestGatewayPrepareWorktreeIgnoresReservedReviewerScratch(t *testing.T) {
 	}
 }
 
+// Tracked .gitignore negations outrank info/exclude; reserved scratch must still
+// be treated as non-dirt for prepare and excluded from fallback commits.
+func TestGatewayPrepareAndCommitIgnoreReservedScratchDespiteGitignoreNegation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/review-negation")
+	gateway := fixture.gateway()
+
+	// Install a higher-precedence re-include on the feature branch before create.
+	runGit(t, fixture.repoPath, "checkout", "feature/review-negation")
+	writeFile(t, filepath.Join(fixture.repoPath, ".gitignore"), "!/.looper-review-*.json\n")
+	runGit(t, fixture.repoPath, "add", ".gitignore")
+	runGit(t, fixture.repoPath, "commit", "-m", "re-include reserved reviewer scratch")
+	runGit(t, fixture.repoPath, "push", "origin", "feature/review-negation")
+	runGit(t, fixture.repoPath, "checkout", "main")
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/review-negation",
+		BaseBranch:   "main",
+		PRNumber:     1049,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	scratchPath := filepath.Join(worktree.WorktreePath, ".looper-review-1049.json")
+	writeFile(t, scratchPath, `{"body":"scratch"}\n`)
+
+	// Prove git itself still sees the file (exclude lost to .gitignore negation).
+	if status := runGit(t, worktree.WorktreePath, "status", "--short", "--", ".looper-review-1049.json"); !strings.Contains(status, ".looper-review-1049.json") {
+		t.Fatalf("expected git status to show untracked scratch under negation; status = %q", status)
+	}
+
+	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "feature/review-negation"})
+	if err != nil {
+		t.Fatalf("PrepareWorktree(scratch under negation) error = %v", err)
+	}
+	if !prepared.Clean {
+		t.Fatal("PrepareWorktree(scratch under negation).Clean = false, want true")
+	}
+	if _, err := os.Stat(scratchPath); err != nil {
+		t.Fatalf("scratch file should be preserved: %v", err)
+	}
+
+	writeFile(t, filepath.Join(worktree.WorktreePath, "app.go"), "package main\n")
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, "nested"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "nested", ".looper-review-1.json"), "{}\n")
+
+	if _, err := gateway.Commit(ctx, CommitInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+		Message:      "source change with reserved scratch present",
+	}); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	committed := runGit(t, worktree.WorktreePath, "show", "--pretty=format:", "--name-only", "HEAD")
+	if !strings.Contains(committed, "app.go") {
+		t.Fatalf("Commit() missing app.go; files = %q", committed)
+	}
+	if strings.Contains(committed, ".looper-review-1049.json") {
+		t.Fatalf("Commit() staged root reserved scratch under negation; files = %q", committed)
+	}
+	if !strings.Contains(committed, "nested/.looper-review-1.json") {
+		t.Fatalf("Commit() should still stage nested lookalike dirt; files = %q", committed)
+	}
+	if _, err := os.Stat(scratchPath); err != nil {
+		t.Fatalf("root scratch should remain uncommitted on disk: %v", err)
+	}
+}
+
 func TestGatewayPrepareWorktreeSupportsExplicitRef(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
