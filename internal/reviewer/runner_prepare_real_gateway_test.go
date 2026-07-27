@@ -207,8 +207,16 @@ func TestRunPrepareWorktreeStepRealGatewayIgnoresReviewerScratchAfterHeadChange(
 	if checkpoint.Worktree.HeadSHA != newHead {
 		t.Fatalf("HeadSHA = %q, want %q", checkpoint.Worktree.HeadSHA, newHead)
 	}
-	if _, err := os.Stat(scratchPath); err != nil {
-		t.Fatalf("scratch should be preserved: %v", err)
+	// Successful prepare relocates reserved scratch out of the worktree so a
+	// later agent-authored commit cannot publish it; payload is preserved in
+	// the quarantine sibling, never deleted.
+	if _, err := os.Stat(scratchPath); !os.IsNotExist(err) {
+		t.Fatalf("scratch should be relocated out of worktree after successful prepare: err=%v", err)
+	}
+	quarantineDir := filepath.Join(filepath.Dir(wtPath), ".looper-reserved-review-scratch", filepath.Base(wtPath))
+	qEntries, qErr := os.ReadDir(quarantineDir)
+	if qErr != nil || len(qEntries) == 0 {
+		t.Fatalf("expected quarantined scratch under %s: err=%v count=%d", quarantineDir, qErr, len(qEntries))
 	}
 	if !strings.Contains(mustReadFile(t, excludePath), "/.looper-review-*.json") {
 		t.Fatalf("exclude not reconciled: %q", mustReadFile(t, excludePath))

@@ -30,7 +30,7 @@ func TestGatewayReservedReviewerScratchEdges(t *testing.T) {
 				}
 			},
 			wantClean: &yes, include: []string{"app.go"}, exclude: []string{".looper-review-ita.json"},
-			keepOnDisk: []string{".looper-review-ita.json"},
+			goneAfterPrepare: []string{".looper-review-ita.json"},
 		},
 		{
 			// With core.ignoreCase=true, Git exclude/pathspec fold case; classifiers
@@ -53,18 +53,20 @@ func TestGatewayReservedReviewerScratchEdges(t *testing.T) {
 				}
 			},
 			wantClean: &yes, include: []string{"app.go"},
-			// Match case-insensitively in committed listing ban check below via keepOnDisk.
-			exclude:    []string{".LOOPER-REVIEW-CASE.JSON", ".looper-review-case.json"},
-			keepOnDisk: []string{".LOOPER-REVIEW-CASE.JSON"},
+			exclude:          []string{".LOOPER-REVIEW-CASE.JSON", ".looper-review-case.json"},
+			goneAfterPrepare: []string{".LOOPER-REVIEW-CASE.JSON"},
 		},
 		{
 			// Without :(literal), git treats \ as escape and leaves scratch staged.
+			// Prepare relocates setup scratch; beforeCommit re-creates for Commit unstage.
 			name: "backslash_in_suffix_reserved", branch: "feature/review-backslash-suffix", gitignoreNegate: true,
 			setup: func(t *testing.T, wt string) {
 				writeFile(t, filepath.Join(wt, `.looper-review-a\b.json`), "{}\n")
 			},
-			wantClean: &yes,
+			wantClean:        &yes,
+			goneAfterPrepare: []string{`.looper-review-a\b.json`},
 			beforeCommit: func(t *testing.T, wt string) {
+				writeFile(t, filepath.Join(wt, `.looper-review-a\b.json`), "{}\n")
 				runGit(t, wt, "add", "-A", "--", `.looper-review-a\b.json`)
 			},
 			include: []string{"app.go"}, exclude: []string{`.looper-review-a\b.json`},
@@ -76,7 +78,7 @@ func TestGatewayReservedReviewerScratchEdges(t *testing.T) {
 				writeFile(t, filepath.Join(wt, ".looper-review-a\nb.json"), "{}\n")
 			},
 			wantClean: &yes, include: []string{"app.go"}, exclude: []string{".looper-review-a\nb.json"},
-			keepOnDisk: []string{".looper-review-a\nb.json"},
+			goneAfterPrepare: []string{".looper-review-a\nb.json"},
 		},
 	})
 }

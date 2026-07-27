@@ -25,7 +25,12 @@ type reservedScratchCase struct {
 	beforeCommit   func(t *testing.T, wt string)
 	include        []string // nil skips Commit
 	exclude        []string
-	keepOnDisk     []string
+	// goneAfterPrepare: reserved basenames that Prepare must relocate out of
+	// the worktree (not merely ignore) so agent-authored commits cannot publish them.
+	goneAfterPrepare []string
+	// keepOnDisk: basenames that must remain in the worktree at end of case
+	// (e.g. Commit unstage-only without Prepare relocate, or recreated in beforeCommit).
+	keepOnDisk []string
 }
 
 func runReservedScratchCases(t *testing.T, cases []reservedScratchCase) {
@@ -86,6 +91,19 @@ func runReservedScratchCases(t *testing.T, cases []reservedScratchCase) {
 				}
 				if prepared.Clean != *tc.wantClean {
 					t.Fatalf("PrepareWorktree().Clean = %v, want %v", prepared.Clean, *tc.wantClean)
+				}
+				for _, rel := range tc.goneAfterPrepare {
+					if _, err := os.Stat(filepath.Join(worktree.WorktreePath, rel)); err == nil {
+						t.Fatalf("PrepareWorktree left reserved scratch %q in worktree; want relocated out", rel)
+					} else if err != nil && !os.IsNotExist(err) {
+						t.Fatalf("stat reserved scratch %q after Prepare: %v", rel, err)
+					}
+					// Case-insensitive FS may preserve a different spelling than rel.
+					if tc.coreIgnoreCase != nil && *tc.coreIgnoreCase {
+						if alt := findCaseFoldedRootFile(t, worktree.WorktreePath, rel); alt != "" {
+							t.Fatalf("PrepareWorktree left case-folded reserved scratch %q in worktree; want relocated out", alt)
+						}
+					}
 				}
 			}
 			if tc.checkExclude {

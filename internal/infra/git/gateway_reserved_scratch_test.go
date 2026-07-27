@@ -1,8 +1,10 @@
 package git
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -52,7 +54,7 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 				writeFile(t, worktreeExcludePath(t, wt), "# stale exclude\n")
 				writeFile(t, filepath.Join(wt, ".looper-review-1048.json"), "{}\n")
 			},
-			wantClean: &yes, checkExclude: true, keepOnDisk: []string{".looper-review-1048.json"},
+			wantClean: &yes, checkExclude: true, goneAfterPrepare: []string{".looper-review-1048.json"},
 		},
 		{
 			name: "prepare_real_dirt_still_dirty", branch: "feature/review-real-dirt",
@@ -60,7 +62,8 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 				writeFile(t, filepath.Join(wt, ".looper-review-1048.json"), "{}\n")
 				writeFile(t, filepath.Join(wt, "partial-fix.go"), "package main\n")
 			},
-			wantClean: &no,
+			// Ordinary dirt keeps Clean=false; reserved scratch is still relocated.
+			wantClean: &no, goneAfterPrepare: []string{".looper-review-1048.json"},
 		},
 		{
 			name: "prepare_nested_lookalike_dirty", branch: "feature/review-nested",
@@ -81,19 +84,19 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 				writeFile(t, filepath.Join(wt, "nested", ".looper-review-1.json"), "{}\n")
 			},
 			wantClean: &yes, include: []string{"app.go", "nested/.looper-review-1.json"},
-			exclude:    []string{".looper-review-1049.json", ".looper-review-.json"},
-			keepOnDisk: []string{".looper-review-1049.json", ".looper-review-.json"},
+			exclude:          []string{".looper-review-1049.json", ".looper-review-.json"},
+			goneAfterPrepare: []string{".looper-review-1049.json", ".looper-review-.json"},
 		},
 		{
-			// Prestaged under negation must unstage in Prepare (retry lifecycle),
-			// then Commit must still keep reserved scratch off HEAD.
+			// Prestaged under negation must unstage + relocate in Prepare (retry
+			// lifecycle), then Commit must still keep reserved scratch off HEAD.
 			name: "prepare_and_commit_unstages_prestaged", branch: "feature/review-prestaged", gitignoreNegate: true,
 			setup: func(t *testing.T, wt string) {
 				writeFile(t, filepath.Join(wt, ".looper-review-1050.json"), "{}\n")
 				runGit(t, wt, "add", "-A", "--", ".looper-review-1050.json")
 			},
 			wantClean: &yes, include: []string{"app.go"}, exclude: []string{".looper-review-1050.json"},
-			keepOnDisk: []string{".looper-review-1050.json"},
+			goneAfterPrepare: []string{".looper-review-1050.json"},
 		},
 		{
 			name: "commit_unstages_despite_rename_detection", branch: "feature/review-rename",
@@ -120,4 +123,77 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 			keepOnDisk: []string{".looper-review-1051.json"},
 		},
 	})
+}
+
+// Reviewer-to-fixer lifecycle: Prepare under .gitignore negation must relocate
+// reserved scratch out of the shared worktree so a subsequent agent-authored
+// `git add -A && git commit` (bypassing Gateway.Commit) cannot publish it.
+func TestGatewayPrepareRelocatesScratchSoAgentAuthoredCommitCannotPublish(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	branch := "feature/review-agent-commit"
+	fixture.createRemoteRepo(t, branch)
+	gateway := fixture.gateway()
+
+	runGit(t, fixture.repoPath, "checkout", branch)
+	writeFile(t, filepath.Join(fixture.repoPath, ".gitignore"), "!/.looper-review-*.json\n")
+	runGit(t, fixture.repoPath, "add", ".gitignore")
+	runGit(t, fixture.repoPath, "commit", "-m", "seed negation for agent-authored commit")
+	runGit(t, fixture.repoPath, "push", "origin", branch)
+	runGit(t, fixture.repoPath, "checkout", "main")
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: branch, BaseBranch: "main", PRNumber: 1060,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	wt := worktree.WorktreePath
+	payload := `{"body":"prior reviewer submission"}` + "\n"
+	scratch := ".looper-review-1060.json"
+	writeFile(t, filepath.Join(wt, scratch), payload)
+	// Prestaged under negation — the hole that used to unstage-in-place then
+	// report clean while leaving the payload for the next agent.
+	runGit(t, wt, "add", "-A", "--", scratch)
+
+	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: wt, Branch: branch})
+	if err != nil {
+		t.Fatalf("PrepareWorktree() error = %v", err)
+	}
+	if !prepared.Clean {
+		t.Fatal("PrepareWorktree().Clean = false, want true after relocating only reserved scratch")
+	}
+	if _, err := os.Stat(filepath.Join(wt, scratch)); !os.IsNotExist(err) {
+		t.Fatalf("reserved scratch still in worktree after Prepare: err=%v", err)
+	}
+	// Payload must be preserved outside the worktree (never deleted).
+	quarantineDir := filepath.Join(filepath.Dir(wt), reservedReviewScratchQuarantineDirName, filepath.Base(wt))
+	entries, err := os.ReadDir(quarantineDir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("expected quarantined payload under %s: err=%v entries=%d", quarantineDir, err, len(entries))
+	}
+	foundPayload := false
+	for _, e := range entries {
+		b, readErr := os.ReadFile(filepath.Join(quarantineDir, e.Name()))
+		if readErr == nil && string(b) == payload {
+			foundPayload = true
+			break
+		}
+	}
+	if !foundPayload {
+		t.Fatalf("quarantine missing original payload bytes under %s", quarantineDir)
+	}
+
+	// Agent-authored publish path (not Gateway.Commit).
+	writeFile(t, filepath.Join(wt, "app.go"), "package main\n")
+	runGit(t, wt, "add", "-A")
+	runGit(t, wt, "commit", "-m", "agent: fix without gateway commit")
+	committed := runGit(t, wt, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD")
+	if strings.Contains(committed, scratch) {
+		t.Fatalf("agent-authored commit published reserved scratch; files = %q", committed)
+	}
+	if !strings.Contains(committed, "app.go") {
+		t.Fatalf("agent-authored commit missing app.go; files = %q", committed)
+	}
 }

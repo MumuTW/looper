@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -719,6 +720,17 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 
 	statusBeforeReset, err := g.readStatus(ctx, input.WorktreePath)
 	if err != nil {
+		// Truncated status fails closed here; leave on-disk payloads untouched so
+		// operators can inspect incomplete classification (never delete).
+		return PrepareWorktreeResult{}, err
+	}
+	// After a complete dirt classification, move reserved scratch outside the
+	// worktree. Reporting clean while leaving the payload in place lets a later
+	// fixer agent run raw `git add -A && git commit` (bypassing Gateway.Commit)
+	// and publish leftover review JSON. Relocate preserves bytes (rename, never
+	// delete) and runs even when ordinary dirt forces Clean=false so the next
+	// prepare after dirt is cleared cannot re-expose the same payload.
+	if err := g.relocateReservedReviewerScratch(ctx, input.WorktreePath); err != nil {
 		return PrepareWorktreeResult{}, err
 	}
 	if len(statusBeforeReset) > 0 {
@@ -737,6 +749,11 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 
 	statusAfterReset, err := g.readStatus(ctx, input.WorktreePath)
 	if err != nil {
+		return PrepareWorktreeResult{}, err
+	}
+	// Untracked files survive reset --hard; relocate again in case any reserved
+	// scratch reappeared or was missed before the reset path.
+	if err := g.relocateReservedReviewerScratch(ctx, input.WorktreePath); err != nil {
 		return PrepareWorktreeResult{}, err
 	}
 	headSHA, err := g.getHeadSHA(ctx, input.WorktreePath)
@@ -821,18 +838,23 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 // PrepareWorktree and Commit both call this unstage first so prestaged reserved
 // paths become untracked; status then drops only "??" / intent-to-add root
 // reserved names; Commit still unstages after git add -A so scratch never
-// lands. Both classifiers use isReservedReviewerScratchPath so Git glob, empty
-// suffix, root-only, and core.ignoreCase rules stay identical. Costs: keep
-// Prepare/Commit unstage + status filter in sync; namespace collisions if a
-// tracked root file uses the reserved pattern (mitigated by unstaging only
-// --diff-filter=A additions, not M/D); Git ignore precedence where tracked
+// lands via Gateway.Commit. PrepareWorktree additionally relocates untracked
+// reserved payloads outside the worktree so agent-authored `git add -A &&
+// git commit` (which bypasses Gateway.Commit) cannot publish leftovers after
+// a clean prepare. Both classifiers use isReservedReviewerScratchPath so Git
+// glob, empty suffix, root-only, and core.ignoreCase rules stay identical.
+// Costs: keep Prepare/Commit unstage + status filter + prepare relocate in
+// sync; namespace collisions if a tracked root file uses the reserved pattern
+// (mitigated by unstaging only --diff-filter=A additions, not M/D, and by
+// never relocating index-tracked paths); Git ignore precedence where tracked
 // .gitignore !/.looper-review-*.json outranks info/exclude (exclude alone is
 // insufficient — that is why classifiers exist); shell capture is still
 // bounded (256 KiB), so this query is pathspec-scoped to the reserved root
 // namespace — ordinary large commits never fail the gate; only a truncated
 // reserved-namespace listing fails closed (pathologically many simultaneous
 // scratch files). Simpler alternatives rejected: exclude-only (broken under
-// negation); delete-on-sight (destroys agent payload); blanket pathspec
+// negation); delete-on-sight (destroys agent payload); leave-in-place after
+// clean prepare (agent-authored commits publish scratch); blanket pathspec
 // exclude on commit (blocks tracked same-name fixtures); unscoped
 // full-addition listing (rejects unrelated large worker/planner/fixer commits).
 //
@@ -887,6 +909,97 @@ func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, w
 	}
 	args := append([]string{"reset", "HEAD", "--"}, paths...)
 	return g.runGit(ctx, worktreePath, nil, args...)
+}
+
+// reservedReviewScratchQuarantineDirName is a sibling directory under the
+// worktree parent (typically the managed worktree root) that holds payloads
+// relocated out of a prepared worktree. It is never a git worktree path.
+const reservedReviewScratchQuarantineDirName = ".looper-reserved-review-scratch"
+
+// relocateReservedReviewerScratch moves untracked root-level reserved reviewer
+// scratch files out of the worktree. Authority permits ignoring and relocating
+// this namespace; it never permits deleting the payload. Tracked same-name
+// fixtures (present in the index/HEAD) are left untouched.
+//
+// Call only after a complete readStatus classification so truncated large
+// listings still fail closed with files left in place for inspection.
+func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreePath string) error {
+	if strings.TrimSpace(worktreePath) == "" {
+		return nil
+	}
+	ignoreCase := g.coreIgnoreCase(ctx, worktreePath)
+	entries, err := os.ReadDir(worktreePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("list worktree for reserved scratch relocate: %w", err)
+	}
+	quarantineRoot := filepath.Join(filepath.Dir(worktreePath), reservedReviewScratchQuarantineDirName, filepath.Base(worktreePath))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !isReservedReviewerScratchPath(name, ignoreCase) {
+			continue
+		}
+		// Never relocate tracked fixtures or other index-present paths that
+		// share the reserved basename pattern.
+		if g.isIndexPathPresent(ctx, worktreePath, name) {
+			continue
+		}
+		src := filepath.Join(worktreePath, name)
+		if err := os.MkdirAll(quarantineRoot, 0o755); err != nil {
+			return fmt.Errorf("create reserved scratch quarantine: %w", err)
+		}
+		// Encode the original basename so newlines/backslashes cannot break
+		// the quarantine path; preserve uniqueness across prepare retries.
+		destName := hex.EncodeToString([]byte(name)) + "." + fmt.Sprintf("%d", g.now().UnixNano())
+		dest := filepath.Join(quarantineRoot, destName)
+		if err := os.Rename(src, dest); err != nil {
+			// Cross-device fallback: copy bytes then remove source only after
+			// the destination is durable (still never drop the payload).
+			if copyErr := copyFileContents(src, dest); copyErr != nil {
+				return fmt.Errorf("relocate reserved scratch %q: rename: %v; copy: %w", name, err, copyErr)
+			}
+			if rmErr := os.Remove(src); rmErr != nil {
+				// Destination holds the payload; surface source cleanup failure.
+				return fmt.Errorf("relocate reserved scratch %q: remove source after copy: %w", name, rmErr)
+			}
+		}
+	}
+	return nil
+}
+
+// isIndexPathPresent reports whether path is known to the index (tracked or
+// staged). Used to avoid relocating tracked reserved-name fixtures.
+func (g *Gateway) isIndexPathPresent(ctx context.Context, worktreePath, path string) bool {
+	// --error-unmatch exits non-zero when the path is not in the index.
+	err := g.runGit(ctx, worktreePath, nil, "ls-files", "--error-unmatch", "-z", "--", ":(literal)"+path)
+	return err == nil
+}
+
+func copyFileContents(src, dest string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dest)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dest)
+		return err
+	}
+	return nil
 }
 
 // coreIgnoreCase reports the repository's effective core.ignoreCase setting.
@@ -1197,8 +1310,9 @@ func (g *Gateway) tryRemoveWorktree(ctx context.Context, repoPath, worktreePath 
 // The list is intentionally conservative — never broad source globs. Patterns
 // only hide untracked matches; tracked modifications remain visible to status.
 // When exclude is overridden, PrepareWorktree/Commit unstage newly-added
-// reserved scratch (without deleting), readStatus ignores only untracked root
-// reserved scratch, and tracked same-name paths still commit.
+// reserved scratch, PrepareWorktree relocates untracked reserved payloads
+// outside the worktree (never deletes), readStatus ignores only untracked root
+// reserved scratch for InspectHead races, and tracked same-name paths still commit.
 var worktreeArtifactExcludePatterns = []string{
 	".pnpm-store/",
 	"node_modules/",
