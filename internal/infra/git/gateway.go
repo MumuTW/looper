@@ -24,8 +24,10 @@ var (
 	missingWorktreeErrorPattern = regexp.MustCompile(`(?i)is not a working tree|does not exist|not found|no such file`)
 	pushConflictErrorPattern    = regexp.MustCompile(`(?i)stale info|non-fast-forward|failed to push|rejected`)
 	// reservedReviewerScratchBaseName matches the root-only namespace reserved for
-	// ephemeral reviewer submit payloads (/.looper-review-*.json).
-	reservedReviewerScratchBaseName = regexp.MustCompile(`^\.looper-review-.+\.json$`)
+	// ephemeral reviewer submit payloads (/.looper-review-*.json). The suffix
+	// after the hyphen uses .* so it matches Git's * wildcard (including empty,
+	// e.g. .looper-review-.json); .+ would leave that name visible dirt.
+	reservedReviewerScratchBaseName = regexp.MustCompile(`^\.looper-review-.*\.json$`)
 )
 
 var fetchRefLockRetryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
@@ -801,6 +803,19 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 // blocking legitimate modifications or deletions of tracked files that share
 // the same basename pattern.
 //
+// Dual classification (with isIgnorableReservedReviewerScratch in readStatus):
+// status drops only "??" root reserved names so PrepareWorktree stays clean;
+// this path drops only newly-added index entries so Commit never lands them.
+// Both must use isReservedReviewerScratchPath so Git glob, empty suffix, and
+// root-only rules stay identical. Costs: keep the two call sites in sync;
+// namespace collisions if a tracked root file uses the reserved pattern
+// (mitigated by unstaging only --diff-filter=A additions, not M/D); Git
+// ignore precedence where tracked .gitignore !/.looper-review-*.json outranks
+// info/exclude (exclude alone is insufficient — that is why classifiers exist).
+// Simpler alternatives rejected: exclude-only (broken under negation);
+// delete-on-sight (destroys agent payload); blanket pathspec exclude on commit
+// (blocks tracked same-name fixtures).
+//
 // --no-renames is required: when a tracked file is deleted and an identical
 // reserved scratch is staged, default rename detection reports R100 so
 // --diff-filter=A would miss the destination. -z avoids core.quotePath
@@ -1322,8 +1337,11 @@ func splitNUL(s string) []string {
 }
 
 // isIgnorableReservedReviewerScratch reports untracked root-level files in the
-// reserved /.looper-review-*.json namespace. Nested lookalikes and any tracked
-// or staged change remain visible dirt.
+// reserved /.looper-review-*.json namespace for dirt inspection. Nested
+// lookalikes and any tracked or staged change remain visible dirt. Paired with
+// unstageReservedReviewerScratchAdditions (index side); both share
+// isReservedReviewerScratchPath — see that function and the Commit unstage
+// comment for trade-offs and failure modes.
 func isIgnorableReservedReviewerScratch(entry statusEntry) bool {
 	if entry.Code != "??" {
 		return false
