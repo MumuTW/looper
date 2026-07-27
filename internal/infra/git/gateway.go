@@ -806,30 +806,42 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 // namespace collisions if a tracked root file uses the reserved pattern
 // (mitigated by unstaging only --diff-filter=A additions, not M/D); Git
 // ignore precedence where tracked .gitignore !/.looper-review-*.json outranks
-// info/exclude (exclude alone is insufficient — that is why classifiers exist).
-// Simpler alternatives rejected: exclude-only (broken under negation);
-// delete-on-sight (destroys agent payload); blanket pathspec exclude on commit
-// (blocks tracked same-name fixtures).
+// info/exclude (exclude alone is insufficient — that is why classifiers exist);
+// shell capture is still bounded (256 KiB), so this query is pathspec-scoped to
+// the reserved root namespace — ordinary large commits never fail the gate;
+// only a truncated reserved-namespace listing fails closed (pathologically many
+// simultaneous scratch files). Simpler alternatives rejected: exclude-only
+// (broken under negation); delete-on-sight (destroys agent payload); blanket
+// pathspec exclude on commit (blocks tracked same-name fixtures); unscoped
+// full-addition listing (rejects unrelated large worker/planner/fixer commits).
 //
 // --no-renames is required: when a tracked file is deleted and an identical
 // reserved scratch is staged, default rename detection reports R100 so
 // --diff-filter=A would miss the destination. -z avoids core.quotePath
-// escaping of non-ASCII reserved basenames. Paths are passed as :(literal)
-// pathspecs so basenames with \, *, ?, [, ] are unstaged as themselves rather
-// than as glob/escape metacharacters (git reset -- <pathspec>...).
+// escaping of non-ASCII reserved basenames. The listing pathspec uses
+// :(glob).looper-review-*.json so only reserved-root candidates are captured
+// (* does not cross /). Paths are then passed as :(literal) pathspecs so
+// basenames with \, *, ?, [, ] are unstaged as themselves rather than as
+// glob/escape metacharacters (git reset -- <pathspec>...).
 func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, worktreePath string) error {
-	result, err := g.runGitResult(ctx, worktreePath, nil, "diff", "--cached", "--name-only", "--diff-filter=A", "--no-renames", "-z")
+	// Scope capture to the reserved root namespace so shell's 256 KiB stdout
+	// bound cannot reject ordinary large commits that never touch scratch.
+	result, err := g.runGitResult(ctx, worktreePath, nil,
+		"diff", "--cached", "--name-only", "--diff-filter=A", "--no-renames", "-z",
+		"--", ":(glob)"+reservedReviewerScratchPrefix+"*"+reservedReviewerScratchSuffix,
+	)
 	if err != nil {
 		return err
 	}
-	// Fail closed: shell capture is bounded (256 KiB). A truncated listing may
-	// omit reserved scratch beyond the prefix, so classifying only the captured
-	// names would leave those entries staged and let Commit publish them.
+	// Fail closed only for the reserved-namespace listing: a truncated capture
+	// may omit scratch beyond the prefix and would otherwise let Commit land it.
 	if result.StdoutTruncated {
-		return fmt.Errorf("staged addition list truncated after %d bytes; refuse incomplete reserved reviewer scratch classification", len(result.Stdout))
+		return fmt.Errorf("reserved reviewer scratch addition list truncated after %d bytes; refuse incomplete classification", len(result.Stdout))
 	}
 	paths := make([]string, 0)
 	for _, path := range splitNUL(result.Stdout) {
+		// Defense in depth: pathspec * is root-only (* does not cross /), but
+		// keep the shared classifier so empty-middle / suffix rules stay one place.
 		if isReservedReviewerScratchPath(path) {
 			// git reset treats args as pathspecs; force literal matching so
 			// reserved basenames with \ * ? [ ] cannot escape or expand.

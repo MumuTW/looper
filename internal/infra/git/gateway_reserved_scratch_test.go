@@ -230,14 +230,25 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 	}
 }
 
-// Real-Git: staged addition names over shell capture (256 KiB) must fail closed
-// so residual reserved scratch past the prefix cannot land in the commit.
-func TestGatewayCommitRejectsTruncatedStagedAdditionListing(t *testing.T) {
+// Real-Git: a large ordinary staged-addition listing (>256 KiB of non-scratch
+// paths) must still Commit successfully. Unstage queries only the reserved root
+// namespace, so shell capture bounds cannot reject unrelated worker/planner/fixer
+// publishes while still keeping reserved scratch off the commit.
+func TestGatewayCommitSucceedsWithLargeNonScratchAdditionListing(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
-	branch := "feature/review-trunc-listing"
+	branch := "feature/review-large-listing"
 	fixture.createRemoteRepo(t, branch)
 	gateway := fixture.gateway()
+
+	// Higher-precedence negation so Commit's git add -A stages reserved scratch;
+	// info/exclude alone would hide it and skip the unstage path under test.
+	runGit(t, fixture.repoPath, "checkout", branch)
+	writeFile(t, filepath.Join(fixture.repoPath, ".gitignore"), "!/.looper-review-*.json\n")
+	runGit(t, fixture.repoPath, "add", ".gitignore")
+	runGit(t, fixture.repoPath, "commit", "-m", "seed negation for large listing")
+	runGit(t, fixture.repoPath, "push", "origin", branch)
+	runGit(t, fixture.repoPath, "checkout", "main")
 
 	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
 		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
@@ -248,8 +259,9 @@ func TestGatewayCommitRejectsTruncatedStagedAdditionListing(t *testing.T) {
 	}
 	wt := worktree.WorktreePath
 	writeFile(t, filepath.Join(wt, "app.go"), "package main\n")
-	writeFile(t, filepath.Join(wt, ".looper-review-trunc.json"), "{}\n")
-	// Long basenames: ~1500 additions exceed defaultMaxOutputBytes of -z --name-only.
+	writeFile(t, filepath.Join(wt, ".looper-review-large.json"), "{}\n")
+	// Long basenames: ~1500 additions exceed defaultMaxOutputBytes of -z --name-only
+	// for an unscoped listing; pathspec-scoped scratch query stays tiny.
 	bulkDir := filepath.Join(wt, "bulk")
 	mustMkdirAll(t, bulkDir)
 	pad := strings.Repeat("x", 180)
@@ -257,30 +269,52 @@ func TestGatewayCommitRejectsTruncatedStagedAdditionListing(t *testing.T) {
 		writeFile(t, filepath.Join(bulkDir, fmt.Sprintf("f%04d_%s.txt", i, pad)), "1\n")
 	}
 	runGit(t, wt, "add", "-A")
-	listing, err := runGitCommand(wt, "diff", "--cached", "--name-only", "--diff-filter=A", "--no-renames", "-z")
+	fullListing, err := runGitCommand(wt, "diff", "--cached", "--name-only", "--diff-filter=A", "--no-renames", "-z")
 	if err != nil {
-		t.Fatalf("diff --cached listing error = %v", err)
+		t.Fatalf("diff --cached full listing error = %v", err)
 	}
-	if len(listing) <= 256*1024 {
-		t.Fatalf("fixture listing is %d bytes; need >256KiB to exercise truncation", len(listing))
+	if len(fullListing) <= 256*1024 {
+		t.Fatalf("fixture full listing is %d bytes; need >256KiB to prove unscoped capture would truncate", len(fullListing))
+	}
+	if !strings.Contains(fullListing, ".looper-review-large.json") {
+		t.Fatalf("fixture full listing missing staged reserved scratch under negation")
+	}
+	scopedListing, err := runGitCommand(wt, "diff", "--cached", "--name-only", "--diff-filter=A", "--no-renames", "-z",
+		"--", ":(glob).looper-review-*.json")
+	if err != nil {
+		t.Fatalf("diff --cached scoped listing error = %v", err)
+	}
+	if len(scopedListing) == 0 || !strings.Contains(scopedListing, ".looper-review-large.json") {
+		t.Fatalf("scoped listing missing reserved scratch; got %q", scopedListing)
+	}
+	if len(scopedListing) > 256*1024 {
+		t.Fatalf("scoped listing unexpectedly huge (%d bytes)", len(scopedListing))
 	}
 
-	_, err = gateway.Commit(ctx, CommitInput{
+	if _, err := gateway.Commit(ctx, CommitInput{
 		RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
-		WorktreePath: wt, Message: "must refuse truncated staged addition list",
-	})
-	if err == nil {
-		t.Fatal("Commit() error = nil, want truncation refusal")
+		WorktreePath: wt, Message: "large non-scratch commit must publish",
+	}); err != nil {
+		t.Fatalf("Commit() error = %v, want success for large non-scratch listing", err)
 	}
-	if !strings.Contains(err.Error(), "staged addition list truncated") {
-		t.Fatalf("Commit() error = %v, want staged addition list truncated", err)
-	}
-	if _, statErr := os.Stat(filepath.Join(wt, ".looper-review-trunc.json")); statErr != nil {
+	if _, statErr := os.Stat(filepath.Join(wt, ".looper-review-large.json")); statErr != nil {
 		t.Fatalf("expected reserved scratch preserved on disk: %v", statErr)
 	}
 	committed := runGit(t, wt, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD")
-	if strings.Contains(committed, ".looper-review-trunc.json") {
+	if strings.Contains(committed, ".looper-review-large.json") {
 		t.Fatalf("HEAD unexpectedly contains reserved scratch; files = %q", committed)
+	}
+	if !strings.Contains(committed, "app.go") {
+		t.Fatalf("HEAD missing app.go; files = %q", committed)
+	}
+	// Sample one bulk path; full 1500-name check is unnecessary.
+	sampleBulk := fmt.Sprintf("bulk/f0000_%s.txt", pad)
+	if !strings.Contains(committed, sampleBulk) {
+		prefix := committed
+		if len(prefix) > 200 {
+			prefix = prefix[:200]
+		}
+		t.Fatalf("HEAD missing bulk sample %q; files prefix = %q", sampleBulk, prefix)
 	}
 }
 
