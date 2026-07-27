@@ -110,14 +110,7 @@ func TestGatewayQuarantineDestinationCollisionSafeUnderFrozenClock(t *testing.T)
 	if len(entries) != 2 {
 		t.Fatalf("quarantine entries = %d, want 2 distinct destinations", len(entries))
 	}
-	found := map[string]bool{}
-	for _, e := range entries {
-		b, readErr := os.ReadFile(filepath.Join(qdir, e.Name()))
-		if readErr != nil {
-			t.Fatalf("ReadFile %s: %v", e.Name(), readErr)
-		}
-		found[string(b)] = true
-	}
+	found := quarantinePayloadBytes(t, qdir)
 	if !found[payload1] || !found[payload2] {
 		t.Fatalf("quarantine payloads = %#v, want both original payloads preserved", found)
 	}
@@ -159,7 +152,8 @@ func TestGatewayCleanupWorktreeRemovesQuarantine(t *testing.T) {
 	}
 }
 
-// Orphan quarantine files older than retention are pruned on the next relocate.
+// Orphan quarantine older than retention is pruned; active worktrees are kept
+// even when their payload mtime is ancient (rename preserves source mtime).
 func TestGatewayPrunesExpiredOrphanQuarantine(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)

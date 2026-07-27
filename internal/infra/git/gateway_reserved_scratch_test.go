@@ -168,21 +168,9 @@ func TestGatewayPrepareRelocatesScratchSoAgentAuthoredCommitCannotPublish(t *tes
 		t.Fatalf("reserved scratch still in worktree after Prepare: err=%v", err)
 	}
 	// Payload must be preserved outside the worktree (never deleted).
-	quarantineDir := filepath.Join(filepath.Dir(wt), reservedReviewScratchQuarantineDirName, filepath.Base(wt))
-	entries, err := os.ReadDir(quarantineDir)
-	if err != nil || len(entries) == 0 {
-		t.Fatalf("expected quarantined payload under %s: err=%v entries=%d", quarantineDir, err, len(entries))
-	}
-	foundPayload := false
-	for _, e := range entries {
-		b, readErr := os.ReadFile(filepath.Join(quarantineDir, e.Name()))
-		if readErr == nil && string(b) == payload {
-			foundPayload = true
-			break
-		}
-	}
-	if !foundPayload {
-		t.Fatalf("quarantine missing original payload bytes under %s", quarantineDir)
+	quarantineDir := ReservedReviewScratchQuarantineDir(wt)
+	if payloads := quarantinePayloadBytes(t, quarantineDir); !payloads[payload] {
+		t.Fatalf("quarantine missing original payload bytes under %s: got %#v", quarantineDir, payloads)
 	}
 
 	// Agent-authored publish path (not Gateway.Commit).

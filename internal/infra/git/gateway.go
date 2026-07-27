@@ -536,6 +536,17 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 		if !missingWorktreeErrorPattern.MatchString(err.Error()) {
 			return err
 		}
+		// The missing-worktree matcher is intentionally broad (Git phrasing
+		// varies) and can also match git-start / CWD failures that contain
+		// "not found" or "no such file" even when remove never ran. Only treat
+		// the worktree as already gone when the path is independently absent.
+		absent, confirmErr := worktreePathAbsent(input.WorktreePath)
+		if confirmErr != nil {
+			return fmt.Errorf("confirm worktree absence after remove: %w", confirmErr)
+		}
+		if !absent {
+			return err
+		}
 	}
 
 	// Terminal cleanup for this worktree's quarantined reviewer payloads. The
@@ -930,20 +941,23 @@ func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, w
 //     ReservedReviewScratchQuarantineDir(W) until that worktree is cleaned.
 //     Operators inspect/recover the JSON there after reviewer failures.
 //   - Terminal cleanup: CleanupWorktree removes that worktree's quarantine
-//     subdirectory after a successful (or already-missing) worktree remove so
-//     recreation cycles do not accumulate forever.
-//   - Bounded retention: relocate opportunistically prunes quarantine entries
-//     older than reservedReviewScratchQuarantineRetention under the sibling
-//     quarantine root, covering abandoned worktrees that never ran cleanup.
-//   - Costs: new sibling directory layout, cleanup coupling, age-based prune
+//     subdirectory after a successful (or independently confirmed missing)
+//     worktree remove so recreation cycles do not accumulate forever.
+//   - Bounded retention: relocate opportunistically prunes only orphan
+//     quarantine subdirs (corresponding worktree path absent) older than
+//     reservedReviewScratchQuarantineRetention. Active worktrees are never
+//     pruned by file mtime — rename preserves source mtime, so age-based
+//     deletion of live payloads would race PrepareWorktree's double relocate.
+//   - Costs: new sibling directory layout, cleanup coupling, orphan-prune
 //     edge cases (clock skew, operators holding copies longer than retention).
 //   - Simpler alternatives rejected: leave-in-place (publish hole); delete on
-//     prepare (destroys recovery); unbounded quarantine (disk growth).
+//     prepare (destroys recovery); unbounded quarantine (disk growth);
+//     mtime-only prune (deletes active old-payload quarantine).
 const reservedReviewScratchQuarantineDirName = ".looper-reserved-review-scratch"
 
 // reservedReviewScratchQuarantineRetention bounds growth for orphaned quarantine
-// entries (abandoned worktrees). Active worktree quarantine is removed on
-// CleanupWorktree instead.
+// entries (abandoned worktrees whose path is gone). Active worktree quarantine
+// is retained until CleanupWorktree, regardless of payload mtime.
 const reservedReviewScratchQuarantineRetention = 7 * 24 * time.Hour
 
 // ReservedReviewScratchQuarantineDir returns the operator-visible directory that
@@ -1044,12 +1058,24 @@ func (g *Gateway) isIndexPathPresent(ctx context.Context, worktreePath, path str
 }
 
 // reserveQuarantineDestination exclusively creates an empty destination file so
-// concurrent/retried prepares with a colliding clock reading cannot clobber a
-// prior payload via os.Rename replace semantics on Unix.
+// concurrent/retried prepares cannot clobber a prior payload via os.Rename
+// replace semantics on Unix.
+//
+// Layout is a short random subdirectory containing the original basename:
+//
+//	{quarantineRoot}/{16-hex}/{basename}
+//
+// Hex-encoding the full basename would double a near-NAME_MAX scratch name past
+// the filesystem component limit (~255) and break Prepare with ENAMETOOLONG.
+// Keeping the original basename under a bounded random dir stays within NAME_MAX
+// whenever the source name was valid in the worktree.
+//
+// now is accepted for call-site stability; destination uniqueness is random-only.
 func reserveQuarantineDestination(quarantineRoot, basename string, now func() time.Time) (string, error) {
-	encoded := hex.EncodeToString([]byte(basename))
-	if now == nil {
-		now = time.Now
+	_ = now
+	base := filepath.Base(basename)
+	if base == "" || base == "." || base == ".." {
+		return "", fmt.Errorf("invalid quarantine basename %q", basename)
 	}
 	var lastErr error
 	for attempt := 0; attempt < 16; attempt++ {
@@ -1057,10 +1083,18 @@ func reserveQuarantineDestination(quarantineRoot, basename string, now func() ti
 		if _, err := rand.Read(randBytes[:]); err != nil {
 			return "", fmt.Errorf("random quarantine suffix: %w", err)
 		}
-		destName := fmt.Sprintf("%s.%d.%s", encoded, now().UnixNano(), hex.EncodeToString(randBytes[:]))
-		dest := filepath.Join(quarantineRoot, destName)
+		destDir := filepath.Join(quarantineRoot, hex.EncodeToString(randBytes[:]))
+		if err := os.Mkdir(destDir, 0o700); err != nil {
+			lastErr = err
+			if os.IsExist(err) {
+				continue
+			}
+			return "", err
+		}
+		dest := filepath.Join(destDir, base)
 		f, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
+			_ = os.Remove(destDir)
 			lastErr = err
 			if os.IsExist(err) {
 				continue
@@ -1069,6 +1103,7 @@ func reserveQuarantineDestination(quarantineRoot, basename string, now func() ti
 		}
 		if err := f.Close(); err != nil {
 			_ = os.Remove(dest)
+			_ = os.Remove(destDir)
 			return "", err
 		}
 		return dest, nil
@@ -1112,32 +1147,85 @@ func removeReservedReviewScratchQuarantineForWorktree(worktreePath string) error
 	return nil
 }
 
-// pruneExpiredReservedReviewScratchQuarantine removes quarantine files older
-// than reservedReviewScratchQuarantineRetention under worktreeRoot's sibling
-// quarantine tree. Best-effort; used to bound growth for abandoned worktrees.
+// pruneExpiredReservedReviewScratchQuarantine removes orphan quarantine
+// subdirectories older than reservedReviewScratchQuarantineRetention under
+// worktreeRoot's sibling quarantine tree. A quarantine subdir is orphan only
+// when the corresponding worktree path under worktreeRoot is absent — never
+// when the worktree is still active, regardless of payload mtime (rename keeps
+// the source mtime). Best-effort; bounds growth for abandoned worktrees.
 func (g *Gateway) pruneExpiredReservedReviewScratchQuarantine(worktreeRoot string) {
 	worktreeRoot = strings.TrimSpace(worktreeRoot)
 	if worktreeRoot == "" {
 		return
 	}
 	root := filepath.Join(worktreeRoot, reservedReviewScratchQuarantineDirName)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
 	cutoff := g.now().Add(-reservedReviewScratchQuarantineRetention)
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d == nil {
+	for _, entry := range entries {
+		name := entry.Name()
+		qPath := filepath.Join(root, name)
+		// Active worktree lifecycle owns its quarantine until CleanupWorktree.
+		wtPath := filepath.Join(worktreeRoot, name)
+		if absent, absErr := worktreePathAbsent(wtPath); absErr != nil || !absent {
+			continue
+		}
+		if !orphanQuarantineExpired(qPath, cutoff) {
+			continue
+		}
+		_ = os.RemoveAll(qPath)
+	}
+	// Best-effort: drop empty quarantine root.
+	if remaining, readErr := os.ReadDir(root); readErr == nil && len(remaining) == 0 {
+		_ = os.Remove(root)
+	}
+}
+
+// orphanQuarantineExpired reports whether every payload file under qPath is
+// older than cutoff (or the empty directory itself is older). Any fresh or
+// unreadable entry keeps the orphan for another retention cycle.
+func orphanQuarantineExpired(qPath string, cutoff time.Time) bool {
+	expired := true
+	sawFile := false
+	_ = filepath.WalkDir(qPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
 			return nil
 		}
-		if d.IsDir() {
-			return nil
-		}
+		sawFile = true
 		info, infoErr := d.Info()
-		if infoErr != nil {
-			return nil
-		}
-		if info.ModTime().Before(cutoff) {
-			_ = os.Remove(path)
+		if infoErr != nil || !info.ModTime().Before(cutoff) {
+			expired = false
 		}
 		return nil
 	})
+	if sawFile {
+		return expired
+	}
+	info, err := os.Stat(qPath)
+	if err != nil {
+		return false
+	}
+	return info.ModTime().Before(cutoff)
+}
+
+// worktreePathAbsent reports whether path does not exist. Non-existence is the
+// only affirmative absence signal; permission and other Stat errors are returned
+// so callers fail closed rather than treating an unreadable path as removed.
+func worktreePathAbsent(path string) (bool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return true, nil
+	}
+	_, err := os.Stat(path)
+	if err == nil {
+		return false, nil
+	}
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	return false, err
 }
 
 // coreIgnoreCase reports the repository's effective core.ignoreCase setting.

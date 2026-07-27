@@ -177,3 +177,28 @@ func worktreeExcludePath(t *testing.T, worktreePath string) string {
 	}
 	return filepath.Join(worktreePath, rel)
 }
+
+// quarantinePayloadBytes walks a worktree quarantine dir (random subdirs holding
+// original basenames) and returns the set of file contents found.
+func quarantinePayloadBytes(t *testing.T, qdir string) map[string]bool {
+	t.Helper()
+	found := map[string]bool{}
+	err := filepath.WalkDir(qdir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d == nil || d.IsDir() {
+			return nil
+		}
+		b, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		found[string(b)] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk quarantine %s: %v", qdir, err)
+	}
+	return found
+}
