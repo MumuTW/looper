@@ -814,7 +814,9 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 // --no-renames is required: when a tracked file is deleted and an identical
 // reserved scratch is staged, default rename detection reports R100 so
 // --diff-filter=A would miss the destination. -z avoids core.quotePath
-// escaping of non-ASCII reserved basenames.
+// escaping of non-ASCII reserved basenames. Paths are passed as :(literal)
+// pathspecs so basenames with \, *, ?, [, ] are unstaged as themselves rather
+// than as glob/escape metacharacters (git reset -- <pathspec>...).
 func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, worktreePath string) error {
 	result, err := g.runGitResult(ctx, worktreePath, nil, "diff", "--cached", "--name-only", "--diff-filter=A", "--no-renames", "-z")
 	if err != nil {
@@ -823,7 +825,9 @@ func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, w
 	paths := make([]string, 0)
 	for _, path := range splitNUL(result.Stdout) {
 		if isReservedReviewerScratchPath(path) {
-			paths = append(paths, path)
+			// git reset treats args as pathspecs; force literal matching so
+			// reserved basenames with \ * ? [ ] cannot escape or expand.
+			paths = append(paths, ":(literal)"+path)
 		}
 	}
 	if len(paths) == 0 {
