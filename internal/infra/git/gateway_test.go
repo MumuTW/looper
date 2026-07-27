@@ -837,9 +837,11 @@ func TestIsReservedReviewerScratchPath(t *testing.T) {
 		{".looper-review-1048.json", true},
 		{".looper-review-.json", true}, // Git * matches empty; classifier must too
 		{".looper-review-\u00e9.json", true},
-		{`".looper-review-1.json"`, true},
+		{".looper-review-a\\b.json", true}, // Unix: backslash is a basename byte
+		{".looper-review-a\nb.json", true}, // Git * matches newline; Go '.' does not
+		{`".looper-review-1.json"`, false}, // -z pathnames are literal; do not dequote
 		{"nested/.looper-review-1.json", false},
-		{`.looper-review-1\json`, false},
+		{`.looper-review-1\json`, false}, // no .json suffix
 		{".looper-review.json", false},
 		{" .looper-review-x.json", false}, // leading whitespace is a different pathname
 		{".looper-review-x.json ", false},
@@ -1015,6 +1017,68 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 			},
 			keepOnDisk: []string{".looper-review-1051.json"},
 		},
+		{
+			// -z pathnames are literal: a root file whose name includes quote
+			// bytes must not be dequoted into the reserved basename.
+			name:            "literal_quote_bytes_not_reserved",
+			branch:          "feature/review-literal-quotes",
+			gitignoreNegate: true,
+			setup: func(t *testing.T, wt string) {
+				name := `".looper-review-q.json"`
+				writeFile(t, filepath.Join(wt, name), `{"body":"quoted-name"}`+"\n")
+				statusZ := runGit(t, wt, "status", "--porcelain", "-z", "--untracked-files=all")
+				if !strings.Contains(statusZ, name) {
+					t.Fatalf("expected -z porcelain to preserve literal quote pathname; status = %q", statusZ)
+				}
+			},
+			prepare: &prepWant{clean: false},
+			commit: &commitWant{
+				include: []string{"app.go", `".looper-review-q.json"`},
+				exclude: []string{},
+			},
+			keepOnDisk: []string{`".looper-review-q.json"`},
+		},
+		{
+			// Unix: backslash is a valid basename byte; Git's * matches it.
+			name:            "backslash_in_suffix_reserved",
+			branch:          "feature/review-backslash-suffix",
+			gitignoreNegate: true,
+			setup: func(t *testing.T, wt string) {
+				name := `.looper-review-a\b.json`
+				writeFile(t, filepath.Join(wt, name), `{"body":"backslash"}`+"\n")
+				// Confirm Git ignore wildcard matches under higher-precedence negation.
+				check := runGit(t, wt, "check-ignore", "-v", "--no-index", "-n", "--", name)
+				if !strings.Contains(check, "/.looper-review-*.json") && !strings.Contains(check, name) {
+					// With negation in .gitignore, check-ignore may report the
+					// negation rule; still require the path to exist as untracked dirt.
+					status := runGit(t, wt, "status", "--porcelain", "-z", "--untracked-files=all")
+					if !strings.Contains(status, name) {
+						t.Fatalf("expected untracked backslash scratch under negation; status = %q check-ignore = %q", status, check)
+					}
+				}
+			},
+			prepare:    &prepWant{clean: true},
+			commit:     &commitWant{include: []string{"app.go"}, exclude: []string{`.looper-review-a\b.json`}},
+			keepOnDisk: []string{`.looper-review-a\b.json`},
+		},
+		{
+			// Git * matches newline in the suffix; classifier must not use
+			// Go regexp '.' which stops at newline.
+			name:            "newline_in_suffix_reserved",
+			branch:          "feature/review-newline-suffix",
+			gitignoreNegate: true,
+			setup: func(t *testing.T, wt string) {
+				name := ".looper-review-a\nb.json"
+				writeFile(t, filepath.Join(wt, name), `{"body":"newline"}`+"\n")
+				statusZ := runGit(t, wt, "status", "--porcelain", "-z", "--untracked-files=all")
+				if !strings.Contains(statusZ, name) {
+					t.Fatalf("expected -z porcelain to preserve newline pathname; status = %q", statusZ)
+				}
+			},
+			prepare:    &prepWant{clean: true},
+			commit:     &commitWant{include: []string{"app.go"}, exclude: []string{".looper-review-a\nb.json"}},
+			keepOnDisk: []string{".looper-review-a\nb.json"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -1093,7 +1157,9 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 				}); err != nil {
 					t.Fatalf("Commit() error = %v", err)
 				}
-				committed := runGit(t, worktree.WorktreePath, "show", "--pretty=format:", "--name-status", "HEAD")
+				// -z keeps pathnames literal (quotes, backslash, newline) so
+				// includes/excludes match the real tree paths, not core.quotePath.
+				committed := runGit(t, worktree.WorktreePath, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD")
 				for _, want := range tc.commit.include {
 					if !strings.Contains(committed, want) {
 						t.Fatalf("Commit() missing %q; files = %q", want, committed)

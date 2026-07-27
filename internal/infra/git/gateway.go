@@ -23,11 +23,6 @@ const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
 var (
 	missingWorktreeErrorPattern = regexp.MustCompile(`(?i)is not a working tree|does not exist|not found|no such file`)
 	pushConflictErrorPattern    = regexp.MustCompile(`(?i)stale info|non-fast-forward|failed to push|rejected`)
-	// reservedReviewerScratchBaseName matches the root-only namespace reserved for
-	// ephemeral reviewer submit payloads (/.looper-review-*.json). The suffix
-	// after the hyphen uses .* so it matches Git's * wildcard (including empty,
-	// e.g. .looper-review-.json); .+ would leave that name visible dirt.
-	reservedReviewerScratchBaseName = regexp.MustCompile(`^\.looper-review-.*\.json$`)
 )
 
 var fetchRefLockRetryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
@@ -1352,23 +1347,37 @@ func isIgnorableReservedReviewerScratch(entry statusEntry) bool {
 	return isReservedReviewerScratchPath(entry.Path)
 }
 
+// reservedReviewerScratchPrefix/Suffix implement Git's root-only
+// /.looper-review-*.json wildcard as literal prefix/suffix checks so the
+// middle * matches any bytes (including empty and newline). Production
+// callers always pass git -z pathnames: every byte is literal — no
+// core.quotePath dequoting.
+const (
+	reservedReviewerScratchPrefix = ".looper-review-"
+	reservedReviewerScratchSuffix = ".json"
+)
+
 func isReservedReviewerScratchPath(path string) bool {
 	// Do not TrimSpace: leading/trailing whitespace is part of a literal
 	// pathname from git -z and is outside the reserved root basename namespace.
 	if path == "" {
 		return false
 	}
-	// Defensive: non -z porcelain may quote unusual names.
-	if len(path) >= 2 && path[0] == '"' && path[len(path)-1] == '"' {
-		path = path[1 : len(path)-1]
-	}
-	// Root-anchored only: any separator means nested (outside reserved namespace).
+	// Root-anchored only: '/' is the repository path separator in git -z
+	// output. On Unix a literal backslash is a valid basename byte (not a
+	// separator) and Git's /.looper-review-*.json wildcard matches it.
 	// Callers that need non-ASCII basenames must pass -z so paths are not
-	// core.quotePath-escaped (backslash octets would fail this check).
-	if strings.Contains(path, "/") || strings.Contains(path, `\`) {
+	// core.quotePath-escaped.
+	if strings.Contains(path, "/") {
 		return false
 	}
-	return reservedReviewerScratchBaseName.MatchString(path)
+	if !strings.HasPrefix(path, reservedReviewerScratchPrefix) ||
+		!strings.HasSuffix(path, reservedReviewerScratchSuffix) {
+		return false
+	}
+	// Prefix and suffix must not overlap; empty middle matches Git * (e.g.
+	// .looper-review-.json).
+	return len(path) >= len(reservedReviewerScratchPrefix)+len(reservedReviewerScratchSuffix)
 }
 
 func (g *Gateway) runGit(ctx context.Context, cwd string, env map[string]string, args ...string) error {
