@@ -272,6 +272,13 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	// Keep common build artifacts (e.g. .pnpm-store/, node_modules/) out of every
 	// loop commit via the worktree-local git exclude file. Best-effort.
 	g.applyWorktreeArtifactExcludes(ctx, worktreePath)
+	// Any CreateWorktree claim invalidates prior fixer ownership so path equality
+	// alone cannot authorize dirty adopt after another runner used this directory.
+	// Fail the claim if the marker cannot be revoked — stale authority is worse
+	// than a retryable create error.
+	if err := worktreesafety.ClearFixerOwnerToken(worktreePath); err != nil {
+		return storage.WorktreeRecord{}, err
+	}
 
 	headSHA, err := g.getHeadSHA(ctx, worktreePath)
 	if err != nil {
@@ -385,6 +392,10 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 						return nil, fmt.Errorf("upsert restored worktree record: %w", err)
 					}
 					g.applyWorktreeArtifactExcludes(ctx, restored.WorktreePath)
+					// Restoring for a new CreateWorktree claim drops prior fixer ownership.
+					if err := worktreesafety.ClearFixerOwnerToken(restored.WorktreePath); err != nil {
+						return nil, err
+					}
 					return &restored, nil
 				}
 				shouldReplace, err := g.shouldReplaceStoredWorktreeOnRestoreMismatch(ctx, stored.WorktreePath, checkoutMode, input.Branch, input.ExpectedWorktreePath)
@@ -488,6 +499,9 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	}
 
 	g.applyWorktreeArtifactExcludes(ctx, record.WorktreePath)
+	if err := worktreesafety.ClearFixerOwnerToken(record.WorktreePath); err != nil {
+		return nil, err
+	}
 	return &record, nil
 }
 
@@ -1276,6 +1290,23 @@ func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
 	}
 
 	return sanitizeBranchName(input.Branch)
+}
+
+// DetachedPRWorktreePath returns the managed shared detached worktree path that
+// CreateWorktree claims for a PR (looper-fix-<project>-pr-<N>-detached).
+// Callers that must read ownership markers before CreateWorktree revokes them
+// should probe this candidate path even when no checkpoint worktree exists.
+func DetachedPRWorktreePath(worktreeRoot, projectID string, prNumber int64) string {
+	worktreeRoot = strings.TrimSpace(worktreeRoot)
+	projectID = strings.TrimSpace(projectID)
+	if worktreeRoot == "" || projectID == "" || prNumber == 0 {
+		return ""
+	}
+	return filepath.Join(worktreeRoot, buildWorktreeDirectoryName(CreateWorktreeInput{
+		ProjectID:    projectID,
+		PRNumber:     prNumber,
+		CheckoutMode: CheckoutModeDetached,
+	}))
 }
 
 func parseGitHubRepoFromRemoteURL(remoteURL string) string {

@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
@@ -6128,6 +6129,100 @@ func TestRunPrepareWorktreeStepFallsBackWhenCheckpointLacksHeadRef(t *testing.T)
 	}
 }
 
+func TestRunPrepareWorktreeStepClearsFixerOwnerTokenWhenReusingPreparedPath(t *testing.T) {
+	t.Parallel()
+
+	// Prepared early return still revokes a race-stamped fixer marker so reviewer
+	// dirt cannot be adopted later. Seed marker after PreparedAt would otherwise
+	// qualify, then clear via the defensive ClearFixerOwnerToken on reuse.
+	// (A marker present before prepared check forces full re-prepare — covered
+	// by TestRunPrepareWorktreeStepRePreparesWhenFixerMarkerPresent.)
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	wtPath := filepath.Join(worktreeRoot, "wt-42")
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "abc123", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", BaseBranch: "main", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != wtPath {
+		t.Fatalf("Worktree = %#v, want reused prepared path", checkpoint.Worktree)
+	}
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != "" {
+		t.Fatalf("ReadFixerOwnerToken() = %q, want empty after prepared reuse", got)
+	}
+}
+
+func TestRunPrepareWorktreeStepRePreparesWhenFixerMarkerPresent(t *testing.T) {
+	t.Parallel()
+
+	// Intervening fixer ownership invalidates PreparedAt reuse; Create/Prepare
+	// reclaim the path and revoke the marker instead of trusting the stale prepare.
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	wtPath := filepath.Join(worktreeRoot, "wt-42")
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	const token = "fixer:loop_x:run_y:must-reprepare"
+	if err := worktreesafety.WriteFixerOwnerToken(wtPath, token); err != nil {
+		t.Fatalf("WriteFixerOwnerToken: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{worktreePath: wtPath}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "abc123", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", BaseBranch: "main", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if len(git.createCalls) == 0 {
+		t.Fatal("expected CreateWorktree reclaim when fixer marker present")
+	}
+	if len(git.prepareCalls) == 0 {
+		t.Fatal("expected PrepareWorktree after fixer-marker invalidation")
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.PreparedAt == "" {
+		t.Fatalf("Worktree = %#v, want re-prepared path", checkpoint.Worktree)
+	}
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != "" {
+		t.Fatalf("ReadFixerOwnerToken() = %q, want empty after reclaim", got)
+	}
+}
+
 func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -10215,6 +10310,10 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 		f.worktreePath = path
 	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
+		return CreateWorktreeResult{}, err
+	}
+	// Match real gateway: any CreateWorktree claim revokes prior fixer ownership.
+	if err := worktreesafety.ClearFixerOwnerToken(path); err != nil {
 		return CreateWorktreeResult{}, err
 	}
 	return CreateWorktreeResult{WorktreePath: path, Branch: input.Branch, HeadSHA: "abc123"}, nil

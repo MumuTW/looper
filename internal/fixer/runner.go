@@ -764,11 +764,24 @@ type checkpointDetail struct {
 }
 
 type checkpointWorktree struct {
-	Path               string `json:"path,omitempty"`
-	Branch             string `json:"branch,omitempty"`
-	HeadSHA            string `json:"headSha,omitempty"`
-	BaseHeadSHA        string `json:"baseHeadSha,omitempty"`
-	PreparedAt         string `json:"preparedAt,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Branch      string `json:"branch,omitempty"`
+	HeadSHA     string `json:"headSha,omitempty"`
+	BaseHeadSHA string `json:"baseHeadSha,omitempty"`
+	PreparedAt  string `json:"preparedAt,omitempty"`
+	// OwnerToken is persisted dual-write ownership state for same-head dirty
+	// adopt: the same value is written to the worktree-private git dir
+	// (looper-fixer-owner) on successful clean prepare. Same-head dirty adopt
+	// reuses the matched token (no rewrite) so marker and checkpoint stay
+	// crash-consistent until the next prepare persists. Adopt requires path
+	// match and on-disk token == this field. Costs: keep checkpoint and disk
+	// copies synchronized; every non-fixer claim of the path (Create/Restore
+	// and prepared-checkpoint reuse) must clear the disk marker and fail if
+	// clear cannot revoke authority; prepare-failure rediscovery must carry
+	// Path+OwnerToken so interrupt leftovers remain adoptable.
+	// Simpler alternatives rejected: path equality alone (cross-runner dirt);
+	// event-only dirty_adopted without a stamp (no durable authority after crash).
+	OwnerToken         string `json:"ownerToken,omitempty"`
 	CleanupAttemptedAt string `json:"cleanupAttemptedAt,omitempty"`
 	CleanedAt          string `json:"cleanedAt,omitempty"`
 }
@@ -2625,8 +2638,64 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 			return checkpoint, nil
 		}
 	}
+	// Interrupted-repair rewind clears PreparedAt while keeping Path. Same-head
+	// adopt (and clean re-stamp) must run before CleanupWorktree so partial
+	// agent output is not force-deleted on repair retries. Dirty non-adopt
+	// stays MI without cleanup (preserve human/cross-head evidence). Prepare
+	// probe failures on an existing checkout (fetch/transport/remote-head)
+	// return without cleanup: the real gateway never reaches the dirt check on
+	// those errors, so force-removing would destroy interrupted-repair edits.
+	// Missing/unregistered paths are not preserve-worthy — fall through to
+	// CreateWorktree so a locally recoverable absence does not burn retries.
 	if shouldRebuildWorktree(checkpoint) && checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.Branch != "" {
-		if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: compactStrings([]string{detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch)})}); err != nil {
+		existingPath := checkpoint.Worktree.Path
+		existingBranch := firstNonEmpty(checkpoint.Worktree.Branch, branch)
+		if !isMissingOrUnusableFixerWorktree(existingPath, nil) {
+			preparedExisting, prepErr := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{
+				RepoPath:        input.Project.RepoPath,
+				WorktreeRoot:    worktreeRoot,
+				WorktreePath:    existingPath,
+				Branch:          existingBranch,
+				ExpectedHeadSHA: detailHeadSHA(checkpoint.Detail),
+			})
+			if prepErr != nil {
+				if !isMissingOrUnusableFixerWorktree(existingPath, prepErr) {
+					// Preserve path + on-disk dirt; outer terminal cleanup also
+					// skips unprepared worktrees (see cleanupFixerWorktreeIfTerminal).
+					return checkpoint, prepErr
+				}
+			} else {
+				if preparedExisting.Clean {
+					return r.finishPreparedWorktree(ctx, input, checkpoint, existingBranch, worktreeRoot, existingPath, preparedExisting.HeadSHA)
+				}
+				createdExisting := CreateWorktreeResult{WorktreePath: existingPath, Branch: existingBranch, HeadSHA: preparedExisting.HeadSHA}
+				if adopted, next, adoptErr := r.tryAdoptDirtyFixerWorktree(ctx, input, checkpoint, existingBranch, worktreeRoot, createdExisting, preparedExisting); adoptErr != nil {
+					return checkpoint, adoptErr
+				} else if adopted {
+					return next, nil
+				}
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
+				return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", existingBranch), kind: FailureManualIntervention}
+			}
+		}
+		// Missing/unusable checkout: best-effort cleanup of stale registration,
+		// then clear empty leftovers / preserve populated ones before CreateWorktree.
+		// Real CleanupWorktree swallows Git's "is not a working tree" without
+		// deleting the directory, so a leftover path would make CreateWorktree fail.
+		// Corrupt private gitdirs can also make `git worktree remove` fail validation;
+		// when the path is already unusable, continue to clear/recreate rather than
+		// stuck-retrying the cleanup error.
+		if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: existingPath, Branch: existingBranch, ProtectedBranches: compactStrings([]string{detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch)})}); err != nil {
+			if localFixerWorktreeCheckoutUsable(existingPath) {
+				return checkpoint, err
+			}
+		}
+		if err := clearUnusableFixerWorktreePath(existingPath); err != nil {
+			if errors.Is(err, errUnusableFixerWorktreePreserved) {
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				return checkpoint, &loopError{message: err.Error(), kind: FailureManualIntervention}
+			}
 			return checkpoint, err
 		}
 	}
@@ -2639,16 +2708,167 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		return checkpoint, err
 	}
 	if !prepared.Clean {
+		// Same-head dirty adopt only with fixer-run ownership (path + owner token
+		// still matching on disk). HEAD equality alone must not authorize adopting
+		// dirt left by a reviewer/worker at the shared PR path.
+		if adopted, next, adoptErr := r.tryAdoptDirtyFixerWorktree(ctx, input, checkpoint, branch, worktreeRoot, created, prepared); adoptErr != nil {
+			return checkpoint, adoptErr
+		} else if adopted {
+			return next, nil
+		}
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
 		return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
 	}
+	return r.finishPreparedWorktree(ctx, input, checkpoint, branch, worktreeRoot, created.WorktreePath, prepared.HeadSHA)
+}
+
+// finishPreparedWorktree stamps durable fixer ownership then records the prepared
+// worktree on the checkpoint. A stamp failure is returned before the agent runs:
+// proceeding with PreparedAt set and an empty OwnerToken would mark the path
+// prepared while later dirty adopt can never satisfy hasFixerWorktreeProvenance.
+func (r *Runner) finishPreparedWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot, worktreePath, headSHA string) (fixerCheckpoint, error) {
 	preparedAt := r.nowISO()
-	checkpoint.Worktree = &checkpointWorktree{Path: created.WorktreePath, Branch: branch, HeadSHA: prepared.HeadSHA, BaseHeadSHA: prepared.HeadSHA, PreparedAt: preparedAt}
+	ownerToken := newFixerWorktreeOwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
+	if err := worktreesafety.WriteFixerOwnerToken(worktreePath, ownerToken); err != nil {
+		return checkpoint, fmt.Errorf("stamp fixer ownership for %s: %w", worktreePath, err)
+	}
+	checkpoint.Worktree = &checkpointWorktree{Path: worktreePath, Branch: branch, HeadSHA: headSHA, BaseHeadSHA: headSHA, PreparedAt: preparedAt, OwnerToken: ownerToken}
 	checkpoint.ensureLifecycle("fixer", branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"), false)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.prepared", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "path": created.WorktreePath, "headSha": nilIfEmpty(prepared.HeadSHA), "preparedAt": preparedAt}})
+	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.prepared", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "path": worktreePath, "headSha": nilIfEmpty(headSHA), "preparedAt": preparedAt}})
 	return checkpoint, nil
+}
+
+// tryAdoptDirtyFixerWorktree adopts a dirty managed fixer worktree when:
+//   - the checkpoint has fixer-run-specific ownership for this path (owner token),
+//   - the on-disk ownership marker still matches (not cleared by another runner),
+//   - local HEAD still matches the expected PR head, and
+//   - the loop is not under human control.
+//
+// PrepareWorktree returns remote HeadSHA when dirty (Clean:false); local HEAD must
+// be read via InspectHead. Returns adopted=false to keep the MI path.
+//
+// Ownership token is reused as-is: hasFixerWorktreeProvenance already matched
+// checkpoint.Worktree.OwnerToken to the on-disk marker. Rewriting a new token
+// here would not be crash-consistent with checkpoint persistence — a terminate
+// after marker write but before the returned checkpoint is saved would leave
+// disk with the new token while the latest checkpoint still has the old one,
+// failing the next retry's provenance check and forcing recoverable dirt into MI.
+func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot string, created CreateWorktreeResult, prepared PrepareWorktreeResult) (bool, fixerCheckpoint, error) {
+	if !hasFixerWorktreeProvenance(checkpoint, created.WorktreePath) {
+		return false, checkpoint, nil
+	}
+	switch input.Loop.Status {
+	case string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusAwaitingHuman):
+		return false, checkpoint, nil
+	}
+	if _, ok := loops.ReadTakeoverResume(input.Loop.MetadataJSON); ok {
+		return false, checkpoint, nil
+	}
+	expectedHead := strings.TrimSpace(detailHeadSHA(checkpoint.Detail))
+	if expectedHead == "" {
+		return false, checkpoint, nil
+	}
+	// prepared.HeadSHA is remote when dirty; require it still matches expected.
+	if remoteHead := strings.TrimSpace(prepared.HeadSHA); remoteHead != "" && remoteHead != expectedHead {
+		return false, checkpoint, nil
+	}
+	local, err := r.git.InspectHead(ctx, InspectHeadInput{
+		RepoPath:     input.Project.RepoPath,
+		WorktreeRoot: worktreeRoot,
+		WorktreePath: created.WorktreePath,
+	})
+	if err != nil {
+		return false, checkpoint, err
+	}
+	if strings.TrimSpace(local.HeadSHA) != expectedHead {
+		return false, checkpoint, nil
+	}
+	preparedAt := r.nowISO()
+	// Keep the already-matched token stable; only refresh PreparedAt for this adopt.
+	ownerToken := strings.TrimSpace(checkpoint.Worktree.OwnerToken)
+	checkpoint.Worktree = &checkpointWorktree{
+		Path:        created.WorktreePath,
+		Branch:      branch,
+		HeadSHA:     expectedHead,
+		BaseHeadSHA: expectedHead,
+		PreparedAt:  preparedAt,
+		OwnerToken:  ownerToken,
+	}
+	checkpoint.ensureLifecycle("fixer", branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"), false)
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	checkpoint.Pause = nil
+	r.appendEvent(ctx, eventInput{
+		eventType:  "fixer.worktree.dirty_adopted",
+		projectID:  input.Project.ID,
+		entityType: "pull_request",
+		entityID:   buildPullRequestTargetID(input.Repo, input.PRNumber),
+		payload: map[string]any{
+			"branch":     branch,
+			"path":       created.WorktreePath,
+			"headSha":    nilIfEmpty(expectedHead),
+			"preparedAt": preparedAt,
+			"mode":       "same_head_dirty_adopt",
+		},
+	})
+	return true, checkpoint, nil
+}
+
+// hasFixerWorktreeProvenance is true when this fixer checkpoint has run-specific
+// ownership of the managed path: path match plus an OwnerToken that still matches
+// the on-disk marker. Path equality alone is insufficient — Create/Restore by
+// reviewer/worker clears the marker so interleaving dirt stays MI.
+func hasFixerWorktreeProvenance(checkpoint fixerCheckpoint, worktreePath string) bool {
+	if checkpoint.Worktree == nil {
+		return false
+	}
+	prior := strings.TrimSpace(checkpoint.Worktree.Path)
+	candidate := strings.TrimSpace(worktreePath)
+	token := strings.TrimSpace(checkpoint.Worktree.OwnerToken)
+	if prior == "" || candidate == "" || token == "" {
+		return false
+	}
+	if !sameManagedWorktreePath(prior, candidate) {
+		return false
+	}
+	diskToken, err := worktreesafety.ReadFixerOwnerToken(candidate)
+	if err != nil {
+		// Unreadable marker is not proven ownership — fail closed for adopt.
+		return false
+	}
+	return diskToken == token
+}
+
+func newFixerWorktreeOwnerToken(loopID, runID, preparedAt string) string {
+	loopID = strings.TrimSpace(loopID)
+	runID = strings.TrimSpace(runID)
+	preparedAt = strings.TrimSpace(preparedAt)
+	if loopID == "" {
+		loopID = "unknown-loop"
+	}
+	if runID == "" {
+		runID = "unknown-run"
+	}
+	if preparedAt == "" {
+		preparedAt = "unknown-time"
+	}
+	return "fixer:" + loopID + ":" + runID + ":" + preparedAt
+}
+
+func sameManagedWorktreePath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	ra, errA := filepath.EvalSymlinks(a)
+	rb, errB := filepath.EvalSymlinks(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return ra == rb
 }
 
 func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -4438,7 +4658,14 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		switch {
 		case restartFromDiscover:
 			startStep = stepDiscoverPR
-			resumedCheckpoint = fixerCheckpoint{ResumePolicy: "replay_step"}
+			// prepare-worktree failures restart discover, but an unprepared path
+			// may still hold interrupted-repair dirt and on-disk ownership. Carry
+			// Path/Branch/OwnerToken so the next prepare can same-head adopt
+			// instead of CreateWorktree-clearing the marker and falling to MI.
+			resumedCheckpoint = fixerCheckpoint{
+				ResumePolicy: "replay_step",
+				Worktree:     preservedWorktreeOwnershipForRediscovery(checkpoint, failedStep),
+			}
 		case resumeFromPrepare:
 			startStep = stepPrepareWorktree
 			resumedCheckpoint = rewindCheckpointForPrepareRetry(checkpoint)
@@ -4455,6 +4682,10 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	if resumed {
 		initialCheckpoint = resumedCheckpoint
 		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
+	} else if restartFromDiscover && resumedCheckpoint.Worktree != nil {
+		// Discover restart is not a mid-pipeline "resume", but prepare-probe
+		// failures still need Path+OwnerToken on the next run's checkpoint.
+		initialCheckpoint.Worktree = resumedCheckpoint.Worktree
 	}
 	initialCheckpoint.Pause = nil
 	initialCheckpoint.RunStartedAt = ""
@@ -5926,6 +6157,12 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 	if checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
 		return
 	}
+	// Unprepared rewind paths (PreparedAt cleared, path kept) may still hold
+	// interrupted-repair dirt that prepare never evaluated. Terminal queue
+	// parking / success cleanup must not force-remove that evidence.
+	if strings.TrimSpace(checkpoint.Worktree.PreparedAt) == "" {
+		return
+	}
 	checkpoint.Worktree.CleanupAttemptedAt = r.nowISO()
 	worktreeRoot, rootErr := fixerWorktreeRoot(project)
 	if rootErr != nil {
@@ -5939,6 +6176,220 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleaned", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch}})
+}
+
+// isMissingOrUnusableFixerWorktree reports whether a checkpoint worktree path
+// cannot be prepared in place and should be recreated. Authority is the local
+// checkout only: path missing/gone, or prepare failed and a non-remote local
+// probe shows the path is not a usable git checkout.
+//
+// Prepare/fetch/ssh stderr must never be treated as proof of local unusability
+// by itself. Remote helpers can emit "fatal: not a git repository" while the
+// managed worktree remains valid; force CleanupWorktree would then destroy
+// interrupted agent dirt. When error text merely *looks* like a local integrity
+// failure, confirm with localFixerWorktreeCheckoutUsable before recreating.
+func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return true
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return true
+		}
+		// Permission/IO errors are not "missing"; let prepare surface them.
+	}
+	if prepErr == nil {
+		// Path present: try prepare in place. Local usability is decided only
+		// after prepare fails (via a non-remote probe, not error text alone).
+		return false
+	}
+	// Path may have vanished during prepare; re-stat the checkout itself.
+	if _, err := os.Stat(path); err != nil {
+		return os.IsNotExist(err)
+	}
+	msg := strings.ToLower(prepErr.Error())
+	// Integrity-looking phrases are necessary but not sufficient: remote
+	// helpers/servers can emit the same text. Do not substring-match generic
+	// existence phrases either — external dependency errors share that wording.
+	// "invalid gitfile format" is Git's distinct message for a .git file that is
+	// not a gitdir: pointer (malformed retained metadata).
+	looksLikeLocalIntegrity := strings.Contains(msg, "not a working tree") ||
+		strings.Contains(msg, "not a git repository") ||
+		strings.Contains(msg, "invalid gitfile format")
+	if !looksLikeLocalIntegrity {
+		return false
+	}
+	// Confirm with a non-remote local probe before force-cleaning.
+	return !localFixerWorktreeCheckoutUsable(path)
+}
+
+// localFixerWorktreeCheckoutUsable reports whether path has local git metadata
+// without contacting remotes. Linked worktrees use a .git file (gitdir pointer);
+// ordinary checkouts use a .git directory. Metadata presence alone is not enough:
+// ordinary repos and the linked common repository need full non-remote integrity
+// (HEAD + objects/ + refs/), and linked private gitdirs need HEAD plus a
+// resolvable usable common repo via commondir. Empty or corrupt metadata makes
+// real Git report "not a git repository", so prepare can recreate instead of
+// retrying forever.
+// A non-empty .git file that is not a gitdir: pointer is also unusable: real Git
+// reports "fatal: invalid gitfile format" and prepare must recreate rather than
+// retry forever on retained broken metadata.
+func localFixerWorktreeCheckoutUsable(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	gitMeta := filepath.Join(path, ".git")
+	info, err := os.Lstat(gitMeta)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		// Ordinary checkout: require full local repository metadata.
+		return localGitRepositoryMetadataUsable(gitMeta)
+	}
+	// Linked worktree or gitfile: .git is a regular file (or symlink to one).
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Stat(gitMeta)
+		if err != nil {
+			return false
+		}
+		if target.IsDir() {
+			return localGitRepositoryMetadataUsable(gitMeta)
+		}
+	}
+	data, err := os.ReadFile(gitMeta)
+	if err != nil {
+		return false
+	}
+	line := strings.TrimSpace(string(data))
+	if line == "" {
+		return false
+	}
+	const prefix = "gitdir:"
+	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+		// Malformed gitfile: real Git rejects non-gitdir: content as
+		// "invalid gitfile format". Treat as unusable so prepare can recreate.
+		return false
+	}
+	gitdir := strings.TrimSpace(line[len(prefix):])
+	if gitdir == "" {
+		return false
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(path, gitdir)
+	}
+	// Linked private gitdir must look like a real git dir (HEAD), not merely exist.
+	// An empty/corrupt gitdir still makes `git` report "not a git repository"; if
+	// we only checked existence, prepare would retry forever without recreating.
+	if _, err = os.Stat(filepath.Join(gitdir, "HEAD")); err != nil {
+		return false
+	}
+	// commondir is required for linked worktrees: without it (or when it does not
+	// resolve to a common repo with full local integrity), Git 2.43+ still fails
+	// with "fatal: not a git repository" even though private HEAD remains.
+	return linkedPrivateGitdirCommonUsable(gitdir)
+}
+
+// localGitRepositoryMetadataUsable is a non-remote integrity probe for a Git
+// repository directory (ordinary .git or a linked worktree common repo).
+// HEAD alone is insufficient: Git 2.43+ also requires objects/ and refs/ and
+// reports "fatal: not a git repository" when either directory is missing.
+func localGitRepositoryMetadataUsable(dir string) bool {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil {
+		return false
+	}
+	objects, err := os.Stat(filepath.Join(dir, "objects"))
+	if err != nil || !objects.IsDir() {
+		return false
+	}
+	refs, err := os.Stat(filepath.Join(dir, "refs"))
+	if err != nil || !refs.IsDir() {
+		return false
+	}
+	return true
+}
+
+// linkedPrivateGitdirCommonUsable reports whether a linked worktree private
+// gitdir has a readable commondir that resolves to a common repository with
+// non-remote integrity (HEAD + objects/ + refs/).
+func linkedPrivateGitdirCommonUsable(gitdir string) bool {
+	data, err := os.ReadFile(filepath.Join(gitdir, "commondir"))
+	if err != nil {
+		return false
+	}
+	common := strings.TrimSpace(string(data))
+	if common == "" {
+		return false
+	}
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(gitdir, common)
+	}
+	common = filepath.Clean(common)
+	return localGitRepositoryMetadataUsable(common)
+}
+
+// errUnusableFixerWorktreePreserved signals that an unusable worktree path still
+// holds content after CleanupWorktree and must not be recreated over.
+var errUnusableFixerWorktreePreserved = errors.New("unusable fixer worktree path preserved")
+
+// clearUnusableFixerWorktreePath handles filesystem leftovers after CleanupWorktree
+// on a missing/unusable checkout. Git's `worktree remove --force` only removes
+// registered worktrees; unregistered directories are left intact, which then
+// blocks CreateWorktree when the managed path already exists.
+//
+// Policy: remove empty directories (safe stale), and remove directories whose only
+// content is unusable local git metadata (corrupt/empty linked .git) so Create
+// can reuse the managed path. Preserve any other populated path for manual
+// intervention (may hold interrupted agent output even without a usable .git).
+func clearUnusableFixerWorktreePath(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, errUnusableFixerWorktreePreserved)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	// Only corrupt/empty git metadata: safe to remove so prepare can recreate.
+	if onlyUnusableLocalGitMetadata(path, entries) {
+		if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, errUnusableFixerWorktreePreserved)
+}
+
+// onlyUnusableLocalGitMetadata is true when path holds nothing but a non-usable
+// .git file/dir (and optional nested empties under an ordinary .git dir). Any
+// other entry is treated as possible agent dirt and must be preserved.
+func onlyUnusableLocalGitMetadata(path string, entries []os.DirEntry) bool {
+	if len(entries) != 1 || entries[0].Name() != ".git" {
+		return false
+	}
+	return !localFixerWorktreeCheckoutUsable(path)
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
@@ -7188,6 +7639,34 @@ func rewindCheckpointForPrepareRetry(checkpoint fixerCheckpoint) fixerCheckpoint
 	checkpoint.ResolvedComments = nil
 	checkpoint.Recheck = nil
 	return checkpoint
+}
+
+// preservedWorktreeOwnershipForRediscovery keeps fixer ownership across a
+// prepare-worktree failure that restarts from discover. Only unprepared paths
+// with a non-empty owner token are carried — prepared worktrees and markerless
+// paths do not need rediscovery ownership for same-head adopt.
+func preservedWorktreeOwnershipForRediscovery(checkpoint fixerCheckpoint, failedStep FixerStep) *checkpointWorktree {
+	if failedStep != stepPrepareWorktree {
+		return nil
+	}
+	if checkpoint.Worktree == nil {
+		return nil
+	}
+	path := strings.TrimSpace(checkpoint.Worktree.Path)
+	token := strings.TrimSpace(checkpoint.Worktree.OwnerToken)
+	if path == "" || token == "" {
+		return nil
+	}
+	// A still-prepared worktree would not re-enter the rebuild/adopt path via
+	// empty PreparedAt; only preserve the unprepared interrupt contract.
+	if strings.TrimSpace(checkpoint.Worktree.PreparedAt) != "" {
+		return nil
+	}
+	return &checkpointWorktree{
+		Path:       path,
+		Branch:     strings.TrimSpace(checkpoint.Worktree.Branch),
+		OwnerToken: token,
+	}
 }
 
 func upsertResolvedComment(items *[]checkpointResolvedComment, next checkpointResolvedComment) {

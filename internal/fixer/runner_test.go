@@ -5745,25 +5745,23 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 func TestRunPrepareWorktreeStepPausesDirtyWorktree(t *testing.T) {
 	t.Parallel()
 
-	runner := New(Options{Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: false}}})
+	// Cross-head dirty without fixer provenance → MI (no InspectHead; ownership gate first).
+	// Local mismatch with provenance is covered by DirtyAdoptEarlyExitGates.
+	git := &fakeGitGateway{
+		createResult:   CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult:  PrepareWorktreeResult{HeadSHA: "base-head", Clean: false},
+		inspectResults: []InspectHeadResult{{HeadSHA: "other-head", HasUncommittedChanges: true}},
+	}
+	runner := New(Options{Git: git})
 	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
 		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
 		Repo:       "acme/looper",
 		PRNumber:   42,
 		Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"}},
 	})
-	if err == nil {
-		t.Fatal("runPrepareWorktreeStep() error = nil, want manual intervention")
-	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) {
-		t.Fatalf("error = %T, want *loopError", err)
-	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
-	}
-	if checkpoint.ResumePolicy != "manual_intervention" {
-		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
+	assertPrepareDirtyManualIntervention(t, checkpoint, err)
+	if len(git.inspectCalls) != 0 {
+		t.Fatalf("len(git.inspectCalls) = %d, want 0 (no provenance)", len(git.inspectCalls))
 	}
 }
 
@@ -6257,6 +6255,9 @@ func (f *fakeGitHubGateway) CompareCommits(_ context.Context, input CompareCommi
 type fakeGitGateway struct {
 	createResult   CreateWorktreeResult
 	prepareResult  PrepareWorktreeResult
+	prepareErr     error
+	prepareErrors  []error // sequential per-call errors; nil entry falls through to prepareErr/result
+	prepareIndex   int
 	inspectResults []InspectHeadResult
 	inspectIndex   int
 	ancestor       map[string]bool
@@ -6299,6 +6300,16 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 
 func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {
 	f.prepareCalls = append(f.prepareCalls, input)
+	if f.prepareIndex < len(f.prepareErrors) {
+		err := f.prepareErrors[f.prepareIndex]
+		f.prepareIndex++
+		if err != nil {
+			return PrepareWorktreeResult{}, err
+		}
+		// nil entry: fall through to success result for this call
+	} else if f.prepareErr != nil {
+		return PrepareWorktreeResult{}, f.prepareErr
+	}
 	result := f.prepareResult
 	if result.HeadSHA == "" {
 		result.HeadSHA = firstNonEmpty(input.ExpectedHeadSHA, "base-head")
