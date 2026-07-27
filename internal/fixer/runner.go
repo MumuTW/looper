@@ -7176,7 +7176,7 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 	}
 	parts = append(parts,
 		"Fix items:\n"+strings.Join(encodedItems, "\n"),
-		"Only perform repair changes for the listed fix items.",
+		fixerRepairScopeInstruction(),
 		"If — and only if — a reviewer's requested change is genuinely unreasonable, incorrect, or would make the code worse, you may decline it: write a JSON file at `.looper/dismiss.json` in the repo root with the shape {\"dismissals\":[{\"reviewer\":\"<their github login>\",\"reason\":\"<a concise, respectful explanation>\"}]} and do NOT make that change — Looper will dismiss that review with your reason. Use this sparingly and only when confident; when in doubt, implement the requested change.",
 	)
 	if instruction := buildFixerReplyExplanationInstruction(fixItems); instruction != "" {
@@ -7204,6 +7204,20 @@ func customInstructionConfig(value *config.Config) config.Config {
 		return cfg
 	}
 	return *value
+}
+
+// fixerRepairScopeInstruction is the repair-scope fragment of the fixer agent
+// prompt. Listed fix items are the primary contract. When the link to a listed
+// item is clear, prefer a complete coherent repair of that root cause over a
+// minimal symptom patch; do not become a free-form refactor agent.
+func fixerRepairScopeInstruction() string {
+	return strings.Join([]string{
+		"Fully address every listed fix item. If a reviewer request should not be implemented, follow the applicable decline instructions below.",
+		"Prefer a coherent, durable repair of the underlying concrete root cause over a narrow symptom patch. When the relationship to a listed item is clear, make the changes needed to restore the affected invariant consistently across its dependency chain; do not minimize the diff if doing so would leave inconsistent behavior, partially updated consumers, or another clearly evidenced instance of the same failure mode.",
+		"Before finishing, inspect the PR diff and the relevant producers, direct usages, consumers, callers, defaults, limits, and assumptions affected by the repair. Follow the behavior through the dependency chain only as far as needed to verify consistency, and add or update focused tests for the repaired behavior. Examples: update consumers of a changed constant/default; align caps, backoff, cadence, or scheduling logic that relies on the same timing assumption; cover affected boundary and failure cases.",
+		"You may fix an unlisted occurrence only when the code provides clear evidence that it has the same concrete root cause or violates the same specific invariant and is in the dependency chain affected by a listed repair.",
+		"Do not fix an independent issue merely because it is nearby, in the same file/module, or might be reported later. Do not perform speculative hardening, broad redesigns, or drive-by refactors, renames, or restyling. If the relationship to a listed item is uncertain, omit the collateral change; if the relationship is clear but the repair breadth is uncertain, prefer the smallest complete, coherent solution over the smallest diff.",
+	}, "\n")
 }
 
 // buildFixerReplyExplanationInstruction returns the prompt fragment that asks
@@ -7239,6 +7253,7 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 			"Before including an entry, re-read the relevant review thread/comment context.",
 			"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
 			"Do not omit any non-native comment-type fix item. Do not use vague explanations like \"looks fine\" or \"no change needed\".",
+			"Create structured `review_thread_replies` entries only for listed comment fix items, never for collateral-only changes. Briefly mention material collateral in the explanation for the listed item it supports.",
 			"Read-only GitHub fetches are allowed for that verification. Do not post replies, resolve threads, submit reviews, edit PR metadata, or perform any other mutating GitHub API action; Looper owns those remote review-state changes after validation and push. Do not invent URLs.",
 		)
 	}
@@ -7247,6 +7262,7 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 			"For EVERY Forgejo native review comment fix item (`source: \"forgejo_review_comment\"`), also include exactly one entry in a top-level `repair_results` array on the final "+agent.CompletionMarker+" JSON line.",
 			"Each `repair_results` entry for a Forgejo native review comment must include: `source` = `forgejo_review_comment`, the exact `providerCommentId`, `action` = `fixed`, `declined`, or `deferred`, a concrete `explanation`, and the exact `observedFingerprint` from the fix item.",
 			"Use Forgejo comment terminology for those entries: decide whether the individual review comment is fixed, declined, or deferred. Do not refer to Forgejo native review comments as threads in `repair_results`.",
+			"Create structured `repair_results` entries only for listed Forgejo native review comment fix items, never for collateral-only changes. Briefly mention material collateral in the explanation for the listed item it supports.",
 		)
 	}
 	return strings.Join(parts, "\n")

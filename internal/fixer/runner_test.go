@@ -110,13 +110,75 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 		"gh api repos/{owner}/{repo}/pulls/{number}/reviews --paginate",
 		"gh api repos/{owner}/{repo}/issues/{number}/comments --paginate",
 		"structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`",
+		"Fully address every listed fix item",
+		"coherent, durable repair of the underlying concrete root cause",
+		"smallest complete, coherent solution over the smallest diff",
+		"clear evidence that it has the same concrete root cause",
+		"Do not perform speculative hardening",
+		"If the relationship to a listed item is uncertain, omit the collateral change",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
 	}
+	if strings.Contains(prompt, "Only perform repair changes for the listed fix items.") {
+		t.Fatalf("prompt still uses the old listed-items-only scope line:\n%s", prompt)
+	}
+	// Non-comment fix items must not activate provider reply protocols.
+	for _, unwanted := range []string{"review_thread_replies", "repair_results"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("non-comment prompt unexpectedly contains %q:\n%s", unwanted, prompt)
+		}
+	}
 	if strings.Contains(prompt, "gh pr diff -- <path>") {
 		t.Fatalf("prompt contains unsupported gh pr diff pathspec instruction:\n%s", prompt)
+	}
+}
+
+func TestFixerRepairScopeInstructionAllowsCollateralWithoutDriveBy(t *testing.T) {
+	t.Parallel()
+
+	got := fixerRepairScopeInstruction()
+	for _, want := range []string{
+		"Fully address every listed fix item",
+		"coherent, durable repair of the underlying concrete root cause",
+		"dependency chain",
+		"smallest complete, coherent solution over the smallest diff",
+		"clear evidence that it has the same concrete root cause",
+		"Do not perform speculative hardening",
+		"If the relationship to a listed item is uncertain, omit the collateral change",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("scope instruction missing %q:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{
+		"Only perform repair changes for the listed fix items.",
+		"review_thread_replies",
+		"repair_results",
+		"change-class",
+		"likely force another review round",
+		"smallest collateral changes that are directly required",
+	} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("scope instruction contains unwanted %q:\n%s", unwanted, got)
+		}
+	}
+}
+
+func TestBuildFixerPromptGitHubCommentMentionsCollateralOnlyInThreadReplies(t *testing.T) {
+	t.Parallel()
+
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	if !strings.Contains(prompt, "review_thread_replies") {
+		t.Fatalf("GitHub comment prompt missing review_thread_replies:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Create structured `review_thread_replies` entries only for listed comment fix items, never for collateral-only changes") {
+		t.Fatalf("GitHub comment prompt missing collateral reporting guidance:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "repair_results") {
+		t.Fatalf("GitHub comment prompt unexpectedly contains repair_results:\n%s", prompt)
 	}
 }
 
