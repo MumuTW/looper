@@ -822,6 +822,12 @@ func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, w
 	if err != nil {
 		return err
 	}
+	// Fail closed: shell capture is bounded (256 KiB). A truncated listing may
+	// omit reserved scratch beyond the prefix, so classifying only the captured
+	// names would leave those entries staged and let Commit publish them.
+	if result.StdoutTruncated {
+		return fmt.Errorf("staged addition list truncated after %d bytes; refuse incomplete reserved reviewer scratch classification", len(result.Stdout))
+	}
 	paths := make([]string, 0)
 	for _, path := range splitNUL(result.Stdout) {
 		if isReservedReviewerScratchPath(path) {
