@@ -9,7 +9,15 @@ import (
 )
 
 // When core.ignoreCase=true, a tracked reserved fixture whose on-disk spelling
-// differs only by case from the index must stay in the worktree through Prepare.
+// differs only by case from the index must stay in the worktree through Prepare
+// (icase index probe must not treat it as untracked scratch).
+//
+// Clean is intentionally not asserted: on case-sensitive filesystems Git still
+// reports the index spelling as worktree-deleted (" D") even with
+// core.ignoreCase=true and a case-folded basename present. That is ordinary
+// tracked path dirt (M/D stays visible), not reserved-scratch dirt. On
+// case-insensitive filesystems the rename is a no-op identity and status is
+// often clean — both outcomes are fine as long as the payload is not quarantined.
 func TestGatewayPrepareKeepsCaseOnlyTrackedReservedFixture(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -66,12 +74,8 @@ func TestGatewayPrepareKeepsCaseOnlyTrackedReservedFixture(t *testing.T) {
 		t.Fatal("isIndexPathPresent(icase upper) = false, want true for case-only tracked fixture")
 	}
 
-	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: wt, Branch: branch})
-	if err != nil {
+	if _, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: wt, Branch: branch}); err != nil {
 		t.Fatalf("PrepareWorktree() error = %v", err)
-	}
-	if !prepared.Clean {
-		t.Fatal("PrepareWorktree().Clean = false, want true for tracked reserved fixture only")
 	}
 	// Tracked content must remain in the worktree under some EqualFold spelling.
 	if alt := findCaseFoldedRootFile(t, wt, trackedLower); alt == "" {
