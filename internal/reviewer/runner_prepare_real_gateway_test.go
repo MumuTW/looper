@@ -209,7 +209,8 @@ func TestRunPrepareWorktreeStepRealGatewayIgnoresReviewerScratchAfterHeadChange(
 	}
 	// Successful prepare relocates reserved scratch out of the worktree so a
 	// later agent-authored commit cannot publish it; payload is preserved in
-	// the quarantine sibling, never deleted.
+	// the quarantine sibling (prepare never deletes; terminal CleanupWorktree
+	// and orphan retention may delete later under reserved-scratch authority).
 	if _, err := os.Stat(scratchPath); !os.IsNotExist(err) {
 		t.Fatalf("scratch should be relocated out of worktree after successful prepare: err=%v", err)
 	}

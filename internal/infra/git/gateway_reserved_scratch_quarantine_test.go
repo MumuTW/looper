@@ -116,8 +116,12 @@ func TestGatewayQuarantineDestinationCollisionSafeUnderFrozenClock(t *testing.T)
 	}
 }
 
-// CleanupWorktree removes the worktree-scoped quarantine (terminal cleanup).
+// CleanupWorktree deletes the worktree-scoped quarantine under
+// reservedReviewerScratchAuthority rule 3 (terminal deletion after remove).
 func TestGatewayCleanupWorktreeRemovesQuarantine(t *testing.T) {
+	if reservedReviewerScratchAuthority == "" {
+		t.Fatal("reservedReviewerScratchAuthority must name the managed-reviewer contract")
+	}
 	ctx := context.Background()
 	fixture := newFixture(t)
 	branch := "feature/review-quarantine-cleanup"
@@ -152,8 +156,9 @@ func TestGatewayCleanupWorktreeRemovesQuarantine(t *testing.T) {
 	}
 }
 
-// Orphan quarantine older than retention is pruned; active worktrees are kept
-// even when their payload mtime is ancient (rename preserves source mtime).
+// Orphan quarantine older than retention is pruned under
+// reservedReviewerScratchAuthority rule 4; active worktrees are kept even when
+// their payload mtime is ancient (rename preserves source mtime).
 func TestGatewayPrunesExpiredOrphanQuarantine(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)

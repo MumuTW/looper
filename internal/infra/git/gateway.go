@@ -549,9 +549,10 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 		}
 	}
 
-	// Terminal cleanup for this worktree's quarantined reviewer payloads. The
-	// worktree is gone (or was already missing); retain only while the worktree
-	// lifecycle is active so operators can recover mid-flight failures.
+	// Authorized terminal deletion of this worktree's reserved-scratch
+	// quarantine (see reservedReviewerScratchAuthority). Recovery holds only
+	// while the worktree lifecycle is active; once remove succeeded (or the
+	// path was independently confirmed missing), the quarantine may go.
 	if err := removeReservedReviewScratchQuarantineForWorktree(input.WorktreePath); err != nil {
 		return err
 	}
@@ -871,10 +872,12 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 // namespace — ordinary large commits never fail the gate; only a truncated
 // reserved-namespace listing fails closed (pathologically many simultaneous
 // scratch files). Simpler alternatives rejected: exclude-only (broken under
-// negation); delete-on-sight (destroys agent payload); leave-in-place after
-// clean prepare (agent-authored commits publish scratch); blanket pathspec
-// exclude on commit (blocks tracked same-name fixtures); unscoped
-// full-addition listing (rejects unrelated large worker/planner/fixer commits).
+// negation); delete-on-sight during prepare (destroys mid-flight recovery;
+// terminal/orphan deletion is separately authorized — see
+// reservedReviewerScratchAuthority); leave-in-place after clean prepare
+// (agent-authored commits publish scratch); blanket pathspec exclude on commit
+// (blocks tracked same-name fixtures); unscoped full-addition listing
+// (rejects unrelated large worker/planner/fixer commits).
 //
 // --no-renames is required: when a tracked file is deleted and an identical
 // reserved scratch is staged, default rename detection reports R100 so
@@ -929,35 +932,52 @@ func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, w
 	return g.runGit(ctx, worktreePath, nil, args...)
 }
 
+// reservedReviewerScratchAuthority is the managed-reviewer contract for
+// top-level /.looper-review-*.json ephemeral submit scratch.
+//
+// Authority (what Looper may do to this namespace):
+//  1. Ignore: clone-local info/exclude and dual status/index classifiers may
+//     treat untracked reserved root names as non-dirt so Prepare stays clean
+//     and Gateway.Commit never lands the payload.
+//  2. Relocate during prepare: untracked reserved root payloads may be moved
+//     to a sibling quarantine under the worktree parent. Prepare never
+//     deletes the payload bytes (rename/copy-then-remove-source only after the
+//     destination is durable). Tracked same-name fixtures are never relocated.
+//  3. Terminal quarantine deletion: after CleanupWorktree successfully removes
+//     the worktree (or independently confirms the path is already absent),
+//     removeReservedReviewScratchQuarantineForWorktree may delete that
+//     worktree's quarantine subdirectory. Operator recovery is mid-flight only
+//     — while the worktree lifecycle is still active.
+//  4. Orphan retention deletion: pruneExpiredReservedReviewScratchQuarantine
+//     may delete quarantine subdirs whose corresponding worktree path is gone
+//     and whose container age exceeds
+//     reservedReviewScratchQuarantineRetention. Active worktrees are never
+//     pruned by payload mtime (rename preserves source mtime).
+//
+// What authority still forbids: delete-on-sight during prepare; treating
+// arbitrary non-reserved dirt as clean; deleting quarantine while the matching
+// worktree path still exists.
+//
+// Costs: sibling quarantine layout, cleanup coupling, orphan-prune edge cases
+// (clock skew, operators wanting copies longer than retention).
+// Simpler alternatives rejected: leave-in-place after clean prepare (agent
+// git add -A && commit publishes leftovers); delete on prepare (destroys
+// recovery); unbounded quarantine (disk growth); mtime-only prune of active
+// quarantine (races double-relocate).
+const reservedReviewerScratchAuthority = "reserved-reviewer-scratch-v1"
+
 // reservedReviewScratchQuarantineDirName is a sibling directory under the
 // worktree parent (typically the managed worktree root) that holds payloads
 // relocated out of a prepared worktree. It is never a git worktree path.
-//
-// Storage / deletion trade-off for this persisted state:
-//   - Failure prevented: agent-authored `git add -A && git commit` publishing
-//     leftover review JSON after a clean prepare. Prepare relocates bytes out of
-//     the worktree and never deletes them mid-flight.
-//   - Operator recovery surface: payloads for worktree W live at
-//     ReservedReviewScratchQuarantineDir(W) until that worktree is cleaned.
-//     Operators inspect/recover the JSON there after reviewer failures.
-//   - Terminal cleanup: CleanupWorktree removes that worktree's quarantine
-//     subdirectory after a successful (or independently confirmed missing)
-//     worktree remove so recreation cycles do not accumulate forever.
-//   - Bounded retention: relocate opportunistically prunes only orphan
-//     quarantine subdirs (corresponding worktree path absent) older than
-//     reservedReviewScratchQuarantineRetention. Active worktrees are never
-//     pruned by file mtime — rename preserves source mtime, so age-based
-//     deletion of live payloads would race PrepareWorktree's double relocate.
-//   - Costs: new sibling directory layout, cleanup coupling, orphan-prune
-//     edge cases (clock skew, operators holding copies longer than retention).
-//   - Simpler alternatives rejected: leave-in-place (publish hole); delete on
-//     prepare (destroys recovery); unbounded quarantine (disk growth);
-//     mtime-only prune (deletes active old-payload quarantine).
+// Deletion of contents is authorized only under reservedReviewerScratchAuthority
+// rules 3 (terminal CleanupWorktree) and 4 (orphan retention), never during
+// prepare relocate (rule 2).
 const reservedReviewScratchQuarantineDirName = ".looper-reserved-review-scratch"
 
 // reservedReviewScratchQuarantineRetention bounds growth for orphaned quarantine
 // entries (abandoned worktrees whose path is gone). Active worktree quarantine
-// is retained until CleanupWorktree, regardless of payload mtime.
+// is retained until CleanupWorktree, regardless of payload mtime. Deletion of
+// expired orphans is authorized by reservedReviewerScratchAuthority rule 4.
 const reservedReviewScratchQuarantineRetention = 7 * 24 * time.Hour
 
 // ReservedReviewScratchQuarantineDir returns the operator-visible directory that
@@ -972,18 +992,20 @@ func ReservedReviewScratchQuarantineDir(worktreePath string) string {
 }
 
 // relocateReservedReviewerScratch moves untracked root-level reserved reviewer
-// scratch files out of the worktree. Authority permits ignoring and relocating
-// this namespace; it never permits deleting the payload during prepare. Tracked
+// scratch files out of the worktree under reservedReviewerScratchAuthority
+// rule 2: prepare may ignore and relocate this namespace, and never deletes
+// payload bytes mid-flight (rename or durable copy then remove source). Tracked
 // same-name fixtures (present in the index/HEAD) are left untouched.
 //
-// Call only after a complete readStatus classification so truncated large
-// listings still fail closed with files left in place for inspection.
+// Opportunistic orphan prune (rule 4) runs first and is independent of this
+// worktree's relocate. Call only after a complete readStatus classification so
+// truncated large listings still fail closed with files left in place.
 func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreePath string) error {
 	if strings.TrimSpace(worktreePath) == "" {
 		return nil
 	}
-	// Best-effort bound on orphaned quarantine growth; failures must not block
-	// prepare relocation of the current worktree's scratch.
+	// Authorized orphan retention deletion (rule 4); best-effort so prune
+	// failures must not block prepare relocation of the current worktree.
 	g.pruneExpiredReservedReviewScratchQuarantine(filepath.Dir(worktreePath))
 
 	ignoreCase := g.coreIgnoreCase(ctx, worktreePath)
@@ -1139,8 +1161,10 @@ func copyFileOnto(src, dest string) error {
 	return out.Close()
 }
 
-// removeReservedReviewScratchQuarantineForWorktree is terminal cleanup for one
-// worktree's quarantine subdirectory after CleanupWorktree removed the worktree.
+// removeReservedReviewScratchQuarantineForWorktree deletes one worktree's
+// quarantine subdirectory under reservedReviewerScratchAuthority rule 3.
+// Call only after CleanupWorktree has removed the worktree or independently
+// confirmed the path is already absent — never while the worktree still exists.
 func removeReservedReviewScratchQuarantineForWorktree(worktreePath string) error {
 	dir := ReservedReviewScratchQuarantineDir(worktreePath)
 	if dir == "" {
@@ -1157,12 +1181,13 @@ func removeReservedReviewScratchQuarantineForWorktree(worktreePath string) error
 	return nil
 }
 
-// pruneExpiredReservedReviewScratchQuarantine removes orphan quarantine
+// pruneExpiredReservedReviewScratchQuarantine deletes orphan quarantine
 // subdirectories older than reservedReviewScratchQuarantineRetention under
-// worktreeRoot's sibling quarantine tree. A quarantine subdir is orphan only
-// when the corresponding worktree path under worktreeRoot is absent — never
-// when the worktree is still active, regardless of payload mtime (rename keeps
-// the source mtime). Best-effort; bounds growth for abandoned worktrees.
+// worktreeRoot's sibling quarantine tree (reservedReviewerScratchAuthority
+// rule 4). A quarantine subdir is orphan only when the corresponding worktree
+// path under worktreeRoot is absent — never when the worktree is still active,
+// regardless of payload mtime (rename keeps the source mtime). Best-effort;
+// bounds growth for abandoned worktrees.
 func (g *Gateway) pruneExpiredReservedReviewScratchQuarantine(worktreeRoot string) {
 	worktreeRoot = strings.TrimSpace(worktreeRoot)
 	if worktreeRoot == "" {
@@ -1177,7 +1202,8 @@ func (g *Gateway) pruneExpiredReservedReviewScratchQuarantine(worktreeRoot strin
 	for _, entry := range entries {
 		name := entry.Name()
 		qPath := filepath.Join(root, name)
-		// Active worktree lifecycle owns its quarantine until CleanupWorktree.
+		// Active worktree lifecycle owns its quarantine until CleanupWorktree
+		// (rule 3); rule 4 never deletes while the worktree path exists.
 		wtPath := filepath.Join(worktreeRoot, name)
 		if absent, absErr := worktreePathAbsent(wtPath); absErr != nil || !absent {
 			continue
