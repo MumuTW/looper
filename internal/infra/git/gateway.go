@@ -800,17 +800,18 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 // covers untracked and already-staged ephemeral submit payloads without
 // blocking legitimate modifications or deletions of tracked files that share
 // the same basename pattern.
+//
+// --no-renames is required: when a tracked file is deleted and an identical
+// reserved scratch is staged, default rename detection reports R100 so
+// --diff-filter=A would miss the destination. -z avoids core.quotePath
+// escaping of non-ASCII reserved basenames.
 func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, worktreePath string) error {
-	result, err := g.runGitResult(ctx, worktreePath, nil, "diff", "--cached", "--name-only", "--diff-filter=A")
+	result, err := g.runGitResult(ctx, worktreePath, nil, "diff", "--cached", "--name-only", "--diff-filter=A", "--no-renames", "-z")
 	if err != nil {
 		return err
 	}
 	paths := make([]string, 0)
-	for _, line := range strings.Split(result.Stdout, "\n") {
-		path := strings.TrimSpace(strings.TrimRight(line, "\r"))
-		if path == "" {
-			continue
-		}
+	for _, path := range splitNUL(result.Stdout) {
 		if isReservedReviewerScratchPath(path) {
 			paths = append(paths, path)
 		}
@@ -1246,24 +1247,16 @@ type statusEntry struct {
 }
 
 func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntry, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
+	// -z: NUL-terminated, unquoted paths so non-ASCII reserved basenames
+	// (e.g. .looper-review-é.json) are not core.quotePath-escaped with
+	// backslashes that would fail the root-only separator check.
+	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "-z", "--untracked-files=all", "--ignored=no")
 	if err != nil {
 		return nil, err
 	}
 
 	entries := []statusEntry{}
-	for _, line := range strings.Split(result.Stdout, "\n") {
-		line = strings.TrimRight(line, "\r")
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		if len(line) < 3 {
-			continue
-		}
-		if line[:2] == "!!" {
-			continue
-		}
-		entry := statusEntry{Code: line[:2], Path: strings.TrimSpace(line[3:])}
+	for _, entry := range parsePorcelainStatusZ(result.Stdout) {
 		// info/exclude is lower precedence than tracked .gitignore. When a repo
 		// re-includes reserved scratch via negation, git still reports it as
 		// untracked; drop only those root-level untracked entries for dirt.
@@ -1273,6 +1266,59 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+// parsePorcelainStatusZ parses git status --porcelain -z output. Rename/copy
+// entries emit destination then origin as consecutive NUL fields.
+func parsePorcelainStatusZ(stdout string) []statusEntry {
+	parts := strings.Split(stdout, "\x00")
+	entries := make([]statusEntry, 0)
+	for i := 0; i < len(parts); {
+		record := parts[i]
+		i++
+		if record == "" {
+			continue
+		}
+		if len(record) < 3 {
+			continue
+		}
+		code := record[:2]
+		if code == "!!" {
+			continue
+		}
+		path := strings.TrimSpace(record[3:])
+		if isRenameOrCopyStatus(code) {
+			// Consume the origin path field that follows destination.
+			if i < len(parts) {
+				i++
+			}
+		}
+		entries = append(entries, statusEntry{Code: code, Path: path})
+	}
+	return entries
+}
+
+func isRenameOrCopyStatus(code string) bool {
+	if len(code) != 2 {
+		return false
+	}
+	return code[0] == 'R' || code[0] == 'C' || code[1] == 'R' || code[1] == 'C'
+}
+
+func splitNUL(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, "\x00")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(strings.TrimRight(part, "\r"))
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
 }
 
 // isIgnorableReservedReviewerScratch reports untracked root-level files in the
@@ -1290,11 +1336,13 @@ func isReservedReviewerScratchPath(path string) bool {
 	if path == "" {
 		return false
 	}
-	// Porcelain may quote unusual names; strip a single surrounding quote pair.
+	// Defensive: non -z porcelain may quote unusual names.
 	if len(path) >= 2 && path[0] == '"' && path[len(path)-1] == '"' {
 		path = path[1 : len(path)-1]
 	}
 	// Root-anchored only: any separator means nested (outside reserved namespace).
+	// Callers that need non-ASCII basenames must pass -z so paths are not
+	// core.quotePath-escaped (backslash octets would fail this check).
 	if strings.Contains(path, "/") || strings.Contains(path, `\`) {
 		return false
 	}

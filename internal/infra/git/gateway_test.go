@@ -1028,6 +1028,144 @@ func TestGatewayCommitUnstagesPreStagedReservedScratch(t *testing.T) {
 	}
 }
 
+// Delete of a tracked file whose contents match reserved scratch is R100 by
+// default; Commit must still unstage the addition via --no-renames classification.
+func TestGatewayCommitUnstagesScratchDespiteRenameDetection(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/review-rename-scratch")
+	gateway := fixture.gateway()
+
+	payload := `{"body":"scratch"}` + "\n"
+	runGit(t, fixture.repoPath, "checkout", "feature/review-rename-scratch")
+	writeFile(t, filepath.Join(fixture.repoPath, ".gitignore"), "!/.looper-review-*.json\n")
+	writeFile(t, filepath.Join(fixture.repoPath, "old.json"), payload)
+	runGit(t, fixture.repoPath, "add", ".gitignore", "old.json")
+	runGit(t, fixture.repoPath, "commit", "-m", "track payload and re-include reserved scratch")
+	runGit(t, fixture.repoPath, "push", "origin", "feature/review-rename-scratch")
+	runGit(t, fixture.repoPath, "checkout", "main")
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/review-rename-scratch",
+		BaseBranch:   "main",
+		PRNumber:     1052,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(worktree.WorktreePath, "old.json")); err != nil {
+		t.Fatalf("Remove old.json: %v", err)
+	}
+	scratchPath := filepath.Join(worktree.WorktreePath, ".looper-review-1.json")
+	writeFile(t, scratchPath, payload)
+	writeFile(t, filepath.Join(worktree.WorktreePath, "app.go"), "package main\n")
+	runGit(t, worktree.WorktreePath, "add", "-A")
+	// Stock git reports R100 without --no-renames; A-filter alone would miss scratch.
+	if renameStatus := runGit(t, worktree.WorktreePath, "diff", "--cached", "--name-status"); !strings.Contains(renameStatus, "R100") || !strings.Contains(renameStatus, ".looper-review-1.json") {
+		t.Fatalf("expected staged R100 rename onto reserved scratch; status = %q", renameStatus)
+	}
+	if added := runGit(t, worktree.WorktreePath, "diff", "--cached", "--name-only", "--diff-filter=A"); strings.Contains(added, ".looper-review-1.json") {
+		t.Fatalf("precondition failed: default A-filter should not list rename destination; added = %q", added)
+	}
+
+	if _, err := gateway.Commit(ctx, CommitInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+		Message:      "source change with rename-detected reserved scratch",
+	}); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	committed := runGit(t, worktree.WorktreePath, "show", "--pretty=format:", "--name-status", "HEAD")
+	if !strings.Contains(committed, "app.go") {
+		t.Fatalf("Commit() missing app.go; files = %q", committed)
+	}
+	if !strings.Contains(committed, "old.json") {
+		t.Fatalf("Commit() missing old.json deletion; files = %q", committed)
+	}
+	if strings.Contains(committed, ".looper-review-1.json") {
+		t.Fatalf("Commit() included rename-detected reserved scratch; files = %q", committed)
+	}
+	if _, err := os.Stat(scratchPath); err != nil {
+		t.Fatalf("root scratch should remain uncommitted on disk: %v", err)
+	}
+}
+
+// Non-ASCII reserved basenames are core.quotePath-escaped without -z; prepare
+// and commit must still treat them as root reserved scratch.
+func TestGatewayPrepareAndCommitIgnoreNonASCIIReservedScratch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/review-nonascii-scratch")
+	gateway := fixture.gateway()
+
+	runGit(t, fixture.repoPath, "checkout", "feature/review-nonascii-scratch")
+	writeFile(t, filepath.Join(fixture.repoPath, ".gitignore"), "!/.looper-review-*.json\n")
+	runGit(t, fixture.repoPath, "add", ".gitignore")
+	runGit(t, fixture.repoPath, "commit", "-m", "re-include reserved reviewer scratch")
+	runGit(t, fixture.repoPath, "push", "origin", "feature/review-nonascii-scratch")
+	runGit(t, fixture.repoPath, "checkout", "main")
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/review-nonascii-scratch",
+		BaseBranch:   "main",
+		PRNumber:     1053,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	scratchName := ".looper-review-\u00e9.json"
+	scratchPath := filepath.Join(worktree.WorktreePath, scratchName)
+	writeFile(t, scratchPath, `{"body":"scratch"}`+"\n")
+
+	// Prove default porcelain quotes/escapes the path (the bug class under test).
+	quotedStatus := runGit(t, worktree.WorktreePath, "status", "--porcelain", "--untracked-files=all", "--", scratchName)
+	if !strings.Contains(quotedStatus, `\`) && !strings.Contains(quotedStatus, `"`) {
+		t.Fatalf("expected default porcelain to quote non-ASCII scratch; status = %q", quotedStatus)
+	}
+
+	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "feature/review-nonascii-scratch"})
+	if err != nil {
+		t.Fatalf("PrepareWorktree(non-ASCII scratch) error = %v", err)
+	}
+	if !prepared.Clean {
+		t.Fatal("PrepareWorktree(non-ASCII scratch).Clean = false, want true")
+	}
+	if _, err := os.Stat(scratchPath); err != nil {
+		t.Fatalf("non-ASCII scratch should be preserved: %v", err)
+	}
+
+	writeFile(t, filepath.Join(worktree.WorktreePath, "app.go"), "package main\n")
+	// Pre-stage so Commit's unstage path must classify the NUL path correctly.
+	runGit(t, worktree.WorktreePath, "add", "-A", "--", scratchName)
+	if _, err := gateway.Commit(ctx, CommitInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+		Message:      "source change with non-ASCII reserved scratch",
+	}); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	committed := runGit(t, worktree.WorktreePath, "show", "--pretty=format:", "--name-only", "HEAD")
+	if !strings.Contains(committed, "app.go") {
+		t.Fatalf("Commit() missing app.go; files = %q", committed)
+	}
+	if strings.Contains(committed, scratchName) || strings.Contains(committed, ".looper-review-") {
+		t.Fatalf("Commit() included non-ASCII reserved scratch; files = %q", committed)
+	}
+	if _, err := os.Stat(scratchPath); err != nil {
+		t.Fatalf("non-ASCII scratch should remain uncommitted on disk: %v", err)
+	}
+}
+
 // Tracked root files matching the reserved basename must still commit; exclude
 // only untracked (newly-added) reserved scratch, not every matching path.
 func TestGatewayCommitIncludesTrackedReservedNamedFile(t *testing.T) {
