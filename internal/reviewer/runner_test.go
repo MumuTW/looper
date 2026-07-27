@@ -7975,6 +7975,39 @@ func TestBuildReviewerMinimalPRSeedUsesEnterpriseHost(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPromptIncludesWorktreeHygieneContract(t *testing.T) {
+	t.Parallel()
+
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	for _, want := range []string{
+		"Worktree hygiene contract",
+		"/.looper-review-*.json",
+		"OS temp directory outside the worktree",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestReviewerDirtyWorktreeMessageIncludesRecoveryHints(t *testing.T) {
+	t.Parallel()
+
+	msg := reviewerDirtyWorktreeMessage("pr-1048-head", "/tmp/wt")
+	for _, want := range []string{
+		"worktree is dirty",
+		"manual intervention required",
+		"/tmp/wt",
+		"git -C \"/tmp/wt\" status --short",
+		"looper retry <seq>",
+		"--discard-worktree-changes --confirm",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message missing %q: %s", want, msg)
+		}
+	}
+}
+
 func TestBuildReviewPromptKeepsCommentCleanPolicyWithoutApproveInstruction(t *testing.T) {
 	t.Parallel()
 

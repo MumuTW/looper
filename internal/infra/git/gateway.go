@@ -694,6 +694,10 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 		return PrepareWorktreeResult{}, &RemoteHeadChangedError{Branch: errorRef, ExpectedHeadSHA: input.ExpectedHeadSHA, ActualHeadSHA: remoteHeadSHA}
 	}
 
+	// Reconcile managed excludes before cleanliness so upgraded daemons heal
+	// existing worktrees (reserved reviewer scratch, build artifacts) without MI.
+	g.applyWorktreeArtifactExcludes(ctx, input.WorktreePath)
+
 	statusBeforeReset, err := g.readStatus(ctx, input.WorktreePath)
 	if err != nil {
 		return PrepareWorktreeResult{}, err
@@ -1066,12 +1070,16 @@ func (g *Gateway) tryRemoveWorktree(ctx context.Context, repoPath, worktreePath 
 	}
 }
 
-// worktreeArtifactExcludePatterns are common build-artifact directories/files
-// that must never be committed by the agent or by looper's fallback commit. On
-// pnpm/node repos whose .gitignore misses one of these (e.g. .pnpm-store/, a
-// 100MB+ content store), an `git add -A` would otherwise stage it and the push
-// would be rejected. The list is intentionally conservative — only universal
-// build output, never source.
+// worktreeArtifactExcludePatterns are clone-local ignore patterns installed into
+// each managed worktree's info/exclude. They cover:
+//   - universal build output that must never be committed by the agent or by
+//     looper's fallback commit (e.g. .pnpm-store/ on repos whose .gitignore
+//     misses it)
+//   - reserved top-level reviewer submission scratch (/.looper-review-*.json)
+//     so leftover agent payload files do not force dirty manual_intervention
+//
+// The list is intentionally conservative — never broad source globs. Patterns
+// only hide untracked matches; tracked modifications remain visible to status.
 var worktreeArtifactExcludePatterns = []string{
 	".pnpm-store/",
 	"node_modules/",
@@ -1080,14 +1088,16 @@ var worktreeArtifactExcludePatterns = []string{
 	".next/",
 	".cache/",
 	"*.log",
+	// Root-anchored reviewer scratch namespace (ephemeral submit payload only).
+	"/.looper-review-*.json",
 }
 
 const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed; safe to remove)"
 
-// applyWorktreeArtifactExcludes appends looper's build-artifact ignore patterns
-// to the worktree's git exclude file (info/exclude). That file is local to this
-// clone and is never committed, so it cannot alter the repo's tracked files or
-// its .gitignore. The write is idempotent (patterns already present are skipped)
+// applyWorktreeArtifactExcludes appends looper's managed ignore patterns to the
+// worktree's git exclude file (info/exclude). That file is local to this clone
+// and is never committed, so it cannot alter the repo's tracked files or its
+// .gitignore. The write is idempotent (patterns already present are skipped)
 // and best-effort: any failure is swallowed so it never blocks a loop worktree.
 func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePath string) {
 	if strings.TrimSpace(worktreePath) == "" {

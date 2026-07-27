@@ -247,7 +247,7 @@ func TestGatewayWorktreeExcludesBuildArtifactsFromCommits(t *testing.T) {
 		excludePath = filepath.Join(worktree.WorktreePath, excludeRelPath)
 	}
 	excludeContent := readFile(t, excludePath)
-	for _, pattern := range []string{".pnpm-store/", "node_modules/", ".turbo/", "dist/", ".next/", ".cache/", "*.log"} {
+	for _, pattern := range []string{".pnpm-store/", "node_modules/", ".turbo/", "dist/", ".next/", ".cache/", "*.log", "/.looper-review-*.json"} {
 		if !strings.Contains(excludeContent, "\n"+pattern) && !strings.HasPrefix(excludeContent, pattern) {
 			t.Fatalf("info/exclude missing pattern %q; content = %q", pattern, excludeContent)
 		}
@@ -825,6 +825,76 @@ func TestGatewayPrepareWorktreeDetectsRemoteHeadChanges(t *testing.T) {
 	}
 	if remoteHeadErr.ExpectedHeadSHA != prepared.HeadSHA {
 		t.Fatalf("RemoteHeadChangedError.ExpectedHeadSHA = %q, want %q", remoteHeadErr.ExpectedHeadSHA, prepared.HeadSHA)
+	}
+}
+
+// Reserved reviewer scratch must not force dirty prepare, including when an
+// older worktree lacks the exclude pattern until Prepare reconciles it.
+func TestGatewayPrepareWorktreeIgnoresReservedReviewerScratch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/review")
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/review",
+		BaseBranch:   "main",
+		PRNumber:     1048,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	excludeRelPath := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "--git-path", "info/exclude"))
+	excludePath := excludeRelPath
+	if !filepath.IsAbs(excludePath) {
+		excludePath = filepath.Join(worktree.WorktreePath, excludeRelPath)
+	}
+	// Simulate a pre-upgrade worktree that never received the reserved pattern.
+	writeFile(t, excludePath, "# stale exclude without reviewer scratch\n")
+
+	scratchPath := filepath.Join(worktree.WorktreePath, ".looper-review-1048.json")
+	writeFile(t, scratchPath, `{"body":"scratch"}\n`)
+
+	prepared, err := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "feature/review"})
+	if err != nil {
+		t.Fatalf("PrepareWorktree(scratch only) error = %v", err)
+	}
+	if !prepared.Clean {
+		t.Fatal("PrepareWorktree(scratch only).Clean = false, want true")
+	}
+	if _, err := os.Stat(scratchPath); err != nil {
+		t.Fatalf("scratch file should be preserved (ignore, not delete): %v", err)
+	}
+	excludeContent := readFile(t, excludePath)
+	if !strings.Contains(excludeContent, "/.looper-review-*.json") {
+		t.Fatalf("PrepareWorktree did not reconcile reserved exclude; content = %q", excludeContent)
+	}
+
+	writeFile(t, filepath.Join(worktree.WorktreePath, "partial-fix.go"), "package main\n")
+	prepared, err = gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "feature/review"})
+	if err != nil {
+		t.Fatalf("PrepareWorktree(real dirt) error = %v", err)
+	}
+	if prepared.Clean {
+		t.Fatal("PrepareWorktree(real dirt).Clean = true, want false")
+	}
+
+	// Nested lookalike is outside the reserved root-anchored namespace.
+	if err := os.Remove(filepath.Join(worktree.WorktreePath, "partial-fix.go")); err != nil {
+		t.Fatalf("Remove partial-fix.go: %v", err)
+	}
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, "nested"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "nested", ".looper-review-1.json"), "{}\n")
+	prepared, err = gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: worktree.WorktreePath, Branch: "feature/review"})
+	if err != nil {
+		t.Fatalf("PrepareWorktree(nested lookalike) error = %v", err)
+	}
+	if prepared.Clean {
+		t.Fatal("PrepareWorktree(nested lookalike).Clean = true, want false")
 	}
 }
 
