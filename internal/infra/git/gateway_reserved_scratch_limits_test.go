@@ -96,10 +96,80 @@ func TestGatewayCommitSucceedsWithLargeNonScratchAdditionListing(t *testing.T) {
 	}
 }
 
-// Real-Git Prepare contract: when porcelain status exceeds the shell 256 KiB
-// capture and the truncated prefix is only reserved scratch, fail closed rather
-// than filtering to "clean" and letting a later commit publish omitted dirt.
+// Real-Git InspectHead contract: ordinary large dirty worktrees must not hard-
+// fail status classification under the shell's generic 256 KiB default. Worker/
+// planner/fixer reconciliation call InspectHead before fallback commit; ~1500
+// long pathnames exceed that default but fit the dedicated status budget.
+func TestGatewayInspectHeadSucceedsWithLargeOrdinaryStatus(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	branch := "feature/review-status-large-ordinary"
+	fixture.createRemoteRepo(t, branch)
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: branch, BaseBranch: "main", PRNumber: 1049,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	wt := worktree.WorktreePath
+
+	bulkDir := filepath.Join(wt, "bulk")
+	mustMkdirAll(t, bulkDir)
+	pad := strings.Repeat("x", 180)
+	const n = 1500
+	for i := 0; i < n; i++ {
+		writeFile(t, filepath.Join(bulkDir, fmt.Sprintf("f%04d_%s.txt", i, pad)), "1\n")
+	}
+	// One reserved scratch among ordinary dirt must be classified away, not
+	// used as a reason to abort the whole inspection.
+	writeFile(t, filepath.Join(wt, ".looper-review-large-status.json"), "{}\n")
+
+	statusOut, err := runGitCommand(wt, "status", "--porcelain", "-z", "--untracked-files=all", "--ignored=no")
+	if err != nil {
+		t.Fatalf("status fixture error = %v", err)
+	}
+	if len(statusOut) <= 256*1024 {
+		t.Fatalf("fixture status is %d bytes; need >256KiB to prove generic shell default would truncate", len(statusOut))
+	}
+	if len(statusOut) > defaultStatusMaxCapturedBytes {
+		t.Fatalf("fixture status is %d bytes; exceeds status budget %d", len(statusOut), defaultStatusMaxCapturedBytes)
+	}
+
+	headBefore, err := gateway.getHeadSHA(ctx, wt)
+	if err != nil {
+		t.Fatalf("getHeadSHA() error = %v", err)
+	}
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: wt, BaseRef: headBefore})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v, want success for large ordinary dirty status", err)
+	}
+	if !inspect.HasUncommittedChanges {
+		t.Fatal("InspectHead().HasUncommittedChanges = false, want true for ordinary bulk dirt")
+	}
+	// Prepare must also classify complete status (dirty) without truncation error.
+	prepared, prepErr := gateway.PrepareWorktree(ctx, PrepareWorktreeInput{WorktreePath: wt, Branch: branch})
+	if prepErr != nil {
+		t.Fatalf("PrepareWorktree() error = %v, want clean classification (dirty, not truncated)", prepErr)
+	}
+	if prepared.Clean {
+		t.Fatal("PrepareWorktree().Clean = true, want false for ordinary bulk dirt")
+	}
+}
+
+// Real-Git Prepare contract: when status capture is still truncated (budget
+// forced down to the shell default for this test), fail closed rather than
+// filtering a reserved-only prefix to "clean" and letting a later commit
+// publish omitted ordinary dirt.
 func TestGatewayPrepareFailsClosedOnTruncatedStatus(t *testing.T) {
+	// Production uses defaultStatusMaxCapturedBytes so ordinary large dirt
+	// succeeds; pin the low generic shell budget only for this fail-closed proof.
+	prev := statusMaxCapturedBytes
+	statusMaxCapturedBytes = 256 * 1024
+	t.Cleanup(func() { statusMaxCapturedBytes = prev })
+
 	ctx := context.Background()
 	fixture := newFixture(t)
 	branch := "feature/review-status-trunc"

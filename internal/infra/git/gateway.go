@@ -20,9 +20,21 @@ import (
 
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
 
+// defaultStatusMaxCapturedBytes is large enough for ordinary dirty worktrees with
+// thousands of long pathnames. The shell runner's generic 256 KiB default is too
+// small for worker/planner/fixer InspectHead reconciliation (~1500 long paths
+// already truncates), which would fail before fallback commit and again on retry.
+// Match the path-diff budget used for complete local git authority elsewhere.
+const defaultStatusMaxCapturedBytes = 32 * 1024 * 1024
+
 var (
 	missingWorktreeErrorPattern = regexp.MustCompile(`(?i)is not a working tree|does not exist|not found|no such file`)
 	pushConflictErrorPattern    = regexp.MustCompile(`(?i)stale info|non-fast-forward|failed to push|rejected`)
+
+	// statusMaxCapturedBytes is the porcelain status capture budget for dirt
+	// classification. Tests may lower it to prove fail-closed truncation without
+	// multi-MiB fixtures; production keeps defaultStatusMaxCapturedBytes.
+	statusMaxCapturedBytes = defaultStatusMaxCapturedBytes
 )
 
 var fetchRefLockRetryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
@@ -1290,13 +1302,19 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 	// -z: NUL-terminated, unquoted paths so non-ASCII reserved basenames
 	// (e.g. .looper-review-é.json) are not core.quotePath-escaped with
 	// backslashes that would fail the root-only separator check.
-	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "-z", "--untracked-files=all", "--ignored=no")
+	// Capture budget is statusMaxCapturedBytes (32 MiB by default), not the
+	// shell runner's 256 KiB generic default: status is shared by InspectHead,
+	// PrepareWorktree, and WorktreeClean for every role. Ordinary large dirt
+	// must return a complete classification so worker/planner/fixer can fall
+	// back to commit instead of hard-failing before any publish attempt.
+	result, err := g.runGitResultWithMaxCapture(ctx, repoPath, nil, statusMaxCapturedBytes,
+		"status", "--porcelain", "-z", "--untracked-files=all", "--ignored=no")
 	if err != nil {
 		return nil, err
 	}
-	// Fail closed: shell capture is 256 KiB. If truncation drops ordinary dirt
-	// after a prefix of only reserved scratch, filtering would report clean and
-	// a later fallback commit could publish the omitted files.
+	// Fail closed even with the raised budget: if truncation still drops paths
+	// after a reserved-only prefix, filtering would report clean and a later
+	// fallback commit could publish the omitted ordinary dirt.
 	if result.StdoutTruncated {
 		return nil, fmt.Errorf("git status output truncated after %d bytes; refuse incomplete dirt classification", len(result.Stdout))
 	}
@@ -1428,10 +1446,18 @@ func (g *Gateway) runGitWithStartGate(ctx context.Context, cwd string, env map[s
 }
 
 func (g *Gateway) runGitResult(ctx context.Context, cwd string, env map[string]string, args ...string) (shell.Result, error) {
+	return g.runGitResultWithMaxCapture(ctx, cwd, env, 0, args...)
+}
+
+// runGitResultWithMaxCapture runs git with an explicit shell stdout/stderr
+// capture budget. maxCapturedBytes <= 0 leaves the shell package default (256
+// KiB). Status classification uses a higher budget so ordinary large dirt is
+// complete; other git calls keep the generic default.
+func (g *Gateway) runGitResultWithMaxCapture(ctx context.Context, cwd string, env map[string]string, maxCapturedBytes int, args ...string) (shell.Result, error) {
 	var result shell.Result
 	var err error
 	for attempt := 0; ; attempt++ {
-		result, err = g.runGitResultOnce(ctx, cwd, env, args...)
+		result, err = g.runGitResultOnceWithStartGateCapture(ctx, cwd, env, nil, maxCapturedBytes, args...)
 		if err == nil || !isRetryableFetchRefLockRace(args, err) || attempt >= len(fetchRefLockRetryDelays) {
 			return result, err
 		}
@@ -1451,7 +1477,18 @@ func (g *Gateway) runGitResultOnce(ctx context.Context, cwd string, env map[stri
 }
 
 func (g *Gateway) runGitResultOnceWithStartGate(ctx context.Context, cwd string, env map[string]string, startGate func(start func() error) error, args ...string) (shell.Result, error) {
-	result, err := shell.Run(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env, StartGate: startGate})
+	return g.runGitResultOnceWithStartGateCapture(ctx, cwd, env, startGate, 0, args...)
+}
+
+func (g *Gateway) runGitResultOnceWithStartGateCapture(ctx context.Context, cwd string, env map[string]string, startGate func(start func() error) error, maxCapturedBytes int, args ...string) (shell.Result, error) {
+	result, err := shell.Run(ctx, shell.Options{
+		Command:          g.gitPath,
+		Args:             args,
+		CWD:              cwd,
+		Env:              env,
+		StartGate:        startGate,
+		MaxCapturedBytes: maxCapturedBytes,
+	})
 	if err == nil {
 		return result, nil
 	}
