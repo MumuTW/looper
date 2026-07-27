@@ -538,6 +538,13 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 		}
 	}
 
+	// Terminal cleanup for this worktree's quarantined reviewer payloads. The
+	// worktree is gone (or was already missing); retain only while the worktree
+	// lifecycle is active so operators can recover mid-flight failures.
+	if err := removeReservedReviewScratchQuarantineForWorktree(input.WorktreePath); err != nil {
+		return err
+	}
+
 	if g.repos == nil {
 		return nil
 	}
@@ -914,12 +921,46 @@ func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, w
 // reservedReviewScratchQuarantineDirName is a sibling directory under the
 // worktree parent (typically the managed worktree root) that holds payloads
 // relocated out of a prepared worktree. It is never a git worktree path.
+//
+// Storage / deletion trade-off for this persisted state:
+//   - Failure prevented: agent-authored `git add -A && git commit` publishing
+//     leftover review JSON after a clean prepare. Prepare relocates bytes out of
+//     the worktree and never deletes them mid-flight.
+//   - Operator recovery surface: payloads for worktree W live at
+//     ReservedReviewScratchQuarantineDir(W) until that worktree is cleaned.
+//     Operators inspect/recover the JSON there after reviewer failures.
+//   - Terminal cleanup: CleanupWorktree removes that worktree's quarantine
+//     subdirectory after a successful (or already-missing) worktree remove so
+//     recreation cycles do not accumulate forever.
+//   - Bounded retention: relocate opportunistically prunes quarantine entries
+//     older than reservedReviewScratchQuarantineRetention under the sibling
+//     quarantine root, covering abandoned worktrees that never ran cleanup.
+//   - Costs: new sibling directory layout, cleanup coupling, age-based prune
+//     edge cases (clock skew, operators holding copies longer than retention).
+//   - Simpler alternatives rejected: leave-in-place (publish hole); delete on
+//     prepare (destroys recovery); unbounded quarantine (disk growth).
 const reservedReviewScratchQuarantineDirName = ".looper-reserved-review-scratch"
+
+// reservedReviewScratchQuarantineRetention bounds growth for orphaned quarantine
+// entries (abandoned worktrees). Active worktree quarantine is removed on
+// CleanupWorktree instead.
+const reservedReviewScratchQuarantineRetention = 7 * 24 * time.Hour
+
+// ReservedReviewScratchQuarantineDir returns the operator-visible directory that
+// holds relocated reserved reviewer payloads for worktreePath. Empty when the
+// worktree path is blank.
+func ReservedReviewScratchQuarantineDir(worktreePath string) string {
+	worktreePath = strings.TrimSpace(worktreePath)
+	if worktreePath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(worktreePath), reservedReviewScratchQuarantineDirName, filepath.Base(worktreePath))
+}
 
 // relocateReservedReviewerScratch moves untracked root-level reserved reviewer
 // scratch files out of the worktree. Authority permits ignoring and relocating
-// this namespace; it never permits deleting the payload. Tracked same-name
-// fixtures (present in the index/HEAD) are left untouched.
+// this namespace; it never permits deleting the payload during prepare. Tracked
+// same-name fixtures (present in the index/HEAD) are left untouched.
 //
 // Call only after a complete readStatus classification so truncated large
 // listings still fail closed with files left in place for inspection.
@@ -927,6 +968,10 @@ func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreeP
 	if strings.TrimSpace(worktreePath) == "" {
 		return nil
 	}
+	// Best-effort bound on orphaned quarantine growth; failures must not block
+	// prepare relocation of the current worktree's scratch.
+	g.pruneExpiredReservedReviewScratchQuarantine(filepath.Dir(worktreePath))
+
 	ignoreCase := g.coreIgnoreCase(ctx, worktreePath)
 	entries, err := os.ReadDir(worktreePath)
 	if err != nil {
@@ -935,7 +980,7 @@ func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreeP
 		}
 		return fmt.Errorf("list worktree for reserved scratch relocate: %w", err)
 	}
-	quarantineRoot := filepath.Join(filepath.Dir(worktreePath), reservedReviewScratchQuarantineDirName, filepath.Base(worktreePath))
+	quarantineRoot := ReservedReviewScratchQuarantineDir(worktreePath)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -945,22 +990,29 @@ func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreeP
 			continue
 		}
 		// Never relocate tracked fixtures or other index-present paths that
-		// share the reserved basename pattern.
-		if g.isIndexPathPresent(ctx, worktreePath, name) {
+		// share the reserved basename pattern. Operational probe failures
+		// (cancel, corrupt index, git start) must fail before any rename so a
+		// tracked matching file is never treated as scratch.
+		present, err := g.isIndexPathPresent(ctx, worktreePath, name)
+		if err != nil {
+			return fmt.Errorf("probe index for reserved scratch %q: %w", name, err)
+		}
+		if present {
 			continue
 		}
 		src := filepath.Join(worktreePath, name)
 		if err := os.MkdirAll(quarantineRoot, 0o755); err != nil {
 			return fmt.Errorf("create reserved scratch quarantine: %w", err)
 		}
-		// Encode the original basename so newlines/backslashes cannot break
-		// the quarantine path; preserve uniqueness across prepare retries.
-		destName := hex.EncodeToString([]byte(name)) + "." + fmt.Sprintf("%d", g.now().UnixNano())
-		dest := filepath.Join(quarantineRoot, destName)
+		dest, err := reserveQuarantineDestination(quarantineRoot, name, g.now)
+		if err != nil {
+			return fmt.Errorf("reserve reserved scratch quarantine dest for %q: %w", name, err)
+		}
 		if err := os.Rename(src, dest); err != nil {
-			// Cross-device fallback: copy bytes then remove source only after
-			// the destination is durable (still never drop the payload).
-			if copyErr := copyFileContents(src, dest); copyErr != nil {
+			// Cross-device fallback: write bytes onto the reserved destination,
+			// then remove source only after the destination is durable.
+			if copyErr := copyFileOnto(src, dest); copyErr != nil {
+				_ = os.Remove(dest) // free empty/partial reservation; keep src
 				return fmt.Errorf("relocate reserved scratch %q: rename: %v; copy: %w", name, err, copyErr)
 			}
 			if rmErr := os.Remove(src); rmErr != nil {
@@ -974,32 +1026,118 @@ func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreeP
 
 // isIndexPathPresent reports whether path is known to the index (tracked or
 // staged). Used to avoid relocating tracked reserved-name fixtures.
-func (g *Gateway) isIndexPathPresent(ctx context.Context, worktreePath, path string) bool {
-	// --error-unmatch exits non-zero when the path is not in the index.
+//
+// git ls-files --error-unmatch exits 1 when the path is absent from the index;
+// that expected miss is returned as (false, nil). Context cancel, corrupt
+// index, and other operational failures are propagated so callers do not
+// mutate the filesystem under an unknown index state.
+func (g *Gateway) isIndexPathPresent(ctx context.Context, worktreePath, path string) (bool, error) {
 	err := g.runGit(ctx, worktreePath, nil, "ls-files", "--error-unmatch", "-z", "--", ":(literal)"+path)
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	var commandErr *shell.CommandExecutionError
+	if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
-func copyFileContents(src, dest string) error {
+// reserveQuarantineDestination exclusively creates an empty destination file so
+// concurrent/retried prepares with a colliding clock reading cannot clobber a
+// prior payload via os.Rename replace semantics on Unix.
+func reserveQuarantineDestination(quarantineRoot, basename string, now func() time.Time) (string, error) {
+	encoded := hex.EncodeToString([]byte(basename))
+	if now == nil {
+		now = time.Now
+	}
+	var lastErr error
+	for attempt := 0; attempt < 16; attempt++ {
+		var randBytes [8]byte
+		if _, err := rand.Read(randBytes[:]); err != nil {
+			return "", fmt.Errorf("random quarantine suffix: %w", err)
+		}
+		destName := fmt.Sprintf("%s.%d.%s", encoded, now().UnixNano(), hex.EncodeToString(randBytes[:]))
+		dest := filepath.Join(quarantineRoot, destName)
+		f, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			lastErr = err
+			if os.IsExist(err) {
+				continue
+			}
+			return "", err
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(dest)
+			return "", err
+		}
+		return dest, nil
+	}
+	return "", fmt.Errorf("exclusive quarantine dest after retries: %w", lastErr)
+}
+
+func copyFileOnto(src, dest string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	// dest is the exclusively reserved empty file from reserveQuarantineDestination.
+	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		_ = out.Close()
-		_ = os.Remove(dest)
 		return err
 	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(dest)
-		return err
+	return out.Close()
+}
+
+// removeReservedReviewScratchQuarantineForWorktree is terminal cleanup for one
+// worktree's quarantine subdirectory after CleanupWorktree removed the worktree.
+func removeReservedReviewScratchQuarantineForWorktree(worktreePath string) error {
+	dir := ReservedReviewScratchQuarantineDir(worktreePath)
+	if dir == "" {
+		return nil
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("remove reserved scratch quarantine for %q: %w", filepath.Base(worktreePath), err)
+	}
+	// Best-effort: drop empty parent quarantine root.
+	parent := filepath.Dir(dir)
+	if entries, err := os.ReadDir(parent); err == nil && len(entries) == 0 {
+		_ = os.Remove(parent)
 	}
 	return nil
+}
+
+// pruneExpiredReservedReviewScratchQuarantine removes quarantine files older
+// than reservedReviewScratchQuarantineRetention under worktreeRoot's sibling
+// quarantine tree. Best-effort; used to bound growth for abandoned worktrees.
+func (g *Gateway) pruneExpiredReservedReviewScratchQuarantine(worktreeRoot string) {
+	worktreeRoot = strings.TrimSpace(worktreeRoot)
+	if worktreeRoot == "" {
+		return
+	}
+	root := filepath.Join(worktreeRoot, reservedReviewScratchQuarantineDirName)
+	cutoff := g.now().Add(-reservedReviewScratchQuarantineRetention)
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return nil
+		}
+		if info.ModTime().Before(cutoff) {
+			_ = os.Remove(path)
+		}
+		return nil
+	})
 }
 
 // coreIgnoreCase reports the repository's effective core.ignoreCase setting.
