@@ -11,45 +11,55 @@ import (
 func TestIsReservedReviewerScratchPath(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		path string
-		want bool
+		path       string
+		ignoreCase bool
+		want       bool
 	}{
-		{".looper-review-1048.json", true},
-		{".looper-review-.json", true}, // Git * matches empty
-		{".looper-review-\u00e9.json", true},
-		{".looper-review-a\\b.json", true}, // Unix: backslash is a basename byte
-		{".looper-review-a\nb.json", true}, // Git * matches newline; Go '.' does not
-		{`".looper-review-1.json"`, false}, // -z pathnames are literal
-		{"nested/.looper-review-1.json", false},
-		{`.looper-review-1\json`, false},
-		{".looper-review.json", false},
-		{" .looper-review-x.json", false},
-		{".looper-review-x.json ", false},
-		{"app.go", false},
-		{"", false},
+		{path: ".looper-review-1048.json", want: true},
+		{path: ".looper-review-.json", want: true}, // Git * matches empty
+		{path: ".looper-review-\u00e9.json", want: true},
+		{path: ".looper-review-a\\b.json", want: true}, // Unix: backslash is a basename byte
+		{path: ".looper-review-a\nb.json", want: true}, // Git * matches newline; Go '.' does not
+		{path: `".looper-review-1.json"`, want: false}, // -z pathnames are literal
+		{path: "nested/.looper-review-1.json", want: false},
+		{path: `.looper-review-1\json`, want: false},
+		{path: ".looper-review.json", want: false},
+		{path: " .looper-review-x.json", want: false},
+		{path: ".looper-review-x.json ", want: false},
+		{path: "app.go", want: false},
+		{path: "", want: false},
+		// Case folding only when core.ignoreCase is true (Git exclude/pathspec).
+		{path: ".LOOPER-REVIEW-X.JSON", ignoreCase: false, want: false},
+		{path: ".LOOPER-REVIEW-X.JSON", ignoreCase: true, want: true},
+		{path: ".Looper-Review-Mixed.JSON", ignoreCase: true, want: true},
+		{path: "nested/.LOOPER-REVIEW-X.JSON", ignoreCase: true, want: false},
 	}
 	for _, tc := range cases {
-		if got := isReservedReviewerScratchPath(tc.path); got != tc.want {
-			t.Fatalf("isReservedReviewerScratchPath(%q) = %v, want %v", tc.path, got, tc.want)
+		if got := isReservedReviewerScratchPath(tc.path, tc.ignoreCase); got != tc.want {
+			t.Fatalf("isReservedReviewerScratchPath(%q, ignoreCase=%v) = %v, want %v", tc.path, tc.ignoreCase, got, tc.want)
 		}
 	}
 }
 
 // Dual-classifier real-Git contracts for reserved /.looper-review-*.json.
 // Basename edges live in the unit table; cases below cover prepare/exclude,
-// negation, prestaged prepare+commit, rename, tracked M, and literal pathspecs.
+// negation, prestaged/ITA prepare+commit, rename, tracked M, case-folding,
+// and literal pathspecs.
 func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 	type caseSpec struct {
 		name, branch    string
 		gitignoreNegate bool
-		seedFiles       map[string]string
-		setup           func(t *testing.T, wt string)
-		wantClean       *bool // nil skips PrepareWorktree
-		checkExclude    bool
-		beforeCommit    func(t *testing.T, wt string)
-		include         []string // nil skips Commit
-		exclude         []string
-		keepOnDisk      []string
+		// coreIgnoreCase, when non-nil, forces core.ignoreCase on the branch
+		// repo before CreateWorktree (worktrees inherit the shared git dir).
+		coreIgnoreCase *bool
+		seedFiles      map[string]string
+		setup          func(t *testing.T, wt string)
+		wantClean      *bool // nil skips PrepareWorktree
+		checkExclude   bool
+		beforeCommit   func(t *testing.T, wt string)
+		include        []string // nil skips Commit
+		exclude        []string
+		keepOnDisk     []string
 	}
 	yes, no := true, false
 	cases := []caseSpec{
@@ -101,6 +111,50 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 			},
 			wantClean: &yes, include: []string{"app.go"}, exclude: []string{".looper-review-1050.json"},
 			keepOnDisk: []string{".looper-review-1050.json"},
+		},
+		{
+			// git add -N records intent-to-add only; cached diff omits ITA unless
+			// --ita-visible-in-index. Retry must still unstage and treat clean.
+			name: "prepare_and_commit_intent_to_add", branch: "feature/review-ita", gitignoreNegate: true,
+			setup: func(t *testing.T, wt string) {
+				writeFile(t, filepath.Join(wt, ".looper-review-ita.json"), "{}\n")
+				runGit(t, wt, "add", "-N", "--", ".looper-review-ita.json")
+				// Prove fixture: porcelain is " A", not "??".
+				status := runGit(t, wt, "status", "--porcelain", "-z", "--untracked-files=all")
+				if !strings.Contains(status, " A .looper-review-ita.json") && !strings.HasPrefix(status, " A ") {
+					// -z uses " A\x00path" form; accept either record layout.
+					if !strings.Contains(status, " A") || !strings.Contains(status, ".looper-review-ita.json") {
+						t.Fatalf("expected intent-to-add porcelain for fixture; status = %q", status)
+					}
+				}
+			},
+			wantClean: &yes, include: []string{"app.go"}, exclude: []string{".looper-review-ita.json"},
+			keepOnDisk: []string{".looper-review-ita.json"},
+		},
+		{
+			// With core.ignoreCase=true, Git exclude/pathspec fold case; classifiers
+			// and :(glob,icase) must ignore uppercase reserved names under negation.
+			name: "prepare_and_commit_ignore_case", branch: "feature/review-ignore-case",
+			gitignoreNegate: true, coreIgnoreCase: &yes,
+			setup: func(t *testing.T, wt string) {
+				// Use a distinct uppercase basename that folds to the reserved
+				// pattern. On case-insensitive filesystems the on-disk name may
+				// preserve the create-time spelling Git reports via -z.
+				writeFile(t, filepath.Join(wt, ".LOOPER-REVIEW-CASE.JSON"), "{}\n")
+				// Prove Git's exclude folds; negation re-includes it as dirt.
+				if out := runGitMaybe(t, wt, "check-ignore", "-v", ".LOOPER-REVIEW-CASE.JSON"); out == "" {
+					// Negation makes check-ignore exit 1 (not ignored / re-included).
+					// Still require status to see the path as untracked dirt.
+				}
+				status := runGit(t, wt, "status", "--porcelain", "-z", "--untracked-files=all")
+				if !strings.Contains(strings.ToLower(status), ".looper-review-case.json") {
+					t.Fatalf("expected uppercase reserved scratch in status under negation; status = %q", status)
+				}
+			},
+			wantClean: &yes, include: []string{"app.go"},
+			// Match case-insensitively in committed listing ban check below via keepOnDisk.
+			exclude:    []string{".LOOPER-REVIEW-CASE.JSON", ".looper-review-case.json"},
+			keepOnDisk: []string{".LOOPER-REVIEW-CASE.JSON"},
 		},
 		{
 			name: "commit_unstages_despite_rename_detection", branch: "feature/review-rename",
@@ -170,6 +224,13 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 				runGit(t, fixture.repoPath, "commit", "-m", "seed reserved-scratch contract")
 				runGit(t, fixture.repoPath, "push", "origin", tc.branch)
 			}
+			if tc.coreIgnoreCase != nil {
+				val := "false"
+				if *tc.coreIgnoreCase {
+					val = "true"
+				}
+				runGit(t, fixture.repoPath, "config", "core.ignoreCase", val)
+			}
 			runGit(t, fixture.repoPath, "checkout", "main")
 
 			worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
@@ -178,6 +239,15 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 			})
 			if err != nil {
 				t.Fatalf("CreateWorktree() error = %v", err)
+			}
+			if tc.coreIgnoreCase != nil {
+				// Worktree shares the repo object database/config; reaffirm on the
+				// worktree path so Prepare/Commit classifiers observe the flag.
+				val := "false"
+				if *tc.coreIgnoreCase {
+					val = "true"
+				}
+				runGit(t, worktree.WorktreePath, "config", "core.ignoreCase", val)
 			}
 			if tc.setup != nil {
 				tc.setup(t, worktree.WorktreePath)
@@ -223,11 +293,35 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 			}
 			for _, rel := range tc.keepOnDisk {
 				if _, err := os.Stat(filepath.Join(worktree.WorktreePath, rel)); err != nil {
+					// Case-insensitive FS may preserve a different spelling.
+					if tc.coreIgnoreCase != nil && *tc.coreIgnoreCase {
+						if alt := findCaseFoldedRootFile(t, worktree.WorktreePath, rel); alt != "" {
+							continue
+						}
+					}
 					t.Fatalf("expected %q preserved on disk: %v", rel, err)
 				}
 			}
 		})
 	}
+}
+
+// findCaseFoldedRootFile returns an existing root basename that EqualFold-matches
+// wantRel, or "" if none. Used when core.ignoreCase tests run on case-insensitive
+// filesystems that may preserve a different create-time spelling.
+func findCaseFoldedRootFile(t *testing.T, dir, wantRel string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	base := filepath.Base(wantRel)
+	for _, e := range entries {
+		if !e.IsDir() && strings.EqualFold(e.Name(), base) {
+			return e.Name()
+		}
+	}
+	return ""
 }
 
 func worktreeExcludePath(t *testing.T, worktreePath string) string {

@@ -819,36 +819,50 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 //
 // Dual classification (with isIgnorableReservedReviewerScratch in readStatus):
 // PrepareWorktree and Commit both call this unstage first so prestaged reserved
-// paths become untracked; status then drops only "??" root reserved names;
-// Commit still unstages after git add -A so scratch never lands. Both classifiers
-// use isReservedReviewerScratchPath so Git glob, empty suffix, and root-only
-// rules stay identical. Costs: keep Prepare/Commit unstage + status filter in
-// sync; namespace collisions if a tracked root file uses the reserved pattern
-// (mitigated by unstaging only --diff-filter=A additions, not M/D); Git ignore
-// precedence where tracked .gitignore !/.looper-review-*.json outranks
-// info/exclude (exclude alone is insufficient — that is why classifiers exist);
-// shell capture is still bounded (256 KiB), so this query is pathspec-scoped to
-// the reserved root namespace — ordinary large commits never fail the gate;
-// only a truncated reserved-namespace listing fails closed (pathologically many
-// simultaneous scratch files). Simpler alternatives rejected: exclude-only
-// (broken under negation); delete-on-sight (destroys agent payload); blanket
-// pathspec exclude on commit (blocks tracked same-name fixtures); unscoped
+// paths become untracked; status then drops only "??" / intent-to-add root
+// reserved names; Commit still unstages after git add -A so scratch never
+// lands. Both classifiers use isReservedReviewerScratchPath so Git glob, empty
+// suffix, root-only, and core.ignoreCase rules stay identical. Costs: keep
+// Prepare/Commit unstage + status filter in sync; namespace collisions if a
+// tracked root file uses the reserved pattern (mitigated by unstaging only
+// --diff-filter=A additions, not M/D); Git ignore precedence where tracked
+// .gitignore !/.looper-review-*.json outranks info/exclude (exclude alone is
+// insufficient — that is why classifiers exist); shell capture is still
+// bounded (256 KiB), so this query is pathspec-scoped to the reserved root
+// namespace — ordinary large commits never fail the gate; only a truncated
+// reserved-namespace listing fails closed (pathologically many simultaneous
+// scratch files). Simpler alternatives rejected: exclude-only (broken under
+// negation); delete-on-sight (destroys agent payload); blanket pathspec
+// exclude on commit (blocks tracked same-name fixtures); unscoped
 // full-addition listing (rejects unrelated large worker/planner/fixer commits).
 //
 // --no-renames is required: when a tracked file is deleted and an identical
 // reserved scratch is staged, default rename detection reports R100 so
-// --diff-filter=A would miss the destination. -z avoids core.quotePath
-// escaping of non-ASCII reserved basenames. The listing pathspec uses
-// :(glob).looper-review-*.json so only reserved-root candidates are captured
-// (* does not cross /). Paths are then passed as :(literal) pathspecs so
-// basenames with \, *, ?, [, ] are unstaged as themselves rather than as
-// glob/escape metacharacters (git reset -- <pathspec>...).
+// --diff-filter=A would miss the destination. --ita-visible-in-index is
+// required so intent-to-add (git add -N) entries appear in the cached addition
+// listing; without it, ITA stays as porcelain " A" and the ??-only status
+// filter cannot clear PrepareWorktree. -z avoids core.quotePath escaping of
+// non-ASCII reserved basenames. The listing pathspec uses
+// :(glob).looper-review-*.json (with ,icase when core.ignoreCase is true) so
+// only reserved-root candidates are captured (* does not cross /). Paths are
+// then passed as :(literal) pathspecs so basenames with \, *, ?, [, ] are
+// unstaged as themselves rather than as glob/escape metacharacters
+// (git reset -- <pathspec>...).
 func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, worktreePath string) error {
+	ignoreCase := g.coreIgnoreCase(ctx, worktreePath)
 	// Scope capture to the reserved root namespace so shell's 256 KiB stdout
 	// bound cannot reject ordinary large commits that never touch scratch.
+	// Honor core.ignoreCase: Git's installed exclude pattern folds case when
+	// the option is true; a case-sensitive pathspec would miss uppercase
+	// reserved names under .gitignore negation and let Commit land them.
+	pathspec := ":(glob)" + reservedReviewerScratchPrefix + "*" + reservedReviewerScratchSuffix
+	if ignoreCase {
+		pathspec = ":(glob,icase)" + reservedReviewerScratchPrefix + "*" + reservedReviewerScratchSuffix
+	}
 	result, err := g.runGitResult(ctx, worktreePath, nil,
-		"diff", "--cached", "--name-only", "--diff-filter=A", "--no-renames", "-z",
-		"--", ":(glob)"+reservedReviewerScratchPrefix+"*"+reservedReviewerScratchSuffix,
+		"diff", "--cached", "--name-only", "--diff-filter=A", "--no-renames",
+		"--ita-visible-in-index", "-z",
+		"--", pathspec,
 	)
 	if err != nil {
 		return err
@@ -861,8 +875,8 @@ func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, w
 	paths := make([]string, 0)
 	for _, path := range splitNUL(result.Stdout) {
 		// Defense in depth: pathspec * is root-only (* does not cross /), but
-		// keep the shared classifier so empty-middle / suffix rules stay one place.
-		if isReservedReviewerScratchPath(path) {
+		// keep the shared classifier so empty-middle / suffix / case rules stay one place.
+		if isReservedReviewerScratchPath(path, ignoreCase) {
 			// git reset treats args as pathspecs; force literal matching so
 			// reserved basenames with \ * ? [ ] cannot escape or expand.
 			paths = append(paths, ":(literal)"+path)
@@ -873,6 +887,17 @@ func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, w
 	}
 	args := append([]string{"reset", "HEAD", "--"}, paths...)
 	return g.runGit(ctx, worktreePath, nil, args...)
+}
+
+// coreIgnoreCase reports the repository's effective core.ignoreCase setting.
+// Unset or unreadable config is treated as false (Git's documented default when
+// init/clone did not probe a case-insensitive filesystem).
+func (g *Gateway) coreIgnoreCase(ctx context.Context, repoPath string) bool {
+	result, err := g.runGitResult(ctx, repoPath, nil, "config", "--bool", "--get", "core.ignoreCase")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(result.Stdout) == "true"
 }
 
 func (g *Gateway) validateMutationWorktree(worktreePath, repoPath, worktreeRoot string) error {
@@ -1319,12 +1344,13 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 		return nil, fmt.Errorf("git status output truncated after %d bytes; refuse incomplete dirt classification", len(result.Stdout))
 	}
 
+	ignoreCase := g.coreIgnoreCase(ctx, repoPath)
 	entries := []statusEntry{}
 	for _, entry := range parsePorcelainStatusZ(result.Stdout) {
 		// info/exclude is lower precedence than tracked .gitignore. When a repo
 		// re-includes reserved scratch via negation, git still reports it as
-		// untracked; drop only those root-level untracked entries for dirt.
-		if isIgnorableReservedReviewerScratch(entry) {
+		// untracked; drop only those root-level untracked/ITA entries for dirt.
+		if isIgnorableReservedReviewerScratch(entry, ignoreCase) {
 			continue
 		}
 		entries = append(entries, entry)
@@ -1388,18 +1414,24 @@ func splitNUL(s string) []string {
 	return out
 }
 
-// isIgnorableReservedReviewerScratch reports untracked root-level files in the
-// reserved /.looper-review-*.json namespace for dirt inspection. Nested
-// lookalikes and any tracked or staged change remain visible dirt. PrepareWorktree
-// unstages reserved additions first so prestaged scratch becomes "??" and is
-// ignored here; Commit reuses the same unstage after git add -A. Both share
-// isReservedReviewerScratchPath — see that function and the unstage comment for
-// trade-offs and failure modes.
-func isIgnorableReservedReviewerScratch(entry statusEntry) bool {
-	if entry.Code != "??" {
+// isIgnorableReservedReviewerScratch reports root-level files in the reserved
+// /.looper-review-*.json namespace that are safe to treat as non-dirt for
+// inspection. Nested lookalikes and tracked M/D (or fully staged non-ITA
+// changes) remain visible dirt. Accepted porcelain codes:
+//   - "??" untracked (typical after exclude or after unstage)
+//   - " A" intent-to-add (git add -N): Prepare unstages ITA with
+//     --ita-visible-in-index, but status still accepts " A" so dirt
+//     classification stays consistent if ITA is observed mid-lifecycle
+//
+// PrepareWorktree unstages reserved additions first so prestaged/ITA scratch
+// becomes "??" before hard reset; Commit reuses the same unstage after
+// git add -A. Both share isReservedReviewerScratchPath — see that function
+// and the unstage comment for trade-offs and failure modes.
+func isIgnorableReservedReviewerScratch(entry statusEntry, ignoreCase bool) bool {
+	if entry.Code != "??" && entry.Code != " A" {
 		return false
 	}
-	return isReservedReviewerScratchPath(entry.Path)
+	return isReservedReviewerScratchPath(entry.Path, ignoreCase)
 }
 
 // reservedReviewerScratchPrefix/Suffix implement Git's root-only
@@ -1412,7 +1444,11 @@ const (
 	reservedReviewerScratchSuffix = ".json"
 )
 
-func isReservedReviewerScratchPath(path string) bool {
+// isReservedReviewerScratchPath reports whether path is a root-level reserved
+// reviewer scratch basename. When ignoreCase is true (repo core.ignoreCase),
+// matching folds ASCII case the same way Git's installed
+// /.looper-review-*.json exclude and :(glob,icase) pathspecs do.
+func isReservedReviewerScratchPath(path string, ignoreCase bool) bool {
 	// Do not TrimSpace: leading/trailing whitespace is part of a literal
 	// pathname from git -z and is outside the reserved root basename namespace.
 	if path == "" {
@@ -1426,13 +1462,26 @@ func isReservedReviewerScratchPath(path string) bool {
 	if strings.Contains(path, "/") {
 		return false
 	}
-	if !strings.HasPrefix(path, reservedReviewerScratchPrefix) ||
+	if ignoreCase {
+		if !hasPrefixFold(path, reservedReviewerScratchPrefix) ||
+			!hasSuffixFold(path, reservedReviewerScratchSuffix) {
+			return false
+		}
+	} else if !strings.HasPrefix(path, reservedReviewerScratchPrefix) ||
 		!strings.HasSuffix(path, reservedReviewerScratchSuffix) {
 		return false
 	}
 	// Prefix and suffix must not overlap; empty middle matches Git * (e.g.
 	// .looper-review-.json).
 	return len(path) >= len(reservedReviewerScratchPrefix)+len(reservedReviewerScratchSuffix)
+}
+
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
+func hasSuffixFold(s, suffix string) bool {
+	return len(s) >= len(suffix) && strings.EqualFold(s[len(s)-len(suffix):], suffix)
 }
 
 func (g *Gateway) runGit(ctx context.Context, cwd string, env map[string]string, args ...string) error {
