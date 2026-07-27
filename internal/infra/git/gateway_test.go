@@ -841,6 +841,8 @@ func TestIsReservedReviewerScratchPath(t *testing.T) {
 		{"nested/.looper-review-1.json", false},
 		{`.looper-review-1\json`, false},
 		{".looper-review.json", false},
+		{" .looper-review-x.json", false}, // leading whitespace is a different pathname
+		{".looper-review-x.json ", false},
 		{"app.go", false},
 		{"", false},
 	}
@@ -904,6 +906,27 @@ func TestGatewayReservedReviewerScratchContract(t *testing.T) {
 				writeFile(t, filepath.Join(wt, "nested", ".looper-review-1.json"), "{}\n")
 			},
 			prepare: &prepWant{clean: false},
+		},
+		{
+			// Leading/trailing whitespace in -z pathnames must not collapse into
+			// the reserved basename; prepare stays dirty and Commit must not rewrite
+			// the path when unstaging (reset would miss the real name).
+			name:   "whitespace_padded_reserved_lookalike_dirty",
+			branch: "feature/review-whitespace-path",
+			setup: func(t *testing.T, wt string) {
+				name := " .looper-review-x.json"
+				writeFile(t, filepath.Join(wt, name), `{"body":"spaced"}`+"\n")
+				statusZ := runGit(t, wt, "status", "--porcelain", "-z", "--untracked-files=all")
+				if !strings.Contains(statusZ, name) {
+					t.Fatalf("expected -z porcelain to preserve leading whitespace pathname; status = %q", statusZ)
+				}
+			},
+			prepare: &prepWant{clean: false},
+			commit: &commitWant{
+				include: []string{"app.go", " .looper-review-x.json"},
+				exclude: []string{},
+			},
+			keepOnDisk: []string{" .looper-review-x.json"},
 		},
 		{
 			name:            "negation_empty_suffix_prepare_and_commit",

@@ -6907,7 +6907,7 @@ func reviewerDirtyWorktreeMessage(branch, worktreePath string) string {
 	if worktreePath == "" {
 		return fmt.Sprintf("Reviewer worktree is dirty for branch %s; manual intervention required. Retry after cleanup: looper retry <seq>. Discard: looper retry <seq> --discard-worktree-changes --confirm", branch)
 	}
-	return fmt.Sprintf("Reviewer worktree is dirty for branch %s at %s; manual intervention required. Inspect: git -C %q status --short. Retry after cleanup: looper retry <seq>. Discard: looper retry <seq> --discard-worktree-changes --confirm", branch, worktreePath, worktreePath)
+	return fmt.Sprintf("Reviewer worktree is dirty for branch %s at %s; manual intervention required. Inspect: git -C %s status --short. Retry after cleanup: looper retry <seq>. Discard: looper retry <seq> --discard-worktree-changes --confirm", branch, worktreePath, shellQuote(worktreePath))
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {

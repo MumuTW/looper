@@ -7998,13 +7998,29 @@ func TestReviewerDirtyWorktreeMessageIncludesRecoveryHints(t *testing.T) {
 		"worktree is dirty",
 		"manual intervention required",
 		"/tmp/wt",
-		"git -C \"/tmp/wt\" status --short",
+		"git -C '/tmp/wt' status --short",
 		"looper retry <seq>",
 		"--discard-worktree-changes --confirm",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("message missing %q: %s", want, msg)
 		}
+	}
+}
+
+func TestReviewerDirtyWorktreeMessageShellQuotesMetacharacters(t *testing.T) {
+	t.Parallel()
+
+	// Paths with $() / backticks must be shell-quoted so operators who copy the
+	// inspect command do not expand them before git runs.
+	path := `/tmp/wt-$(whoami)/` + "`id`"
+	msg := reviewerDirtyWorktreeMessage("pr-1048-head", path)
+	wantInspect := "git -C " + shellQuote(path) + " status --short"
+	if !strings.Contains(msg, wantInspect) {
+		t.Fatalf("message missing shell-quoted inspect %q: %s", wantInspect, msg)
+	}
+	if strings.Contains(msg, fmt.Sprintf("%q", path)) {
+		t.Fatalf("message still uses Go %%q quoting for inspect path: %s", msg)
 	}
 }
 

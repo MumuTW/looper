@@ -1301,7 +1301,10 @@ func parsePorcelainStatusZ(stdout string) []statusEntry {
 		if code == "!!" {
 			continue
 		}
-		path := strings.TrimSpace(record[3:])
+		// Preserve every byte after "XY " through the NUL terminator. -z
+		// pathnames are literal (including leading/trailing whitespace); trimming
+		// would rewrite names like " .looper-review-x.json" into reserved ones.
+		path := record[3:]
 		if isRenameOrCopyStatus(code) {
 			// Consume the origin path field that follows destination.
 			if i < len(parts) {
@@ -1327,7 +1330,7 @@ func splitNUL(s string) []string {
 	parts := strings.Split(s, "\x00")
 	out := make([]string, 0, len(parts))
 	for _, part := range parts {
-		part = strings.TrimSpace(strings.TrimRight(part, "\r"))
+		// Preserve every byte between NULs (git -z pathnames are literal).
 		if part == "" {
 			continue
 		}
@@ -1350,7 +1353,8 @@ func isIgnorableReservedReviewerScratch(entry statusEntry) bool {
 }
 
 func isReservedReviewerScratchPath(path string) bool {
-	path = strings.TrimSpace(path)
+	// Do not TrimSpace: leading/trailing whitespace is part of a literal
+	// pathname from git -z and is outside the reserved root basename namespace.
 	if path == "" {
 		return false
 	}
