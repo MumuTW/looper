@@ -28,10 +28,6 @@ var (
 	reservedReviewerScratchBaseName = regexp.MustCompile(`^\.looper-review-.+\.json$`)
 )
 
-// reservedReviewerScratchPathspecExclude keeps root-level reserved scratch out of
-// `git add -A` even when a tracked .gitignore negation outranks info/exclude.
-const reservedReviewerScratchPathspecExclude = ":(exclude,top).looper-review-*.json"
-
 var fetchRefLockRetryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
 
 type CheckoutMode string
@@ -774,10 +770,14 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
 		return CommitResult{}, err
 	}
-	// Explicit pathspec exclude: info/exclude alone loses to higher-precedence
-	// .gitignore negations (e.g. !/.looper-review-*.json), which would otherwise
-	// stage reserved reviewer scratch into loop fallback commits.
-	if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A", "--", ".", reservedReviewerScratchPathspecExclude); err != nil {
+	// Stage normally so tracked paths that happen to match the reserved name
+	// (e.g. a fixture) still commit. info/exclude alone loses to higher-
+	// precedence .gitignore negations, so after add we unstage only newly-added
+	// root reserved scratch (including any pre-staged by the agent).
+	if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A"); err != nil {
+		return CommitResult{}, err
+	}
+	if err := g.unstageReservedReviewerScratchAdditions(ctx, input.WorktreePath); err != nil {
 		return CommitResult{}, err
 	}
 	if err := g.runGit(ctx, input.WorktreePath, nil, "commit", "-m", input.Message); err != nil {
@@ -793,6 +793,33 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 	}
 
 	return CommitResult{CommitSHA: headSHA}, nil
+}
+
+// unstageReservedReviewerScratchAdditions drops index entries for root-level
+// reserved reviewer scratch that are newly added (not present in HEAD). That
+// covers untracked and already-staged ephemeral submit payloads without
+// blocking legitimate modifications or deletions of tracked files that share
+// the same basename pattern.
+func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, worktreePath string) error {
+	result, err := g.runGitResult(ctx, worktreePath, nil, "diff", "--cached", "--name-only", "--diff-filter=A")
+	if err != nil {
+		return err
+	}
+	paths := make([]string, 0)
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		path := strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if path == "" {
+			continue
+		}
+		if isReservedReviewerScratchPath(path) {
+			paths = append(paths, path)
+		}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	args := append([]string{"reset", "HEAD", "--"}, paths...)
+	return g.runGit(ctx, worktreePath, nil, args...)
 }
 
 func (g *Gateway) validateMutationWorktree(worktreePath, repoPath, worktreeRoot string) error {
@@ -1091,8 +1118,9 @@ func (g *Gateway) tryRemoveWorktree(ctx context.Context, repoPath, worktreePath 
 //
 // The list is intentionally conservative — never broad source globs. Patterns
 // only hide untracked matches; tracked modifications remain visible to status.
-// When exclude is overridden, readStatus and Commit apply explicit reserved-
-// namespace handling so dirt and staging still ignore root-level scratch.
+// When exclude is overridden, readStatus ignores only untracked root reserved
+// scratch, and Commit unstages only newly-added reserved scratch so tracked
+// same-name paths still commit.
 var worktreeArtifactExcludePatterns = []string{
 	".pnpm-store/",
 	"node_modules/",

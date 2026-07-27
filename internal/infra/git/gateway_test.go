@@ -972,6 +972,118 @@ func TestGatewayPrepareAndCommitIgnoreReservedScratchDespiteGitignoreNegation(t 
 	}
 }
 
+// Pre-staged reserved scratch must be dropped from the index before commit; a
+// pathspec exclude alone leaves existing staged entries in the fallback commit.
+func TestGatewayCommitUnstagesPreStagedReservedScratch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/review-prestaged")
+	gateway := fixture.gateway()
+
+	runGit(t, fixture.repoPath, "checkout", "feature/review-prestaged")
+	writeFile(t, filepath.Join(fixture.repoPath, ".gitignore"), "!/.looper-review-*.json\n")
+	runGit(t, fixture.repoPath, "add", ".gitignore")
+	runGit(t, fixture.repoPath, "commit", "-m", "re-include reserved reviewer scratch")
+	runGit(t, fixture.repoPath, "push", "origin", "feature/review-prestaged")
+	runGit(t, fixture.repoPath, "checkout", "main")
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/review-prestaged",
+		BaseBranch:   "main",
+		PRNumber:     1050,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	scratchPath := filepath.Join(worktree.WorktreePath, ".looper-review-1050.json")
+	writeFile(t, scratchPath, `{"body":"scratch"}\n`)
+	// Agent already staged the re-included payload before fallback Commit.
+	runGit(t, worktree.WorktreePath, "add", "-A", "--", ".looper-review-1050.json")
+	if staged := runGit(t, worktree.WorktreePath, "diff", "--cached", "--name-only"); !strings.Contains(staged, ".looper-review-1050.json") {
+		t.Fatalf("expected scratch pre-staged before Commit; staged = %q", staged)
+	}
+	writeFile(t, filepath.Join(worktree.WorktreePath, "app.go"), "package main\n")
+
+	if _, err := gateway.Commit(ctx, CommitInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+		Message:      "source change with pre-staged reserved scratch",
+	}); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	committed := runGit(t, worktree.WorktreePath, "show", "--pretty=format:", "--name-only", "HEAD")
+	if !strings.Contains(committed, "app.go") {
+		t.Fatalf("Commit() missing app.go; files = %q", committed)
+	}
+	if strings.Contains(committed, ".looper-review-1050.json") {
+		t.Fatalf("Commit() included pre-staged reserved scratch; files = %q", committed)
+	}
+	if _, err := os.Stat(scratchPath); err != nil {
+		t.Fatalf("root scratch should remain uncommitted on disk: %v", err)
+	}
+}
+
+// Tracked root files matching the reserved basename must still commit; exclude
+// only untracked (newly-added) reserved scratch, not every matching path.
+func TestGatewayCommitIncludesTrackedReservedNamedFile(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/review-tracked-name")
+	gateway := fixture.gateway()
+
+	runGit(t, fixture.repoPath, "checkout", "feature/review-tracked-name")
+	writeFile(t, filepath.Join(fixture.repoPath, ".looper-review-fixture.json"), `{"fixture":true}`+"\n")
+	runGit(t, fixture.repoPath, "add", ".looper-review-fixture.json")
+	runGit(t, fixture.repoPath, "commit", "-m", "track reserved-named fixture")
+	runGit(t, fixture.repoPath, "push", "origin", "feature/review-tracked-name")
+	runGit(t, fixture.repoPath, "checkout", "main")
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/review-tracked-name",
+		BaseBranch:   "main",
+		PRNumber:     1051,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	writeFile(t, filepath.Join(worktree.WorktreePath, ".looper-review-fixture.json"), `{"fixture":"updated"}`+"\n")
+	writeFile(t, filepath.Join(worktree.WorktreePath, "app.go"), "package main\n")
+	// Untracked ephemeral scratch must still stay out.
+	scratchPath := filepath.Join(worktree.WorktreePath, ".looper-review-1051.json")
+	writeFile(t, scratchPath, `{"body":"scratch"}\n`)
+
+	if _, err := gateway.Commit(ctx, CommitInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+		Message:      "edit tracked reserved-named file with scratch present",
+	}); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	committed := runGit(t, worktree.WorktreePath, "show", "--pretty=format:", "--name-only", "HEAD")
+	if !strings.Contains(committed, "app.go") {
+		t.Fatalf("Commit() missing app.go; files = %q", committed)
+	}
+	if !strings.Contains(committed, ".looper-review-fixture.json") {
+		t.Fatalf("Commit() missing tracked reserved-named edit; files = %q", committed)
+	}
+	if strings.Contains(committed, ".looper-review-1051.json") {
+		t.Fatalf("Commit() included untracked reserved scratch; files = %q", committed)
+	}
+	if _, err := os.Stat(scratchPath); err != nil {
+		t.Fatalf("untracked scratch should remain on disk: %v", err)
+	}
+}
+
 func TestGatewayPrepareWorktreeSupportsExplicitRef(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
