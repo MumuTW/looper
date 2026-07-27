@@ -26,6 +26,57 @@ type worktreeDiscardResult struct {
 	Reason       string  `json:"reason,omitempty"`
 }
 
+// loopWorktreeStatusResponse is the read-only preflight for retry/jump UX.
+//
+// Design trade-off (new status concept + preflight gate on retry):
+//
+// Failure prevented: operators and the dashboard used to call POST /retry while a
+// managed agent worktree was dirty. Retry re-prepares from HEAD and either fails
+// prepare-worktree or silently collides with uncommitted local edits. Without a
+// structured preflight, clients could only guess from logs after the damage.
+//
+// Cost / edge cases:
+//   - New wire fields (present/managed/clean/dirty/reason) that CLI and dashboard
+//     must interpret consistently; drift between clients is a real risk.
+//   - Extra GET before every interactive retry (latency + one more auth/path).
+//   - status_unavailable and unmanaged reasons force fail-closed discard offers
+//     while still exposing path for inspect — more branches than a pure 409.
+//   - Old daemons without /worktree must keep plain-retry fallback so upgrades
+//     are not a hard break.
+//
+// Why not simpler alternatives:
+//   - Delete the gate / trust the agent: dirty trees are operator-local state the
+//     agent did not declare; trusting retry to "just work" already caused lost
+//     edits and opaque prepare failures. Agent structured output cannot see the
+//     worktree after the run ended.
+//   - Fail loud only (hard 409 on dirty retry): blocks the legitimate "discard
+//     and retry" path and gives no jump/inspect guidance when the operator wants
+//     to keep local changes. Preflight keeps authority on the daemon's on-disk
+//     git status while letting the operator choose discard vs inspect.
+//
+// Authority: the daemon's worktree resolution + git status are the authority for
+// present/managed/dirty; the agent does not emit this after the run completes.
+// Clients may gate UX on the response but must not invent discard safety.
+//
+// Semantics:
+//   - present: path exists on disk (after successful stat)
+//   - worktreePath/branch: resolved location hints even when missing on disk
+//   - managed: path is under a Looper-managed worktree root (discard-safe)
+//   - clean/dirty: set only when git status succeeds; omitted on status_unavailable
+//   - reason: no_worktree | worktree_missing | status_unavailable | already_clean |
+//     dirty | loop_type_without_worktree | unmanaged
+type loopWorktreeStatusResponse struct {
+	LoopID       string  `json:"loopId"`
+	Seq          int64   `json:"seq"`
+	Present      bool    `json:"present"`
+	WorktreePath *string `json:"worktreePath,omitempty"`
+	Branch       *string `json:"branch,omitempty"`
+	Managed      bool    `json:"managed"`
+	Clean        *bool   `json:"clean,omitempty"`
+	Dirty        *bool   `json:"dirty,omitempty"`
+	Reason       string  `json:"reason,omitempty"`
+}
+
 type checkpointWorktreeRef struct {
 	ID       string `json:"id,omitempty"`
 	Path     string `json:"path,omitempty"`
@@ -52,6 +103,83 @@ type checkpointWithWorktree struct {
 		HeadRefName string `json:"headRefName,omitempty"`
 		PRNumber    int64  `json:"prNumber,omitempty"`
 	} `json:"detail,omitempty"`
+}
+
+// loopWorktreeStatus resolves the managed worktree for a loop and reports
+// whether git status is clean. Used by CLI/dashboard retry preflight and jump.
+func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecord) (loopWorktreeStatusResponse, error) {
+	resp := loopWorktreeStatusResponse{
+		LoopID: loop.ID,
+		Seq:    loop.Seq,
+	}
+	if loop.Type != string(domain.LoopTypePlanner) && loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeWorker) {
+		resp.Reason = "loop_type_without_worktree"
+		return resp, nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil {
+		return loopWorktreeStatusResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, loop.ProjectID)
+	if err != nil {
+		return loopWorktreeStatusResponse{}, err
+	}
+	resolved, err := resolveManagedWorktreeForLoop(ctx, services.Repositories, *project, loop)
+	if err != nil {
+		return loopWorktreeStatusResponse{}, err
+	}
+	if resolved == nil || strings.TrimSpace(resolved.Path) == "" {
+		resp.Reason = "no_worktree"
+		return resp, nil
+	}
+	path := strings.TrimSpace(resolved.Path)
+	resp.WorktreePath = stringPtrOrNil(path)
+	resp.Branch = stringPtrOrNil(strings.TrimSpace(resolved.Branch))
+	resp.Managed = resolved.Managed
+	if _, statErr := os.Stat(path); statErr != nil {
+		if os.IsNotExist(statErr) {
+			// Path resolved but not on disk — present stays false so jump refuses cd.
+			resp.Reason = "worktree_missing"
+			return resp, nil
+		}
+		return loopWorktreeStatusResponse{}, apiError{
+			code:    pkgapi.ErrorCodeInternalError,
+			status:  http.StatusInternalServerError,
+			message: fmt.Sprintf("Failed to stat worktree at %s: %v", path, statErr),
+		}
+	}
+	resp.Present = true
+	if !resolved.Managed {
+		// Still report path for inspect; discard is not offered by clients.
+		resp.Reason = "unmanaged"
+	}
+	gitPath := ""
+	if h.context.Config.Tools.GitPath != nil {
+		gitPath = strings.TrimSpace(*h.context.Config.Tools.GitPath)
+	}
+	gateway := gitinfra.New(gitinfra.Options{GitPath: gitPath, Repos: services.Repositories, Now: h.now})
+	clean, cleanErr := gateway.WorktreeClean(ctx, path)
+	if cleanErr != nil {
+		// Keep path for jump/inspect; omit clean/dirty so clients fail closed on discard.
+		if resp.Reason == "" {
+			resp.Reason = "status_unavailable"
+		}
+		return resp, nil
+	}
+	resp.Clean = &clean
+	dirty := !clean
+	resp.Dirty = &dirty
+	if !resolved.Managed {
+		// Prefer unmanaged over clean/dirty so clients do not offer discard.
+		resp.Reason = "unmanaged"
+		return resp, nil
+	}
+	if clean {
+		resp.Reason = "already_clean"
+	} else {
+		resp.Reason = "dirty"
+	}
+	return resp, nil
 }
 
 // discardLoopWorktreeChanges performs the operator opt-in dirty-worktree discard
