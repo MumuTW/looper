@@ -95,6 +95,14 @@ func ClearFixerOwnerToken(worktreePath string) error {
 	return nil
 }
 
+// ResolveWorktreePrivateGitDir locates the worktree-private git directory.
+// Linked worktrees use a .git file with gitdir:; ordinary checkouts use .git/.
+// When createMissing is true and .git is absent, a .git directory is created
+// (unit-test / pre-git fixtures only — never overwrites a gitfile).
+func ResolveWorktreePrivateGitDir(worktreePath string, createMissing bool) (string, error) {
+	return resolveWorktreePrivateGitDir(worktreePath, createMissing)
+}
+
 // resolveWorktreePrivateGitDir locates the worktree-private git directory.
 // Linked worktrees use a .git file with gitdir:; ordinary checkouts use .git/.
 // When createMissing is true and .git is absent, a .git directory is created

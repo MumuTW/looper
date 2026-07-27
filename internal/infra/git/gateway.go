@@ -532,6 +532,11 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: input.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}); err != nil {
 		return err
 	}
+	// Capture this lifecycle's quarantine generation before git worktree remove
+	// deletes the private git dir that holds the marker. Terminal cleanup must
+	// delete only this generation — not prior abandoned generations that share
+	// the same worktree basename under the retention window.
+	generation, _ := readReservedReviewScratchGeneration(input.WorktreePath)
 	if err := g.runGitWithStartGate(ctx, input.RepoPath, nil, input.AdmitStart, "worktree", "remove", "--force", input.WorktreePath); err != nil {
 		if !missingWorktreeErrorPattern.MatchString(err.Error()) {
 			return err
@@ -553,7 +558,7 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	// quarantine (see reservedReviewerScratchAuthority). Recovery holds only
 	// while the worktree lifecycle is active; once remove succeeded (or the
 	// path was independently confirmed missing), the quarantine may go.
-	if err := removeReservedReviewScratchQuarantineForWorktree(input.WorktreePath); err != nil {
+	if err := removeReservedReviewScratchQuarantineForWorktree(input.WorktreePath, generation); err != nil {
 		return err
 	}
 
@@ -946,24 +951,28 @@ func (g *Gateway) unstageReservedReviewerScratchAdditions(ctx context.Context, w
 //  3. Terminal quarantine deletion: after CleanupWorktree successfully removes
 //     the worktree (or independently confirms the path is already absent),
 //     removeReservedReviewScratchQuarantineForWorktree may delete that
-//     worktree's quarantine subdirectory. Operator recovery is mid-flight only
-//     — while the worktree lifecycle is still active.
+//     worktree lifecycle's generation-keyed quarantine subdirectory. Operator
+//     recovery is mid-flight only — while the worktree lifecycle is still
+//     active. Prior generations that share the worktree basename stay until
+//     orphan retention (rule 4).
 //  4. Orphan retention deletion: pruneExpiredReservedReviewScratchQuarantine
-//     may delete quarantine subdirs whose corresponding worktree path is gone
-//     and whose container age exceeds
-//     reservedReviewScratchQuarantineRetention. Active worktrees are never
-//     pruned by payload mtime (rename preserves source mtime).
+//     may delete quarantine subdirs that are not the active generation for a
+//     still-present worktree path (or whose worktree path is gone) and whose
+//     container age exceeds reservedReviewScratchQuarantineRetention. Active
+//     worktrees are never pruned by payload mtime (rename preserves source mtime).
 //
 // What authority still forbids: delete-on-sight during prepare; treating
 // arbitrary non-reserved dirt as clean; deleting quarantine while the matching
-// worktree path still exists.
+// worktree path still exists; following symlinked quarantine roots on delete.
 //
-// Costs: sibling quarantine layout, cleanup coupling, orphan-prune edge cases
-// (clock skew, operators wanting copies longer than retention).
+// Costs: sibling quarantine layout, per-lifecycle generation marker, cleanup
+// coupling, orphan-prune edge cases (clock skew, operators wanting copies
+// longer than retention).
 // Simpler alternatives rejected: leave-in-place after clean prepare (agent
 // git add -A && commit publishes leftovers); delete on prepare (destroys
 // recovery); unbounded quarantine (disk growth); mtime-only prune of active
-// quarantine (races double-relocate).
+// quarantine (races double-relocate); path-only quarantine keys (recreated
+// worktree paths steal prior generation retention).
 const reservedReviewerScratchAuthority = "reserved-reviewer-scratch-v1"
 
 // reservedReviewScratchQuarantineDirName is a sibling directory under the
@@ -971,24 +980,43 @@ const reservedReviewerScratchAuthority = "reserved-reviewer-scratch-v1"
 // relocated out of a prepared worktree. It is never a git worktree path.
 // Deletion of contents is authorized only under reservedReviewerScratchAuthority
 // rules 3 (terminal CleanupWorktree) and 4 (orphan retention), never during
-// prepare relocate (rule 2).
+// prepare relocate (rule 2). Must be a real directory (Lstat); symlinked roots
+// are refused for create and delete so RemoveAll cannot escape quarantine.
 const reservedReviewScratchQuarantineDirName = ".looper-reserved-review-scratch"
 
 // reservedReviewScratchQuarantineRetention bounds growth for orphaned quarantine
-// entries (abandoned worktrees whose path is gone). Active worktree quarantine
-// is retained until CleanupWorktree, regardless of payload mtime. Deletion of
-// expired orphans is authorized by reservedReviewerScratchAuthority rule 4.
+// entries (abandoned worktrees whose path is gone, or prior generations under a
+// recreated path). Active worktree quarantine is retained until CleanupWorktree,
+// regardless of payload mtime. Deletion of expired orphans is authorized by
+// reservedReviewerScratchAuthority rule 4.
 const reservedReviewScratchQuarantineRetention = 7 * 24 * time.Hour
 
+// reservedReviewScratchGenerationFile is stored under the worktree-private git
+// dir so each CreateWorktree lifecycle gets a distinct quarantine key without
+// appearing as worktree dirt.
+const reservedReviewScratchGenerationFile = "looper-reserved-scratch-generation"
+
+// reservedReviewScratchQuarantineGenSep joins worktree basename and generation
+// in quarantine entry names: {basename}--gen-{16hex}.
+const reservedReviewScratchQuarantineGenSep = "--gen-"
+
 // ReservedReviewScratchQuarantineDir returns the operator-visible directory that
-// holds relocated reserved reviewer payloads for worktreePath. Empty when the
-// worktree path is blank.
+// holds relocated reserved reviewer payloads for the active lifecycle of
+// worktreePath. Empty when the worktree path is blank or no generation marker
+// is available yet (pre-relocate). After ensure/relocate, the path is
+// generation-keyed under reservedReviewScratchQuarantineDirName.
 func ReservedReviewScratchQuarantineDir(worktreePath string) string {
 	worktreePath = strings.TrimSpace(worktreePath)
 	if worktreePath == "" {
 		return ""
 	}
-	return filepath.Join(filepath.Dir(worktreePath), reservedReviewScratchQuarantineDirName, filepath.Base(worktreePath))
+	gen, err := readReservedReviewScratchGeneration(worktreePath)
+	if err != nil || gen == "" {
+		// Pre-generation or unreadable marker: expose the legacy path-only key
+		// so operators can still find pre-upgrade quarantines.
+		return filepath.Join(filepath.Dir(worktreePath), reservedReviewScratchQuarantineDirName, filepath.Base(worktreePath))
+	}
+	return quarantineDirForGeneration(worktreePath, gen)
 }
 
 // relocateReservedReviewerScratch moves untracked root-level reserved reviewer
@@ -1016,7 +1044,14 @@ func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreeP
 		}
 		return fmt.Errorf("list worktree for reserved scratch relocate: %w", err)
 	}
-	quarantineRoot := ReservedReviewScratchQuarantineDir(worktreePath)
+	generation, err := ensureReservedReviewScratchGeneration(worktreePath)
+	if err != nil {
+		return fmt.Errorf("ensure reserved scratch quarantine generation: %w", err)
+	}
+	if err := migrateLegacyReservedReviewScratchQuarantine(worktreePath, generation); err != nil {
+		return err
+	}
+	quarantineRoot := quarantineDirForGeneration(worktreePath, generation)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -1039,7 +1074,7 @@ func (g *Gateway) relocateReservedReviewerScratch(ctx context.Context, worktreeP
 			continue
 		}
 		src := filepath.Join(worktreePath, name)
-		if err := os.MkdirAll(quarantineRoot, 0o755); err != nil {
+		if err := ensureRealQuarantineTree(quarantineRoot); err != nil {
 			return fmt.Errorf("create reserved scratch quarantine: %w", err)
 		}
 		dest, err := reserveQuarantineDestination(quarantineRoot, name, g.now)
@@ -1161,20 +1196,35 @@ func copyFileOnto(src, dest string) error {
 	return out.Close()
 }
 
-// removeReservedReviewScratchQuarantineForWorktree deletes one worktree's
-// quarantine subdirectory under reservedReviewerScratchAuthority rule 3.
-// Call only after CleanupWorktree has removed the worktree or independently
-// confirmed the path is already absent — never while the worktree still exists.
-func removeReservedReviewScratchQuarantineForWorktree(worktreePath string) error {
-	dir := ReservedReviewScratchQuarantineDir(worktreePath)
-	if dir == "" {
+// removeReservedReviewScratchQuarantineForWorktree deletes one worktree
+// lifecycle's generation-keyed quarantine subdirectory under
+// reservedReviewerScratchAuthority rule 3. generation must be captured before
+// worktree remove destroys the private git-dir marker; empty generation falls
+// back to the legacy path-only key for pre-upgrade quarantines. Call only after
+// CleanupWorktree has removed the worktree or independently confirmed the path
+// is already absent — never while the worktree still exists.
+//
+// Refuse when the quarantine root or target entry is a symlink (Lstat): RemoveAll
+// resolves intermediate symlinks and would otherwise delete outside quarantine.
+func removeReservedReviewScratchQuarantineForWorktree(worktreePath, generation string) error {
+	worktreePath = strings.TrimSpace(worktreePath)
+	if worktreePath == "" {
 		return nil
 	}
-	if err := os.RemoveAll(dir); err != nil {
+	var dir string
+	if generation != "" {
+		dir = quarantineDirForGeneration(worktreePath, generation)
+	} else {
+		dir = filepath.Join(filepath.Dir(worktreePath), reservedReviewScratchQuarantineDirName, filepath.Base(worktreePath))
+	}
+	if err := removeQuarantineDirNoFollow(dir); err != nil {
 		return fmt.Errorf("remove reserved scratch quarantine for %q: %w", filepath.Base(worktreePath), err)
 	}
-	// Best-effort: drop empty parent quarantine root.
+	// Best-effort: drop empty parent quarantine root when it is a real directory.
 	parent := filepath.Dir(dir)
+	if err := requireRealDirNoFollow(parent); err != nil {
+		return nil
+	}
 	if entries, err := os.ReadDir(parent); err == nil && len(entries) == 0 {
 		_ = os.Remove(parent)
 	}
@@ -1184,16 +1234,21 @@ func removeReservedReviewScratchQuarantineForWorktree(worktreePath string) error
 // pruneExpiredReservedReviewScratchQuarantine deletes orphan quarantine
 // subdirectories older than reservedReviewScratchQuarantineRetention under
 // worktreeRoot's sibling quarantine tree (reservedReviewerScratchAuthority
-// rule 4). A quarantine subdir is orphan only when the corresponding worktree
-// path under worktreeRoot is absent — never when the worktree is still active,
-// regardless of payload mtime (rename keeps the source mtime). Best-effort;
-// bounds growth for abandoned worktrees.
+// rule 4). A quarantine entry is orphan when it is not the active generation
+// for a still-present worktree (including prior generations under a recreated
+// path, and path-only legacy keys after a generation marker exists), or when
+// the worktree path is gone — never while it is the active lifecycle, regardless
+// of payload mtime. Best-effort; bounds growth for abandoned worktrees.
+// Symlinked quarantine roots are skipped (never followed for deletion).
 func (g *Gateway) pruneExpiredReservedReviewScratchQuarantine(worktreeRoot string) {
 	worktreeRoot = strings.TrimSpace(worktreeRoot)
 	if worktreeRoot == "" {
 		return
 	}
 	root := filepath.Join(worktreeRoot, reservedReviewScratchQuarantineDirName)
+	if err := requireRealDirNoFollow(root); err != nil {
+		return
+	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return
@@ -1202,21 +1257,264 @@ func (g *Gateway) pruneExpiredReservedReviewScratchQuarantine(worktreeRoot strin
 	for _, entry := range entries {
 		name := entry.Name()
 		qPath := filepath.Join(root, name)
-		// Active worktree lifecycle owns its quarantine until CleanupWorktree
-		// (rule 3); rule 4 never deletes while the worktree path exists.
-		wtPath := filepath.Join(worktreeRoot, name)
-		if absent, absErr := worktreePathAbsent(wtPath); absErr != nil || !absent {
+		if err := requireRealDirNoFollow(qPath); err != nil {
+			// Symlink or non-dir entry: never RemoveAll through it.
+			continue
+		}
+		if quarantineEntryIsActive(worktreeRoot, name) {
 			continue
 		}
 		if !orphanQuarantineExpired(qPath, cutoff) {
 			continue
 		}
-		_ = os.RemoveAll(qPath)
+		_ = removeQuarantineDirNoFollow(qPath)
 	}
 	// Best-effort: drop empty quarantine root.
 	if remaining, readErr := os.ReadDir(root); readErr == nil && len(remaining) == 0 {
 		_ = os.Remove(root)
 	}
+}
+
+// quarantineDirForGeneration returns the generation-keyed quarantine path for
+// worktreePath. generation must be a valid marker value.
+func quarantineDirForGeneration(worktreePath, generation string) string {
+	return filepath.Join(
+		filepath.Dir(worktreePath),
+		reservedReviewScratchQuarantineDirName,
+		quarantineEntryName(filepath.Base(worktreePath), generation),
+	)
+}
+
+func quarantineEntryName(worktreeBase, generation string) string {
+	return worktreeBase + reservedReviewScratchQuarantineGenSep + generation
+}
+
+// parseQuarantineEntryName splits {basename}--gen-{16hex}. Legacy path-only
+// entries return ok=false with basename set to the whole entry name.
+func parseQuarantineEntryName(entry string) (basename, generation string, ok bool) {
+	idx := strings.LastIndex(entry, reservedReviewScratchQuarantineGenSep)
+	if idx <= 0 {
+		return entry, "", false
+	}
+	basename = entry[:idx]
+	generation = entry[idx+len(reservedReviewScratchQuarantineGenSep):]
+	if basename == "" || !isValidReservedReviewScratchGeneration(generation) {
+		return entry, "", false
+	}
+	return basename, generation, true
+}
+
+func isValidReservedReviewScratchGeneration(generation string) bool {
+	if len(generation) != 16 {
+		return false
+	}
+	for i := 0; i < len(generation); i++ {
+		c := generation[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureReservedReviewScratchGeneration returns the lifecycle generation for
+// worktreePath, creating a new 16-hex marker in the private git dir when absent.
+func ensureReservedReviewScratchGeneration(worktreePath string) (string, error) {
+	if gen, err := readReservedReviewScratchGeneration(worktreePath); err != nil {
+		return "", err
+	} else if gen != "" {
+		return gen, nil
+	}
+	gitDir, err := worktreesafety.ResolveWorktreePrivateGitDir(worktreePath, true)
+	if err != nil {
+		return "", err
+	}
+	var randBytes [8]byte
+	if _, err := rand.Read(randBytes[:]); err != nil {
+		return "", fmt.Errorf("random quarantine generation: %w", err)
+	}
+	gen := hex.EncodeToString(randBytes[:])
+	path := filepath.Join(gitDir, reservedReviewScratchGenerationFile)
+	if err := os.WriteFile(path, []byte(gen+"\n"), 0o644); err != nil {
+		return "", err
+	}
+	return gen, nil
+}
+
+// readReservedReviewScratchGeneration returns the generation marker when present.
+// Empty string with nil error means absent/unreadable-as-missing.
+func readReservedReviewScratchGeneration(worktreePath string) (string, error) {
+	worktreePath = strings.TrimSpace(worktreePath)
+	if worktreePath == "" {
+		return "", nil
+	}
+	gitDir, err := worktreesafety.ResolveWorktreePrivateGitDir(worktreePath, false)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	data, err := os.ReadFile(filepath.Join(gitDir, reservedReviewScratchGenerationFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	gen := strings.TrimSpace(string(data))
+	if !isValidReservedReviewScratchGeneration(gen) {
+		return "", nil
+	}
+	return gen, nil
+}
+
+// migrateLegacyReservedReviewScratchQuarantine renames a pre-generation
+// path-only quarantine dir for this worktree basename into the generation-keyed
+// layout when the destination does not yet exist. Same-lifecycle upgrade only;
+// if both exist, the legacy dir is left for orphan retention (prior lifecycle).
+func migrateLegacyReservedReviewScratchQuarantine(worktreePath, generation string) error {
+	legacy := filepath.Join(filepath.Dir(worktreePath), reservedReviewScratchQuarantineDirName, filepath.Base(worktreePath))
+	if err := requireRealDirNoFollow(legacy); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		// Symlink/non-dir at the legacy key: refuse rather than follow.
+		return fmt.Errorf("legacy reserved scratch quarantine unsafe at %q: %w", legacy, err)
+	}
+	dest := quarantineDirForGeneration(worktreePath, generation)
+	if _, err := os.Lstat(dest); err == nil {
+		// Active generation already has a dir; leave legacy as a separate orphan.
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := ensureRealQuarantineRoot(filepath.Dir(dest)); err != nil {
+		return err
+	}
+	if err := os.Rename(legacy, dest); err != nil {
+		return fmt.Errorf("migrate legacy reserved scratch quarantine: %w", err)
+	}
+	return nil
+}
+
+// quarantineEntryIsActive reports whether entry under the quarantine root is the
+// live generation for a still-present worktree. Fail closed (active) on marker
+// I/O errors so prune never deletes under uncertainty.
+func quarantineEntryIsActive(worktreeRoot, entryName string) bool {
+	basename, generation, keyed := parseQuarantineEntryName(entryName)
+	wtPath := filepath.Join(worktreeRoot, basename)
+	absent, err := worktreePathAbsent(wtPath)
+	if err != nil {
+		return true
+	}
+	if absent {
+		return false
+	}
+	activeGen, genErr := readReservedReviewScratchGeneration(wtPath)
+	if genErr != nil {
+		return true
+	}
+	if keyed {
+		return activeGen != "" && activeGen == generation
+	}
+	// Legacy path-only key: active only while the worktree has no generation
+	// marker yet (pre-upgrade lifecycle). Once a generation exists, the path-only
+	// dir is a prior lifecycle orphan.
+	return activeGen == ""
+}
+
+// ensureRealQuarantineTree ensures parent quarantine root and leaf dir exist as
+// real (non-symlink) directories. Intermediate symlink roots are refused so
+// payloads cannot be written outside Looper's quarantine tree.
+func ensureRealQuarantineTree(quarantineLeaf string) error {
+	root := filepath.Dir(quarantineLeaf)
+	if filepath.Base(root) != reservedReviewScratchQuarantineDirName {
+		return fmt.Errorf("quarantine leaf %q not under %s", quarantineLeaf, reservedReviewScratchQuarantineDirName)
+	}
+	if err := ensureRealQuarantineRoot(root); err != nil {
+		return err
+	}
+	info, err := os.Lstat(quarantineLeaf)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if mkErr := os.Mkdir(quarantineLeaf, 0o755); mkErr != nil {
+				return mkErr
+			}
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("quarantine path %q is a symlink", quarantineLeaf)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("quarantine path %q is not a directory", quarantineLeaf)
+	}
+	return nil
+}
+
+func ensureRealQuarantineRoot(root string) error {
+	info, err := os.Lstat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if mkErr := os.Mkdir(root, 0o755); mkErr != nil {
+				return mkErr
+			}
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("quarantine root %q is a symlink", root)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("quarantine root %q is not a directory", root)
+	}
+	return nil
+}
+
+// requireRealDirNoFollow Lstats path and requires a non-symlink directory.
+// Returns the original NotExist error when missing so callers can branch.
+func requireRealDirNoFollow(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("path %q is a symlink", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path %q is not a directory", path)
+	}
+	return nil
+}
+
+// removeQuarantineDirNoFollow deletes dir only when the quarantine root and dir
+// itself are real directories (Lstat). Missing paths are success. Symlinks are
+// refused so os.RemoveAll cannot follow an intermediate symlink out of quarantine.
+func removeQuarantineDirNoFollow(dir string) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil
+	}
+	root := filepath.Dir(dir)
+	if filepath.Base(root) != reservedReviewScratchQuarantineDirName {
+		return fmt.Errorf("refuse quarantine delete outside %s: %q", reservedReviewScratchQuarantineDirName, dir)
+	}
+	if err := requireRealDirNoFollow(root); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := requireRealDirNoFollow(dir); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return os.RemoveAll(dir)
 }
 
 // orphanQuarantineExpired reports whether the orphan quarantine container is
