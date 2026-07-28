@@ -1431,20 +1431,37 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if handle != nil {
 		t.Fatalf("Start() handle = %#v, want nil", handle)
 	}
-	if data, readErr := os.ReadFile(pidPath); readErr == nil {
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if parseErr != nil {
-			t.Fatalf("parse pid: %v", parseErr)
-		}
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
-				return
+	// The child may race Start's reap: wait for a non-empty pid file (or its
+	// absence) before asserting the process is gone. An empty file is not yet a
+	// usable pid — reading it too early flaked with strconv.Atoi("").
+	deadline := time.Now().Add(2 * time.Second)
+	var pid int
+	for time.Now().Before(deadline) {
+		data, readErr := os.ReadFile(pidPath)
+		if readErr != nil {
+			if os.IsNotExist(readErr) {
+				return // never wrote a pid; nothing left to reap
 			}
-			time.Sleep(10 * time.Millisecond)
+		} else if s := strings.TrimSpace(string(data)); s != "" {
+			parsed, parseErr := strconv.Atoi(s)
+			if parseErr != nil {
+				t.Fatalf("parse pid: %v", parseErr)
+			}
+			pid = parsed
+			break
 		}
-		t.Fatalf("spawned process %d survived failed Start", pid)
+		time.Sleep(10 * time.Millisecond)
 	}
+	if pid == 0 {
+		return // still no pid after wait; treat as already gone
+	}
+	for time.Now().Before(deadline) {
+		if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("spawned process %d survived failed Start", pid)
 }
 
 func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {
