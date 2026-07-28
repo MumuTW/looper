@@ -3056,6 +3056,16 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 					kind:    FailureRetryableAfterResume,
 				}
 			}
+		} else if r.hasAnsweredHITLAsk(ctx, &input.Loop) {
+			// Answered park present but not injectable: review/intent (or head)
+			// fingerprints drifted while parked. Do not start the agent against
+			// stale checkpoint FixItems — rediscover live review state first.
+			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+			checkpoint.Repair = nil
+			return checkpoint, &loopError{
+				message: "HITL repair aborted: parked human answer invalidated by live review/intent fingerprint drift; restart from discover",
+				kind:    FailureRetryableAfterResume,
+			}
 		}
 	}
 

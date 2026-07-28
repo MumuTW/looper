@@ -100,7 +100,13 @@ func TestHITLContract_DurableParkClearsStaleAskJSON(t *testing.T) {
 		HeadSHA: pr87Head, BaseSHA: pr87Base, BaseRefName: "main", HeadRefName: "feature/pr87",
 		Title: pr87Title, Body: pr87Body,
 	}
-	fixItems := []FixItem{{Type: "comment", ID: "c-strategy", ThreadID: "t-strategy", Summary: pr87ReviewerBody}}
+	// ThreadFingerprint must match liveReviewThreadFingerprint for the fake
+	// thread below (id@updatedAt with empty UpdatedAt → "c-strategy@").
+	fixItems := []FixItem{{
+		Type: "comment", ID: "c-strategy", ThreadID: "t-strategy",
+		Summary: pr87ReviewerBody, Body: "",
+		ThreadFingerprint: "c-strategy@",
+	}}
 	meta, _ := loops.WriteHITLAsk(nil, loops.HITLAsk{
 		Question: parkedQuestion, Answer: "keep RollingUpdate (PR intent)", Status: "answered",
 		SessionID: "sess-stale-ask", Vendor: "codex",

@@ -135,7 +135,7 @@ func TestHITLContract_LiveReviewDriftBlocksInject(t *testing.T) {
 		Logger: fixture.logger, Now: fixture.now,
 		HITLEnabled: true, AgentRuntime: "codex",
 	})
-	_, err = runner.runRepairStep(ctx, stepInput{
+	cp, err := runner.runRepairStep(ctx, stepInput{
 		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &projectMeta},
 		Loop:    loop, Run: run, Repo: repo, PRNumber: pr,
 		Checkpoint: fixerCheckpoint{
@@ -144,10 +144,19 @@ func TestHITLContract_LiveReviewDriftBlocksInject(t *testing.T) {
 			Worktree: &checkpointWorktree{Path: wt, Branch: "feature/pr87", HeadSHA: pr87Head, PreparedAt: nowISO},
 		},
 	})
-	if len(agent.starts) != 1 {
-		t.Fatalf("agent starts = %d, want 1 (err=%v)", len(agent.starts), err)
+	if err == nil {
+		t.Fatal("expected review fingerprint drift to abort repair before agent start")
 	}
-	if strings.Contains(agent.starts[0].Prompt, "Their decision: keep RollingUpdate") {
-		t.Fatal("live review content drift must not inject the old human decision")
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent starts = %d, want 0 when review fingerprints drift (prompt must not run against stale FixItems)", len(agent.starts))
+	}
+	if cp.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("ResumePolicy = %q, want %q", cp.ResumePolicy, loops.ResumePolicyRestartFromDiscover)
+	}
+	if cp.Repair != nil {
+		t.Fatalf("Repair = %#v, want nil so rediscovery rebuilds fix items", cp.Repair)
+	}
+	if !strings.Contains(err.Error(), "fingerprint drift") {
+		t.Fatalf("error = %v, want fingerprint drift message", err)
 	}
 }

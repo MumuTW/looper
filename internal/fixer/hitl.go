@@ -834,6 +834,17 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		Role:                     "fixer",
 	}
 
+	// Serialize answer delivery with this suspension: once park publishes
+	// awaiting_human the cancelled queue row is requeueable by /respond and the
+	// GitHub poll. Holding the shared requeue lock until suspend fully finishes
+	// (delivery, correlation attach, run complete, notify) keeps the item
+	// nonclaimable for answer paths that take the same lock before requeue.
+	// Call order matches deliverHITLAnswerToLoop: loop lock, then target lock.
+	unlockRequeue := loops.LockLoopRequeue(input.Loop.ID)
+	defer unlockRequeue()
+	unlockTarget := loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(input.Loop))
+	defer unlockTarget()
+
 	// Durable park BEFORE remote GitHub mutation so a DB failure cannot leave an
 	// orphan PR ask without a loop record. Stamp transport/PR identity first so
 	// the parked ask is poll-eligible once AskCommentID is filled after delivery.
@@ -860,10 +871,10 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 
 	if r.hitlTransportGitHub() {
 		if err := r.deliverAskToGitHub(ctx, input, awaiting, &ask); err != nil {
-			// Park happened without a PR comment. Roll back to running + clear the
-			// incomplete ask so claim recovery can MarkRetry and re-enter suspend
-			// (ask.json remains for undurable re-park). Do not notify or complete
-			// as awaiting_human — that would leave poll with AskCommentID unset.
+			// Park happened without a PR comment. Roll back to running, clear the
+			// incomplete ask, and requeue the cancelled claim so the scheduler can
+			// MarkRetry-equivalent retry even when callers use suspendForHuman
+			// directly (ask.json remains for undurable re-park).
 			if rbErr := r.rollbackHITLParkForDeliveryRetry(ctx, input.Loop, nowISO); rbErr != nil && r.logger != nil {
 				r.logger.Warn("fixer HITL rollback after github delivery failure failed", map[string]any{
 					"loopId": input.Loop.ID, "error": rbErr.Error(),
@@ -876,15 +887,16 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		}
 		// Persist AskCommentID onto the durable park (delivery is remote-side;
 		// comment id must land in metadata for detectGitHubHITLAnswer).
+		// Never clear the park after a successful CreateIssueComment: rollback
+		// would drop correlation and a retry would post a second question while
+		// humans reply to the first. Force-attach the delivered id and finish
+		// suspension even if the first CAS write fails.
 		if err := r.persistParkedHITLAsk(ctx, input.Loop, ask, nowISO); err != nil {
-			if rbErr := r.rollbackHITLParkForDeliveryRetry(ctx, input.Loop, nowISO); rbErr != nil && r.logger != nil {
-				r.logger.Warn("fixer HITL rollback after park update failure failed", map[string]any{
-					"loopId": input.Loop.ID, "error": rbErr.Error(),
+			if forceErr := r.forcePersistDeliveredAskComment(ctx, input.Loop, ask, nowISO); forceErr != nil && r.logger != nil {
+				r.logger.Warn("fixer HITL could not attach AskCommentID after GitHub delivery; park kept to avoid double-post", map[string]any{
+					"loopId": input.Loop.ID, "askCommentId": ask.AskCommentID,
+					"persistError": err.Error(), "forceError": forceErr.Error(),
 				})
-			}
-			return ProcessResult{}, &loopError{
-				message: fmt.Sprintf("HITL park update after GitHub delivery failed: %v", err),
-				kind:    FailureRetryableTransient,
 			}
 		}
 	}
@@ -962,7 +974,10 @@ func (r *Runner) finishHITLSuspendAfterTerminate(ctx context.Context, input step
 }
 
 // rollbackHITLParkForDeliveryRetry undoes an awaiting_human park that never got
-// a GitHub AskCommentID so claim recovery can retry the suspension.
+// a GitHub AskCommentID so the scheduler can claim work again and re-enter
+// suspend. parkHITLLoop already cancelled the active queue row; without requeue
+// here a transient CreateIssueComment failure leaves running + no claimable item
+// when callers return the error without going through recoverClaimedItem.
 func (r *Runner) rollbackHITLParkForDeliveryRetry(ctx context.Context, loop storage.LoopRecord, nowISO string) error {
 	apply := func(repos *storage.Repositories) error {
 		current, err := repos.Loops.GetByID(ctx, loop.ID)
@@ -979,8 +994,77 @@ func (r *Runner) rollbackHITLParkForDeliveryRetry(ctx context.Context, loop stor
 		if meta, cerr := loops.ClearHITLAsk(updated.MetadataJSON); cerr == nil {
 			updated.MetadataJSON = &meta
 		}
-		// running so recoverClaimedItem.reconcileRecoveredLoop can requeue.
+		// running + requeued cancelled claim so the scheduler retries suspend.
 		updated.Status = "running"
+		updated.NextRunAt = &nowISO
+		updated.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return err
+		}
+		if _, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, loop.ID, nowISO); err != nil {
+			return err
+		}
+		return nil
+	}
+	if r.db != nil {
+		return storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+			return apply(storage.NewRepositories(tx))
+		})
+	}
+	if r.repos == nil {
+		return fmt.Errorf("repositories unavailable for HITL park rollback")
+	}
+	return apply(r.repos)
+}
+
+// forcePersistDeliveredAskComment writes AskCommentID (and transport identity)
+// onto the durable park after a successful remote CreateIssueComment when the
+// normal CAS attach failed. Never clears the park: a human may already see the
+// first question, and a full rollback would cause a second post on retry.
+func (r *Runner) forcePersistDeliveredAskComment(ctx context.Context, loop storage.LoopRecord, delivered loops.HITLAsk, nowISO string) error {
+	if delivered.AskCommentID <= 0 {
+		return fmt.Errorf("no delivered AskCommentID to force-persist")
+	}
+	apply := func(repos *storage.Repositories) error {
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return fmt.Errorf("loop %s not found for HITL ask force-attach", loop.ID)
+		}
+		if current.Status == "terminated" || current.Status == "stopped" {
+			return errHITLLoopTerminated
+		}
+		existing, ok := loops.ReadHITLAsk(current.MetadataJSON)
+		if !ok {
+			// Park metadata missing; re-seed minimal awaiting ask with the
+			// delivered comment so poll/dashboard can still correlate.
+			existing = loops.HITLAsk{
+				Question: delivered.Question, Options: delivered.Options,
+				SessionID: delivered.SessionID, ExecutionID: delivered.ExecutionID,
+				Vendor: delivered.Vendor, Status: "awaiting", AskedAt: delivered.AskedAt,
+				Role: delivered.Role,
+			}
+		}
+		if existing.AskCommentID == 0 {
+			existing.AskCommentID = delivered.AskCommentID
+		}
+		if strings.TrimSpace(existing.Transport) == "" {
+			existing.Transport = delivered.Transport
+		}
+		if strings.TrimSpace(existing.Provider) == "" {
+			existing.Provider = delivered.Provider
+		}
+		if existing.PRNumber <= 0 {
+			existing.PRNumber = delivered.PRNumber
+		}
+		meta, werr := loops.WriteHITLAsk(current.MetadataJSON, existing)
+		if werr != nil {
+			return werr
+		}
+		updated := *current
+		updated.MetadataJSON = &meta
 		updated.UpdatedAt = nowISO
 		return repos.Loops.Upsert(ctx, updated)
 	}
@@ -990,7 +1074,7 @@ func (r *Runner) rollbackHITLParkForDeliveryRetry(ctx context.Context, loop stor
 		})
 	}
 	if r.repos == nil {
-		return fmt.Errorf("repositories unavailable for HITL park rollback")
+		return fmt.Errorf("repositories unavailable for HITL ask force-attach")
 	}
 	return apply(r.repos)
 }
@@ -1207,6 +1291,29 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 	// Transport fields may already be stamped at park time; re-stamp is idempotent.
 	if err := r.stampGitHubAskTransport(input, ask); err != nil {
 		return err
+	}
+	// Idempotent recovery: a prior CreateIssueComment already succeeded (e.g.
+	// correlation write failed mid-suspend). Never post a second question.
+	if ask.AskCommentID > 0 {
+		return nil
+	}
+	if existing, ok := r.readFreshHITLAsk(ctx, &input.Loop); ok && existing.AskCommentID > 0 {
+		// Same park generation (or already answered with this comment).
+		if strings.TrimSpace(existing.ExecutionID) == "" ||
+			strings.TrimSpace(existing.ExecutionID) == strings.TrimSpace(ask.ExecutionID) ||
+			existing.Status == "answered" || existing.Status == "consumed" {
+			ask.AskCommentID = existing.AskCommentID
+			if strings.TrimSpace(ask.Transport) == "" {
+				ask.Transport = existing.Transport
+			}
+			if strings.TrimSpace(ask.Provider) == "" {
+				ask.Provider = existing.Provider
+			}
+			if ask.PRNumber <= 0 {
+				ask.PRNumber = existing.PRNumber
+			}
+			return nil
+		}
 	}
 	repo := firstNonEmpty(input.Repo, derefString(input.Loop.Repo))
 	prNumber := ask.PRNumber
