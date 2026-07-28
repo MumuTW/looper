@@ -21,6 +21,10 @@ type githubAnswerComment struct {
 	ID     int64
 	Author string
 	Body   string
+	// IsBot is true when the provider marked the author as a bot (GitHub
+	// user.type=Bot, Forgejo/Gitea bot identity, or equivalent). Bot comments
+	// must never be treated as HITL answers when answerAuthors is empty.
+	IsBot bool
 }
 
 // looperCommentMarker tags every comment looper itself posts (the ask marker and
@@ -32,9 +36,10 @@ const looperCommentMarker = "<!-- looper:"
 // detectGitHubHITLAnswer returns the human's answer to a GitHub HITL ask, or ""
 // when none has arrived yet. The answer is the FIRST comment posted after the ask
 // (comment id > askCommentID; GitHub comment ids are monotonic) that is NOT one of
-// looper's own comments (no looper marker). When answerAuthors is non-empty the
-// commenter must be on that allowlist; otherwise any human reply may answer.
-// Empty-bodied comments are ignored so ordinary reactions/edits don't count.
+// looper's own comments (no looper marker) and not a bot account. When
+// answerAuthors is non-empty the commenter must be on that allowlist; otherwise
+// any non-bot human reply may answer. Empty-bodied comments are ignored so
+// ordinary reactions/edits don't count.
 func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, answerAuthors []string) string {
 	allow := make(map[string]bool, len(answerAuthors))
 	for _, a := range answerAuthors {
@@ -55,6 +60,13 @@ func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, 
 		if author == "" {
 			continue
 		}
+		// Reject bots unless the operator explicitly allowlisted that login.
+		// Default empty answerAuthors must not accept CI/app/service-account
+		// comments as the authoritative human decision (Forgejo especially has
+		// no looper marker on third-party bots).
+		if isHITLAnswerBotAuthor(c) && (len(allow) == 0 || !allow[strings.ToLower(author)]) {
+			continue
+		}
 		if len(allow) > 0 && !allow[strings.ToLower(author)] {
 			continue
 		}
@@ -68,6 +80,19 @@ func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, 
 		}
 	}
 	return answer
+}
+
+// isHITLAnswerBotAuthor reports provider-marked bots and GitHub-style [bot]
+// logins. Used by the shared GitHub/Forgejo HITL answer detector.
+func isHITLAnswerBotAuthor(c githubAnswerComment) bool {
+	if c.IsBot {
+		return true
+	}
+	login := strings.ToLower(strings.TrimSpace(c.Author))
+	if login == "" {
+		return false
+	}
+	return strings.HasSuffix(login, "[bot]")
 }
 
 // githubHITLPollDeps are the injected dependencies of the answer-poll lane, kept
@@ -307,7 +332,12 @@ func listHITLIssueComments(ctx context.Context, cfg *config.Config, gw *githubin
 		}
 		out := make([]githubAnswerComment, 0, len(cs))
 		for _, c := range cs {
-			out = append(out, githubAnswerComment{ID: c.ID, Author: c.User.Login, Body: c.Body})
+			out = append(out, githubAnswerComment{
+				ID:     c.ID,
+				Author: c.User.Login,
+				Body:   c.Body,
+				IsBot:  c.User.IsBot,
+			})
 		}
 		return out, nil
 	}
@@ -320,7 +350,12 @@ func listHITLIssueComments(ctx context.Context, cfg *config.Config, gw *githubin
 	}
 	out := make([]githubAnswerComment, 0, len(cs))
 	for _, c := range cs {
-		out = append(out, githubAnswerComment{ID: c.ID, Author: c.Author, Body: c.Body})
+		out = append(out, githubAnswerComment{
+			ID:     c.ID,
+			Author: c.Author,
+			Body:   c.Body,
+			IsBot:  c.IsBot || strings.HasSuffix(strings.ToLower(strings.TrimSpace(c.Author)), "[bot]"),
+		})
 	}
 	return out, nil
 }

@@ -47,11 +47,14 @@ export function HITLDecisionCard({
   const [inlineError, setInlineError] = useState<string | null>(null);
 
   const askStatus = (ask.status || "").toLowerCase();
-  // Interactive respond is only valid while the loop is parked AND the ask has
-  // not been answered/consumed yet. Missing ask status counts as awaiting.
+  // Keep the card interactive for the entire awaiting_human park. If /respond
+  // stored ask.status=answered but requeue then failed (e.g. agent removed), the
+  // loop is still parked and the operator must be able to retry after fixing
+  // config. Only leave interactive mode once the loop itself left awaiting_human.
+  // "consumed" is defensive: a consumed ask with status still awaiting_human is
+  // unexpected but should not reopen a finished decision.
   const interactive =
-    loopStatus === "awaiting_human" &&
-    (askStatus === "" || askStatus === "awaiting");
+    loopStatus === "awaiting_human" && askStatus !== "consumed";
 
   const busy = pendingOption !== null || customPending;
 

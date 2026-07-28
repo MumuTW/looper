@@ -99,6 +99,10 @@ type Provider interface {
 type Identity struct {
 	Login string `json:"login"`
 	ID    int64  `json:"id"`
+	// IsBot is true when the forge marks the account as a bot/app/service
+	// identity. HITL answer detection uses this so unmarked CI comments are not
+	// treated as human decisions when answerAuthors is empty.
+	IsBot bool `json:"is_bot,omitempty"`
 }
 
 type Registry struct {

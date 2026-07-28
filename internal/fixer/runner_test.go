@@ -6694,6 +6694,70 @@ func TestParseReplyExplanationsPreservesUnknownActionForContractViolationHandlin
 	}
 }
 
+func TestRawNeedsHumanEscalationRejected_EmptyExplanation(t *testing.T) {
+	t.Parallel()
+	// needs_human without explanation is dropped by parseReplyExplanations; the
+	// raw-intent gate must still reject so repair cannot complete/push.
+	stdout := `__LOOPER_RESULT__={"summary":"escalating","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","action":"needs_human","explanation":""}]}`
+	items := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
+	accepted := parseReplyExplanations(stdout, "", items)
+	if len(accepted) != 0 {
+		t.Fatalf("accepted = %#v, want empty (empty explanation dropped)", accepted)
+	}
+	if !rawNeedsHumanEscalationRejected(stdout, "", items, accepted) {
+		t.Fatal("raw needs_human with empty explanation must be rejected")
+	}
+}
+
+func TestRawNeedsHumanEscalationRejected_MismatchedThreadID(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"summary":"escalating","review_thread_replies":[{"fixItemId":"c1","threadId":"t-wrong","action":"needs_human","explanation":"conflicts with PR intent"}]}`
+	items := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
+	accepted := parseReplyExplanations(stdout, "", items)
+	if len(accepted) != 0 {
+		t.Fatalf("accepted = %#v, want empty (thread mismatch dropped)", accepted)
+	}
+	if !rawNeedsHumanEscalationRejected(stdout, "", items, accepted) {
+		t.Fatal("raw needs_human with mismatched threadId must be rejected")
+	}
+}
+
+func TestRawNeedsHumanEscalationRejected_UnknownFixItem(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"summary":"escalating","review_thread_replies":[{"fixItemId":"c-unknown","threadId":"t1","action":"needs_human","explanation":"needs human"}]}`
+	items := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
+	accepted := parseReplyExplanations(stdout, "", items)
+	if len(accepted) != 0 {
+		t.Fatalf("accepted = %#v, want empty", accepted)
+	}
+	if !rawNeedsHumanEscalationRejected(stdout, "", items, accepted) {
+		t.Fatal("raw needs_human with unknown fixItemId must be rejected")
+	}
+}
+
+func TestRawNeedsHumanEscalationRejected_ValidNeedsHumanPasses(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"summary":"escalating","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","action":"needs_human","explanation":"conflicts with PR intent"}]}`
+	items := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
+	accepted := parseReplyExplanations(stdout, "", items)
+	if len(accepted) != 1 || accepted[0].Action != string(replyActionNeedsHuman) {
+		t.Fatalf("accepted = %#v, want valid needs_human", accepted)
+	}
+	if rawNeedsHumanEscalationRejected(stdout, "", items, accepted) {
+		t.Fatal("valid needs_human must not be rejected by raw gate")
+	}
+}
+
+func TestRawNeedsHumanEscalationRejected_NoNeedsHumanPasses(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"summary":"done","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","action":"fixed","explanation":"applied"}]}`
+	items := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
+	accepted := parseReplyExplanations(stdout, "", items)
+	if rawNeedsHumanEscalationRejected(stdout, "", items, accepted) {
+		t.Fatal("ordinary fixed reply must not trip needs_human gate")
+	}
+}
+
 func TestRecordZeroProgressSuccessPausesAfterThreeRunsAndResumesOnStateChange(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -946,6 +946,11 @@ func sanitizeForgejoErrorBody(body []byte, token string) string {
 type forgejoUser struct {
 	ID    int64  `json:"id"`
 	Login string `json:"login"`
+	// Type is the Gitea/Forgejo account kind when present ("User", "Organization",
+	// or provider-specific bot/app values). Optional — older instances omit it.
+	Type string `json:"type,omitempty"`
+	// IsBot is set when the instance exposes an explicit bot flag on the user.
+	IsBot bool `json:"is_bot,omitempty"`
 }
 
 type forgejoLabel struct {
@@ -1114,7 +1119,31 @@ func convertPullRequestReviewComment(input forgejoPullRequestReviewComment) Pull
 	return comment
 }
 
-func convertUser(input forgejoUser) Identity { return Identity{Login: input.Login, ID: input.ID} }
+func convertUser(input forgejoUser) Identity {
+	return Identity{
+		Login: input.Login,
+		ID:    input.ID,
+		IsBot: forgejoUserIsBot(input),
+	}
+}
+
+// forgejoUserIsBot reports bot/app/service accounts from provider fields and
+// common login conventions so HITL poll can reject non-human answers.
+func forgejoUserIsBot(input forgejoUser) bool {
+	if input.IsBot {
+		return true
+	}
+	login := strings.ToLower(strings.TrimSpace(input.Login))
+	if strings.HasSuffix(login, "[bot]") {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(input.Type)) {
+	case "bot", "app", "application", "service":
+		return true
+	default:
+		return false
+	}
+}
 
 func convertUsers(input []forgejoUser) []Identity {
 	users := make([]Identity, 0, len(input))

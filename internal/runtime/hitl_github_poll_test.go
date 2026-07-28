@@ -35,6 +35,28 @@ func TestDetectGitHubHITLAnswer(t *testing.T) {
 	}
 }
 
+func TestDetectGitHubHITLAnswer_RejectsBotAuthors(t *testing.T) {
+	// Forgejo/GitHub default empty answerAuthors must not accept the first
+	// unmarked CI/app/service-account comment after the ask as the answer.
+	comments := []githubAnswerComment{
+		{ID: 10, Author: "looper", Body: "<!-- looper:hitl:ask --> q"},
+		{ID: 11, Author: "actions-bot", Body: "Build passed", IsBot: true},
+		{ID: 12, Author: "dependabot[bot]", Body: "Bump lodash"},
+		{ID: 13, Author: "human-op", Body: "keep RollingUpdate"},
+	}
+	if got := detectGitHubHITLAnswer(comments, 10, nil); got != "keep RollingUpdate" {
+		t.Fatalf("answer = %q, want human reply after skipping bots", got)
+	}
+	// Only bots after the ask -> no answer yet.
+	if got := detectGitHubHITLAnswer(comments[:3], 10, nil); got != "" {
+		t.Fatalf("answer = %q, want empty when only bots replied", got)
+	}
+	// Explicit allowlist may accept a bot login (operator choice).
+	if got := detectGitHubHITLAnswer(comments, 10, []string{"actions-bot"}); got != "Build passed" {
+		t.Fatalf("answer = %q, want allowlisted bot comment", got)
+	}
+}
+
 func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 	commentsByPR := map[int64][]githubAnswerComment{
 		42: {{ID: 500, Author: "lefarcen", Body: "<!-- looper:hitl:ask --> ask"}, {ID: 501, Author: "lefarcen", Body: "go with A"}},

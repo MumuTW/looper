@@ -184,6 +184,10 @@ type CommentInfo struct {
 	CreatedAt         string
 	UpdatedAt         string
 	URL               string
+	// IsBot is true when the GitHub user type is Bot (or equivalent). HITL answer
+	// detection uses this so app/bot issue comments are not treated as human
+	// decisions when answerAuthors is empty.
+	IsBot bool
 }
 
 type CurrentUserIdentity struct {
@@ -3839,17 +3843,34 @@ func extractCommentInfos(value any) []CommentInfo {
 	}
 	out := make([]CommentInfo, 0, len(items))
 	for _, row := range items {
+		authorSource := firstNonNil(row["author"], row["user"])
+		author := extractAuthor(authorSource)
 		out = append(out, CommentInfo{
 			ID:                asInt64(firstNonNil(row["id"], row["databaseId"])),
-			Author:            extractAuthor(firstNonNil(row["author"], row["user"])),
+			Author:            author,
 			AuthorAssociation: firstNonEmpty(asString(row["authorAssociation"]), asString(row["author_association"])),
 			Body:              asString(row["body"]),
 			CreatedAt:         firstNonEmpty(asString(row["createdAt"]), asString(row["created_at"])),
 			UpdatedAt:         firstNonEmpty(asString(row["updatedAt"]), asString(row["updated_at"])),
 			URL:               firstNonEmpty(asString(row["url"]), asString(row["html_url"])),
+			IsBot:             commentAuthorIsBot(authorSource, author),
 		})
 	}
 	return out
+}
+
+// commentAuthorIsBot reports GitHub bot accounts from user.type and the
+// conventional [bot] login suffix used by GitHub Apps.
+func commentAuthorIsBot(authorSource any, login string) bool {
+	if obj, ok := authorSource.(map[string]any); ok && obj != nil {
+		if strings.EqualFold(strings.TrimSpace(asString(obj["type"])), "Bot") {
+			return true
+		}
+		if asBool(obj["is_bot"]) || asBool(obj["isBot"]) {
+			return true
+		}
+	}
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(login)), "[bot]")
 }
 
 func splitRepoOwnerName(repo string) (string, string) {

@@ -1019,6 +1019,10 @@ const (
 // keeping the first valid occurrence, and truncated. Disclosure markers,
 // @mentions, and HTML tags are stripped so the adapter remains the only path
 // that stamps and templates the reply.
+//
+// Malformed needs_human rows are intentionally dropped here; callers must run
+// rawNeedsHumanEscalationRejected before treating a missing needs_human reply as
+// "no escalation" so push cannot proceed after a dropped human-authority ask.
 func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyExplanationEntry {
 	combined := stdout + "\n" + stderr
 	if strings.TrimSpace(combined) == "" {
@@ -1092,6 +1096,87 @@ func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyEx
 		return nil
 	}
 	return out
+}
+
+// rawNeedsHumanEscalationRejected reports whether the completion marker declares
+// action "needs_human" (review_thread_replies or native repair_results) but the
+// filtered reply set does not retain that escalation. parseReplyExplanations /
+// parseNativeRepairResults drop empty explanations, unknown fix items, and
+// mismatched thread IDs; without this check the repair step would mark complete
+// and push even though the agent requested human authority.
+func rawNeedsHumanEscalationRejected(stdout, stderr string, fixItems []FixItem, accepted []replyExplanationEntry) bool {
+	if rawNeedsHumanReviewThreadCount(stdout, stderr) == 0 && rawNeedsHumanNativeCount(stdout, stderr) == 0 {
+		return false
+	}
+	acceptedNeedsHuman := 0
+	for _, entry := range accepted {
+		if normalizeReplyAction(entry.Action) == string(replyActionNeedsHuman) {
+			acceptedNeedsHuman++
+		}
+	}
+	// Any raw needs_human that did not survive filtering is a fail-closed contract
+	// violation. Count is a coarse signal: if the agent emitted at least one
+	// needs_human and none are accepted, or accepted count is below raw count,
+	// reject. Comparing counts also catches a mix of valid + malformed rows.
+	rawCount := rawNeedsHumanReviewThreadCount(stdout, stderr) + rawNeedsHumanNativeCount(stdout, stderr)
+	if acceptedNeedsHuman < rawCount {
+		return true
+	}
+	// Defensive: also require accepted needs_human entries to map onto current
+	// fix items (parse already filters, but keep the gate self-contained).
+	_ = fixItems
+	return false
+}
+
+func rawNeedsHumanReviewThreadCount(stdout, stderr string) int {
+	payload := extractCompletionMarkerPayload(stdout + "\n" + stderr)
+	if payload == "" {
+		return 0
+	}
+	var parsed struct {
+		ReviewThreadReplies []struct {
+			Action string `json:"action"`
+		} `json:"review_thread_replies"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return 0
+	}
+	n := 0
+	for _, raw := range parsed.ReviewThreadReplies {
+		if normalizeReplyAction(raw.Action) == string(replyActionNeedsHuman) {
+			n++
+		}
+	}
+	return n
+}
+
+func rawNeedsHumanNativeCount(stdout, stderr string) int {
+	payload := extractCompletionMarkerPayload(stdout + "\n" + stderr)
+	if payload == "" {
+		return 0
+	}
+	var parsed struct {
+		RepairResults []struct {
+			Action string `json:"action"`
+		} `json:"repair_results"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return 0
+	}
+	n := 0
+	for _, raw := range parsed.RepairResults {
+		if normalizeNativeRepairAction(raw.Action) == string(replyActionNeedsHuman) {
+			n++
+		}
+	}
+	return n
+}
+
+func errMalformedNeedsHumanEscalation() error {
+	return &loopError{
+		message: "fixer agent emitted needs_human but the escalation record was malformed (missing explanation, unknown fixItemId, or mismatched threadId); refusing to complete repair or push",
+		kind:    FailureManualIntervention,
+	}
 }
 
 func normalizeReplyAction(raw string) string {
@@ -3177,6 +3262,12 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// needs_human or ask.json sentinel can suspend without mutating review state.
 	replies := normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
 	replies = append(replies, parseNativeRepairResults(result.Stdout, result.Stderr, checkpoint.FixItems)...)
+	// Fail closed when the agent declared needs_human but filtering dropped every
+	// (or any) escalation row. ask.json is optional, so a silent drop would mark
+	// repair complete and push changes the agent asked a human to authorize.
+	if rawNeedsHumanEscalationRejected(result.Stdout, result.Stderr, checkpoint.FixItems, replies) {
+		return checkpoint, errMalformedNeedsHumanEscalation()
+	}
 	if !r.hitlEnabled {
 		// HITL off: needs_human / ask.json is an invalid agent contract — fail closed.
 		if repliesNeedHuman(replies) {
