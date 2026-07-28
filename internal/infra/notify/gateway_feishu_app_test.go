@@ -292,7 +292,7 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 
 		if err := gateway.SendHITLAsk(ctx, HITLAskCard{
 			ProjectID: "od", LoopSeq: 72, Question: "Keep or restore?",
-			Options: []string{"keep", "restore"},
+			Options:     []string{"keep", "restore"},
 			ExecutionID: "agent-gen-1", AskedAt: "2026-07-28T03:00:00Z",
 		}); err != nil {
 			t.Fatalf("SendHITLAsk() error = %v", err)

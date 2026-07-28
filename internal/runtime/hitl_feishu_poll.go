@@ -25,7 +25,7 @@ type feishuInboxEvent struct {
 	RootID       string `json:"rootId"`
 	SenderOpenID string `json:"senderOpenId"`
 	Text         string `json:"text"`
-	Value struct {
+	Value        struct {
 		LoopSeq     string `json:"loopSeq"`
 		Answer      string `json:"answer"`
 		ExecutionID string `json:"executionId"`
