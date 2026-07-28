@@ -2778,3 +2778,91 @@ type reviewSubmitDiagnosticEvent struct {
 	Name   string
 	Fields map[string]any
 }
+
+func TestReviewThreadFingerprintFromNodesExcludesDeclinedAndFixedReplies(t *testing.T) {
+	t.Parallel()
+	const (
+		rootUpdated     = "2026-07-28T00:00:00Z"
+		declinedUpdated = "2026-07-28T01:00:00Z"
+		fixedUpdated    = "2026-07-28T02:00:00Z"
+		humanUpdated    = "2026-07-28T03:00:00Z"
+	)
+	nodes := []any{
+		map[string]any{
+			"id": "c-root", "updatedAt": rootUpdated,
+			"body": "Please restore configurable strategy",
+		},
+		map[string]any{
+			"id": "c-declined", "updatedAt": declinedUpdated,
+			// Declined marker must not be hashed (previously matched only
+			// "<!-- looper-fixer-reply " with a trailing space, so this stayed in).
+			"body": "Decline reason\n\n<!-- looper-fixer-reply-declined thread:t1 fingerprint:fp1 -->",
+		},
+		map[string]any{
+			"id": "c-fixed", "updatedAt": fixedUpdated,
+			"body": "Fixed.\n\n<!-- looper-fixer-reply thread:t1 commit:abc -->",
+		},
+		map[string]any{
+			"id": "c-round", "updatedAt": fixedUpdated,
+			"body": "<!-- looper:fixer-round head=abc -->",
+		},
+		map[string]any{
+			"id": "c-human", "updatedAt": humanUpdated,
+			"body": "Also drop the hard-code in prod",
+		},
+	}
+	got := reviewThreadFingerprintFromNodes(nodes)
+	want := "c-root@" + rootUpdated + "|c-human@" + humanUpdated
+	if got != want {
+		t.Fatalf("fingerprint = %q, want %q", got, want)
+	}
+}
+
+func TestReviewThreadFingerprintFromNodesDeclinedOnlyMatchesRootAlone(t *testing.T) {
+	t.Parallel()
+	// Reopened thrash: root + prior declined reply must hash like root alone so
+	// ask-time collection matches resume-time live refresh.
+	const rootUpdated = "2026-07-28T00:00:00Z"
+	withDeclined := []any{
+		map[string]any{
+			"id": "c-root", "updatedAt": rootUpdated,
+			"body": "Please restore configurable strategy",
+		},
+		map[string]any{
+			"id": "c-declined", "updatedAt": "2026-07-28T01:00:00Z",
+			"body": "<!-- looper-fixer-reply-declined thread:t1 fingerprint:fp1 -->",
+		},
+	}
+	rootOnly := []any{
+		map[string]any{
+			"id": "c-root", "updatedAt": rootUpdated,
+			"body": "Please restore configurable strategy",
+		},
+	}
+	if got, want := reviewThreadFingerprintFromNodes(withDeclined), reviewThreadFingerprintFromNodes(rootOnly); got != want {
+		t.Fatalf("with declined = %q, root only = %q; must match", got, want)
+	}
+	if got := reviewThreadFingerprintFromNodes(withDeclined); got != "c-root@"+rootUpdated {
+		t.Fatalf("fingerprint = %q, want root only", got)
+	}
+}
+
+func TestIsLooperFixerReplyBody(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{"", false},
+		{"human review text", false},
+		{"<!-- looper-fixer-reply thread:t1 commit:abc -->", true},
+		{"Decline\n<!-- looper-fixer-reply-declined thread:t1 fingerprint:fp -->", true},
+		{"<!-- looper:fixer-round head=abc -->", true},
+		{"prefix looper-fixer-reply suffix", true},
+	}
+	for _, tc := range cases {
+		if got := isLooperFixerReplyBody(tc.body); got != tc.want {
+			t.Fatalf("isLooperFixerReplyBody(%q) = %v, want %v", tc.body, got, tc.want)
+		}
+	}
+}

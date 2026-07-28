@@ -3500,6 +3500,13 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	return out, true
 }
 
+// reviewThreadFingerprintFromNodes joins non-Looper-fixer comments as
+// id@updatedAt. Filtering must match fixer.liveReviewThreadFingerprint /
+// isLooperFixerReplyComment so ask-time ThreadFingerprint and resume-time live
+// refresh exclude the same markers (including <!-- looper-fixer-reply-declined -->).
+// The previous narrow check for "<!-- looper-fixer-reply " left declined replies
+// in the ask hash while resume dropped them, so reopened thrash never injected
+// the answered HITL decision.
 func reviewThreadFingerprintFromNodes(nodes []any) string {
 	parts := make([]string, 0, len(nodes))
 	for _, node := range nodes {
@@ -3507,7 +3514,7 @@ func reviewThreadFingerprintFromNodes(nodes []any) string {
 		if comment == nil {
 			continue
 		}
-		if strings.Contains(asString(comment["body"]), "<!-- looper-fixer-reply ") {
+		if isLooperFixerReplyBody(asString(comment["body"])) {
 			continue
 		}
 		id := strings.TrimSpace(asString(comment["id"]))
@@ -3521,6 +3528,17 @@ func reviewThreadFingerprintFromNodes(nodes []any) string {
 		return ""
 	}
 	return strings.Join(parts, "|")
+}
+
+// isLooperFixerReplyBody reports Looper fixer reply / round markers in a comment
+// body. Keep in lockstep with fixer.isLooperFixerReplyComment so collect-time
+// and resume-time thread fingerprints use identical exclusion rules.
+func isLooperFixerReplyBody(body string) bool {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return false
+	}
+	return strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
 }
 
 func validateCloseIssueStateReason(value string) (string, error) {

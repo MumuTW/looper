@@ -4299,6 +4299,9 @@ func isLooperReviewThreadComment(comment ReviewThreadComment) bool {
 	return disclosure.HasMarkdownStamp(body) || strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
 }
 
+// isLooperFixerReplyComment reports Looper fixer reply/round markers, including
+// declined replies. Keep in lockstep with github.isLooperFixerReplyBody so
+// collect-time and resume-time thread fingerprints exclude the same comments.
 func isLooperFixerReplyComment(comment ReviewThreadComment) bool {
 	body := strings.TrimSpace(comment.Body)
 	if body == "" {
