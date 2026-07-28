@@ -214,6 +214,23 @@ func (r *Runner) markHumanAnswerConsumed(ctx context.Context, loop *storage.Loop
 	return nil
 }
 
+// retireInvalidatedHITLAnswer clears a parked answered decision that can no longer
+// be injected (head / review / intent fingerprint drift). Must run before
+// restart_from_discover so rediscovery rebuilds FixItems and the next repair does
+// not re-abort on hasAnsweredHITLAsk + stale stored fingerprints until retries
+// exhaust.
+func (r *Runner) retireInvalidatedHITLAnswer(ctx context.Context, loop *storage.LoopRecord, reason string) error {
+	if loop == nil || !r.hasAnsweredHITLAsk(ctx, loop) {
+		return nil
+	}
+	if r.logger != nil {
+		r.logger.Warn("fixer HITL answered decision retired before rediscovery", map[string]any{
+			"loopId": loop.ID, "reason": reason,
+		})
+	}
+	return r.markHumanAnswerConsumed(ctx, loop)
+}
+
 func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord) (loops.HITLAsk, bool) {
 	meta := loop.MetadataJSON
 	if r.repos != nil && r.repos.Loops != nil {

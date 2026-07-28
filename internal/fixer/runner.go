@@ -3030,6 +3030,15 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		preparedHead := strings.TrimSpace(worktree.HeadSHA)
 		if !worktreeHeadMatchesLive(preparedHead, liveHead) {
 			// Force rediscovery/prepare on resume — do not loop on the same stale worktree.
+			// Retire any parked answered decision first: stored HeadSHA cannot match the
+			// new live head after rediscovery either, so leaving status=answered would
+			// thrash restart_from_discover until retries exhaust.
+			if err := r.retireInvalidatedHITLAnswer(ctx, &input.Loop, "live PR head differs from prepared worktree head"); err != nil {
+				return checkpoint, &loopError{
+					message: fmt.Sprintf("HITL repair aborted: failed to retire invalidated answer after head drift: %v", err),
+					kind:    FailureRetryableAfterResume,
+				}
+			}
 			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 			checkpoint.Repair = nil
 			return checkpoint, &loopError{
@@ -3067,6 +3076,15 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			// Answered park present but not injectable: review/intent (or head)
 			// fingerprints drifted while parked. Do not start the agent against
 			// stale checkpoint FixItems — rediscover live review state first.
+			// Retire the decision before restart: after rediscovery rebuilds FixItems,
+			// hasAnsweredHITLAsk would still be true and the new fingerprint still
+			// cannot match the stored ask FP, re-aborting until retries exhaust.
+			if err := r.retireInvalidatedHITLAnswer(ctx, &input.Loop, "live review/intent fingerprint drift"); err != nil {
+				return checkpoint, &loopError{
+					message: fmt.Sprintf("HITL repair aborted: failed to retire invalidated answer after fingerprint drift: %v", err),
+					kind:    FailureRetryableAfterResume,
+				}
+			}
 			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 			checkpoint.Repair = nil
 			return checkpoint, &loopError{
