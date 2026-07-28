@@ -40,6 +40,18 @@ type HITLAsk struct {
 	// Drift-detection fingerprints (infra signals only — authority remains the
 	// human answer / agent structured output). Populated by Fixer HITL asks;
 	// worker asks leave them empty.
+	//
+	// Trade-off (AGENTS.md "new concept"):
+	//   Failure prevented: a parked human answer must not authorize action after
+	//   the PR head, review thread (incl. non-root replies), or PR title/body
+	//   intent drifted while awaiting_human.
+	//   Cost: new persisted fields; resume must live-refresh provider content;
+	//   not-found vs transient errors must be distinguished; forgejo summary and
+	//   GitHub thread shapes need matching ask/resume field layouts; a refresh
+	//   failure fails closed (retry) instead of injecting the answer.
+	//   Why not simpler: fail-loud without fingerprints still injects a stale
+	//   answer on silent drift; trusting agent structured output alone cannot
+	//   see mid-park external PR/thread mutations the agent never re-observed.
 	HeadSHA                  string `json:"headSha,omitempty"`
 	ReviewThreadID           string `json:"reviewThreadId,omitempty"`
 	ReviewCommentID          string `json:"reviewCommentId,omitempty"`

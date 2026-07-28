@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/nexu-io/looper/internal/hitl"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -202,21 +203,30 @@ const missingLiveReviewMarker = "__hitl_missing_review__"
 // provider content (not the pre-suspend checkpoint snapshot alone).
 //
 // Field layout mirrors collect-time normalizeFixItems:
-//   - GitHub review threads: text lives in Summary, Body is empty
-//   - Native Forgejo comments: text lives in both Summary and Body
+//   - GitHub review threads: text lives in Summary, Body is empty; ThreadFingerprint
+//     covers the full non-Looper reply chain (id@updatedAt|...)
+//   - Native Forgejo comments: text lives in both Summary and Body; ObservedFingerprint
+//     becomes ThreadFingerprint
+//   - Forgejo reviewer-summary items: re-parsed from live PR issue comments
 //
 // Missing/deleted threads clear to missingLiveReviewMarker (do not keep stale
-// checkpoint text). Unverifiable item sources fail closed with an error.
+// checkpoint text). Provider/auth/rate-limit errors fail closed (returned), while
+// true not-found results mark the review missing. Unknown item sources fail closed.
 func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInput, fixItems []FixItem) (string, error) {
 	if r.github == nil {
 		return "", fmt.Errorf("github gateway unavailable for HITL review refresh")
 	}
 	var nativeByProvider map[int64]NativeReviewComment
+	var summaryByID map[string]FixItem
 	needNative := false
+	needSummary := false
 	for _, item := range fixItems {
-		if item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
+		src := strings.TrimSpace(item.Source)
+		if src == NativeReviewCommentSource && item.ProviderCommentID > 0 {
 			needNative = true
-			break
+		}
+		if src == "forgejo-reviewer-summary" {
+			needSummary = true
 		}
 	}
 	if needNative {
@@ -231,6 +241,25 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 			nativeByProvider[c.ProviderCommentID] = c
 		}
 	}
+	if needSummary {
+		// Re-parse open forgejo-reviewer-summary items from live PR issue comments
+		// so a human answer can resume after summary-sourced needs_human escalation.
+		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{
+			Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath,
+		})
+		if err != nil {
+			return "", fmt.Errorf("HITL live forgejo reviewer-summary refresh failed: %w", err)
+		}
+		summaryByID = make(map[string]FixItem)
+		for _, liveItem := range collectFixItems(detail) {
+			if strings.TrimSpace(liveItem.Source) != "forgejo-reviewer-summary" {
+				continue
+			}
+			if id := strings.TrimSpace(liveItem.ID); id != "" {
+				summaryByID[id] = liveItem
+			}
+		}
+	}
 
 	liveItems := make([]FixItem, 0, len(fixItems))
 	for _, item := range fixItems {
@@ -243,6 +272,11 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 				if text := strings.TrimSpace(c.Body); text != "" {
 					live.Summary = text
 					live.Body = text
+					// ObservedFingerprint tracks comment identity+updatedAt drift.
+					if fp := strings.TrimSpace(c.ObservedFingerprint); fp != "" {
+						live.ThreadFingerprint = fp
+						live.ObservedFingerprint = fp
+					}
 				} else {
 					markLiveReviewMissing(&live)
 				}
@@ -250,8 +284,16 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 				markLiveReviewMissing(&live)
 			}
 		case src == "forgejo-reviewer-summary":
-			// Cannot live-verify summary items via ViewReviewThread.
-			return "", fmt.Errorf("HITL cannot live-verify forgejo-reviewer-summary item %q", item.ID)
+			if liveItem, ok := summaryByID[strings.TrimSpace(item.ID)]; ok {
+				live.Summary = liveItem.Summary
+				live.Body = liveItem.Body
+				live.ThreadFingerprint = liveItem.ThreadFingerprint
+				live.Files = cloneStrings(liveItem.Files)
+				live.Path = liveItem.Path
+			} else {
+				// Item closed/removed from the live summary → invalidate answer.
+				markLiveReviewMissing(&live)
+			}
 		case src != "" && src != NativeReviewCommentSource:
 			return "", fmt.Errorf("HITL cannot live-verify fix item source %q (id=%s)", src, item.ID)
 		case strings.TrimSpace(item.ThreadID) != "":
@@ -260,12 +302,20 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 				ThreadID: item.ThreadID, CWD: input.Project.RepoPath,
 			})
 			if err != nil {
-				// Deleted/unreachable thread: do not keep checkpoint text.
-				markLiveReviewMissing(&live)
+				// Only true not-found marks the review missing. Auth, rate-limit,
+				// and other provider errors must fail closed so a human answer is
+				// not injected against an unverifiable thread.
+				if isLiveReviewNotFound(err) {
+					markLiveReviewMissing(&live)
+				} else {
+					return "", fmt.Errorf("HITL live review thread refresh failed for %s: %w", item.ThreadID, err)
+				}
 			} else if body := primaryReviewThreadBody(thread, item); body != "" {
 				// GitHub collect-time layout: Summary holds body text, Body empty.
 				live.Summary = body
 				live.Body = ""
+				// Full non-Looper reply chain so mid-park reply add/edit drifts FP.
+				live.ThreadFingerprint = liveReviewThreadFingerprint(thread)
 			} else {
 				markLiveReviewMissing(&live)
 			}
@@ -287,6 +337,42 @@ func markLiveReviewMissing(item *FixItem) {
 	}
 	item.Summary = missingLiveReviewMarker
 	item.Body = missingLiveReviewMarker
+	// Clear thread identity so a missing live review cannot match ask-time FP via
+	// a still-present ThreadFingerprint alone.
+	item.ThreadFingerprint = missingLiveReviewMarker
+}
+
+// isLiveReviewNotFound reports whether a ViewReviewThread failure means the
+// thread is gone (safe to mark missing) versus a transient/auth failure that
+// must fail closed.
+func isLiveReviewNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var notFound *githubinfra.ReviewThreadNotFoundError
+	if errors.As(err, &notFound) {
+		return true
+	}
+	return githubinfra.IsNotFoundError(err)
+}
+
+// liveReviewThreadFingerprint mirrors collect-time reviewThreadFingerprintFromNodes:
+// non-Looper-fixer comments as id@updatedAt joined by "|". Mid-park reply add/edit
+// changes this value so resume-time fingerprints diverge from ask-time.
+func liveReviewThreadFingerprint(thread ReviewThread) string {
+	parts := make([]string, 0, len(thread.Comments))
+	for _, comment := range thread.Comments {
+		if isLooperFixerReplyComment(comment) {
+			continue
+		}
+		id := strings.TrimSpace(comment.ID)
+		updatedAt := strings.TrimSpace(comment.UpdatedAt)
+		if id == "" && updatedAt == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s@%s", id, updatedAt))
+	}
+	return strings.Join(parts, "|")
 }
 
 func primaryReviewThreadBody(thread ReviewThread, item FixItem) string {
@@ -531,6 +617,9 @@ func reviewIDsFromNeedsHuman(replies []replyExplanationEntry, fixItems []FixItem
 // computeReviewContentFingerprint is the canonical review-content drift hash.
 // Used at BOTH ask-time and resume-time over the same fix-item fields (not agent
 // explanations). Sorted by fix-item id for stability.
+//
+// ThreadFingerprint is included so non-root reply add/edit (which does not change
+// the primary targeted comment body) still invalidates a parked human answer.
 func computeReviewContentFingerprint(fixItems []FixItem) string {
 	items := make([]FixItem, 0, len(fixItems))
 	for _, item := range fixItems {
@@ -541,7 +630,7 @@ func computeReviewContentFingerprint(fixItems []FixItem) string {
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].ID < items[j].ID
 	})
-	parts := make([]string, 0, len(items)*5)
+	parts := make([]string, 0, len(items)*6)
 	for _, item := range items {
 		parts = append(parts,
 			item.ID,
@@ -549,6 +638,7 @@ func computeReviewContentFingerprint(fixItems []FixItem) string {
 			strconv.FormatInt(item.ProviderCommentID, 10),
 			item.Summary,
 			item.Body,
+			item.ThreadFingerprint,
 		)
 	}
 	return hitl.FingerprintContent(parts...)

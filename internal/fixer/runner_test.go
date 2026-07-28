@@ -6093,7 +6093,9 @@ type fakeGitHubGateway struct {
 	viewResponses         []PullRequestDetail
 	threads               []ReviewThread
 	viewThreadCalls       []ViewReviewThreadInput
+	viewThreadErr         error
 	viewIndex             int
+	viewPRErr             error
 	resolveCalls          []ResolveReviewThreadInput
 	addLabelCalls         []PullRequestLabelsInput
 	removeLabelCalls      []PullRequestLabelsInput
@@ -6159,6 +6161,9 @@ func (f *fakeGitHubGateway) GetPullRequestAuthor(_ context.Context, input ViewPu
 }
 
 func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	if f.viewPRErr != nil {
+		return PullRequestDetail{}, f.viewPRErr
+	}
 	if len(f.viewResponses) == 0 {
 		return PullRequestDetail{Number: input.PRNumber, State: "OPEN", HeadSHA: "head-default", HeadRefName: "feature/default", BaseRefName: "main", BaseSHA: "base-default"}, nil
 	}
@@ -6211,12 +6216,17 @@ func (f *fakeGitHubGateway) ListReviewThreads(_ context.Context, _ ListReviewThr
 
 func (f *fakeGitHubGateway) ViewReviewThread(_ context.Context, input ViewReviewThreadInput) (ReviewThread, error) {
 	f.viewThreadCalls = append(f.viewThreadCalls, input)
+	if f.viewThreadErr != nil {
+		return ReviewThread{}, f.viewThreadErr
+	}
 	threads, _ := f.ListReviewThreads(context.Background(), ListReviewThreadsInput{})
 	for _, thread := range threads {
 		if thread.ID == input.ThreadID {
 			return thread, nil
 		}
 	}
+	// Empty thread (no comments) models a deleted/unreachable GraphQL node without
+	// a hard error — same shape as github.Gateway when getReviewThread returns nil.
 	return ReviewThread{ID: input.ThreadID}, nil
 }
 
