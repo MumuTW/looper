@@ -23,7 +23,7 @@ func TestBuildFixerPromptUsesForgejoSeedAndFetchContract(t *testing.T) {
 			"url": "https://code.forgejo.example/acme/looper/pulls/42#issuecomment-202",
 		}},
 	}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", URL: "https://code.forgejo.example/acme/looper/pulls/42/files#diff-1"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", URL: "https://code.forgejo.example/acme/looper/pulls/42/files#diff-1"}}, false, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"\"url\": \"https://code.forgejo.example/acme/looper/pulls/42\"",
 		"Agent-side Forgejo fetch contract",
@@ -50,7 +50,7 @@ func TestBuildFixerPromptAddsForgejoNativeCommentRepairResultsInstruction(t *tes
 	t.Parallel()
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1"), Summary: "rename helper", Body: "Please rename this helper.", Path: "internal/fixer/runner.go", DiffHunk: "@@ -1,2 +1,2 @@"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1"), Summary: "rename helper", Body: "Please rename this helper.", Path: "internal/fixer/runner.go", DiffHunk: "@@ -1,2 +1,2 @@"}}, false, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"Forgejo native review comment fix item",
 		"`repair_results`",
@@ -77,7 +77,7 @@ func TestBuildFixerPromptGitHubRegressionRemainsUnchangedForReviewThreadReplies(
 	t.Parallel()
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	if strings.Contains(prompt, "`repair_results`") {
 		t.Fatalf("prompt unexpectedly contains Forgejo native contract:\n%s", prompt)
 	}

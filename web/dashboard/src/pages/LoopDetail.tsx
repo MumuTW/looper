@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { Link, useParams } from "react-router-dom";
+import { HITLDecisionCard } from "@/components/HITLDecisionCard";
 import { LoopActionBar } from "@/components/LoopActionBar";
 import { PanelError } from "@/components/PanelError";
 import { StatusChip } from "@/components/StatusChip";
@@ -15,6 +16,7 @@ import { Card } from "@/components/ui/card";
 import {
   fetchLoop,
   openLoopLogsStream,
+  parseHITLAsk,
   type Loop,
   type LoopLogsChunk,
   type LoopLogsSnapshot,
@@ -419,6 +421,11 @@ export function LoopDetailPage() {
     await Promise.all([forceRefresh(), forceRefreshActiveRuns()]);
   }, [forceRefresh, forceRefreshActiveRuns]);
 
+  const hitlAsk = useMemo(
+    () => (data ? parseHITLAsk(data.metadataJson) : null),
+    [data],
+  );
+
   if (!selector) {
     return <PanelError message="Missing loop selector" />;
   }
@@ -443,6 +450,15 @@ export function LoopDetailPage() {
           Refresh
         </Button>
       </div>
+
+      {data && hitlAsk ? (
+        <HITLDecisionCard
+          selector={String(data.seq)}
+          loopStatus={data.status}
+          ask={hitlAsk}
+          onMutated={onMutated}
+        />
+      ) : null}
 
       {data ? (
         <Card title="Actions">

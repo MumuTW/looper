@@ -239,6 +239,83 @@ export type Loop = {
   lastFailureReason?: string | null;
 };
 
+/**
+ * HITLAsk mirrors the persisted decision brief stored inside a loop's
+ * `metadataJson` under the `hitl` key. All fields are optional except question
+ * — parseHITLAsk() returns null when no ask is present.
+ */
+export type HITLAsk = {
+  question: string;
+  options: string[];
+  recommendation?: string;
+  recommendedOption?: string;
+  consequences?: Record<string, string>;
+  confidence?: "high" | "medium" | "low" | string;
+  status?: "awaiting" | "answered" | "consumed" | string;
+  answer?: string;
+  askedAt?: string;
+  answeredAt?: string;
+  role?: "fixer" | "worker" | string;
+  headSha?: string;
+  transport?: string;
+  vendor?: string;
+  sessionId?: string;
+};
+
+/**
+ * Parse a loop's `metadataJson` and return the HITL ask when present.
+ * Returns null when metadata is missing, malformed, or has no `hitl` object
+ * with a non-empty question.
+ */
+export function parseHITLAsk(metadataJson?: string | null): HITLAsk | null {
+  if (!metadataJson) return null;
+  let obj: unknown;
+  try {
+    obj = JSON.parse(metadataJson);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object") return null;
+  const raw = (obj as Record<string, unknown>).hitl;
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const question = typeof r.question === "string" ? r.question.trim() : "";
+  if (!question) return null;
+  const options = Array.isArray(r.options)
+    ? r.options
+        .filter((v): v is string => typeof v === "string")
+        .map((v) => v.trim())
+        .filter(Boolean)
+    : [];
+  const consequences =
+    r.consequences && typeof r.consequences === "object"
+      ? Object.fromEntries(
+          Object.entries(r.consequences as Record<string, unknown>).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string",
+          ),
+        )
+      : undefined;
+  const pickString = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() ? v : undefined;
+  return {
+    question,
+    options,
+    recommendation: pickString(r.recommendation),
+    recommendedOption: pickString(r.recommendedOption),
+    consequences,
+    confidence: pickString(r.confidence),
+    status: pickString(r.status),
+    answer: pickString(r.answer),
+    askedAt: pickString(r.askedAt),
+    answeredAt: pickString(r.answeredAt),
+    role: pickString(r.role),
+    headSha: pickString(r.headSha),
+    transport: pickString(r.transport),
+    vendor: pickString(r.vendor),
+    sessionId: pickString(r.sessionId),
+  };
+}
+
 export type LoopsList = {
   items: Loop[];
   total: number;
@@ -581,6 +658,25 @@ export function takeoverLoop(
   return apiFetch<TakeoverResult>(
     `/api/v1/loops/${encodeURIComponent(selector)}/takeover`,
     { method: "POST", signal },
+  );
+}
+
+/**
+ * Deliver a human answer to a loop parked in `awaiting_human`. The answer may
+ * be an option label or free text — the backend accepts any non-empty string.
+ */
+export function respondLoop(
+  selector: string,
+  answer: string,
+  signal?: AbortSignal,
+): Promise<Loop> {
+  return apiFetch<Loop>(
+    `/api/v1/loops/${encodeURIComponent(selector)}/respond`,
+    {
+      method: "POST",
+      body: JSON.stringify({ answer }),
+      signal,
+    },
   );
 }
 

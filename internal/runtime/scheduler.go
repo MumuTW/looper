@@ -2117,13 +2117,13 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 		if err != nil {
 			return fixer.PullRequestDetail{}, err
 		}
-		return fixer.PullRequestDetail{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
+		return fixer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
 	}
 	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
-	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+	return fixer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
 func forgeCommentsToObjects(items []forge.Comment) []map[string]any {
@@ -2430,7 +2430,8 @@ type fixerAgentExecutionAdapter struct{ execution agent.Execution }
 func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
-		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
+		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
@@ -2745,6 +2746,17 @@ func hitlGitHubSettings(cfg *config.HITLGitHubConfig) worker.HITLGitHubSettings 
 		return worker.HITLGitHubSettings{}
 	}
 	return worker.HITLGitHubSettings{
+		AwaitingLabel: cfg.AwaitingLabel,
+		MentionLogins: append([]string(nil), cfg.MentionLogins...),
+	}
+}
+
+// hitlGitHubSettingsFixer maps the HITL GitHub config into the fixer's settings.
+func hitlGitHubSettingsFixer(cfg *config.HITLGitHubConfig) fixer.HITLGitHubSettings {
+	if cfg == nil {
+		return fixer.HITLGitHubSettings{}
+	}
+	return fixer.HITLGitHubSettings{
 		AwaitingLabel: cfg.AwaitingLabel,
 		MentionLogins: append([]string(nil), cfg.MentionLogins...),
 	}
@@ -3370,6 +3382,33 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			},
 		})
 	}
+	notifyHITLAskCard := func(ctx context.Context, card notify.HITLAskCard) error {
+		return notificationGateway.SendHITLAsk(ctx, card)
+	}
+	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
+		return notifyHITLAskCard(ctx, notify.HITLAskCard{
+			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
+			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
+			SourceType: ask.SourceType, SourceRef: ask.SourceRef, SourceURL: ask.SourceURL,
+			TriggerLogin:      ask.TriggerLogin,
+			Recommendation:    ask.Recommendation,
+			RecommendedOption: ask.RecommendedOption,
+			Consequences:      ask.Consequences,
+			Confidence:        ask.Confidence,
+		})
+	}
+	notifyFixerHITLAsk := func(ctx context.Context, ask fixer.HITLAskNotification) error {
+		return notifyHITLAskCard(ctx, notify.HITLAskCard{
+			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
+			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
+			SourceType: ask.SourceType, SourceRef: ask.SourceRef, SourceURL: ask.SourceURL,
+			TriggerLogin:      ask.TriggerLogin,
+			Recommendation:    ask.Recommendation,
+			RecommendedOption: ask.RecommendedOption,
+			Consequences:      ask.Consequences,
+			Confidence:        ask.Confidence,
+		})
+	}
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
 		resolved := resolvedFixer
@@ -3418,18 +3457,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
-		})
-	}
-	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
-		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
-			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
-			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
-			SourceType: ask.SourceType, SourceRef: ask.SourceRef, SourceURL: ask.SourceURL,
-			TriggerLogin:      ask.TriggerLogin,
-			Recommendation:    ask.Recommendation,
-			RecommendedOption: ask.RecommendedOption,
-			Consequences:      ask.Consequences,
-			Confidence:        ask.Confidence,
+			HITLEnabled:         cfg.HITL.Enabled,
+			HITLAnswerTransport: cfg.HITL.AnswerTransport,
+			HITLGitHub:          hitlGitHubSettingsFixer(cfg.HITL.GitHub),
+			HITLNotify:          notifyFixerHITLAsk,
 		})
 	}
 	resolvedWorker, workerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleWorker)

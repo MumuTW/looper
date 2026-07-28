@@ -27,7 +27,7 @@ func TestBuildFixerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 	t.Parallel()
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature"}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{"agent=opencode"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -44,7 +44,7 @@ func TestBuildFixerPromptOmitsMissingAgentRuntime(t *testing.T) {
 	t.Parallel()
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature"}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, false, config.DefaultDisclosureConfig(), "", "openai/gpt-5.5")
 	if strings.Contains(prompt, "agent=") {
 		t.Fatalf("prompt should omit missing agent runtime:\n%s", prompt)
 	}
@@ -91,7 +91,7 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 	t.Parallel()
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"Minimal PR seed",
 		"\"repo\": \"acme/looper\"",
@@ -138,7 +138,7 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 func TestFixerRepairScopeInstructionAllowsCollateralWithoutDriveBy(t *testing.T) {
 	t.Parallel()
 
-	got := fixerRepairScopeInstruction()
+	got := fixerRepairScopeInstruction(false)
 	for _, want := range []string{
 		"Fully address every listed fix item",
 		"coherent, durable repair of the underlying concrete root cause",
@@ -170,7 +170,7 @@ func TestBuildFixerPromptGitHubCommentMentionsCollateralOnlyInThreadReplies(t *t
 	t.Parallel()
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	if !strings.Contains(prompt, "review_thread_replies") {
 		t.Fatalf("GitHub comment prompt missing review_thread_replies:\n%s", prompt)
 	}
@@ -186,7 +186,7 @@ func TestBuildFixerPromptCommentReplyInstructionRequiresVerificationWithoutRemot
 	t.Parallel()
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"Before including an entry, re-read the relevant review thread/comment context",
 		"The \"id\" MUST be the GraphQL PullRequestReviewComment node ID.",
@@ -207,7 +207,7 @@ func TestBuildFixerPromptPrefersRoundSpecificCommitSubject(t *testing.T) {
 	t.Parallel()
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round.",
 		"Do not mechanically reuse the PR title or a previous fixer subject",

@@ -36,6 +36,17 @@ type HITLAsk struct {
 	RecommendedOption string            `json:"recommendedOption,omitempty"`
 	Consequences      map[string]string `json:"consequences,omitempty"`
 	Confidence        string            `json:"confidence,omitempty"`
+
+	// Drift-detection fingerprints (infra signals only — authority remains the
+	// human answer / agent structured output). Populated by Fixer HITL asks;
+	// worker asks leave them empty.
+	HeadSHA                  string `json:"headSha,omitempty"`
+	ReviewThreadID           string `json:"reviewThreadId,omitempty"`
+	ReviewCommentID          string `json:"reviewCommentId,omitempty"`
+	ReviewContentFingerprint string `json:"reviewContentFingerprint,omitempty"`
+	PRIntentFingerprint      string `json:"prIntentFingerprint,omitempty"`
+	// Role is optional debug metadata ("fixer" | "worker").
+	Role string `json:"role,omitempty"`
 }
 
 // ReadHITLAsk extracts the HITL ask state from a loop's metadata JSON. The

@@ -8,12 +8,18 @@ func TestHITLAskRoundTripPreservesOtherMetadata(t *testing.T) {
 	base := strptr(`{"issueTitle":"Fix login","loop":{"status":"running"}}`)
 
 	updated, err := WriteHITLAsk(base, HITLAsk{
-		Question:  "Which direction?",
-		Options:   []string{"continue", "redirect"},
-		SessionID: "sess-1",
-		Vendor:    "codex",
-		Status:    "awaiting",
-		AskedAt:   "2026-04-11T12:00:00.000Z",
+		Question:                 "Which direction?",
+		Options:                  []string{"continue", "redirect"},
+		SessionID:                "sess-1",
+		Vendor:                   "codex",
+		Status:                   "awaiting",
+		AskedAt:                  "2026-04-11T12:00:00.000Z",
+		HeadSHA:                  "abc123",
+		ReviewThreadID:           "thread-9",
+		ReviewCommentID:          "99",
+		ReviewContentFingerprint: "rev-fp",
+		PRIntentFingerprint:      "intent-fp",
+		Role:                     "fixer",
 	})
 	if err != nil {
 		t.Fatalf("WriteHITLAsk() error = %v", err)
@@ -25,6 +31,9 @@ func TestHITLAskRoundTripPreservesOtherMetadata(t *testing.T) {
 	}
 	if ask.Question != "Which direction?" || len(ask.Options) != 2 || ask.SessionID != "sess-1" || ask.Vendor != "codex" || ask.Status != "awaiting" {
 		t.Fatalf("ask round-trip mismatch: %#v", ask)
+	}
+	if ask.HeadSHA != "abc123" || ask.ReviewThreadID != "thread-9" || ask.ReviewCommentID != "99" || ask.ReviewContentFingerprint != "rev-fp" || ask.PRIntentFingerprint != "intent-fp" || ask.Role != "fixer" {
+		t.Fatalf("fingerprint fields round-trip mismatch: %#v", ask)
 	}
 
 	// Other metadata keys must be preserved.
