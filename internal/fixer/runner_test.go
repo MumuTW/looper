@@ -6113,15 +6113,15 @@ type fakeGitHubGateway struct {
 	afterCreateIssueComment func(IssueCommentResult)
 	updateIssueCommentErr   error
 	nextIssueCommentID      int64
-	compareCalls          []CompareCommitsInput
-	compareStatus         string
-	compareErr            error
-	nativeComments        []NativeReviewComment
-	nativeCommentBatches  [][]NativeReviewComment
-	listNativeContextErr  error
-	listNativeErr         error
-	resolveNativeCalls    []ResolveNativeReviewCommentInput
-	resolveNativeErr      error
+	compareCalls            []CompareCommitsInput
+	compareStatus           string
+	compareErr              error
+	nativeComments          []NativeReviewComment
+	nativeCommentBatches    [][]NativeReviewComment
+	listNativeContextErr    error
+	listNativeErr           error
+	resolveNativeCalls      []ResolveNativeReviewCommentInput
+	resolveNativeErr        error
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
