@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
@@ -76,6 +77,77 @@ func TestHandlerRespondResumesAwaitingHumanLoop(t *testing.T) {
 	}
 	if !queued {
 		t.Fatalf("expected a queued queue item for the resumed loop; items=%#v", items)
+	}
+}
+
+// Dashboard /respond must clear the awaiting-human PR label for transport=github
+// asks — the poll lane skips now-running loops so labels would otherwise stick.
+func TestHandlerRespondClearsGitHubAwaitingLabel(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_hitl_label"
+	loopID := "loop_hitl_label"
+	repo := "acme/looper"
+	pr := int64(42)
+	metadata := `{"hitl":{"question":"Pick?","options":["a","b"],"status":"awaiting","transport":"github","provider":"github","prNumber":42,"askCommentId":99,"sessionId":"sess-label","vendor":"codex"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 74, ProjectID: projectID, Type: "fixer", TargetType: "pull_request",
+		Repo: &repo, PRNumber: &pr, Status: "awaiting_human", MetadataJSON: &metadata,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	cancelReason := "loop suspended awaiting human"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_hitl_label", ProjectID: &projectID, LoopID: &loopID, Type: "fixer",
+		TargetType: "pull_request", Repo: &repo, PRNumber: &pr, DedupeKey: "fixer:hitl-label",
+		Priority: storage.QueuePriorityFixer, Status: "cancelled", AvailableAt: nowISO,
+		Attempts: 0, MaxAttempts: 3, LastError: &cancelReason, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	var clearedRepos []struct {
+		Repo  string
+		PR    int64
+		Label string
+	}
+	prev := hitlAwaitingLabelClearer
+	t.Cleanup(func() { hitlAwaitingLabelClearer = prev })
+	hitlAwaitingLabelClearer = func(_ context.Context, _ *config.Config, _ *githubinfra.Gateway, repo string, prNumber int64, _ string, label string) error {
+		clearedRepos = append(clearedRepos, struct {
+			Repo  string
+			PR    int64
+			Label string
+		}{Repo: repo, PR: prNumber, Label: label})
+		return nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/74/respond", strings.NewReader(`{"answer":"option a"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(clearedRepos) != 1 {
+		t.Fatalf("label cleanup calls = %d, want 1", len(clearedRepos))
+	}
+	if clearedRepos[0].Repo != "acme/looper" || clearedRepos[0].PR != 42 {
+		t.Fatalf("cleanup target = %#v, want acme/looper#42", clearedRepos[0])
+	}
+	if clearedRepos[0].Label != "looper:awaiting-human" {
+		t.Fatalf("cleanup label = %q, want looper:awaiting-human", clearedRepos[0].Label)
+	}
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil || loop.Status != "running" {
+		t.Fatalf("loop after respond = %#v err=%v, want running", loop, err)
 	}
 }
 

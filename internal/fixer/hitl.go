@@ -964,7 +964,14 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 	}); err != nil && r.logger != nil {
 		r.logger.Warn("fixer hitl github: failed to add awaiting-human label", map[string]any{"repo": repo, "pr": prNumber, "error": err.Error()})
 	}
+	// Transport is the answer channel (PR comments). Provider is the forge host
+	// that received the ask so the resume poll can use the matching client.
 	ask.Transport = "github"
+	if r.isForgejoProject(input.Project.ID) {
+		ask.Provider = "forgejo"
+	} else {
+		ask.Provider = "github"
+	}
 	ask.PRNumber = prNumber
 	ask.AskCommentID = res.ID
 	return nil

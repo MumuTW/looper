@@ -2,8 +2,11 @@ package runtime
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
@@ -90,6 +93,7 @@ type githubHITLAwaitingLoop struct {
 	ProjectID    string
 	Repo         string
 	Transport    string
+	Provider     string // "github" | "forgejo" | "" (legacy: resolve from project)
 	AskStatus    string
 	PRNumber     int64
 	AskCommentID int64
@@ -234,15 +238,120 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	return err
 }
 
+// hitlPRCommentProvider reports whether a PR-comment HITL ask should be polled
+// via Forgejo vs GitHub.com. Prefer the persisted ask.Provider; fall back to
+// the project's configured provider binding for legacy asks.
+func hitlPRCommentProvider(cfg *config.Config, project storage.ProjectRecord, askProvider string) string {
+	if p := strings.TrimSpace(strings.ToLower(askProvider)); p == "forgejo" || p == "github" {
+		return p
+	}
+	if cfg == nil {
+		return "github"
+	}
+	if binding, ok := runtimeProjectBinding(*cfg, project.ID); ok {
+		if config.ResolvedProjectProviderKind(*cfg, binding) == config.ProviderKindForgejo {
+			return "forgejo"
+		}
+	}
+	return "github"
+}
+
+// clearHITLAwaitingLabel removes the awaiting-human label from a PR after a human
+// answer is delivered (poll lane or dashboard /respond). Routes through the
+// matching forge client so Forgejo PRs are not left permanently labeled.
+// Best-effort: returns the first error but callers typically log and continue.
+func clearHITLAwaitingLabel(ctx context.Context, cfg *config.Config, gw *githubinfra.Gateway, repo string, prNumber int64, cwd, label string) error {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		label = "looper:awaiting-human"
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" || prNumber <= 0 {
+		return nil
+	}
+	if client, ok, err := forgeClientForLocation(cfg, repo, []string{cwd}, forgejoClientForCWD, forgejoClientForRepo); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.RemoveIssueLabel(ctx, prNumber, label)
+	}
+	if gw == nil {
+		return nil
+	}
+	return gw.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{
+		Repo: repo, PRNumber: prNumber, Labels: []string{label}, CWD: cwd,
+	})
+}
+
+// listHITLIssueComments lists PR issue comments via the forge that hosts the PR.
+func listHITLIssueComments(ctx context.Context, cfg *config.Config, gw *githubinfra.Gateway, provider, repo string, prNumber int64, cwd string) ([]githubAnswerComment, error) {
+	if strings.EqualFold(strings.TrimSpace(provider), "forgejo") {
+		client, ok, err := forgeClientForLocation(cfg, repo, []string{cwd}, forgejoClientForCWD, forgejoClientForRepo)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || client == nil {
+			return nil, fmt.Errorf("hitl poll: forgejo client not configured for repo %s", repo)
+		}
+		cs, err := client.ListIssueComments(ctx, prNumber)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]githubAnswerComment, 0, len(cs))
+		for _, c := range cs {
+			out = append(out, githubAnswerComment{ID: c.ID, Author: c.User.Login, Body: c.Body})
+		}
+		return out, nil
+	}
+	if gw == nil {
+		return nil, fmt.Errorf("hitl github poll: github gateway is not configured")
+	}
+	cs, err := gw.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]githubAnswerComment, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, githubAnswerComment{ID: c.ID, Author: c.Author, Body: c.Body})
+	}
+	return out, nil
+}
+
+// ClearHITLAwaitingLabel is the exported best-effort cleanup used by the API
+// /respond path so dashboard answers remove the same awaiting-human label the
+// poll lane clears after detecting a PR reply.
+func ClearHITLAwaitingLabel(ctx context.Context, cfg *config.Config, gw *githubinfra.Gateway, repo string, prNumber int64, cwd, label string) error {
+	return clearHITLAwaitingLabel(ctx, cfg, gw, repo, prNumber, cwd, label)
+}
+
+// NewHITLGitHubGateway builds a short-lived githubinfra.Gateway for API-side
+// label cleanup when the handler does not hold the daemon's long-lived gateway.
+func NewHITLGitHubGateway(ghPath, cwd string) *githubinfra.Gateway {
+	return githubinfra.New(githubinfra.Options{GHPath: strings.TrimSpace(ghPath), CWD: strings.TrimSpace(cwd)})
+}
+
 // runGitHubHITLPoll runs one answer-poll pass for a project's awaiting_human
-// loops that carry a GitHub ask. Gated by hitl.enabled + the github transport;
-// a no-op otherwise.
+// loops that carry a PR-comment (transport=github) ask. Gated by hitl.enabled;
+// routes list/clear through Forgejo or GitHub.com based on ask.Provider / project
+// binding so Forgejo replies are observed.
 func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, project storage.ProjectRecord) {
-	if input.Config == nil || !input.Config.HITL.Enabled || input.GitHubGateway == nil || input.Repos == nil {
+	if input.Config == nil || !input.Config.HITL.Enabled || input.Repos == nil {
 		return
 	}
 	transport := strings.TrimSpace(strings.ToLower(input.Config.HITL.AnswerTransport))
 	if transport != "" && transport != "github" {
+		return
+	}
+
+	// Need at least one way to talk to a forge: GitHub gateway and/or a Forgejo
+	// binding for this project. Forgejo-only daemons must still poll.
+	projectProvider := "github"
+	if binding, ok := runtimeProjectBinding(*input.Config, project.ID); ok {
+		if config.ResolvedProjectProviderKind(*input.Config, binding) == config.ProviderKindForgejo {
+			projectProvider = "forgejo"
+		}
+	}
+	if projectProvider != "forgejo" && input.GitHubGateway == nil {
 		return
 	}
 
@@ -263,9 +372,11 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		if l.Repo != nil {
 			repo = *l.Repo
 		}
+		provider := hitlPRCommentProvider(input.Config, project, ask.Provider)
 		awaiting = append(awaiting, githubHITLAwaitingLoop{
 			ID: l.ID, ProjectID: l.ProjectID, Repo: repo,
-			Transport: ask.Transport, AskStatus: ask.Status, PRNumber: ask.PRNumber, AskCommentID: ask.AskCommentID,
+			Transport: ask.Transport, Provider: provider, AskStatus: ask.Status,
+			PRNumber: ask.PRNumber, AskCommentID: ask.AskCommentID,
 		})
 	}
 	if len(awaiting) == 0 {
@@ -282,24 +393,28 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 	}
 	gw := input.GitHubGateway
 	nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
+	cfg := input.Config
+
+	// Per-loop provider routing: list/clear use the ask's forge host.
+	providerByRepoPR := make(map[string]string, len(awaiting))
+	for _, loop := range awaiting {
+		key := loop.Repo + "#" + strconv.FormatInt(loop.PRNumber, 10)
+		providerByRepoPR[key] = loop.Provider
+	}
 
 	deps := githubHITLPollDeps{
 		listComments: func(ctx contextType, repo string, pr int64, cwd string) ([]githubAnswerComment, error) {
-			cs, err := gw.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: pr, CWD: cwd})
-			if err != nil {
-				return nil, err
+			provider := providerByRepoPR[repo+"#"+strconv.FormatInt(pr, 10)]
+			if provider == "" {
+				provider = projectProvider
 			}
-			out := make([]githubAnswerComment, 0, len(cs))
-			for _, c := range cs {
-				out = append(out, githubAnswerComment{ID: c.ID, Author: c.Author, Body: c.Body})
-			}
-			return out, nil
+			return listHITLIssueComments(ctx, cfg, gw, provider, repo, pr, cwd)
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
 			return deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer)
 		},
 		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {
-			_ = gw.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{awaitingLabel}, CWD: cwd})
+			_ = clearHITLAwaitingLabel(ctx, cfg, gw, repo, pr, cwd, awaitingLabel)
 		},
 		projectCWD:    func(string) string { return project.RepoPath },
 		answerAuthors: answerAuthors,

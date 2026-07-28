@@ -5686,6 +5686,11 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 // the loop is awaiting_human, stores the answer on the loop's HITL metadata, and
 // transitions the loop back to running (requeue + scheduler tick). Both the
 // /respond API endpoint and the Feishu card-action receiver call it.
+//
+// When the ask used the PR-comment answer transport (transport=github), this
+// path also clears the awaiting-human PR label — the same cleanup the GitHub
+// poll lane performs after detecting a PR reply. Dashboard /respond answers
+// otherwise leave the label permanently because the poll skips now-running loops.
 func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnswer string) (loopResponse, error) {
 	answer := strings.TrimSpace(rawAnswer)
 	if answer == "" {
@@ -5694,6 +5699,7 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	var labelCleanup *hitlAwaitingLabelCleanup
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
@@ -5707,6 +5713,21 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
 		}
 		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		// Capture PR-comment cleanup fields before mutating the ask so dashboard
+		// answers clear the same awaiting-human label the poll lane removes.
+		if strings.EqualFold(strings.TrimSpace(ask.Transport), "github") && ask.PRNumber > 0 {
+			repo := ""
+			if loop.Repo != nil {
+				repo = strings.TrimSpace(*loop.Repo)
+			}
+			if repo != "" {
+				labelCleanup = &hitlAwaitingLabelCleanup{
+					ProjectID: loop.ProjectID,
+					Repo:      repo,
+					PRNumber:  ask.PRNumber,
+				}
+			}
+		}
 		ask.Answer = answer
 		ask.Status = "answered"
 		ask.AnsweredAt = nowISO
@@ -5732,8 +5753,60 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)
 	// so the next claim resumes the run with the stored answer.
-	return h.mutateLoopStatus(ctx, loopID, domain.LoopStatusRunning)
+	resp, err := h.mutateLoopStatus(ctx, loopID, domain.LoopStatusRunning)
+	if err != nil {
+		return resp, err
+	}
+	// Best-effort label cleanup after successful resume. Failure must not roll
+	// back the answer — poll-lane cleanup is also best-effort.
+	if labelCleanup != nil {
+		h.clearHITLAwaitingLabelAfterRespond(ctx, *labelCleanup)
+	}
+	return resp, nil
 }
+
+// hitlAwaitingLabelCleanup carries the PR identity needed to remove the
+// awaiting-human label after a dashboard /respond answer.
+type hitlAwaitingLabelCleanup struct {
+	ProjectID string
+	Repo      string
+	PRNumber  int64
+}
+
+func (h *Handler) clearHITLAwaitingLabelAfterRespond(ctx context.Context, cleanup hitlAwaitingLabelCleanup) {
+	cfg := h.context.Config
+	if h.context.Runtime != nil {
+		// Prefer live runtime config so awaitingLabel reloads apply.
+		if runtimeConfig, ok := any(h.context.Runtime).(interface{ Config() config.Config }); ok {
+			cfg = runtimeConfig.Config()
+		}
+	}
+	label := "looper:awaiting-human"
+	if cfg.HITL.GitHub != nil && strings.TrimSpace(cfg.HITL.GitHub.AwaitingLabel) != "" {
+		label = strings.TrimSpace(cfg.HITL.GitHub.AwaitingLabel)
+	}
+	cwd := ""
+	if h.context.Runtime != nil {
+		if services := h.context.Runtime.Services(); services.Repositories != nil && services.Repositories.Projects != nil {
+			if project, err := services.Repositories.Projects.GetByID(ctx, cleanup.ProjectID); err == nil && project != nil {
+				cwd = strings.TrimSpace(project.RepoPath)
+			}
+		}
+	}
+	ghPath := ""
+	if cfg.Tools.GHPath != nil {
+		ghPath = strings.TrimSpace(*cfg.Tools.GHPath)
+	}
+	var gw *githubinfra.Gateway
+	if ghPath != "" || cwd != "" {
+		gw = looperdruntime.NewHITLGitHubGateway(ghPath, cwd)
+	}
+	_ = hitlAwaitingLabelClearer(ctx, &cfg, gw, cleanup.Repo, cleanup.PRNumber, cwd, label)
+}
+
+// hitlAwaitingLabelClearer is the package-level cleanup hook used by /respond.
+// Tests override it to assert dashboard answers clear the awaiting-human label.
+var hitlAwaitingLabelClearer = looperdruntime.ClearHITLAwaitingLabel
 
 type feishuCardActionEnvelope struct {
 	Type      string `json:"type"`

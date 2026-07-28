@@ -3,6 +3,9 @@ package runtime
 import (
 	"context"
 	"testing"
+
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestDetectGitHubHITLAnswer(t *testing.T) {
@@ -64,5 +67,76 @@ func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 	}
 	if len(cleared) != 1 || cleared[0] != 42 {
 		t.Fatalf("cleared = %v, want [42]", cleared)
+	}
+}
+
+func TestHITLPRCommentProvider_UsesAskThenProject(t *testing.T) {
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	tokenEnv := "FORGEJO_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.test", TokenEnv: &tokenEnv}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "p-fj", Name: "FJ", Provider: "fj", Repo: "acme/fj", RepoPath: t.TempDir()}}
+	project := storage.ProjectRecord{ID: "p-fj"}
+
+	if got := hitlPRCommentProvider(&cfg, project, "forgejo"); got != "forgejo" {
+		t.Fatalf("explicit forgejo provider = %q", got)
+	}
+	if got := hitlPRCommentProvider(&cfg, project, "github"); got != "github" {
+		t.Fatalf("explicit github provider = %q", got)
+	}
+	// Legacy asks without Provider fall back to project binding.
+	if got := hitlPRCommentProvider(&cfg, project, ""); got != "forgejo" {
+		t.Fatalf("legacy empty provider on forgejo project = %q, want forgejo", got)
+	}
+	githubProject := storage.ProjectRecord{ID: "unknown"}
+	if got := hitlPRCommentProvider(&cfg, githubProject, ""); got != "github" {
+		t.Fatalf("unknown project defaults to %q, want github", got)
+	}
+}
+
+// Lifecycle: both poll delivery and dashboard /respond must clear the
+// awaiting-human label. Poll path is covered by TestPollGitHubHITLAnswersOnce;
+// this covers clearHITLAwaitingLabel's no-op/fail-soft contract used by /respond.
+func TestClearHITLAwaitingLabel_NoopWithoutPR(t *testing.T) {
+	if err := clearHITLAwaitingLabel(context.Background(), nil, nil, "", 0, "", ""); err != nil {
+		t.Fatalf("empty repo/pr must no-op, got %v", err)
+	}
+	if err := clearHITLAwaitingLabel(context.Background(), nil, nil, "acme/x", 42, "", "looper:awaiting-human"); err != nil {
+		// No forgejo binding and no github gateway → no-op, not hard error.
+		t.Fatalf("nil gateway with no forgejo binding must no-op, got %v", err)
+	}
+}
+
+func TestPollGitHubHITLAnswersOnce_ForgejoProviderLoop(t *testing.T) {
+	// Ensures forgejo-labeled asks still go through the shared poll detector and
+	// clearAwaiting path (provider routing is wired in runGitHubHITLPoll).
+	commentsByPR := map[int64][]githubAnswerComment{
+		7: {
+			{ID: 10, Author: "bot", Body: "<!-- looper:hitl:ask --> q"},
+			{ID: 11, Author: "human", Body: "keep RollingUpdate"},
+		},
+	}
+	var delivered []string
+	var cleared []int64
+	deps := githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, pr int64, _ string) ([]githubAnswerComment, error) {
+			return commentsByPR[pr], nil
+		},
+		deliverAnswer: func(_ contextType, loopID, answer string) error {
+			delivered = append(delivered, loopID+"="+answer)
+			return nil
+		},
+		clearAwaiting: func(_ contextType, _ string, pr int64, _ string) { cleared = append(cleared, pr) },
+	}
+	n := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
+		{ID: "loop-fj", Repo: "acme/fj", Transport: "github", Provider: "forgejo", AskStatus: "awaiting", PRNumber: 7, AskCommentID: 10},
+	}, deps)
+	if n != 1 || len(delivered) != 1 || delivered[0] != "loop-fj=keep RollingUpdate" {
+		t.Fatalf("delivered = %v n=%d, want forgejo reply observed", delivered, n)
+	}
+	if len(cleared) != 1 || cleared[0] != 7 {
+		t.Fatalf("cleared = %v, want [7] (awaiting label cleanup after answer)", cleared)
 	}
 }

@@ -30,7 +30,14 @@ type HITLAsk struct {
 	// Transport records how the ask was delivered ("github" | "feishu"). GitHub
 	// asks carry the PR + ask-comment id so the answer-poll lane can find the human
 	// reply that came after the ask and resolve/re-request on that PR.
-	Transport    string `json:"transport,omitempty"`
+	// Transport is the answer channel, not the forge host: "github" means
+	// PR-comment answers (on GitHub.com or Forgejo).
+	Transport string `json:"transport,omitempty"`
+	// Provider is the forge host that received the PR-comment ask
+	// ("github" | "forgejo"). Distinct from Transport so the resume poll can
+	// call the matching client instead of always using githubinfra.Gateway.
+	// Empty means unknown/legacy; poll resolves from project binding.
+	Provider     string `json:"provider,omitempty"`
 	PRNumber     int64  `json:"prNumber,omitempty"`
 	AskCommentID int64  `json:"askCommentId,omitempty"`
 

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -490,7 +491,14 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkp
 		r.logger.Warn("hitl github: failed to add awaiting-human label", map[string]any{"repo": repo, "pr": prNumber, "error": err.Error()})
 	}
 
+	// Transport is the answer channel (PR comments). Provider is the forge host
+	// that received the ask so the resume poll can use the matching client.
 	ask.Transport = "github"
+	if r.providerKindForProject(input.Project.ID) == config.ProviderKindForgejo {
+		ask.Provider = "forgejo"
+	} else {
+		ask.Provider = "github"
+	}
 	ask.PRNumber = prNumber
 	ask.AskCommentID = res.ID
 	return nil
