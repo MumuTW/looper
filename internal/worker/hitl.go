@@ -374,6 +374,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	// Always notify on suspend (all answer transports): sticky osascript + optional
 	// Feishu card. GitHub PR-comment delivery above is independent.
 	if r.hitlNotify != nil {
+		transport := r.hitlConfiguredTransport()
 		notif := HITLAskNotification{
 			ProjectID:         input.Project.ID,
 			LoopID:            input.Loop.ID,
@@ -387,6 +388,8 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			RecommendedOption: awaiting.recommendedOption,
 			Consequences:      awaiting.consequences,
 			Confidence:        awaiting.confidence,
+			NotifyOnly:        !strings.EqualFold(transport, "feishu"),
+			AnswerTransport:   transport,
 			ExecutionID:       ask.ExecutionID,
 			AskedAt:           ask.AskedAt,
 		}

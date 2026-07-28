@@ -632,9 +632,15 @@ type HITLAskCard struct {
 	AnsweredWith string
 
 	// NotifyOnly suppresses interactive option buttons. Used when the answer
-	// authority is GitHub (answerTransport=github): the card is informational so
-	// a Feishu click cannot resume the loop without GitHub awaiting-label cleanup.
+	// authority is not Feishu (answerTransport=github or respond): the card is
+	// informational so a Feishu click cannot authorize a disabled channel.
 	NotifyOnly bool
+
+	// AnswerTransport is the configured hitl.answerTransport (github|feishu|respond).
+	// Card operator guidance is derived from this (not NotifyOnly alone) so
+	// respond parks do not send users to a GitHub PR that is not polled, and
+	// feishu parks do not claim free-text thread replies will resume the loop.
+	AnswerTransport string
 
 	// ExecutionID and AskedAt identify the parked ask generation. Embedded in
 	// every option button value so card-action callbacks can reject stale cards
@@ -902,6 +908,37 @@ func feishuShortTime(iso string) string {
 	return t.Local().Format("15:04")
 }
 
+// feishuAskAnswerGuidance tells the operator how to actually unblock the loop
+// for the configured answer transport. Free-text Feishu thread replies are
+// conversational only (queued, not deliverHumanAnswer); buttons and /respond
+// are the generation-bound answer paths when Feishu is interactive.
+func feishuAskAnswerGuidance(card HITLAskCard) string {
+	transport := strings.ToLower(strings.TrimSpace(card.AnswerTransport))
+	if transport == "" {
+		// Infer from NotifyOnly when callers omit transport (legacy cards).
+		if card.NotifyOnly {
+			transport = "github"
+		} else {
+			transport = "feishu"
+		}
+	}
+	switch transport {
+	case "feishu":
+		// Buttons bind to the ask generation; free-text stays conversational and
+		// does not leave awaiting_human — do not tell operators to "直接回文字".
+		return "点选项按钮作答，或到 Dashboard /respond"
+	case "respond":
+		return "请到 Dashboard 回复或调用 /respond"
+	case "github":
+		return "请在 GitHub PR 评论或 Dashboard 回复"
+	default:
+		if card.NotifyOnly {
+			return "请到 Dashboard 回复或调用 /respond"
+		}
+		return "点选项按钮作答，或到 Dashboard /respond"
+	}
+}
+
 func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	title := strings.TrimSpace(card.Title)
 	if title == "" {
@@ -952,8 +989,8 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	elements := make([]any, 0, 8)
 	// @-mention the humans who need to act, so an ask isn't missed in a busy group.
 	if mention := feishuMentionMarkup(card.MentionOpenIds); mention != "" {
-		if card.NotifyOnly {
-			elements = append(elements, larkDiv(mention+" 需要你定夺（请到 GitHub PR / Dashboard 回复）"))
+		if guide := feishuAskAnswerGuidance(card); guide != "" && card.NotifyOnly {
+			elements = append(elements, larkDiv(mention+" 需要你定夺（"+guide+"）"))
 		} else {
 			elements = append(elements, larkDiv(mention+" 需要你定夺 👇"))
 		}
@@ -995,16 +1032,12 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if conseq := feishuConsequences(card); conseq != "" {
 		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": conseq}}})
 	}
-	// Footer note: confidence · blocking · loop.
+	// Footer note: confidence · blocking · loop · how to answer on this transport.
 	noteParts := make([]string, 0, 4)
 	if c := feishuConfidenceLabel(card.Confidence); c != "" {
 		noteParts = append(noteParts, c)
 	}
-	if card.NotifyOnly {
-		noteParts = append(noteParts, "loop "+seq, "请在 GitHub PR 评论或 Dashboard 回复")
-	} else {
-		noteParts = append(noteParts, "loop "+seq, "点选项或直接回文字")
-	}
+	noteParts = append(noteParts, "loop "+seq, feishuAskAnswerGuidance(card))
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
 
 	header := map[string]any{"template": "orange", "title": map[string]any{"tag": "plain_text", "content": "Looper needs a decision"}}

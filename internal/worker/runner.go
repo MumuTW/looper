@@ -520,6 +520,11 @@ type HITLAskNotification struct {
 	Consequences      map[string]string
 	Confidence        string
 
+	// NotifyOnly suppresses interactive Feishu answer buttons when Feishu is
+	// not the configured answer authority.
+	NotifyOnly bool
+	// AnswerTransport is the configured hitl.answerTransport for card guidance.
+	AnswerTransport string
 	// ExecutionID and AskedAt bind Feishu card actions to this ask generation.
 	ExecutionID string
 	AskedAt     string

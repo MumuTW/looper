@@ -3394,7 +3394,18 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		// Interactive Feishu buttons only when answerTransport is feishu.
 		// github/respond (and empty default github) secondary cards are notify-only
 		// so a disabled channel cannot authorize repair.
-		notifyOnly := !strings.EqualFold(strings.TrimSpace(cfg.HITL.AnswerTransport), "feishu")
+		transport := strings.TrimSpace(ask.AnswerTransport)
+		if transport == "" {
+			transport = strings.TrimSpace(cfg.HITL.AnswerTransport)
+		}
+		if transport == "" {
+			transport = "github"
+		}
+		notifyOnly := ask.NotifyOnly
+		if strings.TrimSpace(ask.AnswerTransport) == "" {
+			// Legacy worker notifications without transport stamp: derive from config.
+			notifyOnly = !strings.EqualFold(transport, "feishu")
+		}
 		return notifyHITLAskCard(ctx, notify.HITLAskCard{
 			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
 			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
@@ -3405,11 +3416,19 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Consequences:      ask.Consequences,
 			Confidence:        ask.Confidence,
 			NotifyOnly:        notifyOnly,
+			AnswerTransport:   transport,
 			ExecutionID:       ask.ExecutionID,
 			AskedAt:           ask.AskedAt,
 		})
 	}
 	notifyFixerHITLAsk := func(ctx context.Context, ask fixer.HITLAskNotification) error {
+		transport := strings.TrimSpace(ask.AnswerTransport)
+		if transport == "" {
+			transport = strings.TrimSpace(cfg.HITL.AnswerTransport)
+		}
+		if transport == "" {
+			transport = "github"
+		}
 		return notifyHITLAskCard(ctx, notify.HITLAskCard{
 			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
 			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
@@ -3420,6 +3439,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Consequences:      ask.Consequences,
 			Confidence:        ask.Confidence,
 			NotifyOnly:        ask.NotifyOnly,
+			AnswerTransport:   transport,
 			ExecutionID:       ask.ExecutionID,
 			AskedAt:           ask.AskedAt,
 		})

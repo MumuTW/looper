@@ -80,6 +80,9 @@ type HITLAskNotification struct {
 	// answerTransport except feishu so github/respond secondary cards cannot
 	// authorize repair through an explicitly disabled channel.
 	NotifyOnly bool
+	// AnswerTransport is the configured hitl.answerTransport so Feishu card
+	// copy can name the real answer path (github vs respond vs feishu).
+	AnswerTransport string
 	// ExecutionID and AskedAt bind Feishu card actions to this ask generation so
 	// a stale card from a prior escalation cannot answer a later park.
 	ExecutionID string
@@ -1233,6 +1236,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			Consequences:      awaiting.consequences,
 			Confidence:        awaiting.confidence,
 			NotifyOnly:        !r.hitlTransportFeishu(),
+			AnswerTransport:   r.hitlConfiguredTransport(),
 			ExecutionID:       ask.ExecutionID,
 			AskedAt:           ask.AskedAt,
 		}

@@ -441,6 +441,7 @@ func TestBuildFeishuAskCardNotifyOnlyOmitsButtons(t *testing.T) {
 		Options:           []string{"keep", "restore"},
 		RecommendedOption: "keep",
 		NotifyOnly:        true,
+		AnswerTransport:   "github",
 		MentionOpenIds:    []string{"ou_notify"},
 	})
 	if err != nil {
@@ -462,12 +463,60 @@ func TestBuildFeishuAskCardNotifyOnlyOmitsButtons(t *testing.T) {
 	// Interactive default still has buttons.
 	interactive, err := buildFeishuAskCard(HITLAskCard{
 		LoopSeq: 9, Question: "Keep RollingUpdate?", Options: []string{"keep", "restore"},
+		AnswerTransport: "feishu",
 	})
 	if err != nil {
 		t.Fatalf("buildFeishuAskCard(interactive) error = %v", err)
 	}
 	if !strings.Contains(string(interactive), `"tag":"action"`) {
 		t.Fatalf("interactive card must include action buttons: %s", interactive)
+	}
+}
+
+func TestBuildFeishuAskCardGuidanceByAnswerTransport(t *testing.T) {
+	// Feishu interactive: buttons / Dashboard — never "直接回文字" (free-text does not resume).
+	feishuCard, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq: 10, Question: "A or B?", Options: []string{"A", "B"},
+		AnswerTransport: "feishu",
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(feishu) error = %v", err)
+	}
+	feishuRaw := string(feishuCard)
+	if strings.Contains(feishuRaw, "直接回文字") {
+		t.Fatalf("feishu card must not claim free-text resumes the loop: %s", feishuRaw)
+	}
+	if !strings.Contains(feishuRaw, "点选项按钮") && !strings.Contains(feishuRaw, "/respond") {
+		t.Fatalf("feishu card should guide to buttons or /respond: %s", feishuRaw)
+	}
+
+	// respond notify-only: Dashboard /respond, not a GitHub PR that is not polled.
+	respondCard, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq: 11, Question: "A or B?", Options: []string{"A", "B"},
+		NotifyOnly: true, AnswerTransport: "respond", MentionOpenIds: []string{"ou_r"},
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(respond) error = %v", err)
+	}
+	respondRaw := string(respondCard)
+	if strings.Contains(respondRaw, "GitHub PR") {
+		t.Fatalf("respond transport must not direct operators to GitHub PR: %s", respondRaw)
+	}
+	if !strings.Contains(respondRaw, "Dashboard") && !strings.Contains(respondRaw, "/respond") {
+		t.Fatalf("respond transport should guide to Dashboard//respond: %s", respondRaw)
+	}
+
+	// github notify-only: PR comment or Dashboard.
+	githubCard, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq: 12, Question: "A or B?", Options: []string{"A", "B"},
+		NotifyOnly: true, AnswerTransport: "github",
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(github) error = %v", err)
+	}
+	githubRaw := string(githubCard)
+	if !strings.Contains(githubRaw, "GitHub PR") {
+		t.Fatalf("github transport should guide to GitHub PR: %s", githubRaw)
 	}
 }
 
