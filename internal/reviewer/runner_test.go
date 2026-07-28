@@ -7897,6 +7897,8 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Review body style contract",
 		"Never post terminal/tool output",
 		"never build review JSON inside a double-quoted shell string",
+		"Worktree hygiene contract",
+		"do not create review payload or scratch files inside the managed worktree",
 		"outbound content safety gate rejection",
 		"resubmit in the same session",
 		"ANSI escape sequences",
@@ -10333,6 +10335,10 @@ func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktre
 
 func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktreeInput) error {
 	f.cleanupCalls = append(f.cleanupCalls, input)
+	return nil
+}
+
+func (f *fakeGitGateway) ScrubReservedReviewerScratch(_ context.Context, _ string) error {
 	return nil
 }
 
