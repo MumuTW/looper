@@ -73,8 +73,26 @@ answer-detection heuristics.
 
 ## 4. Transport B — `/respond` API (self-host default)
 
-Already shipped: `POST /api/v1/loops/{seq}/respond {"answer": "..."}`. A local UI
-or curl answers. Zero infra; the natural fit for a single self-hosted daemon.
+Already shipped. Answer-only payload (always valid — authorizes the currently
+parked ask):
+
+```bash
+POST /api/v1/loops/{seq}/respond
+{"answer": "..."}
+```
+
+Optional generation tokens bind a dashboard/card UI to a specific park so a
+stale card cannot answer a later re-escalation on the same loop. Fetch the loop
+(`GET /api/v1/loops/{seq}`) and copy `metadata.hitl.executionId` /
+`metadata.hitl.askedAt` when present:
+
+```bash
+POST /api/v1/loops/{seq}/respond
+{"answer": "...", "executionId": "<hitl.executionId>", "askedAt": "<hitl.askedAt>"}
+```
+
+Zero infra; the natural fit for a single self-hosted daemon and for
+`hitl.answerTransport: "respond"`.
 
 ## 5. Transport C — Feishu (this team's default; optional in OSS)
 

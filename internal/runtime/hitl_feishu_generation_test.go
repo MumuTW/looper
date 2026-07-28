@@ -19,7 +19,7 @@ func TestPollFeishuHITLInboxOnce_RejectsStaleAskGeneration(t *testing.T) {
 		loopAskGeneration: func(ctx contextType, loopID string) (executionID, askedAt string, ok bool) {
 			return "exec-new", "2026-07-28T02:00:00Z", true
 		},
-		deliverAnswer: func(ctx contextType, loopID, answer string) error {
+		deliverAnswer: func(ctx contextType, loopID, answer, _, _ string) error {
 			delivered = append(delivered, loopID+":"+answer)
 			return nil
 		},

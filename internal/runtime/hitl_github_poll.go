@@ -234,7 +234,11 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	return err
 }
 
-func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
+// deliverHITLAnswerToLoop stores a human answer on an awaiting_human loop.
+// executionID/askedAt are optional generation tokens: when supplied they must
+// match the park re-read under the requeue lock (same TOCTOU fix as the API
+// deliverHumanAnswer transaction). Omitting both tokens answers the current park.
+func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer, executionID, askedAt string) error {
 	// Same requeue + target exclusion as free-text enqueue / API discard+retry.
 	unlock := LockLoopRequeue(loopID)
 	defer unlock()
@@ -251,6 +255,9 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok {
 		return nil
+	}
+	if !loops.AskGenerationMatches(ask, executionID, askedAt) {
+		return fmt.Errorf("stale ask generation")
 	}
 	ask.Answer = answer
 	ask.Status = "answered"
@@ -456,7 +463,9 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			return listHITLIssueComments(ctx, cfg, gw, provider, repo, pr, cwd)
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer)
+			// PR-comment answers are not generation-bound cards; empty tokens
+			// authorize the currently parked ask under the requeue lock.
+			return deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer, "", "")
 		},
 		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {
 			_ = clearHITLAwaitingLabel(ctx, cfg, gw, repo, pr, cwd, awaitingLabel)

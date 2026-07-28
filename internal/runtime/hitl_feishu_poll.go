@@ -45,7 +45,9 @@ type feishuHITLPollDeps struct {
 	// actions can reject stale tokens. Returns ok=false when no park exists.
 	loopAskGeneration func(ctx contextType, loopID string) (executionID, askedAt string, ok bool)
 	// deliverAnswer feeds a button-click decision into the shared HITL core.
-	deliverAnswer func(ctx contextType, loopID, answer string) error
+	// executionID/askedAt bind the card to the park generation (validated under
+	// the answer write lock).
+	deliverAnswer func(ctx contextType, loopID, answer, executionID, askedAt string) error
 	// enqueueMessage queues a free-text thread reply for the loop (conversational /
 	// anytime), to be drained on the loop's next turn rather than treated as a final
 	// answer.
@@ -65,7 +67,6 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 		}
 		loopID := ""
 		value := ""
-		var deliver func(contextType, string, string) error
 		switch strings.TrimSpace(e.Kind) {
 		case "message":
 			// A typed thread reply is conversational: queue it (question / new
@@ -77,20 +78,31 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 				continue
 			}
 			loopID = deps.loopByRoot(ctx, root)
-			value = text
-			deliver = deps.enqueueMessage
+			if strings.TrimSpace(loopID) == "" {
+				continue
+			}
+			if err := deps.enqueueMessage(ctx, loopID, text); err != nil {
+				if deps.logWarn != nil {
+					deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"loopId": loopID, "kind": e.Kind, "error": err.Error()})
+				}
+				continue
+			}
+			delivered++
 		case "card_action":
 			// A button click is a clean decision → the shared answer path.
 			ans := strings.TrimSpace(e.Value.Answer)
 			seq, err := strconv.ParseInt(strings.TrimSpace(e.Value.LoopSeq), 10, 64)
-			if ans == "" || err != nil || deps.loopBySeq == nil {
+			if ans == "" || err != nil || deps.loopBySeq == nil || deps.deliverAnswer == nil {
 				continue
 			}
 			loopID = deps.loopBySeq(ctx, seq)
+			if strings.TrimSpace(loopID) == "" {
+				continue // belongs to another looper (or already resumed)
+			}
 			value = ans
-			deliver = deps.deliverAnswer
-			// Reject stale cards that target a prior ask generation on the same loop.
-			if strings.TrimSpace(loopID) != "" && deps.loopAskGeneration != nil {
+			// Generation is re-checked inside deliverAnswer under the write lock.
+			// Optional preflight avoids noisy deliver failures for obvious stales.
+			if deps.loopAskGeneration != nil {
 				parkExec, parkAsked, ok := deps.loopAskGeneration(ctx, loopID)
 				if ok {
 					park := loops.HITLAsk{ExecutionID: parkExec, AskedAt: parkAsked}
@@ -104,19 +116,16 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 					}
 				}
 			}
+			if err := deps.deliverAnswer(ctx, loopID, value, e.Value.ExecutionID, e.Value.AskedAt); err != nil {
+				if deps.logWarn != nil {
+					deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"loopId": loopID, "kind": e.Kind, "error": err.Error()})
+				}
+				continue
+			}
+			delivered++
 		default:
 			continue
 		}
-		if strings.TrimSpace(loopID) == "" {
-			continue // belongs to another looper (or already resumed)
-		}
-		if err := deliver(ctx, loopID, value); err != nil {
-			if deps.logWarn != nil {
-				deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"loopId": loopID, "kind": e.Kind, "error": err.Error()})
-			}
-			continue
-		}
-		delivered++
 	}
 	return delivered, maxID
 }
@@ -192,8 +201,8 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			}
 			return ask.ExecutionID, ask.AskedAt, true
 		},
-		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			if err := deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer); err != nil {
+		deliverAnswer: func(ctx contextType, loopID, answer, executionID, askedAt string) error {
+			if err := deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer, executionID, askedAt); err != nil {
 				return err
 			}
 			// Mark the ask card resolved ("✅ 已选:X", brief preserved).

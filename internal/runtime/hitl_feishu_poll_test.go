@@ -13,7 +13,7 @@ func TestPollFeishuHITLInboxOnce(t *testing.T) {
 	deps := feishuHITLPollDeps{
 		loopByRoot: func(_ contextType, root string) string { return rootToLoop[root] },
 		loopBySeq:  func(_ contextType, seq int64) string { return seqToLoop[seq] },
-		deliverAnswer: func(_ contextType, loopID, answer string) error {
+		deliverAnswer: func(_ contextType, loopID, answer, _, _ string) error {
 			answers = append(answers, loopID+"="+answer)
 			return nil
 		},

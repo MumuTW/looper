@@ -146,10 +146,16 @@ func GitHubAskDeliveryPending(ask HITLAsk) bool {
 	return status == "" || status == "awaiting"
 }
 
-// AskGenerationMatches reports whether a Feishu (or other) card-action payload
-// targets the currently parked ask generation. Cards carry executionId and/or
-// askedAt; when the durable park has either field, the card must present a
-// matching token so an old card cannot answer a later re-escalation.
+// AskGenerationMatches reports whether a client payload targets the currently
+// parked ask generation.
+//
+// Rules:
+//   - Legacy parks with no executionId/askedAt accept any payload.
+//   - When the client omits both tokens, accept the current park (answer-only
+//     POST /respond contract — there is only one awaiting ask per loop).
+//   - When the client supplies tokens, every non-empty supplied token must match
+//     the park and at least one token must match, so a stale card cannot apply
+//     its option to a later re-escalation.
 func AskGenerationMatches(ask HITLAsk, executionID, askedAt string) bool {
 	parkExec := strings.TrimSpace(ask.ExecutionID)
 	parkAsked := strings.TrimSpace(ask.AskedAt)
@@ -159,7 +165,12 @@ func AskGenerationMatches(ask HITLAsk, executionID, askedAt string) bool {
 	if parkExec == "" && parkAsked == "" {
 		return true
 	}
-	// Park has a generation: require at least one matching card token.
+	// Answer-only clients (curl / scripts for answerTransport=respond) omit
+	// generation tokens: authorize against the currently parked ask.
+	if cardExec == "" && cardAsked == "" {
+		return true
+	}
+	// Park has a generation and the client supplied tokens: require match.
 	matched := false
 	if parkExec != "" {
 		if cardExec == "" {

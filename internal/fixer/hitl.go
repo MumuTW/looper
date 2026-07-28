@@ -76,9 +76,9 @@ type HITLAskNotification struct {
 	RecommendedOption string
 	Consequences      map[string]string
 	Confidence        string
-	// NotifyOnly suppresses interactive Feishu answer buttons. Used when
-	// answerTransport is github so answers arrive via PR comment / dashboard and
-	// GitHub awaiting-label cleanup still runs.
+	// NotifyOnly suppresses interactive Feishu answer buttons. True for every
+	// answerTransport except feishu so github/respond secondary cards cannot
+	// authorize repair through an explicitly disabled channel.
 	NotifyOnly bool
 	// ExecutionID and AskedAt bind Feishu card actions to this ask generation so
 	// a stale card from a prior escalation cannot answer a later park.
@@ -1120,6 +1120,10 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			}
 		}
 		ask.DeliveryPending = true
+	} else {
+		// Persist the configured answer channel so Feishu callbacks can reject
+		// github/respond parks even when secondary notify cards exist.
+		ask.Transport = r.hitlConfiguredTransport()
 	}
 	reason := "fixer suspended awaiting human decision"
 	if err := r.parkHITLLoop(ctx, input.Loop, ask, nowISO, reason); err != nil {
@@ -1205,9 +1209,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	}
 
 	// Always notify on suspend (all answer transports): sticky osascript + optional
-	// Feishu card. GitHub PR-comment delivery above is independent. When GitHub is
-	// the answer transport, the secondary Feishu card is notify-only so an answer
-	// cannot resume without the GitHub awaiting-label cleanup path.
+	// Feishu card. GitHub PR-comment delivery above is independent. Interactive
+	// Feishu answer buttons are only for answerTransport=feishu; github/respond
+	// secondary cards are notify-only so a disabled channel cannot authorize repair.
 	if r.hitlNotify != nil {
 		title := fmt.Sprintf("Fixer needs a decision · %s #%d", firstNonEmpty(input.Repo, derefString(input.Loop.Repo)), input.PRNumber)
 		if input.PRNumber <= 0 && input.Loop.PRNumber != nil {
@@ -1228,7 +1232,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			RecommendedOption: awaiting.recommendedOption,
 			Consequences:      awaiting.consequences,
 			Confidence:        awaiting.confidence,
-			NotifyOnly:        r.hitlTransportGitHub(),
+			NotifyOnly:        !r.hitlTransportFeishu(),
 			ExecutionID:       ask.ExecutionID,
 			AskedAt:           ask.AskedAt,
 		}
@@ -1546,6 +1550,28 @@ func repliesNeedHuman(replies []replyExplanationEntry) bool {
 func (r *Runner) hitlTransportGitHub() bool {
 	t := strings.TrimSpace(strings.ToLower(r.hitlAnswerTransport))
 	return t == "" || t == "github"
+}
+
+// hitlTransportFeishu reports whether Feishu is the configured answer channel
+// (interactive cards + inbound callback authority).
+func (r *Runner) hitlTransportFeishu() bool {
+	return strings.EqualFold(strings.TrimSpace(r.hitlAnswerTransport), "feishu")
+}
+
+// hitlConfiguredTransport returns the durable transport stamp for a non-github
+// park ("feishu" | "respond"). Empty config defaults to github and is handled
+// by stampGitHubAskTransport instead.
+func (r *Runner) hitlConfiguredTransport() string {
+	t := strings.TrimSpace(strings.ToLower(r.hitlAnswerTransport))
+	switch t {
+	case "feishu", "respond":
+		return t
+	default:
+		if t == "" {
+			return "github"
+		}
+		return t
+	}
 }
 
 func (r *Runner) hitlAwaitingLabel() string {

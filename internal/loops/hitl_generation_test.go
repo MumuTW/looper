@@ -32,8 +32,9 @@ func TestAskGenerationMatches(t *testing.T) {
 	}
 
 	park := HITLAsk{ExecutionID: "exec-2", AskedAt: "2026-07-28T01:00:00Z"}
-	if AskGenerationMatches(park, "", "") {
-		t.Fatal("card missing generation must not match parked generation")
+	// Answer-only /respond omits tokens and authorizes the current park.
+	if !AskGenerationMatches(park, "", "") {
+		t.Fatal("omitted generation tokens must accept current parked ask")
 	}
 	if AskGenerationMatches(park, "exec-1", "2026-07-28T01:00:00Z") {
 		t.Fatal("wrong executionId must not match")

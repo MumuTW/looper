@@ -271,6 +271,7 @@ func TestHandlerRespondRejectsWhenAgentNotConfiguredWithoutSnapshot(t *testing.T
 func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.HITL.Enabled = true
+	cfg.HITL.AnswerTransport = "feishu"
 	// The card-action route is fail-closed: it requires a configured, matching
 	// Feishu verification token before it will deliver an answer.
 	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN", "verify-tok-123")
@@ -281,7 +282,7 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 	projectID := "project_card"
 	loopID := "loop_card"
 	targetID := projectID
-	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting"}}`
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting","transport":"feishu"}}`
 
 	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
@@ -316,6 +317,7 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 func TestHandlerFeishuCardActionMarksAskAnswered(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.HITL.Enabled = true
+	cfg.HITL.AnswerTransport = "feishu"
 	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN_MARK", "verify-tok-mark")
 	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN_MARK"
 
@@ -332,7 +334,7 @@ func TestHandlerFeishuCardActionMarksAskAnswered(t *testing.T) {
 	projectID := "project_card_mark"
 	loopID := "loop_card_mark"
 	targetID := projectID
-	metadata := `{"hitl":{"question":"q","sessionId":"sess-mark","status":"awaiting"}}`
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-mark","status":"awaiting","transport":"feishu"}}`
 	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -366,14 +368,16 @@ func (r *runtimeHITLAnswerProbe) MarkHITLAskAnswered(ctx context.Context, loopID
 }
 
 // setupAwaitingCardLoop seeds a project + awaiting_human loop and returns the
-// handler + services for card-action security tests.
+// handler + services for card-action security tests. Parks are stamped
+// transport=feishu so Feishu answers are the configured authority.
 func setupAwaitingCardLoop(t *testing.T, cfg config.Config, rt *looperdruntime.Runtime, projectID, loopID string, seq int64) *Handler {
 	t.Helper()
+	cfg.HITL.AnswerTransport = "feishu"
 	h := NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)})
 	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
 	targetID := projectID
-	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting"}}`
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting","transport":"feishu"}}`
 	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -528,6 +532,83 @@ func TestHandlerRespondRejectsStaleAskGeneration(t *testing.T) {
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok || ask.Status != "awaiting" || strings.TrimSpace(ask.Answer) != "" {
 		t.Fatalf("ask = %#v, want unanswered", ask)
+	}
+}
+
+// Answer-only /respond remains usable when the park carries generation tokens
+// (answerTransport=respond documented contract).
+func TestHandlerRespondAnswerOnlyAcceptsCurrentPark(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_hitl_answer_only"
+	loopID := "loop_hitl_answer_only"
+	targetID := projectID
+	metadata := `{"hitl":{"question":"Which direction?","options":["a","b"],"sessionId":"sess","executionId":"agent-cur","vendor":"codex","status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z","transport":"respond"}}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 95, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	cancelReason := "loop suspended awaiting human"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_hitl_answer_only", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:hitl-answer-only", Priority: storage.QueuePriorityWorker, Status: "cancelled", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LastError: &cancelReason, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/95/respond", strings.NewReader(`{"answer":"option a"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for answer-only; body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil || loop.Status != "running" {
+		t.Fatalf("loop = %#v err=%v, want running", loop, err)
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Status != "answered" || ask.Answer != "option a" {
+		t.Fatalf("ask = %#v, want answered option a", ask)
+	}
+}
+
+// Feishu card buttons must not authorize answerTransport=respond parks.
+func TestHandlerFeishuCardActionRejectsRespondTransport(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	cfg.HITL.AnswerTransport = "respond"
+	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN_RESPOND", "verify-tok-123")
+	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN_RESPOND"
+	h := NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_respond_btn"
+	loopID := "loop_respond_btn"
+	targetID := projectID
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting","transport":"respond","executionId":"agent-r","askedAt":"2026-04-11T12:00:00.000Z"}}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 96, ProjectID: projectID, Type: "fixer", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	body := `{"token":"verify-tok-123","action":{"tag":"button","value":{"loopSeq":"96","answer":"keep","executionId":"agent-r","askedAt":"2026-04-11T12:00:00.000Z"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"delivered":false`) {
+		t.Fatalf("body = %s, want delivered:false for respond transport button", recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop.Status = %q, want still awaiting_human", loop.Status)
 	}
 }
 

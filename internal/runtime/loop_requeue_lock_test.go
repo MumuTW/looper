@@ -165,7 +165,7 @@ func TestDeliverHITLAnswerToLoopSharesRequeueLock(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		close(started)
-		done <- deliverHITLAnswerToLoop(context.Background(), repos, nowISO, loopID, "yes")
+		done <- deliverHITLAnswerToLoop(context.Background(), repos, nowISO, loopID, "yes", "", "")
 	}()
 	<-started
 	select {

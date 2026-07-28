@@ -3391,12 +3391,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		return notificationGateway.SendHITLAsk(ctx, card)
 	}
 	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
-		// When GitHub is the answer transport, secondary Feishu cards are
-		// notify-only so button clicks cannot resume without GitHub label cleanup.
-		notifyOnly := true
-		if t := strings.TrimSpace(strings.ToLower(cfg.HITL.AnswerTransport)); t != "" && t != "github" {
-			notifyOnly = false
-		}
+		// Interactive Feishu buttons only when answerTransport is feishu.
+		// github/respond (and empty default github) secondary cards are notify-only
+		// so a disabled channel cannot authorize repair.
+		notifyOnly := !strings.EqualFold(strings.TrimSpace(cfg.HITL.AnswerTransport), "feishu")
 		return notifyHITLAskCard(ctx, notify.HITLAskCard{
 			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
 			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,

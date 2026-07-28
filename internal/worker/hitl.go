@@ -344,6 +344,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 				"loopId": input.Loop.ID, "error": err.Error(),
 			})
 		}
+	} else {
+		// Stamp feishu/respond so Feishu callbacks reject non-feishu parks.
+		ask.Transport = r.hitlConfiguredTransport()
 	}
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
@@ -417,6 +420,21 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 func (r *Runner) hitlTransportGitHub() bool {
 	t := strings.TrimSpace(strings.ToLower(r.hitlAnswerTransport))
 	return t == "" || t == "github"
+}
+
+// hitlConfiguredTransport returns the durable transport stamp for a non-github
+// park ("feishu" | "respond").
+func (r *Runner) hitlConfiguredTransport() string {
+	t := strings.TrimSpace(strings.ToLower(r.hitlAnswerTransport))
+	switch t {
+	case "feishu", "respond":
+		return t
+	default:
+		if t == "" {
+			return "github"
+		}
+		return t
+	}
 }
 
 func (r *Runner) hitlAwaitingLabel() string {

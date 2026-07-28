@@ -138,8 +138,8 @@ How it works:
 
 1. When an agent hits a genuine blocker it writes `.looper/ask.json` (`{"question": "...", "options": ["A", "B"]}`) and stops. The worker suspends the loop to `awaiting_human` and sends the ask-card to `chatId`.
 2. A human answers one of two ways:
-   - **Click a button** on the card → Feishu POSTs the card action to `POST <daemon>/api/v1/hitl/feishu` (point the app's *card callback / event* URL there).
-   - **API** → `POST <daemon>/api/v1/loops/<seq>/respond -d '{"answer":"A"}'` (no Feishu needed).
+   - **Click a button** on the card → Feishu POSTs the card action to `POST <daemon>/api/v1/hitl/feishu` (point the app's *card callback / event* URL there). Buttons carry `executionId`/`askedAt` so a stale card cannot answer a later re-ask.
+   - **API** → `POST <daemon>/api/v1/loops/<seq>/respond -d '{"answer":"A"}'` (no Feishu needed). Answer-only is enough for the current park; optionally pass `executionId` and `askedAt` from `GET /api/v1/loops/<seq>` (`metadata.hitl`) to reject a stale UI after a re-escalation.
 3. The loop transitions back to `running` and the agent **resumes the same vendor session** (Codex/Claude/OpenCode) with the decision injected — not a fresh run.
 
 **Security — the inbound callback is fail-closed.** `/hitl/feishu` delivers human text straight into a coding-agent session, so it verifies the Feishu app **Verification Token** on every request:

@@ -5673,8 +5673,10 @@ type respondLoopRequest struct {
 // requeues it and triggers a scheduler tick) so the next run resumes the same
 // agent session with the answer. This is the testable core of the HITL bridge.
 //
-// When the parked ask carries executionId/askedAt, the request must present a
-// matching generation so a stale dashboard card cannot answer a later re-ask.
+// Generation tokens (executionId/askedAt) are optional: omitted tokens answer
+// the currently parked ask (answer-only contract for answerTransport=respond).
+// When supplied, they are validated inside the answer-write transaction so a
+// stale card cannot race a re-park.
 func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID string) (loopResponse, error) {
 	var body respondLoopRequest
 	if r.Body != nil {
@@ -5684,21 +5686,7 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 			return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid respond request: %v", err)}
 		}
 	}
-	services := h.context.Runtime.Services()
-	if services.Repositories != nil && services.Repositories.Loops != nil {
-		if loop, err := services.Repositories.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
-			if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok {
-				if !loops.AskGenerationMatches(ask, body.ExecutionID, body.AskedAt) {
-					return loopResponse{}, apiError{
-						code:    pkgapi.ErrorCodeValidationFailed,
-						status:  http.StatusConflict,
-						message: "stale ask generation: refresh the decision card and try again",
-					}
-				}
-			}
-		}
-	}
-	return h.deliverHumanAnswer(ctx, loopID, body.Answer)
+	return h.deliverHumanAnswer(ctx, loopID, body.Answer, body.ExecutionID, body.AskedAt)
 }
 
 // deliverHumanAnswer is the shared core of the HITL respond path: it validates
@@ -5706,11 +5694,16 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 // transitions the loop back to running (requeue + scheduler tick). Both the
 // /respond API endpoint and the Feishu card-action receiver call it.
 //
+// executionID/askedAt bind the answer to a park generation. Comparison happens
+// inside the same transaction that writes the answer so a concurrent re-park
+// cannot accept a stale generation. Omitting both tokens authorizes the current
+// park (answer-only /respond).
+//
 // When the ask used the PR-comment answer transport (transport=github), this
 // path also clears the awaiting-human PR label — the same cleanup the GitHub
 // poll lane performs after detecting a PR reply. Dashboard /respond answers
 // otherwise leave the label permanently because the poll skips now-running loops.
-func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnswer string) (loopResponse, error) {
+func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnswer string, executionID, askedAt string) (loopResponse, error) {
 	answer := strings.TrimSpace(rawAnswer)
 	if answer == "" {
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "respond requires a non-empty answer"}
@@ -5732,6 +5725,15 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
 		}
 		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		// Generation authority is decided against the row this transaction is
+		// about to mutate — not a prior preflight read that can race a re-park.
+		if !loops.AskGenerationMatches(ask, executionID, askedAt) {
+			return storage.LoopRecord{}, apiError{
+				code:    pkgapi.ErrorCodeValidationFailed,
+				status:  http.StatusConflict,
+				message: "stale ask generation: refresh the decision card and try again",
+			}
+		}
 		// Capture PR-comment cleanup fields before mutating the ask so dashboard
 		// answers clear the same awaiting-human label the poll lane removes.
 		if strings.EqualFold(strings.TrimSpace(ask.Transport), "github") && ask.PRNumber > 0 {
@@ -5988,26 +5990,26 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 		h.writeError(w, requestID, typed)
 		return
 	}
-	// Notify-only / GitHub-transport cards must not accept Feishu button answers:
-	// answer authority is the configured GitHub answerAuthors path (or dashboard).
+	// Non-feishu answer transports must not accept Feishu button answers:
+	// answer authority is the configured channel (github PR comment, /respond API).
 	if h.hitlAskRejectsFeishuAnswer(&loop) {
-		h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": false, "reason": "feishu answers disabled for github transport"})
+		h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": false, "reason": "feishu answers disabled for non-feishu transport"})
 		return
 	}
-	// Bind card actions to the current ask generation so a stale card from a
-	// prior escalation cannot apply its option to a later park on the same loop.
-	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok {
-		if !loops.AskGenerationMatches(ask, value.ExecutionID, value.AskedAt) {
+	// Generation is validated inside deliverHumanAnswer's write transaction so a
+	// concurrent re-park cannot accept a stale card generation.
+	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer, value.ExecutionID, value.AskedAt); err != nil {
+		var typed apiError
+		if !asAPIError(err, &typed) {
+			typed = internalServerError(err)
+		}
+		// Stale generation is a soft reject for Feishu (200 + delivered:false) so
+		// the card action does not surface as a hard callback error.
+		if typed.status == http.StatusConflict {
 			h.writeSuccess(w, requestID, map[string]any{
 				"loopSeq": loopSeq, "delivered": false, "reason": "stale ask generation",
 			})
 			return
-		}
-	}
-	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer); err != nil {
-		var typed apiError
-		if !asAPIError(err, &typed) {
-			typed = internalServerError(err)
 		}
 		h.writeError(w, requestID, typed)
 		return
@@ -6021,8 +6023,9 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 // ask. Only card-action buttons (which carry executionId/askedAt) and dashboard
 // /respond bind to the ask generation. This matches the Feishu inbox poll lane.
 //
-// When answerTransport is github, secondary Feishu cards are notify-only: free-text
-// replies in the loop thread must not resume the Fixer and bypass GitHub authority.
+// When answerTransport is not feishu, secondary Feishu cards are notify-only:
+// free-text replies in the loop thread must not resume the agent and bypass the
+// configured answer channel (github PR comment or /respond API).
 func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request, requestID string, envelope feishuCardActionEnvelope) {
 	msg := envelope.Event.Message
 	if msg.MessageType != "text" {
@@ -6057,7 +6060,7 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if loop, lerr := services.Repositories.Loops.GetByID(r.Context(), loopID); lerr == nil && loop != nil && h.hitlAskRejectsFeishuAnswer(loop) {
-		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "feishu answers disabled for github transport"})
+		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "feishu answers disabled for non-feishu transport"})
 		return
 	}
 	// Conversational inbox only — never deliverHumanAnswer (would apply stale
@@ -6113,9 +6116,9 @@ func (h *Handler) enqueueFeishuThreadMessage(ctx context.Context, loopID, text s
 }
 
 // hitlAskRejectsFeishuAnswer reports whether Feishu card buttons / free-text thread
-// replies must not resume this loop. GitHub answer transport parks a notify-only
-// Feishu card for awareness; answers must arrive via PR comment or dashboard so
-// awaiting-label cleanup and answerAuthors authority stay intact.
+// replies must not resume this loop. Only answerTransport=feishu parks are
+// interactive on Feishu; github/respond (and empty/legacy defaulting to github)
+// parks send notify-only cards and must answer via the configured channel.
 func (h *Handler) hitlAskRejectsFeishuAnswer(loop *storage.LoopRecord) bool {
 	if loop == nil {
 		return false
@@ -6124,7 +6127,21 @@ func (h *Handler) hitlAskRejectsFeishuAnswer(loop *storage.LoopRecord) bool {
 	if !ok {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(ask.Transport), "github")
+	transport := strings.ToLower(strings.TrimSpace(ask.Transport))
+	if transport == "" {
+		// Legacy parks without a stamp: fall back to live config (empty → github).
+		cfg := h.context.Config
+		if h.context.Runtime != nil {
+			if runtimeConfig, ok := any(h.context.Runtime).(interface{ Config() config.Config }); ok {
+				cfg = runtimeConfig.Config()
+			}
+		}
+		transport = strings.ToLower(strings.TrimSpace(cfg.HITL.AnswerTransport))
+		if transport == "" {
+			transport = "github"
+		}
+	}
+	return transport != "feishu"
 }
 
 // retryLoop re-arms a loop for another scheduler pass. fromHandback is true when

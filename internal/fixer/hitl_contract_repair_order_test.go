@@ -155,3 +155,68 @@ func TestHITLContract_GitHubTransportNotifyOnly(t *testing.T) {
 		t.Fatalf("ask transport/provider = %q/%q, want github/github", ask.Transport, ask.Provider)
 	}
 }
+
+// respond transport must not send interactive Feishu cards — /respond is the
+// only configured answer channel (answerTransport=respond is API-only).
+func TestHITLContract_RespondTransportNotifyOnly(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+
+	repo := "acme/looper"
+	pr := int64(87)
+	loop := storage.LoopRecord{
+		ID: "loop_respond_notify", Seq: 105, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", Repo: &repo, PRNumber: &pr, Status: "running",
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	_ = fixture.repos.Loops.Upsert(ctx, loop)
+	loopID := loop.ID
+	projectID := loop.ProjectID
+	queueItem := storage.QueueItemRecord{
+		ID: "queue_respond_notify", ProjectID: &projectID, LoopID: &loopID, Type: "fixer",
+		TargetType: "pull_request", Repo: &repo, PRNumber: &pr, Status: "running",
+		DedupeKey: "fixer:respond-notify", Priority: storage.QueuePriorityFixer, AvailableAt: nowISO,
+		MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	_ = fixture.repos.Queue.Upsert(ctx, queueItem)
+	run := storage.RunRecord{
+		ID: "run_respond_notify", LoopID: loop.ID, Status: "running",
+		StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	_ = fixture.repos.Runs.Upsert(ctx, run)
+	project, _ := fixture.repos.Projects.GetByID(ctx, "project_1")
+
+	var notified []HITLAskNotification
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Logger: fixture.logger, Now: fixture.now,
+		HITLEnabled: true, HITLAnswerTransport: "respond",
+		HITLNotify: func(_ context.Context, n HITLAskNotification) error {
+			notified = append(notified, n)
+			return nil
+		},
+	})
+	_, err := runner.suspendForHuman(ctx, stepInput{
+		Project: *project, Loop: loop, Run: run, QueueItem: queueItem,
+		Repo: repo, PRNumber: pr,
+	}, run, fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: pr87Head}}, &awaitingHumanError{
+		question: "respond notify only?", options: []string{"a", "b"},
+		sessionID: "sess-respond", executionID: "agent-respond", vendor: "codex",
+	})
+	if err != nil {
+		t.Fatalf("suspendForHuman: %v", err)
+	}
+	if len(notified) != 1 || !notified[0].NotifyOnly {
+		t.Fatalf("respond transport notification = %#v, want NotifyOnly=true", notified)
+	}
+	got, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || got == nil {
+		t.Fatalf("Loops.GetByID: %v", err)
+	}
+	ask, ok := loops.ReadHITLAsk(got.MetadataJSON)
+	if !ok || ask.Transport != "respond" {
+		t.Fatalf("ask.Transport = %#v (ok=%v), want respond stamp", ask, ok)
+	}
+}
