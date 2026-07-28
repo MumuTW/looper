@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -29,6 +31,12 @@ const (
 	gatewayStateLoopLimit   = 4096
 )
 
+var (
+	errHITLOsascriptDisabled    = errors.New("osascript HITL alerts are disabled")
+	errHITLOsascriptNoDashboard = errors.New("dashboard base URL is not configured for HITL osascript")
+	errHITLFeishuNotConfigured  = errors.New("feishu app-bot is not configured for HITL asks (need appIdEnv/appSecretEnv/chatId)")
+)
+
 type RunCommandFunc func(context.Context, shell.Options) (shell.Result, error)
 
 // HTTPPostFunc delivers a webhook notification body to url and returns the
@@ -44,12 +52,15 @@ type Options struct {
 	Config        config.NotificationConfig
 	OsascriptPath string
 	LogFilePath   string
-	Repositories  *storage.Repositories
-	State         *GatewayState
-	Now           func() time.Time
-	RunCommand    RunCommandFunc
-	HTTPPost      HTTPPostFunc
-	FeishuAppHTTP FeishuAppHTTPFunc
+	// DashboardBaseURL is the browser origin for sticky HITL dialogs
+	// (e.g. http://127.0.0.1:17310). Loop detail opens at {base}/dashboard/loops/{seq}.
+	DashboardBaseURL string
+	Repositories     *storage.Repositories
+	State            *GatewayState
+	Now              func() time.Time
+	RunCommand       RunCommandFunc
+	HTTPPost         HTTPPostFunc
+	FeishuAppHTTP    FeishuAppHTTPFunc
 }
 
 // GatewayState retains transport continuity across immutable, config-specific
@@ -134,15 +145,16 @@ type SystemNotificationPayload struct {
 }
 
 type Gateway struct {
-	config        config.NotificationConfig
-	osascriptPath string
-	logFilePath   string
-	repositories  *storage.Repositories
-	now           func() time.Time
-	runCommand    RunCommandFunc
-	httpPost      HTTPPostFunc
-	feishuAppHTTP FeishuAppHTTPFunc
-	state         *GatewayState
+	config           config.NotificationConfig
+	osascriptPath    string
+	logFilePath      string
+	dashboardBaseURL string
+	repositories     *storage.Repositories
+	now              func() time.Time
+	runCommand       RunCommandFunc
+	httpPost         HTTPPostFunc
+	feishuAppHTTP    FeishuAppHTTPFunc
+	state            *GatewayState
 }
 
 type askCardState struct {
@@ -176,16 +188,45 @@ func NewGateway(options Options) *Gateway {
 	}
 
 	return &Gateway{
-		config:        options.Config,
-		osascriptPath: options.OsascriptPath,
-		logFilePath:   options.LogFilePath,
-		repositories:  options.Repositories,
-		now:           now,
-		runCommand:    runCommand,
-		httpPost:      httpPost,
-		feishuAppHTTP: feishuAppHTTP,
-		state:         state,
+		config:           options.Config,
+		osascriptPath:    options.OsascriptPath,
+		logFilePath:      options.LogFilePath,
+		dashboardBaseURL: strings.TrimRight(strings.TrimSpace(options.DashboardBaseURL), "/"),
+		repositories:     options.Repositories,
+		now:              now,
+		runCommand:       runCommand,
+		httpPost:         httpPost,
+		feishuAppHTTP:    feishuAppHTTP,
+		state:            state,
 	}
+}
+
+// BrowserDashboardBaseURL builds the origin used to open the operator dashboard
+// from local notifications. Wildcard binds map to loopback; optional baseURL wins.
+func BrowserDashboardBaseURL(host string, port int, baseURL *string) string {
+	if baseURL != nil {
+		if trimmed := strings.TrimRight(strings.TrimSpace(*baseURL), "/"); trimmed != "" {
+			return trimmed
+		}
+	}
+	h := strings.TrimSpace(host)
+	switch h {
+	case "", "0.0.0.0", "::", "[::]":
+		h = "127.0.0.1"
+	}
+	if port <= 0 {
+		port = 17310
+	}
+	return "http://" + net.JoinHostPort(h, strconv.Itoa(port))
+}
+
+// DashboardLoopURL returns the SPA loop-detail URL for a sticky HITL dialog.
+func DashboardLoopURL(baseURL string, loopSeq int64) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" || loopSeq <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s/dashboard/loops/%d", base, loopSeq)
 }
 
 func (g *Gateway) Notify(ctx context.Context, payload SystemNotificationPayload) []storage.NotificationRecord {
@@ -603,16 +644,101 @@ func feishuMentionMarkup(openIDs []string) string {
 	return strings.Join(tags, " ")
 }
 
-// SendHITLAsk delivers an ask-card to the Feishu app-bot target chat. It reuses
-// the app-bot credentials in notifications.webhook (appIdEnv/appSecretEnv/chatId)
-// and is a no-op error when they are not configured. Best-effort; caller logs.
+// SendHITLAsk notifies the operator that a loop is awaiting_human.
+//
+// Channels (best-effort, independent):
+//  1. Sticky macOS osascript dialog (no auto-dismiss) that opens the dashboard
+//     loop detail when the operator clicks — launched asynchronously so suspend
+//     never blocks on the human.
+//  2. Feishu interactive ask-card when app-bot credentials are configured.
+//
+// Succeeds when at least one channel is delivered or launched. Caller logs failures.
 func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
+	localErr := g.launchHITLAskOsascript(card)
+	feishuErr := g.sendHITLAskFeishu(ctx, card)
+	if localErr == nil || feishuErr == nil {
+		return nil
+	}
+	// Prefer a concrete Feishu delivery error over "not configured" when both fail.
+	if feishuErr != nil && !errors.Is(feishuErr, errHITLFeishuNotConfigured) {
+		return feishuErr
+	}
+	if localErr != nil {
+		return localErr
+	}
+	return feishuErr
+}
+
+// launchHITLAskOsascript starts a sticky display-dialog that stays until the
+// operator clicks, then opens the dashboard loop URL. Async: returns once the
+// process is spawned (or immediately if osascript/dashboard is unavailable).
+func (g *Gateway) launchHITLAskOsascript(card HITLAskCard) error {
+	if !g.config.Osascript.Enabled || strings.TrimSpace(g.osascriptPath) == "" {
+		return errHITLOsascriptDisabled
+	}
+	dashboardURL := DashboardLoopURL(g.dashboardBaseURL, card.LoopSeq)
+	if dashboardURL == "" {
+		return errHITLOsascriptNoDashboard
+	}
+	script := buildHITLAskAppleScript(card, dashboardURL)
+	path := g.osascriptPath
+	run := g.runCommand
+	// Detached from caller ctx so scheduler/run completion cancellation cannot
+	// dismiss the dialog before the human acts.
+	go func() {
+		_, _ = run(context.Background(), shell.Options{
+			Command: path,
+			Args:    []string{"-e", script},
+			// No timeout: dialog must stay until the operator clicks.
+		})
+	}()
+	g.persistHITLOsascriptLaunch(card, dashboardURL)
+	return nil
+}
+
+func (g *Gateway) persistHITLOsascriptLaunch(card HITLAskCard, dashboardURL string) {
+	if g.repositories == nil || g.repositories.Notifications == nil {
+		return
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(g.now())
+	body := strings.TrimSpace(card.Question)
+	if body == "" {
+		body = strings.TrimSpace(card.Title)
+	}
+	record := storage.NotificationRecord{
+		ID:        eventlog.NewEventID("notification"),
+		ProjectID: nilIfEmpty(card.ProjectID),
+		LoopID:    nilIfEmpty(card.LoopID),
+		Channel:   "osascript",
+		Level:     "action_required",
+		Title:     firstNonEmpty(card.Title, "Looper needs a decision"),
+		Body:      body,
+		Status:    "success",
+		DedupeKey: stringPointer(fmt.Sprintf("hitl.ask.osascript:%s:%d", card.LoopID, card.LoopSeq)),
+		PayloadJSON: stringPointer(mustMarshalPayload(SystemNotificationPayload{
+			ProjectID:  card.ProjectID,
+			LoopID:     card.LoopID,
+			Level:      "action_required",
+			Title:      firstNonEmpty(card.Title, "Looper needs a decision"),
+			Body:       body + "\n" + dashboardURL,
+			EntityType: "loop",
+			EntityID:   card.LoopID,
+			DedupeKey:  fmt.Sprintf("hitl.ask.osascript:%s:%d", card.LoopID, card.LoopSeq),
+		})),
+		SentAt:    stringPointer(nowISO),
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}
+	_ = g.persistNotification(context.Background(), record)
+}
+
+func (g *Gateway) sendHITLAskFeishu(ctx context.Context, card HITLAskCard) error {
 	cfg := g.config.Webhook
 	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
 	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
 	chatID := strings.TrimSpace(cfg.ChatID)
 	if appID == "" || appSecret == "" || chatID == "" {
-		return fmt.Errorf("feishu app-bot is not configured for HITL asks (need appIdEnv/appSecretEnv/chatId)")
+		return errHITLFeishuNotConfigured
 	}
 	token, err := g.feishuTenantToken(ctx, appID, appSecret)
 	if err != nil {
@@ -1712,6 +1838,43 @@ end if`, body, title, openLogPath)
 	}
 
 	return fmt.Sprintf(`display notification %q with title %q%s%s`, body, title, subtitle, sound)
+}
+
+// buildHITLAskAppleScript builds a sticky modal (no "giving up after") that opens
+// the dashboard loop detail when the operator clicks Open Dashboard.
+func buildHITLAskAppleScript(card HITLAskCard, dashboardURL string) string {
+	title := strings.TrimSpace(card.Title)
+	if title == "" {
+		title = "Looper needs a decision"
+	}
+	body := strings.TrimSpace(card.Question)
+	if body == "" {
+		body = title
+	}
+	if opts := nonEmptyStrings(card.Options); len(opts) > 0 {
+		body = body + "\n\nOptions: " + strings.Join(opts, " · ")
+	}
+	if rec := strings.TrimSpace(card.Recommendation); rec != "" {
+		body = body + "\n\nRecommendation: " + rec
+	}
+	body = body + "\n\nOpen the dashboard to answer."
+
+	return fmt.Sprintf(`display dialog %q with title %q buttons {"Open Dashboard"} default button "Open Dashboard"
+do shell script "open " & quoted form of %q`,
+		escapeAppleScriptString(body),
+		escapeAppleScriptString(title),
+		escapeAppleScriptString(dashboardURL),
+	)
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if t := strings.TrimSpace(v); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func escapeAppleScriptString(value string) string {

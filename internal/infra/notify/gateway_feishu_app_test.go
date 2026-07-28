@@ -283,13 +283,14 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		}
 	})
 
-	t.Run("SendHITLAsk errors when app not configured", func(t *testing.T) {
+	t.Run("SendHITLAsk errors when app not configured and osascript unavailable", func(t *testing.T) {
 		cfg := appModeConfig()
 		cfg.ChatID = ""
 		var calls []capturedFeishuCall
 		gateway := newFeishuAppGateway(t, cfg, &calls)
+		// Osascript disabled by default in this helper — Feishu miss must surface.
 		if err := gateway.SendHITLAsk(ctx, HITLAskCard{LoopSeq: 1, Question: "q"}); err == nil {
-			t.Fatal("SendHITLAsk() error = nil, want error when chatId missing")
+			t.Fatal("SendHITLAsk() error = nil, want error when chatId missing and osascript off")
 		}
 		if len(calls) != 0 {
 			t.Fatalf("feishu calls = %d, want 0 when unconfigured", len(calls))

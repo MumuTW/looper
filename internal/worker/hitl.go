@@ -367,7 +367,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
-	if !r.hitlTransportGitHub() && r.hitlNotify != nil {
+	// Always notify on suspend (all answer transports): sticky osascript + optional
+	// Feishu card. GitHub PR-comment delivery above is independent.
+	if r.hitlNotify != nil {
 		notif := HITLAskNotification{
 			ProjectID:         input.Project.ID,
 			LoopID:            input.Loop.ID,

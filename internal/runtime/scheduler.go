@@ -3062,11 +3062,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	// gated on CodingRoleAgentConfigured via *DiscoveryEnabled flags and
 	// webhook nil-runner checks.
 	notificationGateway := notificationGateways.New(notify.Options{
-		Config:        cfg.Notifications,
-		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
-		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
-		Repositories:  repos,
-		Now:           now,
+		Config:           cfg.Notifications,
+		OsascriptPath:    derefString(cfg.Tools.OsascriptPath),
+		LogFilePath:      filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		DashboardBaseURL: notify.BrowserDashboardBaseURL(cfg.Server.Host, cfg.Server.Port, cfg.Server.BaseURL),
+		Repositories:     repos,
+		Now:              now,
 	})
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
 	// CURRENT status (colour + label), without disturbing the retained live tail.

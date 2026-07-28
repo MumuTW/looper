@@ -772,7 +772,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		}
 	}
 
-	if !r.hitlTransportGitHub() && r.hitlNotify != nil {
+	// Always notify on suspend (all answer transports): sticky osascript + optional
+	// Feishu card. GitHub PR-comment delivery above is independent.
+	if r.hitlNotify != nil {
 		title := fmt.Sprintf("Fixer needs a decision · %s #%d", firstNonEmpty(input.Repo, derefString(input.Loop.Repo)), input.PRNumber)
 		if input.PRNumber <= 0 && input.Loop.PRNumber != nil {
 			title = fmt.Sprintf("Fixer needs a decision · %s #%d", firstNonEmpty(input.Repo, derefString(input.Loop.Repo)), *input.Loop.PRNumber)
