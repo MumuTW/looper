@@ -484,6 +484,40 @@ func (r *Runner) hasAnsweredHITLAsk(ctx context.Context, loop *storage.LoopRecor
 	return ok && ask.Status == "answered" && strings.TrimSpace(ask.Answer) != ""
 }
 
+// worktreeHasInProgressMerge reports whether the worktree still has a git merge
+// in progress (MERGE_HEAD). Used so answered HITL conflict resume skips
+// MergeBaseIntoWorktree only when the retained worktree still carries the
+// original conflict; a replaced worktree at PR head must re-run the merge.
+func worktreeHasInProgressMerge(worktreePath string) bool {
+	path := strings.TrimSpace(worktreePath)
+	if path == "" {
+		return false
+	}
+	// Ordinary checkout: .git/ is a directory.
+	if st, err := os.Stat(filepath.Join(path, ".git", "MERGE_HEAD")); err == nil && !st.IsDir() {
+		return true
+	}
+	// Linked worktree: .git is a gitdir: pointer file.
+	data, err := os.ReadFile(filepath.Join(path, ".git"))
+	if err != nil {
+		return false
+	}
+	line := strings.TrimSpace(string(data))
+	const prefix = "gitdir:"
+	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+		return false
+	}
+	gitdir := strings.TrimSpace(line[len(prefix):])
+	if gitdir == "" {
+		return false
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(path, gitdir)
+	}
+	st, err := os.Stat(filepath.Join(gitdir, "MERGE_HEAD"))
+	return err == nil && !st.IsDir()
+}
+
 // durableHITLParkForAsk reports whether the loop's durable HITL record is an
 // active park for the same ask generation as the on-disk ask.json. A historical
 // "consumed" park must NOT authorize deleting a new ask.json — that would drop
@@ -753,6 +787,10 @@ func (r *Runner) latestAgentSession(ctx context.Context, loopID string) (string,
 	return sessionID, rec.Vendor
 }
 
+// errHITLLoopTerminated is returned when parkHITLLoop observes the loop was
+// stopped/terminated concurrently; suspend must exit without completing a park.
+var errHITLLoopTerminated = errors.New("fixer HITL park aborted: loop terminated")
+
 // suspendForHuman parks a fixer run as awaiting_human: persists HITLAsk, sets
 // loop status, cancels the queue item, ends the run interrupted with repair NOT
 // complete, clears ask/dismiss sentinels after durable state, and notifies.
@@ -795,21 +833,62 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		PRIntentFingerprint:      awaiting.prIntentFP,
 		Role:                     "fixer",
 	}
-	if r.hitlTransportGitHub() {
-		if err := r.deliverAskToGitHub(ctx, input, awaiting, &ask); err != nil && r.logger != nil {
-			r.logger.Warn("fixer HITL github ask delivery failed; loop parked awaiting human without a PR comment", map[string]any{
-				"loopId": input.Loop.ID, "error": err.Error(),
-			})
-		}
-	}
+
+	// Durable park BEFORE remote GitHub mutation so a DB failure cannot leave an
+	// orphan PR ask without a loop record. Stamp transport/PR identity first so
+	// the parked ask is poll-eligible once AskCommentID is filled after delivery.
 	// Cancel the claimable queue item BEFORE publishing awaiting_human. Publishing
 	// answerable status while a queue item is still active races /respond and the
 	// GitHub poll: mutateLoopStatus sees the active item and skips requeue, then
 	// cancel drops the only claimable work (lost-wakeup).
+	if r.hitlTransportGitHub() {
+		if err := r.stampGitHubAskTransport(input, &ask); err != nil {
+			return ProcessResult{}, &loopError{
+				message: fmt.Sprintf("HITL GitHub ask transport setup failed: %v", err),
+				kind:    FailureRetryableTransient,
+			}
+		}
+	}
 	reason := "fixer suspended awaiting human decision"
 	if err := r.parkHITLLoop(ctx, input.Loop, ask, nowISO, reason); err != nil {
+		if errors.Is(err, errHITLLoopTerminated) {
+			// Concurrent stop: do not mark interrupted, notify, or return awaiting_human.
+			return r.finishHITLSuspendAfterTerminate(ctx, input, run, checkpoint)
+		}
 		return ProcessResult{}, err
 	}
+
+	if r.hitlTransportGitHub() {
+		if err := r.deliverAskToGitHub(ctx, input, awaiting, &ask); err != nil {
+			// Park happened without a PR comment. Roll back to running + clear the
+			// incomplete ask so claim recovery can MarkRetry and re-enter suspend
+			// (ask.json remains for undurable re-park). Do not notify or complete
+			// as awaiting_human — that would leave poll with AskCommentID unset.
+			if rbErr := r.rollbackHITLParkForDeliveryRetry(ctx, input.Loop, nowISO); rbErr != nil && r.logger != nil {
+				r.logger.Warn("fixer HITL rollback after github delivery failure failed", map[string]any{
+					"loopId": input.Loop.ID, "error": rbErr.Error(),
+				})
+			}
+			return ProcessResult{}, &loopError{
+				message: fmt.Sprintf("HITL GitHub ask delivery failed after park: %v", err),
+				kind:    FailureRetryableTransient,
+			}
+		}
+		// Persist AskCommentID onto the durable park (delivery is remote-side;
+		// comment id must land in metadata for detectGitHubHITLAnswer).
+		if err := r.persistParkedHITLAsk(ctx, input.Loop, ask, nowISO); err != nil {
+			if rbErr := r.rollbackHITLParkForDeliveryRetry(ctx, input.Loop, nowISO); rbErr != nil && r.logger != nil {
+				r.logger.Warn("fixer HITL rollback after park update failure failed", map[string]any{
+					"loopId": input.Loop.ID, "error": rbErr.Error(),
+				})
+			}
+			return ProcessResult{}, &loopError{
+				message: fmt.Sprintf("HITL park update after GitHub delivery failed: %v", err),
+				kind:    FailureRetryableTransient,
+			}
+		}
+	}
+
 	summary := "Awaiting human decision: " + awaiting.question
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
@@ -864,6 +943,58 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	return ProcessResult{LoopID: input.Loop.ID, RunID: run.ID, QueueItemID: input.QueueItem.ID, Status: "awaiting_human", Summary: summary}, nil
 }
 
+// finishHITLSuspendAfterTerminate ends the run without notifying or returning
+// awaiting_human when the loop was terminated concurrently during park.
+func (r *Runner) finishHITLSuspendAfterTerminate(ctx context.Context, input stepInput, run storage.RunRecord, checkpoint fixerCheckpoint) (ProcessResult, error) {
+	summary := "Fixer HITL suspend aborted because the loop was terminated"
+	if _, err := r.completeRun(ctx, run, "interrupted", summary, summary, checkpoint); err != nil {
+		return ProcessResult{}, err
+	}
+	// Best-effort: drop ask/dismiss sentinels so a terminated loop cannot re-park.
+	if checkpoint.Worktree != nil {
+		hitl.RemoveAskSentinel(checkpoint.Worktree.Path)
+		_ = clearDismissSentinel(checkpoint.Worktree.Path)
+	}
+	return ProcessResult{
+		LoopID: input.Loop.ID, RunID: run.ID, QueueItemID: input.QueueItem.ID,
+		Status: "terminated", Summary: summary,
+	}, nil
+}
+
+// rollbackHITLParkForDeliveryRetry undoes an awaiting_human park that never got
+// a GitHub AskCommentID so claim recovery can retry the suspension.
+func (r *Runner) rollbackHITLParkForDeliveryRetry(ctx context.Context, loop storage.LoopRecord, nowISO string) error {
+	apply := func(repos *storage.Repositories) error {
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return nil
+		}
+		if current.Status != "awaiting_human" {
+			return nil
+		}
+		updated := *current
+		if meta, cerr := loops.ClearHITLAsk(updated.MetadataJSON); cerr == nil {
+			updated.MetadataJSON = &meta
+		}
+		// running so recoverClaimedItem.reconcileRecoveredLoop can requeue.
+		updated.Status = "running"
+		updated.UpdatedAt = nowISO
+		return repos.Loops.Upsert(ctx, updated)
+	}
+	if r.db != nil {
+		return storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+			return apply(storage.NewRepositories(tx))
+		})
+	}
+	if r.repos == nil {
+		return fmt.Errorf("repositories unavailable for HITL park rollback")
+	}
+	return apply(r.repos)
+}
+
 // parkHITLLoop persists the durable HITL ask and awaiting_human status only after
 // (or atomically with) cancelling claimable queue work for the loop.
 func (r *Runner) parkHITLLoop(ctx context.Context, loop storage.LoopRecord, ask loops.HITLAsk, nowISO, cancelReason string) error {
@@ -877,8 +1008,8 @@ func (r *Runner) parkHITLLoop(ctx context.Context, loop storage.LoopRecord, ask 
 		}
 		updated := loop
 		if current != nil {
-			if current.Status == "terminated" {
-				return nil
+			if current.Status == "terminated" || current.Status == "stopped" {
+				return errHITLLoopTerminated
 			}
 			updated = *current
 		}
@@ -898,6 +1029,40 @@ func (r *Runner) parkHITLLoop(ctx context.Context, loop storage.LoopRecord, ask 
 	}
 	if r.repos == nil {
 		return fmt.Errorf("repositories unavailable for HITL park")
+	}
+	return apply(r.repos)
+}
+
+// persistParkedHITLAsk rewrites the durable HITL ask on an already-parked loop
+// (e.g. to attach AskCommentID after GitHub delivery) without changing status.
+func (r *Runner) persistParkedHITLAsk(ctx context.Context, loop storage.LoopRecord, ask loops.HITLAsk, nowISO string) error {
+	apply := func(repos *storage.Repositories) error {
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return fmt.Errorf("loop %s not found for HITL ask update", loop.ID)
+		}
+		if current.Status == "terminated" || current.Status == "stopped" {
+			return errHITLLoopTerminated
+		}
+		updated := *current
+		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr != nil {
+			return werr
+		} else {
+			updated.MetadataJSON = &meta
+		}
+		updated.UpdatedAt = nowISO
+		return repos.Loops.Upsert(ctx, updated)
+	}
+	if r.db != nil {
+		return storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+			return apply(storage.NewRepositories(tx))
+		})
+	}
+	if r.repos == nil {
+		return fmt.Errorf("repositories unavailable for HITL ask update")
 	}
 	return apply(r.repos)
 }
@@ -939,7 +1104,12 @@ func (r *Runner) hitlAwaitingLabel() string {
 	return "looper:awaiting-human"
 }
 
-func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiting *awaitingHumanError, ask *loops.HITLAsk) error {
+// stampGitHubAskTransport fills Transport/Provider/PRNumber on the ask before
+// the durable park so a post-delivery metadata update only needs AskCommentID.
+func (r *Runner) stampGitHubAskTransport(input stepInput, ask *loops.HITLAsk) error {
+	if ask == nil {
+		return fmt.Errorf("hitl github: nil ask")
+	}
 	repo := firstNonEmpty(input.Repo, derefString(input.Loop.Repo))
 	if strings.TrimSpace(repo) == "" {
 		return fmt.Errorf("hitl github: no repo for loop %s", input.Loop.ID)
@@ -951,6 +1121,26 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 	if prNumber <= 0 {
 		return fmt.Errorf("hitl github: no PR number for loop %s", input.Loop.ID)
 	}
+	ask.Transport = "github"
+	if r.isForgejoProject(input.Project.ID) {
+		ask.Provider = "forgejo"
+	} else {
+		ask.Provider = "github"
+	}
+	ask.PRNumber = prNumber
+	return nil
+}
+
+func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiting *awaitingHumanError, ask *loops.HITLAsk) error {
+	if ask == nil {
+		return fmt.Errorf("hitl github: nil ask")
+	}
+	// Transport fields may already be stamped at park time; re-stamp is idempotent.
+	if err := r.stampGitHubAskTransport(input, ask); err != nil {
+		return err
+	}
+	repo := firstNonEmpty(input.Repo, derefString(input.Loop.Repo))
+	prNumber := ask.PRNumber
 	cwd := input.Project.RepoPath
 	body := buildFixerGitHubAskComment(input.Loop.Seq, awaiting.question, awaiting.options, r.hitlGitHub.MentionLogins)
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
@@ -966,15 +1156,6 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 	}); err != nil && r.logger != nil {
 		r.logger.Warn("fixer hitl github: failed to add awaiting-human label", map[string]any{"repo": repo, "pr": prNumber, "error": err.Error()})
 	}
-	// Transport is the answer channel (PR comments). Provider is the forge host
-	// that received the ask so the resume poll can use the matching client.
-	ask.Transport = "github"
-	if r.isForgejoProject(input.Project.ID) {
-		ask.Provider = "forgejo"
-	} else {
-		ask.Provider = "github"
-	}
-	ask.PRNumber = prNumber
 	ask.AskCommentID = res.ID
 	return nil
 }

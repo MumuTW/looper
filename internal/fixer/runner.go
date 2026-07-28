@@ -2962,17 +2962,17 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// the conflict to a human. A merge that fails for a non-conflict reason falls
 	// back to manual intervention.
 	//
-	// Skip when resuming an answered HITL park: the first repair already started
-	// the merge (MERGE_HEAD + markers). Re-running git merge aborts that in-progress
-	// merge on failure and discards conflict work before the human answer can be
-	// injected.
+	// Skip only when resuming an answered HITL park *and* the retained worktree
+	// still has the original in-progress merge (MERGE_HEAD). A replaced/invalid
+	// worktree is recreated at PR head without MERGE_HEAD; re-running the merge
+	// is required so the agent still sees conflict markers for the human decision.
 	executionID := eventlog.NewEventID("agent")
 	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
 	if hasConflict {
-		skipConflictMerge := r.hitlEnabled && r.hasAnsweredHITLAsk(ctx, &input.Loop)
+		skipConflictMerge := r.hitlEnabled && r.hasAnsweredHITLAsk(ctx, &input.Loop) && worktreeHasInProgressMerge(worktree.Path)
 		if !skipConflictMerge {
 			base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
 			if base == "" {
