@@ -71,7 +71,10 @@ export function HITLDecisionCard({
       setCustomPending(true);
     }
     try {
-      await respondLoop(selector, trimmed);
+      await respondLoop(selector, trimmed, undefined, {
+        executionId: ask.executionId,
+        askedAt: ask.askedAt,
+      });
       toast.success("Answer delivered");
       setCustomAnswer("");
       await onMutated?.();

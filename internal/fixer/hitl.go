@@ -289,9 +289,20 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 	var nativeByProvider map[int64]NativeReviewComment
 	var summaryByID map[string]FixItem
 	var liveGitHubThreads []ReviewThread
+	// Always refresh the project's applicable review surfaces — including pure
+	// conflict/check parks whose FixItems contain no review comments. Otherwise a
+	// new actionable review opened while parked is never listed, live FP still
+	// matches the empty ask hash, and resume can push with stale FixItems.
+	// Surfaces already present in FixItems still enable the same listing path.
 	needNative := false
 	needSummary := false
 	needGitHubThreads := false
+	if r.isForgejoProject(input.Project.ID) {
+		needNative = true
+		needSummary = true
+	} else {
+		needGitHubThreads = true
+	}
 	for _, item := range fixItems {
 		src := strings.TrimSpace(item.Source)
 		if src == NativeReviewCommentSource && item.ProviderCommentID > 0 {
@@ -304,9 +315,6 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 			needGitHubThreads = true
 		}
 	}
-	// Only list provider surfaces already represented in the parked FixItems.
-	// That appends mid-park *new* items on the same surface without treating
-	// pre-existing out-of-scope reviews as drift on pure conflict/check parks.
 	// Live native/summary surfaces must apply the same current-user authority filters
 	// as ask-time collection (attachManualForgejoNativeComments / sanitizeForgejoSummaryAuthority).
 	// Without that, self-authored native comments or untrusted summary markers change
@@ -794,12 +802,15 @@ func (r *Runner) durableHITLParkForAsk(ctx context.Context, loop *storage.LoopRe
 // requiring structured needs_human replies (undurable-suspend recovery).
 func (r *Runner) awaitingFromAskPayload(ctx context.Context, input stepInput, worktreePath, executionID string, ask *hitl.AskPayload) *awaitingHumanError {
 	sessionID, vendor := r.latestAgentSession(ctx, input.Loop.ID)
+	// Prefer live surface FP so conflict-only parks snapshot open reviews the same
+	// way resume does (mid-park new review must diverge).
+	reviewFP := r.askTimeReviewContentFingerprint(ctx, input)
 	out := &awaitingHumanError{
 		sessionID:       sessionID,
 		executionID:     executionID,
 		vendor:          vendor,
 		headSHA:         detailHeadSHA(input.Checkpoint.Detail),
-		reviewContentFP: computeReviewContentFingerprint(input.Checkpoint.FixItems),
+		reviewContentFP: reviewFP,
 		prIntentFP:      computePRIntentFingerprint(input.Checkpoint.Detail),
 		worktreePath:    worktreePath,
 	}
@@ -839,8 +850,9 @@ func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePa
 	sessionID, vendor := r.latestAgentSession(ctx, input.Loop.ID)
 	headSHA := detailHeadSHA(input.Checkpoint.Detail)
 	reviewThreadID, reviewCommentID := reviewIDsFromNeedsHuman(needsHumanReplies, input.Checkpoint.FixItems)
-	// Canonical fingerprints — same helpers used on resume.
-	reviewFP := computeReviewContentFingerprint(input.Checkpoint.FixItems)
+	// Canonical fingerprints — same helpers used on resume (live surfaces so
+	// conflict-only parks include open reviews in the ask-time baseline).
+	reviewFP := r.askTimeReviewContentFingerprint(ctx, input)
 	intentFP := computePRIntentFingerprint(input.Checkpoint.Detail)
 
 	out := &awaitingHumanError{
@@ -940,6 +952,18 @@ func reviewIDsFromNeedsHuman(replies []replyExplanationEntry, fixItems []FixItem
 		}
 	}
 	return threadID, commentID
+}
+
+// askTimeReviewContentFingerprint snapshots review content at park time using the
+// same live-surface listing as resume. Falls back to checkpoint FixItems when the
+// live refresh fails so suspend still parks (resume will fail closed on mismatch).
+func (r *Runner) askTimeReviewContentFingerprint(ctx context.Context, input stepInput) string {
+	if r.github != nil {
+		if fp, err := r.liveReviewContentFingerprint(ctx, input, input.Checkpoint.FixItems); err == nil {
+			return fp
+		}
+	}
+	return computeReviewContentFingerprint(input.Checkpoint.FixItems)
 }
 
 // computeReviewContentFingerprint is the canonical review-content drift hash.
@@ -1134,9 +1158,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 					if stashErr := hitl.WriteDeliveredCommentStash(worktreePath, hitl.DeliveredCommentStash{
 						AskCommentID: ask.AskCommentID,
 						ExecutionID:  ask.ExecutionID,
+						Generation:   deliveryGenerationForAsk(worktreePath, &ask),
 						PRNumber:     ask.PRNumber,
 						Provider:     ask.Provider,
 						Transport:    ask.Transport,
+						Question:     ask.Question,
 					}); stashErr != nil && r.logger != nil {
 						r.logger.Warn("fixer HITL could not stash delivered AskCommentID for correlation retry", map[string]any{
 							"loopId": input.Loop.ID, "askCommentId": ask.AskCommentID, "error": stashErr.Error(),
@@ -1154,11 +1180,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 				}
 			}
 		}
-		// Correlation is durable — drop the worktree stash if present and clear
+		// Correlation is durable — drop delivery artifacts and clear
 		// DeliveryPending so startup recovery will not requeue a complete park.
 		ask.DeliveryPending = false
 		if worktreePath != "" {
-			hitl.RemoveDeliveredCommentStash(worktreePath)
+			hitl.RemoveDeliveryArtifacts(worktreePath)
 		}
 	}
 
@@ -1557,10 +1583,10 @@ func (r *Runner) stampGitHubAskTransport(input stepInput, ask *loops.HITLAsk) er
 }
 
 // deliveredCommentStashMatchesPark reports whether a worktree-delivered ask
-// comment belongs to the current park generation. Match on PR identity (and
-// optional provider/transport when present); do not require executionId equality
-// because correlation-retry re-entry assigns a fresh agent execution id.
-func deliveredCommentStashMatchesPark(stash *hitl.DeliveredCommentStash, ask *loops.HITLAsk) bool {
+// comment belongs to the current delivery generation. Match on PR identity and
+// the retry-stable Generation token (not agent executionId — correlation-retry
+// re-entry assigns a fresh execution id while reusing the same delivery cycle).
+func deliveredCommentStashMatchesPark(stash *hitl.DeliveredCommentStash, ask *loops.HITLAsk, generation string) bool {
 	if stash == nil || ask == nil || stash.AskCommentID <= 0 {
 		return false
 	}
@@ -1577,7 +1603,79 @@ func deliveredCommentStashMatchesPark(stash *hitl.DeliveredCommentStash, ask *lo
 			return false
 		}
 	}
+	// Generation is required when the stash carries one (post-binding records).
+	// Legacy stashes without Generation still match by PR identity only.
+	if sg := strings.TrimSpace(stash.Generation); sg != "" {
+		if strings.TrimSpace(generation) == "" || sg != strings.TrimSpace(generation) {
+			return false
+		}
+	}
 	return true
+}
+
+// resolveDeliveryGeneration returns the retry-stable token for this GitHub ask
+// delivery cycle. Incomplete cycles keep the worktree generation file + stash
+// pair; a later escalation mints a fresh token so a leftover stash cannot be
+// adopted after a completed park.
+func resolveDeliveryGeneration(worktreePath string, ask *loops.HITLAsk) string {
+	if ask == nil {
+		return ""
+	}
+	stash, _ := hitl.ReadDeliveredCommentStash(worktreePath)
+	genFile, _ := hitl.ReadDeliveryGeneration(worktreePath)
+	// Incomplete delivery: both artifacts present with the same token.
+	if stash != nil && genFile != nil {
+		sg := strings.TrimSpace(stash.Generation)
+		fg := strings.TrimSpace(genFile.Generation)
+		if sg != "" && sg == fg {
+			if deliveredCommentStashMatchesPark(stash, ask, sg) {
+				return sg
+			}
+		}
+		// Stale leftover pair from a prior cycle — discard.
+		hitl.RemoveDeliveredCommentStash(worktreePath)
+	} else if stash != nil && genFile == nil {
+		// Stash without generation file is stale after a successful correlation
+		// that removed the file first (or a partial cleanup).
+		hitl.RemoveDeliveredCommentStash(worktreePath)
+	}
+	// Gen file alone may mean CreateIssueComment succeeded before stash write —
+	// keep that token so recoverAskCommentByGeneration can find the remote post.
+	if genFile != nil {
+		if g := strings.TrimSpace(genFile.Generation); g != "" {
+			if genFile.PRNumber <= 0 || ask.PRNumber <= 0 || genFile.PRNumber == ask.PRNumber {
+				return g
+			}
+		}
+	}
+	// Fresh delivery cycle.
+	gen := strings.TrimSpace(ask.ExecutionID)
+	if gen == "" {
+		gen = hitl.FingerprintContent(ask.Question, ask.AskedAt, strings.Join(ask.Options, "\x00"))
+	}
+	if worktreePath != "" && gen != "" {
+		_ = hitl.WriteDeliveryGeneration(worktreePath, hitl.DeliveryGeneration{
+			Generation: gen, PRNumber: ask.PRNumber, Question: ask.Question,
+		})
+	}
+	return gen
+}
+
+// deliveryGenerationForAsk returns the current worktree generation token when
+// present, else a stable fallback for stash writes.
+func deliveryGenerationForAsk(worktreePath string, ask *loops.HITLAsk) string {
+	if genFile, _ := hitl.ReadDeliveryGeneration(worktreePath); genFile != nil {
+		if g := strings.TrimSpace(genFile.Generation); g != "" {
+			return g
+		}
+	}
+	if ask == nil {
+		return ""
+	}
+	if g := strings.TrimSpace(ask.ExecutionID); g != "" {
+		return g
+	}
+	return hitl.FingerprintContent(ask.Question, ask.AskedAt)
 }
 
 func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiting *awaitingHumanError, ask *loops.HITLAsk) error {
@@ -1618,17 +1716,16 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 			return nil
 		}
 	}
+	// Retry-stable delivery generation (survives correlation rollback + fresh
+	// execution IDs; rejects leftover stashes from a prior completed escalation).
+	generation := resolveDeliveryGeneration(worktreePath, ask)
 	// Worktree stash written when CreateIssueComment succeeded but durable
 	// correlation attach failed and the park was rolled back for retry.
-	// Correlate by parked PR generation — not transient agent execution IDs.
-	// Scheduler re-entry after correlation rollback regenerates execution IDs via
-	// eventlog.NewEventID while recovering the same ask.json; requiring exec
-	// equality would post a second question and abandon the answered first comment.
 	if worktreePath != "" {
 		if stash, stashErr := hitl.ReadDeliveredCommentStash(worktreePath); stashErr != nil {
 			return fmt.Errorf("hitl github: read delivered comment stash: %w", stashErr)
 		} else if stash != nil && stash.AskCommentID > 0 {
-			if deliveredCommentStashMatchesPark(stash, ask) {
+			if deliveredCommentStashMatchesPark(stash, ask, generation) {
 				ask.AskCommentID = stash.AskCommentID
 				if strings.TrimSpace(ask.Transport) == "" && strings.TrimSpace(stash.Transport) != "" {
 					ask.Transport = stash.Transport
@@ -1646,7 +1743,47 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 	repo := firstNonEmpty(input.Repo, derefString(input.Loop.Repo))
 	prNumber := ask.PRNumber
 	cwd := input.Project.RepoPath
-	body := buildFixerGitHubAskComment(input.Loop.Seq, awaiting.question, awaiting.options, r.hitlGitHub.MentionLogins)
+	// Recover a remote ask posted before the local stash was written (crash
+	// between CreateIssueComment and WriteDeliveredCommentStash).
+	if recoveredID := r.recoverAskCommentByGeneration(ctx, input, prNumber, input.Loop.Seq, generation, ask.Question); recoveredID > 0 {
+		ask.AskCommentID = recoveredID
+		if worktreePath != "" {
+			if stashErr := hitl.WriteDeliveredCommentStash(worktreePath, hitl.DeliveredCommentStash{
+				AskCommentID: ask.AskCommentID,
+				ExecutionID:  ask.ExecutionID,
+				Generation:   generation,
+				PRNumber:     ask.PRNumber,
+				Provider:     ask.Provider,
+				Transport:    ask.Transport,
+				Question:     ask.Question,
+			}); stashErr != nil && r.logger != nil {
+				r.logger.Warn("fixer hitl github: could not stash recovered AskCommentID", map[string]any{
+					"loopId": input.Loop.ID, "askCommentId": ask.AskCommentID, "error": stashErr.Error(),
+				})
+			}
+		}
+		return nil
+	}
+	// Generation file without a recoverable comment is leftover or abandoned —
+	// mint a fresh delivery token so we do not re-tag a new post with a stale gen.
+	if worktreePath != "" {
+		if genFile, _ := hitl.ReadDeliveryGeneration(worktreePath); genFile != nil {
+			if stash, _ := hitl.ReadDeliveredCommentStash(worktreePath); stash == nil {
+				generation = strings.TrimSpace(ask.ExecutionID)
+				if generation == "" {
+					generation = hitl.FingerprintContent(ask.Question, ask.AskedAt, strings.Join(ask.Options, "\x00"))
+				}
+			}
+		}
+	}
+	// Ensure generation is on disk before the remote mutation so a crash after
+	// CreateIssueComment can still recover via the deterministic marker.
+	if worktreePath != "" && strings.TrimSpace(generation) != "" {
+		_ = hitl.WriteDeliveryGeneration(worktreePath, hitl.DeliveryGeneration{
+			Generation: generation, PRNumber: ask.PRNumber, Question: ask.Question,
+		})
+	}
+	body := buildFixerGitHubAskComment(input.Loop.Seq, generation, awaiting.question, awaiting.options, r.hitlGitHub.MentionLogins)
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	res, err := r.github.CreateIssueComment(ctx, IssueCommentInput{
 		Repo: repo, IssueNumber: prNumber, Body: body, CWD: cwd,
@@ -1667,9 +1804,11 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 		if stashErr := hitl.WriteDeliveredCommentStash(worktreePath, hitl.DeliveredCommentStash{
 			AskCommentID: ask.AskCommentID,
 			ExecutionID:  ask.ExecutionID,
+			Generation:   generation,
 			PRNumber:     ask.PRNumber,
 			Provider:     ask.Provider,
 			Transport:    ask.Transport,
+			Question:     ask.Question,
 		}); stashErr != nil && r.logger != nil {
 			r.logger.Warn("fixer hitl github: could not stash delivered AskCommentID", map[string]any{
 				"loopId": input.Loop.ID, "askCommentId": ask.AskCommentID, "error": stashErr.Error(),
@@ -1679,11 +1818,87 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 	return nil
 }
 
+// recoverAskCommentByGeneration finds a previously posted HITL ask comment whose
+// marker carries the delivery generation token (crash between remote post and
+// local stash write). Returns 0 when none found or listing fails.
+func (r *Runner) recoverAskCommentByGeneration(ctx context.Context, input stepInput, prNumber, loopSeq int64, generation, question string) int64 {
+	generation = strings.TrimSpace(generation)
+	if r.github == nil || generation == "" || prNumber <= 0 {
+		return 0
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{
+		Repo: firstNonEmpty(input.Repo, derefString(input.Loop.Repo)), PRNumber: prNumber, CWD: input.Project.RepoPath,
+	})
+	if err != nil {
+		return 0
+	}
+	marker := hitlGitHubAskGenerationMarker(loopSeq, generation)
+	question = strings.TrimSpace(question)
+	var found int64
+	for _, raw := range detail.IssueComments {
+		body := strings.TrimSpace(asStringMap(raw, "body"))
+		if body == "" || !strings.Contains(body, marker) {
+			continue
+		}
+		if question != "" && !strings.Contains(body, question) {
+			continue
+		}
+		id := issueCommentNumericID(raw)
+		if id > found {
+			found = id
+		}
+	}
+	return found
+}
+
+func asStringMap(raw map[string]any, key string) string {
+	if raw == nil {
+		return ""
+	}
+	v, ok := raw[key]
+	if !ok || v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	default:
+		return strings.TrimSpace(fmt.Sprint(t))
+	}
+}
+
+func issueCommentNumericID(raw map[string]any) int64 {
+	if raw == nil {
+		return 0
+	}
+	switch v := raw["id"].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case string:
+		n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		return n
+	default:
+		return 0
+	}
+}
+
 const hitlGitHubAskMarkerPrefix = "<!-- looper:hitl:ask v=1"
 
-func buildFixerGitHubAskComment(loopSeq int64, question string, options []string, mentionLogins []string) string {
+func hitlGitHubAskGenerationMarker(loopSeq int64, generation string) string {
+	generation = strings.TrimSpace(generation)
+	if generation == "" {
+		return fmt.Sprintf("%s loop=%d role=fixer", hitlGitHubAskMarkerPrefix, loopSeq)
+	}
+	return fmt.Sprintf("%s loop=%d role=fixer gen=%s", hitlGitHubAskMarkerPrefix, loopSeq, generation)
+}
+
+func buildFixerGitHubAskComment(loopSeq int64, generation, question string, options []string, mentionLogins []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s loop=%d role=fixer -->\n", hitlGitHubAskMarkerPrefix, loopSeq)
+	fmt.Fprintf(&b, "%s -->\n", hitlGitHubAskGenerationMarker(loopSeq, generation))
 	b.WriteString("🤔 **Fixer needs a decision to continue.**\n\n")
 	b.WriteString(strings.TrimSpace(question))
 	for _, o := range options {

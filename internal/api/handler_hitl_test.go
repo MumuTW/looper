@@ -36,7 +36,7 @@ func TestHandlerRespondResumesAwaitingHumanLoop(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/71/respond", strings.NewReader(`{"answer":"continue with the redis approach"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/71/respond", strings.NewReader(`{"answer":"continue with the redis approach","executionId":"agent-1","askedAt":"2026-04-11T11:59:00.000Z"}`))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
@@ -214,7 +214,7 @@ func TestHandlerRespondAllowsStickySnapshotWhenAgentNotConfigured(t *testing.T) 
 		t.Fatalf("Runs.Upsert(snapshot) error = %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/79/respond", strings.NewReader(`{"answer":"yes continue"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/79/respond", strings.NewReader(`{"answer":"yes continue","askedAt":"2026-04-11T11:59:00.000Z"}`))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
@@ -457,7 +457,7 @@ func TestHandlerFeishuCardActionGatedWhenHITLDisabled(t *testing.T) {
 	}
 }
 
-func TestHandlerFeishuThreadReplyDeliversTypedAnswer(t *testing.T) {
+func TestHandlerFeishuThreadReplyQueuesConversationalText(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.HITL.Enabled = true
 	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN3", "verify-tok-123")
@@ -469,7 +469,8 @@ func TestHandlerFeishuThreadReplyDeliversTypedAnswer(t *testing.T) {
 		t.Fatalf("FeishuThreads.Upsert() error = %v", err)
 	}
 
-	// A human types a free-text reply in the ask thread (im.message.receive_v1).
+	// Free-text in the shared thread is conversational — must not resolve the ask
+	// (generation-bound card buttons / dashboard /respond remain the answer path).
 	body := `{"schema":"2.0","header":{"event_type":"im.message.receive_v1","token":"verify-tok-123"},"event":{"message":{"message_id":"om_reply","root_id":"om_root_91","chat_id":"oc_group","message_type":"text","content":"{\"text\":\"用 A 改 resize handle\"}"},"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}}}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
@@ -477,17 +478,56 @@ func TestHandlerFeishuThreadReplyDeliversTypedAnswer(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
+	if !strings.Contains(recorder.Body.String(), `"queued":true`) {
+		t.Fatalf("body = %s, want queued:true for free-text", recorder.Body.String())
+	}
 
 	loop, err := services.Repositories.Loops.GetByID(context.Background(), "loop_thread")
 	if err != nil || loop == nil {
 		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
 	}
-	if loop.Status != "running" {
-		t.Fatalf("loop.Status = %q, want running (resumed by typed reply)", loop.Status)
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop.Status = %q, want still awaiting_human (free-text is not a final answer)", loop.Status)
 	}
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-	if !ok || ask.Answer != "用 A 改 resize handle" || ask.Status != "answered" {
-		t.Fatalf("ask = %#v (ok=%v), want the typed free-text answer", ask, ok)
+	if !ok || ask.Status != "awaiting" || strings.TrimSpace(ask.Answer) != "" {
+		t.Fatalf("ask = %#v (ok=%v), want unanswered awaiting park", ask, ok)
+	}
+	inbox := loops.ReadHumanInbox(loop.MetadataJSON)
+	if len(inbox) != 1 || inbox[0].Text != "用 A 改 resize handle" {
+		t.Fatalf("human inbox = %#v, want queued free-text", inbox)
+	}
+}
+
+func TestHandlerRespondRejectsStaleAskGeneration(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_hitl_stale_gen"
+	loopID := "loop_hitl_stale_gen"
+	targetID := projectID
+	// Current park is gen-2; a stale dashboard card still shows gen-1.
+	metadata := `{"hitl":{"question":"Which direction?","options":["a","b"],"sessionId":"sess","executionId":"agent-2","vendor":"codex","status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z"}}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 94, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/94/respond", strings.NewReader(`{"answer":"a","executionId":"agent-1","askedAt":"2026-04-11T11:00:00.000Z"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 stale generation; body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil || loop.Status != "awaiting_human" {
+		t.Fatalf("loop = %#v err=%v, want still awaiting_human", loop, err)
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Status != "awaiting" || strings.TrimSpace(ask.Answer) != "" {
+		t.Fatalf("ask = %#v, want unanswered", ask)
 	}
 }
 

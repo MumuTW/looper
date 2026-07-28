@@ -17,6 +17,11 @@ const AskSentinelRelPath = ".looper/ask.json"
 // Survives a correlation-attach retry so CreateIssueComment is not repeated.
 const DeliveredCommentStashRelPath = ".looper/hitl-delivered-comment.json"
 
+// DeliveryGenerationRelPath stores the retry-stable delivery generation token for
+// an in-flight GitHub ask post. Written before CreateIssueComment and removed
+// once AskCommentID correlation is durable (with the delivered-comment stash).
+const DeliveryGenerationRelPath = ".looper/hitl-delivery-generation.json"
+
 // AskPayload is the on-disk decision brief written by an agent before stopping.
 type AskPayload struct {
 	Question          string            `json:"question"`
@@ -76,9 +81,21 @@ func RemoveAskSentinel(worktreePath string) {
 type DeliveredCommentStash struct {
 	AskCommentID int64  `json:"askCommentId"`
 	ExecutionID  string `json:"executionId,omitempty"`
-	PRNumber     int64  `json:"prNumber,omitempty"`
-	Provider     string `json:"provider,omitempty"`
-	Transport    string `json:"transport,omitempty"`
+	// Generation is a retry-stable token for this delivery cycle. Correlation
+	// retries may assign a fresh agent ExecutionID; Generation stays fixed so the
+	// stash cannot be adopted by a later escalation on the same PR.
+	Generation string `json:"generation,omitempty"`
+	PRNumber   int64  `json:"prNumber,omitempty"`
+	Provider   string `json:"provider,omitempty"`
+	Transport  string `json:"transport,omitempty"`
+	Question   string `json:"question,omitempty"`
+}
+
+// DeliveryGeneration is the worktree record of the in-flight ask delivery token.
+type DeliveryGeneration struct {
+	Generation string `json:"generation"`
+	PRNumber   int64  `json:"prNumber,omitempty"`
+	Question   string `json:"question,omitempty"`
 }
 
 // WriteDeliveredCommentStash persists a delivered ask-comment id for correlation
@@ -135,6 +152,67 @@ func RemoveDeliveredCommentStash(worktreePath string) {
 		return
 	}
 	_ = os.Remove(filepath.Join(worktreePath, DeliveredCommentStashRelPath))
+}
+
+// WriteDeliveryGeneration persists the in-flight delivery generation token.
+func WriteDeliveryGeneration(worktreePath string, gen DeliveryGeneration) error {
+	if strings.TrimSpace(worktreePath) == "" {
+		return fmt.Errorf("write delivery generation: empty worktree path")
+	}
+	if strings.TrimSpace(gen.Generation) == "" {
+		return fmt.Errorf("write delivery generation: missing generation")
+	}
+	dir := filepath.Join(worktreePath, ".looper")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("write delivery generation: mkdir: %w", err)
+	}
+	raw, err := json.Marshal(gen)
+	if err != nil {
+		return fmt.Errorf("write delivery generation: marshal: %w", err)
+	}
+	path := filepath.Join(worktreePath, DeliveryGenerationRelPath)
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		return fmt.Errorf("write delivery generation: %w", err)
+	}
+	return nil
+}
+
+// ReadDeliveryGeneration loads the in-flight delivery generation token, if present.
+func ReadDeliveryGeneration(worktreePath string) (*DeliveryGeneration, error) {
+	if strings.TrimSpace(worktreePath) == "" {
+		return nil, nil
+	}
+	path := filepath.Join(worktreePath, DeliveryGenerationRelPath)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read delivery generation: %w", err)
+	}
+	var gen DeliveryGeneration
+	if err := json.Unmarshal(raw, &gen); err != nil {
+		return nil, fmt.Errorf("malformed delivery generation: %w", err)
+	}
+	if strings.TrimSpace(gen.Generation) == "" {
+		return nil, fmt.Errorf("delivery generation missing generation token")
+	}
+	return &gen, nil
+}
+
+// RemoveDeliveryGeneration deletes the in-flight delivery generation token if present.
+func RemoveDeliveryGeneration(worktreePath string) {
+	if strings.TrimSpace(worktreePath) == "" {
+		return
+	}
+	_ = os.Remove(filepath.Join(worktreePath, DeliveryGenerationRelPath))
+}
+
+// RemoveDeliveryArtifacts clears both the generation token and delivered-comment
+// stash after durable AskCommentID correlation (or when discarding stale state).
+func RemoveDeliveryArtifacts(worktreePath string) {
+	RemoveDeliveryGeneration(worktreePath)
+	RemoveDeliveredCommentStash(worktreePath)
 }
 
 // ConsumeAskSentinel reads and removes the agent's ask sentinel from the

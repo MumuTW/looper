@@ -59,7 +59,16 @@ func TestHITLContract_ConflictResumeSkipsBaseMerge(t *testing.T) {
 	_ = fixture.repos.Runs.Upsert(ctx, run)
 
 	git := &fakeGitGateway{}
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{pr87Detail(pr87Head)}}
+	// Empty threads (non-nil): pure conflict park with no open review surfaces.
+	// Avoid pr87Detail.Comments leaking into ListReviewThreads via viewIndex.
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{
+			Number: 87, Title: pr87Title, Body: pr87Body, State: "OPEN",
+			HeadSHA: pr87Head, HeadRefName: "feature/pr87", BaseRefName: "main", BaseSHA: pr87Base,
+			HasConflicts: true,
+		}},
+		threads: []ReviewThread{},
+	}
 	agent := &hitlScriptedAgent{
 		results: []AgentResult{{
 			Status: "completed", Summary: "resolved", ParseStatus: "parsed",
@@ -137,7 +146,14 @@ func TestHITLContract_ConflictResumeReplacedWorktreeReMerges(t *testing.T) {
 	_ = fixture.repos.Runs.Upsert(ctx, run)
 
 	git := &fakeGitGateway{mergeBaseResult: MergeBaseResult{Conflicted: true}}
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{pr87Detail(pr87Head)}}
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{{
+			Number: 87, Title: pr87Title, Body: pr87Body, State: "OPEN",
+			HeadSHA: pr87Head, HeadRefName: "feature/pr87", BaseRefName: "main", BaseSHA: pr87Base,
+			HasConflicts: true,
+		}},
+		threads: []ReviewThread{},
+	}
 	agent := &hitlScriptedAgent{
 		results: []AgentResult{{
 			Status: "completed", Summary: "resolved", ParseStatus: "parsed",

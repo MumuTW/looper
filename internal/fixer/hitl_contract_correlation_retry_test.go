@@ -172,9 +172,15 @@ func TestHITLContract_DeliverAskToGitHubLoadsStash(t *testing.T) {
 	nowISO := fixture.nowISO()
 
 	worktree := t.TempDir()
+	const gen = "agent-stash"
+	if err := hitl.WriteDeliveryGeneration(worktree, hitl.DeliveryGeneration{
+		Generation: gen, PRNumber: 87, Question: "stash?",
+	}); err != nil {
+		t.Fatalf("WriteDeliveryGeneration: %v", err)
+	}
 	if err := hitl.WriteDeliveredCommentStash(worktree, hitl.DeliveredCommentStash{
-		AskCommentID: 4242, ExecutionID: "agent-stash", PRNumber: 87,
-		Provider: "github", Transport: "github",
+		AskCommentID: 4242, ExecutionID: "agent-stash", Generation: gen, PRNumber: 87,
+		Provider: "github", Transport: "github", Question: "stash?",
 	}); err != nil {
 		t.Fatalf("WriteDeliveredCommentStash: %v", err)
 	}
@@ -218,21 +224,50 @@ func TestHITLContract_DeliverAskToGitHubLoadsStash(t *testing.T) {
 	}
 }
 
-func TestDeliveredCommentStashMatchesParkByPRNotExecution(t *testing.T) {
+func TestDeliveredCommentStashMatchesParkByGenerationNotExecution(t *testing.T) {
 	t.Parallel()
+	const gen = "delivery-gen-1"
 	stash := &hitl.DeliveredCommentStash{
-		AskCommentID: 9, ExecutionID: "exec-old", PRNumber: 42,
+		AskCommentID: 9, ExecutionID: "exec-old", Generation: gen, PRNumber: 42,
 		Provider: "github", Transport: "github",
 	}
 	ask := &loops.HITLAsk{
 		ExecutionID: "exec-new", PRNumber: 42,
 		Provider: "github", Transport: "github",
 	}
-	if !deliveredCommentStashMatchesPark(stash, ask) {
-		t.Fatal("same PR with different executionId must match")
+	if !deliveredCommentStashMatchesPark(stash, ask, gen) {
+		t.Fatal("same delivery generation with different executionId must match")
+	}
+	if deliveredCommentStashMatchesPark(stash, ask, "other-gen") {
+		t.Fatal("different delivery generation must not match")
 	}
 	ask.PRNumber = 99
-	if deliveredCommentStashMatchesPark(stash, ask) {
+	if deliveredCommentStashMatchesPark(stash, ask, gen) {
 		t.Fatal("different PR must not match")
+	}
+}
+
+func TestDeliveredCommentStashRejectsStaleGenerationWithoutFile(t *testing.T) {
+	t.Parallel()
+	worktree := t.TempDir()
+	// Leftover stash after durable correlation removed the generation file must
+	// not be adopted by a later escalation on the same PR.
+	if err := hitl.WriteDeliveredCommentStash(worktree, hitl.DeliveredCommentStash{
+		AskCommentID: 99, ExecutionID: "exec-old", Generation: "gen-old", PRNumber: 87,
+		Provider: "github", Transport: "github",
+	}); err != nil {
+		t.Fatalf("WriteDeliveredCommentStash: %v", err)
+	}
+	ask := &loops.HITLAsk{
+		Question: "new ask?", Options: []string{"a"}, ExecutionID: "exec-new",
+		PRNumber: 87, Provider: "github", Transport: "github",
+	}
+	gen := resolveDeliveryGeneration(worktree, ask)
+	if gen == "gen-old" {
+		t.Fatal("stale stash without generation file must not reuse old generation")
+	}
+	stash, _ := hitl.ReadDeliveredCommentStash(worktree)
+	if stash != nil {
+		t.Fatal("stale stash without generation file must be discarded")
 	}
 }

@@ -5662,7 +5662,9 @@ func retryRequestRequestsDiscard(r *http.Request) (bool, error) {
 }
 
 type respondLoopRequest struct {
-	Answer string `json:"answer"`
+	Answer      string `json:"answer"`
+	ExecutionID string `json:"executionId,omitempty"`
+	AskedAt     string `json:"askedAt,omitempty"`
 }
 
 // respondToLoop delivers a human's answer to a loop suspended mid-run as
@@ -5670,6 +5672,9 @@ type respondLoopRequest struct {
 // on the loop's HITL metadata, and transitions the loop back to running (which
 // requeues it and triggers a scheduler tick) so the next run resumes the same
 // agent session with the answer. This is the testable core of the HITL bridge.
+//
+// When the parked ask carries executionId/askedAt, the request must present a
+// matching generation so a stale dashboard card cannot answer a later re-ask.
 func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID string) (loopResponse, error) {
 	var body respondLoopRequest
 	if r.Body != nil {
@@ -5677,6 +5682,20 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 		decoder := json.NewDecoder(r.Body)
 		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 			return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid respond request: %v", err)}
+		}
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories != nil && services.Repositories.Loops != nil {
+		if loop, err := services.Repositories.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
+			if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok {
+				if !loops.AskGenerationMatches(ask, body.ExecutionID, body.AskedAt) {
+					return loopResponse{}, apiError{
+						code:    pkgapi.ErrorCodeValidationFailed,
+						status:  http.StatusConflict,
+						message: "stale ask generation: refresh the decision card and try again",
+					}
+				}
+			}
 		}
 	}
 	return h.deliverHumanAnswer(ctx, loopID, body.Answer)
@@ -5997,10 +6016,10 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 }
 
 // handleFeishuThreadReply consumes a human's free-text reply typed in an ask
-// thread (a Feishu im.message.receive_v1 event). It reverse-maps the thread root
-// to the loop that asked and delivers the typed text as the answer — the lossless,
-// type-anything counterpart to clicking an option button. Ordinary thread chatter
-// (no matching awaiting_human loop) is ignored with 200 so Feishu stops retrying.
+// thread (a Feishu im.message.receive_v1 event). Free-text is conversational —
+// queued on the loop inbox for the agent to read — and must NOT resolve a parked
+// ask. Only card-action buttons (which carry executionId/askedAt) and dashboard
+// /respond bind to the ask generation. This matches the Feishu inbox poll lane.
 //
 // When answerTransport is github, secondary Feishu cards are notify-only: free-text
 // replies in the loop thread must not resume the Fixer and bypass GitHub authority.
@@ -6022,8 +6041,8 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 		Text string `json:"text"`
 	}
 	_ = json.Unmarshal([]byte(msg.Content), &textContent)
-	answer := strings.TrimSpace(textContent.Text)
-	if answer == "" {
+	text := strings.TrimSpace(textContent.Text)
+	if text == "" {
 		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "empty text"})
 		return
 	}
@@ -6041,14 +6060,56 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "feishu answers disabled for github transport"})
 		return
 	}
-	// deliverHumanAnswer only accepts an awaiting_human loop, so this naturally
-	// drops the bot's own thread posts, replies after the loop resumed, and any
-	// duplicate Feishu retries.
-	if _, err := h.deliverHumanAnswer(r.Context(), loopID, answer); err != nil {
-		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop not awaiting a human"})
+	// Conversational inbox only — never deliverHumanAnswer (would apply stale
+	// free-text from an older ask card in the shared thread to a newer park).
+	if err := h.enqueueFeishuThreadMessage(r.Context(), loopID, text); err != nil {
+		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "could not queue free-text message"})
 		return
 	}
-	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": true})
+	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "queued": true, "reason": "free-text is conversational; use option buttons or dashboard /respond"})
+}
+
+// enqueueFeishuThreadMessage appends free-text to the loop human inbox without
+// resolving a parked ask (same semantics as runtime enqueueHumanMessageToLoop).
+func (h *Handler) enqueueFeishuThreadMessage(ctx context.Context, loopID, text string) error {
+	loopID = strings.TrimSpace(loopID)
+	text = strings.TrimSpace(text)
+	if loopID == "" || text == "" {
+		return fmt.Errorf("missing loop or text")
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Loops == nil {
+		return fmt.Errorf("repositories unavailable")
+	}
+	unlock := h.lockLoopRetry(loopID)
+	defer unlock()
+	loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return err
+	}
+	switch loop.Status {
+	case "completed", "failed", "stopped", "terminated", "human_takeover":
+		return nil
+	}
+	if target, targetErr := loopTargetFromRecordCompat(*loop); targetErr == nil {
+		unlockTarget := h.lockLoopTarget(loop.ProjectID, domain.LoopType(loop.Type), target)
+		defer unlockTarget()
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	meta, werr := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
+	if werr != nil {
+		return werr
+	}
+	updated := *loop
+	updated.MetadataJSON = &meta
+	updated.UpdatedAt = nowISO
+	// Do not flip awaiting_human → queued: free-text must not resume the agent
+	// under the wrong authority. The message is available when the human answers
+	// via a generation-bound path or the loop otherwise resumes.
+	if err := services.Repositories.Loops.Upsert(ctx, updated); err != nil {
+		return err
+	}
+	return nil
 }
 
 // hitlAskRejectsFeishuAnswer reports whether Feishu card buttons / free-text thread

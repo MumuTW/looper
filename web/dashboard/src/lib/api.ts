@@ -253,6 +253,8 @@ export type HITLAsk = {
   confidence?: "high" | "medium" | "low" | string;
   status?: "awaiting" | "answered" | "consumed" | string;
   answer?: string;
+  /** Binds dashboard /respond to this ask generation (with askedAt). */
+  executionId?: string;
   askedAt?: string;
   answeredAt?: string;
   role?: "fixer" | "worker" | string;
@@ -306,6 +308,7 @@ export function parseHITLAsk(metadataJson?: string | null): HITLAsk | null {
     confidence: pickString(r.confidence),
     status: pickString(r.status),
     answer: pickString(r.answer),
+    executionId: pickString(r.executionId),
     askedAt: pickString(r.askedAt),
     answeredAt: pickString(r.answeredAt),
     role: pickString(r.role),
@@ -664,17 +667,31 @@ export function takeoverLoop(
 /**
  * Deliver a human answer to a loop parked in `awaiting_human`. The answer may
  * be an option label or free text — the backend accepts any non-empty string.
+ * When the displayed ask carries executionId/askedAt, pass them so the backend
+ * rejects a stale card answering a later re-escalation on the same loop.
  */
 export function respondLoop(
   selector: string,
   answer: string,
   signal?: AbortSignal,
+  generation?: { executionId?: string; askedAt?: string },
 ): Promise<Loop> {
+  const body: {
+    answer: string;
+    executionId?: string;
+    askedAt?: string;
+  } = { answer };
+  if (generation?.executionId) {
+    body.executionId = generation.executionId;
+  }
+  if (generation?.askedAt) {
+    body.askedAt = generation.askedAt;
+  }
   return apiFetch<Loop>(
     `/api/v1/loops/${encodeURIComponent(selector)}/respond`,
     {
       method: "POST",
-      body: JSON.stringify({ answer }),
+      body: JSON.stringify(body),
       signal,
     },
   );
