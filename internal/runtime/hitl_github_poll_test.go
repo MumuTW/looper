@@ -140,3 +140,48 @@ func TestPollGitHubHITLAnswersOnce_ForgejoProviderLoop(t *testing.T) {
 		t.Fatalf("cleared = %v, want [7] (awaiting label cleanup after answer)", cleared)
 	}
 }
+
+// Park-to-poll boundary: after durable park stamps transport+PR but before the
+// ask comment id is persisted, pre-existing human issue comments must not be
+// treated as the answer (AskCommentID==0 would make every id>0 eligible).
+func TestPollGitHubHITLAnswersOnce_SkipsZeroAskCommentID(t *testing.T) {
+	listCalls := 0
+	var delivered []string
+	deps := githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			listCalls++
+			return []githubAnswerComment{
+				{ID: 50, Author: "human", Body: "unrelated prior comment on the PR"},
+				{ID: 51, Author: "human", Body: "another pre-ask comment"},
+			}, nil
+		},
+		deliverAnswer: func(_ contextType, loopID, answer string) error {
+			delivered = append(delivered, loopID+"="+answer)
+			return nil
+		},
+	}
+	// Incomplete park window: transport+PR published, comment not yet durable.
+	n := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
+		{ID: "loop-mid-delivery", Repo: "acme/x", Transport: "github", AskStatus: "awaiting", PRNumber: 99, AskCommentID: 0},
+	}, deps)
+	if n != 0 || listCalls != 0 || len(delivered) != 0 {
+		t.Fatalf("zero AskCommentID must be poll-ineligible: n=%d listCalls=%d delivered=%v", n, listCalls, delivered)
+	}
+
+	// Once the ask comment id is durable, the same pre-existing comments (ids < ask)
+	// still must not answer; only a reply after the ask does.
+	deps.listComments = func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+		listCalls++
+		return []githubAnswerComment{
+			{ID: 50, Author: "human", Body: "unrelated prior comment on the PR"},
+			{ID: 100, Author: "bot", Body: "<!-- looper:hitl:ask --> q"},
+			{ID: 101, Author: "human", Body: "keep RollingUpdate"},
+		}, nil
+	}
+	n = pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
+		{ID: "loop-ready", Repo: "acme/x", Transport: "github", AskStatus: "awaiting", PRNumber: 99, AskCommentID: 100},
+	}, deps)
+	if n != 1 || len(delivered) != 1 || delivered[0] != "loop-ready=keep RollingUpdate" {
+		t.Fatalf("after AskCommentID durable: delivered=%v n=%d, want post-ask answer only", delivered, n)
+	}
+}

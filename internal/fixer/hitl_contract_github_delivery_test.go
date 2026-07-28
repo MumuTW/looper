@@ -150,6 +150,146 @@ func TestHITLContract_GitHubDeliveryPersistsAskCommentID(t *testing.T) {
 	}
 }
 
+// Mid-delivery race: dashboard/poll answers after park but before AskCommentID
+// persistence. Attach only correlation fields; do not rewrite status/answer.
+func TestHITLContract_PersistAskCommentIDPreservesAnsweredAsk(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+
+	repo := "acme/looper"
+	pr := int64(87)
+	// Durable ask already answered (dashboard won the race) while local delivery
+	// still holds a stale awaiting snapshot without a comment id.
+	meta, err := loops.WriteHITLAsk(nil, loops.HITLAsk{
+		Question: "keep or restore?", Options: []string{"keep", "restore"},
+		SessionID: "sess-race", ExecutionID: "agent-race", Vendor: "codex",
+		Status: "answered", Answer: "keep RollingUpdate", AskedAt: nowISO, AnsweredAt: nowISO,
+		Transport: "github", Provider: "github", PRNumber: pr, Role: "fixer",
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk: %v", err)
+	}
+	loop := storage.LoopRecord{
+		ID: "loop_gh_attach_cas", Seq: 204, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", Repo: &repo, PRNumber: &pr, Status: "running",
+		MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Logger: fixture.logger, Now: fixture.now,
+		HITLEnabled: true, HITLAnswerTransport: "github",
+	})
+	staleLocal := loops.HITLAsk{
+		Question: "keep or restore?", Options: []string{"keep", "restore"},
+		SessionID: "sess-race", ExecutionID: "agent-race", Vendor: "codex",
+		Status: "awaiting", AskedAt: nowISO,
+		Transport: "github", Provider: "github", PRNumber: pr,
+		AskCommentID: 9999, Role: "fixer",
+	}
+	if err := runner.persistParkedHITLAsk(ctx, loop, staleLocal, nowISO); err != nil {
+		t.Fatalf("persistParkedHITLAsk: %v", err)
+	}
+	got, gerr := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if gerr != nil || got == nil {
+		t.Fatalf("Loops.GetByID: %v", gerr)
+	}
+	ask, ok := loops.ReadHITLAsk(got.MetadataJSON)
+	if !ok {
+		t.Fatal("HITL ask missing after attach")
+	}
+	if ask.Status != "answered" || ask.Answer != "keep RollingUpdate" {
+		t.Fatalf("ask status/answer = %q/%q, want answered/keep RollingUpdate (must not clobber)", ask.Status, ask.Answer)
+	}
+	if ask.AskCommentID != 9999 {
+		t.Fatalf("AskCommentID = %d, want 9999 attached without rewriting decision", ask.AskCommentID)
+	}
+	if got.Status != "running" {
+		t.Fatalf("loop status = %q, want still running", got.Status)
+	}
+}
+
+// Awaiting park generation receives AskCommentID without losing question/options.
+func TestHITLContract_PersistAskCommentIDOnAwaitingPark(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+
+	repo := "acme/looper"
+	pr := int64(87)
+	meta, err := loops.WriteHITLAsk(nil, loops.HITLAsk{
+		Question: "keep or restore?", Options: []string{"keep", "restore"},
+		SessionID: "sess-ok", ExecutionID: "agent-ok", Vendor: "codex",
+		Status: "awaiting", AskedAt: nowISO,
+		Transport: "github", Provider: "github", PRNumber: pr, Role: "fixer",
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk: %v", err)
+	}
+	loop := storage.LoopRecord{
+		ID: "loop_gh_attach_await", Seq: 205, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", Repo: &repo, PRNumber: &pr, Status: "awaiting_human",
+		MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Logger: fixture.logger, Now: fixture.now,
+		HITLEnabled: true, HITLAnswerTransport: "github",
+	})
+	delivered := loops.HITLAsk{
+		Question: "stale question text", Options: []string{"x"},
+		SessionID: "sess-ok", ExecutionID: "agent-ok",
+		Status: "awaiting", AskedAt: nowISO,
+		Transport: "github", Provider: "github", PRNumber: pr, AskCommentID: 4242,
+	}
+	if err := runner.persistParkedHITLAsk(ctx, loop, delivered, nowISO); err != nil {
+		t.Fatalf("persistParkedHITLAsk: %v", err)
+	}
+	got, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || got == nil {
+		t.Fatalf("Loops.GetByID: %v", err)
+	}
+	ask, ok := loops.ReadHITLAsk(got.MetadataJSON)
+	if !ok {
+		t.Fatal("HITL ask missing")
+	}
+	if ask.AskCommentID != 4242 {
+		t.Fatalf("AskCommentID = %d, want 4242", ask.AskCommentID)
+	}
+	if ask.Question != "keep or restore?" || ask.Status != "awaiting" {
+		t.Fatalf("question/status = %q/%q; must keep durable park fields", ask.Question, ask.Status)
+	}
+}
+
+func TestMergeHITLAskDeliveryCorrelation_GenerationMismatch(t *testing.T) {
+	t.Parallel()
+	current := loops.HITLAsk{
+		Status: "awaiting", ExecutionID: "exec-new", Question: "new ask",
+		Transport: "github", PRNumber: 1,
+	}
+	delivered := loops.HITLAsk{
+		Status: "awaiting", ExecutionID: "exec-old", AskCommentID: 7,
+		Transport: "github", PRNumber: 1,
+	}
+	got, changed := mergeHITLAskDeliveryCorrelation(current, delivered)
+	if changed {
+		t.Fatalf("different ExecutionID must not attach: got=%+v", got)
+	}
+	if got.AskCommentID != 0 {
+		t.Fatalf("AskCommentID = %d, want 0 on generation mismatch", got.AskCommentID)
+	}
+}
+
 // Concurrent terminate during park must not return awaiting_human or notify.
 func TestHITLContract_TerminatedLoopAbortsSuspend(t *testing.T) {
 	t.Parallel()

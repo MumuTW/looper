@@ -103,10 +103,18 @@ type githubHITLAwaitingLoop struct {
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
 // simply won't be passed in again.
+//
+// Asks with AskCommentID==0 are not poll-eligible: park may publish
+// transport=github + PRNumber before CreateIssueComment returns, and treating
+// comment id 0 as the floor would accept any pre-existing PR comment as the
+// answer before the question is posted.
 func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
 	delivered := 0
 	for _, loop := range loops {
 		if !strings.EqualFold(strings.TrimSpace(loop.Transport), "github") || loop.PRNumber == 0 {
+			continue
+		}
+		if loop.AskCommentID == 0 {
 			continue
 		}
 		if s := strings.TrimSpace(loop.AskStatus); s != "" && s != "awaiting" {
@@ -365,7 +373,9 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			continue
 		}
 		ask, ok := loops.ReadHITLAsk(l.MetadataJSON)
-		if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") || ask.PRNumber == 0 {
+		// Require a durable ask-comment id so the delivery window after park
+		// (transport+PR stamped, comment not yet posted) is not polled.
+		if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") || ask.PRNumber == 0 || ask.AskCommentID == 0 {
 			continue
 		}
 		repo := ""

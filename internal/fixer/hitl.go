@@ -1033,8 +1033,18 @@ func (r *Runner) parkHITLLoop(ctx context.Context, loop storage.LoopRecord, ask 
 	return apply(r.repos)
 }
 
-// persistParkedHITLAsk rewrites the durable HITL ask on an already-parked loop
-// (e.g. to attach AskCommentID after GitHub delivery) without changing status.
+// persistParkedHITLAsk attaches post-delivery correlation fields (AskCommentID
+// and transport identity) onto the durable park without replacing the entire
+// current ask. A dashboard /respond or poll delivery that wins after park but
+// before CreateIssueComment returns must keep status=answered and the answer
+// body; overwriting with the local awaiting snapshot would drop the decision
+// while the loop stays running and never re-polls.
+//
+// Attachment is CAS-scoped to the park generation: when the durable ask is still
+// awaiting and (if set) shares the same ExecutionID, correlation fields are
+// merged onto that record. When the ask was already answered/consumed, only a
+// missing AskCommentID is filled in so label cleanup can still find the PR
+// comment.
 func (r *Runner) persistParkedHITLAsk(ctx context.Context, loop storage.LoopRecord, ask loops.HITLAsk, nowISO string) error {
 	apply := func(repos *storage.Repositories) error {
 		current, err := repos.Loops.GetByID(ctx, loop.ID)
@@ -1047,12 +1057,21 @@ func (r *Runner) persistParkedHITLAsk(ctx context.Context, loop storage.LoopReco
 		if current.Status == "terminated" || current.Status == "stopped" {
 			return errHITLLoopTerminated
 		}
-		updated := *current
-		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr != nil {
-			return werr
-		} else {
-			updated.MetadataJSON = &meta
+		existing, ok := loops.ReadHITLAsk(current.MetadataJSON)
+		if !ok {
+			// Park metadata missing (cleared concurrently); nothing to attach to.
+			return nil
 		}
+		merged, changed := mergeHITLAskDeliveryCorrelation(existing, ask)
+		if !changed {
+			return nil
+		}
+		updated := *current
+		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, merged)
+		if werr != nil {
+			return werr
+		}
+		updated.MetadataJSON = &meta
 		updated.UpdatedAt = nowISO
 		return repos.Loops.Upsert(ctx, updated)
 	}
@@ -1065,6 +1084,56 @@ func (r *Runner) persistParkedHITLAsk(ctx context.Context, loop storage.LoopReco
 		return fmt.Errorf("repositories unavailable for HITL ask update")
 	}
 	return apply(r.repos)
+}
+
+// mergeHITLAskDeliveryCorrelation merges post-delivery PR/comment correlation
+// from delivered onto the durable current ask. It never rewrites answer/status/
+// question fields from a stale local park snapshot.
+func mergeHITLAskDeliveryCorrelation(current, delivered loops.HITLAsk) (loops.HITLAsk, bool) {
+	out := current
+	status := strings.TrimSpace(current.Status)
+	switch status {
+	case "awaiting":
+		// Same park generation only: a newer re-ask must not inherit the old
+		// comment id or lose its own identity via a late delivery write.
+		curExec := strings.TrimSpace(current.ExecutionID)
+		delExec := strings.TrimSpace(delivered.ExecutionID)
+		if curExec != "" && delExec != "" && curExec != delExec {
+			return current, false
+		}
+	case "answered", "consumed":
+		// Decision already landed. Only fill a missing AskCommentID (and empty
+		// transport identity) so awaiting-label cleanup can still resolve the PR.
+	default:
+		// Unknown/empty status: treat like awaiting for correlation attach when
+		// the durable record still looks like the park we just wrote.
+		if status != "" {
+			return current, false
+		}
+	}
+
+	changed := false
+	if delivered.AskCommentID != 0 && out.AskCommentID != delivered.AskCommentID {
+		// Never replace a non-zero durable comment id (different generation or
+		// already attached); only fill when unset or update when still zero.
+		if out.AskCommentID == 0 {
+			out.AskCommentID = delivered.AskCommentID
+			changed = true
+		}
+	}
+	if t := strings.TrimSpace(delivered.Transport); t != "" && strings.TrimSpace(out.Transport) == "" {
+		out.Transport = t
+		changed = true
+	}
+	if p := strings.TrimSpace(delivered.Provider); p != "" && strings.TrimSpace(out.Provider) == "" {
+		out.Provider = p
+		changed = true
+	}
+	if delivered.PRNumber != 0 && out.PRNumber == 0 {
+		out.PRNumber = delivered.PRNumber
+		changed = true
+	}
+	return out, changed
 }
 
 func clearDismissSentinel(worktreePath string) error {
