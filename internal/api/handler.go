@@ -5967,6 +5967,12 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 		h.writeError(w, requestID, typed)
 		return
 	}
+	// Notify-only / GitHub-transport cards must not accept Feishu button answers:
+	// answer authority is the configured GitHub answerAuthors path (or dashboard).
+	if h.hitlAskRejectsFeishuAnswer(&loop) {
+		h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": false, "reason": "feishu answers disabled for github transport"})
+		return
+	}
 	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer); err != nil {
 		var typed apiError
 		if !asAPIError(err, &typed) {
@@ -5983,6 +5989,9 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 // to the loop that asked and delivers the typed text as the answer — the lossless,
 // type-anything counterpart to clicking an option button. Ordinary thread chatter
 // (no matching awaiting_human loop) is ignored with 200 so Feishu stops retrying.
+//
+// When answerTransport is github, secondary Feishu cards are notify-only: free-text
+// replies in the loop thread must not resume the Fixer and bypass GitHub authority.
 func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request, requestID string, envelope feishuCardActionEnvelope) {
 	msg := envelope.Event.Message
 	if msg.MessageType != "text" {
@@ -6016,6 +6025,10 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "no loop for thread"})
 		return
 	}
+	if loop, lerr := services.Repositories.Loops.GetByID(r.Context(), loopID); lerr == nil && loop != nil && h.hitlAskRejectsFeishuAnswer(loop) {
+		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "feishu answers disabled for github transport"})
+		return
+	}
 	// deliverHumanAnswer only accepts an awaiting_human loop, so this naturally
 	// drops the bot's own thread posts, replies after the loop resumed, and any
 	// duplicate Feishu retries.
@@ -6024,6 +6037,21 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 		return
 	}
 	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": true})
+}
+
+// hitlAskRejectsFeishuAnswer reports whether Feishu card buttons / free-text thread
+// replies must not resume this loop. GitHub answer transport parks a notify-only
+// Feishu card for awareness; answers must arrive via PR comment or dashboard so
+// awaiting-label cleanup and answerAuthors authority stay intact.
+func (h *Handler) hitlAskRejectsFeishuAnswer(loop *storage.LoopRecord) bool {
+	if loop == nil {
+		return false
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(ask.Transport), "github")
 }
 
 // retryLoop re-arms a loop for another scheduler pass. fromHandback is true when

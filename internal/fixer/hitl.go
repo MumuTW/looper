@@ -303,6 +303,18 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 	// Only list provider surfaces already represented in the parked FixItems.
 	// That appends mid-park *new* items on the same surface without treating
 	// pre-existing out-of-scope reviews as drift on pure conflict/check parks.
+	// Live native/summary surfaces must apply the same current-user authority filters
+	// as ask-time collection (attachManualForgejoNativeComments / sanitizeForgejoSummaryAuthority).
+	// Without that, self-authored native comments or untrusted summary markers change
+	// the resume fingerprint and retire a still-valid human answer.
+	var liveCurrentUser string
+	if needNative || needSummary {
+		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return "", fmt.Errorf("HITL live review refresh current-user lookup failed: %w", err)
+		}
+		liveCurrentUser = strings.TrimSpace(login)
+	}
 	if needNative {
 		comments, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{
 			Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath,
@@ -324,6 +336,10 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 		if err != nil {
 			return "", fmt.Errorf("HITL live forgejo reviewer-summary refresh failed: %w", err)
 		}
+		// Discovery only trusts summary markers from the configured current user.
+		// Sanitize before collectFixItems so a second marker from anyone else cannot
+		// uniqueness-error the authoritative summary and falsely invalidate the answer.
+		sanitizeForgejoSummaryAuthority(&detail, liveCurrentUser)
 		summaryByID = make(map[string]FixItem)
 		for _, liveItem := range collectFixItems(detail) {
 			if strings.TrimSpace(liveItem.Source) != "forgejo-reviewer-summary" {
@@ -442,11 +458,11 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 		}
 	}
 	if needNative {
-		for providerID, c := range nativeByProvider {
+		// Match attachManualForgejoNativeComments: only unresolved, non-self comments
+		// are FixItems at ask time, so only those can count as mid-park drift.
+		for _, c := range actionableNativeReviewComments(mapValuesNativeComments(nativeByProvider), liveCurrentUser) {
+			providerID := c.ProviderCommentID
 			if providerID <= 0 {
-				continue
-			}
-			if c.IsResolved {
 				continue
 			}
 			if _, seen := seenNativeIDs[providerID]; seen {
@@ -506,6 +522,19 @@ func fixItemFromLiveGitHubThread(thread ReviewThread) (FixItem, bool) {
 		Body:              "",
 		ThreadFingerprint: liveReviewThreadFingerprint(thread),
 	}, true
+}
+
+// mapValuesNativeComments returns native comments from a provider-id map in
+// arbitrary order (callers re-filter/sort as needed).
+func mapValuesNativeComments(byID map[int64]NativeReviewComment) []NativeReviewComment {
+	if len(byID) == 0 {
+		return nil
+	}
+	out := make([]NativeReviewComment, 0, len(byID))
+	for _, c := range byID {
+		out = append(out, c)
+	}
+	return out
 }
 
 // fixItemFromLiveNativeComment builds a native Forgejo FixItem for a live
@@ -1492,6 +1521,30 @@ func (r *Runner) stampGitHubAskTransport(input stepInput, ask *loops.HITLAsk) er
 	return nil
 }
 
+// deliveredCommentStashMatchesPark reports whether a worktree-delivered ask
+// comment belongs to the current park generation. Match on PR identity (and
+// optional provider/transport when present); do not require executionId equality
+// because correlation-retry re-entry assigns a fresh agent execution id.
+func deliveredCommentStashMatchesPark(stash *hitl.DeliveredCommentStash, ask *loops.HITLAsk) bool {
+	if stash == nil || ask == nil || stash.AskCommentID <= 0 {
+		return false
+	}
+	if stash.PRNumber > 0 && ask.PRNumber > 0 && stash.PRNumber != ask.PRNumber {
+		return false
+	}
+	if p := strings.TrimSpace(stash.Provider); p != "" {
+		if ap := strings.TrimSpace(ask.Provider); ap != "" && !strings.EqualFold(p, ap) {
+			return false
+		}
+	}
+	if t := strings.TrimSpace(stash.Transport); t != "" {
+		if at := strings.TrimSpace(ask.Transport); at != "" && !strings.EqualFold(t, at) {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiting *awaitingHumanError, ask *loops.HITLAsk) error {
 	if ask == nil {
 		return fmt.Errorf("hitl github: nil ask")
@@ -1532,13 +1585,15 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 	}
 	// Worktree stash written when CreateIssueComment succeeded but durable
 	// correlation attach failed and the park was rolled back for retry.
+	// Correlate by parked PR generation — not transient agent execution IDs.
+	// Scheduler re-entry after correlation rollback regenerates execution IDs via
+	// eventlog.NewEventID while recovering the same ask.json; requiring exec
+	// equality would post a second question and abandon the answered first comment.
 	if worktreePath != "" {
 		if stash, stashErr := hitl.ReadDeliveredCommentStash(worktreePath); stashErr != nil {
 			return fmt.Errorf("hitl github: read delivered comment stash: %w", stashErr)
 		} else if stash != nil && stash.AskCommentID > 0 {
-			stashExec := strings.TrimSpace(stash.ExecutionID)
-			askExec := strings.TrimSpace(ask.ExecutionID)
-			if stashExec == "" || askExec == "" || stashExec == askExec {
+			if deliveredCommentStashMatchesPark(stash, ask) {
 				ask.AskCommentID = stash.AskCommentID
 				if strings.TrimSpace(ask.Transport) == "" && strings.TrimSpace(stash.Transport) != "" {
 					ask.Transport = stash.Transport

@@ -112,8 +112,9 @@ func TestHITLContract_CorrelationAttachFailureRetriesWithoutRepost(t *testing.T)
 		t.Fatalf("stash.AskCommentID = %d, want %d", stash.AskCommentID, deliveredID)
 	}
 
-	// Retry delivery must reuse the stash and not post again.
-	// Restore a claimable running loop for the second suspend attempt.
+	// Retry delivery must reuse the stash and not post again — even when the
+	// scheduler re-entry assigns a fresh agent execution ID (awaitingFromAskPayload
+	// / eventlog.NewEventID), which is the production correlation-retry path.
 	restored := loop
 	restored.Status = "running"
 	restored.UpdatedAt = nowISO
@@ -135,7 +136,7 @@ func TestHITLContract_CorrelationAttachFailureRetriesWithoutRepost(t *testing.T)
 		Worktree: &checkpointWorktree{Path: worktree, HeadSHA: pr87Head, PreparedAt: nowISO},
 	}, &awaitingHumanError{
 		question: "correlation retry?", options: []string{"a", "b"},
-		sessionID: "sess-corr", executionID: "agent-corr", vendor: "codex",
+		sessionID: "sess-corr", executionID: "agent-corr-retry-2", vendor: "codex",
 		worktreePath: worktree,
 	})
 	if err != nil {
@@ -193,9 +194,10 @@ func TestHITLContract_DeliverAskToGitHubLoadsStash(t *testing.T) {
 		Logger: fixture.logger, Now: fixture.now,
 		HITLEnabled: true, HITLAnswerTransport: "github",
 	})
+	// Fresh execution id (scheduler re-entry) must still reuse the PR-correlated stash.
 	ask := loops.HITLAsk{
 		Question: "stash?", Options: []string{"yes"},
-		SessionID: "sess-stash", ExecutionID: "agent-stash", Status: "awaiting",
+		SessionID: "sess-stash", ExecutionID: "agent-stash-retry-new", Status: "awaiting",
 		Transport: "github", Provider: "github", PRNumber: pr,
 	}
 	if err := runner.deliverAskToGitHub(ctx, stepInput{
@@ -203,7 +205,7 @@ func TestHITLContract_DeliverAskToGitHubLoadsStash(t *testing.T) {
 		Loop:    loop, Repo: repo, PRNumber: pr,
 		Checkpoint: fixerCheckpoint{Worktree: &checkpointWorktree{Path: worktree}},
 	}, &awaitingHumanError{
-		question: "stash?", options: []string{"yes"}, executionID: "agent-stash",
+		question: "stash?", options: []string{"yes"}, executionID: "agent-stash-retry-new",
 		worktreePath: worktree,
 	}, &ask); err != nil {
 		t.Fatalf("deliverAskToGitHub: %v", err)
@@ -213,5 +215,24 @@ func TestHITLContract_DeliverAskToGitHubLoadsStash(t *testing.T) {
 	}
 	if ask.AskCommentID != 4242 {
 		t.Fatalf("AskCommentID = %d, want 4242 from stash", ask.AskCommentID)
+	}
+}
+
+func TestDeliveredCommentStashMatchesParkByPRNotExecution(t *testing.T) {
+	t.Parallel()
+	stash := &hitl.DeliveredCommentStash{
+		AskCommentID: 9, ExecutionID: "exec-old", PRNumber: 42,
+		Provider: "github", Transport: "github",
+	}
+	ask := &loops.HITLAsk{
+		ExecutionID: "exec-new", PRNumber: 42,
+		Provider: "github", Transport: "github",
+	}
+	if !deliveredCommentStashMatchesPark(stash, ask) {
+		t.Fatal("same PR with different executionId must match")
+	}
+	ask.PRNumber = 99
+	if deliveredCommentStashMatchesPark(stash, ask) {
+		t.Fatal("different PR must not match")
 	}
 }

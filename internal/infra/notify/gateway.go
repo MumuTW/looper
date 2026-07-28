@@ -759,6 +759,8 @@ func (g *Gateway) sendHITLAskFeishu(ctx context.Context, card HITLAskCard) error
 	}
 	// Thread the ask card under the loop's root so the question lands in the same
 	// thread as the task's other updates. Card buttons still work inside a thread.
+	// NotifyOnly cards still thread for awareness, but free-text replies are rejected
+	// by the inbound Feishu handler when transport is github (not answerable here).
 	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, card.LoopID)
 	// The loop is awaiting_human now — turn the anchor card orange "等你定夺".
 	g.updateFeishuThreadHeader(ctx, token, card.LoopID)
@@ -767,6 +769,7 @@ func (g *Gateway) sendHITLAskFeishu(ctx context.Context, card HITLAskCard) error
 		return err
 	}
 	// Remember the card so MarkAskAnswered can patch it in place on delivery.
+	// NotifyOnly cards are still patched for UX, but are not answer authorities.
 	if strings.TrimSpace(msgID) != "" && strings.TrimSpace(card.LoopID) != "" {
 		g.state.liveMu.Lock()
 		if g.state.askCards == nil {
