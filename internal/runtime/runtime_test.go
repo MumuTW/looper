@@ -3974,6 +3974,15 @@ func TestShouldRequeueLoopKeepsPausedLoopsExcluded(t *testing.T) {
 	if shouldRequeueLoop(storage.LoopRecord{Status: "human_takeover"}, &storage.RunRecord{Status: "interrupted"}, false) {
 		t.Fatal("shouldRequeueLoop() = true, want false for human_takeover loop")
 	}
+	// Successful HITL suspend completes the run as interrupted while the loop stays
+	// awaiting_human. Daemon restart recovery must not revive the cancelled claim
+	// before a human answers (would restart Fixer without the decision).
+	if shouldRequeueLoop(storage.LoopRecord{Status: "awaiting_human"}, &storage.RunRecord{Status: "interrupted"}, false) {
+		t.Fatal("shouldRequeueLoop() = true, want false for awaiting_human loop")
+	}
+	if !shouldRequeueLoop(storage.LoopRecord{Status: "running"}, &storage.RunRecord{Status: "interrupted"}, false) {
+		t.Fatal("shouldRequeueLoop() = false, want true for running loop with interrupted run")
+	}
 }
 
 func TestShouldAutoRecoverFailedReviewerLoopIgnoresLegacyBudgetTermination(t *testing.T) {

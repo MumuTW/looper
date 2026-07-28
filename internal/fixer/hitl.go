@@ -886,18 +886,40 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			}
 		}
 		// Persist AskCommentID onto the durable park (delivery is remote-side;
-		// comment id must land in metadata for detectGitHubHITLAnswer).
-		// Never clear the park after a successful CreateIssueComment: rollback
-		// would drop correlation and a retry would post a second question while
-		// humans reply to the first. Force-attach the delivered id and finish
-		// suspension even if the first CAS write fails.
+		// comment id must land in metadata for detectGitHubHITLAnswer / poll).
+		// When both CAS attach paths fail, do not complete suspension with
+		// AskCommentID==0: stash the delivered id on disk, roll the park back for
+		// re-entry, and return retryable. deliverAskToGitHub reloads the stash so
+		// the next attempt does not CreateIssueComment again.
 		if err := r.persistParkedHITLAsk(ctx, input.Loop, ask, nowISO); err != nil {
-			if forceErr := r.forcePersistDeliveredAskComment(ctx, input.Loop, ask, nowISO); forceErr != nil && r.logger != nil {
-				r.logger.Warn("fixer HITL could not attach AskCommentID after GitHub delivery; park kept to avoid double-post", map[string]any{
-					"loopId": input.Loop.ID, "askCommentId": ask.AskCommentID,
-					"persistError": err.Error(), "forceError": forceErr.Error(),
-				})
+			if forceErr := r.forcePersistDeliveredAskComment(ctx, input.Loop, ask, nowISO); forceErr != nil {
+				if worktreePath != "" && ask.AskCommentID > 0 {
+					if stashErr := hitl.WriteDeliveredCommentStash(worktreePath, hitl.DeliveredCommentStash{
+						AskCommentID: ask.AskCommentID,
+						ExecutionID:  ask.ExecutionID,
+						PRNumber:     ask.PRNumber,
+						Provider:     ask.Provider,
+						Transport:    ask.Transport,
+					}); stashErr != nil && r.logger != nil {
+						r.logger.Warn("fixer HITL could not stash delivered AskCommentID for correlation retry", map[string]any{
+							"loopId": input.Loop.ID, "askCommentId": ask.AskCommentID, "error": stashErr.Error(),
+						})
+					}
+				}
+				if rbErr := r.rollbackHITLParkForDeliveryRetry(ctx, input.Loop, nowISO); rbErr != nil && r.logger != nil {
+					r.logger.Warn("fixer HITL rollback after correlation attach failure failed", map[string]any{
+						"loopId": input.Loop.ID, "error": rbErr.Error(),
+					})
+				}
+				return ProcessResult{}, &loopError{
+					message: fmt.Sprintf("HITL GitHub ask correlation failed after delivery (comment %d): persist=%v; force=%v", ask.AskCommentID, err, forceErr),
+					kind:    FailureRetryableTransient,
+				}
 			}
+		}
+		// Correlation is durable — drop the worktree stash if present.
+		if worktreePath != "" {
+			hitl.RemoveDeliveredCommentStash(worktreePath)
 		}
 	}
 
@@ -1292,6 +1314,13 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 	if err := r.stampGitHubAskTransport(input, ask); err != nil {
 		return err
 	}
+	worktreePath := ""
+	if awaiting != nil {
+		worktreePath = strings.TrimSpace(awaiting.worktreePath)
+	}
+	if worktreePath == "" && input.Checkpoint.Worktree != nil {
+		worktreePath = strings.TrimSpace(input.Checkpoint.Worktree.Path)
+	}
 	// Idempotent recovery: a prior CreateIssueComment already succeeded (e.g.
 	// correlation write failed mid-suspend). Never post a second question.
 	if ask.AskCommentID > 0 {
@@ -1315,6 +1344,29 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 			return nil
 		}
 	}
+	// Worktree stash written when CreateIssueComment succeeded but durable
+	// correlation attach failed and the park was rolled back for retry.
+	if worktreePath != "" {
+		if stash, stashErr := hitl.ReadDeliveredCommentStash(worktreePath); stashErr != nil {
+			return fmt.Errorf("hitl github: read delivered comment stash: %w", stashErr)
+		} else if stash != nil && stash.AskCommentID > 0 {
+			stashExec := strings.TrimSpace(stash.ExecutionID)
+			askExec := strings.TrimSpace(ask.ExecutionID)
+			if stashExec == "" || askExec == "" || stashExec == askExec {
+				ask.AskCommentID = stash.AskCommentID
+				if strings.TrimSpace(ask.Transport) == "" && strings.TrimSpace(stash.Transport) != "" {
+					ask.Transport = stash.Transport
+				}
+				if strings.TrimSpace(ask.Provider) == "" && strings.TrimSpace(stash.Provider) != "" {
+					ask.Provider = stash.Provider
+				}
+				if ask.PRNumber <= 0 && stash.PRNumber > 0 {
+					ask.PRNumber = stash.PRNumber
+				}
+				return nil
+			}
+		}
+	}
 	repo := firstNonEmpty(input.Repo, derefString(input.Loop.Repo))
 	prNumber := ask.PRNumber
 	cwd := input.Project.RepoPath
@@ -1333,6 +1385,21 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, awaiti
 		r.logger.Warn("fixer hitl github: failed to add awaiting-human label", map[string]any{"repo": repo, "pr": prNumber, "error": err.Error()})
 	}
 	ask.AskCommentID = res.ID
+	// Stash immediately so a post-delivery correlation failure can retry without
+	// posting a second PR question.
+	if worktreePath != "" {
+		if stashErr := hitl.WriteDeliveredCommentStash(worktreePath, hitl.DeliveredCommentStash{
+			AskCommentID: ask.AskCommentID,
+			ExecutionID:  ask.ExecutionID,
+			PRNumber:     ask.PRNumber,
+			Provider:     ask.Provider,
+			Transport:    ask.Transport,
+		}); stashErr != nil && r.logger != nil {
+			r.logger.Warn("fixer hitl github: could not stash delivered AskCommentID", map[string]any{
+				"loopId": input.Loop.ID, "askCommentId": ask.AskCommentID, "error": stashErr.Error(),
+			})
+		}
+	}
 	return nil
 }
 

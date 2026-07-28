@@ -2957,40 +2957,21 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
-	// Autonomous conflict resolution (risky fixes on): merge the base into the
-	// worktree so the agent has the conflict markers to resolve, instead of punting
-	// the conflict to a human. A merge that fails for a non-conflict reason falls
-	// back to manual intervention.
-	//
-	// Skip only when resuming an answered HITL park *and* the retained worktree
-	// still has the original in-progress merge (MERGE_HEAD). A replaced/invalid
-	// worktree is recreated at PR head without MERGE_HEAD; re-running the merge
-	// is required so the agent still sees conflict markers for the human decision.
-	executionID := eventlog.NewEventID("agent")
-	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
-	if err != nil {
-		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
-	}
-	if hasConflict {
-		skipConflictMerge := r.hitlEnabled && r.hasAnsweredHITLAsk(ctx, &input.Loop) && worktreeHasInProgressMerge(worktree.Path)
-		if !skipConflictMerge {
-			base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
-			if base == "" {
-				base = "main"
-			}
-			if _, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base}); mergeErr != nil {
-				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
-				return checkpoint, &loopError{message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), kind: FailureManualIntervention}
-			}
-		}
-	}
-
 	// When HITL is enabled the agent must not push: Looper owns push only after
 	// repair completes without escalation.
 	agentAllowPush := r.allowAutoPush && !r.hitlEnabled
 	nativeResumePrompt := ""
 	nativeSessionID := ""
+	executionID := eventlog.NewEventID("agent")
+	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	if err != nil {
+		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+	}
+
+	// HITL ask.json recovery MUST run before autonomous conflict re-merge.
+	// Delivery-failure rollback clears the durable park, requeues the claim, and
+	// deliberately leaves ask.json; the retained worktree still has MERGE_HEAD.
+	// Re-merging first fails into manual intervention and never re-parks.
 	if r.hitlEnabled {
 		// Always clear leftover dismiss.json before the agent runs.
 		if err := clearDismissSentinel(worktree.Path); err != nil {
@@ -3009,11 +2990,37 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 				hitl.RemoveAskSentinel(worktree.Path)
 			} else {
 				// Undurable suspend recovery OR a new ask after a prior consumed
-				// cycle: park without starting the agent.
+				// cycle: park without starting the agent (and without re-merging).
 				return checkpoint, r.awaitingFromAskPayload(ctx, input, worktree.Path, executionID, askFile)
 			}
 		}
+	}
 
+	// Autonomous conflict resolution (risky fixes on): merge the base into the
+	// worktree so the agent has the conflict markers to resolve, instead of punting
+	// the conflict to a human. A merge that fails for a non-conflict reason falls
+	// back to manual intervention.
+	//
+	// Skip only when resuming an answered HITL park *and* the retained worktree
+	// still has the original in-progress merge (MERGE_HEAD). A replaced/invalid
+	// worktree is recreated at PR head without MERGE_HEAD; re-running the merge
+	// is required so the agent still sees conflict markers for the human decision.
+	if hasConflict {
+		skipConflictMerge := r.hitlEnabled && r.hasAnsweredHITLAsk(ctx, &input.Loop) && worktreeHasInProgressMerge(worktree.Path)
+		if !skipConflictMerge {
+			base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
+			if base == "" {
+				base = "main"
+			}
+			if _, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base}); mergeErr != nil {
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
+				return checkpoint, &loopError{message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), kind: FailureManualIntervention}
+			}
+		}
+	}
+
+	if r.hitlEnabled {
 		// Authority refresh BEFORE building the prompt / injecting a human answer.
 		liveDetail, refreshErr := r.refreshLiveHITLDetail(ctx, input)
 		if refreshErr != nil {

@@ -6108,8 +6108,11 @@ type fakeGitHubGateway struct {
 	createIssueComments   []IssueCommentInput
 	updateIssueComments   []UpdateIssueCommentInput
 	createIssueCommentErr error
-	updateIssueCommentErr error
-	nextIssueCommentID    int64
+	// afterCreateIssueComment runs after a successful comment create (tests can
+	// mutate durable state to force correlation-attach failures).
+	afterCreateIssueComment func(IssueCommentResult)
+	updateIssueCommentErr   error
+	nextIssueCommentID      int64
 	compareCalls          []CompareCommitsInput
 	compareStatus         string
 	compareErr            error
@@ -6280,7 +6283,11 @@ func (f *fakeGitHubGateway) CreateIssueComment(_ context.Context, input IssueCom
 	}
 	id := f.nextIssueCommentID
 	f.nextIssueCommentID++
-	return IssueCommentResult{ID: id, URL: fmt.Sprintf("https://example.test/c/%d", id)}, nil
+	res := IssueCommentResult{ID: id, URL: fmt.Sprintf("https://example.test/c/%d", id)}
+	if f.afterCreateIssueComment != nil {
+		f.afterCreateIssueComment(res)
+	}
+	return res, nil
 }
 
 func (f *fakeGitHubGateway) UpdateIssueComment(_ context.Context, input UpdateIssueCommentInput) error {

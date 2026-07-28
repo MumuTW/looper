@@ -12,6 +12,11 @@ import (
 // the worktree root.
 const AskSentinelRelPath = ".looper/ask.json"
 
+// DeliveredCommentStashRelPath stores the GitHub/Forgejo ask-comment id after a
+// successful remote post when durable park correlation has not yet been written.
+// Survives a correlation-attach retry so CreateIssueComment is not repeated.
+const DeliveredCommentStashRelPath = ".looper/hitl-delivered-comment.json"
+
 // AskPayload is the on-disk decision brief written by an agent before stopping.
 type AskPayload struct {
 	Question          string            `json:"question"`
@@ -64,6 +69,72 @@ func RemoveAskSentinel(worktreePath string) {
 		return
 	}
 	_ = os.Remove(filepath.Join(worktreePath, AskSentinelRelPath))
+}
+
+// DeliveredCommentStash is the on-disk correlation recovery record written after
+// CreateIssueComment succeeds and removed once AskCommentID is durably parked.
+type DeliveredCommentStash struct {
+	AskCommentID int64  `json:"askCommentId"`
+	ExecutionID  string `json:"executionId,omitempty"`
+	PRNumber     int64  `json:"prNumber,omitempty"`
+	Provider     string `json:"provider,omitempty"`
+	Transport    string `json:"transport,omitempty"`
+}
+
+// WriteDeliveredCommentStash persists a delivered ask-comment id for correlation
+// retry. Best-effort: returns an error when the worktree path is unusable.
+func WriteDeliveredCommentStash(worktreePath string, stash DeliveredCommentStash) error {
+	if strings.TrimSpace(worktreePath) == "" {
+		return fmt.Errorf("write delivered comment stash: empty worktree path")
+	}
+	if stash.AskCommentID <= 0 {
+		return fmt.Errorf("write delivered comment stash: missing askCommentId")
+	}
+	dir := filepath.Join(worktreePath, ".looper")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("write delivered comment stash: mkdir: %w", err)
+	}
+	raw, err := json.Marshal(stash)
+	if err != nil {
+		return fmt.Errorf("write delivered comment stash: marshal: %w", err)
+	}
+	path := filepath.Join(worktreePath, DeliveredCommentStashRelPath)
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		return fmt.Errorf("write delivered comment stash: %w", err)
+	}
+	return nil
+}
+
+// ReadDeliveredCommentStash loads a correlation recovery record, if present.
+// Returns (nil, nil) when missing.
+func ReadDeliveredCommentStash(worktreePath string) (*DeliveredCommentStash, error) {
+	if strings.TrimSpace(worktreePath) == "" {
+		return nil, nil
+	}
+	path := filepath.Join(worktreePath, DeliveredCommentStashRelPath)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read delivered comment stash: %w", err)
+	}
+	var stash DeliveredCommentStash
+	if err := json.Unmarshal(raw, &stash); err != nil {
+		return nil, fmt.Errorf("malformed delivered comment stash: %w", err)
+	}
+	if stash.AskCommentID <= 0 {
+		return nil, fmt.Errorf("delivered comment stash missing askCommentId")
+	}
+	return &stash, nil
+}
+
+// RemoveDeliveredCommentStash deletes the correlation recovery record if present.
+func RemoveDeliveredCommentStash(worktreePath string) {
+	if strings.TrimSpace(worktreePath) == "" {
+		return
+	}
+	_ = os.Remove(filepath.Join(worktreePath, DeliveredCommentStashRelPath))
 }
 
 // ConsumeAskSentinel reads and removes the agent's ask sentinel from the
