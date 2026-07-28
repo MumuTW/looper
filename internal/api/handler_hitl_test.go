@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -27,7 +28,8 @@ func (r *runtimeHITLAnswerProbe) MarkHITLAskAnswered(ctx context.Context, loopID
 
 // setupAwaitingCardLoop seeds a project + awaiting_human loop and returns the
 // handler + services for card-action security tests. Parks are stamped
-// transport=feishu so Feishu answers are the configured authority.
+// transport=feishu so Feishu answers are the configured authority. Generation
+// tokens are always present so card actions satisfy the Feishu-route contract.
 
 func setupAwaitingCardLoop(t *testing.T, cfg config.Config, rt *looperdruntime.Runtime, projectID, loopID string, seq int64) *Handler {
 	t.Helper()
@@ -36,7 +38,7 @@ func setupAwaitingCardLoop(t *testing.T, cfg config.Config, rt *looperdruntime.R
 	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
 	targetID := projectID
-	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting","transport":"feishu"}}`
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting","transport":"feishu","executionId":"agent-card","askedAt":"2026-04-11T12:00:00.000Z"}}`
 	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -369,6 +371,117 @@ func TestHandlerRespondAnswerOnlyAcceptsCurrentPark(t *testing.T) {
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok || ask.Status != "answered" || ask.Answer != "option a" {
 		t.Fatalf("ask = %#v, want answered option a", ask)
+	}
+}
+
+// deliverHumanAnswer holds LockLoopRequeue across accept+requeue so a concurrent
+// answer path (e.g. GitHub poll) cannot interleave and overwrite the decision.
+func TestHandlerDeliverHumanAnswerSharesRequeueLock(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_hitl_lock"
+	loopID := "loop_hitl_lock"
+	targetID := projectID
+	metadata := `{"hitl":{"question":"ok?","options":["yes","no"],"sessionId":"sess","executionId":"agent-lock","vendor":"codex","status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z"}}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 98, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	cancelReason := "loop suspended awaiting human"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_hitl_lock", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:hitl-lock", Priority: storage.QueuePriorityWorker, Status: "cancelled", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LastError: &cancelReason, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	unlock := looperdruntime.LockLoopRequeue(loopID)
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := h.deliverHumanAnswer(context.Background(), loopID, "yes", "agent-lock", "2026-04-11T12:00:00.000Z")
+		done <- err
+	}()
+	<-started
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("deliverHumanAnswer completed while LockLoopRequeue held: err=%v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("deliverHumanAnswer after unlock error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliverHumanAnswer did not complete after LockLoopRequeue release")
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil || loop.Status != "running" {
+		t.Fatalf("loop = %#v err=%v, want running", loop, err)
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Status != "answered" || ask.Answer != "yes" {
+		t.Fatalf("ask = %#v, want answered yes", ask)
+	}
+}
+
+// Two concurrent answer paths: exactly one accepts; the loser cannot overwrite
+// after the winner's atomic answer+running+requeue commit.
+func TestHandlerDeliverHumanAnswerConcurrentSecondLoses(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_hitl_race"
+	loopID := "loop_hitl_race"
+	targetID := projectID
+	metadata := `{"hitl":{"question":"pick?","options":["alpha","beta"],"sessionId":"sess","executionId":"agent-race","vendor":"codex","status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z"}}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 99, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	cancelReason := "loop suspended awaiting human"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_hitl_race", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:hitl-race", Priority: storage.QueuePriorityWorker, Status: "cancelled", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LastError: &cancelReason, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	type result struct {
+		answer string
+		err    error
+	}
+	results := make(chan result, 2)
+	for _, ans := range []string{"alpha", "beta"} {
+		go func(a string) {
+			_, err := h.deliverHumanAnswer(context.Background(), loopID, a, "agent-race", "2026-04-11T12:00:00.000Z")
+			results <- result{answer: a, err: err}
+		}(ans)
+	}
+	var winners, losers []string
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err == nil {
+			winners = append(winners, r.answer)
+		} else {
+			losers = append(losers, r.answer)
+		}
+	}
+	if len(winners) != 1 || len(losers) != 1 {
+		t.Fatalf("winners=%v losers=%v, want exactly one accept", winners, losers)
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil || loop.Status != "running" {
+		t.Fatalf("loop = %#v err=%v, want running", loop, err)
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Status != "answered" || ask.Answer != winners[0] {
+		t.Fatalf("ask = %#v, want answered winner %q", ask, winners[0])
 	}
 }
 

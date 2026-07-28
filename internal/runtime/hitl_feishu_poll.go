@@ -100,13 +100,26 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 				continue // belongs to another looper (or already resumed)
 			}
 			value = ans
+			// Feishu cards must carry generation tokens (same as the API card-action
+			// route). Pre-upgrade cards with only loopSeq+answer must not apply via
+			// AskGenerationMatches omission semantics used by answer-only /respond.
+			cardExec := strings.TrimSpace(e.Value.ExecutionID)
+			cardAsked := strings.TrimSpace(e.Value.AskedAt)
+			if cardExec == "" || cardAsked == "" {
+				if deps.logWarn != nil {
+					deps.logWarn("hitl feishu poll: missing ask generation tokens", map[string]any{
+						"loopId": loopID, "kind": e.Kind,
+					})
+				}
+				continue
+			}
 			// Generation is re-checked inside deliverAnswer under the write lock.
 			// Optional preflight avoids noisy deliver failures for obvious stales.
 			if deps.loopAskGeneration != nil {
 				parkExec, parkAsked, ok := deps.loopAskGeneration(ctx, loopID)
 				if ok {
 					park := loops.HITLAsk{ExecutionID: parkExec, AskedAt: parkAsked}
-					if !loops.AskGenerationMatches(park, e.Value.ExecutionID, e.Value.AskedAt) {
+					if !loops.AskGenerationMatches(park, cardExec, cardAsked) {
 						if deps.logWarn != nil {
 							deps.logWarn("hitl feishu poll: stale ask generation", map[string]any{
 								"loopId": loopID, "kind": e.Kind,
@@ -116,7 +129,7 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 					}
 				}
 			}
-			if err := deps.deliverAnswer(ctx, loopID, value, e.Value.ExecutionID, e.Value.AskedAt); err != nil {
+			if err := deps.deliverAnswer(ctx, loopID, value, cardExec, cardAsked); err != nil {
 				if deps.logWarn != nil {
 					deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"loopId": loopID, "kind": e.Kind, "error": err.Error()})
 				}

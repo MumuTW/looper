@@ -25,7 +25,7 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 	projectID := "project_card"
 	loopID := "loop_card"
 	targetID := projectID
-	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting","transport":"feishu"}}`
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting","transport":"feishu","executionId":"agent-card","askedAt":"2026-04-11T12:00:00.000Z"}}`
 
 	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
@@ -34,7 +34,7 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	body := `{"token":"verify-tok-123","action":{"tag":"button","value":{"loopSeq":"81","answer":"redis"}}}`
+	body := `{"token":"verify-tok-123","action":{"tag":"button","value":{"loopSeq":"81","answer":"redis","executionId":"agent-card","askedAt":"2026-04-11T12:00:00.000Z"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
@@ -51,6 +51,52 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok || ask.Answer != "redis" || ask.Status != "answered" {
 		t.Fatalf("ask = %#v (ok=%v), want answer redis + answered", ask, ok)
+	}
+}
+
+// Pre-upgrade Feishu cards lack executionId/askedAt; they must not bind via
+// /respond omission semantics after the loop re-escalates.
+func TestHandlerFeishuCardActionRejectsMissingGenerationTokens(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	cfg.HITL.AnswerTransport = "feishu"
+	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN_NOGEN", "verify-tok-nogen")
+	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN_NOGEN"
+	h := NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_card_nogen"
+	loopID := "loop_card_nogen"
+	targetID := projectID
+	// Park has a generation (post-escalation); old card omits tokens.
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-1","status":"awaiting","transport":"feishu","executionId":"agent-new","askedAt":"2026-04-11T13:00:00.000Z"}}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 97, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	body := `{"token":"verify-tok-nogen","action":{"tag":"button","value":{"loopSeq":"97","answer":"stale-option"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"delivered":false`) || !strings.Contains(recorder.Body.String(), "missing ask generation tokens") {
+		t.Fatalf("body = %s, want delivered:false missing generation tokens", recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop.Status = %q, want still awaiting_human", loop.Status)
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Status != "awaiting" || ask.Answer != "" {
+		t.Fatalf("ask = %#v, want still awaiting with empty answer", ask)
 	}
 }
 
@@ -78,7 +124,7 @@ func TestHandlerFeishuCardActionMarksAskAnswered(t *testing.T) {
 	projectID := "project_card_mark"
 	loopID := "loop_card_mark"
 	targetID := projectID
-	metadata := `{"hitl":{"question":"q","sessionId":"sess-mark","status":"awaiting","transport":"feishu"}}`
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-mark","status":"awaiting","transport":"feishu","executionId":"agent-mark","askedAt":"2026-04-11T12:00:00.000Z"}}`
 	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -86,7 +132,7 @@ func TestHandlerFeishuCardActionMarksAskAnswered(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	body := `{"token":"verify-tok-mark","action":{"tag":"button","value":{"loopSeq":"88","answer":"postgres"}}}`
+	body := `{"token":"verify-tok-mark","action":{"tag":"button","value":{"loopSeq":"88","answer":"postgres","executionId":"agent-mark","askedAt":"2026-04-11T12:00:00.000Z"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
@@ -107,7 +153,7 @@ func TestHandlerFeishuCardActionRejectsWhenTokenNotConfigured(t *testing.T) {
 	// No verificationTokenEnv configured -> the injection route must fail closed.
 	h := setupAwaitingCardLoop(t, cfg, rt, "project_card_notok", "loop_card_notok", 82)
 
-	body := `{"token":"anything","action":{"tag":"button","value":{"loopSeq":"82","answer":"redis"}}}`
+	body := `{"token":"anything","action":{"tag":"button","value":{"loopSeq":"82","answer":"redis","executionId":"agent-card","askedAt":"2026-04-11T12:00:00.000Z"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
@@ -130,7 +176,7 @@ func TestHandlerFeishuCardActionRejectsTokenMismatch(t *testing.T) {
 	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN2"
 	h := setupAwaitingCardLoop(t, cfg, rt, "project_card_bad", "loop_card_bad", 83)
 
-	body := `{"token":"wrong-token","action":{"tag":"button","value":{"loopSeq":"83","answer":"redis"}}}`
+	body := `{"token":"wrong-token","action":{"tag":"button","value":{"loopSeq":"83","answer":"redis","executionId":"agent-card","askedAt":"2026-04-11T12:00:00.000Z"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
@@ -233,7 +279,7 @@ func TestHandlerFeishuCardActionRejectsGitHubTransport(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	body := `{"token":"verify-tok-123","action":{"tag":"button","value":{"loopSeq":"94","answer":"keep"}}}`
+	body := `{"token":"verify-tok-123","action":{"tag":"button","value":{"loopSeq":"94","answer":"keep","executionId":"agent-g","askedAt":"2026-04-11T12:00:00.000Z"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)

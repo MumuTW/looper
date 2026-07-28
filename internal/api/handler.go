@@ -5354,7 +5354,14 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		unlock := h.lockLoopRetry(loopID)
 		defer unlock()
 	}
+	return h.mutateLoopStatusWithRetryLock(ctx, loopID, status)
+}
 
+// mutateLoopStatusWithRetryLock performs the status mutation. When status is
+// Running, the caller must already hold lockLoopRetry(loopID) — the same
+// process-wide exclusion deliverHumanAnswer holds across answer acceptance and
+// requeue so overlapping answer paths cannot interleave.
+func (h *Handler) mutateLoopStatusWithRetryLock(ctx context.Context, loopID string, status domain.LoopStatus) (loopResponse, error) {
 	services := h.context.Runtime.Services()
 	if status == domain.LoopStatusRunning {
 		if services.Repositories == nil || services.Coordinator == nil {
@@ -5456,66 +5463,8 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 				return storage.LoopRecord{}, err
 			}
 		case domain.LoopStatusRunning:
-			requeued, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, updated.ID, nowISO)
-			if err != nil {
+			if err := h.requeueLoopWorkInTx(ctx, repos, updated, nowISO); err != nil {
 				return storage.LoopRecord{}, err
-			}
-			if requeued == 0 {
-				activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, updated.ID)
-				if err != nil {
-					return storage.LoopRecord{}, err
-				}
-				if activeQueue != nil {
-					break
-				}
-				latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, updated.ID)
-				if err != nil {
-					return storage.LoopRecord{}, err
-				}
-				target, targetErr := loopTargetFromRecordCompat(updated)
-				if targetErr != nil {
-					return storage.LoopRecord{}, targetErr
-				}
-				if latestQueue != nil {
-					if latestQueue.Status == "queued" || latestQueue.Status == "running" {
-						break
-					}
-					if latestQueue.DedupeKey != "" {
-						activeQueue, err := repos.Queue.FindActiveByDedupe(ctx, latestQueue.DedupeKey)
-						if err != nil {
-							return storage.LoopRecord{}, err
-						}
-						if activeQueue != nil {
-							break
-						}
-					}
-					replacement := *latestQueue
-					replacement.ID = generateRequestID()
-					replacement.Status = "queued"
-					replacement.AvailableAt = nowISO
-					replacement.Attempts = 0
-					replacement.ClaimedBy = nil
-					replacement.ClaimedAt = nil
-					replacement.StartedAt = nil
-					replacement.FinishedAt = nil
-					replacement.LastError = nil
-					replacement.LastErrorKind = nil
-					replacement.CreatedAt = nowISO
-					replacement.UpdatedAt = nowISO
-					if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement); err != nil {
-						return storage.LoopRecord{}, err
-					}
-				} else {
-					queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(updated, target, nowISO, updated.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
-					if queueErr != nil {
-						return storage.LoopRecord{}, queueErr
-					}
-					if ok {
-						if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord); err != nil {
-							return storage.LoopRecord{}, err
-						}
-					}
-				}
 			}
 		}
 
@@ -5541,6 +5490,71 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 	}
 
 	return serializeLoop(updated), nil
+}
+
+// requeueLoopWorkInTx publishes claimable queue work for a loop already Upserted
+// as running. Shared by mutateLoopStatus and deliverHumanAnswer's atomic path.
+func (h *Handler) requeueLoopWorkInTx(ctx context.Context, repos *storage.Repositories, updated storage.LoopRecord, nowISO string) error {
+	requeued, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, updated.ID, nowISO)
+	if err != nil {
+		return err
+	}
+	if requeued != 0 {
+		return nil
+	}
+	activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, updated.ID)
+	if err != nil {
+		return err
+	}
+	if activeQueue != nil {
+		return nil
+	}
+	latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, updated.ID)
+	if err != nil {
+		return err
+	}
+	target, targetErr := loopTargetFromRecordCompat(updated)
+	if targetErr != nil {
+		return targetErr
+	}
+	if latestQueue != nil {
+		if latestQueue.Status == "queued" || latestQueue.Status == "running" {
+			return nil
+		}
+		if latestQueue.DedupeKey != "" {
+			activeQueue, err := repos.Queue.FindActiveByDedupe(ctx, latestQueue.DedupeKey)
+			if err != nil {
+				return err
+			}
+			if activeQueue != nil {
+				return nil
+			}
+		}
+		replacement := *latestQueue
+		replacement.ID = generateRequestID()
+		replacement.Status = "queued"
+		replacement.AvailableAt = nowISO
+		replacement.Attempts = 0
+		replacement.ClaimedBy = nil
+		replacement.ClaimedAt = nil
+		replacement.StartedAt = nil
+		replacement.FinishedAt = nil
+		replacement.LastError = nil
+		replacement.LastErrorKind = nil
+		replacement.CreatedAt = nowISO
+		replacement.UpdatedAt = nowISO
+		_, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement)
+		return err
+	}
+	queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(updated, target, nowISO, updated.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+	if queueErr != nil {
+		return queueErr
+	}
+	if !ok {
+		return nil
+	}
+	_, _, err = repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord)
+	return err
 }
 
 type takeoverLoopResponse struct {
@@ -5697,7 +5711,13 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 // executionID/askedAt bind the answer to a park generation. Comparison happens
 // inside the same transaction that writes the answer so a concurrent re-park
 // cannot accept a stale generation. Omitting both tokens authorizes the current
-// park (answer-only /respond).
+// park (answer-only /respond). Feishu card actions must supply tokens at the
+// route boundary and do not share this omission contract.
+//
+// Answer acceptance, status transition, and requeue share LockLoopRequeue and
+// run in one transaction so overlapping answer paths (dashboard + poll) cannot
+// commit an answered ask while the loop is still awaiting_human and overwrite
+// each other. Runtime deliverHITLAnswerToLoop holds the same exclusion.
 //
 // When the ask used the PR-comment answer transport (transport=github), this
 // path also clears the awaiting-human PR label — the same cleanup the GitHub
@@ -5709,10 +5729,45 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "respond requires a non-empty answer"}
 	}
 
+	// Hold the shared requeue exclusion across acceptance + requeue so a second
+	// answer path cannot read the same generation mid-window (see runtime
+	// deliverHITLAnswerToLoop). Call order: per-loop lock first, then target.
+	unlock := h.lockLoopRetry(loopID)
+	defer unlock()
+
 	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	preflightLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if preflightLoop != nil {
+		target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
+		if targetErr != nil {
+			return loopResponse{}, targetErr
+		}
+		unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
+		defer unlockTarget()
+	}
+
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	// Clear sticky stop gate before publishing claimable queue work (same as
+	// mutateLoopStatus Running). Restore on TX failure.
+	gateWasActive := false
+	if services.ActiveExecutions != nil {
+		gateWasActive = services.ActiveExecutions.ClearLoopStop(loopID)
+	}
+	restoreStopGate := func() error {
+		if gateWasActive && services.ActiveExecutions != nil {
+			return services.ActiveExecutions.RestoreLoopStop(loopID)
+		}
+		return nil
+	}
+
 	var labelCleanup *hitlAwaitingLabelCleanup
-	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
 		if err != nil {
@@ -5756,27 +5811,64 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		if err != nil {
 			return storage.LoopRecord{}, err
 		}
+
+		// Running-transition checks (same as mutateLoopStatus) before publishing
+		// claimable work in this same transaction.
+		if strings.TrimSpace(loop.ProjectID) != "" {
+			if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+				return storage.LoopRecord{}, err
+			}
+		}
+		if err := h.assertCodingRoleResumeAgent(ctx, repos, *loop, "start"); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if loop.Type == string(domain.LoopTypeReviewer) && isTerminalReviewerLoopRecord(*loop) {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start terminal reviewer loop: %s", loop.ID)}
+		}
+		target, targetErr := loopTargetFromRecordCompat(*loop)
+		if targetErr != nil {
+			return storage.LoopRecord{}, targetErr
+		}
+		existing, listErr := repos.Loops.List(ctx)
+		if listErr != nil {
+			return storage.LoopRecord{}, listErr
+		}
+		if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusRunning); uniqueErr != nil {
+			return storage.LoopRecord{}, uniqueErr
+		}
+
+		// Atomic: answer + status=running + requeue in one commit so the loop
+		// never sits as answered while still awaiting_human.
 		updated := *loop
 		updated.MetadataJSON = stringPtrOrNil(metadataJSON)
+		updated.Status = string(domain.LoopStatusRunning)
+		updated.NextRunAt = &nowISO
 		updated.UpdatedAt = nowISO
 		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if err := h.requeueLoopWorkInTx(ctx, repos, updated, nowISO); err != nil {
 			return storage.LoopRecord{}, err
 		}
 		return updated, nil
 	})
 	if err != nil {
+		if restoreErr := restoreStopGate(); restoreErr != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				typed.message = errors.Join(err, restoreErr).Error()
+				return loopResponse{}, typed
+			}
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: errors.Join(err, restoreErr).Error()}
+		}
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return loopResponse{}, typed
 		}
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
-
-	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)
-	// so the next claim resumes the run with the stored answer.
-	resp, err := h.mutateLoopStatus(ctx, loopID, domain.LoopStatusRunning)
-	if err != nil {
-		return resp, err
+	if h.context.TriggerSchedulerTick != nil {
+		h.context.TriggerSchedulerTick()
 	}
 	// Best-effort label cleanup after successful resume. Failure must not roll
 	// back the answer — poll-lane cleanup is also best-effort.
@@ -5788,7 +5880,7 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 	// already calls the same completion hook; without this, API answers leave
 	// cards clickable after the loop is no longer awaiting a human.
 	h.markHITLAskAnsweredAfterRespond(ctx, loopID, answer)
-	return resp, nil
+	return serializeLoop(updated), nil
 }
 
 // markHITLAskAnsweredAfterRespond routes API-delivered HITL answers through the
@@ -5996,9 +6088,21 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 		h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": false, "reason": "feishu answers disabled for non-feishu transport"})
 		return
 	}
+	// Feishu cards must carry generation tokens. Pre-upgrade cards only had
+	// loopSeq+answer; AskGenerationMatches deliberately accepts omitted tokens
+	// for answer-only /respond, so missing tokens here would apply a stale card
+	// option to a later re-escalation. Do not share /respond omission semantics.
+	cardExec := strings.TrimSpace(value.ExecutionID)
+	cardAsked := strings.TrimSpace(value.AskedAt)
+	if cardExec == "" || cardAsked == "" {
+		h.writeSuccess(w, requestID, map[string]any{
+			"loopSeq": loopSeq, "delivered": false, "reason": "missing ask generation tokens",
+		})
+		return
+	}
 	// Generation is validated inside deliverHumanAnswer's write transaction so a
 	// concurrent re-park cannot accept a stale card generation.
-	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer, value.ExecutionID, value.AskedAt); err != nil {
+	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer, cardExec, cardAsked); err != nil {
 		var typed apiError
 		if !asAPIError(err, &typed) {
 			typed = internalServerError(err)

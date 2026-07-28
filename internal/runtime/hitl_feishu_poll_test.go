@@ -48,5 +48,40 @@ func mustCardAction(id int64, seq, answer string) feishuInboxEvent {
 	e := feishuInboxEvent{ID: id, Kind: "card_action"}
 	e.Value.LoopSeq = seq
 	e.Value.Answer = answer
+	// Feishu card actions require generation tokens (API route + poll lane).
+	e.Value.ExecutionID = "agent-poll"
+	e.Value.AskedAt = "2026-04-11T12:00:00.000Z"
 	return e
+}
+
+func TestPollFeishuHITLInboxOnce_RejectsMissingGenerationTokens(t *testing.T) {
+	t.Parallel()
+	var delivered []string
+	deps := feishuHITLPollDeps{
+		loopBySeq: func(_ contextType, seq int64) string {
+			if seq == 71 {
+				return "loop-71"
+			}
+			return ""
+		},
+		deliverAnswer: func(_ contextType, loopID, answer, _, _ string) error {
+			delivered = append(delivered, loopID+":"+answer)
+			return nil
+		},
+	}
+	// Pre-upgrade card: loopSeq+answer only.
+	legacy := feishuInboxEvent{ID: 1, Kind: "card_action"}
+	legacy.Value.LoopSeq = "71"
+	legacy.Value.Answer = "stale-option"
+	n, _ := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{legacy}, deps)
+	if n != 0 || len(delivered) != 0 {
+		t.Fatalf("tokenless card delivered=%v count=%d, want none", delivered, n)
+	}
+	// Partial tokens still rejected (both required).
+	partial := mustCardAction(2, "71", "partial")
+	partial.Value.AskedAt = ""
+	n, _ = pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{partial}, deps)
+	if n != 0 || len(delivered) != 0 {
+		t.Fatalf("partial-token card delivered=%v count=%d, want none", delivered, n)
+	}
 }
