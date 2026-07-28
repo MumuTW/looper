@@ -4443,18 +4443,14 @@ func isLooperReviewThreadComment(comment ReviewThreadComment) bool {
 	if body == "" {
 		return false
 	}
-	return disclosure.HasMarkdownStamp(body) || strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
+	return disclosure.HasMarkdownStamp(body) || githubinfra.IsLooperFixerReplyBody(body)
 }
 
 // isLooperFixerReplyComment reports Looper fixer reply/round markers, including
-// declined replies. Keep in lockstep with github.isLooperFixerReplyBody so
-// collect-time and resume-time thread fingerprints exclude the same comments.
+// declined replies. Delegates to githubinfra.IsLooperFixerReplyBody so collect-time
+// and resume-time thread fingerprints exclude the same comments (single authority).
 func isLooperFixerReplyComment(comment ReviewThreadComment) bool {
-	body := strings.TrimSpace(comment.Body)
-	if body == "" {
-		return false
-	}
-	return strings.Contains(body, "looper-fixer-reply") || strings.Contains(body, "looper:fixer-round")
+	return githubinfra.IsLooperFixerReplyBody(comment.Body)
 }
 
 // isBotReviewThreadComment reports whether the comment was authored by a

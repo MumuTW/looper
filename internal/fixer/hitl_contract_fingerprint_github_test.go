@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/hitl"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -81,14 +82,24 @@ func TestHITLContract_NonRootReplyChangesReviewFP(t *testing.T) {
 // TestHITLContract_ReopenedThreadWithDeclinedReplyMatchesAsk covers the second-
 // reopen thrash path: a prior <!-- looper-fixer-reply-declined --> remains on
 // the thread. Collect-time reviewThreadFingerprintFromNodes and resume-time
-// liveReviewThreadFingerprint must exclude it identically so an answered HITL
-// decision still MaterialFingerprintsMatch.
+// liveReviewThreadFingerprint both exclude via githubinfra.IsLooperFixerReplyBody
+// so an answered HITL decision still MaterialFingerprintsMatch.
 func TestHITLContract_ReopenedThreadWithDeclinedReplyMatchesAsk(t *testing.T) {
 	t.Parallel()
 	const (
 		rootUpdated     = "2026-07-28T00:00:00Z"
 		declinedUpdated = "2026-07-28T01:00:00Z"
 	)
+	declinedBody := "Not acting: conflicts with PR intent.\n\n<!-- looper-fixer-reply-declined thread:t1 fingerprint:fp1 -->"
+	// Shared authority: resume isLooperFixerReplyComment and collect-time
+	// IsLooperFixerReplyBody must both treat declined markers as Looper replies.
+	if !githubinfra.IsLooperFixerReplyBody(declinedBody) {
+		t.Fatal("IsLooperFixerReplyBody must exclude declined markers (collect-time authority)")
+	}
+	if !isLooperFixerReplyComment(ReviewThreadComment{Body: declinedBody}) {
+		t.Fatal("isLooperFixerReplyComment must use the same declined exclusion (resume-time)")
+	}
+
 	// Ask-time ThreadFingerprint after collect-time filtering (root only;
 	// declined marker excluded — see github.reviewThreadFingerprintFromNodes).
 	// Bug shape: ask included "c1@…|c-declined@…" while live excluded declined.
@@ -108,7 +119,7 @@ func TestHITLContract_ReopenedThreadWithDeclinedReplyMatchesAsk(t *testing.T) {
 				{ID: "c1", Body: "Please restore configurable strategy", UpdatedAt: rootUpdated},
 				{
 					ID: "c-declined", UpdatedAt: declinedUpdated,
-					Body: "Not acting: conflicts with PR intent.\n\n<!-- looper-fixer-reply-declined thread:t1 fingerprint:fp1 -->",
+					Body: declinedBody,
 				},
 			},
 		}},

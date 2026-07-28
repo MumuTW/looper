@@ -2861,8 +2861,8 @@ func TestIsLooperFixerReplyBody(t *testing.T) {
 		{"prefix looper-fixer-reply suffix", true},
 	}
 	for _, tc := range cases {
-		if got := isLooperFixerReplyBody(tc.body); got != tc.want {
-			t.Fatalf("isLooperFixerReplyBody(%q) = %v, want %v", tc.body, got, tc.want)
+		if got := IsLooperFixerReplyBody(tc.body); got != tc.want {
+			t.Fatalf("IsLooperFixerReplyBody(%q) = %v, want %v", tc.body, got, tc.want)
 		}
 	}
 }

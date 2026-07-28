@@ -594,10 +594,11 @@ func isLiveReviewNotFound(err error) bool {
 }
 
 // liveReviewThreadFingerprint mirrors collect-time reviewThreadFingerprintFromNodes:
-// non-Looper-fixer comments as id@updatedAt joined by "|". Exclusion uses the same
-// looper-fixer-reply / looper:fixer-round body markers as collect-time (including
-// declined replies). Mid-park human/reviewer reply add/edit changes this value so
-// resume-time fingerprints diverge from ask-time.
+// non-Looper-fixer comments as id@updatedAt joined by "|". Exclusion uses
+// githubinfra.IsLooperFixerReplyBody (via isLooperFixerReplyComment), the same
+// authority as collect-time, so declined replies cannot diverge ask vs resume.
+// Mid-park human/reviewer reply add/edit changes this value so resume-time
+// fingerprints diverge from ask-time.
 func liveReviewThreadFingerprint(thread ReviewThread) string {
 	parts := make([]string, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
