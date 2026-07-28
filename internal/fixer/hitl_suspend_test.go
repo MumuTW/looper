@@ -56,6 +56,10 @@ func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 		HITLEnabled:         true,
 		HITLAnswerTransport: "feishu",
 		HITLNotify: func(_ context.Context, n HITLAskNotification) error {
+			// Feishu is the answer transport — card may stay interactive.
+			if n.NotifyOnly {
+				t.Errorf("feishu answer transport should not force NotifyOnly")
+			}
 			sent = append(sent, n)
 			return nil
 		},

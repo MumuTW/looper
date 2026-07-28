@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -75,6 +76,10 @@ type HITLAskNotification struct {
 	RecommendedOption string
 	Consequences      map[string]string
 	Confidence        string
+	// NotifyOnly suppresses interactive Feishu answer buttons. Used when
+	// answerTransport is github so answers arrive via PR comment / dashboard and
+	// GitHub awaiting-label cleanup still runs.
+	NotifyOnly bool
 }
 
 // HITLNotifyFunc delivers a mid-run ask to the human channel. Best-effort.
@@ -141,6 +146,44 @@ func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecor
 	return resumePrompt, strings.TrimSpace(ask.SessionID)
 }
 
+// markHITLAnswerResumeStarted records that this execution is injecting the parked
+// human answer. Later same-text ask.json files are treated as a new generation.
+func (r *Runner) markHITLAnswerResumeStarted(ctx context.Context, loop *storage.LoopRecord, executionID string) error {
+	if r.repos == nil || r.repos.Loops == nil {
+		return fmt.Errorf("loops repository unavailable")
+	}
+	executionID = strings.TrimSpace(executionID)
+	if executionID == "" {
+		return nil
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if fresh == nil {
+		return fmt.Errorf("loop not found: %s", loop.ID)
+	}
+	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !ok || ask.Status != "answered" {
+		return nil
+	}
+	if strings.TrimSpace(ask.ResumeExecutionID) == executionID {
+		return nil
+	}
+	ask.ResumeExecutionID = executionID
+	meta, werr := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
+	if werr != nil {
+		return werr
+	}
+	fresh.MetadataJSON = &meta
+	fresh.UpdatedAt = r.nowISO()
+	if err := r.repos.Loops.Upsert(ctx, *fresh); err != nil {
+		return err
+	}
+	loop.MetadataJSON = &meta
+	return nil
+}
+
 func (r *Runner) markHumanAnswerConsumed(ctx context.Context, loop *storage.LoopRecord) error {
 	if r.repos == nil || r.repos.Loops == nil {
 		return fmt.Errorf("loops repository unavailable")
@@ -157,6 +200,7 @@ func (r *Runner) markHumanAnswerConsumed(ctx context.Context, loop *storage.Loop
 		return nil
 	}
 	ask.Status = "consumed"
+	ask.ResumeExecutionID = ""
 	meta, werr := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
 	if werr != nil {
 		return werr
@@ -439,9 +483,11 @@ func (r *Runner) hasAnsweredHITLAsk(ctx context.Context, loop *storage.LoopRecor
 }
 
 // durableHITLParkForAsk reports whether the loop's durable HITL record is an
-// active park for the same question as the on-disk ask.json. A historical
+// active park for the same ask generation as the on-disk ask.json. A historical
 // "consumed" park must NOT authorize deleting a new ask.json — that would drop
-// an undurable new escalation on the same loop.
+// an undurable new escalation on the same loop. An "answered" park that already
+// started resume (ResumeExecutionID set) also must not match: the agent may
+// have written a same-text re-escalation after the human answered.
 func (r *Runner) durableHITLParkForAsk(ctx context.Context, loop *storage.LoopRecord, fileAsk *hitl.AskPayload) bool {
 	if fileAsk == nil {
 		return false
@@ -456,10 +502,22 @@ func (r *Runner) durableHITLParkForAsk(ctx context.Context, loop *storage.LoopRe
 	}
 	parkedQ := strings.TrimSpace(parked.Question)
 	fileQ := strings.TrimSpace(fileAsk.Question)
-	if parkedQ == "" || fileQ == "" {
+	if parkedQ == "" || fileQ == "" || parkedQ != fileQ {
 		return false
 	}
-	return parkedQ == fileQ
+	// Same question alone is not enough once a resume turn bound the answer to
+	// an execution — treat the on-disk file as a new generation.
+	if status == "answered" && strings.TrimSpace(parked.ResumeExecutionID) != "" {
+		return false
+	}
+	// When the sentinel carries an execution identity, require it to match the
+	// parked ask generation (prevents same-text re-asks with explicit ids).
+	if fileExec := strings.TrimSpace(fileAsk.ExecutionID); fileExec != "" {
+		if parkedExec := strings.TrimSpace(parked.ExecutionID); parkedExec != "" && fileExec != parkedExec {
+			return false
+		}
+	}
+	return true
 }
 
 // awaitingFromAskPayload builds a suspend error from a worktree ask.json without
@@ -742,18 +800,12 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			})
 		}
 	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
-			updated.MetadataJSON = &meta
-		}
-		updated.Status = "awaiting_human"
-		updated.LastRunAt = stringPtr(nowISO)
-		updated.NextRunAt = nil
-	}); err != nil {
-		return ProcessResult{}, err
-	}
+	// Cancel the claimable queue item BEFORE publishing awaiting_human. Publishing
+	// answerable status while a queue item is still active races /respond and the
+	// GitHub poll: mutateLoopStatus sees the active item and skips requeue, then
+	// cancel drops the only claimable work (lost-wakeup).
 	reason := "fixer suspended awaiting human decision"
-	if _, err := r.repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {
+	if err := r.parkHITLLoop(ctx, input.Loop, ask, nowISO, reason); err != nil {
 		return ProcessResult{}, err
 	}
 	summary := "Awaiting human decision: " + awaiting.question
@@ -773,7 +825,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	}
 
 	// Always notify on suspend (all answer transports): sticky osascript + optional
-	// Feishu card. GitHub PR-comment delivery above is independent.
+	// Feishu card. GitHub PR-comment delivery above is independent. When GitHub is
+	// the answer transport, the secondary Feishu card is notify-only so an answer
+	// cannot resume without the GitHub awaiting-label cleanup path.
 	if r.hitlNotify != nil {
 		title := fmt.Sprintf("Fixer needs a decision · %s #%d", firstNonEmpty(input.Repo, derefString(input.Loop.Repo)), input.PRNumber)
 		if input.PRNumber <= 0 && input.Loop.PRNumber != nil {
@@ -794,6 +848,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			RecommendedOption: awaiting.recommendedOption,
 			Consequences:      awaiting.consequences,
 			Confidence:        awaiting.confidence,
+			NotifyOnly:        r.hitlTransportGitHub(),
 		}
 		if input.PRNumber <= 0 && input.Loop.PRNumber != nil {
 			notif.SourceRef = "#" + strconv.FormatInt(*input.Loop.PRNumber, 10)
@@ -805,6 +860,44 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		}
 	}
 	return ProcessResult{LoopID: input.Loop.ID, RunID: run.ID, QueueItemID: input.QueueItem.ID, Status: "awaiting_human", Summary: summary}, nil
+}
+
+// parkHITLLoop persists the durable HITL ask and awaiting_human status only after
+// (or atomically with) cancelling claimable queue work for the loop.
+func (r *Runner) parkHITLLoop(ctx context.Context, loop storage.LoopRecord, ask loops.HITLAsk, nowISO, cancelReason string) error {
+	apply := func(repos *storage.Repositories) error {
+		if _, err := repos.Queue.CancelByLoop(ctx, loop.ID, nowISO, &cancelReason); err != nil {
+			return err
+		}
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return err
+		}
+		updated := loop
+		if current != nil {
+			if current.Status == "terminated" {
+				return nil
+			}
+			updated = *current
+		}
+		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
+			updated.MetadataJSON = &meta
+		}
+		updated.Status = "awaiting_human"
+		updated.LastRunAt = stringPtr(nowISO)
+		updated.NextRunAt = nil
+		updated.UpdatedAt = nowISO
+		return repos.Loops.Upsert(ctx, updated)
+	}
+	if r.db != nil {
+		return storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+			return apply(storage.NewRepositories(tx))
+		})
+	}
+	if r.repos == nil {
+		return fmt.Errorf("repositories unavailable for HITL park")
+	}
+	return apply(r.repos)
 }
 
 func clearDismissSentinel(worktreePath string) error {

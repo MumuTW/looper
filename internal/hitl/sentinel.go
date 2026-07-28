@@ -20,6 +20,10 @@ type AskPayload struct {
 	RecommendedOption string            `json:"recommendedOption,omitempty"`
 	Consequences      map[string]string `json:"consequences,omitempty"`
 	Confidence        string            `json:"confidence,omitempty"`
+	// ExecutionID optionally identifies the agent execution that wrote this
+	// sentinel. When present it is matched against the durable park's
+	// ExecutionID so a same-text re-escalation is not treated as the parked file.
+	ExecutionID string `json:"executionId,omitempty"`
 }
 
 // ReadAskSentinel reads the agent's ask sentinel without deleting it.

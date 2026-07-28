@@ -2961,21 +2961,29 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// worktree so the agent has the conflict markers to resolve, instead of punting
 	// the conflict to a human. A merge that fails for a non-conflict reason falls
 	// back to manual intervention.
-	if hasConflict {
-		base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
-		if base == "" {
-			base = "main"
-		}
-		if _, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base}); mergeErr != nil {
-			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
-			return checkpoint, &loopError{message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), kind: FailureManualIntervention}
-		}
-	}
+	//
+	// Skip when resuming an answered HITL park: the first repair already started
+	// the merge (MERGE_HEAD + markers). Re-running git merge aborts that in-progress
+	// merge on failure and discards conflict work before the human answer can be
+	// injected.
 	executionID := eventlog.NewEventID("agent")
 	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+	}
+	if hasConflict {
+		skipConflictMerge := r.hitlEnabled && r.hasAnsweredHITLAsk(ctx, &input.Loop)
+		if !skipConflictMerge {
+			base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
+			if base == "" {
+				base = "main"
+			}
+			if _, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base}); mergeErr != nil {
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
+				return checkpoint, &loopError{message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), kind: FailureManualIntervention}
+			}
+		}
 	}
 
 	// When HITL is enabled the agent must not push: Looper owns push only after
@@ -3039,6 +3047,16 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			liveReviewFP = computeReviewContentFingerprint(checkpoint.FixItems)
 		}
 		nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop, agentVendor, liveHead, liveReviewFP, liveIntentFP)
+		if nativeResumePrompt != "" {
+			// Bind this resume execution to the answered park so a same-text
+			// re-escalation written mid-turn is not treated as the parked sentinel.
+			if err := r.markHITLAnswerResumeStarted(ctx, &input.Loop, executionID); err != nil {
+				return checkpoint, &loopError{
+					message: fmt.Sprintf("HITL resume generation stamp failed: %v", err),
+					kind:    FailureRetryableAfterResume,
+				}
+			}
+		}
 	}
 
 	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, agentAllowPush, r.hitlEnabled, r.disclosure, agentVendor, derefString(agentModel))

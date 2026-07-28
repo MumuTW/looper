@@ -630,6 +630,11 @@ type HITLAskCard struct {
 	// buttons are replaced by a "✅ 已选:<answer>" line while the question, research
 	// and consequences stay intact for later review.
 	AnsweredWith string
+
+	// NotifyOnly suppresses interactive option buttons. Used when the answer
+	// authority is GitHub (answerTransport=github): the card is informational so
+	// a Feishu click cannot resume the loop without GitHub awaiting-label cleanup.
+	NotifyOnly bool
 }
 
 // feishuMentionMarkup renders Feishu open_ids as card @-mention tags, e.g.
@@ -902,33 +907,40 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 
 	// Option buttons — the recommended one is marked ⭐ and stays "primary"; the
 	// rest drop to "default" so the recommendation reads at a glance.
+	// NotifyOnly cards omit buttons (GitHub/dashboard is the answer authority).
 	actions := make([]any, 0, len(card.Options))
-	for _, option := range card.Options {
-		option = strings.TrimSpace(option)
-		if option == "" {
-			continue
-		}
-		label := option
-		btnType := "primary"
-		if recommended != "" {
-			if strings.EqualFold(option, recommended) {
-				label = "⭐ " + option + " · 推荐"
-			} else {
-				btnType = "default"
+	if !card.NotifyOnly {
+		for _, option := range card.Options {
+			option = strings.TrimSpace(option)
+			if option == "" {
+				continue
 			}
+			label := option
+			btnType := "primary"
+			if recommended != "" {
+				if strings.EqualFold(option, recommended) {
+					label = "⭐ " + option + " · 推荐"
+				} else {
+					btnType = "default"
+				}
+			}
+			actions = append(actions, map[string]any{
+				"tag":   "button",
+				"type":  btnType,
+				"text":  map[string]any{"tag": "plain_text", "content": label},
+				"value": map[string]any{"loopSeq": seq, "answer": option},
+			})
 		}
-		actions = append(actions, map[string]any{
-			"tag":   "button",
-			"type":  btnType,
-			"text":  map[string]any{"tag": "plain_text", "content": label},
-			"value": map[string]any{"loopSeq": seq, "answer": option},
-		})
 	}
 
 	elements := make([]any, 0, 8)
 	// @-mention the humans who need to act, so an ask isn't missed in a busy group.
 	if mention := feishuMentionMarkup(card.MentionOpenIds); mention != "" {
-		elements = append(elements, larkDiv(mention+" 需要你定夺 👇"))
+		if card.NotifyOnly {
+			elements = append(elements, larkDiv(mention+" 需要你定夺（请到 GitHub PR / Dashboard 回复）"))
+		} else {
+			elements = append(elements, larkDiv(mention+" 需要你定夺 👇"))
+		}
 	}
 	// Source line: what this is (Issue/PR + link) · repo · who triggered it.
 	if src := feishuSourceLine(card); src != "" {
@@ -943,11 +955,25 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	}
 	// Options — or, once answered, the resolved selection. Buttons are removed (so
 	// it can't be re-clicked) but the question, research and consequences stay for
-	// later review.
+	// later review. NotifyOnly lists options as text without action buttons.
 	if answered := strings.TrimSpace(card.AnsweredWith); answered != "" {
 		elements = append(elements, larkDiv("✅ **已选:"+answered+"** · Looper 继续处理中 →"))
 	} else if len(actions) > 0 {
 		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
+	} else if card.NotifyOnly && len(card.Options) > 0 {
+		optLines := make([]string, 0, len(card.Options))
+		for _, option := range card.Options {
+			if option = strings.TrimSpace(option); option != "" {
+				if recommended != "" && strings.EqualFold(option, recommended) {
+					optLines = append(optLines, "• ⭐ "+option+" · 推荐")
+				} else {
+					optLines = append(optLines, "• "+option)
+				}
+			}
+		}
+		if len(optLines) > 0 {
+			elements = append(elements, larkDiv(strings.Join(optLines, "\n")))
+		}
 	}
 	// Per-option consequences: pick this → that happens.
 	if conseq := feishuConsequences(card); conseq != "" {
@@ -958,7 +984,11 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if c := feishuConfidenceLabel(card.Confidence); c != "" {
 		noteParts = append(noteParts, c)
 	}
-	noteParts = append(noteParts, "loop "+seq, "点选项或直接回文字")
+	if card.NotifyOnly {
+		noteParts = append(noteParts, "loop "+seq, "请在 GitHub PR 评论或 Dashboard 回复")
+	} else {
+		noteParts = append(noteParts, "loop "+seq, "点选项或直接回文字")
+	}
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
 
 	header := map[string]any{"template": "orange", "title": map[string]any{"tag": "plain_text", "content": "Looper needs a decision"}}

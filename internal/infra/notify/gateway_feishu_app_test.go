@@ -405,6 +405,43 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 	}
 }
 
+func TestBuildFeishuAskCardNotifyOnlyOmitsButtons(t *testing.T) {
+	card, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq:           9,
+		Question:          "Keep RollingUpdate?",
+		Options:           []string{"keep", "restore"},
+		RecommendedOption: "keep",
+		NotifyOnly:        true,
+		MentionOpenIds:    []string{"ou_notify"},
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(notify-only) error = %v", err)
+	}
+	raw := string(card)
+	if strings.Contains(raw, `"tag":"action"`) {
+		t.Fatalf("NotifyOnly card must not include interactive action buttons: %s", raw)
+	}
+	if !strings.Contains(raw, "GitHub PR") && !strings.Contains(raw, "Dashboard") {
+		// Footer or mention guidance must point operators at the answer authority.
+		if !strings.Contains(raw, "GitHub") && !strings.Contains(cardText(t, card), "Dashboard") {
+			t.Fatalf("NotifyOnly card should guide operators to GitHub/Dashboard: %s", raw)
+		}
+	}
+	if !strings.Contains(raw, "keep") || !strings.Contains(raw, "restore") {
+		t.Fatalf("NotifyOnly card should still list options as text: %s", raw)
+	}
+	// Interactive default still has buttons.
+	interactive, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq: 9, Question: "Keep RollingUpdate?", Options: []string{"keep", "restore"},
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(interactive) error = %v", err)
+	}
+	if !strings.Contains(string(interactive), `"tag":"action"`) {
+		t.Fatalf("interactive card must include action buttons: %s", interactive)
+	}
+}
+
 func TestLiveStatusHelpers(t *testing.T) {
 	if got := humanizeElapsedSeconds(134); got != "2m14s" {
 		t.Fatalf("humanizeElapsedSeconds(134) = %q; want 2m14s", got)

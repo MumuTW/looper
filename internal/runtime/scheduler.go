@@ -3387,6 +3387,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		return notificationGateway.SendHITLAsk(ctx, card)
 	}
 	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
+		// When GitHub is the answer transport, secondary Feishu cards are
+		// notify-only so button clicks cannot resume without GitHub label cleanup.
+		notifyOnly := true
+		if t := strings.TrimSpace(strings.ToLower(cfg.HITL.AnswerTransport)); t != "" && t != "github" {
+			notifyOnly = false
+		}
 		return notifyHITLAskCard(ctx, notify.HITLAskCard{
 			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
 			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
@@ -3396,6 +3402,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			RecommendedOption: ask.RecommendedOption,
 			Consequences:      ask.Consequences,
 			Confidence:        ask.Confidence,
+			NotifyOnly:        notifyOnly,
 		})
 	}
 	notifyFixerHITLAsk := func(ctx context.Context, ask fixer.HITLAskNotification) error {
@@ -3408,6 +3415,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			RecommendedOption: ask.RecommendedOption,
 			Consequences:      ask.Consequences,
 			Confidence:        ask.Confidence,
+			NotifyOnly:        ask.NotifyOnly,
 		})
 	}
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
