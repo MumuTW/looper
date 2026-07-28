@@ -162,3 +162,50 @@ func TestHITLContract_ReopenedThreadWithDeclinedReplyMatchesAsk(t *testing.T) {
 		t.Fatalf("liveReviewThreadFingerprint = %q, want root only", liveDirect)
 	}
 }
+
+// TestHITLContract_NewGitHubThreadDuringParkChangesReviewFP covers add-item-
+// during-park: a new top-level GitHub review thread opened while awaiting_human
+// must change the live review fingerprint so the parked answer is not injected
+// against stale FixItems that omit the new feedback.
+func TestHITLContract_NewGitHubThreadDuringParkChangesReviewFP(t *testing.T) {
+	t.Parallel()
+	const updated = "2026-07-28T00:00:00Z"
+	items := []FixItem{{
+		Type: "comment", ID: "c1", ThreadID: "t1",
+		Summary: "Please restore configurable strategy", Body: "",
+		ThreadFingerprint: "c1@" + updated,
+	}}
+	askFP := computeReviewContentFingerprint(items)
+
+	github := &fakeGitHubGateway{
+		threads: []ReviewThread{
+			{
+				ID: "t1",
+				Comments: []ReviewThreadComment{{
+					ID: "c1", Body: "Please restore configurable strategy", UpdatedAt: updated,
+				}},
+			},
+			// New top-level thread opened while parked.
+			{
+				ID: "t-new",
+				Comments: []ReviewThreadComment{{
+					ID: "c-new", Body: "Also fix the timeout", UpdatedAt: "2026-07-28T02:00:00Z", Author: "reviewer",
+				}},
+			},
+		},
+	}
+	runner := New(Options{GitHub: github, HITLEnabled: true})
+	liveFP, err := runner.liveReviewContentFingerprint(context.Background(), stepInput{
+		Project: storage.ProjectRecord{RepoPath: "/tmp"},
+		Repo:    "acme/looper", PRNumber: 1,
+	}, items)
+	if err != nil {
+		t.Fatalf("liveReviewContentFingerprint error = %v", err)
+	}
+	if liveFP == askFP {
+		t.Fatal("new top-level GitHub thread during park must change review content fingerprint")
+	}
+	if hitl.MaterialFingerprintsMatch("h", "h", askFP, liveFP, "i", "i") {
+		t.Fatal("parked answer must not inject when a new GitHub thread appeared mid-park")
+	}
+}

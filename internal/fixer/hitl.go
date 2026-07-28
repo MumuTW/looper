@@ -270,6 +270,11 @@ const missingLiveReviewMarker = "__hitl_missing_review__"
 //     becomes ThreadFingerprint
 //   - Forgejo reviewer-summary items: re-parsed from live PR issue comments
 //
+// The live set starts from checkpoint FixItems, then appends any newly listed
+// provider items (GitHub threads, Forgejo native comments, forgejo-reviewer-summary
+// opens) that appeared while parked. Without that append, ask/resume hashes stay
+// equal while the agent would resume with stale FixItems that omit the new feedback.
+//
 // Missing/deleted threads clear to missingLiveReviewMarker (do not keep stale
 // checkpoint text). Provider/auth/rate-limit errors fail closed (returned), while
 // true not-found results mark the review missing. Unknown item sources fail closed.
@@ -279,8 +284,10 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 	}
 	var nativeByProvider map[int64]NativeReviewComment
 	var summaryByID map[string]FixItem
+	var liveGitHubThreads []ReviewThread
 	needNative := false
 	needSummary := false
+	needGitHubThreads := false
 	for _, item := range fixItems {
 		src := strings.TrimSpace(item.Source)
 		if src == NativeReviewCommentSource && item.ProviderCommentID > 0 {
@@ -289,7 +296,13 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 		if src == "forgejo-reviewer-summary" {
 			needSummary = true
 		}
+		if src == "" && strings.TrimSpace(item.ThreadID) != "" {
+			needGitHubThreads = true
+		}
 	}
+	// Only list provider surfaces already represented in the parked FixItems.
+	// That appends mid-park *new* items on the same surface without treating
+	// pre-existing out-of-scope reviews as drift on pure conflict/check parks.
 	if needNative {
 		comments, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{
 			Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath,
@@ -321,13 +334,26 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 			}
 		}
 	}
+	if needGitHubThreads {
+		threads, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{
+			Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath,
+		})
+		if err != nil {
+			return "", fmt.Errorf("HITL live GitHub review-thread list failed: %w", err)
+		}
+		liveGitHubThreads = threads
+	}
 
-	liveItems := make([]FixItem, 0, len(fixItems))
+	seenThreadIDs := make(map[string]struct{})
+	seenNativeIDs := make(map[int64]struct{})
+	seenSummaryIDs := make(map[string]struct{})
+	liveItems := make([]FixItem, 0, len(fixItems)+len(liveGitHubThreads)+len(nativeByProvider)+len(summaryByID))
 	for _, item := range fixItems {
 		live := item
 		src := strings.TrimSpace(item.Source)
 		switch {
 		case src == NativeReviewCommentSource && item.ProviderCommentID > 0:
+			seenNativeIDs[item.ProviderCommentID] = struct{}{}
 			// Forgejo native: ListNativeReviewComments only (no ViewReviewThread).
 			if c, ok := nativeByProvider[item.ProviderCommentID]; ok {
 				if text := strings.TrimSpace(c.Body); text != "" {
@@ -345,6 +371,9 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 				markLiveReviewMissing(&live)
 			}
 		case src == "forgejo-reviewer-summary":
+			if id := strings.TrimSpace(item.ID); id != "" {
+				seenSummaryIDs[id] = struct{}{}
+			}
 			if liveItem, ok := summaryByID[strings.TrimSpace(item.ID)]; ok {
 				live.Summary = liveItem.Summary
 				live.Body = liveItem.Body
@@ -358,6 +387,9 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 		case src != "" && src != NativeReviewCommentSource:
 			return "", fmt.Errorf("HITL cannot live-verify fix item source %q (id=%s)", src, item.ID)
 		case strings.TrimSpace(item.ThreadID) != "":
+			if tid := strings.TrimSpace(item.ThreadID); tid != "" {
+				seenThreadIDs[tid] = struct{}{}
+			}
 			// GitHub GraphQL review threads.
 			thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{
 				ThreadID: item.ThreadID, CWD: input.Project.RepoPath,
@@ -389,7 +421,122 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 		}
 		liveItems = append(liveItems, live)
 	}
+
+	// Append provider items that appeared while parked (not in the checkpoint).
+	if needGitHubThreads {
+		for _, thread := range liveGitHubThreads {
+			if thread.IsResolved {
+				continue
+			}
+			tid := strings.TrimSpace(thread.ID)
+			if tid == "" {
+				continue
+			}
+			if _, seen := seenThreadIDs[tid]; seen {
+				continue
+			}
+			if item, ok := fixItemFromLiveGitHubThread(thread); ok {
+				liveItems = append(liveItems, item)
+				seenThreadIDs[tid] = struct{}{}
+			}
+		}
+	}
+	if needNative {
+		for providerID, c := range nativeByProvider {
+			if providerID <= 0 {
+				continue
+			}
+			if c.IsResolved {
+				continue
+			}
+			if _, seen := seenNativeIDs[providerID]; seen {
+				continue
+			}
+			if item, ok := fixItemFromLiveNativeComment(c); ok {
+				liveItems = append(liveItems, item)
+				seenNativeIDs[providerID] = struct{}{}
+			}
+		}
+	}
+	if needSummary {
+		for id, liveItem := range summaryByID {
+			if id == "" {
+				continue
+			}
+			if _, seen := seenSummaryIDs[id]; seen {
+				continue
+			}
+			liveItems = append(liveItems, liveItem)
+			seenSummaryIDs[id] = struct{}{}
+		}
+	}
 	return computeReviewContentFingerprint(liveItems), nil
+}
+
+// fixItemFromLiveGitHubThread builds a GitHub-shaped FixItem for a live thread
+// that was not present at ask time (mid-park new top-level review).
+func fixItemFromLiveGitHubThread(thread ReviewThread) (FixItem, bool) {
+	tid := strings.TrimSpace(thread.ID)
+	if tid == "" {
+		return FixItem{}, false
+	}
+	body := ""
+	id := ""
+	for _, c := range thread.Comments {
+		if isLooperFixerReplyComment(c) {
+			continue
+		}
+		if b := strings.TrimSpace(c.Body); b != "" {
+			body = b
+			id = strings.TrimSpace(c.ID)
+			break
+		}
+	}
+	if body == "" {
+		return FixItem{}, false
+	}
+	if id == "" {
+		id = tid
+	}
+	return FixItem{
+		Type:              "comment",
+		ID:                id,
+		ThreadID:          tid,
+		Summary:           body,
+		Body:              "",
+		ThreadFingerprint: liveReviewThreadFingerprint(thread),
+	}, true
+}
+
+// fixItemFromLiveNativeComment builds a native Forgejo FixItem for a live
+// comment that was not present at ask time.
+func fixItemFromLiveNativeComment(c NativeReviewComment) (FixItem, bool) {
+	if c.ProviderCommentID <= 0 {
+		return FixItem{}, false
+	}
+	text := strings.TrimSpace(c.Body)
+	if text == "" {
+		return FixItem{}, false
+	}
+	fp := strings.TrimSpace(c.ObservedFingerprint)
+	if fp == "" {
+		fp = NativeReviewCommentFingerprint(c.ProviderCommentID, c.UpdatedAt)
+	}
+	return FixItem{
+		Type:                "comment",
+		Source:              NativeReviewCommentSource,
+		ID:                  NativeReviewCommentFixItemID(c.ProviderCommentID),
+		ThreadID:            NativeReviewCommentThreadID(c.ProviderCommentID),
+		ProviderCommentID:   c.ProviderCommentID,
+		Summary:             text,
+		Body:                text,
+		ThreadFingerprint:   fp,
+		ObservedFingerprint: fp,
+		Path:                strings.TrimSpace(c.Path),
+		URL:                 strings.TrimSpace(c.URL),
+		Author:              strings.TrimSpace(c.Author),
+		ResolverPresent:     c.ResolverPresent,
+	}, true
 }
 
 func markLiveReviewMissing(item *FixItem) {
@@ -499,6 +646,28 @@ func worktreeHeadMatchesLive(worktreeHead, liveHead string) bool {
 func (r *Runner) hasAnsweredHITLAsk(ctx context.Context, loop *storage.LoopRecord) bool {
 	ask, ok := r.readFreshHITLAsk(ctx, loop)
 	return ok && ask.Status == "answered" && strings.TrimSpace(ask.Answer) != ""
+}
+
+// abortStaleWorktreeMergeBeforeRediscover clears an in-progress merge left by a
+// conflicted repair when HITL drift forces restart_from_discover. Best-effort
+// no-op when there is no MERGE_HEAD or git is unavailable.
+func (r *Runner) abortStaleWorktreeMergeBeforeRediscover(ctx context.Context, worktreePath string) error {
+	path := strings.TrimSpace(worktreePath)
+	if path == "" || !worktreeHasInProgressMerge(path) {
+		return nil
+	}
+	if r.git == nil {
+		return fmt.Errorf("git gateway unavailable to abort obsolete merge in %s", path)
+	}
+	if err := r.git.AbortInProgressMerge(ctx, path); err != nil {
+		return err
+	}
+	if r.logger != nil {
+		r.logger.Info("fixer HITL aborted obsolete merge before rediscovery", map[string]any{
+			"worktreePath": path,
+		})
+	}
+	return nil
 }
 
 // worktreeHasInProgressMerge reports whether the worktree still has a git merge

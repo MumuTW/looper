@@ -5762,7 +5762,25 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 	if labelCleanup != nil {
 		h.clearHITLAwaitingLabelAfterRespond(ctx, *labelCleanup)
 	}
+	// Mark interactive Feishu ask cards resolved on every delivery path (API
+	// card action, thread reply, dashboard /respond). The Feishu poll lane
+	// already calls the same completion hook; without this, API answers leave
+	// cards clickable after the loop is no longer awaiting a human.
+	h.markHITLAskAnsweredAfterRespond(ctx, loopID, answer)
 	return resp, nil
+}
+
+// markHITLAskAnsweredAfterRespond routes API-delivered HITL answers through the
+// same notification completion hook the Feishu inbox poll uses.
+func (h *Handler) markHITLAskAnsweredAfterRespond(ctx context.Context, loopID, answer string) {
+	if h.context.Runtime == nil {
+		return
+	}
+	if marker, ok := any(h.context.Runtime).(interface {
+		MarkHITLAskAnswered(context.Context, string, string)
+	}); ok {
+		marker.MarkHITLAskAnswered(ctx, loopID, answer)
+	}
 }
 
 // hitlAwaitingLabelCleanup carries the PR identity needed to remove the

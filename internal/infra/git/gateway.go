@@ -956,6 +956,30 @@ type MergeBaseResult struct {
 	Conflicted bool
 }
 
+// AbortInProgressMerge runs `git merge --abort` when MERGE_HEAD is present so a
+// later prepare/rediscovery does not treat an obsolete conflict merge as dirt.
+// No-op when there is no in-progress merge.
+func (g *Gateway) AbortInProgressMerge(ctx context.Context, worktreePath string) error {
+	path := strings.TrimSpace(worktreePath)
+	if path == "" {
+		return fmt.Errorf("worktree path is required")
+	}
+	// Probe for MERGE_HEAD via merge-abort; git exits non-zero with a clear
+	// message when nothing is in progress — treat that as success/no-op.
+	res, err := g.runGitResult(ctx, path, nil, "merge", "--abort")
+	if err == nil {
+		return nil
+	}
+	out := strings.ToLower(res.Stdout + res.Stderr + err.Error())
+	if strings.Contains(out, "merge is not possible") ||
+		strings.Contains(out, "there is no merge to abort") ||
+		strings.Contains(out, "fatal: there is no merge to abort") ||
+		strings.Contains(out, "no merge in progress") {
+		return nil
+	}
+	return err
+}
+
 // MergeBaseIntoWorktree fetches the base branch and merges it into the worktree.
 // On a clean merge it returns AlreadyUpToDate as appropriate; on conflicts it
 // leaves the conflict markers in place and returns Conflicted=true so the caller

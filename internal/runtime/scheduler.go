@@ -2416,6 +2416,10 @@ func (a fixerGitAdapter) MergeBaseIntoWorktree(ctx context.Context, input fixer.
 	return fixer.MergeBaseResult{AlreadyUpToDate: res.AlreadyUpToDate, Conflicted: res.Conflicted}, nil
 }
 
+func (a fixerGitAdapter) AbortInProgressMerge(ctx context.Context, worktreePath string) error {
+	return a.gateway.AbortInProgressMerge(ctx, worktreePath)
+}
+
 func (a fixerGitAdapter) IsAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
 	return a.gateway.IsAncestor(ctx, repoPath, ancestor, descendant)
 }

@@ -310,6 +310,61 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 	}
 }
 
+// TestHandlerFeishuCardActionMarksAskAnswered covers both Feishu delivery paths:
+// the API card-action callback must invoke the same MarkHITLAskAnswered hook the
+// inbox poll uses so interactive cards leave the clickable "awaiting" state.
+func TestHandlerFeishuCardActionMarksAskAnswered(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN_MARK", "verify-tok-mark")
+	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN_MARK"
+
+	var marked [][2]string
+	runtimeWithHook := &runtimeHITLAnswerProbe{
+		RuntimeState: rt,
+		onMark: func(_ context.Context, loopID, answer string) {
+			marked = append(marked, [2]string{loopID, answer})
+		},
+	}
+	h := NewHandler(Context{Config: cfg, Runtime: runtimeWithHook})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_card_mark"
+	loopID := "loop_card_mark"
+	targetID := projectID
+	metadata := `{"hitl":{"question":"q","sessionId":"sess-mark","status":"awaiting"}}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 88, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	body := `{"token":"verify-tok-mark","action":{"tag":"button","value":{"loopSeq":"88","answer":"postgres"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(marked) != 1 || marked[0][0] != loopID || marked[0][1] != "postgres" {
+		t.Fatalf("MarkHITLAskAnswered calls = %#v, want one card completion for loop/answer", marked)
+	}
+}
+
+// runtimeHITLAnswerProbe embeds RuntimeState and adds MarkHITLAskAnswered so
+// API delivery tests can assert the notification completion hook ran.
+type runtimeHITLAnswerProbe struct {
+	RuntimeState
+	onMark func(context.Context, string, string)
+}
+
+func (r *runtimeHITLAnswerProbe) MarkHITLAskAnswered(ctx context.Context, loopID, answer string) {
+	if r.onMark != nil {
+		r.onMark(ctx, loopID, answer)
+	}
+}
+
 // setupAwaitingCardLoop seeds a project + awaiting_human loop and returns the
 // handler + services for card-action security tests.
 func setupAwaitingCardLoop(t *testing.T, cfg config.Config, rt *looperdruntime.Runtime, projectID, loopID string, seq int64) *Handler {

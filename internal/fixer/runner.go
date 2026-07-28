@@ -451,6 +451,9 @@ type GitGateway interface {
 	FetchBranch(context.Context, string, string, string) error
 	IsAncestor(context.Context, string, string, string) (bool, error)
 	MergeBaseIntoWorktree(context.Context, MergeBaseInput) (MergeBaseResult, error)
+	// AbortInProgressMerge clears MERGE_HEAD / conflict markers so a later
+	// prepare or rediscovery does not treat an obsolete merge as manual dirt.
+	AbortInProgressMerge(context.Context, string) error
 	CleanupWorktree(context.Context, CleanupWorktreeInput) error
 }
 
@@ -3039,6 +3042,14 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 					kind:    FailureRetryableAfterResume,
 				}
 			}
+			// Drop obsolete conflict merge before rediscovery so the next prepare
+			// does not re-adopt MERGE_HEAD dirt as manual intervention.
+			if err := r.abortStaleWorktreeMergeBeforeRediscover(ctx, worktree.Path); err != nil {
+				return checkpoint, &loopError{
+					message: fmt.Sprintf("HITL repair aborted: failed to clear obsolete merge before rediscovery: %v", err),
+					kind:    FailureRetryableAfterResume,
+				}
+			}
 			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 			checkpoint.Repair = nil
 			return checkpoint, &loopError{
@@ -3082,6 +3093,16 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			if err := r.retireInvalidatedHITLAnswer(ctx, &input.Loop, "live review/intent fingerprint drift"); err != nil {
 				return checkpoint, &loopError{
 					message: fmt.Sprintf("HITL repair aborted: failed to retire invalidated answer after fingerprint drift: %v", err),
+					kind:    FailureRetryableAfterResume,
+				}
+			}
+			// Conflict parks leave MERGE_HEAD in the retained worktree. Restart
+			// discards checkpoint worktree identity; CreateWorktree would restore
+			// that dirty checkout without ownership and prepare would MI on dirt.
+			// Abort the obsolete merge first so rediscovery can rebuild cleanly.
+			if err := r.abortStaleWorktreeMergeBeforeRediscover(ctx, worktree.Path); err != nil {
+				return checkpoint, &loopError{
+					message: fmt.Sprintf("HITL repair aborted: failed to clear obsolete merge before rediscovery: %v", err),
 					kind:    FailureRetryableAfterResume,
 				}
 			}

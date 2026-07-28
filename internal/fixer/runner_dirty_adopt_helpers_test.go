@@ -218,6 +218,10 @@ func (g *countingRealGitGateway) MergeBaseIntoWorktree(ctx context.Context, inpu
 	return MergeBaseResult{AlreadyUpToDate: res.AlreadyUpToDate, Conflicted: res.Conflicted}, nil
 }
 
+func (g *countingRealGitGateway) AbortInProgressMerge(ctx context.Context, worktreePath string) error {
+	return g.inner.AbortInProgressMerge(ctx, worktreePath)
+}
+
 func (g *countingRealGitGateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInput) error {
 	g.cleanupCalls++
 	return g.inner.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{

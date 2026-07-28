@@ -21,6 +21,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
@@ -207,6 +208,10 @@ type Runtime struct {
 	// storageRetained is true when Stop skipped coordinator.Close after a
 	// drain failure so undrained ownership is not closed under SQLite.
 	storageRetained bool
+
+	// notificationGateways shares Feishu ask-card state between the scheduler
+	// poll lane and API-delivered HITL answers (card action / /respond).
+	notificationGateways *schedulerNotificationGatewayFactory
 }
 
 type runtimeNetworkManager interface {
@@ -662,6 +667,37 @@ func (r *Runtime) WebhookForwarder() WebhookForwarder {
 	return r.webhookForwarder
 }
 
+// MarkHITLAskAnswered patches the Feishu interactive ask card for a loop to its
+// resolved state. Shares the same notification GatewayState as the scheduler
+// Feishu poll lane so API-delivered answers (card action / dashboard /respond)
+// complete cards the same way as inbox-poll delivery. Best-effort no-op when
+// notifications are not configured.
+func (r *Runtime) MarkHITLAskAnswered(ctx context.Context, loopID, answer string) {
+	loopID = strings.TrimSpace(loopID)
+	answer = strings.TrimSpace(answer)
+	if loopID == "" || answer == "" {
+		return
+	}
+	r.mu.RLock()
+	factory := r.notificationGateways
+	cfg := r.config
+	now := r.now
+	repos := r.services.Repositories
+	r.mu.RUnlock()
+	if factory == nil {
+		return
+	}
+	gw := factory.New(notify.Options{
+		Config:           cfg.Notifications,
+		OsascriptPath:    derefString(cfg.Tools.OsascriptPath),
+		LogFilePath:      filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		DashboardBaseURL: notify.BrowserDashboardBaseURL(cfg.Server.Host, cfg.Server.Port, cfg.Server.BaseURL),
+		Repositories:     repos,
+		Now:              now,
+	})
+	gw.MarkAskAnswered(ctx, loopID, answer)
+}
+
 func (r *Runtime) NetworkStatus() networkclient.Status {
 	r.mu.RLock()
 	manager := r.networkManager
@@ -972,6 +1008,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
+		r.notificationGateways = handlers.notificationGateways
 		schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
 	}
 	r.githubGateway = githubGateway

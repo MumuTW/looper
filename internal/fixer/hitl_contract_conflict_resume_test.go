@@ -171,3 +171,106 @@ func TestHITLContract_ConflictResumeReplacedWorktreeReMerges(t *testing.T) {
 		t.Fatalf("agent prompt missing human decision:\n%s", agent.starts[0].Prompt)
 	}
 }
+
+// Fingerprint drift on a conflicted PR must abort the retained MERGE_HEAD before
+// restart_from_discover so the next prepare does not treat obsolete merge dirt
+// as manual intervention.
+func TestHITLContract_ConflictDriftAbortsMergeBeforeRediscover(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+
+	worktreeRoot := t.TempDir()
+	wt := filepath.Join(worktreeRoot, "wt-conflict-drift")
+	_ = os.MkdirAll(filepath.Join(wt, ".git"), 0o755)
+	if err := os.WriteFile(filepath.Join(wt, ".git", "MERGE_HEAD"), []byte("abc\n"), 0o644); err != nil {
+		t.Fatalf("write MERGE_HEAD: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "conflicted.go"), []byte("<<<<<<< HEAD\na\n=======\nb\n>>>>>>> base\n"), 0o644); err != nil {
+		t.Fatalf("write conflicted.go: %v", err)
+	}
+	repoPath := t.TempDir()
+	projectMeta := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+
+	detail := &checkpointDetail{
+		HeadSHA: pr87Head, BaseSHA: pr87Base, BaseRefName: "main", HeadRefName: "feature/pr87",
+		Title: pr87Title, Body: pr87Body, State: "OPEN", HasConflicts: true,
+	}
+	// Conflict park that also scoped a review thread; a new top-level thread
+	// mid-park changes the live review fingerprint and forces rediscovery.
+	const askUpdated = "2026-07-28T00:00:00Z"
+	fixItems := []FixItem{
+		{Type: "conflict", Summary: "merge conflict with main"},
+		{
+			Type: "comment", ID: "c-strategy", ThreadID: "t-strategy",
+			Summary: pr87ReviewerBody, Body: "",
+			ThreadFingerprint: "c-strategy@" + askUpdated,
+		},
+	}
+	intentFP := computePRIntentFingerprint(detail)
+	reviewFP := computeReviewContentFingerprint(fixItems)
+	meta, err := loops.WriteHITLAsk(nil, loops.HITLAsk{
+		Question: "How should conflict resolution proceed?", Answer: "keep feature side",
+		Status: "answered", SessionID: "sess-conflict-drift", Vendor: "codex",
+		HeadSHA: pr87Head, ReviewContentFingerprint: reviewFP, PRIntentFingerprint: intentFP,
+		Role: "fixer", ExecutionID: "agent-ask-drift",
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk: %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(87)
+	loop := storage.LoopRecord{
+		ID: "loop_conflict_drift", Seq: 103, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", Repo: &repo, PRNumber: &pr,
+		Status: "awaiting_human", MetadataJSON: &meta,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	_ = fixture.repos.Loops.Upsert(ctx, loop)
+	run := storage.RunRecord{ID: "run_conflict_drift", LoopID: loop.ID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	_ = fixture.repos.Runs.Upsert(ctx, run)
+
+	git := &fakeGitGateway{}
+	github := &fakeGitHubGateway{
+		viewResponses: []PullRequestDetail{pr87Detail(pr87Head)},
+		threads: []ReviewThread{
+			{
+				ID: "t-strategy",
+				Comments: []ReviewThreadComment{{
+					ID: "c-strategy", Body: pr87ReviewerBody, UpdatedAt: askUpdated,
+				}},
+			},
+			// New top-level review thread while parked → review FP drift.
+			{
+				ID: "t-new-during-park",
+				Comments: []ReviewThreadComment{{
+					ID: "c-new", Body: "Also prefer strategy X", UpdatedAt: "2026-07-28T04:00:00Z", Author: "reviewer",
+				}},
+			},
+		},
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		GitHub: github, Git: git, AgentExecutor: &hitlScriptedAgent{},
+		Logger: fixture.logger, Now: fixture.now,
+		HITLEnabled: true, AllowRiskyFixes: true, AgentRuntime: "codex",
+	})
+	cp, err := runner.runRepairStep(ctx, stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &projectMeta},
+		Loop:    loop, Run: run, Repo: repo, PRNumber: pr,
+		Checkpoint: fixerCheckpoint{
+			Detail: detail, FixItems: fixItems,
+			Worktree: &checkpointWorktree{Path: wt, Branch: "feature/pr87", HeadSHA: pr87Head, PreparedAt: nowISO},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected fingerprint-drift abort before agent start")
+	}
+	if cp.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("ResumePolicy = %q, want %q", cp.ResumePolicy, loops.ResumePolicyRestartFromDiscover)
+	}
+	if len(git.abortMergeCalls) != 1 || git.abortMergeCalls[0] != wt {
+		t.Fatalf("abortMergeCalls = %#v, want one abort of retained conflict worktree", git.abortMergeCalls)
+	}
+}

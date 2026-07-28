@@ -6356,6 +6356,8 @@ type fakeGitGateway struct {
 	mergeBaseCalls  []MergeBaseInput
 	mergeBaseResult MergeBaseResult
 	mergeBaseErr    error
+	abortMergeCalls []string
+	abortMergeErr   error
 	cleanupCalls    []CleanupWorktreeInput
 }
 
@@ -6442,6 +6444,11 @@ func (f *fakeGitGateway) FetchBranch(_ context.Context, repoPath, remote, branch
 func (f *fakeGitGateway) MergeBaseIntoWorktree(_ context.Context, input MergeBaseInput) (MergeBaseResult, error) {
 	f.mergeBaseCalls = append(f.mergeBaseCalls, input)
 	return f.mergeBaseResult, f.mergeBaseErr
+}
+
+func (f *fakeGitGateway) AbortInProgressMerge(_ context.Context, worktreePath string) error {
+	f.abortMergeCalls = append(f.abortMergeCalls, worktreePath)
+	return f.abortMergeErr
 }
 
 func (f *fakeGitGateway) IsAncestor(_ context.Context, _ string, ancestor, descendant string) (bool, error) {
