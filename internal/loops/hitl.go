@@ -40,6 +40,12 @@ type HITLAsk struct {
 	Provider     string `json:"provider,omitempty"`
 	PRNumber     int64  `json:"prNumber,omitempty"`
 	AskCommentID int64  `json:"askCommentId,omitempty"`
+	// DeliveryPending is true after a GitHub-transport park commits but before
+	// AskCommentID correlation is durable. Startup recovery retries these parks
+	// (daemon crash between parkHITLLoop and persistParkedHITLAsk); normal
+	// awaiting parks with a correlated comment leave this false so recovery
+	// does not requeue answerable HITL loops.
+	DeliveryPending bool `json:"deliveryPending,omitempty"`
 
 	// The agent's decision brief — research + recommendation surfaced on the ask
 	// card so a human can confirm in seconds instead of researching from scratch.
@@ -120,6 +126,61 @@ func ClearHITLAsk(metadataJSON *string) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// GitHubAskDeliveryPending reports whether a durable park is waiting on GitHub
+// ask delivery / AskCommentID correlation. Used by startup recovery to requeue
+// incomplete parks that would otherwise stay awaiting_human forever (poll skips
+// AskCommentID==0 and recovery deliberately does not requeue full parks).
+func GitHubAskDeliveryPending(ask HITLAsk) bool {
+	if !ask.DeliveryPending {
+		return false
+	}
+	if ask.AskCommentID > 0 {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") {
+		return false
+	}
+	status := strings.TrimSpace(ask.Status)
+	return status == "" || status == "awaiting"
+}
+
+// AskGenerationMatches reports whether a Feishu (or other) card-action payload
+// targets the currently parked ask generation. Cards carry executionId and/or
+// askedAt; when the durable park has either field, the card must present a
+// matching token so an old card cannot answer a later re-escalation.
+func AskGenerationMatches(ask HITLAsk, executionID, askedAt string) bool {
+	parkExec := strings.TrimSpace(ask.ExecutionID)
+	parkAsked := strings.TrimSpace(ask.AskedAt)
+	cardExec := strings.TrimSpace(executionID)
+	cardAsked := strings.TrimSpace(askedAt)
+	// Legacy parks with no generation identity accept any card (pre-binding).
+	if parkExec == "" && parkAsked == "" {
+		return true
+	}
+	// Park has a generation: require at least one matching card token.
+	matched := false
+	if parkExec != "" {
+		if cardExec == "" {
+			// Card missing execution id while park has one — not a match unless
+			// askedAt matches below.
+		} else if cardExec != parkExec {
+			return false
+		} else {
+			matched = true
+		}
+	}
+	if parkAsked != "" {
+		if cardAsked == "" {
+			// missing askedAt
+		} else if cardAsked != parkAsked {
+			return false
+		} else {
+			matched = true
+		}
+	}
+	return matched
 }
 
 func parseMetadataObject(metadataJSON *string) map[string]any {

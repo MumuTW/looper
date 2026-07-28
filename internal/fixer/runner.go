@@ -3145,6 +3145,29 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		mergeLiveHITLDetailOntoCheckpoint(&checkpoint, liveDetail)
 		input.Checkpoint = checkpoint
 
+		// Eligibility recheck: a PR closed or newly draft-excluded while parked
+		// must not resume the agent (computePRIntentFingerprint omits state/draft).
+		policy := r.discoveryPolicyForProject(input.Project.ID)
+		if (!isManualFixerLoop(input.Loop) && !policy.IncludeDrafts && checkpoint.Detail.IsDraft) ||
+			normalizePRState(checkpoint.Detail.State) != "open" {
+			if err := r.retireInvalidatedHITLAnswer(ctx, &input.Loop, "live PR no longer eligible (closed or draft)"); err != nil {
+				return checkpoint, &loopError{
+					message: fmt.Sprintf("HITL repair aborted: failed to retire answer after PR became ineligible: %v", err),
+					kind:    FailureRetryableAfterResume,
+				}
+			}
+			if err := r.abortStaleWorktreeMergeBeforeRediscover(ctx, worktree.Path); err != nil {
+				return checkpoint, &loopError{
+					message: fmt.Sprintf("HITL repair aborted: failed to clear obsolete merge after PR became ineligible: %v", err),
+					kind:    FailureRetryableAfterResume,
+				}
+			}
+			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because it is not eligible", input.Repo, input.PRNumber)
+			checkpoint.Repair = nil
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, nil
+		}
+
 		liveIntentFP := computePRIntentFingerprint(checkpoint.Detail)
 		liveReviewFP := ""
 		if r.hasAnsweredHITLAsk(ctx, &input.Loop) {

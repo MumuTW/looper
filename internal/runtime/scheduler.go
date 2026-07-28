@@ -3407,6 +3407,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Consequences:      ask.Consequences,
 			Confidence:        ask.Confidence,
 			NotifyOnly:        notifyOnly,
+			ExecutionID:       ask.ExecutionID,
+			AskedAt:           ask.AskedAt,
 		})
 	}
 	notifyFixerHITLAsk := func(ctx context.Context, ask fixer.HITLAskNotification) error {
@@ -3420,6 +3422,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Consequences:      ask.Consequences,
 			Confidence:        ask.Confidence,
 			NotifyOnly:        ask.NotifyOnly,
+			ExecutionID:       ask.ExecutionID,
+			AskedAt:           ask.AskedAt,
 		})
 	}
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)

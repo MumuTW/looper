@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -24,9 +25,11 @@ type feishuInboxEvent struct {
 	RootID       string `json:"rootId"`
 	SenderOpenID string `json:"senderOpenId"`
 	Text         string `json:"text"`
-	Value        struct {
-		LoopSeq string `json:"loopSeq"`
-		Answer  string `json:"answer"`
+	Value struct {
+		LoopSeq     string `json:"loopSeq"`
+		Answer      string `json:"answer"`
+		ExecutionID string `json:"executionId"`
+		AskedAt     string `json:"askedAt"`
 	} `json:"value"`
 }
 
@@ -38,6 +41,9 @@ type feishuHITLPollDeps struct {
 	// loopBySeq maps a loop seq (from a card-action value) to a loop id; "" when
 	// unknown to this looper.
 	loopBySeq func(ctx contextType, seq int64) string
+	// loopAskGeneration loads the parked ask generation for a loop id so card
+	// actions can reject stale tokens. Returns ok=false when no park exists.
+	loopAskGeneration func(ctx contextType, loopID string) (executionID, askedAt string, ok bool)
 	// deliverAnswer feeds a button-click decision into the shared HITL core.
 	deliverAnswer func(ctx contextType, loopID, answer string) error
 	// enqueueMessage queues a free-text thread reply for the loop (conversational /
@@ -83,6 +89,21 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 			loopID = deps.loopBySeq(ctx, seq)
 			value = ans
 			deliver = deps.deliverAnswer
+			// Reject stale cards that target a prior ask generation on the same loop.
+			if strings.TrimSpace(loopID) != "" && deps.loopAskGeneration != nil {
+				parkExec, parkAsked, ok := deps.loopAskGeneration(ctx, loopID)
+				if ok {
+					park := loops.HITLAsk{ExecutionID: parkExec, AskedAt: parkAsked}
+					if !loops.AskGenerationMatches(park, e.Value.ExecutionID, e.Value.AskedAt) {
+						if deps.logWarn != nil {
+							deps.logWarn("hitl feishu poll: stale ask generation", map[string]any{
+								"loopId": loopID, "kind": e.Kind,
+							})
+						}
+						continue
+					}
+				}
+			}
 		default:
 			continue
 		}
@@ -159,6 +180,17 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 				return ""
 			}
 			return loop.ID
+		},
+		loopAskGeneration: func(ctx contextType, loopID string) (executionID, askedAt string, ok bool) {
+			loop, err := input.Repos.Loops.GetByID(ctx, loopID)
+			if err != nil || loop == nil {
+				return "", "", false
+			}
+			ask, found := loops.ReadHITLAsk(loop.MetadataJSON)
+			if !found {
+				return "", "", false
+			}
+			return ask.ExecutionID, ask.AskedAt, true
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
 			if err := deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer); err != nil {

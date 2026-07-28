@@ -283,6 +283,35 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		}
 	})
 
+	t.Run("SendHITLAsk embeds ask generation on option buttons", func(t *testing.T) {
+		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+		var calls []capturedFeishuCall
+		gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+
+		if err := gateway.SendHITLAsk(ctx, HITLAskCard{
+			ProjectID: "od", LoopSeq: 72, Question: "Keep or restore?",
+			Options: []string{"keep", "restore"},
+			ExecutionID: "agent-gen-1", AskedAt: "2026-07-28T03:00:00Z",
+		}); err != nil {
+			t.Fatalf("SendHITLAsk() error = %v", err)
+		}
+		if len(calls) != 2 {
+			t.Fatalf("feishu calls = %d, want 2 (token + message)", len(calls))
+		}
+		var envelope struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(calls[1].body, &envelope); err != nil {
+			t.Fatalf("message body not JSON: %v", err)
+		}
+		if !strings.Contains(envelope.Content, `"executionId":"agent-gen-1"`) ||
+			!strings.Contains(envelope.Content, `"askedAt":"2026-07-28T03:00:00Z"`) {
+			t.Fatalf("card buttons missing ask generation tokens: %s", envelope.Content)
+		}
+	})
+
 	t.Run("SendHITLAsk errors when app not configured and osascript unavailable", func(t *testing.T) {
 		cfg := appModeConfig()
 		cfg.ChatID = ""

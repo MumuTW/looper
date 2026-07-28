@@ -519,6 +519,10 @@ type HITLAskNotification struct {
 	RecommendedOption string
 	Consequences      map[string]string
 	Confidence        string
+
+	// ExecutionID and AskedAt bind Feishu card actions to this ask generation.
+	ExecutionID string
+	AskedAt     string
 }
 
 // HITLNotifyFunc delivers a mid-run ask to the human channel (e.g. a Feishu

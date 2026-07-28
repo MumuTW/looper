@@ -384,6 +384,8 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			RecommendedOption: awaiting.recommendedOption,
 			Consequences:      awaiting.consequences,
 			Confidence:        awaiting.confidence,
+			ExecutionID:       ask.ExecutionID,
+			AskedAt:           ask.AskedAt,
 		}
 		// Source + trigger come from the loop's work metadata (issue #, url, author).
 		if w := checkpoint.Work; w != nil {

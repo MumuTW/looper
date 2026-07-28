@@ -635,6 +635,12 @@ type HITLAskCard struct {
 	// authority is GitHub (answerTransport=github): the card is informational so
 	// a Feishu click cannot resume the loop without GitHub awaiting-label cleanup.
 	NotifyOnly bool
+
+	// ExecutionID and AskedAt identify the parked ask generation. Embedded in
+	// every option button value so card-action callbacks can reject stale cards
+	// after a later re-escalation on the same loop seq.
+	ExecutionID string
+	AskedAt     string
 }
 
 // feishuMentionMarkup renders Feishu open_ids as card @-mention tags, e.g.
@@ -927,11 +933,18 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 					btnType = "default"
 				}
 			}
+			btnValue := map[string]any{"loopSeq": seq, "answer": option}
+			if execID := strings.TrimSpace(card.ExecutionID); execID != "" {
+				btnValue["executionId"] = execID
+			}
+			if askedAt := strings.TrimSpace(card.AskedAt); askedAt != "" {
+				btnValue["askedAt"] = askedAt
+			}
 			actions = append(actions, map[string]any{
 				"tag":   "button",
 				"type":  btnType,
 				"text":  map[string]any{"tag": "plain_text", "content": label},
-				"value": map[string]any{"loopSeq": seq, "answer": option},
+				"value": btnValue,
 			})
 		}
 	}

@@ -5946,8 +5946,10 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var value struct {
-		LoopSeq string `json:"loopSeq"`
-		Answer  string `json:"answer"`
+		LoopSeq     string `json:"loopSeq"`
+		Answer      string `json:"answer"`
+		ExecutionID string `json:"executionId"`
+		AskedAt     string `json:"askedAt"`
 	}
 	if len(envelope.Action.Value) > 0 {
 		_ = json.Unmarshal(envelope.Action.Value, &value)
@@ -5972,6 +5974,16 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 	if h.hitlAskRejectsFeishuAnswer(&loop) {
 		h.writeSuccess(w, requestID, map[string]any{"loopSeq": loopSeq, "delivered": false, "reason": "feishu answers disabled for github transport"})
 		return
+	}
+	// Bind card actions to the current ask generation so a stale card from a
+	// prior escalation cannot apply its option to a later park on the same loop.
+	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok {
+		if !loops.AskGenerationMatches(ask, value.ExecutionID, value.AskedAt) {
+			h.writeSuccess(w, requestID, map[string]any{
+				"loopSeq": loopSeq, "delivered": false, "reason": "stale ask generation",
+			})
+			return
+		}
 	}
 	if _, err := h.deliverHumanAnswer(r.Context(), loop.ID, answer); err != nil {
 		var typed apiError

@@ -80,6 +80,10 @@ type HITLAskNotification struct {
 	// answerTransport is github so answers arrive via PR comment / dashboard and
 	// GitHub awaiting-label cleanup still runs.
 	NotifyOnly bool
+	// ExecutionID and AskedAt bind Feishu card actions to this ask generation so
+	// a stale card from a prior escalation cannot answer a later park.
+	ExecutionID string
+	AskedAt     string
 }
 
 // HITLNotifyFunc delivers a mid-run ask to the human channel. Best-effort.
@@ -372,7 +376,11 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 			seenNativeIDs[item.ProviderCommentID] = struct{}{}
 			// Forgejo native: ListNativeReviewComments only (no ViewReviewThread).
 			if c, ok := nativeByProvider[item.ProviderCommentID]; ok {
-				if text := strings.TrimSpace(c.Body); text != "" {
+				// Resolved native comments are no longer live feedback; invalidate
+				// the parked answer the same way as a missing comment.
+				if c.IsResolved {
+					markLiveReviewMissing(&live)
+				} else if text := strings.TrimSpace(c.Body); text != "" {
 					live.Summary = text
 					live.Body = text
 					// ObservedFingerprint tracks comment identity+updatedAt drift.
@@ -419,6 +427,10 @@ func (r *Runner) liveReviewContentFingerprint(ctx context.Context, input stepInp
 				} else {
 					return "", fmt.Errorf("HITL live review thread refresh failed for %s: %w", item.ThreadID, err)
 				}
+			} else if thread.IsResolved {
+				// Reviewer resolved the thread while parked: body/timestamps may be
+				// unchanged, but the feedback is no longer live — invalidate.
+				markLiveReviewMissing(&live)
 			} else if body := primaryReviewThreadBody(thread, item); body != "" {
 				// GitHub collect-time layout: Summary holds body text, Body empty.
 				live.Summary = body
@@ -657,6 +669,12 @@ func mergeLiveHITLDetailOntoCheckpoint(checkpoint *fixerCheckpoint, live *checkp
 	checkpoint.Detail.BaseRefName = live.BaseRefName
 	checkpoint.Detail.HeadRefName = live.HeadRefName
 	checkpoint.Detail.State = live.State
+	// IsDraft is eligibility-critical (IncludeDrafts policy); copy so resume can
+	// abort before the agent when the PR became draft while parked.
+	checkpoint.Detail.IsDraft = live.IsDraft
+	if live.Labels != nil {
+		checkpoint.Detail.Labels = cloneStrings(live.Labels)
+	}
 }
 
 // worktreeHeadMatchesLive reports whether the prepared worktree head still matches
@@ -1064,6 +1082,8 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	// Durable park BEFORE remote GitHub mutation so a DB failure cannot leave an
 	// orphan PR ask without a loop record. Stamp transport/PR identity first so
 	// the parked ask is poll-eligible once AskCommentID is filled after delivery.
+	// DeliveryPending stays true until AskCommentID correlation is durable so a
+	// daemon crash mid-delivery is recoverable at startup (poll skips id==0).
 	// Cancel the claimable queue item BEFORE publishing awaiting_human. Publishing
 	// answerable status while a queue item is still active races /respond and the
 	// GitHub poll: mutateLoopStatus sees the active item and skips requeue, then
@@ -1075,6 +1095,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 				kind:    FailureRetryableTransient,
 			}
 		}
+		ask.DeliveryPending = true
 	}
 	reason := "fixer suspended awaiting human decision"
 	if err := r.parkHITLLoop(ctx, input.Loop, ask, nowISO, reason); err != nil {
@@ -1133,7 +1154,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 				}
 			}
 		}
-		// Correlation is durable — drop the worktree stash if present.
+		// Correlation is durable — drop the worktree stash if present and clear
+		// DeliveryPending so startup recovery will not requeue a complete park.
+		ask.DeliveryPending = false
 		if worktreePath != "" {
 			hitl.RemoveDeliveredCommentStash(worktreePath)
 		}
@@ -1180,6 +1203,8 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			Consequences:      awaiting.consequences,
 			Confidence:        awaiting.confidence,
 			NotifyOnly:        r.hitlTransportGitHub(),
+			ExecutionID:       ask.ExecutionID,
+			AskedAt:           ask.AskedAt,
 		}
 		if input.PRNumber <= 0 && input.Loop.PRNumber != nil {
 			notif.SourceRef = "#" + strconv.FormatInt(*input.Loop.PRNumber, 10)
@@ -1287,6 +1312,9 @@ func (r *Runner) forcePersistDeliveredAskComment(ctx context.Context, loop stora
 		}
 		if existing.AskCommentID == 0 {
 			existing.AskCommentID = delivered.AskCommentID
+		}
+		if existing.AskCommentID > 0 {
+			existing.DeliveryPending = false
 		}
 		if strings.TrimSpace(existing.Transport) == "" {
 			existing.Transport = delivered.Transport
@@ -1442,6 +1470,12 @@ func mergeHITLAskDeliveryCorrelation(current, delivered loops.HITLAsk) (loops.HI
 			out.AskCommentID = delivered.AskCommentID
 			changed = true
 		}
+	}
+	// Correlation complete (or already had an id): clear delivery-pending so
+	// startup recovery will not treat this park as an incomplete delivery.
+	if out.AskCommentID > 0 && out.DeliveryPending {
+		out.DeliveryPending = false
+		changed = true
 	}
 	if t := strings.TrimSpace(delivered.Transport); t != "" && strings.TrimSpace(out.Transport) == "" {
 		out.Transport = t

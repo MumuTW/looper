@@ -1851,6 +1851,37 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if _, quarantined := quarantinedLoopIDs[loop.ID]; quarantined {
 			continue
 		}
+		// Incomplete GitHub HITL delivery: park committed with DeliveryPending and
+		// AskCommentID==0 (crash after parkHITLLoop, before correlation). Normal
+		// awaiting_human parks must stay parked; only delivery-pending rolls back
+		// so suspend can retry post/correlation (stash prevents double-post).
+		// Note: local `loops` shadows the package name — recovery helper owns the check.
+		if loop.Status == string(domain.LoopStatusAwaitingHuman) || loop.Status == "awaiting_human" {
+			recovered, err := recoverIncompleteHITLGitHubDelivery(ctx, repositories, loop, nowISO)
+			if err != nil {
+				return RecoverySummary{}, err
+			}
+			if recovered {
+				requeuedLoopIDs[loop.ID] = struct{}{}
+				summary.LoopsRequeued += 1
+				if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+					ID:         newRuntimeEventID(),
+					EventType:  "looperd.recovery.hitl_github_delivery_pending_requeued",
+					LoopID:     stringPtr(loop.ID),
+					EntityType: stringPtr("loop"),
+					EntityID:   stringPtr(loop.ID),
+					PayloadJSON: mustMarshalJSON(map[string]any{
+						"previousStatus": loop.Status,
+						"reason":         "github_ask_delivery_pending",
+					}),
+					CreatedAt: nowISO,
+				}); err != nil {
+					return RecoverySummary{}, err
+				}
+				eventsWritten += 1
+				continue
+			}
+		}
 		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
 			return RecoverySummary{}, err
@@ -3752,6 +3783,46 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// recoverIncompleteHITLGitHubDelivery rolls back an awaiting_human park that
+// never finished GitHub ask delivery / AskCommentID correlation. Mirrors fixer
+// rollbackHITLParkForDeliveryRetry: clear the incomplete ask, set running, and
+// requeue the cancelled claim so suspend can retry (ask.json / stash still apply).
+func recoverIncompleteHITLGitHubDelivery(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string) (bool, error) {
+	if repositories == nil || repositories.Loops == nil {
+		return false, nil
+	}
+	current, err := repositories.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return false, err
+	}
+	if current == nil {
+		return false, nil
+	}
+	if current.Status != "awaiting_human" && current.Status != string(domain.LoopStatusAwaitingHuman) {
+		return false, nil
+	}
+	ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
+	if !ok || !loops.GitHubAskDeliveryPending(ask) {
+		return false, nil
+	}
+	updated := *current
+	if meta, cerr := loops.ClearHITLAsk(updated.MetadataJSON); cerr == nil {
+		updated.MetadataJSON = &meta
+	}
+	updated.Status = "running"
+	updated.NextRunAt = &nowISO
+	updated.UpdatedAt = nowISO
+	if err := repositories.Loops.Upsert(ctx, updated); err != nil {
+		return false, err
+	}
+	if repositories.Queue != nil {
+		if _, err := repositories.Queue.RequeueLatestCancelledByLoop(ctx, loop.ID, nowISO); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
 func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestRunHasLiveAgent bool) bool {
 	if terminalReviewerRecoveryMetadataStatus(loop) != "" {
 		return false
@@ -3760,6 +3831,8 @@ func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, la
 	// paused it, is driving via takeover, or the loop is waiting on a HITL answer.
 	// Recovery must NOT re-queue them (successful HITL suspend records the run as
 	// "interrupted", but that is expected) — only an explicit answer/handback does.
+	// Incomplete GitHub delivery parks (DeliveryPending) are recovered earlier via
+	// recoverIncompleteHITLGitHubDelivery, not here.
 	if loop.Status == "paused" ||
 		loop.Status == string(domain.LoopStatusHumanTakeover) ||
 		loop.Status == string(domain.LoopStatusAwaitingHuman) {
