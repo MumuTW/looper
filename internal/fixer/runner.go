@@ -696,6 +696,15 @@ type zeroProgressState struct {
 	RecordedAt        string `json:"recordedAt,omitempty"`
 }
 
+type failureStreakState struct {
+	LastRunID         string `json:"lastRunId,omitempty"`
+	LastHeadSHA       string `json:"lastHeadSha,omitempty"`
+	FixItemsStateHash string `json:"fixItemsStateHash,omitempty"`
+	Step              string `json:"step,omitempty"`
+	ConsecutiveCount  int    `json:"consecutiveCount,omitempty"`
+	RecordedAt        string `json:"recordedAt,omitempty"`
+}
+
 type rediscoveryAction string
 
 const (
@@ -810,17 +819,6 @@ type checkpointRepair struct {
 	ElapsedRuntimeSeconds        int64                   `json:"elapsedRuntimeSeconds,omitempty"`
 	LastProgressAt               string                  `json:"lastProgressAt,omitempty"`
 	ReplyExplanations            []replyExplanationEntry `json:"replyExplanations,omitempty"`
-
-	// GitHubUnreachable records whether the agent's own logs showed it failing
-	// to reach GitHub. It is decided once, when the run ends and the full
-	// stdout/stderr is still in hand, because Summary degrades to a single line
-	// (agent.summarizeLogs) once the completion marker fails to parse — the
-	// exact case this classification exists for. Later readers load a persisted
-	// checkpoint and cannot re-derive it.
-	//
-	// nil means the checkpoint predates the field; those fall back to scanning
-	// the one-line summary, which is what shipped before.
-	GitHubUnreachable *bool `json:"githubUnreachable,omitempty"`
 }
 
 // replyExplanationEntry holds the agent's per-fix-item explanation for the
@@ -986,69 +984,14 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 	if repair.ParseStatus == "parsed" {
 		return nil
 	}
-	// A run that could not reach GitHub is not worth repeating: with the default
-	// scheduler.retryMaxAttempts of -1, transient is retried forever, and every
-	// attempt spends another agent run on an environment fault no retry can fix.
-	// NonRetryable is the only brake that branch honours (see
-	// shouldRetryQueueFailure).
-	if repairSawUnreachableGitHub(repair) {
-		return &loopError{
-			message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent could not reach GitHub (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
-			kind:    FailureNonRetryable,
-		}
-	}
 	return &loopError{
 		message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent completed without valid structured result (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
 		kind:    FailureRetryableTransient,
 	}
 }
 
-// repairSawUnreachableGitHub reports whether this run failed because it could
-// not reach GitHub, preferring the decision recorded while the full logs were
-// available over re-deriving it from the truncated summary.
-func repairSawUnreachableGitHub(repair *checkpointRepair) bool {
-	if repair.GitHubUnreachable != nil {
-		return *repair.GitHubUnreachable
-	}
-	return mentionsUnreachableGitHub(repair.Summary)
-}
-
-// unreachableGitHubFragments are matched against a whole agent transcript, so
-// every entry has to be a phrase that only appears when a call actually failed.
-// Bare tokens do not qualify: "network", "unreachable" and "api.github.com" all
-// occur incidentally in the logs of an agent editing code, and misreading one
-// as an outage parks a loop that should have been retried.
-var unreachableGitHubFragments = []string{
-	"could not connect",
-	"could not resolve host",
-	"connection refused",
-	"connection timed out",
-	"network is unreachable",
-	"bad credentials",
-	"authentication failed",
-	"token expired",
-	"github was unreachable",
-	"github api access failed",
-}
-
-func mentionsUnreachableGitHub(text string) bool {
-	lowered := strings.ToLower(text)
-	for _, fragment := range unreachableGitHubFragments {
-		if strings.Contains(lowered, fragment) {
-			return true
-		}
-	}
-	return false
-}
-
 func checkpointRepairFromAgentResult(executionID, headSHA string, result AgentResult, nowISO string) *checkpointRepair {
-	// Scan the transcript, not result.Summary: when the completion marker fails
-	// to parse, Summary is only the last non-empty log line, so a connection
-	// failure anywhere earlier in the run would be invisible.
-	unreachable := mentionsUnreachableGitHub(result.Stdout) ||
-		mentionsUnreachableGitHub(result.Stderr) ||
-		mentionsUnreachableGitHub(result.Summary)
-	return &checkpointRepair{AgentExecutionID: executionID, Status: result.Status, Summary: result.Summary, HeadSHA: headSHA, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: nowISO, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, GitHubUnreachable: &unreachable}
+	return &checkpointRepair{AgentExecutionID: executionID, Status: result.Status, Summary: result.Summary, HeadSHA: headSHA, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: nowISO, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
 }
 
 // maxReplyExplanationLength caps each agent-supplied explanation. Replies are
@@ -1063,6 +1006,14 @@ const (
 	maxDeclinedThreadRecords              = 200
 	zeroProgressPauseReason               = "agent_zero_progress"
 	labelMismatchPauseReason              = "fixer_label_mismatch"
+	failureStreakPauseReason              = "agent_failure_streak"
+	// maxConsecutiveFixerFailures caps how many runs in a row may fail at the
+	// same step against the same fix-items state before the loop is parked. The queue-item
+	// retry layer alone could not stop the incident where a fixer loop retried
+	// 52+ times in 5 hours: every push minted a new queue item (the dedupe key
+	// contains the head SHA), so attempts kept resetting while the agent kept
+	// failing on the same unresolved feedback.
+	maxConsecutiveFixerFailures = 3
 )
 
 // parseReplyExplanations extracts the optional review_thread_replies array from
@@ -1928,25 +1879,70 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*ProcessResult, error) {
 	failure := r.classifyFailure(err)
 	var activeErr *activeRunError
+	var runFailure *claimedRunFailureError
 	var failedQueue *storage.QueueItemRecord
+	breakerTripped := false
 	var failErr error
 	if errors.As(err, &activeErr) {
 		failedQueue, failErr = r.requeueQueueItem(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts)
+	} else if errors.As(err, &runFailure) && queueItem.LoopID != nil {
+		loop, loopErr := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
+		if loopErr != nil {
+			return nil, loopErr
+		}
+		if loop != nil {
+			failedQueue, breakerTripped, failErr = r.failQueueItemWithBreaker(ctx, *loop, queueItem, runFailure.runID, runFailure.checkpoint, runFailure.step, failure)
+		} else {
+			failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		}
 	} else {
 		failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+	}
+	// A prior transition may have persisted the queue terminal state before a
+	// later loop/metadata write failed. Treat that durable row as the recovery
+	// result so reconcileRecoveredLoop can finish the partial transition.
+	if errors.Is(failErr, storage.ErrQueueItemNotActive) {
+		persisted, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID)
+		if getErr != nil {
+			return nil, getErr
+		}
+		if persisted != nil && persisted.Status != "running" {
+			failedQueue = persisted
+			failErr = nil
+		}
 	}
 	if failErr != nil {
 		return nil, failErr
 	}
-	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue, failure.kind); err != nil {
+	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue); err != nil {
 		return nil, err
 	}
-	if queueItem.LoopID != nil && queueItem.Repo != nil && queueItem.PRNumber != nil && queueResultIsTerminalForCleanup(failedQueue) {
+	recoveredRunTerminal := runFailure != nil && failedQueue != nil && failedQueue.Status == "manual_intervention"
+	if queueItem.LoopID != nil && queueItem.Repo != nil && queueItem.PRNumber != nil && (queueResultIsTerminalForCleanup(failedQueue) || recoveredRunTerminal) {
 		loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
 		if err != nil {
 			return nil, err
 		}
 		if loop != nil {
+			if runFailure != nil {
+				project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+				if projectErr != nil {
+					return nil, projectErr
+				}
+				if project != nil {
+					if breakerTripped {
+						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &runFailure.checkpoint)
+						if resumeErr != nil {
+							return nil, resumeErr
+						}
+						if resumed {
+							return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+						}
+					} else {
+						r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &runFailure.checkpoint)
+					}
+				}
+			}
 			if _, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 				return nil, err
 			}
@@ -1955,7 +1951,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 }
 
-func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind QueueFailureKind) error {
+func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord) error {
 	if queueItem.LoopID == nil {
 		return nil
 	}
@@ -1963,7 +1959,10 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 	if err != nil {
 		return err
 	}
-	if loop == nil || loop.Status != "running" {
+	// A run is created before the loop is flipped to running. If that status
+	// write itself fails, the run is still a genuine failed run and its breaker
+	// result must reconcile the still-queued loop.
+	if loop == nil || (loop.Status != "running" && loop.Status != "queued") {
 		return nil
 	}
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -2025,6 +2024,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return
 		}
 		run = completed
+		failedStep := asFixerStep(derefString(completed.CurrentStep))
+		if failedStep == "" {
+			failedStep = resumedRun.StartStep
+		}
+		retErr = &claimedRunFailureError{cause: retErr, runID: completed.ID, checkpoint: latest, step: failedStep}
 	}()
 	claimedLockKey := ""
 	acquiredClaimedLock := false
@@ -2070,7 +2074,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 			return ProcessResult{}, err
 		}
-		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		failedQueue, breakerTripped, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, resumedRun.StartStep, failure)
 		if err != nil {
 			return ProcessResult{}, err
 		}
@@ -2086,6 +2090,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}); err != nil {
 			return ProcessResult{}, err
+		}
+		if breakerTripped {
+			if _, err := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &latest); err != nil {
+				return ProcessResult{}, err
+			}
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
 			if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
@@ -2120,6 +2130,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if _, err := r.completeRun(ctx, run, "success", reason, "", checkpoint); err != nil {
 			return ProcessResult{}, err
 		}
+		if _, err := r.clearFixerFailureStreakMetadata(ctx, *loop); err != nil {
+			r.logWarn("fixer failure streak cleanup after successful ownership skip failed", map[string]any{"loopId": loop.ID, "runId": run.ID, "error": err.Error()})
+		}
 		r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": reason}})
 		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 			return ProcessResult{}, err
@@ -2147,27 +2160,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if kind == runtimeSkipHold {
 				return r.finishHeldFixerQueueItem(ctx, *loop, &run, queueItem, checkpoint, reason)
 			}
-			checkpoint.SkipReason = reason
-			if _, err := r.completeRun(ctx, run, "success", reason, "", checkpoint); err != nil {
-				return ProcessResult{}, err
-			}
-			r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": reason}})
-			if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
-				return ProcessResult{}, err
-			}
-			pausedLoop, err := r.markLoopPausedForLabelMismatch(ctx, *loop)
-			if err != nil {
-				return ProcessResult{}, err
-			}
-			if _, err := r.updateLoop(ctx, pausedLoop, func(updated *storage.LoopRecord) {
-				updated.Status = "paused"
-				updated.LastRunAt = stringPtr(r.nowISO())
-				updated.NextRunAt = nil
-			}); err != nil {
-				return ProcessResult{}, err
-			}
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
+			return r.finishLabelMismatchFixerQueueItem(ctx, *project, *loop, &run, queueItem, checkpoint, reason)
 		}
 	}
 	checkpoint.RunStartedAt = r.nowISO()
@@ -2204,7 +2197,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			var labelMismatchErr *labelMismatchSkipError
 			if errors.As(err, &labelMismatchErr) {
-				return r.finishLabelMismatchFixerQueueItem(ctx, *loop, &run, queueItem, checkpoint, labelMismatchErr.summary)
+				return r.finishLabelMismatchFixerQueueItem(ctx, *project, *loop, &run, queueItem, checkpoint, labelMismatchErr.summary)
 			}
 			failure := r.classifyFailureWithBoundary(err, fixerFailureBoundaryForStep(step))
 			latest := checkpoint
@@ -2215,7 +2208,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "failureKind": string(failure.kind), "currentStep": derefString(run.CurrentStep)}})
 			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.message, "failureKind": string(failure.kind)}})
 			r.logError("fixer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "failureKind": string(failure.kind), "summary": failure.message})
-			failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+			// Consecutive-failure circuit breaker: once the same step/fix-items
+			// state has failed maxConsecutiveFixerFailures runs in a row, stop
+			// requeueing and park the loop until discovery sees new feedback.
+			failedQueue, breakerTripped, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
 			if err != nil {
 				return ProcessResult{}, err
 			}
@@ -2231,6 +2227,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 			}); err != nil {
 				return ProcessResult{}, err
+			}
+			if breakerTripped {
+				if _, err := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &latest); err != nil {
+					return ProcessResult{}, err
+				}
+				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
 				if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
@@ -2265,6 +2267,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
+	}
+	// Every successful exit breaks the streak, including skips and queue rows
+	// that another recovery path already finalized.
+	if _, err := r.clearFixerFailureStreakMetadata(ctx, *loop); err != nil {
+		r.logWarn("fixer failure streak cleanup after successful run failed", map[string]any{"loopId": loop.ID, "runId": run.ID, "error": err.Error()})
 	}
 	r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": summary}})
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
@@ -2533,6 +2540,9 @@ func (r *Runner) finishHeldFixerQueueItem(ctx context.Context, loop storage.Loop
 			return ProcessResult{}, err
 		}
 	}
+	if _, err := r.clearFixerFailureStreakMetadata(ctx, loop); err != nil {
+		r.logWarn("fixer failure streak cleanup after successful hold failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
 		return ProcessResult{}, err
 	}
@@ -2550,12 +2560,16 @@ func (r *Runner) finishHeldFixerQueueItem(ctx context.Context, loop storage.Loop
 	return result, nil
 }
 
-func (r *Runner) finishLabelMismatchFixerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, summary string) (ProcessResult, error) {
+func (r *Runner) finishLabelMismatchFixerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, summary string) (ProcessResult, error) {
 	checkpoint.SkipReason = summary
 	if run != nil {
 		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
 			return ProcessResult{}, err
 		}
+		r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": summary}})
+	}
+	if _, err := r.clearFixerFailureStreakMetadata(ctx, loop); err != nil {
+		r.logWarn("fixer failure streak cleanup after successful label skip failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
 	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		return ProcessResult{}, err
@@ -2571,6 +2585,7 @@ func (r *Runner) finishLabelMismatchFixerQueueItem(ctx context.Context, loop sto
 	}); err != nil {
 		return ProcessResult{}, err
 	}
+	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, &checkpoint)
 	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
 	if run != nil {
 		result.RunID = run.ID
@@ -4910,6 +4925,20 @@ func (e *activeRunError) Unwrap() error {
 	return e.loopError
 }
 
+// claimedRunFailureError proves ProcessClaimedItem created and durably failed
+// a run before returning control to recoverClaimedItem. Errors before run
+// creation (especially active-run contention) are deliberately not wrapped,
+// so they keep the queue claim without consuming an attempt or breaker budget.
+type claimedRunFailureError struct {
+	cause      error
+	runID      string
+	checkpoint fixerCheckpoint
+	step       FixerStep
+}
+
+func (e *claimedRunFailureError) Error() string { return e.cause.Error() }
+func (e *claimedRunFailureError) Unwrap() error { return e.cause }
+
 func checkpointStartedCurrentRun(checkpoint fixerCheckpoint, run storage.RunRecord) bool {
 	if checkpoint.RunStartedAt == "" {
 		return false
@@ -5098,6 +5127,10 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 				return loopUpsertResult{}, err
 			} else if resumed {
 				updatedLoop = updated
+			} else if resumed, updated, err := r.resumePausedFailureStreakLoop(ctx, updatedLoop, headSHA, fixItemsStateHash, unresolvedThreadIDs); err != nil {
+				return loopUpsertResult{}, err
+			} else if resumed {
+				updatedLoop = updated
 			} else if resumed, updated, err := r.resumePausedLabelMismatchLoop(ctx, updatedLoop); err != nil {
 				return loopUpsertResult{}, err
 			} else if resumed {
@@ -5204,6 +5237,92 @@ func (r *Runner) resumePausedZeroProgressLoop(ctx context.Context, loop storage.
 		return false, storage.LoopRecord{}, err
 	}
 	return true, updated, nil
+}
+
+// resumePausedFailureStreakLoop unparks a loop stopped by the consecutive-
+// failure circuit breaker. Only new feedback — a changed fix-items state
+// (new unresolved threads, different failing checks) — justifies another
+// run; the same state would simply fail again, which is the retry storm the
+// breaker exists to prevent. Unlike the zero-progress breaker a head-SHA
+// change alone does not resume: a push does not fix broken agent behaviour.
+func (r *Runner) resumePausedFailureStreakLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string) (bool, storage.LoopRecord, error) {
+	if loop.Status != "paused" {
+		return false, loop, nil
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	pauseReason, _ := stringFromAny(metadata["pauseReason"])
+	if pauseReason != failureStreakPauseReason {
+		return false, loop, nil
+	}
+	state, ok := parseFailureStreakState(metadata)
+	if !ok {
+		return false, loop, nil
+	}
+	currentStateHash := strings.TrimSpace(fixItemsStateHash)
+	// A legacy/manual queue may not carry discovery-time state. Unknown state
+	// is fail-closed: only explicit operator retry may reset it, because treating
+	// the first later discovery as new feedback would reopen the retry storm.
+	if state.FixItemsStateHash == "" || currentStateHash == "" || state.FixItemsStateHash == currentStateHash {
+		return false, loop, nil
+	}
+	// The changed discovery state authorizes a fresh attempt, not continuation
+	// of the failed run's stale FixItems snapshot. Persist the restart policy
+	// before exposing the loop as queued so a crash between these writes cannot
+	// process new feedback through an old checkpoint.
+	if err := r.restartLatestRunFromDiscover(ctx, loop.ID); err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		nextRunAt := r.nowISO()
+		updated.NextRunAt = &nextRunAt
+	})
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	updated, err = r.clearFixerFailureStreakMetadata(ctx, updated)
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	updated, err = r.clearPendingFixerRediscoveryIfMatch(ctx, updated, pendingFixerRediscoveryState{
+		HeadSHA:             strings.TrimSpace(headSHA),
+		FixItemsStateHash:   currentStateHash,
+		UnresolvedThreadIDs: canonicalizeStringSlice(unresolvedThreadIDs),
+	})
+	if err != nil {
+		return false, storage.LoopRecord{}, err
+	}
+	return true, updated, nil
+}
+
+func (r *Runner) restartLatestRunFromDiscover(ctx context.Context, loopID string) error {
+	if r.repos == nil || r.repos.Runs == nil {
+		return fmt.Errorf("fixer run repository is not configured")
+	}
+	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	// A legacy test fixture or manually repaired loop may have no run at all;
+	// there is then no checkpoint to invalidate and a fresh run already starts
+	// at discovery.
+	if latestRun == nil {
+		return nil
+	}
+	if latestRun.Status == "success" {
+		// A successful predecessor already creates a fresh discover run.
+		return nil
+	}
+	if latestRun.Status != "failed" && latestRun.Status != "interrupted" {
+		return fmt.Errorf("cannot restart failure-streak loop %s without a failed or interrupted run", loopID)
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+	updated := *latestRun
+	encoded := mustMarshalJSON(checkpoint)
+	updated.CheckpointJSON = &encoded
+	updated.UpdatedAt = r.nowISO()
+	return r.repos.Runs.Upsert(ctx, updated)
 }
 
 func (r *Runner) resumePausedNoopResolveLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string) (bool, storage.LoopRecord, error) {
@@ -5505,7 +5624,10 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 		}
 		return *existing, nil
 	}
-	payload := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash)})
+	payload := mustMarshalJSON(map[string]any{
+		"discoveryFingerprint": buildFixerDiscoveryFingerprint(input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash),
+		"fixItemsStateHash":    strings.TrimSpace(input.FixItemsHash),
+	})
 	activeForLoop, err := r.repos.Queue.FindActiveByLoopID(ctx, input.LoopID)
 	if err != nil {
 		return storage.QueueItemRecord{}, err
@@ -5516,6 +5638,17 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				return *activeForLoop, nil
 			}
 			updated := *activeForLoop
+			oldPayload := parseJSONObject(activeForLoop.PayloadJSON)
+			oldStateHash, _ := stringFromAny(oldPayload["fixItemsStateHash"])
+			newStateHash := strings.TrimSpace(input.FixItemsHash)
+			if oldStateHash = strings.TrimSpace(oldStateHash); oldStateHash != "" && newStateHash != "" && oldStateHash != newStateHash {
+				// The active queue row is a retry of the latest failed run. Replacing
+				// its discovery state without invalidating that run would execute the
+				// old checkpoint while attributing failures to the new payload.
+				if err := r.restartLatestRunFromDiscover(ctx, input.LoopID); err != nil {
+					return storage.QueueItemRecord{}, err
+				}
+			}
 			updated.DedupeKey = dedupeKey
 			updated.AvailableAt = availableAt
 			updated.PayloadJSON = &payload
@@ -5552,9 +5685,87 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 	}
 }
 
+// finishFailureStreakBreaker applies terminal cleanup for every breaker path
+// and immediately hands off to feedback that discovery durably observed while
+// the failing run was active. The new queue state is exposed only after the
+// failed checkpoint is forced back to discover.
+func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint *fixerCheckpoint) (bool, error) {
+	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, checkpoint)
+	if queueItem.Repo == nil || queueItem.PRNumber == nil {
+		return false, nil
+	}
+	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return false, err
+	}
+	if current == nil {
+		return false, nil
+	}
+	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(current.MetadataJSON))
+	if !ok || strings.TrimSpace(pending.FixItemsStateHash) == "" {
+		return false, nil
+	}
+	failedStateHash := ""
+	if checkpoint != nil {
+		failedStateHash = failureStreakFixItemsStateHash(queueItem, *checkpoint)
+	}
+	if strings.TrimSpace(pending.FixItemsStateHash) == strings.TrimSpace(failedStateHash) {
+		return false, nil
+	}
+	if err := r.restartLatestRunFromDiscover(ctx, loop.ID); err != nil {
+		return false, err
+	}
+	availableAt := r.now()
+	queued, err := r.enqueue(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt})
+	if err != nil {
+		return false, err
+	}
+	if queued.Status != "queued" {
+		return false, fmt.Errorf("pending fixer rediscovery for loop %s did not produce a queued item", loop.ID)
+	}
+	updated, err := r.clearPendingFixerRediscoveryIfMatch(ctx, *current, pending)
+	if err != nil {
+		return false, err
+	}
+	updated, err = r.clearFixerFailureStreakMetadata(ctx, updated)
+	if err != nil {
+		return false, err
+	}
+	nextRunAt := eventlog.FormatJavaScriptISOString(availableAt.UTC())
+	_, err = r.updateLoop(ctx, updated, func(next *storage.LoopRecord) {
+		next.Status = "queued"
+		next.LastRunAt = stringPtr(r.nowISO())
+		next.NextRunAt = &nextRunAt
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	return r.requeueOrFailQueueItem(ctx, queueItem, kind, message, nextAttempts)
+}
+
+func (r *Runner) failQueueItemWithBreaker(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep, failure *loopError) (*storage.QueueItemRecord, bool, error) {
+	streak, streakLoop, err := r.recordFixerFailureStreak(ctx, loop, queueItem, runID, checkpoint, step)
+	if err != nil {
+		return nil, false, err
+	}
+	if streak < maxConsecutiveFixerFailures {
+		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		return failedQueue, false, err
+	}
+	// Persist the loop-side pause intent before terminalizing the queue row. If
+	// either write fails, recovery can still observe an active queue item or the
+	// durable terminal row and reconcile the loop; it cannot be stranded as
+	// running with only an inactive queue item.
+	if _, err := r.mergeLoopMetadata(ctx, streakLoop, map[string]any{"pauseReason": failureStreakPauseReason}); err != nil {
+		return nil, false, err
+	}
+	failedQueue, err := r.failQueueItemTerminal(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts+1)
+	return failedQueue, true, err
 }
 
 func (r *Runner) requeueQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, attempts int64) (*storage.QueueItemRecord, error) {
@@ -5569,13 +5780,22 @@ func (r *Runner) requeueQueueItem(ctx context.Context, queueItem storage.QueueIt
 func (r *Runner) requeueOrFailQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, nextAttempts int64) (*storage.QueueItemRecord, error) {
 	nowISO := r.nowISO()
 	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
-		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
-			return nil, err
-		}
-		return r.repos.Queue.GetByID(ctx, queueItem.ID)
+		return r.failQueueItemTerminal(ctx, queueItem, kind, message, nextAttempts)
 	}
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
 	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
+	}
+	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
+// failQueueItemTerminal marks the queue item failed with no further retries,
+// regardless of MaxAttempts. The consecutive-failure circuit breaker uses this
+// to stop a loop whose runs keep failing even when the retry budget would
+// otherwise be unbounded.
+func (r *Runner) failQueueItemTerminal(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, nextAttempts int64) (*storage.QueueItemRecord, error) {
+	nowISO := r.nowISO()
+	if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 		return nil, err
 	}
 	return r.repos.Queue.GetByID(ctx, queueItem.ID)
@@ -5944,6 +6164,31 @@ func (r *Runner) clearZeroProgressMetadata(ctx context.Context, loop storage.Loo
 	return updated, err
 }
 
+func (r *Runner) clearFixerFailureStreakMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	apply := func(updated *storage.LoopRecord) error {
+		meta := parseJSONObject(updated.MetadataJSON)
+		delete(meta, "fixerFailureStreak")
+		if pauseReason, _ := stringFromAny(meta["pauseReason"]); pauseReason == failureStreakPauseReason {
+			delete(meta, "pauseReason")
+		}
+		encoded, err := json.Marshal(meta)
+		if err != nil {
+			return err
+		}
+		metadataJSON := string(encoded)
+		updated.MetadataJSON = &metadataJSON
+		return nil
+	}
+	var mutateErr error
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		mutateErr = apply(updated)
+	})
+	if mutateErr != nil {
+		return storage.LoopRecord{}, mutateErr
+	}
+	return updated, err
+}
+
 func (r *Runner) clearPauseReasonMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
 	apply := func(updated *storage.LoopRecord) error {
 		meta := parseJSONObject(updated.MetadataJSON)
@@ -6181,6 +6426,64 @@ func (r *Runner) recordZeroProgressSuccess(ctx context.Context, loop storage.Loo
 		return false, err
 	}
 	return true, nil
+}
+
+// recordFixerFailureStreak counts consecutive failed runs at the same step
+// against the same fix-items state and persists the streak in loop metadata.
+// Head SHA is diagnostic only: a push changes it and creates a fresh queue
+// item, which is exactly how the retry-storm incident (52+ attempts in 5
+// hours) escaped the queue attempt budget. New feedback or a different
+// failing step starts a fresh streak.
+func (r *Runner) recordFixerFailureStreak(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep) (int, storage.LoopRecord, error) {
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return 0, loop, err
+		}
+		if current != nil {
+			loop = *current
+		}
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	previous, _ := parseFailureStreakState(metadata)
+	current := failureStreakState{
+		LastRunID:         strings.TrimSpace(runID),
+		LastHeadSHA:       detailHeadSHA(checkpoint.Detail),
+		FixItemsStateHash: failureStreakFixItemsStateHash(queueItem, checkpoint),
+		Step:              string(step),
+		ConsecutiveCount:  1,
+		RecordedAt:        r.nowISO(),
+	}
+	// Queue finalization and recovery are separate durable transitions. If a
+	// recovery replay reaches this helper after the streak was persisted but
+	// before the queue transition completed, the same failed run must not count
+	// twice toward the breaker.
+	if current.LastRunID != "" && previous.LastRunID == current.LastRunID {
+		return previous.ConsecutiveCount, loop, nil
+	}
+	if previous.FixItemsStateHash == current.FixItemsStateHash && previous.Step == current.Step {
+		current.ConsecutiveCount = previous.ConsecutiveCount + 1
+	}
+	updatedLoop, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerFailureStreak": current})
+	if err != nil {
+		return 0, loop, err
+	}
+	return current.ConsecutiveCount, updatedLoop, nil
+}
+
+func failureStreakFixItemsStateHash(queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint) string {
+	payload := parseJSONObject(queueItem.PayloadJSON)
+	stateHash, _ := stringFromAny(payload["fixItemsStateHash"])
+	if stateHash = strings.TrimSpace(stateHash); stateHash != "" {
+		// Discovery state is the breaker authority. Later steps may legitimately
+		// filter consumed reviewer summaries from checkpoint.FixItems, but that
+		// must not make unchanged feedback look new and reopen a parked loop.
+		return stateHash
+	}
+	if checkpoint.FixItems != nil {
+		return hashFixItemsState(checkpoint.FixItems)
+	}
+	return ""
 }
 
 func hasProgressed(checkpoint fixerCheckpoint) bool {
@@ -6824,6 +7127,29 @@ func parseZeroProgressState(metadata map[string]any) (zeroProgressState, bool) {
 	}
 	if state.HeadSHA == "" && state.FixItemsHash == "" && state.FixItemsStateHash == "" {
 		return zeroProgressState{}, false
+	}
+	return state, true
+}
+
+func parseFailureStreakState(metadata map[string]any) (failureStreakState, bool) {
+	raw, ok := metadata["fixerFailureStreak"]
+	if !ok || raw == nil {
+		return failureStreakState{}, false
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return failureStreakState{}, false
+	}
+	var state failureStreakState
+	if err := json.Unmarshal(encoded, &state); err != nil {
+		return failureStreakState{}, false
+	}
+	// RecordedAt is the sentinel for "a state was actually persisted": runs
+	// that fail before discovery have no head SHA or fix items, so the key
+	// fields alone cannot distinguish a stored state from garbage, and those
+	// early failures must still accumulate towards the breaker.
+	if state.RecordedAt == "" {
+		return failureStreakState{}, false
 	}
 	return state, true
 }
