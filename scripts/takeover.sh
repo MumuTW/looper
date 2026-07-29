@@ -9,7 +9,7 @@
 #
 # Intended to be pasted into a PR comment, for example:
 #
-#   curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/takeover.sh \
+#   curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/takeover.sh \
 #     | sh -s -- acme/repo#42
 #
 # Everything after `--` is forwarded verbatim to `looper takeover`, so flags
@@ -23,7 +23,7 @@
 
 set -eu
 
-OWNER="${LOOPER_GITHUB_OWNER:-nexu-io}"
+OWNER="${LOOPER_GITHUB_OWNER:-mumutw}"
 REPO="${LOOPER_GITHUB_REPO:-looper}"
 REF="${LOOPER_INSTALL_REF:-main}"
 

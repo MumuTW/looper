@@ -15,11 +15,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const feedbackRepo = "nexu-io/looper"
+const feedbackRepo = "mumutw/looper"
 
 const feedbackCommandTimeout = 5 * time.Minute
 
-var feedbackIssueURLPattern = regexp.MustCompile(`https://github\.com/` + regexp.QuoteMeta(feedbackRepo) + `/issues/\d+`)
+var feedbackIssueURLPattern = regexp.MustCompile(`(?i)https://github\.com/` + regexp.QuoteMeta(feedbackRepo) + `/issues/\d+`)
 
 type feedbackOutput struct {
 	Repo      string `json:"repo"`
@@ -103,7 +103,7 @@ func (r *commandRuntime) feedback(cmd *cobra.Command, args []string) error {
 
 func buildFeedbackPrompt(titleHint, message string, stamper disclosure.Stamper) string {
 	sections := []string{
-		"Create a new GitHub issue in the repository nexu-io/looper for the user feedback below.",
+		"Create a new GitHub issue in the repository mumutw/looper for the user feedback below.",
 		"Write the issue title and body in English.",
 		"Use the local GitHub CLI (`gh`) if needed.",
 	}
@@ -115,7 +115,7 @@ func buildFeedbackPrompt(titleHint, message string, stamper disclosure.Stamper) 
 	}
 	sections = append(sections,
 		"Feedback message:\n"+message,
-		"After creating the issue, print the issue URL (https://github.com/nexu-io/looper/issues/<number>) before the final completion marker line.",
+		"After creating the issue, print the issue URL (https://github.com/mumutw/looper/issues/<number>) before the final completion marker line.",
 	)
 	return agent.AppendCompletionInstruction(strings.Join(sections, "\n\n"))
 }

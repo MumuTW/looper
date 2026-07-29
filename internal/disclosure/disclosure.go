@@ -10,12 +10,13 @@ import (
 )
 
 const (
-	Marker        = "<!-- looper:stamp v=1 -->"
-	RepoURL       = "https://github.com/nexu-io/looper"
-	LegacyRepoURL = "https://github.com/powerformer/looper"
-	RepoLinkHTML  = `<a href="` + RepoURL + `">Looper</a>`
-	Slogan        = "An autonomous AI dev team for your GitHub repos."
-	Emoji         = "🔁"
+	Marker          = "<!-- looper:stamp v=1 -->"
+	RepoURL         = "https://github.com/mumutw/looper"
+	UpstreamRepoURL = "https://github.com/nexu-io/looper"
+	LegacyRepoURL   = "https://github.com/powerformer/looper"
+	RepoLinkHTML    = `<a href="` + RepoURL + `">Looper</a>`
+	Slogan          = "An autonomous AI dev team for your GitHub repos."
+	Emoji           = "🔁"
 
 	ChannelGitCommit     = "gitCommit"
 	ChannelPullRequest   = "pullRequest"
@@ -24,7 +25,7 @@ const (
 )
 
 var (
-	markdownStampPattern = regexp.MustCompile(`(?s)\n*(?:<!-- looper:stamp v=1 -->\n)?<sub>(?:🔁 )?(?:Generated|Powered) by (?:Looper|\[Looper\]\(https://github\.com/(?:nexu-io|powerformer)/looper\)|<a href=\\?"https://github\.com/nexu-io/looper\\?">Looper</a>)(?: [0-9A-Za-z.-]+)?\s*· .*?</sub>\s*`)
+	markdownStampPattern = regexp.MustCompile(`(?s)\n*(?:<!-- looper:stamp v=1 -->\n)?<sub>(?:🔁 )?(?:Generated|Powered) by (?:Looper|\[Looper\]\(https://github\.com/(?:mumutw|nexu-io|powerformer)/looper\)|<a href=\\?"https://github\.com/(?:mumutw|nexu-io)/looper\\?">Looper</a>)(?: [0-9A-Za-z.-]+)?\s*· .*?</sub>\s*`)
 	markerOnlyPattern    = regexp.MustCompile(`(?m)\n*<!-- looper:stamp v=1 -->\s*`)
 	commitTrailerPattern = regexp.MustCompile(`(?m)^Generated-By: looper .*$`)
 )

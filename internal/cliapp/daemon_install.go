@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	defaultReleaseOwner = "nexu-io"
+	defaultReleaseOwner = "mumutw"
 	defaultReleaseRepo  = "looper"
 	looperdBinaryName   = "looperd"
 	looperdUserAgent    = "looper-cli"

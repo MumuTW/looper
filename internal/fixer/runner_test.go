@@ -3549,7 +3549,7 @@ func TestRunResolveCommentsStepSkipsThreadWhenObservedThreadSnapshotDriftsDuring
 func TestRunResolveCommentsStepResolvesLooperReviewerStampedThread(t *testing.T) {
 	t.Parallel()
 
-	reviewerBody := "please fix\n\n<!-- looper:stamp v=1 -->\n<sub>🔁 Powered by <a href=\"https://github.com/nexu-io/looper\">Looper</a> · runner=reviewer · agent=opencode · model=openai/gpt-5.4 · An autonomous AI dev team for your GitHub repos.</sub>"
+	reviewerBody := "please fix\n\n<!-- looper:stamp v=1 -->\n<sub>🔁 Powered by <a href=\"https://github.com/mumutw/looper\">Looper</a> · runner=reviewer · agent=opencode · model=openai/gpt-5.4 · An autonomous AI dev team for your GitHub repos.</sub>"
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
 		Number:      42,
 		State:       "OPEN",

@@ -212,7 +212,7 @@ func TestInstallManagedDaemonExtractsArchiveWhenAvailable(t *testing.T) {
 	app := New(Deps{
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"assets":[
 					{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},
 					{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"},
@@ -300,8 +300,8 @@ func TestUpgradeUnifiedDownloadsCLIAndDaemonConcurrently(t *testing.T) {
 			switch req.URL.String() {
 			case "http://daemon.test/api/v1/status":
 				return nil, errDaemonOffline
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest",
-				"https://api.github.com/repos/nexu-io/looper/releases/tags/v9.9.9":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest",
+				"https://api.github.com/repos/mumutw/looper/releases/tags/v9.9.9":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v9.9.9","assets":[
 					{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},
 					{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"},

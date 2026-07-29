@@ -61,7 +61,7 @@ func TestBootstrapYesInstallsStartsAndPrintsNextSteps(t *testing.T) {
 		},
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, binary), nil
@@ -276,7 +276,7 @@ func TestEnsureBootstrapDaemonForceReinstallsBrokenManagedBinary(t *testing.T) {
 		Arch:     "arm64",
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, binary), nil
@@ -355,7 +355,7 @@ func TestBootstrapJSONSuppressesDaemonStartOutput(t *testing.T) {
 		},
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, binary), nil
@@ -834,7 +834,7 @@ func TestBootstrapIdempotentWhenConfigProjectAndDaemonAlreadyHealthy(t *testing.
 		},
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64", "https://example.invalid/looperd-darwin-arm64.sha256":
 				installAssetCalls.Add(1)
@@ -954,7 +954,7 @@ func TestBootstrapRestartsReachableStaleDaemonAfterReinstall(t *testing.T) {
 		},
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64":
 				installedVersion = "1.2.3"
@@ -1074,7 +1074,7 @@ func TestBootstrapInstalledStatusAPIErrorFailsWithoutSpawnOrRestart(t *testing.T
 		},
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, binary), nil
@@ -1287,7 +1287,7 @@ func TestBootstrapAddsProjectWithoutPersistingRuntimeOverrides(t *testing.T) {
 		},
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[]}`), nil
 			case "http://daemon.test/api/v1/status":
 				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true,"binary":{"name":"looperd"}}}}`), nil

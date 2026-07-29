@@ -635,8 +635,8 @@ func TestBackgroundAutoUpgradeCommandPersistsReadyRestartState(t *testing.T) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_status","data":{"service":{"version":"0.2.1","binary":{"name":"looperd","path":%q}}}}`, managedPath)), nil
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest",
-				"https://api.github.com/repos/nexu-io/looper/releases/tags/v0.3.0":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest",
+				"https://api.github.com/repos/mumutw/looper/releases/tags/v0.3.0":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"},{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looper-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, cliBinary), nil
@@ -731,7 +731,7 @@ func TestBackgroundAutoUpgradeCommandSkipsDaemonInstallWithoutManagedBinary(t *t
 		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looper-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, cliBinary), nil
@@ -740,7 +740,7 @@ func TestBackgroundAutoUpgradeCommandSkipsDaemonInstallWithoutManagedBinary(t *t
 			case "http://127.0.0.1:4321/api/v1/status":
 				t.Fatalf("unexpected daemon status request %q", req.URL.String())
 				return nil, nil
-			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v0.3.0":
+			case "https://api.github.com/repos/mumutw/looper/releases/tags/v0.3.0":
 				t.Fatalf("unexpected daemon release fetch %q", req.URL.String())
 				return nil, nil
 			default:
@@ -915,7 +915,7 @@ func TestUpgradeCheckPrintsSummary(t *testing.T) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return nil, fmt.Errorf("daemon offline")
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[]}`), nil
 			default:
 				t.Fatalf("unexpected request URL %q", req.URL.String())
@@ -966,7 +966,7 @@ func TestUpgradeCheckUsesManagedProvenanceFromStatusAPI(t *testing.T) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return jsonResponse(t, http.StatusOK, `{"success":true,"data":{"service":{"version":"0.2.1","binary":{"path":"`+managedPath+`"}}}}`), nil
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[]}`), nil
 			default:
 				t.Fatalf("unexpected request URL %q", req.URL.String())
@@ -1108,9 +1108,9 @@ func TestUpgradeWithoutFlagsContinuesWithDaemonWhenCLISelfUpgradeRefused(t *test
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return nil, fmt.Errorf("daemon offline")
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
-			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v0.3.0":
+			case "https://api.github.com/repos/mumutw/looper/releases/tags/v0.3.0":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, binary), nil
@@ -1191,8 +1191,8 @@ func TestUpgradeWithoutFlagsDoesNotInstallDaemonWhenCLIUpgradeFails(t *testing.T
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return nil, fmt.Errorf("daemon offline")
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest",
-				"https://api.github.com/repos/nexu-io/looper/releases/tags/v9.9.9":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest",
+				"https://api.github.com/repos/mumutw/looper/releases/tags/v9.9.9":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v9.9.9","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"},{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looper-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, cliBinary), nil
@@ -1250,9 +1250,9 @@ func TestUpgradeWithoutFlagsWritesSingleJSONDocument(t *testing.T) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return nil, fmt.Errorf("daemon offline")
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
-			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v0.3.0":
+			case "https://api.github.com/repos/mumutw/looper/releases/tags/v0.3.0":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, binary), nil
@@ -1387,7 +1387,7 @@ func TestUpgradeCLIPreflightsInstallPathBeforeDownload(t *testing.T) {
 		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"}]}`), nil
 			default:
 				t.Fatalf("unexpected request URL %q", req.URL.String())
@@ -1435,7 +1435,7 @@ func TestUpgradeCLIPrintsDownloadProgressToStderr(t *testing.T) {
 		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v999.0.0","assets":[{"name":"looper-darwin-arm64","browser_download_url":"https://example.invalid/looper-darwin-arm64"},{"name":"looper-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looper-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looper-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, binary), nil
@@ -1539,9 +1539,9 @@ func TestUpgradeDaemonPrintsRestartHint(t *testing.T) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return nil, fmt.Errorf("daemon offline")
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
-			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v0.3.0":
+			case "https://api.github.com/repos/mumutw/looper/releases/tags/v0.3.0":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, binary), nil
@@ -1594,7 +1594,7 @@ func TestUpgradeDaemonSkipsCurrentManagedBinary(t *testing.T) {
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return nil, fmt.Errorf("daemon offline")
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.2.1","assets":[]}`), nil
 			default:
 				t.Fatalf("unexpected request URL %q", req.URL.String())
@@ -1646,9 +1646,9 @@ func TestUpgradeDaemonInstallsManagedBinaryWhenOnlyPathBinaryExists(t *testing.T
 			switch req.URL.String() {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return nil, fmt.Errorf("daemon offline")
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.4.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
-			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v0.4.0":
+			case "https://api.github.com/repos/mumutw/looper/releases/tags/v0.4.0":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.4.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64":
 				return binaryResponse(t, http.StatusOK, binary), nil
@@ -1721,15 +1721,15 @@ func TestManagedDaemonInstallUpgradeLifecycleEndToEnd(t *testing.T) {
 		Arch:     "arm64",
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
-			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+			case "https://api.github.com/repos/mumutw/looper/releases/latest":
 				latestCalls += 1
 				if latestCalls == 1 {
 					return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.2.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64-v0.2.0"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64-v0.2.0.sha256"}]}`), nil
 				}
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64-v0.3.0"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64-v0.3.0.sha256"}]}`), nil
-			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v0.3.0":
+			case "https://api.github.com/repos/mumutw/looper/releases/tags/v0.3.0":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64-v0.3.0"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64-v0.3.0.sha256"}]}`), nil
-			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v0.2.0":
+			case "https://api.github.com/repos/mumutw/looper/releases/tags/v0.2.0":
 				return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.2.0","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64-v0.2.0"},{"name":"looperd-darwin-arm64.sha256","browser_download_url":"https://example.invalid/looperd-darwin-arm64-v0.2.0.sha256"}]}`), nil
 			case "https://example.invalid/looperd-darwin-arm64-v0.2.0":
 				return binaryResponse(t, http.StatusOK, oldBinary), nil
