@@ -32,6 +32,7 @@ import (
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validationcmd"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
@@ -2728,11 +2729,9 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 
 	outputs := make([]string, 0, len(input.Commands)*2)
 	for _, command := range input.Commands {
-		result, err := shell.Run(ctx, shell.Options{
-			Command: "/bin/sh",
-			Args:    []string{"-c", command},
+		result, err := validationcmd.Run(ctx, validationcmd.Options{
 			CWD:     input.CWD,
-			Env:     agent.BuildCommandEnvMap(input.CWD, ""),
+			Command: command,
 			Timeout: r.agentTimeout,
 			// Supervisor-owned validation: track handle so shutdown retain-storage
 			// sees Kill/Drain failures even when validation collapses them to Passed=false.

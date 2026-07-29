@@ -2075,6 +2075,8 @@ func enforceCodexToolNetworkDenied(args []string, prompt string) []string {
 		switch {
 		case arg == "--dangerously-bypass-approvals-and-sandbox" || arg == "--dangerously-bypass-hook-trust":
 			continue
+		case arg == "--search" || strings.HasPrefix(arg, "--search="):
+			continue
 		case arg == "--add-dir" || arg == "-C" || arg == "--cd" || arg == "-p" || arg == "--profile" || arg == "--enable":
 			if i+1 < len(args) {
 				i++
@@ -2104,7 +2106,7 @@ func enforceCodexToolNetworkDenied(args []string, prompt string) []string {
 	if trailingPrompt {
 		filtered = filtered[:len(filtered)-1]
 	}
-	filtered = append(filtered,
+	restrictions := []string{
 		"--ignore-user-config",
 		"-s", "workspace-write",
 		"-c", "sandbox_workspace_write.network_access=false",
@@ -2113,7 +2115,15 @@ func enforceCodexToolNetworkDenied(args []string, prompt string) []string {
 		"--disable", "browser_use_full_cdp_access",
 		"--disable", "in_app_browser",
 		"--disable", "standalone_web_search",
-	)
+	}
+	insertAt := len(filtered)
+	for i, arg := range filtered {
+		if arg == "resume" {
+			insertAt = i
+			break
+		}
+	}
+	filtered = append(filtered[:insertAt], append(restrictions, filtered[insertAt:]...)...)
 	if trailingPrompt {
 		filtered = append(filtered, prompt)
 	}
@@ -2121,7 +2131,7 @@ func enforceCodexToolNetworkDenied(args []string, prompt string) []string {
 }
 
 func unsafeCodexSandboxConfig(value string) bool {
-	for _, key := range []string{"sandbox_workspace_write", "sandbox_permissions", "sandbox_mode", "approval_policy", "mcp_servers", "features.browser_use", "features.in_app_browser", "features.standalone_web_search"} {
+	for _, key := range []string{"sandbox_workspace_write", "sandbox_permissions", "sandbox_mode", "approval_policy", "mcp_servers", "web_search", "features.browser_use", "features.in_app_browser", "features.standalone_web_search"} {
 		if strings.Contains(value, key) {
 			return true
 		}

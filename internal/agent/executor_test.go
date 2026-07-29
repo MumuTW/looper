@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -102,10 +103,10 @@ func TestResolveSpawnCodexDoesNotDuplicateExecSubcommand(t *testing.T) {
 func TestEnforceCodexToolNetworkDeniedOverridesUnsafeOperatorArgs(t *testing.T) {
 	t.Parallel()
 
-	args := []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "--add-dir", "/tmp/escape", "--profile", "unsafe", "--enable", "enable_mcp_apps", "--sandbox", "danger-full-access", "-c", "sandbox_workspace_write.network_access=true", "-c", "sandbox_permissions=[\"disk-full-read-access\"]", "-c", "mcp_servers.github.command=\"unsafe\"", "-c", "model_reasoning_effort=high", "hello"}
+	args := []string{"exec", "--search", "--dangerously-bypass-approvals-and-sandbox", "--add-dir", "/tmp/escape", "--profile", "unsafe", "--enable", "enable_mcp_apps", "--sandbox", "danger-full-access", "-c", "sandbox_workspace_write.network_access=true", "-c", "sandbox_permissions=[\"disk-full-read-access\"]", "-c", "mcp_servers.github.command=\"unsafe\"", "-c", "web_search=\"live\"", "-c", "model_reasoning_effort=high", "hello"}
 	got := enforceCodexToolNetworkDenied(args, "hello")
 	joined := strings.Join(got, " ")
-	if strings.Contains(joined, "dangerously-bypass") || strings.Contains(joined, "danger-full-access") || strings.Contains(joined, "network_access=true") || strings.Contains(joined, "/tmp/escape") || strings.Contains(joined, "sandbox_permissions") || strings.Contains(joined, "mcp_servers") || strings.Contains(joined, "enable_mcp_apps") || strings.Contains(joined, "unsafe") {
+	if strings.Contains(joined, "dangerously-bypass") || strings.Contains(joined, "danger-full-access") || strings.Contains(joined, "network_access=true") || strings.Contains(joined, "/tmp/escape") || strings.Contains(joined, "sandbox_permissions") || strings.Contains(joined, "mcp_servers") || strings.Contains(joined, "web_search=\"live\"") || strings.Contains(joined, "--search") || strings.Contains(joined, "enable_mcp_apps") || strings.Contains(joined, "unsafe") {
 		t.Fatalf("restricted args retain an unsafe override: %q", joined)
 	}
 	for _, want := range []string{"--ignore-user-config", "-s workspace-write", "-c sandbox_workspace_write.network_access=false", "--disable browser_use", "--disable in_app_browser", "-c model_reasoning_effort=high"} {
@@ -115,6 +116,20 @@ func TestEnforceCodexToolNetworkDeniedOverridesUnsafeOperatorArgs(t *testing.T) 
 	}
 	if got[len(got)-1] != "hello" {
 		t.Fatalf("restricted args = %#v, prompt must remain last", got)
+	}
+}
+
+func TestEnforceCodexToolNetworkDeniedPlacesExecFlagsBeforeResume(t *testing.T) {
+	t.Parallel()
+
+	got := enforceCodexToolNetworkDenied([]string{"exec", "--json", "resume", "session-123", "continue"}, "continue")
+	resumeIndex := slices.Index(got, "resume")
+	sandboxIndex := slices.Index(got, "-s")
+	if resumeIndex < 0 || sandboxIndex < 0 || sandboxIndex > resumeIndex {
+		t.Fatalf("restricted resume args = %#v, want exec-level sandbox flags before resume", got)
+	}
+	if got[len(got)-1] != "continue" {
+		t.Fatalf("restricted resume args = %#v, want prompt last", got)
 	}
 }
 

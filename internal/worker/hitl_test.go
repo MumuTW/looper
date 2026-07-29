@@ -291,3 +291,65 @@ func containsAll(s string, subs ...string) bool {
 	}
 	return true
 }
+
+func TestEnsureDraftPRForAskValidatesAndPinsPublishedHead(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	git := &fakeGitGateway{inspectResults: []InspectHeadResult{
+		{HeadSHA: "validated-head", NewCommitSHAs: []string{"validated-head"}},
+		{HeadSHA: "validated-head", NewCommitSHAs: []string{"validated-head"}},
+		{HeadSHA: "validated-head", NewCommitSHAs: []string{"validated-head"}},
+	}}
+	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 42, URL: "https://example/pr/42"}}
+	runner := New(Options{
+		Git: git, GitHub: github,
+		ValidationCommands: []string{"make check"},
+		ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+			return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+		},
+	})
+	checkpoint := workerCheckpoint{
+		Work:     &workerInput{Repo: "acme/widgets", Branch: "looper/feature", BaseBranch: "main", Title: "Feature"},
+		Worktree: &checkpointWorktree{Path: worktree, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head"},
+	}
+	input := stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: worktree}, Loop: storage.LoopRecord{ID: "loop_1"}}
+
+	number, err := runner.ensureDraftPRForAsk(context.Background(), input, &checkpoint, "acme/widgets", worktree)
+	if err != nil {
+		t.Fatalf("ensureDraftPRForAsk() error = %v", err)
+	}
+	if number != 42 || len(git.pushCalls) != 1 || git.pushCalls[0].LocalHeadSHA != "validated-head" {
+		t.Fatalf("draft publish = number %d pushes %#v, want PR 42 pinned to validated-head", number, git.pushCalls)
+	}
+	if checkpoint.Validation == nil || !checkpoint.Validation.Passed || checkpoint.Validation.HeadSHA != "validated-head" {
+		t.Fatalf("checkpoint.Validation = %#v, want validated-head", checkpoint.Validation)
+	}
+}
+
+func TestEnsureDraftPRForAskDoesNotPublishFailedValidation(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	git := &fakeGitGateway{}
+	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 42}}
+	runner := New(Options{
+		Git: git, GitHub: github,
+		ValidationCommands: []string{"make check"},
+		ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+			return ValidationResult{Passed: false, Summary: "Validation failed"}, nil
+		},
+	})
+	checkpoint := workerCheckpoint{
+		Work:     &workerInput{Repo: "acme/widgets", Branch: "looper/feature", BaseBranch: "main", Title: "Feature"},
+		Worktree: &checkpointWorktree{Path: worktree, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head"},
+	}
+	input := stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: worktree}, Loop: storage.LoopRecord{ID: "loop_1"}}
+
+	if _, err := runner.ensureDraftPRForAsk(context.Background(), input, &checkpoint, "acme/widgets", worktree); err == nil {
+		t.Fatal("ensureDraftPRForAsk() error = nil, want validation failure")
+	}
+	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 {
+		t.Fatalf("failed validation published draft: pushes=%d prs=%d", len(git.pushCalls), len(github.createPRCalls))
+	}
+}

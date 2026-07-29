@@ -218,3 +218,46 @@ func TestRunValidateStepRefreshesReconcileMetadataWhenValidationCommitsCleanly(t
 		t.Fatalf("ReconcileCommits = %#v, want refreshed clean validation head", checkpoint.ReconcileCommits)
 	}
 }
+
+func TestRunValidateStepRefreshesReconcileMetadataAfterSecondValidation(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	git := &fakeGitGateway{
+		inspectResults: []InspectHeadResult{
+			{HeadSHA: "repair-head", HasUncommittedChanges: true},
+			{HeadSHA: "repair-head", HasUncommittedChanges: true, ChangedFiles: []string{"generated.go"}},
+			{HeadSHA: "commit-1", NewCommitSHAs: []string{"commit-1"}},
+			{HeadSHA: "validation-head", NewCommitSHAs: []string{"commit-1", "validation-head"}, ChangedFiles: []string{"generated.go"}},
+		},
+	}
+	validationCalls := 0
+	runner := New(Options{
+		Git: git, AllowAutoCommit: true,
+		ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+			validationCalls++
+			return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+		},
+	})
+	checkpoint, err := runner.runValidateStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Run:     storage.RunRecord{ID: "run_1"},
+		Checkpoint: fixerCheckpoint{
+			Detail:           &checkpointDetail{BaseRefName: "main"},
+			Worktree:         &checkpointWorktree{Path: worktree, Branch: "feature/fix", BaseHeadSHA: "base-head"},
+			ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "repair-head", WorkingTreeClean: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runValidateStep() error = %v", err)
+	}
+	if validationCalls != 2 {
+		t.Fatalf("validation calls = %d, want 2", validationCalls)
+	}
+	if checkpoint.Validation == nil || checkpoint.Validation.HeadSHA != "validation-head" {
+		t.Fatalf("Validation = %#v, want validation-head", checkpoint.Validation)
+	}
+	if checkpoint.ReconcileCommits == nil || checkpoint.ReconcileCommits.FinalHeadSHA != "validation-head" {
+		t.Fatalf("ReconcileCommits = %#v, want final validation head", checkpoint.ReconcileCommits)
+	}
+}

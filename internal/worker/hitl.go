@@ -338,7 +338,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	// so the ask metadata carries the PR + comment id the answer-poll lane needs.
 	// Best-effort — the loop still parks awaiting_human if delivery fails.
 	if r.hitlTransportGitHub() {
-		if err := r.deliverAskToGitHub(ctx, input, checkpoint, awaiting, &ask); err != nil && r.logger != nil {
+		if err := r.deliverAskToGitHub(ctx, input, &checkpoint, awaiting, &ask); err != nil && r.logger != nil {
 			r.logger.Warn("worker HITL github ask delivery failed; loop parked awaiting human without a PR comment", map[string]any{
 				"loopId": input.Loop.ID, "error": err.Error(),
 			})
@@ -425,7 +425,10 @@ func (r *Runner) hitlAwaitingLabel() string {
 // question as a marked PR comment, labels the PR so the answer-poll lane finds
 // it, and records the PR + comment id on the ask. Best-effort; returns an error
 // the caller logs while still parking the loop awaiting_human.
-func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkpoint workerCheckpoint, awaiting *awaitingHumanError, ask *loops.HITLAsk) error {
+func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkpoint *workerCheckpoint, awaiting *awaitingHumanError, ask *loops.HITLAsk) error {
+	if checkpoint == nil {
+		return fmt.Errorf("hitl github: worker checkpoint is required")
+	}
 	repo := derefString(input.Loop.Repo)
 	if repo == "" && checkpoint.Work != nil {
 		repo = checkpoint.Work.Repo
@@ -497,8 +500,8 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkp
 // ensureDraftPRForAsk pushes the loop's WIP branch and opens a draft PR to carry
 // the question. Requires committed WIP on the branch; returns an error when there
 // is nothing to open a PR from.
-func (r *Runner) ensureDraftPRForAsk(ctx context.Context, input stepInput, checkpoint workerCheckpoint, repo, cwd string) (int64, error) {
-	if checkpoint.Worktree == nil || strings.TrimSpace(checkpoint.Worktree.Branch) == "" {
+func (r *Runner) ensureDraftPRForAsk(ctx context.Context, input stepInput, checkpoint *workerCheckpoint, repo, cwd string) (int64, error) {
+	if checkpoint == nil || checkpoint.Worktree == nil || strings.TrimSpace(checkpoint.Worktree.Branch) == "" {
 		return 0, fmt.Errorf("hitl github: no worktree branch to open a draft PR for loop %s", input.Loop.ID)
 	}
 	base := strings.TrimSpace(checkpoint.Worktree.BaseBranch)
@@ -519,7 +522,16 @@ func (r *Runner) ensureDraftPRForAsk(ctx context.Context, input stepInput, check
 	if err != nil {
 		return 0, err
 	}
-	if err := r.git.Push(ctx, PushInput{RepoPath: cwd, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: compactStrings([]string{base})}); err != nil {
+	if len(r.validationCommands) > 0 {
+		validateInput := input
+		validateInput.Checkpoint = *checkpoint
+		validated, err := r.runValidateStep(ctx, validateInput)
+		if err != nil {
+			return 0, fmt.Errorf("hitl github: validation blocked draft publication: %w", err)
+		}
+		*checkpoint = validated
+	}
+	if err := r.git.Push(ctx, PushInput{RepoPath: cwd, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, LocalHeadSHA: workerValidatedHeadSHA(*checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{base})}); err != nil {
 		return 0, err
 	}
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)

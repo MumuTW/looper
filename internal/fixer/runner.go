@@ -34,6 +34,7 @@ import (
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validationcmd"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
@@ -3170,27 +3171,33 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		}
 		second.HeadSHA = finalInspect.HeadSHA
 		second.Summary = firstNonEmpty(second.Summary, "Validation passed after extra reconcile")
+		r.refreshReconcileMetadata(&checkpoint, worktree, finalInspect)
 		checkpoint.Validation = &second
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
-	if checkpoint.ReconcileCommits != nil && checkpoint.ReconcileCommits.FinalHeadSHA != inspect.HeadSHA {
-		checkpoint.ReconcileCommits.FinalHeadSHA = inspect.HeadSHA
-		checkpoint.ReconcileCommits.NewCommitSHAs = append([]string(nil), inspect.NewCommitSHAs...)
-		checkpoint.ReconcileCommits.CommittedByAgent = len(inspect.NewCommitSHAs) > 0
-		checkpoint.ReconcileCommits.WorkingTreeClean = true
-		checkpoint.ReconcileCommits.ChangedFiles = append([]string(nil), inspect.ChangedFiles...)
-		checkpoint.ReconcileCommits.CompletedAt = r.nowISO()
-		checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
-		checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
-		if len(inspect.NewCommitSHAs) > 0 && checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
-			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
-		}
-	}
+	r.refreshReconcileMetadata(&checkpoint, worktree, inspect)
 	result.HeadSHA = inspect.HeadSHA
 	checkpoint.Validation = &result
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) refreshReconcileMetadata(checkpoint *fixerCheckpoint, worktree *checkpointWorktree, inspect InspectHeadResult) {
+	if checkpoint == nil || worktree == nil || checkpoint.ReconcileCommits == nil || checkpoint.ReconcileCommits.FinalHeadSHA == inspect.HeadSHA {
+		return
+	}
+	checkpoint.ReconcileCommits.FinalHeadSHA = inspect.HeadSHA
+	checkpoint.ReconcileCommits.NewCommitSHAs = append([]string(nil), inspect.NewCommitSHAs...)
+	checkpoint.ReconcileCommits.CommittedByAgent = len(inspect.NewCommitSHAs) > 0
+	checkpoint.ReconcileCommits.WorkingTreeClean = true
+	checkpoint.ReconcileCommits.ChangedFiles = append([]string(nil), inspect.ChangedFiles...)
+	checkpoint.ReconcileCommits.CompletedAt = r.nowISO()
+	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
+	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
+	if len(inspect.NewCommitSHAs) > 0 && checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
+		checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+	}
 }
 
 func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -6572,11 +6579,9 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 
 	outputs := make([]string, 0, len(input.Commands)*2)
 	for _, command := range input.Commands {
-		result, err := shell.Run(ctx, shell.Options{
-			Command: "/bin/sh",
-			Args:    []string{"-c", command},
+		result, err := validationcmd.Run(ctx, validationcmd.Options{
 			CWD:     input.CWD,
-			Env:     agent.BuildCommandEnvMap(input.CWD, ""),
+			Command: command,
 			Timeout: r.agentTimeout,
 			// Supervisor-owned validation: track handle so shutdown retain-storage
 			// sees Kill/Drain failures even when validation collapses them to Passed=false.
