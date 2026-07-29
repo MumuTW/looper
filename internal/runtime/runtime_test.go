@@ -2628,7 +2628,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 			default:
 				return "", nil
 			}
-		}})
+		}, RunSchedulerTick: func(context.Context, Services) error { return nil }})
 		if err := rt.Start(context.Background()); err != nil {
 			t.Fatalf("Start() error = %v", err)
 		}
@@ -2802,7 +2802,12 @@ func TestRuntimeReconcileStaleRunningRunsIsIdempotent(t *testing.T) {
 			nowISO := formatJavaScriptISOString(now)
 			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+			rt := New(Options{
+				Config:           cfg,
+				Logger:           &testLogger{},
+				Now:              func() time.Time { return now },
+				RunSchedulerTick: func(context.Context, Services) error { return nil },
+			})
 			if err := rt.Start(context.Background()); err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
