@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -121,11 +122,19 @@ func TestRunRetryDiscardsWhenConfirmed(t *testing.T) {
 	}
 }
 
+// writeAPIError emits the envelope a real daemon sends, so these tests exercise
+// the code the CLI branches on rather than Go's bare "404 page not found" body.
+func writeAPIError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, `{"ok":false,"error":{"code":%q,"message":%q}}`, code, message)
+}
+
 func TestRunRetrySkipsPreflightWhenRouteMissing(t *testing.T) {
 	var posts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/worktree") {
-			http.NotFound(w, r)
+			writeAPIError(w, http.StatusNotFound, "ROUTE_NOT_FOUND", "Unknown route")
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/retry") {
@@ -144,6 +153,44 @@ func TestRunRetrySkipsPreflightWhenRouteMissing(t *testing.T) {
 	}
 	if posts != 1 {
 		t.Fatalf("posts = %d, want 1", posts)
+	}
+}
+
+// A 404 that is not ROUTE_NOT_FOUND means the route exists and answered. The
+// gate must hold: /worktree returns PROJECT_NOT_FOUND when the loop's project
+// row is archived or missing, and skipping the preflight there would requeue a
+// dirty worktree — the exact regression the preflight exists to prevent.
+func TestRunRetryKeepsPreflightOnNonRouteNotFound(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		status  int
+		code    string
+		message string
+	}{
+		{"archived project", http.StatusNotFound, "PROJECT_NOT_FOUND", "Project not found: acme"},
+		{"stat failure naming pr 404", http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to stat worktree at /w/looper-fix-acme-pr-404: permission denied"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var posts int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/worktree") {
+					writeAPIError(w, testCase.status, testCase.code, testCase.message)
+					return
+				}
+				posts++
+				_, _ = w.Write([]byte(`{"ok":true,"data":{}}`))
+			}))
+			defer server.Close()
+
+			host, port := splitHostPort(server.URL)
+			code := run([]string{"--host", host, "--port", port, "retry", "12"}, strings.NewReader(""), io.Discard, io.Discard)
+			if code == 0 {
+				t.Fatalf("exit = 0, want non-zero: the preflight was skipped on a %s", testCase.code)
+			}
+			if posts != 0 {
+				t.Fatalf("posts = %d, want 0: retry was requeued without a worktree check", posts)
+			}
+		})
 	}
 }
 
