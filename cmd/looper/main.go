@@ -404,6 +404,13 @@ Global flags, accepted before or after the verb:
   --host <host>                Daemon host, overriding the config
   --port <port>                Daemon port, overriding the config
 
+There is one more command, which is not for operators:
+  looper review submit <repo>#<number> --event <event> --commit-id <sha>
+                               Publish a reviewer agent's pull request review.
+                               Reviewer agents reach it through a wrapper the
+                               daemon writes; run directly it has no provider
+                               credentials and will fail.
+
 A selector is a loop sequence number (looper stop 12) or a loop id
 (looper stop loop_1cf3); those are what the daemon resolves.
 The respond answer is a single argument, so quote anything with spaces.
