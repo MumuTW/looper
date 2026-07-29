@@ -72,11 +72,26 @@ type CodingRoleConfig struct {
 	// phase runs between consecutive lanes, so an earlier role gets first
 	// call on the free run slots. A new role declares where it belongs
 	// instead of inheriting whatever order a map happened to produce.
+	//
+	// The zero value is not a safe default: it sorts ahead of every shipped
+	// role, so an unset Priority silently claims the most consequential
+	// position in the tick. Every construction path fills it today
+	// (CodingRolesFromLegacy), which is what keeps that unreachable. Whoever
+	// makes roles authorable from TOML has to close it — reject an unset
+	// priority, or default it to the tail — before an omitted field can mean
+	// "run first".
 	Priority int `json:"priority"`
 }
 
-// Lane priorities for the roles looper ships with. Spaced so a custom role
-// can be slotted between two of them without renumbering.
+// Lane priorities for the roles looper ships with. These are the only lane
+// priorities in play: roles cannot yet be authored from configuration (see
+// RoleConfigs.Coding), and a role name with no compiled-in discoverer is
+// skipped, so the set below is closed. Spaced by 10 so reordering means
+// editing one constant rather than renumbering the block.
+//
+// Coordinator is listed here to keep the whole tick order readable in one
+// place, but it does not travel through CodingRoleConfig.Priority like the
+// others: it is not a coding role, so coordinatorLane applies it directly.
 const (
 	PriorityPlanner     = 10
 	PriorityCoordinator = 20
