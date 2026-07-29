@@ -181,6 +181,7 @@ type Runtime struct {
 	worktreeCleanupRunning      bool
 	worktreeCleanupInitialDelay time.Duration
 	worktreeCleanupStatus       WorktreeCleanupStatus
+	projectDiscovery            *projectDiscoveryRunner
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
 	activeExecutions            *ActiveExecutionRegistry
@@ -280,6 +281,7 @@ func New(options Options) *Runtime {
 		signalProcess:               signalProcess,
 		shutdownTimeout:             shutdownTimeout,
 		worktreeCleanupInitialDelay: options.WorktreeCleanupInitialDelay,
+		projectDiscovery:            newProjectDiscoveryRunner(),
 		deferRecovery:               options.DeferRecovery,
 		recovery:                    createEmptyRecoverySummary(),
 		shutdownCh:                  make(chan struct{}),
@@ -361,6 +363,7 @@ func (r *Runtime) Stop(reason string) {
 		r.stopDeferredReviewerRecovery()
 		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
+		r.stopProjectDiscovery()
 		r.stopWebhookRuntime()
 
 		// Re-collect non-agent containment drain failures reported while
@@ -481,10 +484,11 @@ func (r *Runtime) BeginShutdown(reason string) {
 // MarkDegraded/BeginShutdown can invoke them while holding admission.mu
 // without re-entering r.mu (lock-order safety).
 type workProducerCancels struct {
-	scheduler context.CancelFunc
-	recovery  context.CancelFunc
-	cleanup   context.CancelFunc
-	forwarder interface{ CancelExecute() }
+	scheduler        context.CancelFunc
+	recovery         context.CancelFunc
+	cleanup          context.CancelFunc
+	projectDiscovery *projectDiscoveryRunner
+	forwarder        interface{ CancelExecute() }
 }
 
 // invokeForDegrade cancels sticky-degrade producers but leaves webhook execute
@@ -499,6 +503,9 @@ func (c workProducerCancels) invokeForDegrade() {
 	}
 	if c.cleanup != nil {
 		c.cleanup()
+	}
+	if c.projectDiscovery != nil {
+		c.projectDiscovery.Cancel()
 	}
 }
 
@@ -518,10 +525,11 @@ func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return workProducerCancels{
-		scheduler: r.schedulerCancel,
-		recovery:  r.recoveryCancel,
-		cleanup:   r.worktreeCleanupCancel,
-		forwarder: r.webhookForwarder,
+		scheduler:        r.schedulerCancel,
+		recovery:         r.recoveryCancel,
+		cleanup:          r.worktreeCleanupCancel,
+		projectDiscovery: r.projectDiscovery,
+		forwarder:        r.webhookForwarder,
 	}
 }
 
@@ -926,6 +934,8 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.publishProjectsSnapshot(projects)
 		},
 		AfterPublishProjects: r.afterProjectsPublished,
+		DiscoveryContext:     r.projectDiscoveryContext,
+		ScheduleDiscovery:    r.scheduleProjectDiscovery,
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	startedAt := r.now().UTC()

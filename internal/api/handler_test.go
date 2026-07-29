@@ -2230,6 +2230,23 @@ func TestHandlerProjectDiscoverRouteRejectsGet(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsRemoveRouteDoesNotTreatDiscoverIDAsDiscoverSubroute(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "discover", Name: "Discover", RepoPath: "/tmp/discover", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/api/v1/projects/discover", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["id"], "discover")
+	assertEqual(t, data["archived"], true)
+}
+
 func TestHandlerProjectsRemoveRouteArchivesProject(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)

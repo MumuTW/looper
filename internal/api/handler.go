@@ -1987,9 +1987,15 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 
 	requestPath := normalizePath(r.URL.EscapedPath())
 	discoverRoute := false
-	if trimmed := strings.TrimSuffix(requestPath, "/"); strings.HasSuffix(trimmed, "/discover") {
-		discoverRoute = true
-		requestPath = strings.TrimSuffix(trimmed, "/discover")
+	trimmed := strings.TrimSuffix(requestPath, "/")
+	projectPathPrefix := apiBasePath + "/projects/"
+	projectPathSuffix := strings.TrimPrefix(trimmed, projectPathPrefix)
+	if projectPathSuffix != trimmed {
+		segments := strings.Split(projectPathSuffix, "/")
+		if len(segments) == 2 && segments[1] == "discover" {
+			discoverRoute = true
+			requestPath = projectPathPrefix + segments[0]
+		}
 	}
 
 	identifier, err := decodeProjectIdentifier(requestPath)

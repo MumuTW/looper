@@ -103,7 +103,7 @@ type DiscoveryState struct {
 
 type Service struct {
 	mutationMu   sync.Mutex
-	projectLocks sync.Map // map[string]*sync.Mutex
+	projectLocks sync.Map // map[string]*projectOperationLock
 	DB           *sql.DB
 	Repos        *storage.Repositories
 	Logger       bootstrap.Logger
@@ -130,12 +130,24 @@ type Service struct {
 	// background goroutine so registration never waits on discovery. Tests may
 	// replace it to run inline or to suppress automatic discovery.
 	ScheduleDiscovery func(func())
+	// DiscoveryContext supplies the lifecycle context for post-commit work. The
+	// default is context.Background for standalone Service users; runtimes inject
+	// a cancelable context and own the corresponding goroutine drain.
+	DiscoveryContext func() context.Context
+}
+
+type projectOperationLock struct{ token chan struct{} }
+
+func newProjectOperationLock() *projectOperationLock {
+	lock := &projectOperationLock{token: make(chan struct{}, 1)}
+	lock.token <- struct{}{}
+	return lock
 }
 
 // lockProjectOperations serializes discovery with mutations for the supplied
 // Projects. The locks are process-local coordination only; SQLite remains the
 // Project authority.
-func (s *Service) lockProjectOperations(ids ...string) func() {
+func (s *Service) lockProjectOperations(ctx context.Context, ids ...string) (func(), error) {
 	unique := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
 		if id = strings.TrimSpace(id); id != "" {
@@ -143,7 +155,7 @@ func (s *Service) lockProjectOperations(ids ...string) func() {
 		}
 	}
 	if len(unique) == 0 {
-		return func() {}
+		return func() {}, nil
 	}
 
 	orderedIDs := make([]string, 0, len(unique))
@@ -152,21 +164,28 @@ func (s *Service) lockProjectOperations(ids ...string) func() {
 	}
 	sort.Strings(orderedIDs)
 
-	locks := make([]*sync.Mutex, 0, len(orderedIDs))
+	locks := make([]*projectOperationLock, 0, len(orderedIDs))
 	for _, id := range orderedIDs {
-		value, _ := s.projectLocks.LoadOrStore(id, &sync.Mutex{})
-		locks = append(locks, value.(*sync.Mutex))
+		value, _ := s.projectLocks.LoadOrStore(id, newProjectOperationLock())
+		locks = append(locks, value.(*projectOperationLock))
 	}
 
-	for _, lock := range locks {
-		lock.Lock()
+	for index, lock := range locks {
+		select {
+		case <-ctx.Done():
+			for releaseIndex := index - 1; releaseIndex >= 0; releaseIndex-- {
+				locks[releaseIndex].token <- struct{}{}
+			}
+			return nil, ctx.Err()
+		case <-lock.token:
+		}
 	}
 
 	return func() {
 		for index := len(locks) - 1; index >= 0; index-- {
-			locks[index].Unlock()
+			locks[index].token <- struct{}{}
 		}
-	}
+	}, nil
 }
 
 type AddInput struct {
@@ -228,7 +247,11 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		return AddResult{}, fmt.Errorf("projects repository is not configured")
 	}
 	s.mutationMu.Lock()
-	unlockProjects := s.lockProjectOperations(input.ID, normalizeProjectID(input))
+	unlockProjects, lockErr := s.lockProjectOperations(ctx, input.ID, normalizeProjectID(input))
+	if lockErr != nil {
+		s.mutationMu.Unlock()
+		return AddResult{}, lockErr
+	}
 	result, discoverInput, err := s.addProjectLocked(ctx, input)
 	unlockProjects()
 	s.mutationMu.Unlock()
@@ -434,7 +457,10 @@ func (s *Service) DiscoverProject(ctx context.Context, input DiscoverInput) (Dis
 	if projectID == "" {
 		return DiscoverResult{}, ProjectValidationError{Message: "project id is required"}
 	}
-	unlockProject := s.lockProjectOperations(projectID)
+	unlockProject, lockErr := s.lockProjectOperations(ctx, projectID)
+	if lockErr != nil {
+		return DiscoverResult{}, lockErr
+	}
 	defer unlockProject()
 
 	project, err := s.Repos.Projects.GetByID(ctx, projectID)
@@ -539,7 +565,10 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 	if project == nil {
 		return storage.ProjectRecord{}, ProjectNotFoundError{Identifier: trimmed}
 	}
-	unlockProject := s.lockProjectOperations(project.ID)
+	unlockProject, lockErr := s.lockProjectOperations(ctx, project.ID)
+	if lockErr != nil {
+		return storage.ProjectRecord{}, lockErr
+	}
 	defer unlockProject()
 	if source, _ := parseMetadata(project.MetadataJSON)["source"].(string); source == "config" {
 		return storage.ProjectRecord{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be removed from the CLI", project.ID)}
@@ -643,19 +672,29 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 
 	nowISO := currentISO(func() time.Time { return now })
 	cancelReason := "project archived"
-	existingProjects, err := s.Repos.Projects.List(ctx)
+	initialProjects, err := s.Repos.Projects.List(ctx)
 	if err != nil {
 		return err
 	}
-	projectIDs := make([]string, 0, len(existingProjects)+len(cfg.Projects))
-	for _, project := range existingProjects {
+	projectIDs := make([]string, 0, len(initialProjects)+len(cfg.Projects))
+	for _, project := range initialProjects {
 		projectIDs = append(projectIDs, project.ID)
 	}
 	for _, project := range cfg.Projects {
 		projectIDs = append(projectIDs, project.ID)
 	}
-	unlockProjects := s.lockProjectOperations(projectIDs...)
+	unlockProjects, lockErr := s.lockProjectOperations(ctx, projectIDs...)
+	if lockErr != nil {
+		return lockErr
+	}
 	defer unlockProjects()
+	// Discovery does not take mutationMu, so it may have updated metadata while
+	// SyncConfigured waited for the keyed locks. Re-read after acquiring them;
+	// this second snapshot is the authoritative input for the replacement rows.
+	existingProjects, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
 	desiredIDs := make(map[string]struct{}, len(cfg.Projects))
 	existingByID := make(map[string]*storage.ProjectRecord, len(existingProjects))
 	for index := range existingProjects {
@@ -1110,7 +1149,7 @@ func (s *Service) discoverWorktrees(ctx context.Context, project storage.Project
 
 		existing, err := s.Repos.Worktrees.GetByBranch(ctx, project.ID, worktree.Branch)
 		if err != nil {
-			return 0, err
+			return discovered, err
 		}
 
 		baseBranch := stringPointer(worktree.Branch)
@@ -1142,7 +1181,7 @@ func (s *Service) discoverWorktrees(ctx context.Context, project storage.Project
 			CleanedAt:    nil,
 		}
 		if err := s.Repos.Worktrees.Upsert(ctx, record); err != nil {
-			return 0, err
+			return discovered, err
 		}
 		discovered++
 	}
@@ -1182,7 +1221,7 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 		if mode == SnapshotModeAsync {
 			queued, err := s.enqueuePullRequestSnapshot(ctx, project, *repo, pullRequest.Number)
 			if err != nil {
-				return 0, 0, 0, err
+				return discovered, pending, captured, err
 			}
 			if queued {
 				pending++
@@ -1202,10 +1241,10 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 		})
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return 0, 0, 0, err
+				return discovered, pending, captured, err
 			}
 			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) || errors.Is(ctxErr, context.DeadlineExceeded) {
-				return 0, 0, 0, ctxErr
+				return discovered, pending, captured, ctxErr
 			}
 			message := err.Error()
 			if s.Logger != nil {
@@ -1215,7 +1254,7 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 			continue
 		}
 		if err := s.Repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
-			return 0, 0, 0, err
+			return discovered, pending, captured, err
 		}
 		captured++
 	}
@@ -1361,8 +1400,14 @@ func worktreeCreatedAt(existing *storage.WorktreeRecord, nowISO string) string {
 }
 
 func (s *Service) scheduleDiscovery(input DiscoverInput) {
+	ctx := context.Background()
+	if s.DiscoveryContext != nil {
+		if candidate := s.DiscoveryContext(); candidate != nil {
+			ctx = candidate
+		}
+	}
 	run := func() {
-		_, err := s.DiscoverProject(context.Background(), input)
+		_, err := s.DiscoverProject(ctx, input)
 		if err == nil || s.Logger == nil {
 			return
 		}
