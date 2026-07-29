@@ -295,6 +295,10 @@ func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial Partial
 	}
 	value := *source.EnableSelfReview
 	config.Roles.Reviewer.Discovery.Triggers.EnableSelfReview = value
+	if reviewer, ok := config.Roles.Coding[CodingRoleReviewer]; ok {
+		reviewer.Discovery.EnableSelfReview = value
+		config.Roles.Coding[CodingRoleReviewer] = reviewer
+	}
 	for i := range config.Projects {
 		if config.Projects[i].Roles == nil {
 			continue

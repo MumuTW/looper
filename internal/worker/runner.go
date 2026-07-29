@@ -956,9 +956,12 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if r.projectRoleConfig == nil {
 		return r.discoveryPolicy
 	}
-	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
+	role, ok := config.ProjectCodingRoleConfig(*r.projectRoleConfig, projectID, config.CodingRoleWorker)
+	if !ok {
+		return r.discoveryPolicy
+	}
 	isPlane := r.providerSelectionForProject(projectID).UsesExternalTaskSource()
-	return DiscoveryPolicy{AutoDiscovery: roles.Worker.AutoDiscovery, Labels: append([]string(nil), roles.Worker.Triggers.Labels...), LabelMode: roles.Worker.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Worker.Triggers.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), IsPlane: isPlane, PlaneAssigneeID: strings.TrimSpace(roles.Worker.Triggers.PlaneAssigneeID)}
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), IsPlane: isPlane, PlaneAssigneeID: strings.TrimSpace(role.Discovery.PlaneAssigneeID)}
 }
 
 func (r *Runner) requiredTargetLabel(ctx context.Context, projectID string) (string, error) {

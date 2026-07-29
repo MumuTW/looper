@@ -1622,8 +1622,11 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if r.projectRoleConfig == nil {
 		return r.discoveryPolicy
 	}
-	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Fixer.AutoDiscovery, IncludeDrafts: roles.Fixer.Triggers.IncludeDrafts, AuthorFilter: roles.Fixer.Triggers.AuthorFilter, Labels: append([]string(nil), roles.Fixer.Triggers.Labels...), LabelMode: roles.Fixer.Triggers.LabelMode}
+	role, ok := config.ProjectCodingRoleConfig(*r.projectRoleConfig, projectID, config.CodingRoleFixer)
+	if !ok {
+		return r.discoveryPolicy
+	}
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, IncludeDrafts: role.Discovery.IncludeDrafts, AuthorFilter: config.FixerAuthorFilter(role.Discovery.AuthorFilter), Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode}
 }
 
 func (r *Runner) isForgejoProject(projectID string) bool {

@@ -11,24 +11,74 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	defaultCodingRoles := CodingRolesFromLegacy(config.Roles)
 
+	normalizedLayers := make([]PartialConfig, 0, len(partials))
 	for _, partial := range partials {
 		if issues := validateLegacyProjectInstructionRoleKeys(partial); len(issues) > 0 {
 			return Config{}, &ConfigValidationError{Issues: issues}
 		}
-		mergeConfig(&config, normalizeLayerPartial(partial))
+		if issues := validateProjectCodingRoleSections(partial); len(issues) > 0 {
+			return Config{}, &ConfigValidationError{Issues: issues}
+		}
+		normalized := normalizeLayerPartial(clonePartialConfig(partial))
+		mergeConfig(&config, normalized)
+		normalizedLayers = append(normalizedLayers, normalized)
 	}
 
 	if err := applyProviderProfiles(&config, partials...); err != nil {
 		return Config{}, err
 	}
 
-	// Project the named role structs onto the role map last, so it reflects
-	// the fully merged config rather than any single layer. Consumers read
-	// the map; the named fields are the legacy input shape.
-	config.Roles.Coding = CodingRolesFromLegacy(config.Roles)
+	// Build the canonical role registry last from its default projection plus
+	// every layer's role fields. Within a layer, legacy named fields seed the
+	// shared role settings and roles.coding.* wins. Across layers, the normal
+	// config precedence holds: a later legacy env or CLI override must be able
+	// to replace an earlier file-backed roles.coding.* value.
+	authored, authoredInstructions, issues := collectAuthoredCodingRoles(normalizedLayers...)
+	if len(issues) > 0 {
+		return Config{}, &ConfigValidationError{Issues: issues}
+	}
+	codingRoles, issues := resolveCodingRoles(defaultCodingRoles, authored)
+	if len(issues) > 0 {
+		return Config{}, &ConfigValidationError{Issues: issues}
+	}
+	for name := range authoredInstructions {
+		validateCustomCodingRoleInstruction("roles.coding."+name+".instructions", codingRoles[name].Instructions, 0, &issues)
+	}
+	if len(issues) > 0 {
+		return Config{}, &ConfigValidationError{Issues: issues}
+	}
+	config.Roles.Coding = codingRoles
 
 	return config, nil
+}
+
+// validateProjectCodingRoleSections rejects roles.coding.* under a project:
+// the coding-role registry is global, so a project-scoped section would be
+// configured but inert. Project overrides of the shipped roles keep using the
+// legacy named sections (projects[].roles.planner and friends).
+func validateProjectCodingRoleSections(partial PartialConfig) []ValidationIssue {
+	if partial.Projects == nil {
+		return nil
+	}
+
+	issues := make([]ValidationIssue, 0)
+	for index, project := range *partial.Projects {
+		validateProjectCodingRoleOverrides(project.Roles, fmt.Sprintf("projects[%d].roles", index), &issues)
+	}
+
+	return issues
+}
+
+func validateProjectCodingRoleOverrides(roles *PartialRoleConfigs, prefix string, issues *[]ValidationIssue) {
+	if roles == nil || len(roles.Coding) == 0 {
+		return
+	}
+	*issues = append(*issues, ValidationIssue{
+		Path:    prefix + ".coding",
+		Message: "coding roles are global-only; author roles.coding.* at the top level",
+	})
 }
 
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
@@ -762,6 +812,12 @@ func isEmptyRoleAgentConfig(agent *RoleAgentConfig) bool {
 func canonicalizePartialRoleAgentBindings(roles *PartialRoleConfigs) {
 	if roles == nil {
 		return
+	}
+	for name, role := range roles.Coding {
+		if isEmptyRoleAgentConfig(role.Agent) {
+			role.Agent = nil
+			roles.Coding[name] = role
+		}
 	}
 	if roles.Planner != nil && isEmptyRoleAgentConfig(roles.Planner.Agent) {
 		roles.Planner.Agent = nil
@@ -1914,6 +1970,20 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		return nil
 	}
 	cloned := PartialRoleConfigs{}
+	if configs.Coding != nil {
+		cloned.Coding = make(map[string]PartialCodingRoleConfig, len(configs.Coding))
+		for name, role := range configs.Coding {
+			clonedRole := role
+			if role.Priority != nil {
+				priority := *role.Priority
+				clonedRole.Priority = &priority
+			}
+			clonedRole.Instructions = cloneStringPtr(role.Instructions)
+			clonedRole.Agent = cloneRoleAgentConfig(role.Agent)
+			clonedRole.Discovery = clonePartialRoleDiscoveryConfig(role.Discovery)
+			cloned.Coding[name] = clonedRole
+		}
+	}
 	if configs.Planner != nil {
 		planner := *configs.Planner
 		if configs.Planner.Triggers != nil {
@@ -2045,6 +2115,51 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		}
 		fixer.Agent = cloneRoleAgentConfig(configs.Fixer.Agent)
 		cloned.Fixer = &fixer
+	}
+	return &cloned
+}
+
+func clonePartialRoleDiscoveryConfig(config *PartialRoleDiscoveryConfig) *PartialRoleDiscoveryConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	if config.Enabled != nil {
+		value := *config.Enabled
+		cloned.Enabled = &value
+	}
+	if config.Source != nil {
+		value := *config.Source
+		cloned.Source = &value
+	}
+	if config.Labels != nil {
+		values := cloneStrings(*config.Labels)
+		cloned.Labels = &values
+	}
+	if config.LabelMode != nil {
+		value := *config.LabelMode
+		cloned.LabelMode = &value
+	}
+	if config.RequireAssigneeCurrentUser != nil {
+		value := *config.RequireAssigneeCurrentUser
+		cloned.RequireAssigneeCurrentUser = &value
+	}
+	cloned.PlaneAssigneeID = cloneStringPtr(config.PlaneAssigneeID)
+	if config.IncludeDrafts != nil {
+		value := *config.IncludeDrafts
+		cloned.IncludeDrafts = &value
+	}
+	if config.AuthorFilter != nil {
+		value := *config.AuthorFilter
+		cloned.AuthorFilter = &value
+	}
+	if config.RequireReviewRequest != nil {
+		value := *config.RequireReviewRequest
+		cloned.RequireReviewRequest = &value
+	}
+	if config.EnableSelfReview != nil {
+		value := *config.EnableSelfReview
+		cloned.EnableSelfReview = &value
 	}
 	return &cloned
 }

@@ -872,12 +872,13 @@ func isFailingCheckConclusion(conclusion string) bool {
 }
 
 func enabledLanesForProject(cfg config.Config, projectID string, lanes map[Lane]struct{}) map[Lane]struct{} {
-	roles := config.ProjectRoleConfigs(cfg, projectID)
 	result := map[Lane]struct{}{}
-	if _, ok := lanes[LaneReviewer]; ok && roles.Reviewer.Discovery.AutoDiscovery {
+	reviewer, reviewerOK := config.ProjectCodingRoleConfig(cfg, projectID, config.CodingRoleReviewer)
+	if _, ok := lanes[LaneReviewer]; ok && reviewerOK && reviewer.Discovery.Enabled {
 		result[LaneReviewer] = struct{}{}
 	}
-	if _, ok := lanes[LaneFixer]; ok && roles.Fixer.AutoDiscovery {
+	fixer, fixerOK := config.ProjectCodingRoleConfig(cfg, projectID, config.CodingRoleFixer)
+	if _, ok := lanes[LaneFixer]; ok && fixerOK && fixer.Discovery.Enabled {
 		result[LaneFixer] = struct{}{}
 	}
 	if _, ok := lanes[LaneGatekeeper]; ok {

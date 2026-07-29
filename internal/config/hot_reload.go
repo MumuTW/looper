@@ -274,8 +274,83 @@ func RestartRequiredChanges(oldConfig Config, newConfig Config) []string {
 	// resolved vendors stay stable while a hot global vendor edit would still
 	// rebind coordinator and params under a new CLI.
 	appendResolvedVendorRestartGuards(oldConfig, newConfig, seen, &restartRequired)
+	appendCodingRoleRegistryGuards(oldConfig, newConfig, seen, &restartRequired)
 	sort.Strings(restartRequired)
 	return restartRequired
+}
+
+// appendCodingRoleRegistryGuards marks a TOML-authored registry overlay as
+// restart-bound. Roles.Coding is derived and non-serialized, so a registry-only
+// edit would otherwise apply neither hot nor through a restart prompt. A map
+// change fully explained by legacy named fields is left to the existing JSON
+// policy for those fields.
+func appendCodingRoleRegistryGuards(oldConfig Config, newConfig Config, seen map[string]struct{}, restartRequired *[]string) {
+	oldRoles := EffectiveCodingRoles(oldConfig.Roles)
+	newRoles := EffectiveCodingRoles(newConfig.Roles)
+	oldLegacy := CodingRolesFromLegacy(oldConfig.Roles)
+	newLegacy := CodingRolesFromLegacy(newConfig.Roles)
+	for name, oldRole := range oldRoles {
+		newRole, ok := newRoles[name]
+		if !ok {
+			if !reflect.DeepEqual(oldRole, oldLegacy[name]) {
+				markCodingRoleRestart(seen, restartRequired, name)
+			}
+			continue
+		}
+		if codingRoleChangeUsesAuthoredField(oldRole, newRole, oldLegacy[name], newLegacy[name]) {
+			markCodingRoleRestart(seen, restartRequired, name)
+		}
+	}
+	for name, newRole := range newRoles {
+		if _, ok := oldRoles[name]; ok {
+			continue
+		}
+		if !reflect.DeepEqual(newRole, newLegacy[name]) {
+			markCodingRoleRestart(seen, restartRequired, name)
+		}
+	}
+}
+
+func codingRoleChangeUsesAuthoredField(oldRole, newRole, oldLegacy, newLegacy CodingRoleConfig) bool {
+	return changedValueUsesAuthoredField(
+		reflect.ValueOf(oldRole),
+		reflect.ValueOf(newRole),
+		reflect.ValueOf(oldLegacy),
+		reflect.ValueOf(newLegacy),
+	)
+}
+
+func changedValueUsesAuthoredField(oldValue, newValue, oldLegacy, newLegacy reflect.Value) bool {
+	if oldValue.Kind() == reflect.Struct {
+		for i := 0; i < oldValue.NumField(); i++ {
+			if changedValueUsesAuthoredField(
+				oldValue.Field(i),
+				newValue.Field(i),
+				oldLegacy.Field(i),
+				newLegacy.Field(i),
+			) {
+				return true
+			}
+		}
+		return false
+	}
+	if oldValue.Kind() == reflect.Pointer && !oldValue.IsNil() && !newValue.IsNil() && !oldLegacy.IsNil() && !newLegacy.IsNil() {
+		return changedValueUsesAuthoredField(oldValue.Elem(), newValue.Elem(), oldLegacy.Elem(), newLegacy.Elem())
+	}
+	if reflect.DeepEqual(oldValue.Interface(), newValue.Interface()) {
+		return false
+	}
+	return !reflect.DeepEqual(oldValue.Interface(), oldLegacy.Interface()) ||
+		!reflect.DeepEqual(newValue.Interface(), newLegacy.Interface())
+}
+
+func markCodingRoleRestart(seen map[string]struct{}, restartRequired *[]string, name string) {
+	path := "roles.coding." + name
+	if _, exists := seen[path]; exists {
+		return
+	}
+	seen[path] = struct{}{}
+	*restartRequired = append(*restartRequired, path)
 }
 
 func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen map[string]struct{}, restartRequired *[]string) {
@@ -377,6 +452,13 @@ func CloneConfig(source Config) Config {
 	var cloned Config
 	if err := json.Unmarshal(raw, &cloned); err != nil {
 		panic(fmt.Sprintf("clone config: %v", err))
+	}
+	// Roles.Coding is derived runtime state and intentionally omitted from the
+	// JSON payload above. Keep it detached but intact: dropping an authored
+	// overlay here would make config snapshots silently fall back to legacy
+	// named fields and break the canonical-registry contract.
+	if source.Roles.Coding != nil {
+		cloned.Roles.Coding = cloneCodingRoleRegistry(source.Roles.Coding)
 	}
 	return cloned
 }
