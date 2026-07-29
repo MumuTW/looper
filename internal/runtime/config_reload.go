@@ -208,6 +208,7 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 	}
 
 	changed := !reflect.DeepEqual(r.loadedConfig.Config, loaded.Config)
+	cleanupChanged := r.loadedConfig.Config.Daemon.WorktreeCleanup != loaded.Config.Daemon.WorktreeCleanup
 	r.loadedConfig = loaded
 	r.configReloadStatus.ConfigPath = loaded.Metadata.ConfigPath
 	r.configReloadStatus.Format = strings.TrimPrefix(strings.ToLower(filepath.Ext(loaded.Metadata.ConfigPath)), ".")
@@ -231,6 +232,11 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 		})
 	}
 	r.TriggerSchedulerTick()
+	if cleanupChanged {
+		// Newly enabled or shortened schedules should not wait out the interval
+		// that was in force when the loop last slept.
+		r.TriggerWorktreeCleanup()
+	}
 	return nil
 }
 

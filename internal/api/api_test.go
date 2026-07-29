@@ -3,6 +3,8 @@ package api
 import (
 	"os"
 	"testing"
+
+	"github.com/nexu-io/looper/internal/testenv"
 )
 
 func TestMain(m *testing.M) {
@@ -11,5 +13,5 @@ func TestMain(m *testing.M) {
 	// the configured server authority so existing unit tests remain focused on
 	// route behavior (see rewriteHTTPtestDefaultHost / effectiveRequestHost).
 	rewriteHTTPtestDefaultHost = true
-	os.Exit(m.Run())
+	os.Exit(testenv.RunTestMain(m))
 }

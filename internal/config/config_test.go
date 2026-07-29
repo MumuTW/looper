@@ -2356,6 +2356,7 @@ func TestNoCustomInstructionsCLIOverrideAcceptsExplicitFalse(t *testing.T) {
 func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_HOME", "")
 	t.Setenv("LOOPER_CONFIG", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
@@ -2698,6 +2699,7 @@ func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenOptions(t *testing.T) {
 func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenDiscoveredDefault(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_HOME", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
@@ -2771,6 +2773,7 @@ func TestLoadFileConfigPathSelectionPrefersCLIThenEnvThenDiscoveredDefault(t *te
 func TestLoadFileRejectsMultipleDefaultConfigFiles(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_HOME", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
@@ -2795,6 +2798,7 @@ func TestLoadFileRejectsMultipleDefaultConfigFiles(t *testing.T) {
 func TestLoadFilePrefersCanonicalTOMLWhenLegacyJSONAlsoExists(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_HOME", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
@@ -2823,6 +2827,7 @@ func TestLoadFilePrefersCanonicalTOMLWhenLegacyJSONAlsoExists(t *testing.T) {
 func TestLoadFileLegacyDefaultConfigJSONEmitsMigrationNote(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_HOME", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
@@ -2886,6 +2891,7 @@ func TestLoadFileIgnoresConfigLoadNoticeHomeResolutionErrors(t *testing.T) {
 func TestLoadFileDoesNotEmitMigrationNoteForNonLegacyDefaultJSON(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_HOME", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
