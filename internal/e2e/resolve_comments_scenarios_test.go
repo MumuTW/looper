@@ -712,10 +712,16 @@ func stringValue(value *string) string {
 
 func waitForRunTerminalCount(tb testing.TB, client apiClient, loopID string, count int, timeout time.Duration) runView {
 	tb.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
 		var runs runsListResponse
-		client.get(tb, "/api/v1/runs?loopId="+loopID, &runs)
+		if err := client.getContext(ctx, "/api/v1/runs?loopId="+loopID, &runs); err != nil {
+			if ctx.Err() != nil {
+				tb.Fatalf("timed out waiting for loop %s terminal run count %d: %v", loopID, count, ctx.Err())
+			}
+			tb.Fatalf("poll loop %s terminal run count %d: %v", loopID, count, err)
+		}
 		if len(runs.Items) >= count {
 			last := runs.Items[len(runs.Items)-1]
 			switch last.Status {
@@ -723,18 +729,24 @@ func waitForRunTerminalCount(tb testing.TB, client apiClient, loopID string, cou
 				return runView(last)
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		if !waitForAPIPoll(ctx) {
+			tb.Fatalf("timed out waiting for loop %s terminal run count %d: %v", loopID, count, ctx.Err())
+		}
 	}
-	tb.Fatalf("timed out waiting for loop %s terminal run count %d", loopID, count)
-	panic("unreachable")
 }
 
 func waitForNewTerminalRun(tb testing.TB, client apiClient, loopID string, existing map[string]struct{}, timeout time.Duration) runView {
 	tb.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
 		var runs runsListResponse
-		client.get(tb, "/api/v1/runs?loopId="+loopID, &runs)
+		if err := client.getContext(ctx, "/api/v1/runs?loopId="+loopID, &runs); err != nil {
+			if ctx.Err() != nil {
+				tb.Fatalf("timed out waiting for new terminal run for loop %s: %v", loopID, ctx.Err())
+			}
+			tb.Fatalf("poll new terminal run for loop %s: %v", loopID, err)
+		}
 		for _, item := range runs.Items {
 			if _, ok := existing[item.ID]; ok {
 				continue
@@ -744,8 +756,8 @@ func waitForNewTerminalRun(tb testing.TB, client apiClient, loopID string, exist
 				return runView(item)
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		if !waitForAPIPoll(ctx) {
+			tb.Fatalf("timed out waiting for new terminal run for loop %s: %v", loopID, ctx.Err())
+		}
 	}
-	tb.Fatalf("timed out waiting for new terminal run for loop %s", loopID)
-	panic("unreachable")
 }

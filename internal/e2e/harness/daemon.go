@@ -83,8 +83,16 @@ func StartLooperd(tb testing.TB, bins BuiltBinaries, home TempHome, configPath s
 	return proc
 }
 
+// readinessProbeTimeout bounds one /api/v1/status probe. Before the daemon
+// listens, dials fail immediately and the loop keeps its 100ms cadence
+// regardless of this value; it only applies once the daemon accepts the
+// connection but is slow to answer, which is when waiting beats retrying. Keep
+// it well under the caller's overall readiness budget so a genuinely stuck
+// response still leaves room for another probe.
+const readinessProbeTimeout = 5 * time.Second
+
 func (d *DaemonProcess) WaitForReady(ctx context.Context) (map[string]any, error) {
-	client := &http.Client{Timeout: 500 * time.Millisecond}
+	client := &http.Client{Timeout: readinessProbeTimeout}
 	statusURL := d.baseURL + "/api/v1/status"
 	for {
 		select {
@@ -98,7 +106,11 @@ func (d *DaemonProcess) WaitForReady(ctx context.Context) (map[string]any, error
 			return nil, fmt.Errorf("looperd exited before readiness: %w", err)
 		default:
 		}
-		resp, err := client.Get(statusURL)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build readiness request for %s: %w", statusURL, err)
+		}
+		resp, err := client.Do(req)
 		if err == nil {
 			body, readErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
@@ -114,7 +126,11 @@ func (d *DaemonProcess) WaitForReady(ctx context.Context) (map[string]any, error
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("wait for %s: %w", statusURL, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
