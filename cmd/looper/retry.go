@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 
 	"github.com/nexu-io/looper/internal/config"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 // runRetry is the dirty-worktree-safe retry path. A bodyless POST would requeue
@@ -42,7 +44,7 @@ func runRetry(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		if statusErr != nil {
 			// Older daemons without /worktree: keep plain retry, matching the
 			// dashboard fallback when the route is missing.
-			if !isHTTPNotFound(statusErr) {
+			if !isWorktreeRouteMissing(statusErr) {
 				_, _ = fmt.Fprintf(stderr, "looper: %v\n", statusErr)
 				return 1
 			}
@@ -238,12 +240,19 @@ func dirtyWorktreeGuidance(selector string, status loopWorktreeStatus, offerDisc
 	return fmt.Errorf("worktree is dirty and not Looper-managed for loop %s; inspect and clean it before retrying", selector)
 }
 
-func isHTTPNotFound(err error) bool {
-	if err == nil {
+// isWorktreeRouteMissing reports the one case that may skip the dirty-worktree
+// gate: a daemon too old to serve /worktree at all. It matches on the daemon's
+// typed error code, the same signal the dashboard branches on.
+//
+// Matching the error text instead would silently disarm the gate this preflight
+// exists to enforce. Every 404 carries "not found" — including the
+// PROJECT_NOT_FOUND the route itself returns for an archived project — and any
+// message that merely contains "404" would qualify, which a managed worktree
+// path for PR #404 does.
+func isWorktreeRouteMissing(err error) bool {
+	var daemonErr *daemonError
+	if !errors.As(err, &daemonErr) {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "404") ||
-		strings.Contains(msg, "not found") ||
-		strings.Contains(msg, "unknown route")
+	return daemonErr.Code == string(pkgapi.ErrorCodeRouteNotFound)
 }

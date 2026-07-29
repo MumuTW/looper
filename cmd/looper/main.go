@@ -802,7 +802,8 @@ func doHTTP(ctx context.Context, cfg config.Config, method, path string, body []
 		return "", fmt.Errorf("read response: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fmt.Errorf("looperd returned %s: %s", response.Status, apiErrorMessage(payload))
+		code, message := apiErrorEnvelope(payload)
+		return "", &daemonError{Status: response.Status, StatusCode: response.StatusCode, Code: code, Message: message}
 	}
 	return string(payload), nil
 }
@@ -857,6 +858,15 @@ func stopAllResultCounts(payload []byte) (failed, pausedOnly int, err error) {
 // apiErrorMessage pulls the daemon's own message out of an error envelope so
 // the operator sees "loop not found", not a raw JSON blob.
 func apiErrorMessage(payload []byte) string {
+	_, message := apiErrorEnvelope(payload)
+	return message
+}
+
+// apiErrorEnvelope returns the daemon's typed error code alongside its message.
+// The code is what callers must branch on: the message is prose that varies by
+// cause, and the status alone cannot distinguish "this route does not exist on
+// an older daemon" from "this daemon answered the route with a 404 of its own".
+func apiErrorEnvelope(payload []byte) (code, message string) {
 	var envelope struct {
 		Error struct {
 			Code    string `json:"code"`
@@ -864,11 +874,24 @@ func apiErrorMessage(payload []byte) string {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &envelope); err == nil {
-		if message := strings.TrimSpace(envelope.Error.Message); message != "" {
-			return message
+		if trimmed := strings.TrimSpace(envelope.Error.Message); trimmed != "" {
+			return strings.TrimSpace(envelope.Error.Code), trimmed
 		}
 	}
-	return strings.TrimSpace(string(payload))
+	return "", strings.TrimSpace(string(payload))
+}
+
+// daemonError is a non-2xx answer from looperd, carrying the typed error code
+// so a caller can tell one 404 from another without reading prose.
+type daemonError struct {
+	Status     string
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *daemonError) Error() string {
+	return fmt.Sprintf("looperd returned %s: %s", e.Status, e.Message)
 }
 
 // singleLine keeps multi-line validation errors from breaking the aligned
