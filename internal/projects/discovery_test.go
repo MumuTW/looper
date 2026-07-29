@@ -67,6 +67,49 @@ func TestServiceAddProjectDoesNotWaitForOtherProjectDiscovery(t *testing.T) {
 	}
 }
 
+// A bare Service has no lifecycle owner for asynchronous work. Registration
+// must still commit and return pending, but it must not leave a goroutine using
+// SQLite after its caller tears the service down.
+func TestServiceAddProjectWithoutLifecycleOwnerLeavesDiscoveryPendingAndCanCloseStorage(t *testing.T) {
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	discoveryStarted := make(chan struct{})
+	releaseDiscovery := make(chan struct{})
+	t.Cleanup(func() { close(releaseDiscovery) })
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
+			close(discoveryStarted)
+			<-releaseDiscovery
+			return nil, nil
+		},
+	}
+
+	added, err := service.AddProject(context.Background(), AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if added.Discovery.Status != DiscoveryStatusPending {
+		t.Fatalf("AddProject().Discovery.Status = %q, want pending", added.Discovery.Status)
+	}
+	select {
+	case <-discoveryStarted:
+		t.Fatal("AddProject() started unowned post-commit discovery")
+	case <-time.After(100 * time.Millisecond):
+	}
+	stored, err := repos.Projects.GetByID(context.Background(), "looper")
+	if err != nil || stored == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want registered project", stored, err)
+	}
+	if got := DiscoveryStateFromRecord(*stored); got.Status != DiscoveryStatusPending {
+		t.Fatalf("stored discovery = %#v, want pending without lifecycle owner", got)
+	}
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+}
+
 func TestServiceDiscoverProjectSerializesSameProjectRetries(t *testing.T) {
 	coordinator := openCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())

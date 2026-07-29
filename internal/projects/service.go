@@ -126,8 +126,9 @@ type Service struct {
 	// external reconciliation or other potentially blocking follow-up here;
 	// PublishProjects itself is part of the atomic config/catalog publication.
 	AfterPublishProjects func()
-	// ScheduleDiscovery runs post-commit discovery. The default starts a
-	// background goroutine so registration never waits on discovery. Tests may
+	// ScheduleDiscovery runs post-commit discovery under an explicit lifecycle
+	// owner. Without it, registration leaves discovery pending for an explicit
+	// DiscoverProject call rather than starting an unowned goroutine. Tests may
 	// replace it to run inline or to suppress automatic discovery.
 	ScheduleDiscovery func(func())
 	// DiscoveryContext supplies the lifecycle context for post-commit work. The
@@ -1400,6 +1401,14 @@ func worktreeCreatedAt(existing *storage.WorktreeRecord, nowISO string) string {
 }
 
 func (s *Service) scheduleDiscovery(input DiscoverInput) {
+	if s == nil || s.ScheduleDiscovery == nil {
+		if s != nil && s.Logger != nil {
+			s.Logger.Warn("post-commit project discovery left pending without a lifecycle owner", map[string]any{
+				"projectId": input.ProjectID,
+			})
+		}
+		return
+	}
 	ctx := context.Background()
 	if s.DiscoveryContext != nil {
 		if candidate := s.DiscoveryContext(); candidate != nil {
@@ -1416,11 +1425,7 @@ func (s *Service) scheduleDiscovery(input DiscoverInput) {
 			"message":   err.Error(),
 		})
 	}
-	if s.ScheduleDiscovery != nil {
-		s.ScheduleDiscovery(run)
-		return
-	}
-	go run()
+	s.ScheduleDiscovery(run)
 }
 
 func (s *Service) writeDiscoveryState(ctx context.Context, project *storage.ProjectRecord, discovery DiscoveryState) error {
