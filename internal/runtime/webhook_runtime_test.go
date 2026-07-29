@@ -707,7 +707,7 @@ func TestWebhookRuntimeBootstrapAdoptsMatchingForwarderRecord(t *testing.T) {
 		probe:           probe,
 		now:             time.Now,
 	}
-	t.Cleanup(func() { probe.alive = false; rt.Stop() })
+	t.Cleanup(func() { probe.setAlive(false); rt.Stop() })
 
 	rt.Start(repositories)
 	status := rt.Status()
@@ -765,7 +765,7 @@ func TestWebhookRuntimeBootstrapAdoptsDesiredForwarderWhenGHPathUnavailable(t *t
 		probe:           probe,
 		now:             time.Now,
 	}
-	t.Cleanup(func() { probe.alive = false; rt.Stop() })
+	t.Cleanup(func() { probe.setAlive(false); rt.Stop() })
 
 	rt.Bootstrap(context.Background(), repositories)
 	status := rt.Status()
@@ -957,7 +957,7 @@ func TestWebhookRuntimeBootstrapRetryDoesNotDuplicateAdoptedForwarders(t *testin
 		t.Fatalf("WebhookForwarders.Upsert(record2) error = %v", err)
 	}
 
-	probe := &multiProcessProbe{probes: map[int]testProcessProbe{
+	probe := &multiProcessProbe{probes: map[int]*testProcessProbe{
 		4242: {alive: true, start: 99, exe: ghPath, argv: []string{ghPath, "webhook", "forward", "--repo", "nexu-io/looper", "--events", events1, "--url", endpoint}},
 		4343: {alive: true, startErr: errors.New("probe failed")},
 	}}
@@ -970,7 +970,7 @@ func TestWebhookRuntimeBootstrapRetryDoesNotDuplicateAdoptedForwarders(t *testin
 		probe:           probe,
 		now:             time.Now,
 	}
-	t.Cleanup(func() { probe.probes[4242] = testProcessProbe{}; rt.Stop() })
+	t.Cleanup(func() { probe.setProbe(4242, &testProcessProbe{}); rt.Stop() })
 
 	rt.Bootstrap(context.Background(), repositories)
 	rt.Bootstrap(context.Background(), repositories)
@@ -1135,6 +1135,7 @@ func webhookRuntimeTestConfig(repos ...string) config.Config {
 }
 
 type testProcessProbe struct {
+	mu       sync.Mutex
 	alive    bool
 	aliveErr error
 	start    int64
@@ -1145,28 +1146,68 @@ type testProcessProbe struct {
 	argvErr  error
 }
 
+// setAlive updates the liveness the probe reports. Adopted-forwarder Wait
+// goroutines can outlive webhookRuntime.Stop, so test mutation of probe
+// state must go through this locked setter.
+func (p *testProcessProbe) setAlive(alive bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.alive = alive
+}
+
 type multiProcessProbe struct {
-	probes map[int]testProcessProbe
+	mu     sync.Mutex
+	probes map[int]*testProcessProbe
+}
+
+func (p *multiProcessProbe) setProbe(pid int, probe *testProcessProbe) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.probes[pid] = probe
 }
 
 func (p *multiProcessProbe) IsAlive(pid int) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	probe := p.probes[pid]
+	if probe == nil {
+		return false, nil
+	}
 	return probe.alive, probe.aliveErr
 }
 func (p *multiProcessProbe) StartTime(pid int) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	probe := p.probes[pid]
+	if probe == nil {
+		return 0, nil
+	}
 	return probe.start, probe.startErr
 }
 func (p *multiProcessProbe) ExecutablePath(pid int) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	probe := p.probes[pid]
+	if probe == nil {
+		return "", nil
+	}
 	return probe.exe, probe.exeErr
 }
 func (p *multiProcessProbe) Argv(pid int) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	probe := p.probes[pid]
+	if probe == nil {
+		return []string{}, nil
+	}
 	return append([]string{}, probe.argv...), probe.argvErr
 }
 
-func (p *testProcessProbe) IsAlive(pid int) (bool, error)    { return p.alive, p.aliveErr }
+func (p *testProcessProbe) IsAlive(pid int) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.alive, p.aliveErr
+}
 func (p *testProcessProbe) StartTime(pid int) (int64, error) { return p.start, p.startErr }
 func (p *testProcessProbe) Argv(pid int) ([]string, error) {
 	return append([]string{}, p.argv...), p.argvErr
