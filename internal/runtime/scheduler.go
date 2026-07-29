@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/gatekeeper"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
@@ -61,6 +62,11 @@ type fixerScheduler interface {
 	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*fixer.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*fixer.ProcessResult, error)
+}
+
+type gatekeeperScheduler interface {
+	DiscoverPullRequests(context.Context, gatekeeper.DiscoveryInput) (gatekeeper.DiscoveryResult, error)
+	EvaluatePullRequest(context.Context, gatekeeper.EvaluationInput) (gatekeeper.Report, error)
 }
 
 type workerScheduler interface {
@@ -104,6 +110,7 @@ type defaultSchedulerTickInput struct {
 	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
 	Fixer                    fixerScheduler
+	Gatekeeper               gatekeeperScheduler
 	Worker                   workerScheduler
 	Snapshotter              snapshotScheduler
 	Config                   *config.Config
@@ -127,6 +134,7 @@ type defaultSchedulerHandlers struct {
 	webhook              WebhookForwarder
 	reviewer             reviewerScheduler
 	fixer                fixerScheduler
+	gatekeeper           gatekeeperScheduler
 	input                func(Services) defaultSchedulerTickInput
 	snapshot             func() defaultSchedulerHandlers
 	notificationGateways *schedulerNotificationGatewayFactory
@@ -149,6 +157,21 @@ func (r catalogWebhookReviewer) DiscoverPullRequest(ctx context.Context, input r
 
 type catalogWebhookFixer struct {
 	snapshot func() fixerScheduler
+}
+
+type catalogWebhookGatekeeper struct {
+	snapshot func() gatekeeperScheduler
+}
+
+func (g catalogWebhookGatekeeper) EvaluatePullRequest(ctx context.Context, input gatekeeper.EvaluationInput) (gatekeeper.Report, error) {
+	if g.snapshot == nil {
+		return gatekeeper.Report{}, fmt.Errorf("gatekeeper is not configured")
+	}
+	runner := g.snapshot()
+	if runner == nil {
+		return gatekeeper.Report{}, fmt.Errorf("gatekeeper is not configured")
+	}
+	return runner.EvaluatePullRequest(ctx, input)
 }
 
 func (f catalogWebhookFixer) DiscoverPullRequest(ctx context.Context, input fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
@@ -3004,6 +3027,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			Fixer: catalogWebhookFixer{snapshot: func() fixerScheduler {
 				return handlers.snapshot().fixer
 			}},
+			Gatekeeper: catalogWebhookGatekeeper{snapshot: func() gatekeeperScheduler {
+				return handlers.snapshot().gatekeeper
+			}},
 			Logger: logger,
 			Now:    now,
 			// Accept-time gate only: once Forward returns accepted/202 the
@@ -3097,6 +3123,28 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Repositories:  repos,
 		Now:           now,
 	})
+	var gatekeeperRunner gatekeeperScheduler
+	if githubGateway != nil {
+		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{
+			Repos:  repos,
+			GitHub: githubGateway,
+			Now:    now,
+			PolicyPermitsTarget: func(projectID, repo, baseRefName string) bool {
+				project, ok := runtimeProjectBinding(cfg, projectID)
+				if !ok || !providerHasGitHubPullRequests(config.ResolvedProjectProviderKind(cfg, project)) {
+					return false
+				}
+				if !strings.EqualFold(strings.TrimSpace(project.Repo), strings.TrimSpace(repo)) {
+					return false
+				}
+				configuredBase := cfg.Defaults.BaseBranch
+				if project.BaseBranch != nil && strings.TrimSpace(*project.BaseBranch) != "" {
+					configuredBase = strings.TrimSpace(*project.BaseBranch)
+				}
+				return strings.EqualFold(strings.TrimSpace(configuredBase), strings.TrimSpace(baseRefName))
+			},
+		})
+	}
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
 	// CURRENT status (colour + label), without disturbing the retained live tail.
 	// The anchor is otherwise only patched opportunistically by the progress ticker
@@ -3573,6 +3621,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Coordinator:          coordinatorRunner,
 			Reviewer:             reviewerRunner,
 			Fixer:                fixerRunner,
+			Gatekeeper:           gatekeeperRunner,
 			Worker:               workerRunner,
 			Snapshotter:          snapshotter,
 			Config:               &cfg,
@@ -3608,6 +3657,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		},
 		reviewer:             webhookReviewer,
 		fixer:                webhookFixer,
+		gatekeeper:           gatekeeperRunner,
 		input:                inputForServices,
 		notificationGateways: notificationGateways,
 	}
@@ -3618,6 +3668,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ConfigSource: configSource,
 			Reviewer:     webhookReviewer,
 			Fixer:        webhookFixer,
+			Gatekeeper:   gatekeeperRunner,
 			Logger:       logger,
 			Now:          now,
 		})

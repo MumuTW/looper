@@ -7,6 +7,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/fixer"
+	"github.com/nexu-io/looper/internal/gatekeeper"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
@@ -93,6 +94,15 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 				result, err := workerDiscoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
 				return result.QueueItems, err
+			},
+		},
+		config.RoleGatekeeper: {
+			Enabled:   func(string) bool { return true },
+			Present:   input.Gatekeeper != nil,
+			Supported: providerHasGitHubPullRequests,
+			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
+				_, err := input.Gatekeeper.DiscoverPullRequests(ctx, gatekeeper.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+				return nil, err
 			},
 		},
 	}

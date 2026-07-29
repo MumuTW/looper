@@ -36,6 +36,10 @@ _Avoid_: critic, checker.
 A reactive Role that addresses review feedback on a Pull Request.
 _Avoid_: patcher, responder.
 
+**Merge Gatekeeper**:
+A reactive, agent-free policy Role that re-fetches current Pull Request state and writes an observe-only **Gate report**. It never reviews code, repairs a Pull Request, resolves comments, or merges.
+_Avoid_: merger, reviewer, fixer.
+
 **Coordinator**:
 A proactive, LLM-driven Role that performs Triage on fresh Issues and executes Dispatch. In Network mode, Coordinator is also the control plane for Issue admission, PR review assignment, and exact Node targeting, gated by the Network Lease.
 _Avoid_: manager, commander, maintainer.
@@ -81,6 +85,9 @@ The GitHub-native state of a Pull Request after `gh pr merge --auto` has been ca
 
 **Watch marker**:
 The `<!-- looper:coordinator:merge-watch retries=N -->` HTML-comment marker Coordinator places on the linked Issue (not the PR — preserves ADR-0003 Issue-rooted scope) to carry merge-watch retry-counter state across ticks. Public, durable, idempotent — preserves ADR-0001's stateless property.
+
+**Gate report**:
+The durable `pull_request.merge_gate.evaluated` event written by Merge Gatekeeper. It records `eligible` or `blocked`, stable reasons and evidence, and the observed head SHA. It is audit evidence, not merge authority: a future merge path must rerun every gate immediately before merging because holds, reviews, threads, and Project policy can change without moving the head.
 
 ### Authority and statelessness
 
@@ -158,6 +165,7 @@ _Avoid_: local sandbox, mock sandbox.
 - A **Coordinator** may perform **PR review assignment**, producing a GitHub review request that **Reviewer** observes
 - A **Coordinator** consults the **Dependency gate** before performing **Dispatch** when `roles.coordinator.dependencies.enabled = true`
 - **Reviewer** opts approved code PRs (carrying **Auto-merge scope**) into GitHub-native auto-merge after verifying each **Acceptance criterion** has satisfying-evidence in the diff
+- **Merge Gatekeeper** evaluates every active GitHub-backed Project Pull Request from source discovery, then re-evaluates after head, check, review, thread, or hold changes and writes a head-bound **Gate report**
 - **Coordinator**'s per-tick poll classifies **Merge-pending state** PRs into WatchActions, routing mechanical failures (conflict, red CI) to **Fixer** via **Trigger label** and policy failures (branch protection change) to re-Triage by removing the Issue's `triaged` and `dispatch/*` labels
 - The **Watch marker** carries merge-watch retry state on the linked Issue, preserving Coordinator's stateless property
 - A **Veto signal** from a human overrides Coordinator's autonomous Dispatch but does not override **Triage** itself
