@@ -729,17 +729,6 @@ type pendingFixerRediscoveryState struct {
 	RecordedAt          string   `json:"recordedAt,omitempty"`
 }
 
-// fixerResumeHandoffState is the short-lived, durable authority for the one
-// interval where a replacement queue item exists while its loop remains paused.
-// It is written before exposing the queue and removed atomically with the
-// queued loop transition; generic pending rediscovery is not sufficient because
-// it may coexist with an operator pause.
-type fixerResumeHandoffState struct {
-	HeadSHA           string `json:"headSha,omitempty"`
-	FixItemsStateHash string `json:"fixItemsStateHash,omitempty"`
-	RecordedAt        string `json:"recordedAt,omitempty"`
-}
-
 type fixerCheckpoint struct {
 	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
 	Pause            *checkpointPause            `json:"pause,omitempty"`
@@ -2024,12 +2013,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
-	// The loop record is the execution authority. Requeue a paused claim only
-	// during the explicitly-recorded replacement handoff: generic paused loops
-	// are durable operator/quarantine states and must remain for the scheduler's
-	// terminal/cancel path. The handoff marker is written before the queue item
-	// becomes visible and is removed in the queued loop transition.
-	if loop.Status == "paused" && pausedClaimHasFixerResumeHandoff(*loop, queueItem) {
+	// A pending-rediscovery queue row can become visible while its resume
+	// handoff is still clearing metadata and changing the loop to queued.
+	// Requeue only that row without spending an attempt; other paused loops
+	// retain their durable pause semantics.
+	if pendingFixerRediscoveryHandoffInFlight(*loop, queueItem) {
 		availableAt := eventlog.FormatJavaScriptISOString(r.now().Add(r.retryBaseDelay).UTC())
 		message := "fixer loop remains paused while resume handoff is incomplete"
 		if err := r.repos.Queue.MarkRetryIfRunning(ctx, storage.QueueMarkRetryInput{
@@ -2051,7 +2039,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: status}, nil
 	}
 	if loop.Status == "paused" {
-		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "paused"}, nil
+		reason := "fixer loop is paused"
+		if _, err := r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &reason); err != nil {
+			return ProcessResult{}, err
+		}
+		status := "cancelled"
+		persisted, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if persisted != nil {
+			status = persisted.Status
+		}
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: status}, nil
 	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
@@ -2387,6 +2387,22 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 	status := statusForSkip(checkpoint.SkipReason)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+}
+
+func pendingFixerRediscoveryHandoffInFlight(loop storage.LoopRecord, queueItem storage.QueueItemRecord) bool {
+	if loop.Status != "paused" || queueItem.Repo == nil || queueItem.PRNumber == nil {
+		return false
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	pauseReason, _ := stringFromAny(metadata["pauseReason"])
+	if pauseReason != failureStreakPauseReason {
+		return false
+	}
+	pending, ok := parsePendingFixerRediscoveryState(metadata)
+	if !ok {
+		return false
+	}
+	return queueItem.DedupeKey == buildFixerDedupeKey(loop.ProjectID, loop.ID, *queueItem.Repo, *queueItem.PRNumber, pending.HeadSHA, pending.FixItemsStateHash)
 }
 
 func statusForSkip(skipReason string) string {
@@ -5791,10 +5807,6 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 	if err := r.restartLatestRunFromDiscover(ctx, loop.ID); err != nil {
 		return false, err
 	}
-	handoffLoop, err := r.recordFixerResumeHandoff(ctx, *current, pending)
-	if err != nil {
-		return false, err
-	}
 	availableAt := r.now()
 	queued, err := r.enqueueWithWake(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt}, false)
 	if err != nil {
@@ -5803,7 +5815,7 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 	if queued.Status != "queued" {
 		return false, fmt.Errorf("pending fixer rediscovery for loop %s did not produce a queued item", loop.ID)
 	}
-	updated, err := r.clearPendingFixerRediscoveryIfMatch(ctx, handoffLoop, pending)
+	updated, err := r.clearPendingFixerRediscoveryIfMatch(ctx, *current, pending)
 	if err != nil {
 		return false, err
 	}
@@ -5816,7 +5828,6 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 		next.Status = "queued"
 		next.LastRunAt = stringPtr(r.nowISO())
 		next.NextRunAt = &nextRunAt
-		next.MetadataJSON = clearFixerResumeHandoffMetadata(next.MetadataJSON)
 	})
 	if err != nil {
 		return false, err
@@ -6384,61 +6395,6 @@ func (r *Runner) recordPendingFixerRediscovery(ctx context.Context, loop storage
 		return loop, nil
 	}
 	return r.mergeLoopMetadata(ctx, loop, map[string]any{"pendingFixerRediscovery": state})
-}
-
-func (r *Runner) recordFixerResumeHandoff(ctx context.Context, loop storage.LoopRecord, pending pendingFixerRediscoveryState) (storage.LoopRecord, error) {
-	state := fixerResumeHandoffState{
-		HeadSHA:           strings.TrimSpace(pending.HeadSHA),
-		FixItemsStateHash: strings.TrimSpace(pending.FixItemsStateHash),
-		RecordedAt:        r.nowISO(),
-	}
-	if state.FixItemsStateHash == "" {
-		return storage.LoopRecord{}, fmt.Errorf("fixer resume handoff requires a fix-items state hash")
-	}
-	return r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerResumeHandoff": state})
-}
-
-func pausedClaimHasFixerResumeHandoff(loop storage.LoopRecord, queueItem storage.QueueItemRecord) bool {
-	metadata := parseJSONObject(loop.MetadataJSON)
-	handoff, ok := parseFixerResumeHandoffState(metadata)
-	if !ok || strings.TrimSpace(handoff.FixItemsStateHash) == "" {
-		return false
-	}
-	payload := parseJSONObject(queueItem.PayloadJSON)
-	stateHash, _ := stringFromAny(payload["fixItemsStateHash"])
-	return strings.TrimSpace(stateHash) != "" && strings.TrimSpace(stateHash) == handoff.FixItemsStateHash
-}
-
-func parseFixerResumeHandoffState(metadata map[string]any) (fixerResumeHandoffState, bool) {
-	raw, ok := metadata["fixerResumeHandoff"]
-	if !ok || raw == nil {
-		return fixerResumeHandoffState{}, false
-	}
-	encoded, err := json.Marshal(raw)
-	if err != nil {
-		return fixerResumeHandoffState{}, false
-	}
-	var state fixerResumeHandoffState
-	if err := json.Unmarshal(encoded, &state); err != nil {
-		return fixerResumeHandoffState{}, false
-	}
-	state.HeadSHA = strings.TrimSpace(state.HeadSHA)
-	state.FixItemsStateHash = strings.TrimSpace(state.FixItemsStateHash)
-	return state, state.FixItemsStateHash != ""
-}
-
-func clearFixerResumeHandoffMetadata(current *string) *string {
-	metadata := parseJSONObject(current)
-	if _, ok := metadata["fixerResumeHandoff"]; !ok {
-		return current
-	}
-	delete(metadata, "fixerResumeHandoff")
-	encoded, err := json.Marshal(metadata)
-	if err != nil {
-		return current
-	}
-	value := string(encoded)
-	return &value
 }
 
 func (r *Runner) clearPendingFixerRediscovery(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {

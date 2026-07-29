@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -254,13 +255,23 @@ func TestNewForgejoClientFromConfigTeaMissingBinary(t *testing.T) {
 func TestTeaTransportReportsBinaryMissingAfterStartup(t *testing.T) {
 	t.Parallel()
 
+	teaPath := filepath.Join(t.TempDir(), "tea-that-disappeared")
+	if err := os.WriteFile(teaPath, []byte("#!/bin/sh\nprintf '{\"version\":\"ok\"}\\n'\n"), 0o755); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
 	transport := newTeaTransport(
-		filepath.Join(t.TempDir(), "tea-that-disappeared"),
+		teaPath,
 		"selected-login",
 		nil,
 		time.Second,
 		nil,
 	)
+	if _, err := transport.doRaw(context.Background(), "GET", "/api/v1/version", nil, nil); err != nil {
+		t.Fatalf("first doRaw() error = %v, want successful startup", err)
+	}
+	if err := os.Remove(teaPath); err != nil {
+		t.Fatalf("os.Remove() error = %v", err)
+	}
 	_, err := transport.doRaw(context.Background(), "GET", "/api/v1/version", nil, nil)
 	var teaErr *TeaAuthError
 	if !errors.As(err, &teaErr) || teaErr.Code != TeaErrorMissing {
