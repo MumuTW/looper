@@ -58,14 +58,20 @@ Setup is manual: install both binaries, write a config, start `looperd`, then re
 # 1. CLI (macOS darwin-arm64 or Linux linux-amd64)
 curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/install.sh | sh
 
-# 2. Daemon — same release's looperd-<target>.tar.gz onto PATH, or:
+# 2. Put the install directory on PATH for this shell. Piped through `sh` the
+#    installer has no terminal to ask with, so it cannot edit your profile and
+#    cannot change this shell — it installs to ~/.local/bin and prints the line
+#    it would have added. Skip only if ~/.local/bin is already on PATH.
+export PATH="$HOME/.local/bin:$PATH"
+
+# 3. Daemon — same release's looperd-<target>.tar.gz onto PATH, or:
 #    go build -o ~/.local/bin/looperd ./cmd/looperd
 
-# 3. Config — writes a commented ~/.looper/config.toml, never overwrites one
+# 4. Config — writes a commented ~/.looper/config.toml, never overwrites one
 looper init
 #    then edit it (agent vendor, base branch); see docs/configuration.md
 
-# 4. Run the daemon (foreground)
+# 5. Run the daemon (foreground)
 looperd
 ```
 

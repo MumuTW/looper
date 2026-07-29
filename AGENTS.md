@@ -17,7 +17,7 @@
 
 ## Configuration & runtime
 
-- Default daemon config path: `~/.looper/config.json`.
+- Default daemon config path: `~/.looper/config.toml` — what `DiscoverDefaultConfigPath` selects when `~/.looper` holds no config, and what `looper init` writes. `.yaml`, `.yml`, and `.json` in `~/.looper` are still loaded if present; a legacy `~/.looper/config.json` loads with a migration notice.
 - Precedence: defaults → config file → env → CLI flags.
 - looperd fails fast on config-validation errors and requires writable runtime paths.
 - Tool paths (`git`, `gh`, `osascript`) are auto-detected unless explicitly configured.

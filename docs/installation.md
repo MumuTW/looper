@@ -94,7 +94,11 @@ With the daemon up, register a local git repository root either:
 - through the local operator dashboard (served by `looperd` under `/dashboard/`), or
 - with `POST /api/v1/projects` and a JSON body like `{"repoPath":"/absolute/path/to/repo"}`.
 
-`looper project add` is the API call with the mistakes checked first: it refuses a path that is not a repository root, and refuses a checkout that is already registered. Setting an explicit id, name, base branch, worktree root, or provider is available on the API and the dashboard, not on the CLI.
+`looper project add` is the API call with the mistakes checked first. It asks git for the repository root and refuses anything that is not one — a subdirectory, a broken or empty `.git`, a bare repository — and it refuses both a checkout that is already registered and a directory name that would derive an existing project's id (`/work/acme/api` after `/work/other/api`), because a path-only add on an existing id rebinds that project instead of creating one. Setting an explicit id, name, base branch, worktree root, or provider is available on the API and the dashboard, not on the CLI; an explicit id is the way past a derived-id collision.
+
+On a repository with many open pull requests the call can take minutes: the daemon records the project and then discovers its worktrees and pull requests. If it times out anyway, run `looper project list` before retrying — the project is recorded before discovery starts.
+
+Do not use `looper project add` for Forgejo or Plane projects. Those need a provider binding the CLI cannot express, so they belong in `[[projects]]` in the config file. Registering one through the API first and adding it to the config afterwards makes `looperd` fail to start, because a configured project cannot take over an id an API-managed record already holds.
 
 Projects registered through the API take effect immediately. Projects listed under `[[projects]]` in the config file are imported at daemon startup instead.
 

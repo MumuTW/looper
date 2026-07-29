@@ -106,14 +106,22 @@ curl -sS "http://127.0.0.1:17310/api/v1/healthz"
 
 ### Step 5 — Register a project
 
-With the daemon up:
+**First decide which of the two registration paths this project uses — they do not mix.**
+
+**Forgejo and Plane projects: do NOT run `looper project add`.** Define the project entirely in the config file under `[[projects]]`, alongside its provider, and restart the daemon. `looper project add` has no way to express the provider binding those projects require, and the record it creates is marked `source = "api"`. Adding the same project to the config afterwards does not convert it: on the next start `SyncConfigured` sees a configured project whose id already belongs to an API record, fails with `configured project <id> conflicts with an API-managed project`, and **`looperd` refuses to start**. Recovering means removing the API record before the daemon will come back up. See [docs/configuration.md](../../docs/configuration.md) and [docs/plane-provider.md](../../docs/plane-provider.md).
+
+**GitHub projects, with the daemon up:**
 
 ```bash
 looper project add /absolute/path/to/repo
 looper project list
 ```
 
-The path must be a git repository **root** (contains `.git`); `looper project add` refuses anything else, and refuses a checkout that is already registered. Always pass an absolute path, and confirm it with the user rather than guessing. The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` register the same way, and are where the fields the CLI does not expose (explicit id, name, base branch, worktree root, provider) live. For Forgejo/Plane providers, put the provider + project binding in the config file (see [docs/configuration.md](../../docs/configuration.md) and [docs/plane-provider.md](../../docs/plane-provider.md)); the project API will not rewrite file-managed projects.
+The path must be a git repository **root** — `looper project add` asks git (`rev-parse --show-toplevel`) and refuses a subdirectory, a directory with a broken or empty `.git`, or a bare repository, naming the real root when it finds one. It also refuses a checkout already registered, and one whose directory name would derive a project id that already exists (`/work/acme/api` after `/work/other/api`), because a path-only add on an existing id rebinds that project rather than creating one. Always pass an absolute path, and confirm it with the user rather than guessing.
+
+The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` register the same way, and are where the fields the CLI does not expose (explicit id, name, base branch, worktree root, provider) live — use them when you need an explicit id to sidestep a derived-id collision.
+
+`project add` can take minutes on a repository with many open pull requests: the daemon records the project first, then discovers its worktrees and PRs. If it does time out, run `looper project list` before retrying — the registration has probably landed.
 
 ### Step 6 — Verify
 
@@ -151,12 +159,14 @@ Inspect loops in the dashboard or via `GET /api/v1/loops`. Worktree path for a d
 | PR URL rejected as selector | Expected — use loop seq or loop id only |
 | Reviewer can't publish | Daemon must spawn the trusted `looper review submit` wrapper; never run it by hand without the proxy |
 | Daemon fails on startup | Config validation, missing `git`/`gh`, or unwritable `~/.looper` |
+| `configured project X conflicts with an API-managed project` | X was registered with `looper project add` and then added to `[[projects]]`. Pick one: drop it from the config, or remove the API record. Config-managed projects must never be `project add`ed |
 | Want daemon across reboot | User's `launchd`/`systemd`/`tmux` — not a Looper feature |
 
 ## Anti-patterns
 
 - Reaching for `looper bootstrap`, `daemon start`, `ps`, `logs`, `plan`, `review`, `work`, `jump`
 - Passing `looper project add` a subdirectory instead of the repository root, or expecting it to take an id / base branch / provider — those are API and dashboard fields
+- Running `looper project add` for a Forgejo or Plane project, then adding it to the config file — that combination stops `looperd` from starting
 - Telling a user to run `looper review submit`
 - Using a PR URL as a selector
 - Force-pushing or inventing flags the strip CLI does not have
