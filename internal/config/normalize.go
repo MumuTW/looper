@@ -599,6 +599,10 @@ func mergeSchedulerConfig(config *SchedulerConfig, partial PartialSchedulerConfi
 		config.RetryMaxAttempts = *partial.RetryMaxAttempts
 	}
 
+	if partial.ConsecutiveFailureThreshold != nil {
+		config.ConsecutiveFailureThreshold = *partial.ConsecutiveFailureThreshold
+	}
+
 	if partial.RetryBaseDelayMS != nil {
 		config.RetryBaseDelayMS = *partial.RetryBaseDelayMS
 	}

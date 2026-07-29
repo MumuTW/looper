@@ -3296,6 +3296,44 @@ func TestValidateSchedulerRetryMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestValidateSchedulerConsecutiveFailureThreshold(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		threshold int
+		wantError string
+	}{
+		{name: "default positive", threshold: 3},
+		{name: "zero rejected", threshold: 0, wantError: "must be a positive integer"},
+		{name: "negative rejected", threshold: -1, wantError: "must be a positive integer"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			cfg.Scheduler.ConsecutiveFailureThreshold = tt.threshold
+			err = Validate(cfg)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			var validationErr *ConfigValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+			}
+			assertValidationIssue(t, validationErr, "scheduler.consecutiveFailureThreshold", tt.wantError)
+		})
+	}
+}
+
 func TestValidateRejectsDuplicateAndIncompleteProjects(t *testing.T) {
 	config, err := DefaultConfig(t.TempDir())
 	if err != nil {
@@ -3427,6 +3465,9 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	}
 	if config.Scheduler.RetryMaxAttempts != -1 {
 		t.Fatalf("DefaultConfig().Scheduler.RetryMaxAttempts = %d, want %d", config.Scheduler.RetryMaxAttempts, -1)
+	}
+	if config.Scheduler.ConsecutiveFailureThreshold != 3 {
+		t.Fatalf("DefaultConfig().Scheduler.ConsecutiveFailureThreshold = %d, want %d", config.Scheduler.ConsecutiveFailureThreshold, 3)
 	}
 	if config.Scheduler.SlowLaneWarnThresholdMS != 5000 {
 		t.Fatalf("DefaultConfig().Scheduler.SlowLaneWarnThresholdMS = %d, want %d", config.Scheduler.SlowLaneWarnThresholdMS, 5000)
@@ -3652,6 +3693,10 @@ func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {
 
 	if config.Scheduler.SlowLaneWarnThresholdMS != 5000 {
 		t.Fatalf("Normalize().Scheduler.SlowLaneWarnThresholdMS = %d, want default %d", config.Scheduler.SlowLaneWarnThresholdMS, 5000)
+	}
+
+	if config.Scheduler.ConsecutiveFailureThreshold != 3 {
+		t.Fatalf("Normalize().Scheduler.ConsecutiveFailureThreshold = %d, want default %d", config.Scheduler.ConsecutiveFailureThreshold, 3)
 	}
 
 	if config.Agent.Vendor == nil || *config.Agent.Vendor != AgentVendorOpenCode {
