@@ -218,6 +218,12 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "defaults.addSnapshotMode", Message: fmt.Sprintf("must be one of: %s, %s, %s", AddSnapshotModeAsync, AddSnapshotModeFull, AddSnapshotModeOff)})
 	}
 
+	for index, command := range config.Defaults.ValidationCommands {
+		if strings.TrimSpace(command) == "" {
+			issues = append(issues, ValidationIssue{Path: fmt.Sprintf("defaults.validationCommands[%d]", index), Message: "must be a non-empty string"})
+		}
+	}
+
 	if config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
 	}
