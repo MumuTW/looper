@@ -19,6 +19,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -53,17 +54,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	verb := args[0]
-	rest := args[1:]
-
-	request, err := routeForVerb(verb, rest)
+	parsed, err := splitGlobalFlags(args)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
 		usage(stderr)
 		return 2
 	}
 
-	cfg, err := loadConfig(args)
+	request, err := routeForVerb(parsed.Verb, parsed.Operands)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
+		usage(stderr)
+		return 2
+	}
+
+	cfg, err := loadConfig(parsed.Global)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
 		return 1
@@ -95,10 +100,88 @@ type respondBody struct {
 	Answer string `json:"answer"`
 }
 
+// globalFlag is a flag the CLI accepts before or after the verb and forwards
+// to config.LoadFile rather than acting on itself. Every one takes a value, in
+// either `--flag value` or `--flag=value` form.
+//
+// The list is deliberately a subset of what config.LoadFile parses: those are
+// the three an operator needs to reach a daemon that is not the default one,
+// and an unlisted flag is refused rather than silently swallowed as a
+// selector.
+var globalFlags = map[string]struct{}{
+	"--config": {},
+	"--host":   {},
+	"--port":   {},
+}
+
+// parsedArgs is one command line split into the part the CLI routes on and the
+// part config.LoadFile reads.
+type parsedArgs struct {
+	Verb     string
+	Operands []string
+	// Global holds the global flags in their original order, including their
+	// values, so LoadFile sees exactly what the operator typed and nothing
+	// else. Passing the whole command line instead would let an operand after
+	// `--` be reinterpreted as configuration.
+	Global []string
+}
+
+// splitGlobalFlags separates global flags from the verb and its operands so
+// both `looper --config /path stop 12` and `looper stop 12 --config /path`
+// reach the same request. Routing used to run on the raw argv, which made the
+// first form an unknown command and the second an arity error — the flags were
+// documented but unreachable.
+//
+// Value consumption matches config.parseCLIArgs: `--flag=value` inline, else
+// the next argument unless it starts with `--`. The two parsers must agree,
+// because a value this one skips is a value LoadFile still reads.
+func splitGlobalFlags(args []string) (parsedArgs, error) {
+	parsed := parsedArgs{}
+	positional := make([]string, 0, len(args))
+
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+
+		// Everything after `--` is an operand, which is how an answer or a
+		// selector that begins with a dash gets through.
+		if arg == "--" {
+			positional = append(positional, args[index+1:]...)
+			break
+		}
+
+		name, inlineValue, hasInline := strings.Cut(arg, "=")
+		if _, global := globalFlags[name]; global {
+			if hasInline {
+				parsed.Global = append(parsed.Global, name+"="+inlineValue)
+				continue
+			}
+			if index+1 >= len(args) || strings.HasPrefix(args[index+1], "--") {
+				return parsedArgs{}, fmt.Errorf("missing value for %s", name)
+			}
+			parsed.Global = append(parsed.Global, name, args[index+1])
+			index++
+			continue
+		}
+
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
+		}
+
+		positional = append(positional, arg)
+	}
+
+	if len(positional) == 0 {
+		return parsedArgs{}, fmt.Errorf("a command is required")
+	}
+	parsed.Verb = positional[0]
+	parsed.Operands = positional[1:]
+	return parsed, nil
+}
+
 // routeForVerb maps a control verb to its API request. Selectors are passed
-// through unvalidated: the daemon resolves them (loop id, PR URL, shorthand)
-// and is the only component that can say authoritatively what a selector
-// means, so validating here would only invent a second, staler answer.
+// through unvalidated: the daemon resolves them and is the only component that
+// can say authoritatively what a selector means, so validating here would only
+// invent a second, staler answer.
 // Emptiness and argument count are checked locally because those are decidable
 // here and cost a round trip otherwise.
 func routeForVerb(verb string, args []string) (apiRequest, error) {
@@ -113,12 +196,20 @@ func routeForVerb(verb string, args []string) (apiRequest, error) {
 		if strings.TrimSpace(args[0]) == "all" && verb == "stop" {
 			return apiRequest{Path: "/api/v1/runs/active/stop-all"}, nil
 		}
-		return apiRequest{Path: "/api/v1/runs/active/" + args[0] + "/" + verb}, nil
+		segment, err := selectorPathSegment(args[0])
+		if err != nil {
+			return apiRequest{}, err
+		}
+		return apiRequest{Path: "/api/v1/runs/active/" + segment + "/" + verb}, nil
 	case "takeover", "retry", "start", "pause", "handback":
 		if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 			return apiRequest{}, fmt.Errorf("%s requires exactly one loop id", verb)
 		}
-		return apiRequest{Path: "/api/v1/loops/" + args[0] + "/" + verb}, nil
+		segment, err := selectorPathSegment(args[0])
+		if err != nil {
+			return apiRequest{}, err
+		}
+		return apiRequest{Path: "/api/v1/loops/" + segment + "/" + verb}, nil
 	case "respond":
 		// The answer is one argument, not the joined tail: a loop waiting on a
 		// human is answered with prose, and joining would turn a forgotten
@@ -130,14 +221,36 @@ func routeForVerb(verb string, args []string) (apiRequest, error) {
 		if answer == "" {
 			return apiRequest{}, fmt.Errorf("respond requires a non-empty answer")
 		}
+		segment, err := selectorPathSegment(args[0])
+		if err != nil {
+			return apiRequest{}, err
+		}
 		body, err := json.Marshal(respondBody{Answer: answer})
 		if err != nil {
 			return apiRequest{}, fmt.Errorf("encode answer: %w", err)
 		}
-		return apiRequest{Path: "/api/v1/loops/" + args[0] + "/respond", Body: body}, nil
+		return apiRequest{Path: "/api/v1/loops/" + segment + "/respond", Body: body}, nil
 	default:
 		return apiRequest{}, fmt.Errorf("unknown command %q", verb)
 	}
+}
+
+// selectorPathSegment turns a selector into exactly one URL path segment.
+//
+// Escaping matters because a selector is interpolated into the request path: a
+// "#" would truncate it to a fragment and a space would not survive the
+// request line at all. A "/" is refused rather than escaped, because the
+// daemon routes on the *decoded* path (api.Handler splits r.URL.Path), so an
+// escaped slash decodes back into a segment separator and the request lands on
+// "Unknown route" — an operator would read that as "no such loop". The daemon
+// resolves loop sequence numbers and loop ids, neither of which contains a
+// slash, so refusing here loses nothing.
+func selectorPathSegment(selector string) (string, error) {
+	trimmed := strings.TrimSpace(selector)
+	if strings.Contains(trimmed, "/") {
+		return "", fmt.Errorf("selector %q is not a loop id or sequence number; the daemon resolves those, not pull request URLs", trimmed)
+	}
+	return url.PathEscape(trimmed), nil
 }
 
 func loadConfig(args []string) (config.Config, error) {
@@ -156,12 +269,35 @@ func loadConfig(args []string) (config.Config, error) {
 	return loaded.Config, nil
 }
 
-func post(ctx context.Context, cfg config.Config, call apiRequest) (string, error) {
-	host := strings.TrimSpace(cfg.Server.Host)
-	if host == "" {
-		host = "127.0.0.1"
+// daemonBaseURL is where this CLI expects the daemon to answer.
+//
+// server.baseUrl wins when set: it is the operator's statement of the address
+// the daemon is actually reachable at, which is not derivable from the bind
+// address once a reverse proxy, a tunnel, or TLS is in front of it. Only when
+// it is unset is the bind host used, and then a wildcard bind is mapped to
+// loopback — dialing 0.0.0.0 or :: reaches nothing, and it is also the Host
+// the daemon's own guard expects.
+func daemonBaseURL(cfg config.Config) string {
+	if cfg.Server.BaseURL != nil {
+		if base := strings.TrimSpace(*cfg.Server.BaseURL); base != "" {
+			return strings.TrimRight(base, "/")
+		}
 	}
-	endpoint := "http://" + net.JoinHostPort(host, strconv.Itoa(cfg.Server.Port)) + call.Path
+	// JoinHostPort brackets IPv6 literals, so hosts like ::1 stay dialable.
+	return "http://" + net.JoinHostPort(dialHost(cfg.Server.Host), strconv.Itoa(cfg.Server.Port))
+}
+
+func dialHost(host string) string {
+	switch trimmed := strings.TrimSpace(host); trimmed {
+	case "", "0.0.0.0", "::", "[::]":
+		return "127.0.0.1"
+	default:
+		return trimmed
+	}
+}
+
+func post(ctx context.Context, cfg config.Config, call apiRequest) (string, error) {
+	endpoint := daemonBaseURL(cfg) + call.Path
 
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
@@ -171,8 +307,12 @@ func post(ctx context.Context, cfg config.Config, call apiRequest) (string, erro
 		return "", err
 	}
 	request.Header.Set("Content-Type", "application/json")
-	if cfg.Server.LocalToken != nil && strings.TrimSpace(*cfg.Server.LocalToken) != "" {
-		request.Header.Set("Authorization", "Bearer "+*cfg.Server.LocalToken)
+	// Only local-token auth mode has a token the daemon will accept. Sending
+	// one whenever server.localToken happens to be set leaks it to whatever is
+	// listening — including a proxy in front of a daemon that never asked for
+	// it.
+	if cfg.Server.AuthMode == config.AuthModeLocalToken && cfg.Server.LocalToken != nil && strings.TrimSpace(*cfg.Server.LocalToken) != "" {
+		request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(*cfg.Server.LocalToken))
 	}
 
 	response, err := http.DefaultClient.Do(request)
@@ -214,16 +354,22 @@ func usage(w io.Writer) {
 Usage:
   looper stop <selector>       Stop the active run for a loop ("all" stops every run)
   looper close <selector>      Stop the active run and close the loop
-  looper takeover <loop-id>    Take a loop over for manual work
-  looper handback <loop-id>    Hand a taken-over loop back to the daemon
-  looper retry <loop-id>       Requeue a paused or parked loop
-  looper start <loop-id>       Start a loop now
-  looper pause <loop-id>       Pause a loop
-  looper respond <loop-id> "<answer>"
+  looper takeover <selector>   Take a loop over for manual work
+  looper handback <selector>   Hand a taken-over loop back to the daemon
+  looper retry <selector>      Requeue a paused or parked loop
+  looper start <selector>      Start a loop now
+  looper pause <selector>      Pause a loop
+  looper respond <selector> "<answer>"
                                Answer a loop waiting on a human and resume it
   looper version               Print the looper version
 
-Selectors are resolved by the daemon; a loop id or a pull request URL both work.
+Global flags, accepted before or after the verb:
+  --config <path>              Config file to load
+  --host <host>                Daemon host, overriding the config
+  --port <port>                Daemon port, overriding the config
+
+A selector is a loop sequence number (looper stop 12) or a loop id
+(looper stop loop_1cf3); those are what the daemon resolves.
 The respond answer is a single argument, so quote anything with spaces.
 `)
 }

@@ -45,10 +45,21 @@ func TestRouteForVerb(t *testing.T) {
 			wantPath: "/api/v1/runs/active/all/close",
 		},
 		{
-			name:     "close resolves a selector",
+			// See TestPullRequestURLSelectorCannotRoute: the daemon splits the
+			// decoded request path, so a selector with a slash cannot reach a
+			// route however it is encoded.
+			name:    "close refuses a pull request URL the daemon cannot resolve",
+			verb:    "close",
+			args:    []string{"https://github.com/o/r/pull/7"},
+			wantErr: "is not a loop id or sequence number",
+		},
+		{
+			// Escaped rather than concatenated raw: a selector is one path
+			// segment, and "#" would otherwise truncate the path to a fragment.
+			name:     "close escapes a selector that would break the request path",
 			verb:     "close",
-			args:     []string{"https://github.com/o/r/pull/7"},
-			wantPath: "/api/v1/runs/active/https://github.com/o/r/pull/7/close",
+			args:     []string{"loop#7"},
+			wantPath: "/api/v1/runs/active/loop%237/close",
 		},
 		{
 			name:     "takeover targets the loop",
