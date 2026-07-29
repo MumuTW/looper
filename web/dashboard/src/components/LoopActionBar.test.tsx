@@ -182,7 +182,7 @@ describe("LoopActionBar retry dirty UX", () => {
     });
   });
 
-  it("inspect-first cancels discard and shows jump guidance", async () => {
+  it("inspect-first cancels discard and shows the worktree cd command", async () => {
     fetchLoopWorktree.mockResolvedValue({
       loopId: "loop_1",
       seq: 3491,
@@ -201,9 +201,37 @@ describe("LoopActionBar retry dirty UX", () => {
     fireEvent.click(screen.getByRole("button", { name: "Inspect first" }));
 
     await screen.findByText(/Inspect dirty worktree/i);
-    expect(screen.getByText("looper jump 3491")).toBeTruthy();
+    expect(screen.getByText("cd -- '/tmp/dirty-wt'")).toBeTruthy();
     expect(screen.getByText("/tmp/dirty-wt")).toBeTruthy();
+    expect(
+      screen.getByText(
+        'POST /api/v1/loops/3491/retry {"discardWorktreeChanges": true}',
+      ),
+    ).toBeTruthy();
     expect(retryLoop).not.toHaveBeenCalled();
+  });
+
+  it("shell-quotes worktree paths that contain spaces", async () => {
+    fetchLoopWorktree.mockResolvedValue({
+      loopId: "loop_1",
+      seq: 3491,
+      present: true,
+      managed: true,
+      dirty: true,
+      clean: false,
+      worktreePath: "/Users/Alice Smith/worktrees/x",
+      branch: "feat/x",
+    });
+    renderBar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByText(/Dirty worktree — discard and retry/i);
+    fireEvent.click(screen.getByRole("button", { name: "Inspect first" }));
+
+    await screen.findByText(/Inspect dirty worktree/i);
+    expect(
+      screen.getByText("cd -- '/Users/Alice Smith/worktrees/x'"),
+    ).toBeTruthy();
   });
 
   it("does not offer discard for unmanaged dirty worktree", async () => {

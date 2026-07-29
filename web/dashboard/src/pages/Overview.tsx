@@ -64,13 +64,14 @@ function FullPageError({ message }: { message: string }) {
         <p className="m-0 mb-1 font-medium">Recovery</p>
         <ol className="m-0 list-decimal pl-4 text-[var(--text-muted)]">
           <li>
-            Start the daemon:{" "}
-            <code className="mono text-[var(--text)]">looper daemon start</code>
+            Start the daemon (managed install path first):{" "}
+            <code className="mono text-[var(--text)]">
+              ~/.looper/bin/looperd
+            </code>
+            {" or "}
+            <code className="mono text-[var(--text)]">looperd</code>
           </li>
-          <li>
-            Or open via CLI:{" "}
-            <code className="mono text-[var(--text)]">looper dashboard</code>
-          </li>
+          <li>Reload this page once it is listening.</li>
         </ol>
       </div>
     </div>
