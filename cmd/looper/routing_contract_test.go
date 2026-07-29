@@ -163,6 +163,10 @@ func (f *contractFixture) post(t *testing.T, request apiRequest) (pkgapi.ErrorCo
 	// Host is what the CLI would actually send, so the daemon's Host guard is
 	// part of the contract under test rather than something the test waves away.
 	httpRequest.Host = strings.TrimPrefix(daemonBaseURL(f.config), "http://")
+	// The CLI connects directly to the local daemon. httptest.NewRequest uses
+	// the synthetic non-loopback address 192.0.2.1, which does not model that
+	// transport peer and must not bypass the daemon's locality check.
+	httpRequest.RemoteAddr = "127.0.0.1:54321"
 
 	recorder := httptest.NewRecorder()
 	f.handler.ServeHTTP(recorder, httpRequest)
