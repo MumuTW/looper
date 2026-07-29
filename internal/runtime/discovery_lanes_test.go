@@ -1,0 +1,60 @@
+package runtime
+
+import (
+	"context"
+	"testing"
+
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/triager"
+)
+
+func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(t *testing.T) {
+	t.Parallel()
+	lanes := discoveryLanes(defaultSchedulerTickInput{})
+	byName := make(map[string]discoveryLane, len(lanes))
+	positions := make(map[string]int, len(lanes))
+	for index, lane := range lanes {
+		byName[lane.Name] = lane
+		positions[lane.Name] = index
+	}
+
+	if positions["triager"] >= positions[config.CodingRolePlanner] {
+		t.Fatalf("lane positions = %#v, want triager before planner", positions)
+	}
+	if byName["triager"].Supported(config.ProviderKindGitHub) != true ||
+		byName["triager"].Supported(config.ProviderKindForgejo) != false {
+		t.Fatal("triager must accept GitHub issues only")
+	}
+	if !byName[config.CodingRoleFixer].Supported(config.ProviderKindForgejo) {
+		t.Fatal("triager registration changed fixer Forgejo discovery support")
+	}
+}
+
+func TestTriagerLaneSharesOneDecisionBudgetAcrossProjects(t *testing.T) {
+	t.Parallel()
+	runner := &budgetTriager{}
+	lane := triagerLane(defaultSchedulerTickInput{Triager: runner})
+	if _, err := lane.Discover(context.Background(), "project_1", "acme/one", nil); err != nil {
+		t.Fatalf("first Discover() error = %v", err)
+	}
+	if _, err := lane.Discover(context.Background(), "project_2", "acme/two", nil); err != nil {
+		t.Fatalf("second Discover() error = %v", err)
+	}
+	if len(runner.budgets) != 2 || runner.budgets[0] != 1 || runner.budgets[1] != 0 {
+		t.Fatalf("decision budgets = %v, want [1 0]", runner.budgets)
+	}
+}
+
+type budgetTriager struct{ budgets []int }
+
+func (f *budgetTriager) DiscoverIssues(_ context.Context, input triager.DiscoveryInput) (triager.DiscoveryResult, error) {
+	if input.DecisionBudget == nil {
+		f.budgets = append(f.budgets, -1)
+		return triager.DiscoveryResult{}, nil
+	}
+	f.budgets = append(f.budgets, *input.DecisionBudget)
+	if *input.DecisionBudget > 0 {
+		*input.DecisionBudget--
+	}
+	return triager.DiscoveryResult{}, nil
+}

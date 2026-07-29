@@ -7,10 +7,12 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/fixer"
+	"github.com/nexu-io/looper/internal/gatekeeper"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/triager"
 	"github.com/nexu-io/looper/internal/worker"
 )
 
@@ -95,6 +97,15 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 				return result.QueueItems, err
 			},
 		},
+		config.RoleGatekeeper: {
+			Enabled:   func(string) bool { return true },
+			Present:   input.Gatekeeper != nil,
+			Supported: providerHasGitHubPullRequests,
+			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
+				_, err := input.Gatekeeper.DiscoverPullRequests(ctx, gatekeeper.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+				return nil, err
+			},
+		},
 	}
 }
 
@@ -114,14 +125,33 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 	}
 }
 
-// codingDiscoveryLanes builds the ordered lane list for one tick from the
-// configured roles.
+// triagerLane is an internal issue-source role. Its persisted report is the
+// routing authority; the lane does not need a label-gated CodingRoleConfig.
+func triagerLane(input defaultSchedulerTickInput) discoveryLane {
+	decisionBudget := triager.DefaultDecisionLimit
+	return discoveryLane{
+		Name:     "triager",
+		Priority: config.PriorityTriager,
+		Present:  input.Triager != nil,
+		Enabled: func(projectID string) bool {
+			return input.TriagerEnabled != nil && input.TriagerEnabled(projectID)
+		},
+		Supported: func(kind config.ProviderKind) bool { return kind == config.ProviderKindGitHub },
+		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
+			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: &decisionBudget})
+			return result.QueueItems, err
+		},
+	}
+}
+
+// discoveryLanes builds the ordered lane list for one tick from registered
+// coding and internal roles.
 //
 // Configuration decides which lanes exist, how each filters, and in what
 // order they run; the discoverer registry decides what can actually run. A
 // role configured without a runner is skipped rather than failing the tick,
 // because a tick is the wrong place to report a static configuration fault.
-func codingDiscoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
+func discoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
 	// A nil Config is legal (unit tests, and any caller driving the tick
 	// directly). Fall back to the shipped role set so the lanes still run in
 	// their documented order: losing every lane because configuration was
@@ -135,7 +165,7 @@ func codingDiscoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
 	roles := config.EffectiveCodingRoles(roleConfigs)
 	names := config.CodingRoleNames(roleConfigs)
 
-	lanes := make([]discoveryLane, 0, len(names)+1)
+	lanes := make([]discoveryLane, 0, len(names)+2)
 	for _, name := range names {
 		role := roles[name]
 		lane, ok := discoverers[name]
@@ -148,7 +178,7 @@ func codingDiscoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
 		lanes = append(lanes, lane)
 	}
 
-	lanes = append(lanes, coordinatorLane(input))
+	lanes = append(lanes, triagerLane(input), coordinatorLane(input))
 	sort.SliceStable(lanes, func(i, j int) bool { return lanes[i].Priority < lanes[j].Priority })
 	return lanes
 }

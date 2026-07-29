@@ -127,10 +127,10 @@ func TestSafetyFloorClaimRechecksAdmissionBeforeClaimNext(t *testing.T) {
 	}
 }
 
-// Contract: when availableSlots is already 0, admission must be rechecked
-// immediately before ReconcileStaleRuns so BeginShutdown cannot race past the
-// claim-phase entry gate and still mutate runs/queue during the drain window.
-func TestSafetyFloorClaimPhaseRechecksAdmissionBeforeStaleReconcile(t *testing.T) {
+// Contract: admission must be rechecked immediately before the periodic stale
+// reconcile so BeginShutdown cannot race past the tick-entry gate and mutate
+// runs/queue during the drain window.
+func TestSafetyFloorTickRechecksAdmissionBeforeStaleReconcile(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -142,28 +142,25 @@ func TestSafetyFloorClaimPhaseRechecksAdmissionBeforeStaleReconcile(t *testing.T
 
 	var allowCalls atomic.Int64
 	var reconcileCalls atomic.Int64
-	claimed, available, err := executeClaimPhase(context.Background(), "test", defaultSchedulerTickInput{
+	err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
 		Repos:             repos,
 		Now:               func() time.Time { return now },
-		MaxConcurrentRuns: 0, // forces availableSlots == 0 so reconcile path is taken
+		MaxConcurrentRuns: 1,
 		ReconcileStaleRuns: func(context.Context) (StaleRunReconcileSummary, error) {
 			reconcileCalls.Add(1)
 			return StaleRunReconcileSummary{}, nil
 		},
 		AllowClaim: func() error {
-			// First call: claim-phase entry recheck passes.
-			// Second call: must gate ReconcileStaleRuns after slots return 0.
+			// First call: tick entry passes.
+			// Second call: must gate periodic ReconcileStaleRuns immediately before it runs.
 			if allowCalls.Add(1) >= 2 {
 				return ErrAdmissionStopping
 			}
 			return nil
 		},
-	}, nil, false)
+	})
 	if err != nil {
-		t.Fatalf("executeClaimPhase() error = %v", err)
-	}
-	if claimed != 0 || available != 0 {
-		t.Fatalf("claimed=%d available=%d, want 0/0", claimed, available)
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
 	}
 	if allowCalls.Load() < 2 {
 		t.Fatalf("AllowClaim calls = %d, want >= 2 (entry + pre-reconcile)", allowCalls.Load())

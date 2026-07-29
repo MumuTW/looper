@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/processidentity"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/validationcmd"
 )
@@ -1162,6 +1163,18 @@ func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
 	}
 	if record == nil || record.HeartbeatCount < 3 || record.LastHeartbeatAt == nil {
 		t.Fatalf("heartbeat record = %#v, want >=3 heartbeats with timestamp", record)
+	}
+	var metadata struct {
+		ProcessIdentity struct {
+			StartTime int64  `json:"startTime"`
+			BootID    string `json:"bootId"`
+		} `json:"processIdentity"`
+	}
+	if record.MetadataJSON == nil || json.Unmarshal([]byte(*record.MetadataJSON), &metadata) != nil || metadata.ProcessIdentity.StartTime <= 0 {
+		t.Fatalf("MetadataJSON = %v, want durable process birth identity", record.MetadataJSON)
+	}
+	if processidentity.RequiresBootID() && metadata.ProcessIdentity.BootID == "" {
+		t.Fatalf("MetadataJSON = %v, want Linux boot identity paired with start ticks", record.MetadataJSON)
 	}
 }
 
