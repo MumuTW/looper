@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -51,15 +52,15 @@ func TestDiscoverIssuesReplaysPersistedRouteWithoutRepeatingLLM(t *testing.T) {
 	if fixture.llm.calls != 1 {
 		t.Fatalf("LLM calls = %d, want 1", fixture.llm.calls)
 	}
-	if len(fixture.planner.inputs) != 2 {
-		t.Fatalf("planner calls = %d, want idempotent route projection retried", len(fixture.planner.inputs))
+	if len(fixture.planner.inputs) != 1 {
+		t.Fatalf("planner calls = %d, want durable projection acknowledgement", len(fixture.planner.inputs))
 	}
 	events, err := fixture.repos.Events.List(context.Background(), 10)
 	if err != nil {
 		t.Fatalf("Events.List() error = %v", err)
 	}
-	if len(events) != 1 {
-		t.Fatalf("triage reports = %d, want 1", len(events))
+	if len(events) != 3 {
+		t.Fatalf("triage lifecycle events = %d, want enrollment, report, and projection", len(events))
 	}
 }
 
@@ -82,8 +83,8 @@ func TestDiscoverIssuesTreatsReopenedIssueAsNewSourceEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Events.List() error = %v", err)
 	}
-	if fixture.llm.calls != 2 || len(events) != 2 {
-		t.Fatalf("LLM calls/events = %d/%d, want a report per new and reopened event", fixture.llm.calls, len(events))
+	if fixture.llm.calls != 2 || len(events) != 6 {
+		t.Fatalf("LLM calls/events = %d/%d, want a lifecycle per new and reopened event", fixture.llm.calls, len(events))
 	}
 }
 
@@ -190,29 +191,63 @@ func (f *runnerFixture) singleReport(t *testing.T) Report {
 	if err != nil {
 		t.Fatalf("Events.List() error = %v", err)
 	}
-	if len(events) != 1 || events[0].EventType != ReportEventType {
+	var reports []storage.EventLogRecord
+	for _, event := range events {
+		if event.EventType == ReportEventType {
+			reports = append(reports, event)
+		}
+	}
+	if len(reports) != 1 {
 		t.Fatalf("events = %#v, want one triage report", events)
 	}
 	var report Report
-	if err := json.Unmarshal([]byte(events[0].PayloadJSON), &report); err != nil {
+	if err := json.Unmarshal([]byte(reports[0].PayloadJSON), &report); err != nil {
 		t.Fatalf("decode report: %v", err)
 	}
 	return report
 }
 
 type fakeGitHub struct {
-	detail     githubinfra.IssueDetail
-	timeline   []map[string]any
-	listInput  githubinfra.ListOpenIssuesInput
-	permission string
+	detail       githubinfra.IssueDetail
+	details      map[int64]githubinfra.IssueDetail
+	viewSequence []githubinfra.IssueDetail
+	viewCalls    int
+	timeline     []map[string]any
+	listInput    githubinfra.ListOpenIssuesInput
+	listEmpty    bool
+	permission   string
 }
 
 func (f *fakeGitHub) ListOpenIssues(_ context.Context, input githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
 	f.listInput = input
+	if f.listEmpty {
+		return nil, nil
+	}
+	if len(f.details) > 0 {
+		numbers := make([]int, 0, len(f.details))
+		for number := range f.details {
+			numbers = append(numbers, int(number))
+		}
+		sort.Ints(numbers)
+		issues := make([]githubinfra.IssueSummary, 0, len(numbers))
+		for _, number := range numbers {
+			detail := f.details[int64(number)]
+			issues = append(issues, githubinfra.IssueSummary{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, UpdatedAt: detail.UpdatedAt, Labels: detail.Labels})
+		}
+		return issues, nil
+	}
 	return []githubinfra.IssueSummary{{Number: f.detail.Number, Title: f.detail.Title, Body: f.detail.Body, URL: f.detail.URL, State: f.detail.State, UpdatedAt: f.detail.UpdatedAt, Labels: f.detail.Labels}}, nil
 }
 
-func (f *fakeGitHub) ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+func (f *fakeGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	if f.viewCalls < len(f.viewSequence) {
+		detail := f.viewSequence[f.viewCalls]
+		f.viewCalls++
+		return detail, nil
+	}
+	if detail, ok := f.details[input.IssueNumber]; ok {
+		return detail, nil
+	}
 	return f.detail, nil
 }
 
@@ -226,10 +261,16 @@ func (f *fakeGitHub) GetRepositoryPermission(context.Context, githubinfra.Reposi
 
 type fakeLLM struct {
 	responses []string
+	errors    []error
 	calls     int
 }
 
 func (f *fakeLLM) Complete(context.Context, Request) (string, error) {
+	if f.calls < len(f.errors) && f.errors[f.calls] != nil {
+		err := f.errors[f.calls]
+		f.calls++
+		return "", err
+	}
 	response := f.responses[f.calls]
 	f.calls++
 	return response, nil
@@ -237,11 +278,15 @@ func (f *fakeLLM) Complete(context.Context, Request) (string, error) {
 
 type fakePlanner struct {
 	inputs []planner.RouteIssueInput
+	err    error
 }
 
 func (f *fakePlanner) RouteIssue(_ context.Context, input planner.RouteIssueInput) (planner.DiscoveryResult, error) {
 	f.inputs = append(f.inputs, input)
-	return planner.DiscoveryResult{}, nil
+	if f.err != nil {
+		return planner.DiscoveryResult{}, f.err
+	}
+	return planner.DiscoveryResult{ProjectionAccepted: true}, nil
 }
 
 func eligibleDecisionJSON() string {

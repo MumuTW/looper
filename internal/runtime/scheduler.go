@@ -3836,6 +3836,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		projectSnapshots[projectID] = snapshot
 		return snapshot
 	}
+	lanes := discoveryLanes(input)
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
 			retErr = errors.Join(append(errs, err)...)
@@ -3877,7 +3878,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		admissionClosed := false
-		for _, lane := range discoveryLanes(input) {
+		for _, lane := range lanes {
 			if !lane.Present {
 				continue
 			}

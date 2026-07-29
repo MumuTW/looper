@@ -22,8 +22,11 @@ import (
 )
 
 const (
+	EnrollmentEventType   = "triage.enrolled"
 	ReportEventType       = "triage.report"
 	ConfirmationEventType = "triage.confirmed"
+	ProjectionEventType   = "triage.routed"
+	RetirementEventType   = "triage.retired"
 
 	ActionRoutePlanner Action = "route_planner"
 	ActionAwaitHuman   Action = "await_human_confirmation"
@@ -45,12 +48,15 @@ const (
 	NextRoleHuman   NextRole = "human"
 
 	defaultIssueLimit                     = 100
+	defaultDecisionLimit                  = 1
 	defaultSourceLookback                 = 5 * time.Minute
 	autoRouteConfidence                   = 0.8
 	reportEntityType                      = "github_issue"
 	sourceEventNew        SourceEventKind = "new"
 	sourceEventReopened   SourceEventKind = "reopened"
 )
+
+const DefaultDecisionLimit = defaultDecisionLimit
 
 type Classification string
 type Scope string
@@ -84,15 +90,27 @@ type SourceEvent struct {
 // are intentionally absent: they may be projected later, but do not authorize
 // Planner.
 type Report struct {
-	Version        int            `json:"version"`
-	IdempotencyKey string         `json:"idempotencyKey"`
-	ProjectID      string         `json:"projectId"`
-	Repo           string         `json:"repo"`
-	IssueNumber    int64          `json:"issueNumber"`
-	Source         SourceEvent    `json:"source"`
-	Decision       Decision       `json:"decision"`
-	Policy         PolicyDecision `json:"policy"`
-	CreatedAt      string         `json:"createdAt"`
+	Version                    int            `json:"version"`
+	IdempotencyKey             string         `json:"idempotencyKey"`
+	ProjectID                  string         `json:"projectId"`
+	Repo                       string         `json:"repo"`
+	IssueNumber                int64          `json:"issueNumber"`
+	Source                     SourceEvent    `json:"source"`
+	Decision                   Decision       `json:"decision"`
+	Policy                     PolicyDecision `json:"policy"`
+	ConfirmationAfterCommentID int64          `json:"confirmationAfterCommentId,omitempty"`
+	CreatedAt                  string         `json:"createdAt"`
+}
+
+type Enrollment struct {
+	Version        int         `json:"version"`
+	IdempotencyKey string      `json:"idempotencyKey"`
+	ProjectID      string      `json:"projectId"`
+	Repo           string      `json:"repo"`
+	IssueNumber    int64       `json:"issueNumber"`
+	Source         SourceEvent `json:"source"`
+	CommentID      int64       `json:"commentId"`
+	EnrolledAt     string      `json:"enrolledAt"`
 }
 
 type Confirmation struct {
@@ -100,6 +118,19 @@ type Confirmation struct {
 	CommentID   int64  `json:"commentId"`
 	Author      string `json:"author"`
 	ConfirmedAt string `json:"confirmedAt"`
+}
+
+type Projection struct {
+	ReportKey    string   `json:"reportKey"`
+	QueueItemIDs []string `json:"queueItemIds,omitempty"`
+	LoopIDs      []string `json:"loopIds,omitempty"`
+	RoutedAt     string   `json:"routedAt"`
+}
+
+type Retirement struct {
+	EnrollmentKey string `json:"enrollmentKey"`
+	Reason        string `json:"reason"`
+	RetiredAt     string `json:"retiredAt"`
 }
 
 type Request struct {
@@ -129,6 +160,7 @@ type Options struct {
 	Planner        PlannerRouter
 	Now            func() time.Time
 	SourceLookback time.Duration
+	DecisionLimit  int
 }
 
 type Runner struct {
@@ -138,20 +170,25 @@ type Runner struct {
 	planner        PlannerRouter
 	now            func() time.Time
 	sourceLookback time.Duration
+	decisionLimit  int
 }
 
 type DiscoveryInput struct {
-	ProjectID string
-	Repo      string
-	Snapshot  *githubinfra.DiscoverySnapshot
+	ProjectID      string
+	Repo           string
+	Snapshot       *githubinfra.DiscoverySnapshot
+	DecisionBudget *int
 }
 
 type DiscoveryResult struct {
+	Enrolled             int
+	DecisionsAttempted   int
 	ReportsPersisted     int
 	Routed               int
 	AwaitingConfirmation int
 	Confirmed            int
 	Skipped              int
+	Retired              int
 	QueueItems           []storage.QueueItemRecord
 }
 
@@ -164,9 +201,13 @@ func New(options Options) *Runner {
 	if sourceLookback <= 0 {
 		sourceLookback = defaultSourceLookback
 	}
+	decisionLimit := options.DecisionLimit
+	if decisionLimit <= 0 {
+		decisionLimit = defaultDecisionLimit
+	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, llm: options.LLM,
-		planner: options.Planner, now: now, sourceLookback: sourceLookback,
+		planner: options.Planner, now: now, sourceLookback: sourceLookback, decisionLimit: decisionLimit,
 	}
 }
 
@@ -188,6 +229,11 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if project.Archived {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
+	states, err := r.loadSourceStates(ctx, input.ProjectID, input.Repo)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	result := DiscoveryResult{}
 	cutoff := r.now().UTC().Add(-r.sourceLookback)
 	issues, err := r.github.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{
 		Repo: input.Repo, CWD: project.RepoPath, Limit: defaultIssueLimit,
@@ -196,7 +242,6 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	result := DiscoveryResult{}
 	for _, summary := range issues {
 		detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: summary.Number, CWD: project.RepoPath})
 		if err != nil {
@@ -216,63 +261,264 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			continue
 		}
 		key := buildIdempotencyKey(input.ProjectID, input.Repo, detail.Number, source)
-		report, found, err := r.findReport(ctx, input.ProjectID, input.Repo, detail.Number, key)
-		if err != nil {
+		if !r.sourceIsRecent(source, cutoff) {
+			result.Skipped++
+			continue
+		}
+		if _, exists := states[key]; exists {
+			continue
+		}
+		enrollment := Enrollment{
+			Version: 1, IdempotencyKey: key, ProjectID: input.ProjectID, Repo: input.Repo,
+			IssueNumber: detail.Number, Source: source, CommentID: latestCommentID(detail.Comments),
+			EnrolledAt: r.now().UTC().Format(time.RFC3339Nano),
+		}
+		if err := r.persistEnrollment(ctx, enrollment); err != nil {
 			return result, err
 		}
-		if !found {
-			if !r.sourceIsRecent(source, cutoff) {
-				result.Skipped++
-				continue
-			}
-			decision, err := r.decide(ctx, *project, input.Repo, detail)
-			if err != nil {
-				return result, err
-			}
-			report = Report{
-				Version: 1, IdempotencyKey: key, ProjectID: input.ProjectID, Repo: input.Repo,
-				IssueNumber: detail.Number, Source: source, Decision: decision,
-				Policy: validateDecision(decision), CreatedAt: r.now().UTC().Format(time.RFC3339Nano),
-			}
-			if err := r.persistReport(ctx, report); err != nil {
-				return result, err
-			}
-			result.ReportsPersisted++
-		}
-		action := report.Policy.Action
-		if action == ActionAwaitHuman {
-			confirmed, created, err := r.confirmedByHuman(ctx, input.Repo, project.RepoPath, detail, report)
-			if err != nil {
-				return result, err
-			}
-			if !confirmed {
-				result.AwaitingConfirmation++
-				continue
-			}
-			if created {
-				result.Confirmed++
-			}
-			action = ActionRoutePlanner
-		}
-		switch action {
-		case ActionRoutePlanner:
-			route, err := r.planner.RouteIssue(ctx, planner.RouteIssueInput{
-				ProjectID: input.ProjectID, Repo: input.Repo, Authority: report.IdempotencyKey,
-				Issue: planner.IssueSummary{
-					Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL,
-					Assignees: append([]string(nil), detail.Assignees...), Labels: append([]string(nil), detail.Labels...),
-				},
-			})
-			if err != nil {
-				return result, err
-			}
-			result.Routed++
-			result.QueueItems = append(result.QueueItems, route.QueueItems...)
-		default:
-			return result, fmt.Errorf("triage report %s has unknown policy action %q", report.IdempotencyKey, action)
+		states[key] = &sourceState{enrollment: enrollment}
+		result.Enrolled++
+	}
+
+	pending := pendingSourceStates(states)
+	for _, state := range pending {
+		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, &result); err != nil {
+			return result, err
 		}
 	}
 	return result, nil
+}
+
+type sourceState struct {
+	enrollment Enrollment
+	report     *Report
+	projected  bool
+	retired    bool
+}
+
+func (r *Runner) loadSourceStates(ctx context.Context, projectID, repo string) (map[string]*sourceState, error) {
+	events, err := r.repos.Events.ListByProjectAndEntityType(ctx, projectID, reportEntityType)
+	if err != nil {
+		return nil, err
+	}
+	states := map[string]*sourceState{}
+	for _, event := range events {
+		switch event.EventType {
+		case EnrollmentEventType:
+			var enrollment Enrollment
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &enrollment); err != nil {
+				return nil, fmt.Errorf("decode triage enrollment: %w", err)
+			}
+			if enrollment.ProjectID != projectID || !strings.EqualFold(strings.TrimSpace(enrollment.Repo), strings.TrimSpace(repo)) {
+				continue
+			}
+			state := states[enrollment.IdempotencyKey]
+			if state == nil {
+				state = &sourceState{}
+				states[enrollment.IdempotencyKey] = state
+			}
+			state.enrollment = enrollment
+		case ReportEventType:
+			var report Report
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
+				return nil, fmt.Errorf("decode persisted triage report: %w", err)
+			}
+			if report.ProjectID != projectID || !strings.EqualFold(strings.TrimSpace(report.Repo), strings.TrimSpace(repo)) {
+				continue
+			}
+			state := states[report.IdempotencyKey]
+			if state == nil {
+				state = &sourceState{}
+				states[report.IdempotencyKey] = state
+			}
+			copy := report
+			state.report = &copy
+			if state.enrollment.IdempotencyKey == "" {
+				state.enrollment = Enrollment{
+					Version: 1, IdempotencyKey: report.IdempotencyKey, ProjectID: report.ProjectID,
+					Repo: report.Repo, IssueNumber: report.IssueNumber, Source: report.Source,
+					EnrolledAt: report.CreatedAt,
+				}
+			}
+		case ProjectionEventType:
+			var projection Projection
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &projection); err != nil {
+				return nil, fmt.Errorf("decode triage projection: %w", err)
+			}
+			state := states[projection.ReportKey]
+			if state == nil {
+				state = &sourceState{}
+				states[projection.ReportKey] = state
+			}
+			state.projected = true
+		case RetirementEventType:
+			var retirement Retirement
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &retirement); err != nil {
+				return nil, fmt.Errorf("decode triage retirement: %w", err)
+			}
+			state := states[retirement.EnrollmentKey]
+			if state == nil {
+				state = &sourceState{}
+				states[retirement.EnrollmentKey] = state
+			}
+			state.retired = true
+		}
+	}
+	for key, state := range states {
+		if state.enrollment.IdempotencyKey == "" {
+			delete(states, key)
+		}
+	}
+	return states, nil
+}
+
+func pendingSourceStates(states map[string]*sourceState) []*sourceState {
+	pending := make([]*sourceState, 0, len(states))
+	for _, state := range states {
+		if state.projected || state.retired {
+			continue
+		}
+		pending = append(pending, state)
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		if pending[i].enrollment.EnrolledAt != pending[j].enrollment.EnrolledAt {
+			return pending[i].enrollment.EnrolledAt < pending[j].enrollment.EnrolledAt
+		}
+		return pending[i].enrollment.IdempotencyKey < pending[j].enrollment.IdempotencyKey
+	})
+	return pending
+}
+
+func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *int, result *DiscoveryResult) error {
+	enrollment := state.enrollment
+	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: enrollment.IssueNumber, CWD: project.RepoPath})
+	if err != nil {
+		return err
+	}
+	if !eligibleTarget(detail) {
+		return r.retireSource(ctx, state, "source_no_longer_eligible", result)
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		result.Skipped++
+		return nil
+	}
+	currentSource, matches, err := r.sourceStillCurrent(ctx, repo, project.RepoPath, detail, enrollment)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return r.retireSource(ctx, state, "source_superseded", result)
+	}
+	detailSource := currentSource
+	report := state.report
+	if report == nil {
+		if result.DecisionsAttempted >= r.decisionLimit || (decisionBudget != nil && *decisionBudget <= 0) {
+			return nil
+		}
+		result.DecisionsAttempted++
+		if decisionBudget != nil {
+			*decisionBudget--
+		}
+		decision, err := r.decide(ctx, project, repo, detail)
+		if err != nil {
+			return err
+		}
+		refreshed, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: enrollment.IssueNumber, CWD: project.RepoPath})
+		if err != nil {
+			return err
+		}
+		if !eligibleTarget(refreshed) {
+			return r.retireSource(ctx, state, "source_no_longer_eligible", result)
+		}
+		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, refreshed.Labels) {
+			result.Skipped++
+			return nil
+		}
+		refreshedSource, matches, err := r.sourceStillCurrent(ctx, repo, project.RepoPath, refreshed, enrollment)
+		if err != nil {
+			return err
+		}
+		if !matches {
+			return r.retireSource(ctx, state, "source_superseded", result)
+		}
+		detail = refreshed
+		detailSource = refreshedSource
+		created := r.now().UTC().Format(time.RFC3339Nano)
+		value := Report{
+			Version: 1, IdempotencyKey: enrollment.IdempotencyKey, ProjectID: enrollment.ProjectID, Repo: enrollment.Repo,
+			IssueNumber: enrollment.IssueNumber, Source: detailSource, Decision: decision,
+			Policy: validateDecision(decision), ConfirmationAfterCommentID: enrollment.CommentID, CreatedAt: created,
+		}
+		if err := r.persistReport(ctx, value); err != nil {
+			return err
+		}
+		report = &value
+		state.report = report
+		result.ReportsPersisted++
+	}
+	action := report.Policy.Action
+	if action == ActionAwaitHuman {
+		confirmed, created, err := r.confirmedByHuman(ctx, repo, project.RepoPath, detail, *report)
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			result.AwaitingConfirmation++
+			return nil
+		}
+		if created {
+			result.Confirmed++
+		}
+		action = ActionRoutePlanner
+	}
+	if action != ActionRoutePlanner {
+		return fmt.Errorf("triage report %s has unknown policy action %q", report.IdempotencyKey, action)
+	}
+	route, err := r.planner.RouteIssue(ctx, planner.RouteIssueInput{
+		ProjectID: enrollment.ProjectID, Repo: repo, Authority: report.IdempotencyKey,
+		Issue: planner.IssueSummary{
+			Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL,
+			Assignees: append([]string(nil), detail.Assignees...), Labels: append([]string(nil), detail.Labels...),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if !route.ProjectionAccepted {
+		result.Skipped++
+		return nil
+	}
+	if err := r.persistProjection(ctx, *report, route); err != nil {
+		return err
+	}
+	state.projected = true
+	result.Routed++
+	result.QueueItems = append(result.QueueItems, route.QueueItems...)
+	return nil
+}
+
+func (r *Runner) sourceStillCurrent(ctx context.Context, repo, cwd string, detail githubinfra.IssueDetail, enrollment Enrollment) (SourceEvent, bool, error) {
+	timeline, err := r.github.ListIssueTimeline(ctx, githubinfra.IssueTimelineInput{Repo: repo, IssueNumber: detail.Number, CWD: cwd})
+	if err != nil {
+		return SourceEvent{}, false, err
+	}
+	source, ok := sourceEvent(detail, timeline)
+	if !ok {
+		return SourceEvent{}, false, nil
+	}
+	key := buildIdempotencyKey(enrollment.ProjectID, enrollment.Repo, enrollment.IssueNumber, source)
+	return source, key == enrollment.IdempotencyKey, nil
+}
+
+func (r *Runner) retireSource(ctx context.Context, state *sourceState, reason string, result *DiscoveryResult) error {
+	retirement := Retirement{EnrollmentKey: state.enrollment.IdempotencyKey, Reason: reason, RetiredAt: r.now().UTC().Format(time.RFC3339Nano)}
+	if err := r.persistRetirement(ctx, state.enrollment, retirement); err != nil {
+		return err
+	}
+	state.retired = true
+	result.Retired++
+	result.Skipped++
+	return nil
 }
 
 func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue githubinfra.IssueDetail, report Report) (confirmed, created bool, err error) {
@@ -292,17 +538,26 @@ func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue g
 			return true, false, nil
 		}
 	}
-	reportedAt, err := time.Parse(time.RFC3339Nano, report.CreatedAt)
-	if err != nil {
-		return false, false, fmt.Errorf("parse triage report timestamp: %w", err)
+	var reportedAt time.Time
+	if report.ConfirmationAfterCommentID == 0 {
+		reportedAt, err = time.Parse(time.RFC3339Nano, report.CreatedAt)
+		if err != nil {
+			return false, false, fmt.Errorf("parse triage report timestamp: %w", err)
+		}
 	}
 	for _, comment := range issue.Comments {
 		if strings.TrimSpace(comment.Body) != "/plan" || strings.TrimSpace(comment.Author) == "" {
 			continue
 		}
-		commentedAt, err := time.Parse(time.RFC3339Nano, comment.CreatedAt)
-		if err != nil || !commentedAt.After(reportedAt) {
-			continue
+		if report.ConfirmationAfterCommentID > 0 {
+			if comment.ID <= report.ConfirmationAfterCommentID {
+				continue
+			}
+		} else {
+			commentedAt, err := time.Parse(time.RFC3339Nano, comment.CreatedAt)
+			if err != nil || commentedAt.Before(reportedAt.Truncate(time.Second)) {
+				continue
+			}
 		}
 		permission, err := r.github.GetRepositoryPermission(ctx, githubinfra.RepositoryPermissionInput{
 			Repo: repo, User: comment.Author, CWD: cwd,
@@ -430,6 +685,22 @@ Issue: #%d %s
 %s`, repo, issue.Number, strings.TrimSpace(issue.Title), strings.TrimSpace(issue.Body))
 }
 
+func (r *Runner) persistEnrollment(ctx context.Context, enrollment Enrollment) error {
+	payload, err := json.Marshal(enrollment)
+	if err != nil {
+		return err
+	}
+	projectID := enrollment.ProjectID
+	entityType := reportEntityType
+	entityID := reportEntityID(enrollment.ProjectID, enrollment.Repo, enrollment.IssueNumber)
+	actorType, actorID := "system", "triager"
+	return r.repos.Events.Append(ctx, storage.EventLogRecord{
+		ID: eventlog.NewEventID("triage-enroll"), EventType: EnrollmentEventType, ProjectID: &projectID,
+		EntityType: &entityType, EntityID: &entityID, ActorType: &actorType, ActorID: &actorID,
+		PayloadJSON: string(payload), CreatedAt: enrollment.EnrolledAt,
+	})
+}
+
 func (r *Runner) persistReport(ctx context.Context, report Report) error {
 	payload, err := json.Marshal(report)
 	if err != nil {
@@ -462,24 +733,41 @@ func (r *Runner) persistConfirmation(ctx context.Context, report Report, confirm
 	})
 }
 
-func (r *Runner) findReport(ctx context.Context, projectID, repo string, issueNumber int64, key string) (Report, bool, error) {
-	events, err := r.repos.Events.ListByEntity(ctx, reportEntityType, reportEntityID(projectID, repo, issueNumber))
+func (r *Runner) persistProjection(ctx context.Context, report Report, route planner.DiscoveryResult) error {
+	projection := Projection{ReportKey: report.IdempotencyKey, RoutedAt: r.now().UTC().Format(time.RFC3339Nano)}
+	for _, item := range route.QueueItems {
+		projection.QueueItemIDs = append(projection.QueueItemIDs, item.ID)
+	}
+	projection.LoopIDs = append(projection.LoopIDs, route.CreatedLoopIDs...)
+	payload, err := json.Marshal(projection)
 	if err != nil {
-		return Report{}, false, err
+		return err
 	}
-	for _, event := range events {
-		if event.EventType != ReportEventType {
-			continue
-		}
-		var report Report
-		if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
-			return Report{}, false, fmt.Errorf("decode persisted triage report: %w", err)
-		}
-		if report.IdempotencyKey == key {
-			return report, true, nil
-		}
+	projectID := report.ProjectID
+	entityType := reportEntityType
+	entityID := reportEntityID(report.ProjectID, report.Repo, report.IssueNumber)
+	actorType, actorID := "system", "triager"
+	return r.repos.Events.Append(ctx, storage.EventLogRecord{
+		ID: eventlog.NewEventID("triage-route"), EventType: ProjectionEventType, ProjectID: &projectID,
+		EntityType: &entityType, EntityID: &entityID, ActorType: &actorType, ActorID: &actorID,
+		PayloadJSON: string(payload), CreatedAt: projection.RoutedAt,
+	})
+}
+
+func (r *Runner) persistRetirement(ctx context.Context, enrollment Enrollment, retirement Retirement) error {
+	payload, err := json.Marshal(retirement)
+	if err != nil {
+		return err
 	}
-	return Report{}, false, nil
+	projectID := enrollment.ProjectID
+	entityType := reportEntityType
+	entityID := reportEntityID(enrollment.ProjectID, enrollment.Repo, enrollment.IssueNumber)
+	actorType, actorID := "system", "triager"
+	return r.repos.Events.Append(ctx, storage.EventLogRecord{
+		ID: eventlog.NewEventID("triage-retire"), EventType: RetirementEventType, ProjectID: &projectID,
+		EntityType: &entityType, EntityID: &entityID, ActorType: &actorType, ActorID: &actorID,
+		PayloadJSON: string(payload), CreatedAt: retirement.RetiredAt,
+	})
 }
 
 func buildIdempotencyKey(projectID, repo string, issueNumber int64, source SourceEvent) string {
@@ -509,6 +797,16 @@ func compactStrings(values []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func latestCommentID(comments []githubinfra.CommentInfo) int64 {
+	var latest int64
+	for _, comment := range comments {
+		if comment.ID > latest {
+			latest = comment.ID
+		}
+	}
+	return latest
 }
 
 func stringValue(value any) string {

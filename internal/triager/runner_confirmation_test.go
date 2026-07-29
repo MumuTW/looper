@@ -61,7 +61,34 @@ func TestDiscoverIssuesRoutesConfirmedUnsafeReportWithoutRepeatingLLM(t *testing
 	if err != nil {
 		t.Fatalf("Events.List() error = %v", err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("events = %d, want report plus confirmation", len(events))
+	if len(events) != 4 {
+		t.Fatalf("events = %d, want enrollment, report, confirmation, and projection", len(events))
+	}
+}
+
+func TestDiscoverIssuesAcceptsNewConfirmationInReportTimestampSecond(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.now = fixture.now.Add(500 * time.Millisecond)
+	old := githubinfra.CommentInfo{ID: 76, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Add(-time.Second).Format(time.RFC3339)}
+	fixture.github.detail.Comments = []githubinfra.CommentInfo{old}
+	fixture.llm.responses = []string{`{"classification":"feature","scope":"in_scope","risk":"high","confidence":0.98,"missingInformation":[],"recommendedNextRole":"planner","rationale":"Touches credentials."}`}
+	runner := fixture.runner()
+
+	first, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil || first.AwaitingConfirmation != 1 {
+		t.Fatalf("first DiscoverIssues() = (%#v, %v)", first, err)
+	}
+	fixture.github.listEmpty = true
+	fixture.github.detail.Comments = append(fixture.github.detail.Comments, githubinfra.CommentInfo{
+		ID: 77, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Truncate(time.Second).Format(time.RFC3339),
+	})
+	fixture.github.permission = "write"
+	second, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverIssues() error = %v", err)
+	}
+	if second.Confirmed != 1 || second.Routed != 1 {
+		t.Fatalf("second DiscoverIssues() = %#v", second)
 	}
 }

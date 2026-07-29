@@ -46,6 +46,18 @@ func TestCodexJSONLTranslator(t *testing.T) {
 	}
 }
 
+func TestFinalMessageExtractsCodexJSONLAndPreservesPlainText(t *testing.T) {
+	jsonl := "{\"type\":\"thread.started\",\"thread_id\":\"th_1\"}\n" +
+		"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"action\\\":\\\"route\\\"}\"}}\n" +
+		"{\"type\":\"turn.completed\"}"
+	if got := FinalMessage(jsonl); got != `{"action":"route"}` {
+		t.Fatalf("FinalMessage(JSONL) = %q", got)
+	}
+	if got := FinalMessage(`{"action":"route"}`); got != `{"action":"route"}` {
+		t.Fatalf("FinalMessage(plain) = %q", got)
+	}
+}
+
 func TestResolveCodexArgsJSONFlag(t *testing.T) {
 	base := ExecutorConfig{Vendor: "codex"}
 	// off by default → no --json

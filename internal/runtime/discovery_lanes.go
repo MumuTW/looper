@@ -128,6 +128,7 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 // triagerLane is an internal issue-source role. Its persisted report is the
 // routing authority; the lane does not need a label-gated CodingRoleConfig.
 func triagerLane(input defaultSchedulerTickInput) discoveryLane {
+	decisionBudget := triager.DefaultDecisionLimit
 	return discoveryLane{
 		Name:     "triager",
 		Priority: config.PriorityTriager,
@@ -137,7 +138,7 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 		},
 		Supported: func(kind config.ProviderKind) bool { return kind == config.ProviderKindGitHub },
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
-			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: &decisionBudget})
 			return result.QueueItems, err
 		},
 	}

@@ -41,8 +41,16 @@ func (l agentLLM) Complete(ctx context.Context, req Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(result.Stdout) == "" {
+	return completedAgentMessage(result)
+}
+
+func completedAgentMessage(result agent.Result) (string, error) {
+	if !strings.EqualFold(strings.TrimSpace(result.Status), "completed") {
+		return "", fmt.Errorf("triager execution ended with status %q: %s", result.Status, strings.TrimSpace(result.Summary))
+	}
+	message := agent.FinalMessage(result.Stdout)
+	if strings.TrimSpace(message) == "" {
 		return "", fmt.Errorf("triager returned empty stdout")
 	}
-	return strings.TrimSpace(result.Stdout), nil
+	return strings.TrimSpace(message), nil
 }

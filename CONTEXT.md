@@ -69,6 +69,14 @@ Issue event, idempotency key, and policy outcome. It is stored as a
 routing. GitHub labels may project its outcome but cannot replace it.
 _Avoid_: routing label, inferred issue state.
 
+**Triage enrollment**:
+Triager's durable record that a specific new/reopened source event entered the
+workflow before any LLM call. `triage.enrolled` provides retry identity across
+agent outages and source-lookback expiry; it does not authorize Planner.
+`triage.routed` acknowledges an accepted projection, while `triage.retired`
+settles a source that closed or was superseded.
+_Avoid_: routing authority, report.
+
 **Triage routing**:
 The projection of an accepted Triage Report into Planner's durable loop and
 queue without consulting Planner's label/assignee discovery filters. This is

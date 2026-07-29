@@ -148,11 +148,81 @@ func TestRouteIssueUsesPersistedAuthorityWithoutLabelOrAssignee(t *testing.T) {
 	if len(first.CreatedLoopIDs) != 1 || len(first.QueueItems) != 1 {
 		t.Fatalf("first RouteIssue() = %#v, want one loop and queue item", first)
 	}
+	if !first.ProjectionAccepted || !second.ProjectionAccepted {
+		t.Fatalf("route acceptance = %v/%v, want durable acceptance", first.ProjectionAccepted, second.ProjectionAccepted)
+	}
 	if len(second.CreatedLoopIDs) != 0 || len(second.QueueItems) != 1 || second.QueueItems[0].ID != first.QueueItems[0].ID {
 		t.Fatalf("second RouteIssue() = %#v, want same durable queue item", second)
 	}
 	if plannerQueueDiscoveryFingerprint(first.QueueItems[0].PayloadJSON) != plannerQueueDiscoveryFingerprint(second.QueueItems[0].PayloadJSON) {
 		t.Fatal("persisted report authority changed after mutable issue fields changed")
+	}
+}
+
+func TestReportAuthorizedRouteProcessesWithoutDiscoveryLabelOrAssignee(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	branch := "looper/planner/23-route-from-triage"
+	github := &fakeGitHubGateway{
+		issueDetail:    IssueDetail{Number: 23, Title: "Route from triage", Body: "No routing label or assignee.", URL: "https://example/issues/23"},
+		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main"}}
+	agentExecutor := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	route, err := runner.RouteIssue(context.Background(), RouteIssueInput{
+		ProjectID: "project_1", Repo: "acme/looper", Authority: "triage:report-23",
+		Issue: IssueSummary{Number: 23, Title: "Route from triage", Body: "No routing label or assignee."},
+	})
+	if err != nil || !route.ProjectionAccepted || len(route.QueueItems) != 1 {
+		t.Fatalf("RouteIssue() = (%#v, %v)", route, err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
+	}
+	processed, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if processed.Status != "success" || processed.PullRequestNumber != 101 || len(agentExecutor.starts) != 1 {
+		t.Fatalf("processed = %#v, agent calls = %d", processed, len(agentExecutor.starts))
+	}
+}
+
+func TestRouteIssueCreatesNewLoopForNewReopenedAuthority(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	input := RouteIssueInput{ProjectID: "project_1", Repo: "acme/looper", Authority: "triage:new", Issue: IssueSummary{Number: 23, Title: "Route from triage"}}
+	first, err := runner.RouteIssue(context.Background(), input)
+	if err != nil || len(first.CreatedLoopIDs) != 1 || len(first.QueueItems) != 1 {
+		t.Fatalf("first RouteIssue() = (%#v, %v)", first, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), first.CreatedLoopIDs[0])
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	loop.Status = "completed"
+	loop.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := first.QueueItems[0]
+	queue.Status = "completed"
+	queue.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	input.Authority = "triage:reopened"
+	second, err := runner.RouteIssue(context.Background(), input)
+	if err != nil {
+		t.Fatalf("reopened RouteIssue() error = %v", err)
+	}
+	if !second.ProjectionAccepted || len(second.CreatedLoopIDs) != 1 || second.CreatedLoopIDs[0] == first.CreatedLoopIDs[0] || len(second.QueueItems) != 1 {
+		t.Fatalf("reopened RouteIssue() = %#v", second)
 	}
 }
 
