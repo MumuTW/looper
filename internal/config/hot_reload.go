@@ -279,31 +279,34 @@ func RestartRequiredChanges(oldConfig Config, newConfig Config) []string {
 	return restartRequired
 }
 
-// appendCodingRoleRegistryGuards marks TOML-authored coding-role changes as
-// restart-bound. Roles.Coding is derived, non-serialized state, so the JSON
-// diff above cannot see it; without this guard an edit to roles.coding.* would
-// apply neither hot nor via a restart prompt — configured but inert.
-//
-// Shipped roles compare only priority: their discovery, instructions, and
-// agent mirror legacy named fields that the JSON diff already classifies
-// (several are hot). Custom roles have no mirrored input, so every field must
-// be compared or a discovery/instruction/agent edit would be invisible and
-// silently remain on the old runtime snapshot.
+// appendCodingRoleRegistryGuards marks a TOML-authored registry overlay as
+// restart-bound. Roles.Coding is derived and non-serialized, so a registry-only
+// edit would otherwise apply neither hot nor through a restart prompt. A map
+// change fully explained by legacy named fields is left to the existing JSON
+// policy for those fields.
 func appendCodingRoleRegistryGuards(oldConfig Config, newConfig Config, seen map[string]struct{}, restartRequired *[]string) {
 	oldRoles := EffectiveCodingRoles(oldConfig.Roles)
 	newRoles := EffectiveCodingRoles(newConfig.Roles)
+	oldLegacy := CodingRolesFromLegacy(oldConfig.Roles)
+	newLegacy := CodingRolesFromLegacy(newConfig.Roles)
 	for name, oldRole := range oldRoles {
 		newRole, ok := newRoles[name]
-		changed := !ok || oldRole.Priority != newRole.Priority
-		if ok && !isCodingRole(name) && !reflect.DeepEqual(oldRole, newRole) {
-			changed = true
-		}
-		if changed {
-			markCodingRoleRestart(seen, restartRequired, name)
+		if !ok || !reflect.DeepEqual(oldRole, newRole) {
+			_, oldAuthored := oldConfig.Roles.Coding[name]
+			_, newAuthored := newConfig.Roles.Coding[name]
+			oldIsLegacy := reflect.DeepEqual(oldRole, oldLegacy[name])
+			newIsLegacy := ok && reflect.DeepEqual(newRole, newLegacy[name])
+			if oldAuthored && !oldIsLegacy || newAuthored && !newIsLegacy {
+				markCodingRoleRestart(seen, restartRequired, name)
+			}
 		}
 	}
-	for name := range newRoles {
-		if _, ok := oldRoles[name]; !ok {
+	for name, newRole := range newRoles {
+		if _, ok := oldRoles[name]; ok {
+			continue
+		}
+		_, authored := newConfig.Roles.Coding[name]
+		if authored && !reflect.DeepEqual(newRole, newLegacy[name]) {
 			markCodingRoleRestart(seen, restartRequired, name)
 		}
 	}
@@ -417,6 +420,13 @@ func CloneConfig(source Config) Config {
 	var cloned Config
 	if err := json.Unmarshal(raw, &cloned); err != nil {
 		panic(fmt.Sprintf("clone config: %v", err))
+	}
+	// Roles.Coding is derived runtime state and intentionally omitted from the
+	// JSON payload above. Keep it detached but intact: dropping an authored
+	// overlay here would make config snapshots silently fall back to legacy
+	// named fields and break the canonical-registry contract.
+	if source.Roles.Coding != nil {
+		cloned.Roles.Coding = cloneCodingRoleRegistry(source.Roles.Coding)
 	}
 	return cloned
 }

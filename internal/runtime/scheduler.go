@@ -427,7 +427,11 @@ func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.
 	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
 		return nil
 	}
-	labels := config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.Labels
+	reviewerRole, ok := config.ProjectCodingRoleConfig(cfg, project.ID, config.CodingRoleReviewer)
+	if !ok {
+		return nil
+	}
+	labels := reviewerRole.Discovery.Labels
 	result := make([]string, 0, len(labels))
 	for _, label := range labels {
 		label = strings.TrimSpace(label)
@@ -507,7 +511,8 @@ func forgejoReviewerRequireReviewRequestForProject(cfg config.Config, project co
 	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
 		return true
 	}
-	return config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.RequireReviewRequest
+	reviewerRole, ok := config.ProjectCodingRoleConfig(cfg, project.ID, config.CodingRoleReviewer)
+	return !ok || reviewerRole.Discovery.RequireReviewRequest
 }
 
 func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
@@ -3303,6 +3308,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
+	codingRoles := config.EffectiveCodingRoles(cfg.Roles)
+	plannerRole := codingRoles[config.CodingRolePlanner]
+	reviewerRole := codingRoles[config.CodingRoleReviewer]
+	fixerRole := codingRoles[config.CodingRoleFixer]
+	workerRole := codingRoles[config.CodingRoleWorker]
 	roleStamper := func(resolved config.ResolvedAgent) disclosure.Stamper {
 		model := ""
 		if resolved.Model != nil {
@@ -3328,7 +3338,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			agentModel = &model
 		}
 		plannerStamper := roleStamper(resolved)
-		plannerAutoDiscovery := cfg.Roles.Planner.AutoDiscovery
+		plannerAutoDiscovery := plannerRole.Discovery.Enabled
 		if !plannerConfigured {
 			plannerAutoDiscovery = false
 		}
@@ -3350,9 +3360,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
 			DiscoveryPolicy: planner.DiscoveryPolicy{
 				AutoDiscovery:              plannerAutoDiscovery,
-				Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),
-				LabelMode:                  cfg.Roles.Planner.Triggers.LabelMode,
-				RequireAssigneeCurrentUser: cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser,
+				Labels:                     append([]string(nil), plannerRole.Discovery.Labels...),
+				LabelMode:                  plannerRole.Discovery.LabelMode,
+				RequireAssigneeCurrentUser: plannerRole.Discovery.RequireAssigneeCurrentUser,
 			},
 			RetryBaseDelay:      retryBaseDelay,
 			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
@@ -3430,7 +3440,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			agentModel = &model
 		}
 		reviewerStamper := roleStamper(resolved)
-		reviewerAutoDiscovery := cfg.Roles.Reviewer.Discovery.AutoDiscovery
+		reviewerAutoDiscovery := reviewerRole.Discovery.Enabled
 		if !reviewerConfigured {
 			reviewerAutoDiscovery = false
 		}
@@ -3455,11 +3465,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
 			DiscoveryPolicy: reviewer.DiscoveryPolicy{
 				AutoDiscovery:             reviewerAutoDiscovery,
-				IncludeDrafts:             cfg.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
-				RequireReviewRequest:      cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
-				EnableSelfReview:          cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
-				Labels:                    append([]string(nil), cfg.Roles.Reviewer.Discovery.Triggers.Labels...),
-				LabelMode:                 cfg.Roles.Reviewer.Discovery.Triggers.LabelMode,
+				IncludeDrafts:             reviewerRole.Discovery.IncludeDrafts,
+				RequireReviewRequest:      reviewerRole.Discovery.RequireReviewRequest,
+				EnableSelfReview:          reviewerRole.Discovery.EnableSelfReview,
+				Labels:                    append([]string(nil), reviewerRole.Discovery.Labels...),
+				LabelMode:                 reviewerRole.Discovery.LabelMode,
 				IncludeSpecReviewingLabel: cfg.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel,
 				SpecReviewingLabel:        cfg.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel,
 			},
@@ -3505,7 +3515,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			agentModel = &model
 		}
 		fixerStamper := roleStamper(resolved)
-		fixerAutoDiscovery := cfg.Roles.Fixer.AutoDiscovery
+		fixerAutoDiscovery := fixerRole.Discovery.Enabled
 		if !fixerConfigured {
 			fixerAutoDiscovery = false
 		}
@@ -3527,10 +3537,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: fixer.DiscoveryPolicy{
 				AutoDiscovery: fixerAutoDiscovery,
-				IncludeDrafts: cfg.Roles.Fixer.Triggers.IncludeDrafts,
-				AuthorFilter:  cfg.Roles.Fixer.Triggers.AuthorFilter,
-				Labels:        append([]string(nil), cfg.Roles.Fixer.Triggers.Labels...),
-				LabelMode:     cfg.Roles.Fixer.Triggers.LabelMode,
+				IncludeDrafts: fixerRole.Discovery.IncludeDrafts,
+				AuthorFilter:  config.FixerAuthorFilter(fixerRole.Discovery.AuthorFilter),
+				Labels:        append([]string(nil), fixerRole.Discovery.Labels...),
+				LabelMode:     fixerRole.Discovery.LabelMode,
 			},
 			Disclosure:          &cfg.Disclosure,
 			AgentRuntime:        string(resolved.Vendor),
@@ -3569,7 +3579,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			agentModel = &model
 		}
 		workerStamper := roleStamper(resolved)
-		workerAutoDiscovery := cfg.Roles.Worker.AutoDiscovery
+		workerAutoDiscovery := workerRole.Discovery.Enabled
 		if !workerConfigured {
 			workerAutoDiscovery = false
 		}
@@ -3593,9 +3603,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: worker.DiscoveryPolicy{
 				AutoDiscovery:              workerAutoDiscovery,
-				Labels:                     append([]string(nil), cfg.Roles.Worker.Triggers.Labels...),
-				LabelMode:                  cfg.Roles.Worker.Triggers.LabelMode,
-				RequireAssigneeCurrentUser: cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser,
+				Labels:                     append([]string(nil), workerRole.Discovery.Labels...),
+				LabelMode:                  workerRole.Discovery.LabelMode,
+				RequireAssigneeCurrentUser: workerRole.Discovery.RequireAssigneeCurrentUser,
 			},
 			Disclosure:          &cfg.Disclosure,
 			AgentRuntime:        string(resolved.Vendor),
@@ -3657,7 +3667,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			PlannerDiscoveryEnabled: boolPtr(plannerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
 			TriagerEnabled: func(projectID string) bool {
 				roles := config.ProjectRoleConfigs(cfg, projectID)
-				return plannerConfigured && roles.Planner.AutoDiscovery && !roles.Coordinator.Enabled
+				plannerRole, ok := config.ProjectCodingRoleConfig(cfg, projectID, config.CodingRolePlanner)
+				return plannerConfigured && ok && plannerRole.Discovery.Enabled && !roles.Coordinator.Enabled
 			},
 			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
 			ReviewerDiscoveryEnabled: boolPtr(reviewerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),

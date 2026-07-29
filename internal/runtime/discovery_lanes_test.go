@@ -45,6 +45,27 @@ func TestTriagerLaneSharesOneDecisionBudgetAcrossProjects(t *testing.T) {
 	}
 }
 
+func TestDiscoveryLanesOrderFromCanonicalRegistryPriority(t *testing.T) {
+	t.Parallel()
+	priority := 1
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: &config.PartialRoleConfigs{Coding: map[string]config.PartialCodingRoleConfig{
+		config.CodingRoleWorker: {Priority: &priority},
+	}}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	lanes := discoveryLanes(defaultSchedulerTickInput{Config: &cfg})
+	for _, lane := range lanes {
+		if lane.Name == config.CodingRoleWorker {
+			if lane.Priority != 1 {
+				t.Fatalf("worker lane priority = %d, want canonical registry priority", lane.Priority)
+			}
+			return
+		}
+	}
+	t.Fatal("worker discovery lane missing")
+}
+
 type budgetTriager struct{ budgets []int }
 
 func (f *budgetTriager) DiscoverIssues(_ context.Context, input triager.DiscoveryInput) (triager.DiscoveryResult, error) {

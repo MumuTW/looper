@@ -597,18 +597,14 @@ type CoordinatorRoleConfig struct {
 }
 
 type RoleConfigs struct {
-	// Coding holds every coding role keyed by role name. It is the canonical
-	// registry, but not yet the authority for everything it carries: today
-	// the only thing read from it is which roles exist and each one's
-	// Priority, which codingDiscoveryLanes uses to build and order the
-	// scheduler's discovery lanes. Discovery filters, per-role instructions,
-	// and agent resolution for the four shipped roles are still read from
-	// the named fields below.
+	// Coding is the canonical runtime registry for the compiled planner,
+	// worker, reviewer, and fixer roles. Discovery, instructions, agent
+	// resolution, and lane priority read from this map. The named sections
+	// below remain source-compatible inputs and are projected here first.
 	//
-	// Normalize derives it: CodingRolesFromLegacy projects the named fields,
-	// then the TOML-authored roles.coding.* sections (PartialRoleConfigs.
-	// Coding) are overlaid — priority only for shipped roles, full entries
-	// for custom ones.
+	// Normalize overlays TOML-authored roles.coding.<shipped-role> fields on
+	// that projection. Arbitrary names are rejected because no custom runner
+	// exists; gatekeeper remains a compiled policy, outside author control.
 	//
 	// Not serialized: it is derived state, so emitting it would duplicate
 	// the inputs in every config payload and in the frozen parity fixtures.
@@ -1146,12 +1142,11 @@ type PartialCoordinatorRoleConfig struct {
 }
 
 type PartialRoleConfigs struct {
-	// Coding holds the TOML-authored coding roles (`[roles.coding.<name>]`
-	// sections) keyed by role name. Global-only: projects[].roles.coding is
-	// rejected at load. For a shipped role name only priority may be set —
-	// everything else stays with the legacy named section; any other name
-	// authors a custom role, which requires priority and discovery.source.
-	// See resolveCodingRoles for the full precedence rules.
+	// Coding holds TOML-authored coding-role overlays
+	// (`[roles.coding.<shipped-role>]`). It is global-only:
+	// projects[].roles.coding is rejected. The only accepted names are the
+	// compiled planner, worker, reviewer, and fixer runners; gatekeeper's
+	// compiled policy cannot be overridden.
 	Coding      map[string]PartialCodingRoleConfig `json:"coding,omitempty"`
 	Planner     *PartialPlannerRoleConfig          `json:"planner,omitempty"`
 	Reviewer    *PartialReviewerRoleConfig         `json:"reviewer,omitempty"`

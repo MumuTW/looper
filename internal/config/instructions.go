@@ -35,7 +35,7 @@ func BuildCustomInstructionBlock(cfg Config, projectID, role string) CustomInstr
 			// No global role instructions are configured for this role.
 		} else {
 			sections = append(sections, fmt.Sprintf("Global %s instructions:\n%s", role, globalInstructions))
-			block.Sources = append(block.Sources, CustomInstructionSource{Kind: "global-role", Path: "roles." + role + ".instructions"})
+			block.Sources = append(block.Sources, CustomInstructionSource{Kind: "global-role", Path: "roles.coding." + role + ".instructions"})
 		}
 	}
 	if project != nil {

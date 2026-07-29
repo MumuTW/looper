@@ -244,6 +244,8 @@ Profiles do not carry params, env, or timeouts.
 
 Optional on the four coding roles only: `planner`, `worker`, `reviewer`, and `fixer`.
 
+This named form remains compatibility input. For new canonical registry configuration, put the same binding at `roles.coding.<role>.agent`; when both forms set a field, `roles.coding.<role>` wins.
+
 | Field | Purpose |
 | --- | --- |
 | `profile` | Name of an entry in `agent.profiles` |
@@ -259,8 +261,8 @@ Project-level `projects[].roles.*.agent` bindings are **not supported**. Agent i
 For each coding role, Looper overlays identity in this order:
 
 1. **Global** `agent.vendor` / `agent.model`
-2. **Role profile** — if `roles.<role>.agent.profile` is set, overlay that profile's vendor/model
-3. **Role inline** — overlay `roles.<role>.agent.vendor` / `roles.<role>.agent.model` when present
+2. **Role profile** — from the effective canonical registry (projected from `roles.<role>.agent` and then overlaid by `roles.coding.<role>.agent`)
+3. **Role inline** — the registry's inline vendor/model fields win over the selected profile
 
 A role is runnable only when the overlay leaves a non-empty vendor. Missing global vendor is fine when a profile or role inline supplies one.
 
@@ -280,7 +282,7 @@ Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.m
 
 ### Hot reload and frozen runs
 
-- Profile and role agent vendor/model/profile paths are hot-safe for **new claims** after a successful config publication.
+- Legacy profile and named-role agent paths are hot-safe for **new claims** after a successful config publication. A `roles.coding.*` overlay is restart-bound with the rest of the canonical registry.
 - In-flight runs keep the immutable config snapshot (and durable per-run agent snapshot) they started with; resume/retry copies the predecessor run's agent snapshot rather than re-resolving live config.
 - `agent.params` remain global, file-only, and restart-bound. The dashboard does not edit params.
 - Every `daemon.worktreeCleanup.*` leaf is hot-safe. The cleanup loop always runs and rereads `enabled` and `interval` on each wake, and a successful publication wakes it immediately, so enabling cleanup or shortening its interval takes effect without waiting out the previous schedule or restarting the daemon. The `daemon.worktreeCleanup` object itself stays restart-bound.
@@ -473,36 +475,37 @@ All role-specific config lives under `roles.<role>`.
 - runtime behavior lives at `roles.<role>.behavior.*` when that split is useful for the role
 - coding-role agent identity overlays live at `roles.{planner,worker,reviewer,fixer}.agent` (profile ref and/or inline vendor/model); see [Multi-role agent vendor and model](#multi-role-agent-vendor-and-model)
 
-### TOML-authored coding roles (`roles.coding.<name>`)
+### Canonical coding-role registry (`roles.coding.<shipped-role>`)
 
-Coding roles can also be authored directly as `[roles.coding.<name>]` sections. These feed the canonical coding-role registry that orders the scheduler's discovery lanes; each entry carries `priority` (required; lower runs first), an optional `discovery` block (same shape as the role discovery model: `enabled`, `source` = `issue` | `pull_request`, label gating, and the per-source fields), optional `instructions`, and an optional `agent` binding.
+`roles.coding` is the canonical runtime registry for the four compiled agent runners: `planner`, `worker`, `reviewer`, and `fixer`. Its `priority`, `discovery`, `instructions`, and `agent` fields drive the scheduler, runner policy, prompt instructions, and agent identity.
 
-Precedence rules when both forms are present:
+The existing named `roles.<name>.*` sections remain supported as compatibility input: Looper projects them into the registry first, then overlays the matching `roles.coding.<name>` fields. This means a legacy-only configuration keeps its behavior, while an authored registry entry wins for the fields it sets. Reviewer-only behavior such as `autoMerge`, `behavior`, and `specReview` remains under `roles.reviewer.*` because only the reviewer runner implements it.
 
-- For a shipped role name (`planner`, `worker`, `reviewer`, `fixer`, `gatekeeper`), only `priority` may be set — it overrides the compiled-in lane priority. Discovery, instructions, and agent for the four agent-backed roles keep coming from the legacy `roles.<name>.*` section; Gatekeeper's policy is compiled in. Setting those fields under `roles.coding.<name>` is a load-time error because the values would be inert.
-- `roles.coding.coordinator` is rejected — Coordinator is not a coding role.
-- Any other name authors a custom role. `priority` and `discovery.source` are required, fields that belong to the other work source are rejected (an issue-source role may not set `includeDrafts`, and so on), and discovery fields merge field-by-field across config layers with later layers winning.
-- `roles.coding.*` is global-only: `projects[].roles.coding` is rejected.
+- Only `planner`, `worker`, `reviewer`, and `fixer` are valid keys. Any other name is rejected because no compiled runner could execute it.
+- `gatekeeper` is a compiled policy role, not an authorable registry entry. Its source, priority, and policy cannot be overridden.
+- `coordinator` and `triager` are internal lanes, not coding roles.
+- `roles.coding.*` is global-only; `projects[].roles.coding` is rejected. Existing project-level named role overrides remain compatible.
+- A runner's source is fixed: Planner and Worker use `issue`; Reviewer and Fixer use `pull_request`. If `discovery.source` is written, it must match that source. Source-inapplicable fields are rejected even when set to `false` or an empty string.
+- `priority` must be a positive integer. Lower values run earlier. `labelMode` defaults to `all` when omitted.
 
-A custom role with no compiled-in runner is registered and ordered but its discovery lane is skipped — the section is the configuration half of adding a role; the runner half still ships with the binary. `roles.coding.*` edits are restart-bound.
-
-When `labelMode` is omitted it defaults to `all`. Cross-source fields are rejected even when explicitly set to `false` or an empty string, so configuration never accepts a key that the selected source would ignore.
+`roles.coding.*` overlays are restart-bound because the canonical registry is derived runtime state rather than a serialized dashboard field.
 
 ```toml
-# Reorder lanes: run worker before reviewer.
+# Worker policy, prompt guidance, identity, and lane order all come from this
+# one canonical entry.
 [roles.coding.worker]
 priority = 25
+instructions = "Implement only tasks carrying the ready label."
 
-# Register a custom role (lane skips until a runner exists for it).
-[roles.coding.auditor]
-priority = 60
-instructions = "audit the diff"
-
-[roles.coding.auditor.discovery]
-enabled = true
+[roles.coding.worker.discovery]
 source = "issue"
-labels = ["looper:audit"]
-labelMode = "any"
+enabled = true
+labels = ["looper:ready"]
+labelMode = "all"
+requireAssigneeCurrentUser = false
+
+[roles.coding.worker.agent]
+profile = "fast"
 ```
 
 ## Coordinator config reference
