@@ -591,6 +591,12 @@ type CoordinatorRoleConfig struct {
 }
 
 type RoleConfigs struct {
+	// Coding holds every coding role keyed by role name. This is the
+	// authority the scheduler and agent resolution read from; the named
+	// fields below are the legacy shape, retained only until the remaining
+	// consumers are migrated off them.
+	Coding map[string]CodingRoleConfig `json:"coding,omitempty"`
+
 	Planner     PlannerRoleConfig     `json:"planner"`
 	Reviewer    ReviewerRoleConfig    `json:"reviewer"`
 	Fixer       FixerRoleConfig       `json:"fixer"`
