@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -92,6 +93,14 @@ func buildPermissionProfile(cwd, tempRoot string) string {
 	}
 	if moduleCache != "" {
 		readRoots[filepath.Clean(moduleCache)] = struct{}{}
+	}
+	if goBinary, err := exec.LookPath("go"); err == nil {
+		if resolved, resolveErr := filepath.EvalSymlinks(goBinary); resolveErr == nil {
+			// GOROOT is the parent of bin/go for both the standard distribution
+			// and Homebrew's libexec/bin/go layout. The compiler, linker, vet,
+			// and standard library live below it.
+			readRoots[filepath.Dir(filepath.Dir(resolved))] = struct{}{}
+		}
 	}
 	delete(readRoots, filepath.Clean(cwd))
 	delete(readRoots, filepath.Clean(tempRoot))

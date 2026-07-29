@@ -77,3 +77,24 @@ func TestRunUsesNativeSandboxForCredentialFreeWorkspaceValidation(t *testing.T) 
 		t.Fatalf("sandbox did not preserve workspace write: %v", err)
 	}
 }
+
+func TestRunAllowsInstalledToolchainAndReadOnlyModuleCache(t *testing.T) {
+	codex, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("codex sandbox is not installed")
+	}
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Run(context.Background(), Options{
+		CWD:          repoRoot,
+		Command:      `go test ./internal/validationcmd -run '^TestBuildPermissionProfileDeniesNetworkAndLimitsWrites$' -count=1`,
+		Timeout:      30 * time.Second,
+		CodexCommand: codex,
+	})
+	if err != nil {
+		t.Fatalf("Run(go test) error = %v; stdout=%q stderr=%q", err, result.Stdout, result.Stderr)
+	}
+}
