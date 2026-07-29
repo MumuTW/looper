@@ -98,18 +98,40 @@ func TestResolverCWDSelectionIsAuthoritative(t *testing.T) {
 func TestResolverDetachesCapturedConfig(t *testing.T) {
 	t.Parallel()
 
+	baseBranch := "main"
+	worktreeRoot := t.TempDir()
+	originalWorktreeRoot := worktreeRoot
+	roles := &config.PartialRoleConfigs{}
 	cfg := config.Config{
 		Providers: []config.ProviderConfig{{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test"}},
-		Projects:  []config.ProjectRefConfig{{ID: "project", Provider: "forgejo", Repo: "acme/repo", RepoPath: t.TempDir()}},
+		Projects: []config.ProjectRefConfig{{
+			ID:           "project",
+			Provider:     "forgejo",
+			Repo:         "acme/repo",
+			RepoPath:     t.TempDir(),
+			BaseBranch:   &baseBranch,
+			WorktreeRoot: &worktreeRoot,
+			Roles:        roles,
+		}},
 	}
 	resolver := NewResolver(cfg)
 
 	cfg.Providers[0].Kind = config.ProviderKindGitHub
 	cfg.Projects[0].Provider = ""
 	cfg.Projects[0].Repo = "mutated/repo"
+	*cfg.Projects[0].BaseBranch = "release"
+	*cfg.Projects[0].WorktreeRoot = filepath.Join(worktreeRoot, "mutated")
+	cfg.Projects[0].Roles.Reviewer = &config.PartialReviewerRoleConfig{}
 
 	selection := resolver.ForProject("project")
 	if !selection.UsesNativePullRequestAPI() || selection.TaskSourceName() != "Forgejo" {
 		t.Fatalf("selection changed with caller config mutation: %#v", selection)
+	}
+	if projectID, bound := selection.ProjectID(); !bound || projectID != "project" {
+		t.Fatalf("ProjectID() = (%q, %v), want (project, true)", projectID, bound)
+	}
+	selection, matched, err := resolver.ForLocation("acme/repo", filepath.Join(originalWorktreeRoot, "feature"))
+	if err != nil || !matched || !selection.UsesNativePullRequestAPI() {
+		t.Fatalf("ForLocation() after caller mutation = matched %v, selection %#v, err %v", matched, selection, err)
 	}
 }

@@ -17,18 +17,78 @@ import (
 // its selection, capability policy, and adapter construction are all used by
 // runtime roles and review submission.
 type Resolver struct {
-	config config.Config
+	projects  []projectBinding
+	providers map[string]config.ProviderConfig
 }
 
 func NewResolver(cfg config.Config) Resolver {
-	return Resolver{config: config.CloneConfig(cfg)}
+	resolver := Resolver{
+		projects:  make([]projectBinding, 0, len(cfg.Projects)),
+		providers: make(map[string]config.ProviderConfig, len(cfg.Providers)),
+	}
+	for _, provider := range cfg.Providers {
+		providerID := strings.TrimSpace(provider.ID)
+		if _, exists := resolver.providers[providerID]; exists {
+			continue
+		}
+		resolver.providers[providerID] = cloneProviderConfig(provider)
+	}
+	for _, project := range cfg.Projects {
+		resolver.projects = append(resolver.projects, projectBindingFromConfig(project))
+	}
+	return resolver
+}
+
+// projectBinding is the complete project projection needed for provider
+// selection and adapter construction. Keeping this separate from
+// config.ProjectRefConfig prevents role configuration pointers from escaping
+// through a Selection.
+type projectBinding struct {
+	id           string
+	providerID   string
+	repo         string
+	repoPath     string
+	worktreeRoot string
+}
+
+func projectBindingFromConfig(project config.ProjectRefConfig) projectBinding {
+	worktreeRoot := ""
+	if project.WorktreeRoot != nil {
+		worktreeRoot = strings.TrimSpace(*project.WorktreeRoot)
+	}
+	return projectBinding{
+		id:           project.ID,
+		providerID:   strings.TrimSpace(project.Provider),
+		repo:         project.Repo,
+		repoPath:     project.RepoPath,
+		worktreeRoot: worktreeRoot,
+	}
+}
+
+func cloneProviderConfig(provider config.ProviderConfig) config.ProviderConfig {
+	cloned := provider
+	cloned.GHPath = cloneStringPointer(provider.GHPath)
+	cloned.TokenEnv = cloneStringPointer(provider.TokenEnv)
+	cloned.TeaLogin = cloneStringPointer(provider.TeaLogin)
+	cloned.TeaPath = cloneStringPointer(provider.TeaPath)
+	cloned.Workspace = cloneStringPointer(provider.Workspace)
+	cloned.ProjectID = cloneStringPointer(provider.ProjectID)
+	return cloned
+}
+
+func cloneStringPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 // Selection is the immutable result of resolving one configured project. A
 // selection exposes role-facing capability terms rather than provider config or
 // concrete SDK types.
 type Selection struct {
-	project  config.ProjectRefConfig
+	project  projectBinding
 	provider config.ProviderConfig
 	kind     ProviderKind
 	bound    bool
@@ -38,8 +98,8 @@ type Selection struct {
 // GitHub-default behavior used by role configuration lookup.
 func (resolver Resolver) ForProject(projectID string) Selection {
 	projectID = strings.TrimSpace(projectID)
-	for _, project := range resolver.config.Projects {
-		if strings.TrimSpace(project.ID) == projectID {
+	for _, project := range resolver.projects {
+		if strings.TrimSpace(project.id) == projectID {
 			selection, err := resolver.forProject(project)
 			if err == nil {
 				return selection
@@ -54,24 +114,22 @@ func (resolver Resolver) ForProject(projectID string) Selection {
 // (for example review-submit's merged file/SQLite catalog). It never performs
 // catalog lookup itself.
 func (resolver Resolver) ForProjectRef(project config.ProjectRefConfig) (Selection, error) {
-	return resolver.forProject(project)
+	return resolver.forProject(projectBindingFromConfig(project))
 }
 
-func (resolver Resolver) forProject(project config.ProjectRefConfig) (Selection, error) {
-	selection := Selection{project: project, bound: true, kind: config.ResolvedProjectProviderKind(resolver.config, project)}
-	if selection.kind == "" {
-		return selection, fmt.Errorf("provider %q is not configured for project %s", strings.TrimSpace(project.Provider), strings.TrimSpace(project.ID))
-	}
-	if strings.TrimSpace(project.Provider) == "" {
+func (resolver Resolver) forProject(project projectBinding) (Selection, error) {
+	selection := Selection{project: project, bound: true}
+	if project.providerID == "" {
+		selection.kind = ProviderKindGitHub
 		return selection, nil
 	}
-	for _, provider := range resolver.config.Providers {
-		if strings.TrimSpace(provider.ID) == strings.TrimSpace(project.Provider) {
-			selection.provider = provider
-			return selection, nil
-		}
+	provider, ok := resolver.providers[project.providerID]
+	if !ok || provider.Kind == "" {
+		return selection, fmt.Errorf("provider %q is not configured for project %s", project.providerID, strings.TrimSpace(project.id))
 	}
-	return selection, fmt.Errorf("provider %q is not configured for project %s", strings.TrimSpace(project.Provider), strings.TrimSpace(project.ID))
+	selection.provider = provider
+	selection.kind = provider.Kind
+	return selection, nil
 }
 
 // ForLocation resolves CWD before repository name. A configured CWD binding is
@@ -79,8 +137,8 @@ func (resolver Resolver) forProject(project config.ProjectRefConfig) (Selection,
 // fallback. The bool is false only when no configured project matches.
 func (resolver Resolver) ForLocation(repo, cwd string) (Selection, bool, error) {
 	if strings.TrimSpace(cwd) != "" {
-		matches := make([]config.ProjectRefConfig, 0, 1)
-		for _, project := range resolver.config.Projects {
+		matches := make([]projectBinding, 0, 1)
+		for _, project := range resolver.projects {
 			if cwdBelongsToProject(project, cwd) {
 				matches = append(matches, project)
 			}
@@ -93,16 +151,16 @@ func (resolver Resolver) ForLocation(repo, cwd string) (Selection, bool, error) 
 		default:
 			ids := make([]string, 0, len(matches))
 			for _, project := range matches {
-				ids = append(ids, project.ID)
+				ids = append(ids, project.id)
 			}
 			return Selection{}, false, fmt.Errorf("working directory %s matches multiple projects: %s", strings.TrimSpace(cwd), strings.Join(ids, ", "))
 		}
 	}
 
 	repo = strings.TrimSpace(repo)
-	var matched *config.ProjectRefConfig
-	for _, project := range resolver.config.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+	var matched *projectBinding
+	for _, project := range resolver.projects {
+		if !strings.EqualFold(strings.TrimSpace(project.repo), repo) {
 			continue
 		}
 		if matched != nil {
@@ -118,21 +176,18 @@ func (resolver Resolver) ForLocation(repo, cwd string) (Selection, bool, error) 
 	return selection, true, err
 }
 
-func cwdBelongsToProject(project config.ProjectRefConfig, cwd string) bool {
+func cwdBelongsToProject(project projectBinding, cwd string) bool {
 	cwd = filepath.Clean(strings.TrimSpace(cwd))
 	if cwd == "." || cwd == "" {
 		return false
 	}
-	repoPath := filepath.Clean(strings.TrimSpace(project.RepoPath))
+	repoPath := filepath.Clean(strings.TrimSpace(project.repoPath))
 	if repoPath != "." && cwd == repoPath {
 		return true
 	}
-	worktreeRoot := ""
-	if project.WorktreeRoot != nil {
-		worktreeRoot = strings.TrimSpace(*project.WorktreeRoot)
-	}
+	worktreeRoot := project.worktreeRoot
 	if worktreeRoot == "" {
-		resolved, err := config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
+		resolved, err := config.DefaultProjectWorktreeRoot(project.id, project.repoPath)
 		if err != nil {
 			return false
 		}
@@ -145,8 +200,11 @@ func cwdBelongsToProject(project config.ProjectRefConfig, cwd string) bool {
 
 func (selection Selection) Bound() bool { return selection.bound }
 
-func (selection Selection) Project() (config.ProjectRefConfig, bool) {
-	return selection.project, selection.bound
+// ProjectID returns the externally-owned catalog binding selected by this
+// resolver. It deliberately does not expose a config.ProjectRefConfig because
+// its pointer fields would let callers mutate the resolver snapshot.
+func (selection Selection) ProjectID() (string, bool) {
+	return selection.project.id, selection.bound
 }
 
 func (selection Selection) Capabilities() Capabilities {
@@ -188,10 +246,10 @@ func (selection Selection) ForgejoClient() (*ForgejoClient, bool, error) {
 	if !selection.UsesNativePullRequestAPI() {
 		return nil, false, nil
 	}
-	if strings.TrimSpace(selection.project.Repo) == "" {
-		return nil, true, fmt.Errorf("forgejo project %s is missing repo", strings.TrimSpace(selection.project.ID))
+	if strings.TrimSpace(selection.project.repo) == "" {
+		return nil, true, fmt.Errorf("forgejo project %s is missing repo", strings.TrimSpace(selection.project.id))
 	}
-	client, err := NewForgejoClientFromConfig(selection.provider, strings.TrimSpace(selection.project.Repo))
+	client, err := NewForgejoClientFromConfig(selection.provider, strings.TrimSpace(selection.project.repo))
 	if err != nil {
 		return nil, true, err
 	}
@@ -202,10 +260,10 @@ func (selection Selection) PlaneClient() (*PlaneClient, bool, error) {
 	if !selection.UsesExternalTaskSource() {
 		return nil, false, nil
 	}
-	if strings.TrimSpace(selection.project.Repo) == "" {
-		return nil, true, fmt.Errorf("plane project %s is missing repo", strings.TrimSpace(selection.project.ID))
+	if strings.TrimSpace(selection.project.repo) == "" {
+		return nil, true, fmt.Errorf("plane project %s is missing repo", strings.TrimSpace(selection.project.id))
 	}
-	client, err := NewPlaneClientFromConfig(selection.provider, strings.TrimSpace(selection.project.Repo))
+	client, err := NewPlaneClientFromConfig(selection.provider, strings.TrimSpace(selection.project.repo))
 	if err != nil {
 		return nil, true, err
 	}
@@ -218,7 +276,7 @@ func (selection Selection) ProbeNativeReviewCommentResolution(ctx context.Contex
 	if !selection.UsesNativePullRequestAPI() {
 		return ProbeStateSupported, nil
 	}
-	return ProbeForgejoReviewCommentResolution(ctx, selection.provider, selection.project.Repo)
+	return ProbeForgejoReviewCommentResolution(ctx, selection.provider, selection.project.repo)
 }
 
 func (resolver Resolver) ForgejoForLocation(repo, cwd string) (*ForgejoClient, bool, error) {

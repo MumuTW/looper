@@ -13,6 +13,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/fixer"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/gatekeeper"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
@@ -473,11 +474,12 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 	if f.configSource != nil {
 		cfg = f.configSource.Snapshot()
 	}
+	providers := forge.NewResolver(cfg)
 	for _, project := range projects {
 		if project.Archived {
 			continue
 		}
-		if configured, ok := configuredProjectByID(cfg, project.ID); ok && config.ResolvedProjectProviderKind(cfg, configured) == config.ProviderKindForgejo {
+		if providers.ForProject(project.ID).UsesNativePullRequestAPI() {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
@@ -543,15 +545,6 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 		f.cond.Signal()
 	}
 	return matched, nil
-}
-
-func configuredProjectByID(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
-	for _, project := range cfg.Projects {
-		if project.ID == projectID {
-			return project, true
-		}
-	}
-	return config.ProjectRefConfig{}, false
 }
 
 func (f *forwarder) worker() {

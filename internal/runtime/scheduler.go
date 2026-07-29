@@ -397,16 +397,16 @@ func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo, cwd string)
 	if err != nil || !matched || !selection.UsesNativePullRequestAPI() {
 		return nil
 	}
-	project, _ := selection.Project()
-	return forgejoReviewerDiscoveryLabelsForProject(*cfg, project)
+	projectID, _ := selection.ProjectID()
+	return forgejoReviewerDiscoveryLabelsForProject(*cfg, projectID)
 }
 
-func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.ProjectRefConfig) []string {
-	selection, err := forge.NewResolver(cfg).ForProjectRef(project)
-	if err != nil || !selection.UsesNativePullRequestAPI() {
+func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, projectID string) []string {
+	selection := forge.NewResolver(cfg).ForProject(projectID)
+	if !selection.UsesNativePullRequestAPI() {
 		return nil
 	}
-	labels := config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.Labels
+	labels := config.ProjectRoleConfigs(cfg, projectID).Reviewer.Discovery.Triggers.Labels
 	result := make([]string, 0, len(labels))
 	for _, label := range labels {
 		label = strings.TrimSpace(label)
@@ -461,16 +461,16 @@ func forgejoReviewerRequireReviewRequestForRepo(cfg *config.Config, repo, cwd st
 	if err != nil || !matched || !selection.UsesNativePullRequestAPI() {
 		return true
 	}
-	project, _ := selection.Project()
-	return forgejoReviewerRequireReviewRequestForProject(*cfg, project)
+	projectID, _ := selection.ProjectID()
+	return forgejoReviewerRequireReviewRequestForProject(*cfg, projectID)
 }
 
-func forgejoReviewerRequireReviewRequestForProject(cfg config.Config, project config.ProjectRefConfig) bool {
-	selection, err := forge.NewResolver(cfg).ForProjectRef(project)
-	if err != nil || !selection.UsesNativePullRequestAPI() {
+func forgejoReviewerRequireReviewRequestForProject(cfg config.Config, projectID string) bool {
+	selection := forge.NewResolver(cfg).ForProject(projectID)
+	if !selection.UsesNativePullRequestAPI() {
 		return true
 	}
-	return config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.RequireReviewRequest
+	return config.ProjectRoleConfigs(cfg, projectID).Reviewer.Discovery.Triggers.RequireReviewRequest
 }
 
 func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
@@ -569,8 +569,8 @@ func forgejoSummaryCommentMode(cfg *config.Config, repo, cwd string) bool {
 	if err != nil || !matched || !selection.UsesNativePullRequestAPI() {
 		return false
 	}
-	project, _ := selection.Project()
-	return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
+	projectID, _ := selection.ProjectID()
+	return config.ProjectRoleConfigs(*cfg, projectID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
 }
 
 func appendLabels(label string, labels []string) []string {
@@ -3604,6 +3604,10 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		return snapshot
 	}
 	lanes := discoveryLanes(input)
+	providers := forge.NewResolver(config.Config{})
+	if input.Config != nil {
+		providers = forge.NewResolver(*input.Config)
+	}
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
 			retErr = errors.Join(append(errs, err)...)
@@ -3621,7 +3625,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		if project.Archived {
 			continue
 		}
-		provider := forge.NewResolver(config.Config{}).ForProject(project.ID)
+		provider := providers.ForProject(project.ID)
 		repo := repoFromProjectMetadata(project.MetadataJSON)
 		if input.Config != nil {
 			binding, ok := runtimeProjectBinding(*input.Config, project.ID)
@@ -3631,7 +3635,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				}
 				continue
 			}
-			provider = forge.NewResolver(*input.Config).ForProject(project.ID)
 			repo = strings.TrimSpace(binding.Repo)
 		}
 		var snapshot *githubinfra.DiscoverySnapshot

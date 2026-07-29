@@ -569,7 +569,7 @@ func TestForwardFansOutToMultipleProjectsForSameRepo(t *testing.T) {
 	reviewerRunner.assertRepos(t, []string{"acme/looper", "acme/looper"})
 }
 
-func TestForwardDoesNotRouteGitHubWebhookToSameSlugForgejoProject(t *testing.T) {
+func TestForwardUsesProviderSeamForNativePullRequestCapability(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "github", "acme/looper")
 	seedProject(t, repos, "plane", "acme/looper")
