@@ -34,10 +34,10 @@ import (
 const requestTimeout = 30 * time.Second
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		usage(stderr)
 		return 2
@@ -53,6 +53,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// `review` owns its own flag set, and the daemon's trusted review proxy
+	// composes that argv. Routing it before splitGlobalFlags is what keeps
+	// --event and --commit-id from being rejected as unknown flags.
+	if verb, ok := leadingVerb(args); ok && verb == "review" {
+		return runReview(ctx, args, stdin, stdout, stderr)
+	}
 
 	parsed, err := splitGlobalFlags(args)
 	if err != nil {
@@ -124,6 +131,35 @@ type parsedArgs struct {
 	// else. Passing the whole command line instead would let an operand after
 	// `--` be reinterpreted as configuration.
 	Global []string
+}
+
+// leadingVerb returns the first positional argument, skipping global flags and
+// the values they consume. It exists so a verb that parses its own flags can be
+// routed before splitGlobalFlags rejects them, and it deliberately mirrors the
+// tolerance of the trusted review proxy's own argv scan, which also allows
+// global flags to precede `review`.
+func leadingVerb(args []string) (string, bool) {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if arg == "--" {
+			if index+1 < len(args) {
+				return args[index+1], true
+			}
+			return "", false
+		}
+		name, _, hasInline := strings.Cut(arg, "=")
+		if _, global := globalFlags[name]; global {
+			if !hasInline && index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
+				index++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			return "", false
+		}
+		return arg, true
+	}
+	return "", false
 }
 
 // splitGlobalFlags separates global flags from the verb and its operands so
