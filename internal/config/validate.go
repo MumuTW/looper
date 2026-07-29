@@ -467,6 +467,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if providerKind == ProviderKindForgejo {
 			validateForgejoRoleCapabilities(effectiveProjectRoles, prefix, &issues)
+		} else if providerKind == ProviderKindPlane {
+			validatePlaneRoleCapabilities(effectiveProjectRoles, prefix, &issues)
 		} else if effectiveProjectRoles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: "summary_comment is supported only for forgejo projects"})
 		}
@@ -561,6 +563,12 @@ func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[
 	}
 	if roles.Coordinator.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.coordinator.enabled", Message: "must be false for forgejo projects"})
+	}
+}
+
+func validatePlaneRoleCapabilities(roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
+	if roles.Coordinator.Enabled {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.coordinator.enabled", Message: "must be false for plane projects; coordinator requires GitHub issue authority"})
 	}
 }
 

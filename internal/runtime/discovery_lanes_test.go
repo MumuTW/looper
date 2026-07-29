@@ -24,12 +24,16 @@ func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(
 	}
 	githubCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindGitHub)
 	forgejoCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindForgejo)
+	planeCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindPlane)
 	if byName["triager"].Supported(githubCapabilities) != true ||
 		byName["triager"].Supported(forgejoCapabilities) != false {
 		t.Fatal("triager must accept GitHub issues only")
 	}
 	if !byName[config.CodingRoleFixer].Supported(forgejoCapabilities) {
 		t.Fatal("triager registration changed fixer Forgejo discovery support")
+	}
+	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(forgejoCapabilities) || byName["coordinator"].Supported(planeCapabilities) {
+		t.Fatal("coordinator must run only where GitHub owns issue authority")
 	}
 }
 

@@ -20,15 +20,16 @@ func TestResolverSelectsGitHubAndForgejoWithSharedContract(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		repo           string
-		cwd            string
-		wantNativeAPI  bool
-		wantTaskSource string
-		wantGitHubPRs  bool
-		wantGitHubCLI  bool
+		name             string
+		repo             string
+		cwd              string
+		wantNativeAPI    bool
+		wantTaskSource   string
+		wantGitHubPRs    bool
+		wantGitHubIssues bool
+		wantGitHubCLI    bool
 	}{
-		{name: "github by repo", repo: "acme/github", wantTaskSource: "GitHub", wantGitHubPRs: true, wantGitHubCLI: true},
+		{name: "github by repo", repo: "acme/github", wantTaskSource: "GitHub", wantGitHubPRs: true, wantGitHubIssues: true, wantGitHubCLI: true},
 		{name: "forgejo by cwd", repo: "acme/forgejo", cwd: filepath.Join(forgejoRoot, "feature"), wantNativeAPI: true, wantTaskSource: "Forgejo"},
 	}
 	for _, test := range tests {
@@ -50,6 +51,9 @@ func TestResolverSelectsGitHubAndForgejoWithSharedContract(t *testing.T) {
 			if got := capabilities.GitHubPullRequests; got != test.wantGitHubPRs {
 				t.Fatalf("GitHubPullRequests = %v, want %v", got, test.wantGitHubPRs)
 			}
+			if got := capabilities.GitHubIssues; got != test.wantGitHubIssues {
+				t.Fatalf("GitHubIssues = %v, want %v", got, test.wantGitHubIssues)
+			}
 			if got := capabilities.GitHubCLIPullRequestCreation; got != test.wantGitHubCLI {
 				t.Fatalf("GitHubCLIPullRequestCreation = %v, want %v", got, test.wantGitHubCLI)
 			}
@@ -69,7 +73,7 @@ func TestResolverMakesPlaneTaskSourceExplicit(t *testing.T) {
 	if !selection.UsesExternalTaskSource() || selection.TaskSourceName() != "Plane" {
 		t.Fatalf("Plane selection = %#v, want explicit external task source", selection)
 	}
-	if capabilities.PullRequests || capabilities.NativeReviews || !capabilities.GitHubPullRequests {
+	if capabilities.PullRequests || capabilities.NativeReviews || !capabilities.GitHubPullRequests || capabilities.GitHubIssues {
 		t.Fatalf("Plane capabilities = %#v, want task source without native PRs and GitHub code PR delegation", capabilities)
 	}
 }

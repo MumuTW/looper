@@ -70,6 +70,10 @@ type Capabilities struct {
 	// task source are served by the GitHub code repository. Plane is explicit:
 	// it owns tasks but delegates code reviews to GitHub.
 	GitHubPullRequests bool
+	// GitHubIssues records that issue discovery and mutation are served by
+	// GitHub. It is deliberately separate from GitHubPullRequests: Plane owns
+	// task issues while delegating only code-repository pull requests to GitHub.
+	GitHubIssues bool
 	// GitHubCLIPullRequestCreation records the legacy GitHub CLI requirement
 	// for agent-created PRs. Other provider adapters own their own tooling.
 	GitHubCLIPullRequestCreation bool
@@ -78,7 +82,7 @@ type Capabilities struct {
 func StaticCapabilities(kind ProviderKind) (Capabilities, bool) {
 	switch kind {
 	case ProviderKindGitHub:
-		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: true, Webhooks: true, ReviewCommentResolution: ReviewCommentResolutionNative, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionNative, WorkerClaim: WorkerClaimAssignSelf, Webhook: WebhookNative, GitHubPullRequests: true, GitHubCLIPullRequestCreation: true}, true
+		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: true, Webhooks: true, ReviewCommentResolution: ReviewCommentResolutionNative, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionNative, WorkerClaim: WorkerClaimAssignSelf, Webhook: WebhookNative, GitHubPullRequests: true, GitHubIssues: true, GitHubCLIPullRequestCreation: true}, true
 	case ProviderKindForgejo:
 		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: false, Webhooks: false, ReviewCommentResolution: ReviewCommentResolutionManualOnly, Dependencies: false, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
 	case ProviderKindPlane:

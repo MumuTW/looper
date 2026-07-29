@@ -120,7 +120,7 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 		Priority:  config.PriorityCoordinator,
 		Present:   input.Coordinator != nil,
 		Enabled:   func(projectID string) bool { return coordinatorEnabledForProject(input, projectID) },
-		Supported: func(capabilities forge.Capabilities) bool { return capabilities.GitHubPullRequests },
+		Supported: func(capabilities forge.Capabilities) bool { return capabilities.GitHubIssues },
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 			_, err := input.Coordinator.DiscoverIssues(ctx, coordinator.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
 			return nil, err
