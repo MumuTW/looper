@@ -14,8 +14,9 @@ func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin:/opt/tools/bin")
 	t.Setenv("GOMODCACHE", "/cache/go-mod")
 
-	profile := buildPermissionProfile("/workspace/repo", "/private/tmp/validation")
+	profile := buildPermissionProfile("/workspace/repo", "/private/tmp/validation", permissionProfile)
 	for _, want := range []string{
+		`permissions.looper-validation=`,
 		`network = { enabled = false }`,
 		`":workspace_roots" = { "." = "write" }`,
 		`"/private/tmp/validation" = "write"`,
@@ -40,10 +41,48 @@ func TestIsolatedEnvironmentOmitsDaemonCredentials(t *testing.T) {
 			t.Fatalf("isolated environment leaked %q: %s", forbidden, joined)
 		}
 	}
-	for _, required := range []string{"HOME=/tmp/validation/home", "GIT_CONFIG_GLOBAL=/dev/null", "PWD=/workspace/repo"} {
+	for _, required := range []string{"HOME=/tmp/validation/home", "GIT_CONFIG_GLOBAL=/dev/null", "PWD=/workspace/repo", "GOROOT="} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("isolated environment = %s, missing %q", joined, required)
 		}
+	}
+}
+
+func TestRunAllowsGitStatusInLinkedWorktree(t *testing.T) {
+	codex, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("codex sandbox is not installed")
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	worktree := filepath.Join(root, "linked")
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "user.name=Looper Test", "-c", "user.email=looper@example.invalid"}, args...)...)
+		cmd.Dir = repo
+		if output, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("git %v: %v\n%s", args, runErr, output)
+		}
+	}
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit("init")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "README.md")
+	runGit("commit", "-m", "initial")
+	runGit("worktree", "add", "-b", "linked-test", worktree)
+
+	result, err := Run(context.Background(), Options{
+		CWD:          worktree,
+		Command:      `git status --porcelain >/dev/null`,
+		Timeout:      10 * time.Second,
+		CodexCommand: codex,
+	})
+	if err != nil {
+		t.Fatalf("Run(git status) error = %v; stdout=%q stderr=%q", err, result.Stdout, result.Stderr)
 	}
 }
 

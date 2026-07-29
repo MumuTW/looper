@@ -3412,6 +3412,16 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	validationCommands := config.ResolveValidationCommands(cfg)
+	validationCodexCommand := func(resolved config.ResolvedAgent) string {
+		if resolved.Vendor != config.AgentVendorCodex {
+			return "codex"
+		}
+		params := agent.ParamsForRoleVendor(cfg.Agent.Params, cfg.Agent.Vendor, resolved.Vendor, resolved.Model)
+		if command, ok := params["command"].(string); ok && strings.TrimSpace(command) != "" {
+			return strings.TrimSpace(command)
+		}
+		return "codex"
+	}
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
 		resolved := resolvedFixer
@@ -3427,18 +3437,19 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			fixerAutoDiscovery = false
 		}
 		fixerRunner = fixer.New(fixer.Options{
-			DB:                 coordinator.DB(),
-			Repos:              repos,
-			GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
-			Git:                fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
-			AgentExecutor:      fixerAgentExecutorAdapter{executor: fixerExecutor},
-			Logger:             logger,
-			Now:                now,
-			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
-			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
-			ValidationCommands: validationCommands,
+			DB:                     coordinator.DB(),
+			Repos:                  repos,
+			GitHub:                 fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
+			Git:                    fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
+			AgentExecutor:          fixerAgentExecutorAdapter{executor: fixerExecutor},
+			Logger:                 logger,
+			Now:                    now,
+			AllowAutoCommit:        cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:          cfg.Defaults.AllowAutoPush,
+			AllowRiskyFixes:        cfg.Defaults.AllowRiskyFixes,
+			FixAllPullRequests:     cfg.Defaults.FixAllPullRequests,
+			ValidationCommands:     validationCommands,
+			ValidationCodexCommand: validationCodexCommand(resolved),
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: fixer.DiscoveryPolicy{
@@ -3496,14 +3507,15 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 			},
-			Git:                workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
-			AgentExecutor:      workerAgentExecutorAdapter{executor: workerExecutor},
-			Logger:             logger,
-			Now:                now,
-			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-			OpenPRStrategy:     cfg.Defaults.OpenPRStrategy,
-			ValidationCommands: validationCommands,
+			Git:                    workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
+			AgentExecutor:          workerAgentExecutorAdapter{executor: workerExecutor},
+			Logger:                 logger,
+			Now:                    now,
+			AllowAutoCommit:        cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:          cfg.Defaults.AllowAutoPush,
+			OpenPRStrategy:         cfg.Defaults.OpenPRStrategy,
+			ValidationCommands:     validationCommands,
+			ValidationCodexCommand: validationCodexCommand(resolved),
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: worker.DiscoveryPolicy{

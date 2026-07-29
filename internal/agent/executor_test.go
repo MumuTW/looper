@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validationcmd"
 )
 
 func customOwner() *config.AgentVendor {
@@ -104,7 +105,7 @@ func TestEnforceCodexToolNetworkDeniedOverridesUnsafeOperatorArgs(t *testing.T) 
 	t.Parallel()
 
 	args := []string{"exec", "--search", "--dangerously-bypass-approvals-and-sandbox", "--add-dir", "/tmp/escape", "--profile", "unsafe", "--enable", "enable_mcp_apps", "--sandbox", "danger-full-access", "-c", "sandbox_workspace_write.network_access=true", "-c", "sandbox_permissions=[\"disk-full-read-access\"]", "-c", "mcp_servers.github.command=\"unsafe\"", "-c", "web_search=\"live\"", "-c", "model_reasoning_effort=high", "hello"}
-	got := enforceCodexToolNetworkDenied(args, "hello")
+	got := enforceCodexToolNetworkDenied(args, "hello", nil)
 	joined := strings.Join(got, " ")
 	if strings.Contains(joined, "dangerously-bypass") || strings.Contains(joined, "danger-full-access") || strings.Contains(joined, "network_access=true") || strings.Contains(joined, "/tmp/escape") || strings.Contains(joined, "sandbox_permissions") || strings.Contains(joined, "mcp_servers") || strings.Contains(joined, "web_search=\"live\"") || strings.Contains(joined, "--search") || strings.Contains(joined, "enable_mcp_apps") || strings.Contains(joined, "unsafe") {
 		t.Fatalf("restricted args retain an unsafe override: %q", joined)
@@ -122,7 +123,7 @@ func TestEnforceCodexToolNetworkDeniedOverridesUnsafeOperatorArgs(t *testing.T) 
 func TestEnforceCodexToolNetworkDeniedPlacesExecFlagsBeforeResume(t *testing.T) {
 	t.Parallel()
 
-	got := enforceCodexToolNetworkDenied([]string{"exec", "--json", "resume", "session-123", "continue"}, "continue")
+	got := enforceCodexToolNetworkDenied([]string{"exec", "--json", "resume", "session-123", "continue"}, "continue", nil)
 	resumeIndex := slices.Index(got, "resume")
 	sandboxIndex := slices.Index(got, "-s")
 	if resumeIndex < 0 || sandboxIndex < 0 || sandboxIndex > resumeIndex {
@@ -130,6 +131,46 @@ func TestEnforceCodexToolNetworkDeniedPlacesExecFlagsBeforeResume(t *testing.T) 
 	}
 	if got[len(got)-1] != "continue" {
 		t.Fatalf("restricted resume args = %#v, want prompt last", got)
+	}
+}
+
+func TestEnforceCodexToolNetworkDeniedRejectsAttachedShortOverridesAndUsesIsolatedProfile(t *testing.T) {
+	sandbox, err := validationcmd.NewSandbox(t.TempDir(), "looper-agent", "looper-agent-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Cleanup()
+
+	args := []string{"exec", "-C/tmp/escape", "-punsafe", "-sdanger-full-access", "-csandbox_workspace_write.network_access=true", "hello"}
+	got := enforceCodexToolNetworkDenied(args, "hello", sandbox)
+	joined := strings.Join(got, " ")
+	for _, forbidden := range []string{"/tmp/escape", "punsafe", "danger-full-access", "network_access=true", "-s workspace-write"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("restricted args retain %q: %q", forbidden, joined)
+		}
+	}
+	for _, want := range []string{"permissions.looper-agent=", `permission_profile="looper-agent"`, `shell_environment_policy={ inherit = "none"`} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("restricted args = %q, missing %q", joined, want)
+		}
+	}
+}
+
+func TestRestrictedAgentSandboxConfigIsAcceptedByCodexExec(t *testing.T) {
+	codex, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("codex is not installed")
+	}
+	sandbox, err := validationcmd.NewSandbox(t.TempDir(), "looper-agent", "looper-agent-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Cleanup()
+
+	args := enforceCodexToolNetworkDenied([]string{"exec", "hello"}, "hello", sandbox)
+	args = append(args[:len(args)-1], "--strict-config", "--help")
+	if output, runErr := exec.Command(codex, args...).CombinedOutput(); runErr != nil {
+		t.Fatalf("codex rejected restricted agent config: %v\n%s", runErr, output)
 	}
 }
 

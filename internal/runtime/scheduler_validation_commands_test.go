@@ -35,6 +35,15 @@ func runnerValidationCommands(t *testing.T, runner any) []string {
 	return commands
 }
 
+func runnerStringField(t *testing.T, runner any, name string) string {
+	t.Helper()
+	field := reflect.ValueOf(runner).Elem().FieldByName(name)
+	if !field.IsValid() || field.Kind() != reflect.String {
+		t.Fatalf("%T has no string field %q", runner, name)
+	}
+	return field.String()
+}
+
 func buildValidationCommandHandlers(t *testing.T, cfg config.Config, logger *capturingSchedulerLogger) defaultSchedulerHandlers {
 	t.Helper()
 
@@ -79,6 +88,7 @@ func TestBuildDefaultSchedulerHandlersThreadsValidationCommandsIntoWorkerAndFixe
 	}
 	vendor := config.AgentVendorCodex
 	cfg.Agent.Vendor = &vendor
+	cfg.Agent.Params = map[string]any{"command": "/opt/open-codex/bin/codex"}
 	// Blank/padded entries exercise the resolver on the way through.
 	cfg.Defaults.ValidationCommands = []string{"  go vet ./...  ", "go test ./..."}
 
@@ -95,6 +105,11 @@ func TestBuildDefaultSchedulerHandlersThreadsValidationCommandsIntoWorkerAndFixe
 	}
 	if got := runnerValidationCommands(t, input.Fixer); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixer validationCommands = %#v, want %#v", got, want)
+	}
+	for name, runner := range map[string]any{"worker": input.Worker, "fixer": input.Fixer} {
+		if got := runnerStringField(t, runner, "validationCodexCommand"); got != "/opt/open-codex/bin/codex" {
+			t.Fatalf("%s validationCodexCommand = %q, want configured command", name, got)
+		}
 	}
 	if schedulerLoggerContains(logger, validationGateDisabledWarning) {
 		t.Fatal("scheduler warned about a disabled validation gate while commands are configured")

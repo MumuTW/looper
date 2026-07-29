@@ -466,6 +466,7 @@ type Options struct {
 	AgentIdleTimeout                time.Duration
 	ClaimTTL                        time.Duration
 	ValidationCommands              []string
+	ValidationCodexCommand          string
 	ValidationRunner                ValidationRunner
 	// ContainmentTracker registers validation shell handles with the Execution
 	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
@@ -558,6 +559,7 @@ type Runner struct {
 	agentIdleTimeout        time.Duration
 	claimTTL                time.Duration
 	validationCommands      []string
+	validationCodexCommand  string
 	validationRunner        ValidationRunner
 	containmentTracker      processcontainment.LiveTracker
 	allowAutoCommit         bool
@@ -831,6 +833,7 @@ func New(options Options) *Runner {
 		agentIdleTimeout:        agentIdleTimeout,
 		claimTTL:                claimTTL,
 		validationCommands:      append([]string(nil), options.ValidationCommands...),
+		validationCodexCommand:  strings.TrimSpace(options.ValidationCodexCommand),
 		validationRunner:        options.ValidationRunner,
 		containmentTracker:      options.ContainmentTracker,
 		allowAutoCommit:         options.AllowAutoCommit,
@@ -2730,9 +2733,10 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	outputs := make([]string, 0, len(input.Commands)*2)
 	for _, command := range input.Commands {
 		result, err := validationcmd.Run(ctx, validationcmd.Options{
-			CWD:     input.CWD,
-			Command: command,
-			Timeout: r.agentTimeout,
+			CWD:          input.CWD,
+			Command:      command,
+			Timeout:      r.agentTimeout,
+			CodexCommand: r.validationCodexCommand,
 			// Supervisor-owned validation: track handle so shutdown retain-storage
 			// sees Kill/Drain failures even when validation collapses them to Passed=false.
 			Tracker: r.containmentTracker,
