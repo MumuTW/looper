@@ -253,7 +253,11 @@ func routeForVerb(verb string, args []string) (apiRequest, error) {
 			return apiRequest{}, err
 		}
 		return apiRequest{Path: "/api/v1/runs/active/" + segment + "/" + verb}, nil
-	case "takeover", "retry", "start", "pause", "handback":
+	// retry is absent deliberately: run dispatches it to runRetry before this
+	// function is reached, because it needs a GET preflight and flags of its
+	// own. Leaving a case here would be a branch no invocation can take, and a
+	// test covering it would report success for a path the CLI never walks.
+	case "takeover", "start", "pause", "handback":
 		if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 			return apiRequest{}, fmt.Errorf("%s requires exactly one loop id", verb)
 		}

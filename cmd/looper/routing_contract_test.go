@@ -7,8 +7,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,7 +38,7 @@ func TestRoutedPathsReachTheDaemonRoute(t *testing.T) {
 	// Both selector spellings the usage text promises: the loop's sequence
 	// number and its id.
 	for _, selector := range []string{"12", contractLoopID} {
-		for _, verb := range []string{"stop", "close", "takeover", "handback", "retry", "start", "pause"} {
+		for _, verb := range []string{"stop", "close", "takeover", "handback", "start", "pause"} {
 			t.Run(verb+"/"+selector, func(t *testing.T) {
 				request, err := routeForVerb(verb, []string{selector})
 				if err != nil {
@@ -261,3 +263,86 @@ func (contractLogger) Warn(string, map[string]any)  {}
 func (contractLogger) Error(string, map[string]any) {}
 
 var _ bootstrap.Logger = contractLogger{}
+
+// TestRetryReachesTheDaemonRoutes covers the one verb that never reaches
+// routeForVerb. runRetry builds its own two paths — a GET preflight on
+// /worktree and the POST on /retry — so nothing in the routing table proves
+// either of them resolves. retry_test.go drives them against hand-written
+// http.HandlerFunc stubs, which can only confirm the CLI agrees with the test's
+// own idea of the route; this drives the real daemon handler instead.
+func TestRetryReachesTheDaemonRoutes(t *testing.T) {
+	fixture := newContractFixture(t)
+
+	var mu sync.Mutex
+	seen := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder := httptest.NewRecorder()
+		fixture.handler.ServeHTTP(recorder, r)
+
+		mu.Lock()
+		seen[r.Method+" "+r.URL.Path] = recorder.Code
+		mu.Unlock()
+
+		for key, values := range recorder.Header() {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(recorder.Code)
+		_, _ = w.Write(recorder.Body.Bytes())
+	}))
+	defer server.Close()
+
+	configPath := writeContractConfig(t, server.URL)
+	t.Setenv("HOME", t.TempDir())
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	runRetry(context.Background(), []string{"retry", "12", "--config", configPath}, stdout, stderr)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// The preflight must resolve. A 404 here is the failure the dashboard
+	// tolerates on older daemons, so a broken path would silently degrade into
+	// "no preflight" rather than erroring — which is the whole risk this guards.
+	worktree, ok := seen["GET /api/v1/loops/12/worktree"]
+	if !ok {
+		t.Fatalf("retry never requested the worktree preflight; saw %v", seen)
+	}
+	if worktree == http.StatusNotFound {
+		t.Fatalf("GET /api/v1/loops/12/worktree returned 404: the preflight path does not exist on the daemon")
+	}
+
+	if status, ok := seen["POST /api/v1/loops/12/retry"]; ok && status == http.StatusNotFound {
+		t.Fatalf("POST /api/v1/loops/12/retry returned 404 (stderr %q)", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Unknown route") {
+		t.Fatalf("retry hit an unknown route: %s", stderr.String())
+	}
+}
+
+// writeContractConfig points the CLI's own config loading at a running server,
+// so the request goes through loadConfig and daemonBaseURL rather than around
+// them.
+func writeContractConfig(t *testing.T, baseURL string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	cfg, err := config.DefaultConfig(dir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Server.BaseURL = &baseURL
+	cfg.Network = config.NetworkConfig{}
+	cfg.Storage.DBPath = filepath.Join(dir, "state", "looper.sqlite")
+
+	encoded, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, encoded, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}

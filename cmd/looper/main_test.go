@@ -74,10 +74,13 @@ func TestRouteForVerb(t *testing.T) {
 			wantPath: "/api/v1/loops/loop-1/handback",
 		},
 		{
-			name:     "retry targets the loop",
-			verb:     "retry",
-			args:     []string{"loop-1"},
-			wantPath: "/api/v1/loops/loop-1/retry",
+			// retry is dispatched to runRetry before routing, so it is not a
+			// verb this function knows. See TestRetryReachesTheDaemonRoutes for
+			// the paths it actually builds.
+			name:    "retry is not routed here",
+			verb:    "retry",
+			args:    []string{"loop-1"},
+			wantErr: `unknown command "retry"`,
 		},
 		{
 			name:     "start targets the loop",
@@ -194,7 +197,7 @@ func TestRouteForVerb(t *testing.T) {
 // peeks at the body for discardWorktreeChanges, so a stray payload on a bare
 // verb would be interpreted rather than ignored.
 func TestRouteForVerbBareVerbsSendNoBody(t *testing.T) {
-	for _, verb := range []string{"stop", "close", "takeover", "handback", "retry", "start", "pause"} {
+	for _, verb := range []string{"stop", "close", "takeover", "handback", "start", "pause"} {
 		t.Run(verb, func(t *testing.T) {
 			got, err := routeForVerb(verb, []string{"loop-1"})
 			if err != nil {
