@@ -2,7 +2,9 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -37,19 +39,46 @@ const AUTO_DISMISS_MS = 5000;
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
+  const timers = useRef(new Map<number, number>());
+  const mounted = useRef(true);
 
   const dismiss = useCallback((id: number) => {
+    const timer = timers.current.get(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      timers.current.delete(id);
+    }
     setItems((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
   const push = useCallback(
     (kind: ToastKind, message: string) => {
+      if (!mounted.current) {
+        return;
+      }
       const id = nextId++;
       setItems((prev) => [...prev.slice(-4), { id, kind, message }]);
-      window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
+      timers.current.set(
+        id,
+        window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS),
+      );
     },
     [dismiss],
   );
+
+  // No toast timer may outlive the provider: a late auto-dismiss would set
+  // state on an unmounted component (and blow up after a test teardown).
+  useEffect(() => {
+    mounted.current = true;
+    const pending = timers.current;
+    return () => {
+      mounted.current = false;
+      for (const timer of pending.values()) {
+        window.clearTimeout(timer);
+      }
+      pending.clear();
+    };
+  }, []);
 
   const value = useMemo<ToastContextValue>(
     () => ({
