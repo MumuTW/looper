@@ -3025,14 +3025,14 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, &holdSkipError{summary: summary}
 	}
 	replies := normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
+	if err := validateNeedsHumanReplies(result.Stdout, result.Stderr, checkpoint.FixItems, replies); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureManualIntervention}
+	}
 	if awaiting := humanDecisionFromReplies(replies, executionID, agentVendor); awaiting != nil {
 		if !r.hitlEnabled {
 			return checkpoint, &loopError{message: "Fixer requested human input while HITL is disabled", kind: FailureManualIntervention}
 		}
 		return checkpoint, awaiting
-	}
-	if completionMentionsNeedsHuman(result.Stdout, result.Stderr) {
-		return checkpoint, &loopError{message: "Fixer emitted an invalid needs_human decision", kind: FailureManualIntervention}
 	}
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	checkpoint.Repair.ReplyExplanations = replies
@@ -4694,7 +4694,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
 		pause, _ := classifyFixerPause(latestRun, checkpoint, loop.MetadataJSON)
 		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, pause, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
-		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint)
+		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint) &&
+			!shouldResumeAnsweredHITLRepair(loop.MetadataJSON, latestRun.Status, failedStep)
 	}
 	startStep := stepDiscoverPR
 	resumedCheckpoint := checkpoint

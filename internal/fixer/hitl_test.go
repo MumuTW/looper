@@ -40,7 +40,8 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	run1 := storage.RunRecord{
 		ID: "run_fixer_hitl_1", LoopID: loopID, Status: "running",
 		CurrentStep: stringPtr(string(stepRepair)), StartedAt: fixture.nowISO(),
-		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+		LastCompletedStep: stringPtr(string(stepPrepareWorktree)),
+		CreatedAt:         fixture.nowISO(), UpdatedAt: fixture.nowISO(),
 	}
 	if err := fixture.repos.Runs.Upsert(ctx, run1); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
@@ -72,9 +73,10 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 		{Status: "completed", Summary: "blocked on intent", ParseStatus: "parsed", Stdout: needsHuman},
 		{Status: "completed", Summary: "applied decision", ParseStatus: "parsed", Stdout: fixed},
 	}}
+	git := &fakeGitGateway{}
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos,
-		GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{},
+		GitHub: &fakeGitHubGateway{}, Git: git,
 		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
 		AgentRuntime: "codex", AllowAutoPush: true, HITLEnabled: true,
 	})
@@ -120,17 +122,17 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(ctx, *persistedLoop); err != nil {
 		t.Fatalf("Loops.Upsert(answer) error = %v", err)
 	}
-	run2 := storage.RunRecord{
-		ID: "run_fixer_hitl_2", LoopID: loopID, Status: "running",
-		CurrentStep: stringPtr(string(stepRepair)), StartedAt: fixture.nowISO(),
-		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	resume, err := runner.createRunContext(ctx, *persistedLoop)
+	if err != nil {
+		t.Fatalf("createRunContext(resume) error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(ctx, run2); err != nil {
-		t.Fatalf("Runs.Upsert(resume) error = %v", err)
+	if !resume.Resumed || resume.StartStep != stepRepair ||
+		resume.Checkpoint.Worktree == nil || resume.Checkpoint.Worktree.PreparedAt == "" {
+		t.Fatalf("resume context = %#v, want direct repair with prepared worktree preserved", resume)
 	}
 	step.Loop = *persistedLoop
-	step.Run = run2
-	step.Checkpoint = parkedCheckpoint
+	step.Run = resume.Run
+	step.Checkpoint = resume.Checkpoint
 	resumed, err := runner.runRepairStep(ctx, step)
 	if err != nil || resumed.Repair == nil {
 		t.Fatalf("resumed runRepairStep() = (%#v, %v)", resumed.Repair, err)
@@ -142,5 +144,24 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	consumed, _ := loops.ReadHITLAsk(finishedLoop.MetadataJSON)
 	if consumed.Status != "consumed" {
 		t.Fatalf("answer status = %q, want consumed", consumed.Status)
+	}
+	if len(git.prepareCalls) != 0 {
+		t.Fatalf("PrepareWorktree calls = %d, want no reset-capable prepare on HITL resume", len(git.prepareCalls))
+	}
+}
+
+func TestValidateNeedsHumanRepliesRejectsMixedValidAndUnboundEntries(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"review_thread_replies":[` +
+		`{"fixItemId":"c1","threadId":"t1","action":"needs_human","explanation":"Choose the intended behavior."},` +
+		`{"fixItemId":"stale","threadId":"old","action":"needs_human","explanation":"Stale question."}` +
+		`]}`
+	items := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
+	accepted := normalizeReplyExplanationActions(parseReplyExplanations(stdout, "", items))
+	if len(accepted) != 1 {
+		t.Fatalf("accepted replies = %#v, want only the bound entry", accepted)
+	}
+	if err := validateNeedsHumanReplies(stdout, "", items, accepted); err == nil {
+		t.Fatal("validateNeedsHumanReplies() error = nil, want mixed decision set rejected")
 	}
 }

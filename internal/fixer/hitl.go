@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -53,9 +54,57 @@ func humanDecisionFromReplies(replies []replyExplanationEntry, executionID, vend
 	}
 }
 
-func completionMentionsNeedsHuman(stdout, stderr string) bool {
+func validateNeedsHumanReplies(stdout, stderr string, fixItems []FixItem, accepted []replyExplanationEntry) error {
 	payload := extractCompletionMarkerPayload(stdout + "\n" + stderr)
-	return strings.Contains(payload, `"`+string(replyActionNeedsHuman)+`"`)
+	if strings.TrimSpace(payload) == "" {
+		return nil
+	}
+	var result struct {
+		Replies []struct {
+			FixItemID   string `json:"fixItemId"`
+			ThreadID    string `json:"threadId"`
+			Action      string `json:"action"`
+			Explanation string `json:"explanation"`
+		} `json:"review_thread_replies"`
+	}
+	if err := json.Unmarshal([]byte(payload), &result); err != nil {
+		if strings.Contains(strings.ToLower(payload), `"`+string(replyActionNeedsHuman)+`"`) {
+			return fmt.Errorf("invalid needs_human completion payload: %w", err)
+		}
+		return nil
+	}
+	items := make(map[string]FixItem, len(fixItems))
+	for _, item := range fixItems {
+		if item.Type == "comment" && item.Source != NativeReviewCommentSource && item.ID != "" {
+			items[item.ID] = item
+		}
+	}
+	acceptedCount := 0
+	for _, reply := range accepted {
+		if normalizeReplyAction(reply.Action) == string(replyActionNeedsHuman) {
+			acceptedCount++
+		}
+	}
+	rawCount := 0
+	seen := map[string]struct{}{}
+	for _, reply := range result.Replies {
+		if normalizeReplyAction(reply.Action) != string(replyActionNeedsHuman) {
+			continue
+		}
+		rawCount++
+		item, ok := items[strings.TrimSpace(reply.FixItemID)]
+		_, duplicate := seen[item.ID]
+		if !ok || duplicate || strings.TrimSpace(reply.ThreadID) == "" ||
+			strings.TrimSpace(reply.ThreadID) != item.ThreadID ||
+			sanitizeReplyExplanation(reply.Explanation) == "" {
+			return fmt.Errorf("invalid needs_human decision for fix item %q", reply.FixItemID)
+		}
+		seen[item.ID] = struct{}{}
+	}
+	if rawCount != acceptedCount {
+		return fmt.Errorf("invalid needs_human decision set")
+	}
+	return nil
 }
 
 func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecord, agentVendor string) (string, string) {
@@ -68,6 +117,14 @@ func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecor
 		return prompt + "\nThe configured agent vendor changed, so continue in a fresh session.", ""
 	}
 	return prompt, strings.TrimSpace(ask.SessionID)
+}
+
+func shouldResumeAnsweredHITLRepair(metadataJSON *string, runStatus string, failedStep FixerStep) bool {
+	if runStatus != "interrupted" || failedStep != stepRepair {
+		return false
+	}
+	ask, ok := loops.ReadHITLAsk(metadataJSON)
+	return ok && ask.Status == "answered" && strings.TrimSpace(ask.Answer) != ""
 }
 
 func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord) (loops.HITLAsk, bool) {
