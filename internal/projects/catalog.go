@@ -99,21 +99,11 @@ func cloneCatalogProjects(projects []config.ProjectRefConfig) []config.ProjectRe
 	return cloned.Projects
 }
 
-// Config is composed exclusively of JSON configuration values. JSON
-// round-tripping gives the Catalog a single complete deep-copy boundary,
-// including nested role overrides and map[string]any agent parameters. A
-// failure indicates a programming error: normalized Config must remain JSON
-// representable.
+// CloneConfig is the canonical detached-copy boundary. In particular it
+// preserves the derived Roles.Coding registry, which is intentionally omitted
+// from JSON to avoid serializing duplicate authoring inputs.
 func cloneCatalogConfig(source config.Config) config.Config {
-	encoded, err := json.Marshal(source)
-	if err != nil {
-		panic(fmt.Sprintf("clone project catalog config: %v", err))
-	}
-	var cloned config.Config
-	if err := json.Unmarshal(encoded, &cloned); err != nil {
-		panic(fmt.Sprintf("clone project catalog config: %v", err))
-	}
-	return cloned
+	return config.CloneConfig(source)
 }
 
 // MaterializeCatalog builds the immutable runtime Project view from active
