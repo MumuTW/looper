@@ -29,7 +29,7 @@ func (c *Catalog) View() OperationView {
 // configuration value. It is useful for tests and focused consumers that build
 // policy input without a live Catalog.
 func OperationViewFromConfig(cfg config.Config) OperationView {
-	return OperationView{generation: cfg}
+	return OperationView{generation: cloneCatalogConfig(cfg)}
 }
 
 // ProjectView is an operation-scoped, detached view of a single project and its
@@ -148,7 +148,7 @@ func (v OperationView) ProviderPolicy(projectID string) (ProviderPolicyView, boo
 			break
 		}
 	}
-	if !found {
+	if !found || strings.TrimSpace(project.Repo) == "" {
 		return ProviderPolicyView{}, false
 	}
 	project = cloneProjectRefConfig(project)
@@ -230,8 +230,21 @@ func cloneRoleConfigs(source config.RoleConfigs) config.RoleConfigs {
 
 func cloneCodingRoleConfig(source config.CodingRoleConfig) config.CodingRoleConfig {
 	cloned := source
+	cloned.Discovery.Labels = append([]string(nil), source.Discovery.Labels...)
 	if source.Agent != nil {
-		agent := *source.Agent
+		agent := config.RoleAgentConfig{}
+		if source.Agent.Profile != nil {
+			profile := *source.Agent.Profile
+			agent.Profile = &profile
+		}
+		if source.Agent.Vendor != nil {
+			vendor := *source.Agent.Vendor
+			agent.Vendor = &vendor
+		}
+		if source.Agent.Model != nil {
+			model := *source.Agent.Model
+			agent.Model = &model
+		}
 		cloned.Agent = &agent
 	}
 	return cloned

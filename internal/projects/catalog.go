@@ -114,6 +114,12 @@ func cloneCatalogConfig(source config.Config) config.Config {
 	if err := json.Unmarshal(encoded, &cloned); err != nil {
 		panic(fmt.Sprintf("clone project catalog config: %v", err))
 	}
+	if len(source.Roles.Coding) > 0 {
+		cloned.Roles.Coding = make(map[string]config.CodingRoleConfig, len(source.Roles.Coding))
+		for name, role := range source.Roles.Coding {
+			cloned.Roles.Coding[name] = cloneCodingRoleConfig(role)
+		}
+	}
 	return cloned
 }
 

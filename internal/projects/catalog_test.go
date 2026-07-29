@@ -508,6 +508,19 @@ func TestCatalogViewProviderPolicy(t *testing.T) {
 	}
 }
 
+func TestCatalogViewProviderPolicyRequiresRepositoryBinding(t *testing.T) {
+	t.Parallel()
+
+	catalog := NewCatalog(config.Config{
+		Projects: []config.ProjectRefConfig{{ID: "demo", Repo: "  "}},
+	})
+
+	policy, ok := catalog.View().ProviderPolicy("demo")
+	if ok || policy != (ProviderPolicyView{}) {
+		t.Fatalf("view.ProviderPolicy(\"demo\") = (%#v, %v), want empty policy, false", policy, ok)
+	}
+}
+
 func TestCatalogViewProviderByRemoteHost(t *testing.T) {
 	t.Parallel()
 
@@ -525,6 +538,33 @@ func TestCatalogViewProviderByRemoteHost(t *testing.T) {
 	}
 	if policy.Provider.ID != "forgejo-main" || policy.ProviderKind != config.ProviderKindForgejo {
 		t.Fatalf("view.ProviderByRemoteHost = %#v, want forgejo-main", policy)
+	}
+}
+
+func TestOperationViewFromConfigDetachesCodingRolePolicy(t *testing.T) {
+	t.Parallel()
+
+	profile := "fast"
+	input := config.Config{Roles: config.RoleConfigs{Coding: map[string]config.CodingRoleConfig{
+		"auditor": {
+			Discovery: config.RoleDiscoveryConfig{Labels: []string{"audit"}},
+			Agent:     &config.RoleAgentConfig{Profile: &profile},
+		},
+	}}}
+	view := OperationViewFromConfig(input)
+
+	input.Roles.Coding["auditor"].Discovery.Labels[0] = "mutated-input"
+	*input.Roles.Coding["auditor"].Agent.Profile = "mutated-input"
+	first := view.RolePolicy("")
+	first.Roles.Coding["auditor"].Discovery.Labels[0] = "mutated-view"
+	*first.Roles.Coding["auditor"].Agent.Profile = "mutated-view"
+
+	got := view.RolePolicy("").Roles.Coding["auditor"]
+	if len(got.Discovery.Labels) != 1 || got.Discovery.Labels[0] != "audit" {
+		t.Fatalf("coding role labels = %v, want detached audit label", got.Discovery.Labels)
+	}
+	if got.Agent == nil || got.Agent.Profile == nil || *got.Agent.Profile != "fast" {
+		t.Fatalf("coding role agent = %#v, want detached fast profile", got.Agent)
 	}
 }
 
