@@ -330,6 +330,43 @@ func TestGatewayKeepsPrimaryCheckoutCleanForDetachedFixerWorktree(t *testing.T) 
 	}
 }
 
+func TestGatewayPushPublishesPinnedCommitWhenHeadAdvances(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	baseHeadSHA := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "refs/remotes/origin/feature/fixer"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "README.md"), "validated\n")
+	if _, err := gateway.Commit(ctx, CommitInput{WorktreePath: worktree.WorktreePath, Message: "validated"}); err != nil {
+		t.Fatalf("Commit(validated) error = %v", err)
+	}
+	validatedSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "README.md"), "advanced after validation\n")
+	if _, err := gateway.Commit(ctx, CommitInput{WorktreePath: worktree.WorktreePath, Message: "unvalidated"}); err != nil {
+		t.Fatalf("Commit(unvalidated) error = %v", err)
+	}
+	advancedSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
+
+	if err := gateway.Push(ctx, PushInput{WorktreePath: worktree.WorktreePath, Branch: "feature/fixer", ExpectedRemoteHeadSHA: baseHeadSHA, LocalHeadSHA: validatedSHA}); err != nil {
+		t.Fatalf("Push() error = %v", err)
+	}
+	remoteSHA := stringsTrimSpace(runGit(t, fixture.repoPath, "ls-remote", "origin", "refs/heads/feature/fixer"))
+	if !strings.HasPrefix(remoteSHA, validatedSHA+"\t") {
+		t.Fatalf("remote ref = %q, want validated SHA %s", remoteSHA, validatedSHA)
+	}
+	if validatedSHA == advancedSHA {
+		t.Fatal("test setup did not advance HEAD after validation")
+	}
+}
+
 func TestGatewayDetachedWorktreeFallsBackToRemoteOnlyBaseBranch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)

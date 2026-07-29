@@ -34,6 +34,7 @@ import (
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validationcmd"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
@@ -427,6 +428,7 @@ type PushInput struct {
 	Branch                string
 	Remote                string
 	ExpectedRemoteHeadSHA string
+	LocalHeadSHA          string
 	ProtectedBranches     []string
 }
 
@@ -463,16 +465,17 @@ type MergeBaseResult struct {
 }
 
 type AgentRunInput struct {
-	ExecutionID      string
-	ProjectID        string
-	LoopID           string
-	RunID            string
-	Prompt           string
-	WorkingDirectory string
-	Timeout          time.Duration
-	HeartbeatTimeout time.Duration
-	Metadata         map[string]any
-	IdempotencyKey   string
+	ExecutionID         string
+	ProjectID           string
+	LoopID              string
+	RunID               string
+	Prompt              string
+	WorkingDirectory    string
+	Timeout             time.Duration
+	HeartbeatTimeout    time.Duration
+	Metadata            map[string]any
+	IdempotencyKey      string
+	RestrictToolNetwork bool
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot    bool
@@ -493,6 +496,11 @@ type AgentResult struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 }
+
+const validationGatedLocalOnlyPrompt = `
+
+VALIDATION-GATED LOCAL-ONLY EXECUTION:
+Looper's daemon already fetched the PR head and supplied the review items above. Tool network access is intentionally disabled. Do not run gh, git fetch/pull/push, access remote URLs, or fail merely because the forge is unavailable. Use the local checkout and supplied PR seed, edit, test, and commit locally only; Looper will validate the exact commit and publish it afterward.`
 
 type AgentExecution interface {
 	Wait(context.Context) (AgentResult, error)
@@ -529,18 +537,19 @@ type AgentExecutionStartedInput struct {
 type AgentExecutionStartedFunc func(context.Context, AgentExecutionStartedInput) error
 
 type Options struct {
-	DB                 *sql.DB
-	Repos              *storage.Repositories
-	GitHub             GitHubGateway
-	Git                GitGateway
-	AgentExecutor      AgentExecutor
-	Logger             bootstrap.Logger
-	Now                func() time.Time
-	AgentTimeout       time.Duration
-	AgentIdleTimeout   time.Duration
-	ClaimTTL           time.Duration
-	ValidationCommands []string
-	ValidationRunner   ValidationRunner
+	DB                     *sql.DB
+	Repos                  *storage.Repositories
+	GitHub                 GitHubGateway
+	Git                    GitGateway
+	AgentExecutor          AgentExecutor
+	Logger                 bootstrap.Logger
+	Now                    func() time.Time
+	AgentTimeout           time.Duration
+	AgentIdleTimeout       time.Duration
+	ClaimTTL               time.Duration
+	ValidationCommands     []string
+	ValidationCodexCommand string
+	ValidationRunner       ValidationRunner
 	// ContainmentTracker registers validation shell handles with the Execution
 	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
 	// when the runner is not daemon-owned.
@@ -582,6 +591,7 @@ type Runner struct {
 	agentIdleTimeout        time.Duration
 	claimTTL                time.Duration
 	validationCommands      []string
+	validationCodexCommand  string
 	validationRunner        ValidationRunner
 	containmentTracker      processcontainment.LiveTracker
 	allowAutoCommit         bool
@@ -1373,6 +1383,7 @@ func New(options Options) *Runner {
 		agentIdleTimeout:        agentIdleTimeout,
 		claimTTL:                claimTTL,
 		validationCommands:      append([]string(nil), options.ValidationCommands...),
+		validationCodexCommand:  strings.TrimSpace(options.ValidationCodexCommand),
 		validationRunner:        options.ValidationRunner,
 		containmentTracker:      options.ContainmentTracker,
 		allowAutoCommit:         options.AllowAutoCommit,
@@ -3013,7 +3024,14 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
+	// A configured validation gate makes Looper the publishing boundary: the
+	// agent leaves changes local, then the validate and push steps publish only
+	// the content that passed.
+	agentMayPush := fixerAgentMayPush(r.allowAutoPush, r.validationCommands)
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, agentMayPush, r.disclosure, agentVendor, derefString(agentModel))
+	if len(r.validationCommands) > 0 {
+		prompt += validationGatedLocalOnlyPrompt
+	}
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -3028,7 +3046,8 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown")),
-		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		RestrictToolNetwork: len(r.validationCommands) > 0,
+		UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 	})
 	if err != nil {
 		return checkpoint, err
@@ -3083,6 +3102,10 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	return checkpoint, nil
 }
 
+func fixerAgentMayPush(allowAutoPush bool, validationCommands []string) bool {
+	return allowAutoPush && len(validationCommands) == 0
+}
+
 func (r *Runner) runReconcileCommitsStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint, err := r.reconcileCommits(ctx, input.Project, input.Checkpoint, buildFixerCommitMessage(input.PRNumber), input.Run)
 	if err != nil {
@@ -3109,17 +3132,19 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 	if err != nil {
 		return checkpoint, err
 	}
+	checkpoint.Validation = &result
 	if !result.Passed {
-		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, "Validation failed"), kind: FailureRetryableAfterResume}
+		failure := classifyFixerValidationFailure(result)
+		checkpoint.ResumePolicy = failure.resumePolicy
+		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
 	}
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
 	if err != nil {
 		return checkpoint, err
 	}
 	if inspect.HasUncommittedChanges {
-		if checkpoint.Validation != nil && strings.Contains(strings.ToLower(checkpoint.Validation.Summary), "extra reconcile") {
-			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: FailureRetryableAfterResume}
-		}
+		baseHeadSHA := reconcileBaseHeadSHA(checkpoint.ReconcileCommits)
+		checkpoint.ReconcileCommits = &checkpointReconcileCommits{BaseHeadSHA: baseHeadSHA}
 		checkpoint, err = r.reconcileCommits(ctx, input.Project, checkpoint, buildFixerCommitMessage(input.PRNumber), input.Run)
 		if err != nil {
 			return input.Checkpoint, err
@@ -3132,26 +3157,50 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		if err != nil {
 			return checkpoint, err
 		}
+		checkpoint.Validation = &second
 		if !second.Passed {
-			return checkpoint, &loopError{message: firstNonEmpty(second.Summary, "Validation failed after reconcile"), kind: FailureRetryableAfterResume}
+			failure := classifyFixerValidationFailure(second)
+			checkpoint.ResumePolicy = failure.resumePolicy
+			return checkpoint, &loopError{message: failure.message, kind: failure.kind}
 		}
 		finalInspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
 		if err != nil {
 			return checkpoint, err
 		}
 		if finalInspect.HasUncommittedChanges {
-			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: FailureRetryableAfterResume}
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
+			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: FailureManualIntervention}
 		}
 		second.HeadSHA = finalInspect.HeadSHA
 		second.Summary = firstNonEmpty(second.Summary, "Validation passed after extra reconcile")
+		r.refreshReconcileMetadata(&checkpoint, worktree, finalInspect)
 		checkpoint.Validation = &second
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
+	r.refreshReconcileMetadata(&checkpoint, worktree, inspect)
 	result.HeadSHA = inspect.HeadSHA
 	checkpoint.Validation = &result
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) refreshReconcileMetadata(checkpoint *fixerCheckpoint, worktree *checkpointWorktree, inspect InspectHeadResult) {
+	if checkpoint == nil || worktree == nil || checkpoint.ReconcileCommits == nil || checkpoint.ReconcileCommits.FinalHeadSHA == inspect.HeadSHA {
+		return
+	}
+	checkpoint.ReconcileCommits.FinalHeadSHA = inspect.HeadSHA
+	checkpoint.ReconcileCommits.NewCommitSHAs = append([]string(nil), inspect.NewCommitSHAs...)
+	checkpoint.ReconcileCommits.CommittedByAgent = len(inspect.NewCommitSHAs) > 0
+	checkpoint.ReconcileCommits.WorkingTreeClean = true
+	checkpoint.ReconcileCommits.ChangedFiles = append([]string(nil), inspect.ChangedFiles...)
+	checkpoint.ReconcileCommits.CompletedAt = r.nowISO()
+	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
+	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
+	if len(inspect.NewCommitSHAs) > 0 && checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
+		checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+	}
 }
 
 func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -3184,6 +3233,25 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if checkpoint.ReconcileCommits == nil {
 		return checkpoint, &loopError{message: "Missing reconcile-commits checkpoint for push step", kind: FailureRetryableAfterResume}
 	}
+	if len(r.validationCommands) > 0 {
+		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
+		if err != nil {
+			return checkpoint, err
+		}
+		if checkpoint.Validation == nil || !checkpoint.Validation.Passed || checkpoint.Validation.HeadSHA != inspect.HeadSHA || inspect.HasUncommittedChanges {
+			baseHeadSHA := reconcileBaseHeadSHA(checkpoint.ReconcileCommits)
+			checkpoint.ReconcileCommits = &checkpointReconcileCommits{BaseHeadSHA: baseHeadSHA}
+			checkpoint, err = r.reconcileCommits(ctx, input.Project, checkpoint, buildFixerCommitMessage(input.PRNumber), input.Run)
+			if err != nil {
+				return input.Checkpoint, err
+			}
+			input.Checkpoint = checkpoint
+			checkpoint, err = r.runValidateStep(ctx, input)
+			if err != nil {
+				return checkpoint, err
+			}
+		}
+	}
 	if !checkpoint.ReconcileCommits.WorkingTreeClean {
 		return checkpoint, &loopError{message: "Working tree must be clean before push", kind: FailureRetryableAfterResume}
 	}
@@ -3205,7 +3273,14 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
-	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: branch, ExpectedRemoteHeadSHA: worktree.BaseHeadSHA}); err != nil {
+	localHeadSHA := ""
+	if len(r.validationCommands) > 0 {
+		if checkpoint.Validation == nil || !checkpoint.Validation.Passed || strings.TrimSpace(checkpoint.Validation.HeadSHA) == "" {
+			return checkpoint, &loopError{message: "Missing validated head SHA for push step", kind: FailureRetryableAfterResume}
+		}
+		localHeadSHA = checkpoint.Validation.HeadSHA
+	}
+	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: branch, ExpectedRemoteHeadSHA: worktree.BaseHeadSHA, LocalHeadSHA: localHeadSHA}); err != nil {
 		message := err.Error()
 		eventType := "fixer.push.retryable"
 		if strings.Contains(strings.ToLower(message), "remote head changed") {
@@ -6507,19 +6582,29 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 
 	outputs := make([]string, 0, len(input.Commands)*2)
 	for _, command := range input.Commands {
-		result, err := shell.Run(ctx, shell.Options{
-			Command: "/bin/sh",
-			Args:    []string{"-c", command},
-			CWD:     input.CWD,
+		result, err := validationcmd.Run(ctx, validationcmd.Options{
+			CWD:          input.CWD,
+			Command:      command,
+			Timeout:      r.agentTimeout,
+			CodexCommand: r.validationCodexCommand,
 			// Supervisor-owned validation: track handle so shutdown retain-storage
 			// sees Kill/Drain failures even when validation collapses them to Passed=false.
 			Tracker: r.containmentTracker,
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return ValidationResult{}, err
+			}
 			output := "Unknown validation failure"
 			var commandErr *shell.CommandExecutionError
 			if errors.As(err, &commandErr) {
 				output = strings.TrimSpace(strings.Join([]string{commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n"))
+				if output == "" {
+					output = commandErr.Error()
+				}
+				if strings.EqualFold(strings.TrimSpace(commandErr.Message), "command timed out") {
+					return ValidationResult{Passed: false, Summary: fmt.Sprintf("Validation timed out: %s", command), Output: output}, nil
+				}
 			} else {
 				output = err.Error()
 			}
@@ -6534,6 +6619,33 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	}
 
 	return ValidationResult{Passed: true, Summary: "Validation passed", Output: strings.Join(outputs, "\n")}, nil
+}
+
+type fixerValidationFailure struct {
+	message      string
+	kind         QueueFailureKind
+	resumePolicy string
+}
+
+func classifyFixerValidationFailure(result ValidationResult) fixerValidationFailure {
+	message := firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed")
+	if strings.HasPrefix(result.Summary, "Validation timed out:") {
+		return fixerValidationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
+	}
+	summary := strings.ToLower(strings.TrimSpace(result.Summary))
+	if containsAnyFixerValidationHint(summary, []string{"command not found", "executable file not found", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
+		return fixerValidationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
+	}
+	return fixerValidationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
+}
+
+func containsAnyFixerValidationHint(message string, hints []string) bool {
+	for _, hint := range hints {
+		if strings.Contains(message, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 type eventInput struct {

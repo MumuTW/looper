@@ -2437,7 +2437,7 @@ func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (f
 }
 
 func (a fixerGitAdapter) Push(ctx context.Context, input fixer.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, LocalHeadSHA: input.LocalHeadSHA, ProtectedBranches: input.ProtectedBranches})
 }
 
 func (a fixerGitAdapter) FetchBranch(ctx context.Context, repoPath, remote, branch string) error {
@@ -2468,7 +2468,8 @@ func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentR
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
 		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
-		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		RestrictToolNetwork: input.RestrictToolNetwork,
+		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
 	if err != nil {
 		return nil, err
@@ -2914,7 +2915,7 @@ func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) 
 }
 
 func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, LocalHeadSHA: input.LocalHeadSHA, ProtectedBranches: input.ProtectedBranches})
 }
 
 type workerAgentExecutorAdapter struct {
@@ -2932,7 +2933,8 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
 		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
-		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		RestrictToolNetwork: input.RestrictToolNetwork,
+		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
 	if err != nil {
 		return nil, err
@@ -2977,6 +2979,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	claimMu := &sync.Mutex{}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
+	if len(config.ResolveValidationCommands(source.Snapshot())) == 0 && logger != nil {
+		logger.Warn("worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything", nil)
+	}
 	// Trusted review proxies are minted per reviewer agent run (bound to that
 	// run's PR). Catalog snapshots reuse claim serialization and notification
 	// transport continuity while retaining config-specific policy.
@@ -3406,6 +3411,17 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			},
 		})
 	}
+	validationCommands := config.ResolveValidationCommands(cfg)
+	validationCodexCommand := func(resolved config.ResolvedAgent) string {
+		if resolved.Vendor != config.AgentVendorCodex {
+			return "codex"
+		}
+		params := agent.ParamsForRoleVendor(cfg.Agent.Params, cfg.Agent.Vendor, resolved.Vendor, resolved.Model)
+		if command, ok := params["command"].(string); ok && strings.TrimSpace(command) != "" {
+			return strings.TrimSpace(command)
+		}
+		return "codex"
+	}
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
 		resolved := resolvedFixer
@@ -3421,17 +3437,19 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			fixerAutoDiscovery = false
 		}
 		fixerRunner = fixer.New(fixer.Options{
-			DB:                 coordinator.DB(),
-			Repos:              repos,
-			GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
-			Git:                fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
-			AgentExecutor:      fixerAgentExecutorAdapter{executor: fixerExecutor},
-			Logger:             logger,
-			Now:                now,
-			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
-			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
+			DB:                     coordinator.DB(),
+			Repos:                  repos,
+			GitHub:                 fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
+			Git:                    fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
+			AgentExecutor:          fixerAgentExecutorAdapter{executor: fixerExecutor},
+			Logger:                 logger,
+			Now:                    now,
+			AllowAutoCommit:        cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:          cfg.Defaults.AllowAutoPush,
+			AllowRiskyFixes:        cfg.Defaults.AllowRiskyFixes,
+			FixAllPullRequests:     cfg.Defaults.FixAllPullRequests,
+			ValidationCommands:     validationCommands,
+			ValidationCodexCommand: validationCodexCommand(resolved),
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: fixer.DiscoveryPolicy{
@@ -3489,13 +3507,15 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 			},
-			Git:             workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
-			AgentExecutor:   workerAgentExecutorAdapter{executor: workerExecutor},
-			Logger:          logger,
-			Now:             now,
-			AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
-			AllowAutoPush:   cfg.Defaults.AllowAutoPush,
-			OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
+			Git:                    workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
+			AgentExecutor:          workerAgentExecutorAdapter{executor: workerExecutor},
+			Logger:                 logger,
+			Now:                    now,
+			AllowAutoCommit:        cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:          cfg.Defaults.AllowAutoPush,
+			OpenPRStrategy:         cfg.Defaults.OpenPRStrategy,
+			ValidationCommands:     validationCommands,
+			ValidationCodexCommand: validationCodexCommand(resolved),
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: worker.DiscoveryPolicy{

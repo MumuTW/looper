@@ -793,6 +793,7 @@ allowAutoApprove = true
 allowRiskyFixes = false
 openPrStrategy = "all_done"
 addSnapshotMode = "async"
+validationCommands = ["go build ./...", "go test ./..."]
 
 # `allowAutoApprove` is a legacy compatibility alias.
 # Prefer `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"` in new config.
@@ -1068,6 +1069,23 @@ To restore it by default for all project additions:
 }
 ```
 
+### `defaults.validationCommands`
+
+`defaults.validationCommands` is the mechanical gate the worker and fixer run in the run's worktree before opening a PR or pushing. Each entry is executed with `/bin/sh -c` from the worktree root, in order, and the first non-zero exit fails the validate step; the run never advances to open-pr or push. Each command is bounded by the coding role's `agent.timeouts.*MaxRuntimeSeconds` value.
+
+```toml
+[defaults]
+validationCommands = ["test -z \"$(gofmt -l .)\"", "go vet ./...", "go test ./...", "go build ./..."]
+```
+
+The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides). The command strings come from daemon configuration, but commands such as `make check` and `go test ./...` intentionally execute repository-controlled code. Looper therefore launches each command through `codex sandbox` with a custom permission profile: network access is disabled, `HOME`/XDG/Go write caches are disposable, daemon credentials (`SSH_AUTH_SOCK`, `LOOPER_CONFIG`, forge/API keys) are omitted, and writes are limited to the worktree plus that disposable root. Tool directories on `PATH` and the existing Go module cache are read-only. If native sandbox support is missing or rejects the profile, validation fails closed rather than falling back to an unsandboxed shell.
+
+When this gate is configured, Looper is the fetch-and-publish authority. The daemon prepares the worktree before execution, then launches the Codex agent with a read-isolated permission profile and a disposable, allowlisted tool environment. The Codex parent can still authenticate to its model provider, but model-invoked tools cannot read daemon `HOME`/`CODEX_HOME`, SSH agents, forge credentials, or unrelated host files; they can edit and commit only inside the prepared worktree and cannot use the network. Looper then pushes the exact commit SHA that passed validation. A later local `HEAD` change is not included in that push. This mode currently supports only the Codex executor; other coding vendors fail closed because Looper cannot yet enforce the same tool-level network boundary for them.
+
+The trade-off is deliberate: the gated agent and repository-controlled validation cannot fetch new remote state, query the forge, or download dependencies while they run. Required tools must be on the daemon's `PATH`; dependencies must already exist in the worktree or approved read-only caches. Linked-worktree Git metadata and the discovered Go toolchain/GOROOT are mounted read-only so normal local Git and Go validation still work. Remote context must be present in the daemon-supplied prompt and prepared checkout. If a task needs fresh remote information, let the daemon rediscover/restart it rather than weakening the gate. The agent receives a non-secret local Git identity so local commits still work; remote credentials remain daemon-side authority. If `agent.params.command` selects a custom Codex executable, the same executable is used for the validation sandbox instead of silently falling back to `codex` on `PATH`.
+
+The default is empty, which keeps the historical behavior: the validate step passes without running anything and "done" is only the agent's own self-assessment. `looperd` logs a startup warning while the list is empty so the no-op is visible. The field is restart-bound.
+
 ### `roles`
 
 The `roles` section controls scheduler-driven auto-discovery for planner, reviewer, fixer, and worker. It does not block manual commands, direct processing, retries, or already queued work.
@@ -1134,6 +1152,7 @@ looperd \
 - the default worktree root must be writable
 - required tool paths must resolve
 - `notifications.osascript.enabled=true` requires `tools.osascriptPath` to resolve
+- every `defaults.validationCommands[]` entry must be a non-empty string
 
 ## Recommended first-time setup
 

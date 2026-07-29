@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validationcmd"
 )
 
 // ErrExecutionPersistence is returned when a hard agent_executions observation
@@ -157,7 +159,12 @@ type RunInput struct {
 	Metadata           map[string]any
 	IdempotencyKey     string
 	Env                map[string]string
-	NativeSessionID    string
+	// RestrictToolNetwork forces supported coding agents to keep their tool
+	// subprocesses inside the writable worktree with network access disabled.
+	// The agent process itself may still reach its model provider; the daemon
+	// remains the only authority that fetches or publishes repository state.
+	RestrictToolNetwork bool
+	NativeSessionID     string
 	// UseSnapshot, when true with a non-empty SnapshotVendor, overrides the
 	// executor's configured vendor/model for this start only (spawn, native
 	// resume vendor checks, and persisted execution vendor). Env and
@@ -457,6 +464,19 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	startedAt := e.now().UTC()
 	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
 	cfg := e.effectiveConfig(input)
+	if input.RestrictToolNetwork && cfg.Vendor != config.AgentVendorCodex {
+		return nil, fmt.Errorf("tool-network restriction is supported only for codex; refusing validation-gated %s execution", cfg.Vendor)
+	}
+	if input.RestrictToolNetwork {
+		input.Env = maps.Clone(input.Env)
+		if input.Env == nil {
+			input.Env = map[string]string{}
+		}
+		input.Env["GIT_AUTHOR_NAME"] = "Looper Agent"
+		input.Env["GIT_AUTHOR_EMAIL"] = "looper-agent@localhost"
+		input.Env["GIT_COMMITTER_NAME"] = "Looper Agent"
+		input.Env["GIT_COMMITTER_EMAIL"] = "looper-agent@localhost"
+	}
 	resume, err := e.resolveNativeResume(ctx, input)
 	if err != nil {
 		return nil, err
@@ -494,7 +514,23 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	if resume.Enabled && strings.TrimSpace(input.NativeResumePrompt) != "" {
 		spawnPrompt = input.NativeResumePrompt
 	}
+	var toolSandbox *validationcmd.Sandbox
+	if input.RestrictToolNetwork {
+		toolSandbox, err = validationcmd.NewSandbox(input.WorkingDirectory, "looper-agent", "looper-agent-")
+		if err != nil {
+			return nil, fmt.Errorf("prepare credential-free agent tool sandbox: %w", err)
+		}
+		defer func() {
+			// On successful Start the execution owns cleanup until terminal Wait.
+			if toolSandbox != nil {
+				toolSandbox.Cleanup()
+			}
+		}()
+	}
 	command, args := ResolveSpawnWithNativeResume(cfg, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
+	if input.RestrictToolNetwork {
+		args = enforceCodexToolNetworkDenied(args, spawnPrompt, toolSandbox)
+	}
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
@@ -532,6 +568,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		killCh:             make(chan string, 1),
 		doneCh:             make(chan execOutcome, 1),
 		lease:              lease,
+		toolSandbox:        toolSandbox,
 	}
 	x.stdoutLogPath, x.stderrLogPath = e.executionLogPaths(input, executionID)
 	x.initializePersistedLogs()
@@ -556,6 +593,9 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 				// best-effort marker only; command fallback is the important recovery behavior
 			}
 			command, args = ResolveSpawn(cfg, input.WorkingDirectory, input.Prompt)
+			if input.RestrictToolNetwork {
+				args = enforceCodexToolNetworkDenied(args, input.Prompt, toolSandbox)
+			}
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
 			processcontainment.Configure(cmd)
@@ -620,6 +660,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory, "nativeResumeMode": resumeMode, "nativeResumeStatus": resumeStatus, "nativeSessionId": resumeSessionID}, startedAtISO)
 
 	go x.run(ctx)
+	toolSandbox = nil
 	return x, nil
 }
 
@@ -676,6 +717,7 @@ type execution struct {
 	nativeResumeStatus      string
 	nativeResumeError       string
 	leaseReleased           bool
+	toolSandbox             *validationcmd.Sandbox
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -768,6 +810,7 @@ func (x *execution) waitLeader() error {
 
 func (x *execution) run(ctx context.Context) {
 	defer x.releaseLease()
+	defer x.cleanupToolSandbox()
 
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- x.waitLeader() }()
@@ -1023,6 +1066,16 @@ func (x *execution) run(ctx context.Context) {
 	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
+func (x *execution) cleanupToolSandbox() {
+	x.mu.Lock()
+	sandbox := x.toolSandbox
+	x.toolSandbox = nil
+	x.mu.Unlock()
+	if sandbox != nil {
+		sandbox.Cleanup()
+	}
+}
+
 func (x *execution) shouldFallbackNativeResume(status string, stdout string, stderr string) bool {
 	_, mode, resumeStatus, _ := x.nativeResumeSnapshot()
 	return mode == "native_resume" && resumeStatus == "started" && status == "failed" && isNativeResumeAttachFailure(stdout, stderr)
@@ -1095,6 +1148,9 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 
 	cfg := x.executor.effectiveConfig(x.input)
 	command, args := ResolveSpawn(cfg, x.input.WorkingDirectory, x.input.Prompt)
+	if x.input.RestrictToolNetwork {
+		args = enforceCodexToolNetworkDenied(args, x.input.Prompt, x.toolSandbox)
+	}
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
 	processcontainment.Configure(cmd)
@@ -2036,6 +2092,96 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 	return append(withModel, prompt)
 }
 
+// enforceCodexToolNetworkDenied overrides all operator-supplied Codex sandbox
+// choices for a validation-gated run. Codex's model transport remains outside
+// the tool sandbox, while shell commands cannot reach the network or write
+// outside the worktree. Removing the bypass flag is essential: appending a
+// safer flag after it would not restore containment.
+func enforceCodexToolNetworkDenied(args []string, prompt string, sandbox *validationcmd.Sandbox) []string {
+	filtered := make([]string, 0, len(args)+4)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--dangerously-bypass-approvals-and-sandbox" || arg == "--dangerously-bypass-hook-trust":
+			continue
+		case arg == "--search" || strings.HasPrefix(arg, "--search="):
+			continue
+		case arg == "--add-dir" || arg == "-C" || arg == "--cd" || arg == "-p" || arg == "--profile" || arg == "--enable":
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		case strings.HasPrefix(arg, "--add-dir=") || strings.HasPrefix(arg, "-C=") || strings.HasPrefix(arg, "--cd=") || strings.HasPrefix(arg, "--profile=") || strings.HasPrefix(arg, "--enable="):
+			continue
+		case (strings.HasPrefix(arg, "-C") || strings.HasPrefix(arg, "-p")) && len(arg) > 2:
+			continue
+		case arg == "-s" || arg == "--sandbox":
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		case strings.HasPrefix(arg, "-s=") || strings.HasPrefix(arg, "--sandbox="):
+			continue
+		case strings.HasPrefix(arg, "-s") && len(arg) > 2:
+			continue
+		case arg == "-c" || arg == "--config":
+			if i+1 < len(args) && unsafeCodexSandboxConfig(args[i+1]) {
+				i++
+				continue
+			}
+		case (strings.HasPrefix(arg, "-c=") || strings.HasPrefix(arg, "--config=")) && unsafeCodexSandboxConfig(arg):
+			continue
+		case strings.HasPrefix(arg, "-c") && len(arg) > 2:
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+
+	trailingPrompt := len(filtered) > 0 && filtered[len(filtered)-1] == prompt
+	if trailingPrompt {
+		filtered = filtered[:len(filtered)-1]
+	}
+	restrictions := []string{
+		"--ignore-user-config",
+		"--disable", "browser_use",
+		"--disable", "browser_use_external",
+		"--disable", "browser_use_full_cdp_access",
+		"--disable", "in_app_browser",
+		"--disable", "standalone_web_search",
+	}
+	if sandbox != nil {
+		restrictions = append(restrictions,
+			"-c", sandbox.PermissionConfig(),
+			"-c", "permission_profile="+strconv.Quote(sandbox.ProfileName),
+			"-c", sandbox.ShellEnvironmentConfig(),
+		)
+	} else {
+		// Unit callers without a prepared sandbox still fail closed on network.
+		restrictions = append(restrictions, "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=false")
+	}
+	insertAt := len(filtered)
+	for i, arg := range filtered {
+		if arg == "resume" {
+			insertAt = i
+			break
+		}
+	}
+	filtered = append(filtered[:insertAt], append(restrictions, filtered[insertAt:]...)...)
+	if trailingPrompt {
+		filtered = append(filtered, prompt)
+	}
+	return filtered
+}
+
+func unsafeCodexSandboxConfig(value string) bool {
+	for _, key := range []string{"sandbox_workspace_write", "sandbox_permissions", "sandbox_mode", "permission_profile", "permissions.", "shell_environment_policy", "approval_policy", "mcp_servers", "web_search", "features.browser_use", "features.in_app_browser", "features.standalone_web_search"} {
+		if strings.Contains(value, key) {
+			return true
+		}
+	}
+	return false
+}
+
 // appendCodexSandboxDefaults sets the sandbox mode and grants networking
 // unless the operator already spoke about either.
 func appendCodexSandboxDefaults(args []string) []string {
@@ -2204,6 +2350,10 @@ func buildCommandEnv(workingDirectory string, prompt string, envSources ...map[s
 
 func BuildCommandEnv(workingDirectory string, prompt string, envSources ...map[string]string) []string {
 	return buildCommandEnv(workingDirectory, prompt, envSources...)
+}
+
+func BuildCommandEnvMap(workingDirectory string, prompt string, envSources ...map[string]string) map[string]string {
+	return envSliceToMap(buildCommandEnv(workingDirectory, prompt, envSources...))
 }
 
 func envSliceToMap(env []string) map[string]string {

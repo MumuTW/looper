@@ -2361,7 +2361,7 @@ func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T)
 	}
 }
 
-func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
+func TestProcessClaimedItemDeterministicValidationFailurePauses(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
@@ -2380,31 +2380,31 @@ func TestProcessClaimedItemValidationFailureRequeues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume {
-		t.Fatalf("result = %#v, want retryable_after_resume validation failure", result)
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result = %#v, want manual_intervention validation failure", result)
 	}
-	if len(completed) != 0 {
-		t.Fatalf("len(completed) = %d, want 0 for queued retry", len(completed))
+	if len(completed) != 1 {
+		t.Fatalf("len(completed) = %d, want terminal completion notification", len(completed))
 	}
 	if len(github.updateIssueCommentCalls) > 0 {
 		body := github.updateIssueCommentCalls[len(github.updateIssueCommentCalls)-1].Body
-		if strings.Contains(body, "paused work") || strings.Contains(body, "stopped work") {
-			t.Fatalf("issue comment updates = %#v, want no paused/stopped marker while queued retry is pending", github.updateIssueCommentCalls)
+		if !strings.Contains(body, "paused work") {
+			t.Fatalf("issue comment updates = %#v, want paused marker for deterministic failure", github.updateIssueCommentCalls)
 		}
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" {
-		t.Fatalf("queue = %#v, want queued retry item", queue)
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want parked manual_intervention item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "queued" {
-		t.Fatalf("loop = %#v, want queued", loop)
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused", loop)
 	}
 }
 
@@ -3506,9 +3506,11 @@ func TestProcessClaimedItemUsesIssueScopedLockForIssueWork(t *testing.T) {
 	}
 }
 
-func TestRunValidationUsesShellCommandsByDefault(t *testing.T) {
+func TestRunValidationUsesInjectedRunner(t *testing.T) {
 	t.Parallel()
-	runner := New(Options{})
+	runner := New(Options{ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: true, Summary: "Validation passed", Output: "hello\nwarn"}, nil
+	}})
 	result, err := runner.runValidation(context.Background(), ValidationInput{
 		CWD:      t.TempDir(),
 		Commands: []string{"printf 'hello'", "printf 'warn' >&2"},
@@ -3529,7 +3531,9 @@ func TestRunValidationUsesShellCommandsByDefault(t *testing.T) {
 
 func TestRunValidationReturnsCommandFailureOutput(t *testing.T) {
 	t.Parallel()
-	runner := New(Options{})
+	runner := New(Options{ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: false, Summary: "Validation failed: printf 'bad' >&2; exit 9", Output: "bad"}, nil
+	}})
 	result, err := runner.runValidation(context.Background(), ValidationInput{
 		CWD:      t.TempDir(),
 		Commands: []string{"printf 'bad' >&2; exit 9"},

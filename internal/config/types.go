@@ -403,6 +403,12 @@ type DefaultsConfig struct {
 	FixAllPullRequests bool            `json:"fixAllPullRequests"`
 	OpenPRStrategy     OpenPRStrategy  `json:"openPrStrategy"`
 	AddSnapshotMode    AddSnapshotMode `json:"addSnapshotMode"`
+	// ValidationCommands is the mechanical gate the worker and fixer run in the
+	// worktree before opening a PR or pushing: each entry is executed with
+	// `/bin/sh -c` and a non-zero exit blocks the run. Empty (the default) keeps
+	// the historical behavior where the validate step passes unconditionally and
+	// "done" is only the agent's own self-assessment.
+	ValidationCommands []string `json:"validationCommands,omitempty"`
 }
 
 type ReviewerLoopConfig struct {
@@ -892,6 +898,7 @@ type PartialDefaultsConfig struct {
 	FixAllPullRequests *bool            `json:"fixAllPullRequests,omitempty"`
 	OpenPRStrategy     *OpenPRStrategy  `json:"openPrStrategy,omitempty"`
 	AddSnapshotMode    *AddSnapshotMode `json:"addSnapshotMode,omitempty"`
+	ValidationCommands *[]string        `json:"validationCommands,omitempty"`
 }
 
 type PartialReviewerLoopConfig struct {
