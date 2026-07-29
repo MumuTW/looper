@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -101,27 +104,27 @@ func TestRunValidationBoundsCommandRuntime(t *testing.T) {
 	if result.Passed || !strings.Contains(strings.ToLower(result.Output), "timed out") {
 		t.Fatalf("runValidation() result = %#v, want bounded timeout failure", result)
 	}
-	failure := classifyFixerValidationFailure(result)
-	if failure.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFixerValidationFailure() = %#v, want retryable timeout", failure)
+	failure := failurepolicy.ClassifyValidation(result.Summary, result.Output)
+	if failure.Kind != failureclass.RetryableTransient {
+		t.Fatalf("ClassifyValidation() = %#v, want retryable timeout", failure)
 	}
 }
 
 func TestClassifyFixerValidationFailureParksDeterministicFailures(t *testing.T) {
 	t.Parallel()
 
-	failure := classifyFixerValidationFailure(ValidationResult{Passed: false, Summary: "go test failed", Output: "assertion mismatch"})
-	if failure.kind != FailureManualIntervention || failure.resumePolicy != "manual_intervention" {
-		t.Fatalf("classifyFixerValidationFailure() = %#v, want manual intervention", failure)
+	failure := failurepolicy.ClassifyValidation("go test failed", "assertion mismatch")
+	if failure.Kind != failureclass.ManualIntervention || failure.ResumePolicy != loops.ResumePolicyManualIntervention {
+		t.Fatalf("ClassifyValidation() = %#v, want manual intervention", failure)
 	}
 }
 
 func TestClassifyFixerValidationFailureDoesNotInferTimeoutFromTestOutput(t *testing.T) {
 	t.Parallel()
 
-	failure := classifyFixerValidationFailure(ValidationResult{Passed: false, Summary: "go test failed", Output: "--- FAIL: TestTimeoutPolicy"})
-	if failure.kind != FailureManualIntervention || failure.resumePolicy != "manual_intervention" {
-		t.Fatalf("classifyFixerValidationFailure() = %#v, want deterministic failure parked", failure)
+	failure := failurepolicy.ClassifyValidation("go test failed", "--- FAIL: TestTimeoutPolicy")
+	if failure.Kind != failureclass.ManualIntervention || failure.ResumePolicy != loops.ResumePolicyManualIntervention {
+		t.Fatalf("ClassifyValidation() = %#v, want deterministic failure parked", failure)
 	}
 }
 

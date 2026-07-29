@@ -1,4 +1,4 @@
-package fixer
+package worktreesafety
 
 import (
 	"errors"
@@ -177,8 +177,8 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := isMissingOrUnusableFixerWorktree(tc.path, tc.prepErr); got != tc.want {
-				t.Fatalf("isMissingOrUnusableFixerWorktree(%q, %v) = %v, want %v", tc.path, tc.prepErr, got, tc.want)
+			if got := IsMissingOrUnusableFixerWorktree(tc.path, tc.prepErr); got != tc.want {
+				t.Fatalf("IsMissingOrUnusableFixerWorktree(%q, %v) = %v, want %v", tc.path, tc.prepErr, got, tc.want)
 			}
 		})
 	}
@@ -189,8 +189,8 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 
 	t.Run("missing_ok", func(t *testing.T) {
 		t.Parallel()
-		if err := clearUnusableFixerWorktreePath(filepath.Join(t.TempDir(), "gone")); err != nil {
-			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		if err := ClearUnusableFixerWorktreePath(filepath.Join(t.TempDir(), "gone")); err != nil {
+			t.Fatalf("ClearUnusableFixerWorktreePath() error = %v", err)
 		}
 	})
 
@@ -200,8 +200,8 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			t.Fatalf("MkdirAll: %v", err)
 		}
-		if err := clearUnusableFixerWorktreePath(path); err != nil {
-			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		if err := ClearUnusableFixerWorktreePath(path); err != nil {
+			t.Fatalf("ClearUnusableFixerWorktreePath() error = %v", err)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("path still exists after clear, err=%v", err)
@@ -218,9 +218,9 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		if err := os.WriteFile(marker, []byte("x\n"), 0o644); err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}
-		err := clearUnusableFixerWorktreePath(path)
-		if !errors.Is(err, errUnusableFixerWorktreePreserved) {
-			t.Fatalf("error = %v, want errUnusableFixerWorktreePreserved", err)
+		err := ClearUnusableFixerWorktreePath(path)
+		if !errors.Is(err, ErrUnusableFixerWorktreePreserved) {
+			t.Fatalf("error = %v, want ErrUnusableFixerWorktreePreserved", err)
 		}
 		if _, err := os.Stat(marker); err != nil {
 			t.Fatalf("populated marker missing: %v", err)
@@ -240,8 +240,8 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(path, ".git"), []byte("gitdir: "+emptyGitdir+"\n"), 0o644); err != nil {
 			t.Fatalf("WriteFile .git: %v", err)
 		}
-		if err := clearUnusableFixerWorktreePath(path); err != nil {
-			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		if err := ClearUnusableFixerWorktreePath(path); err != nil {
+			t.Fatalf("ClearUnusableFixerWorktreePath() error = %v", err)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("corrupt-only path still exists after clear, err=%v", err)
@@ -257,11 +257,29 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(path, ".git"), []byte("garbage-not-gitdir\n"), 0o644); err != nil {
 			t.Fatalf("WriteFile .git: %v", err)
 		}
-		if err := clearUnusableFixerWorktreePath(path); err != nil {
-			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		if err := ClearUnusableFixerWorktreePath(path); err != nil {
+			t.Fatalf("ClearUnusableFixerWorktreePath() error = %v", err)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("malformed-only path still exists after clear, err=%v", err)
 		}
 	})
+}
+
+func TestLocalGitRepositoryMetadataUsable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeMinimalGitRepoMetadata(t, dir)
+	if !LocalGitRepositoryMetadataUsable(dir) {
+		t.Fatalf("LocalGitRepositoryMetadataUsable(%q) = false, want true", dir)
+	}
+
+	headOnly := t.TempDir()
+	if err := os.WriteFile(filepath.Join(headOnly, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile HEAD: %v", err)
+	}
+	if LocalGitRepositoryMetadataUsable(headOnly) {
+		t.Fatalf("LocalGitRepositoryMetadataUsable(%q) = true, want false", headOnly)
+	}
 }

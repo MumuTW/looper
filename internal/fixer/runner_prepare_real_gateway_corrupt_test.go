@@ -10,6 +10,7 @@ import (
 
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 // Real gateway lifecycle: .git points at an existing but empty/corrupt private
@@ -67,7 +68,7 @@ func TestRunPrepareWorktreeStepRealGatewayRecreatesCorruptCommonRepo(t *testing.
 	t.Parallel()
 
 	f := setupRealLinkedWorktree(t, "project_real_corrupt_common", "feature/fix-42")
-	if !localGitRepositoryMetadataUsable(resolveLinkedCommonDir(t, f.gitdir)) {
+	if !worktreesafety.LocalGitRepositoryMetadataUsable(resolveLinkedCommonDir(t, f.gitdir)) {
 		t.Fatal("common repo not usable before corruption")
 	}
 	// HEAD-only common: missing objects/ (and refs/) — Git rejects as not a repo.
