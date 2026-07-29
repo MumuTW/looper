@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -242,7 +243,8 @@ func dirtyWorktreeGuidance(selector string, status loopWorktreeStatus, offerDisc
 
 // isWorktreeRouteMissing reports the one case that may skip the dirty-worktree
 // gate: a daemon too old to serve /worktree at all. It matches on the daemon's
-// typed error code, the same signal the dashboard branches on.
+// typed error code — a stronger signal than the dashboard's, whose second
+// branch still substring-matches and is fixed separately.
 //
 // Matching the error text instead would silently disarm the gate this preflight
 // exists to enforce. Every 404 carries "not found" — including the
@@ -254,5 +256,9 @@ func isWorktreeRouteMissing(err error) bool {
 	if !errors.As(err, &daemonErr) {
 		return false
 	}
-	return daemonErr.Code == string(pkgapi.ErrorCodeRouteNotFound)
+	// The code is read out of a response body, which anything between this CLI
+	// and the daemon can author; the status line is the transport's own. Both
+	// must agree before the gate stands down.
+	return daemonErr.StatusCode == http.StatusNotFound &&
+		daemonErr.Code == string(pkgapi.ErrorCodeRouteNotFound)
 }

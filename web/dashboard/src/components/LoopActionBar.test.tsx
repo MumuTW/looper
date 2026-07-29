@@ -109,6 +109,30 @@ describe("isWorktreeRouteUnavailable", () => {
       ),
     ).toBe(false);
   });
+
+  // These are answers from the route itself. Treating them as "route missing"
+  // skips the dirty-worktree gate and retries with unreviewed edits in the tree.
+  it("holds the gate for a 404 that is not ROUTE_NOT_FOUND", () => {
+    expect(
+      isWorktreeRouteUnavailable(
+        new ApiError("Project not found: acme", {
+          status: 404,
+          code: "PROJECT_NOT_FOUND",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("holds the gate for a non-404 whose message mentions 404", () => {
+    expect(
+      isWorktreeRouteUnavailable(
+        new ApiError(
+          "Failed to stat worktree at /w/looper-fix-acme-pr-404: permission denied",
+          { status: 500, code: "INTERNAL_ERROR" },
+        ),
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("LoopActionBar retry dirty UX", () => {
