@@ -25,8 +25,15 @@ type apiClient struct {
 	client  *http.Client
 }
 
+// apiRequestTimeout bounds a single daemon request so a hung daemon fails the
+// test with a useful message instead of stalling until the package timeout. It
+// is deliberately generous: under `go test ./...` the daemon shares the machine
+// with every other package, and a request that takes seconds under that load is
+// slow, not broken.
+const apiRequestTimeout = 30 * time.Second
+
 func newAPIClient(baseURL string) apiClient {
-	return apiClient{baseURL: baseURL, client: &http.Client{Timeout: 2 * time.Second}}
+	return apiClient{baseURL: baseURL, client: &http.Client{Timeout: apiRequestTimeout}}
 }
 
 func (c apiClient) get(tb testing.TB, path string, target any) {

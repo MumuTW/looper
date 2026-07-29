@@ -83,8 +83,16 @@ func StartLooperd(tb testing.TB, bins BuiltBinaries, home TempHome, configPath s
 	return proc
 }
 
+// readinessProbeTimeout bounds one /api/v1/status probe. Before the daemon
+// listens, dials fail immediately and the loop keeps its 100ms cadence
+// regardless of this value; it only applies once the daemon accepts the
+// connection but is slow to answer, which is when waiting beats retrying. Keep
+// it well under the caller's overall readiness budget so a genuinely stuck
+// response still leaves room for another probe.
+const readinessProbeTimeout = 5 * time.Second
+
 func (d *DaemonProcess) WaitForReady(ctx context.Context) (map[string]any, error) {
-	client := &http.Client{Timeout: 500 * time.Millisecond}
+	client := &http.Client{Timeout: readinessProbeTimeout}
 	statusURL := d.baseURL + "/api/v1/status"
 	for {
 		select {
