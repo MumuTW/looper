@@ -61,6 +61,24 @@ func TestRunCommandsDistinguishesSupervisorTimeoutFromContextDeadline(t *testing
 	}
 }
 
+func TestRunCommandsPreservesDiagnosticsWhenCommandProducesNoOutput(t *testing.T) {
+	t.Parallel()
+
+	result, err := RunCommands(context.Background(), Input{Commands: []string{"go test ./..."}}, &Options{
+		CWD:          t.TempDir(),
+		CodexCommand: "/path/that/does/not/exist/codex",
+	})
+	if err != nil {
+		t.Fatalf("RunCommands() error = %v", err)
+	}
+	if result.Passed || result.FailureCategory != FailureInfrastructure {
+		t.Fatalf("RunCommands() = %#v, want infrastructure failure", result)
+	}
+	if !strings.Contains(result.Output, "no such file or directory") {
+		t.Fatalf("Output = %q, want missing executable diagnostic", result.Output)
+	}
+}
+
 func TestPolicyForOperationalFailureCategory(t *testing.T) {
 	t.Parallel()
 

@@ -93,6 +93,9 @@ func RunCommands(ctx context.Context, input Input, options *Options) (Result, er
 		if err != nil {
 			var commandErr *shell.CommandExecutionError
 			if errors.As(err, &commandErr) {
+				if output == "" {
+					output = commandErr.Error()
+				}
 				return Result{
 					Passed:          false,
 					Summary:         "Validation failed: " + command,
