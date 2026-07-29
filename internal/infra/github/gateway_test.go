@@ -338,7 +338,7 @@ func TestGatewayListOpenPullRequestsFallsBackWhenReviewRequestReviewerIsInaccess
 		args := strings.Join(options.Args, " ")
 		if strings.HasPrefix(args, "pr list") && strings.Contains(args, "reviewRequests") {
 			result := shell.Result{ExitCode: 1, Stderr: "GraphQL: Resource not accessible by personal access token (repository.pullRequests.nodes.3.reviewRequests.nodes.0.requestedReviewer)"}
-			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Category: shell.FailureNonZeroExit, Result: result}
 		}
 		if strings.HasPrefix(args, "pr list") {
 			if strings.Contains(args, "reviewRequests") {
@@ -363,6 +363,25 @@ func TestGatewayListOpenPullRequestsFallsBackWhenReviewRequestReviewerIsInaccess
 	}
 	if len(runner.calls) != 2 {
 		t.Fatalf("gh calls = %#v, want primary and fallback list calls", runner.calls)
+	}
+}
+
+func TestGatewayIsAuthenticatedPropagatesInfrastructureFailure(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") != "auth status" {
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		}
+		return shell.Result{}, &shell.CommandExecutionError{
+			Message:  "start command: gh disappeared",
+			Category: shell.FailureInfrastructure,
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	authenticated, err := gateway.IsAuthenticated(context.Background(), "", "")
+	if err == nil || authenticated {
+		t.Fatalf("IsAuthenticated() = (%v, %v), want infrastructure error", authenticated, err)
 	}
 }
 
@@ -1669,7 +1688,7 @@ func TestGatewayIsAuthenticatedTracksGHAuthStatus(t *testing.T) {
 		args := strings.Join(options.Args, " ")
 		if args == "auth status" {
 			result := shell.Result{ExitCode: 1}
-			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Category: shell.FailureNonZeroExit, Result: result}
 		}
 		return shell.Result{Stdout: "{}"}, nil
 	}

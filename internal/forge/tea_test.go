@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -244,6 +245,23 @@ func TestNewForgejoClientFromConfigTeaMissingBinary(t *testing.T) {
 	_, err := NewForgejoClientFromConfig(provider, "acme/looper", WithLookPath(func(string) (string, error) {
 		return "", errors.New("not found")
 	}))
+	var teaErr *TeaAuthError
+	if !errors.As(err, &teaErr) || teaErr.Code != TeaErrorMissing {
+		t.Fatalf("error = %v, want tea_missing", err)
+	}
+}
+
+func TestTeaTransportReportsBinaryMissingAfterStartup(t *testing.T) {
+	t.Parallel()
+
+	transport := newTeaTransport(
+		filepath.Join(t.TempDir(), "tea-that-disappeared"),
+		"selected-login",
+		nil,
+		time.Second,
+		nil,
+	)
+	_, err := transport.doRaw(context.Background(), "GET", "/api/v1/version", nil, nil)
 	var teaErr *TeaAuthError
 	if !errors.As(err, &teaErr) || teaErr.Code != TeaErrorMissing {
 		t.Fatalf("error = %v, want tea_missing", err)
