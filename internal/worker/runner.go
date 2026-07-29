@@ -3722,14 +3722,14 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		parts = append(parts, "User prompt:\n"+work.Prompt)
 	}
 	parts = append(parts, fmt.Sprintf("Repository: %s", work.Repo), fmt.Sprintf("Base branch: %s", work.BaseBranch))
-	if work.ExecutionMode == "push-existing" && work.SpecPath != "" {
-		parts = append(parts, fmt.Sprintf("Do not modify the spec file at %s.", work.SpecPath))
-	}
 	specBlock, err := readSpecBlock(repoRootPath, work.SpecPath)
 	if err != nil {
 		return "", config.CustomInstructionBlock{}, err
 	}
 	if specBlock != "" {
+		if work.ExecutionMode == "push-existing" {
+			parts = append(parts, fmt.Sprintf("Do not modify the spec file at %s.", work.SpecPath))
+		}
 		parts = append(parts, specBlock)
 	}
 	if plan != nil && len(plan.Items) > 0 {
