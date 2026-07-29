@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -64,6 +65,35 @@ func TestRunValidationDoesNotInheritDaemonSecrets(t *testing.T) {
 	}
 	if !result.Passed {
 		t.Fatalf("runValidation() result = %#v, daemon secret leaked to command", result)
+	}
+}
+
+func TestRunValidationPreservesCancellation(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{AgentTimeout: time.Second, ValidationCommands: []string{"sleep 5"}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := runner.runValidation(ctx, ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runValidation() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunValidationBoundsCommandRuntime(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{AgentTimeout: 20 * time.Millisecond, ValidationCommands: []string{"sleep 5"}})
+	result, err := runner.runValidation(context.Background(), ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
+	if err != nil {
+		t.Fatalf("runValidation() error = %v", err)
+	}
+	if result.Passed || !strings.Contains(strings.ToLower(result.Output), "timed out") {
+		t.Fatalf("runValidation() result = %#v, want bounded timeout failure", result)
+	}
+	failure := classifyFixerValidationFailure(result)
+	if failure.kind != FailureRetryableTransient {
+		t.Fatalf("classifyFixerValidationFailure() = %#v, want retryable timeout", failure)
 	}
 }
 

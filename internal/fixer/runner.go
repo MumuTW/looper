@@ -6526,15 +6526,22 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 			Args:    []string{"-c", command},
 			CWD:     input.CWD,
 			Env:     agent.BuildCommandEnvMap(input.CWD, ""),
+			Timeout: r.agentTimeout,
 			// Supervisor-owned validation: track handle so shutdown retain-storage
 			// sees Kill/Drain failures even when validation collapses them to Passed=false.
 			Tracker: r.containmentTracker,
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return ValidationResult{}, err
+			}
 			output := "Unknown validation failure"
 			var commandErr *shell.CommandExecutionError
 			if errors.As(err, &commandErr) {
 				output = strings.TrimSpace(strings.Join([]string{commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n"))
+				if output == "" {
+					output = commandErr.Error()
+				}
 			} else {
 				output = err.Error()
 			}

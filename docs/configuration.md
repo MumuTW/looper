@@ -1071,14 +1071,14 @@ To restore it by default for all project additions:
 
 ### `defaults.validationCommands`
 
-`defaults.validationCommands` is the mechanical gate the worker and fixer run in the run's worktree before opening a PR or pushing. Each entry is executed with `/bin/sh -c` from the worktree root, in order, and the first non-zero exit fails the validate step; the run never advances to open-pr or push.
+`defaults.validationCommands` is the mechanical gate the worker and fixer run in the run's worktree before opening a PR or pushing. Each entry is executed with `/bin/sh -c` from the worktree root, in order, and the first non-zero exit fails the validate step; the run never advances to open-pr or push. Each command is bounded by the coding role's `agent.timeouts.*MaxRuntimeSeconds` value.
 
 ```toml
 [defaults]
 validationCommands = ["test -z \"$(gofmt -l .)\"", "go vet ./...", "go test ./...", "go build ./..."]
 ```
 
-The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides). Commands come only from daemon configuration, never from the target worktree, so repository changes cannot inject host shell commands into this gate.
+The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides). The command strings come from daemon configuration, but commands such as `make check` and `go test ./...` intentionally execute repository-controlled code. Validation subprocesses therefore use the execution-safe environment filter and process containment; configure this gate only for repositories whose code you are willing to execute on the daemon host.
 
 The default is empty, which keeps the historical behavior: the validate step passes without running anything and "done" is only the agent's own self-assessment. `looperd` logs a startup warning while the list is empty so the no-op is visible. The field is restart-bound.
 

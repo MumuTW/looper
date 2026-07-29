@@ -2,9 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 )
@@ -71,6 +73,35 @@ func TestRunValidationDoesNotInheritDaemonSecrets(t *testing.T) {
 	}
 }
 
+func TestRunValidationPreservesCancellation(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{AgentTimeout: time.Second, ValidationCommands: []string{"sleep 5"}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := runner.runValidation(ctx, ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runValidation() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunValidationBoundsCommandRuntime(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{AgentTimeout: 20 * time.Millisecond, ValidationCommands: []string{"sleep 5"}})
+	result, err := runner.runValidation(context.Background(), ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
+	if err != nil {
+		t.Fatalf("runValidation() error = %v", err)
+	}
+	if result.Passed || !strings.Contains(strings.ToLower(result.Output), "timed out") {
+		t.Fatalf("runValidation() result = %#v, want bounded timeout failure", result)
+	}
+	failure := classifyValidationFailure(result)
+	if failure.kind != FailureRetryableTransient {
+		t.Fatalf("classifyValidationFailure() = %#v, want retryable timeout", failure)
+	}
+}
+
 func TestClassifyValidationFailureParksDeterministicFailures(t *testing.T) {
 	t.Parallel()
 
@@ -120,5 +151,47 @@ func TestProcessClaimedItemRevalidatesChangesCreatedByValidation(t *testing.T) {
 	}
 	if len(git.commitCalls) != 1 || len(git.pushCalls) != 1 {
 		t.Fatalf("commit calls=%d push calls=%d, want reconciled commit published once", len(git.commitCalls), len(git.pushCalls))
+	}
+}
+
+func TestProcessClaimedItemRevalidatesCleanCommitObservedAfterValidation(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{
+		createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head", WorktreeID: "worktree_1"},
+		inspectResults: []InspectHeadResult{
+			{HeadSHA: "agent-head", NewCommitSHAs: []string{"agent-head"}},
+			{HeadSHA: "agent-head", NewCommitSHAs: []string{"agent-head"}},
+			{HeadSHA: "late-head", NewCommitSHAs: []string{"agent-head", "late-head"}},
+			{HeadSHA: "late-head", NewCommitSHAs: []string{"agent-head", "late-head"}},
+		},
+	}
+	validationCalls := 0
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		GitHub: &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}},
+		Git:    git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}},
+		Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true,
+		OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationCommands: []string{"go test ./..."},
+		ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+			validationCalls++
+			return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+		},
+	})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 101 {
+		t.Fatalf("result = %#v, want published success", result)
+	}
+	if validationCalls != 2 {
+		t.Fatalf("validation calls = %d, want initial and pre-publish passes", validationCalls)
+	}
+	if len(git.commitCalls) != 0 || len(git.pushCalls) != 1 {
+		t.Fatalf("commit calls=%d push calls=%d, want clean late commit revalidated and pushed", len(git.commitCalls), len(git.pushCalls))
 	}
 }
