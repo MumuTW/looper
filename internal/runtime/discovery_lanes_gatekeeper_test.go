@@ -14,7 +14,7 @@ func TestCodingDiscoveryLanesRegistersSourceBasedGatekeeper(t *testing.T) {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	runner := &fakeGatekeeperScheduler{}
-	lanes := codingDiscoveryLanes(defaultSchedulerTickInput{Config: &cfg, Gatekeeper: runner})
+	lanes := discoveryLanes(defaultSchedulerTickInput{Config: &cfg, Gatekeeper: runner})
 
 	var found *discoveryLane
 	for i := range lanes {

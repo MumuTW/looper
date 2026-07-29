@@ -563,6 +563,7 @@ type ListOpenIssuesInput struct {
 	Assignee string
 	Label    string
 	Labels   []string
+	Search   string
 }
 
 type ViewIssueInput struct {
@@ -935,6 +936,9 @@ func (g *Gateway) listOpenIssuesRaw(ctx context.Context, input ListOpenIssuesInp
 	}
 	for _, label := range issueListLabels(input) {
 		args = append(args, "--label", label)
+	}
+	if strings.TrimSpace(input.Search) != "" {
+		args = append(args, "--search", strings.TrimSpace(input.Search))
 	}
 	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}, ","))
 
@@ -1407,6 +1411,17 @@ func (g *Gateway) GetRepositoryPermission(ctx context.Context, input RepositoryP
 		return "", err
 	}
 	return strings.ToLower(strings.TrimSpace(asString(row["permission"]))), nil
+}
+
+// RepositoryPermissionAllowsWrite is the shared authority predicate for
+// maintainer-confirmed GitHub actions.
+func RepositoryPermissionAllowsWrite(permission string) bool {
+	switch strings.ToLower(strings.TrimSpace(permission)) {
+	case "admin", "maintain", "write":
+		return true
+	default:
+		return false
+	}
 }
 
 func (g *Gateway) GetRepositorySettings(ctx context.Context, input RepositorySettingsInput) (RepositorySettings, error) {

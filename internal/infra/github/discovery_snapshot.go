@@ -128,6 +128,11 @@ func (s *DiscoverySnapshot) ensureOpenPullRequests(ctx context.Context, input Li
 }
 
 func (s *DiscoverySnapshot) listOpenIssues(ctx context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
+	// Search expressions are source queries, not filters this snapshot can
+	// faithfully reproduce from its generic open-issue page.
+	if strings.TrimSpace(input.Search) != "" {
+		return s.gateway.listOpenIssuesRaw(ctx, input)
+	}
 	if err := s.ensureOpenIssues(ctx, input); err != nil {
 		return nil, err
 	}
