@@ -2205,6 +2205,43 @@ func TestProjectRoleInstructionsCanClearGlobalInstructions(t *testing.T) {
 	}
 }
 
+func TestBuildCustomInstructionBlockAuthorityHeaderIsFixerOnly(t *testing.T) {
+	enabled := true
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Instructions: &PartialInstructionsConfig{Enabled: &enabled},
+		Roles: &PartialRoleConfigs{
+			Planner:  &PartialPlannerRoleConfig{Instructions: stringPtr("Planner guidance.")},
+			Worker:   &PartialWorkerRoleConfig{Instructions: stringPtr("Worker guidance.")},
+			Reviewer: &PartialReviewerRoleConfig{Instructions: stringPtr("Reviewer guidance.")},
+			Fixer:    &PartialFixerRoleConfig{Instructions: stringPtr("Fixer guidance.")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	fixerBlock := BuildCustomInstructionBlock(cfg, "", "fixer")
+	for _, want := range []string{
+		"Fixer guidance.",
+		"operator-configured content rules for this role",
+		"above repository AGENTS.md, PR design intent, reviewer suggestions, and agent judgment",
+	} {
+		if !strings.Contains(fixerBlock.Text, want) {
+			t.Fatalf("fixer block missing %q:\n%s", want, fixerBlock.Text)
+		}
+	}
+
+	for _, role := range []string{"planner", "worker", "reviewer"} {
+		block := BuildCustomInstructionBlock(cfg, "", role)
+		if !strings.Contains(block.Text, "Custom instructions (supplemental, lower priority than Looper lifecycle, safety, disclosure, and output contracts):") {
+			t.Fatalf("%s block missing supplemental header:\n%s", role, block.Text)
+		}
+		if strings.Contains(block.Text, "above repository AGENTS.md") {
+			t.Fatalf("%s block must not claim AGENTS.md outranking:\n%s", role, block.Text)
+		}
+	}
+}
+
 func TestLegacyProjectInstructionsNormalizeToCanonicalProjectRoleInstructions(t *testing.T) {
 	loaded := loadConfigFixture(t, "config.json", `{
 		"instructions": {"enabled": true, "maxBytes": 128},

@@ -49,7 +49,14 @@ func BuildCustomInstructionBlock(cfg Config, projectID, role string) CustomInstr
 	if len(sections) == 0 {
 		return block
 	}
-	block.Text = "Custom instructions (operator-configured content rules for this role; lower priority than Looper lifecycle, safety, disclosure, and output contracts; for content decisions they rank below authenticated control-plane directives such as `/respond` and above repository AGENTS.md, PR design intent, reviewer suggestions, and agent judgment; project-role instructions outrank global-role when both apply):\n" + strings.Join(sections, "\n\n")
+	// Only the Fixer prompt defines custom-instruction ranking above AGENTS.md.
+	// Other roles keep the generic supplemental header so this shared helper does
+	// not silently change planner/worker/reviewer authority without an explicit contract.
+	header := "Custom instructions (supplemental, lower priority than Looper lifecycle, safety, disclosure, and output contracts):\n"
+	if role == "fixer" {
+		header = "Custom instructions (operator-configured content rules for this role; lower priority than Looper lifecycle, safety, disclosure, and output contracts; for content decisions they rank below authenticated control-plane directives such as `/respond` and above repository AGENTS.md, PR design intent, reviewer suggestions, and agent judgment; project-role instructions outrank global-role when both apply):\n"
+	}
+	block.Text = header + strings.Join(sections, "\n\n")
 	block.PromptBytes = len([]byte(block.Text))
 	sum := sha256.Sum256([]byte(block.Text))
 	block.PromptHash = hex.EncodeToString(sum[:])

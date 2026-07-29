@@ -31,7 +31,8 @@ func TestBuildFixerPromptUsesForgejoSeedAndFetchContract(t *testing.T) {
 		"Agent-side Forgejo fetch contract",
 		"GET /api/v1/repos/{owner}/{repo}/pulls/{number}",
 		"user.login",
-		"seeded `pr_author`",
+		"Prefer the live PR author login from `user.login` whenever it is non-empty",
+		"use the seeded `pr_author` only when the live provider omits author login",
 		"GET /api/v1/repos/{owner}/{repo}/pulls/{number}.diff",
 		"GET /api/v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/comments",
 	} {
