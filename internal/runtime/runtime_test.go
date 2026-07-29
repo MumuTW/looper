@@ -71,8 +71,11 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	if services.Repositories == nil || services.Repositories.Projects == nil {
 		t.Fatal("Services().Repositories.Projects = nil, want initialized repository set")
 	}
-	if services.Projects == nil || services.Loops == nil || services.Runs == nil {
+	if services.Projects == nil || services.Loops == nil {
 		t.Fatal("Services() orchestration services = nil, want initialized services")
+	}
+	if services.Repositories.Runs == nil {
+		t.Fatal("Services().Repositories.Runs = nil, want initialized run repository")
 	}
 
 	project, err := services.Repositories.Projects.GetByID(context.Background(), "project_1")
