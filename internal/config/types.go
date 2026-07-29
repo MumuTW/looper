@@ -591,10 +591,14 @@ type CoordinatorRoleConfig struct {
 }
 
 type RoleConfigs struct {
-	// Coding holds every coding role keyed by role name. This is the
-	// authority the scheduler and agent resolution read from; the named
-	// fields below are the legacy shape, retained only until the remaining
-	// consumers are migrated off them.
+	// Coding holds every coding role keyed by role name. The migration onto
+	// it is in progress, so it is not yet the authority for everything it
+	// carries: today the only thing read from it is which roles exist and
+	// each one's Priority, which codingDiscoveryLanes uses to build and
+	// order the scheduler's discovery lanes. Discovery filters, per-role
+	// instructions, and agent resolution are still read from the named
+	// fields below, so a value set on Coding.Discovery or Coding.Agent
+	// alone changes nothing.
 	//
 	// Not serialized: while it is still derived from the named fields by
 	// Normalize, emitting it would duplicate them in every config payload

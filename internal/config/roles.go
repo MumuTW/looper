@@ -142,8 +142,11 @@ func NormalizeRoleName(raw string) string {
 
 // CodingRolesFromLegacy projects the four named legacy role structs onto the
 // role map. It is the single bridge between the old shape and the new one:
-// while both exist, normalization calls this so cfg.Roles.Coding is the only
-// thing consumers need to read.
+// while both exist, normalization calls this so cfg.Roles.Coding is populated
+// for the consumers that have already moved onto it. That is currently the
+// discovery-lane builder alone, which reads role names and Priority; every
+// other consumer still reads the named fields, so the projection is a
+// migration step and not yet the authority.
 func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 	out := make(map[string]CodingRoleConfig, 4)
 
