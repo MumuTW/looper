@@ -6,15 +6,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/validationcmd"
 )
+
+func localValidationRunner(ctx context.Context, options validationcmd.Options) (shell.Result, error) {
+	return shell.Run(ctx, shell.Options{
+		Command: "/bin/sh",
+		Args:    []string{"-c", options.Command},
+		CWD:     options.CWD,
+		Timeout: options.Timeout,
+		Tracker: options.Tracker,
+	})
+}
 
 func TestRunCommandsKeepsPolicyWordsDiagnosticForNonZeroExit(t *testing.T) {
 	t.Parallel()
 
 	result, err := RunCommands(context.Background(), Input{
 		Commands: []string{`printf 'TestTimeoutPolicy: head changed'; printf 'connection refused' >&2; exit 1`},
-	}, nil)
+	}, &Options{CWD: t.TempDir(), runValidation: localValidationRunner})
 	if err != nil {
 		t.Fatalf("RunCommands() error = %v", err)
 	}
@@ -42,7 +54,7 @@ func TestRunCommandsDistinguishesSupervisorTimeoutFromContextDeadline(t *testing
 	timeoutResult, err := RunCommands(context.Background(), Input{
 		Commands:       []string{`sleep 1`},
 		CommandTimeout: 20 * time.Millisecond,
-	}, nil)
+	}, &Options{CWD: t.TempDir(), runValidation: localValidationRunner})
 	if err != nil {
 		t.Fatalf("RunCommands(timeout) error = %v", err)
 	}
@@ -52,7 +64,7 @@ func TestRunCommandsDistinguishesSupervisorTimeoutFromContextDeadline(t *testing
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	contextResult, err := RunCommands(ctx, Input{Commands: []string{`sleep 1`}}, nil)
+	contextResult, err := RunCommands(ctx, Input{Commands: []string{`sleep 1`}}, &Options{CWD: t.TempDir(), runValidation: localValidationRunner})
 	if err != nil {
 		t.Fatalf("RunCommands(context deadline) error = %v", err)
 	}
@@ -76,6 +88,21 @@ func TestRunCommandsPreservesDiagnosticsWhenCommandProducesNoOutput(t *testing.T
 	}
 	if !strings.Contains(result.Output, "no such file or directory") {
 		t.Fatalf("Output = %q, want missing executable diagnostic", result.Output)
+	}
+}
+
+func TestRunCommandsFailsClosedWithoutSandboxConfiguration(t *testing.T) {
+	t.Parallel()
+
+	result, err := RunCommands(context.Background(), Input{Commands: []string{"printf exposed"}}, nil)
+	if err != nil {
+		t.Fatalf("RunCommands() error = %v", err)
+	}
+	if result.Passed || result.FailureCategory != FailureInfrastructure {
+		t.Fatalf("RunCommands() = %#v, want fail-closed infrastructure result", result)
+	}
+	if !strings.Contains(result.Output, "cwd is required") {
+		t.Fatalf("Output = %q, want sandbox configuration diagnostic", result.Output)
 	}
 }
 
