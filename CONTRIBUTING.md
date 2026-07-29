@@ -52,7 +52,7 @@ go vet ./...
 go test ./...
 ```
 
-Default runtime artifacts land in `~/.looper/` (`looper.sqlite`, `backups/`, `logs/`). The default config path is `~/.looper/config.json`. Configuration precedence is: defaults → config file → environment → CLI flags. See `docs/configuration.md` for every field.
+Default runtime artifacts land in `~/.looper/` (`looper.sqlite`, `backups/`, `logs/`). The default config path is `~/.looper/config.toml` (also `config.yaml` / `config.yml` / `config.json` if present). Configuration precedence is: defaults → config file → environment → CLI flags. See `docs/configuration.md` for every field.
 
 ## Local pre-flight (so CI never surprises you)
 
@@ -141,7 +141,7 @@ A good bug report includes:
 - Looper version (`looper version`) and OS / architecture
 - The command you ran and the full output
 - Relevant excerpts from `~/.looper/logs/`
-- Your `~/.looper/config.json` with secrets redacted
+- Your `~/.looper/config.toml` (or whichever config file Looper is loading) with secrets redacted
 - Steps to reproduce, ideally minimal
 
 ## Security

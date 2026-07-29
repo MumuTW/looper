@@ -53,7 +53,23 @@ else
   say "warn: looper not found on PATH"
 fi
 
-config_path="${LOOPER_CONFIG:-$home/.looper/config.json}"
+# Match Go DiscoverDefaultConfigPath: LOOPER_CONFIG, else first existing among
+# config.toml → config.yaml → config.yml → config.json; canonical default is toml.
+if [ -n "${LOOPER_CONFIG:-}" ]; then
+  config_path="$LOOPER_CONFIG"
+else
+  config_path=""
+  for name in config.toml config.yaml config.yml config.json; do
+    candidate="$home/.looper/$name"
+    if [ -f "$candidate" ]; then
+      config_path="$candidate"
+      break
+    fi
+  done
+  if [ -z "$config_path" ]; then
+    config_path="$home/.looper/config.toml"
+  fi
+fi
 if [ -f "$config_path" ]; then
   say "ok: config exists at $config_path"
 else
