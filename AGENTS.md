@@ -27,7 +27,7 @@
 ## Conventions
 
 - Build output lives in `dist/`; do not edit generated files.
-- CI (`.github/workflows/ci.yml`) runs on PR updates: `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build ./...`.
+- CI (`.github/workflows/ci.yml`) `verify` runs on PR updates: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build ./...`.
 - Commit messages and PR titles must use semantic prefixes, for example `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`, or `ci:`.
 
 ## Review guidelines

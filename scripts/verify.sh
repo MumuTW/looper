@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Local mirror of CI's `verify` job — run this before you push and CI won't
-# surprise you. Same four gates, same order as .github/workflows/ci.yml:
-#   gofmt -l  →  go vet  →  go test  →  go build (with release ldflags)
+# surprise you. Same gates, same order as .github/workflows/ci.yml:
+#   dashboard (pnpm install/test/build + artifact checks)
+#   → gofmt -l  →  go vet  →  go test  →  go build (with release ldflags)
 #
 # Usage:
 #   scripts/verify.sh                 # check everything (fails like CI would)
@@ -20,12 +21,23 @@ for arg in "$@"; do
       echo "✓ git hooks enabled (core.hooksPath=.githooks) — pre-commit now auto-gofmts"
       exit 0 ;;
     -h|--help)
-      sed -n '2,12p' "$0"; exit 0 ;;
+      sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
 
 step() { printf '\n\033[1m▸ %s\033[0m\n' "$1"; }
+
+step "dashboard (pnpm install/test/build + artifact checks)"
+(
+  cd web/dashboard
+  pnpm install --frozen-lockfile
+  pnpm test
+  pnpm run build
+  test -f ../../internal/dashboard/assets/.production
+  test -f ../../internal/dashboard/assets/index.html
+)
+echo "  clean"
 
 step "gofmt"
 if [ "$FIX" -eq 1 ]; then
