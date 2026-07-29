@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -3837,19 +3838,56 @@ func resolvedIssueRepo(work workerInput, issue IssueDetail) string {
 	return firstNonEmpty(strings.TrimSpace(work.IssueRepo), issueRepoFromURL(issue.URL), issueRepoFromURL(work.IssueURL), work.Repo)
 }
 
+// maxSpecFileBytes bounds the spec content embedded into a worker prompt.
+const maxSpecFileBytes = 256 << 10
+
 func readSpecBlock(projectRepoPath, specPath string) (string, error) {
 	if specPath == "" {
 		return "", nil
 	}
-	resolved := specPath
-	if !filepath.IsAbs(specPath) {
-		resolved = filepath.Join(projectRepoPath, specPath)
-	}
-	content, err := os.ReadFile(resolved)
+	content, err := readSpecFile(projectRepoPath, specPath)
 	if err != nil {
 		return fmt.Sprintf("Spec path: %s", specPath), nil
 	}
 	return fmt.Sprintf("Spec (%s):\n%s", specPath, string(content)), nil
+}
+
+// readSpecFile reads a repository-relative spec file under projectRepoPath.
+// Absolute paths, paths escaping the repo root (including via symlinks),
+// non-regular files, and files larger than maxSpecFileBytes are rejected so
+// worker metadata cannot make the daemon embed arbitrary local files into a
+// prompt sent to a model provider.
+func readSpecFile(projectRepoPath, specPath string) ([]byte, error) {
+	if filepath.IsAbs(specPath) {
+		return nil, fmt.Errorf("spec path must be repository-relative: %s", specPath)
+	}
+	repoRoot, err := filepath.EvalSymlinks(projectRepoPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repository root: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Join(repoRoot, specPath))
+	if err != nil {
+		return nil, fmt.Errorf("resolve spec path %s: %w", specPath, err)
+	}
+	if resolved != repoRoot && !strings.HasPrefix(resolved, repoRoot+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("spec path escapes repository root: %s", specPath)
+	}
+	file, err := os.Open(resolved)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("spec path is not a regular file: %s", specPath)
+	}
+	if info.Size() > maxSpecFileBytes {
+		return nil, fmt.Errorf("spec file exceeds %d bytes: %s", maxSpecFileBytes, specPath)
+	}
+	return io.ReadAll(io.LimitReader(file, maxSpecFileBytes+1))
 }
 
 func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *checkpointExecution) string {
