@@ -1,4 +1,4 @@
-// Onboarding verbs (init, status, project add|list) and the shared fake daemon
+// Onboarding verbs (init, status, project add|list|discover) and the shared fake daemon
 // they are exercised against. Kept apart from main_test.go, which covers the
 // argument-to-request mapping for the control verbs: the two surfaces fail in
 // different ways — routing is a pure function, onboarding is several daemon
@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,13 +95,6 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 				t.Errorf("decode create project body: %v", err)
 			}
 			daemon.createBody = body
-			if daemon.createDelay > 0 {
-				select {
-				case <-time.After(daemon.createDelay):
-				case <-r.Context().Done():
-					return
-				}
-			}
 			if daemon.createStatus != 0 {
 				w.WriteHeader(daemon.createStatus)
 				_ = json.NewEncoder(w).Encode(map[string]any{
@@ -116,7 +110,17 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 				"repoPath":   repoPath,
 				"baseBranch": "main",
 				"archived":   false,
+				"discovery":  map[string]any{"status": "pending"},
 				"warnings":   []string{"Could not detect repository from git remote"},
+			})
+		case r.URL.Path == "/api/v1/projects/repo/discover" && r.Method == http.MethodPost:
+			writeEnvelope(w, http.StatusOK, map[string]any{
+				"id": "repo",
+				"discovery": map[string]any{
+					"status":                 "succeeded",
+					"discoveredWorktrees":    2,
+					"discoveredPullRequests": 1,
+				},
 			})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -821,27 +825,110 @@ func TestProjectAddSendsCanonicalRepoPath(t *testing.T) {
 	}
 }
 
-// TestProjectAddReportsTimeoutAsPossiblySucceeded guards the one failure that
-// must not read as a failure. The daemon records and publishes the project
-// before it discovers worktrees and pull requests, so a deadline that expires
-// during discovery leaves a registration that landed and an operator told it
-// did not — who then retries and is told only that the checkout is already
-// registered.
-func TestProjectAddReportsTimeoutAsPossiblySucceeded(t *testing.T) {
+// TestProjectAddReportsDiscoveryAsPostCommit guards the registration
+// boundary: `project add` succeeds once the daemon has validated, committed,
+// and published the project, and worktree/PR discovery is reported as
+// pending post-commit work rather than something the CLI waits on.
+func TestProjectAddReportsDiscoveryAsPostCommit(t *testing.T) {
 	daemon := newFakeDaemon(t)
-	daemon.createDelay = time.Second
 	configForDaemon(t, daemon.server.URL)
 
-	previous := projectAddTimeout
-	projectAddTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { projectAddTimeout = previous })
-
-	code, _, stderr := runCLI(t, "project", "add", gitRepo(t))
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	code, stdout, _ := runCLI(t, "project", "add", gitRepo(t))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(stderr, "may already have succeeded") || !strings.Contains(stderr, "looper project list") {
-		t.Fatalf("stderr = %q, want a timeout that points at project list rather than reading as a plain failure", stderr)
+	if !strings.Contains(stdout, "registered project repo") {
+		t.Fatalf("stdout = %q, want registration success", stdout)
+	}
+	if !strings.Contains(stdout, "pending") || !strings.Contains(stdout, "looper project discover") {
+		t.Fatalf("stdout = %q, want pending discovery with a discover retry hint", stdout)
+	}
+}
+
+// TestProjectDiscoverRetriesDiscovery confirms the CLI can ask the daemon to
+// re-run post-commit worktree/PR discovery for an existing project.
+func TestProjectDiscoverRetriesDiscovery(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	configForDaemon(t, daemon.server.URL)
+
+	code, stdout, _ := runCLI(t, "project", "discover", "repo")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "discovery for project repo: succeeded") {
+		t.Fatalf("stdout = %q, want succeeded discovery", stdout)
+	}
+	if !strings.Contains(stdout, "worktrees:  2") {
+		t.Fatalf("stdout = %q, want discovered worktree count", stdout)
+	}
+	if !strings.Contains(stdout, "pullRequests: 1") {
+		t.Fatalf("stdout = %q, want discovered pull request count", stdout)
+	}
+}
+
+func TestProjectDiscoverUsesExplicitLongTimeout(t *testing.T) {
+	if projectDiscoveryTimeout != 10*time.Minute {
+		t.Fatalf("projectDiscoveryTimeout = %s, want 10m", projectDiscoveryTimeout)
+	}
+	if projectDiscoveryTimeout <= requestTimeout {
+		t.Fatalf("projectDiscoveryTimeout = %s, want longer than requestTimeout %s", projectDiscoveryTimeout, requestTimeout)
+	}
+}
+
+func TestProjectDiscoverHonorsExplicitTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/projects/repo/discover" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	configForDaemon(t, server.URL)
+	cfg, err := loadConfig(nil)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+
+	_, err = requestProjectDiscoveryWithin(context.Background(), 25*time.Millisecond, cfg, "repo")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("requestProjectDiscoveryWithin() error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestProjectDiscoverHonorsCallerCancellation(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/projects/repo/discover" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		close(started)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	configForDaemon(t, server.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runProjectDiscover(ctx, nil, "repo", io.Discard)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("project discovery request did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runProjectDiscover() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("project discovery did not stop after caller cancellation")
 	}
 }
 
@@ -855,6 +942,8 @@ func TestProjectRejectsBadSubcommands(t *testing.T) {
 		{name: "add without path", args: []string{"project", "add"}},
 		{name: "add with extra args", args: []string{"project", "add", "a", "b"}},
 		{name: "list with args", args: []string{"project", "list", "x"}},
+		{name: "discover without id", args: []string{"project", "discover"}},
+		{name: "discover with extra args", args: []string{"project", "discover", "a", "b"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			code, _, stderr := runCLI(t, testCase.args...)
