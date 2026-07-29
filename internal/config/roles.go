@@ -255,16 +255,31 @@ func ValidateRoleDiscovery(pathPrefix string, d RoleDiscoveryConfig) []Validatio
 	return issues
 }
 
-// collectAuthoredCodingRoles merges the roles.coding maps from each config
-// layer in order, later layers winning field-by-field per role. Keys are
-// normalized with NormalizeRoleName; an empty key is a load-time error
-// rather than a role no one can address.
-func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCodingRoleConfig, []ValidationIssue) {
+// collectAuthoredCodingRoles merges each layer's shared legacy role fields
+// followed by its roles.coding map. This gives roles.coding.* precedence over
+// the named form in the same layer while preserving the normal file -> env ->
+// CLI precedence across layers. The second result records instruction values
+// still authored by roles.coding after that merge, so Normalize can retain its
+// early safety validation without treating an overridden legacy instruction as
+// a coding-section error. Keys are normalized with NormalizeRoleName; an empty
+// key is a load-time error rather than a role no one can address.
+func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCodingRoleConfig, map[string]struct{}, []ValidationIssue) {
 	var authored map[string]PartialCodingRoleConfig
+	var authoredInstructions map[string]struct{}
 	var issues []ValidationIssue
 	for _, partial := range partials {
 		if partial.Roles == nil {
 			continue
+		}
+		legacy := legacyCodingRoleOverrides(*partial.Roles)
+		for _, name := range sortedKeys(legacy) {
+			if authored == nil {
+				authored = make(map[string]PartialCodingRoleConfig)
+			}
+			authored[name] = mergePartialCodingRoleConfig(authored[name], legacy[name])
+			if legacy[name].Instructions != nil {
+				delete(authoredInstructions, name)
+			}
 		}
 		// A map can contain keys that become the same canonical role name
 		// (for example Auditor and auditor). Iterating and merging those keys
@@ -294,9 +309,15 @@ func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCo
 				authored = make(map[string]PartialCodingRoleConfig)
 			}
 			authored[name] = mergePartialCodingRoleConfig(authored[name], role)
+			if role.Instructions != nil {
+				if authoredInstructions == nil {
+					authoredInstructions = make(map[string]struct{})
+				}
+				authoredInstructions[name] = struct{}{}
+			}
 		}
 	}
-	return authored, issues
+	return authored, authoredInstructions, issues
 }
 
 func mergePartialCodingRoleConfig(base, overlay PartialCodingRoleConfig) PartialCodingRoleConfig {
@@ -409,7 +430,6 @@ func resolveCodingRoles(legacy map[string]CodingRoleConfig, authored map[string]
 			issues = append(issues, ValidationIssue{Path: pathPrefix + ".priority", Message: "must be a positive integer"})
 		}
 		issues = append(issues, validateCodingRoleDiscoveryCommon(pathPrefix, entry.Discovery)...)
-		validateCustomCodingRoleInstruction(pathPrefix+".instructions", entry.Instructions, 0, &issues)
 		resolved[name] = entry
 	}
 

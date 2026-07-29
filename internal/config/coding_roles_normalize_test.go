@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -123,4 +124,67 @@ priority = 1
 	if !hasIssuePath(normalizeIssuePaths(err), "projects[0].roles.coding") {
 		t.Fatalf("issues = %v", normalizeIssuePaths(err))
 	}
+}
+
+func TestLoadFileLegacyDiscoveryOverridesHonorCodingRoleLayerPrecedence(t *testing.T) {
+	t.Parallel()
+	const fileConfig = `{
+  "roles": {
+    "coding": {
+      "planner": {"discovery": {"enabled": false, "labels": ["file-plan"], "labelMode": "all", "requireAssigneeCurrentUser": true}},
+      "worker": {"discovery": {"enabled": false, "labels": ["file-work"], "labelMode": "all", "requireAssigneeCurrentUser": true}},
+      "reviewer": {"discovery": {"enabled": false, "includeDrafts": true, "requireReviewRequest": true, "enableSelfReview": true, "labels": ["file-review"], "labelMode": "all"}},
+      "fixer": {"discovery": {"enabled": false, "includeDrafts": true, "authorFilter": "any", "labels": ["file-fix"], "labelMode": "all"}}
+    }
+  }
+}`
+	env := map[string]string{
+		"LOOPER_ROLES_PLANNER_AUTO_DISCOVERY":                             "true",
+		"LOOPER_ROLES_PLANNER_TRIGGERS_LABELS":                            "env-plan",
+		"LOOPER_ROLES_PLANNER_TRIGGERS_LABEL_MODE":                        "any",
+		"LOOPER_ROLES_PLANNER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER":     "false",
+		"LOOPER_ROLES_WORKER_AUTO_DISCOVERY":                              "true",
+		"LOOPER_ROLES_WORKER_TRIGGERS_LABELS":                             "env-work",
+		"LOOPER_ROLES_WORKER_TRIGGERS_LABEL_MODE":                         "any",
+		"LOOPER_ROLES_WORKER_TRIGGERS_REQUIRE_ASSIGNEE_CURRENT_USER":      "false",
+		"LOOPER_ROLES_REVIEWER_DISCOVERY_AUTO_DISCOVERY":                  "true",
+		"LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_INCLUDE_DRAFTS":         "false",
+		"LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_REQUIRE_REVIEW_REQUEST": "false",
+		"LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW":     "false",
+		"LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABELS":                 "env-review",
+		"LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_LABEL_MODE":             "any",
+		"LOOPER_ROLES_FIXER_AUTO_DISCOVERY":                               "true",
+		"LOOPER_ROLES_FIXER_TRIGGERS_INCLUDE_DRAFTS":                      "false",
+		"LOOPER_ROLES_FIXER_TRIGGERS_LABELS":                              "env-fix",
+		"LOOPER_ROLES_FIXER_TRIGGERS_LABEL_MODE":                          "any",
+		"LOOPER_ROLES_FIXER_TRIGGERS_AUTHOR_FILTER":                       "current_user",
+	}
+	assertDiscovery := func(t *testing.T, cfg Config, wantFixerAuthor AuthorFilter) {
+		t.Helper()
+		planner := cfg.Roles.Coding[CodingRolePlanner].Discovery
+		if !planner.Enabled || !reflect.DeepEqual(planner.Labels, []string{"env-plan"}) || planner.LabelMode != LabelModeAny || planner.RequireAssigneeCurrentUser {
+			t.Fatalf("planner discovery = %#v", planner)
+		}
+		worker := cfg.Roles.Coding[CodingRoleWorker].Discovery
+		if !worker.Enabled || !reflect.DeepEqual(worker.Labels, []string{"env-work"}) || worker.LabelMode != LabelModeAny || worker.RequireAssigneeCurrentUser {
+			t.Fatalf("worker discovery = %#v", worker)
+		}
+		reviewer := cfg.Roles.Coding[CodingRoleReviewer].Discovery
+		if !reviewer.Enabled || reviewer.IncludeDrafts || reviewer.RequireReviewRequest || reviewer.EnableSelfReview || !reflect.DeepEqual(reviewer.Labels, []string{"env-review"}) || reviewer.LabelMode != LabelModeAny {
+			t.Fatalf("reviewer discovery = %#v", reviewer)
+		}
+		fixer := cfg.Roles.Coding[CodingRoleFixer].Discovery
+		if !fixer.Enabled || fixer.IncludeDrafts || fixer.AuthorFilter != wantFixerAuthor || !reflect.DeepEqual(fixer.Labels, []string{"env-fix"}) || fixer.LabelMode != LabelModeAny {
+			t.Fatalf("fixer discovery = %#v", fixer)
+		}
+	}
+
+	t.Run("environment wins over file coding config", func(t *testing.T) {
+		loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, fileConfig, env, nil)
+		assertDiscovery(t, loaded.Config, AuthorFilterCurrentUser)
+	})
+	t.Run("CLI wins over environment and file coding config", func(t *testing.T) {
+		loaded := loadConfigFromJSONWithEnvAndArgsFixture(t, fileConfig, env, []string{"--roles-fixer-triggers-author-filter=any"})
+		assertDiscovery(t, loaded.Config, AuthorFilterAny)
+	})
 }

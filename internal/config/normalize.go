@@ -11,6 +11,7 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	defaultCodingRoles := CodingRolesFromLegacy(config.Roles)
 
 	normalizedLayers := make([]PartialConfig, 0, len(partials))
 	for _, partial := range partials {
@@ -29,16 +30,22 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		return Config{}, err
 	}
 
-	// Build the canonical role registry last, so it reflects the fully merged
-	// config rather than any single layer: the named legacy role structs are
-	// projected first, then the TOML-authored roles.coding.* sections are
-	// overlaid. Consumers read the map; the named fields are the legacy input
-	// shape.
-	authored, issues := collectAuthoredCodingRoles(normalizedLayers...)
+	// Build the canonical role registry last from its default projection plus
+	// every layer's role fields. Within a layer, legacy named fields seed the
+	// shared role settings and roles.coding.* wins. Across layers, the normal
+	// config precedence holds: a later legacy env or CLI override must be able
+	// to replace an earlier file-backed roles.coding.* value.
+	authored, authoredInstructions, issues := collectAuthoredCodingRoles(normalizedLayers...)
 	if len(issues) > 0 {
 		return Config{}, &ConfigValidationError{Issues: issues}
 	}
-	codingRoles, issues := resolveCodingRoles(CodingRolesFromLegacy(config.Roles), authored)
+	codingRoles, issues := resolveCodingRoles(defaultCodingRoles, authored)
+	if len(issues) > 0 {
+		return Config{}, &ConfigValidationError{Issues: issues}
+	}
+	for name := range authoredInstructions {
+		validateCustomCodingRoleInstruction("roles.coding."+name+".instructions", codingRoles[name].Instructions, 0, &issues)
+	}
 	if len(issues) > 0 {
 		return Config{}, &ConfigValidationError{Issues: issues}
 	}
