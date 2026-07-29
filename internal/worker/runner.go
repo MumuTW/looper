@@ -314,13 +314,14 @@ type PrepareWorktreeResult struct {
 }
 
 type PushInput struct {
-	RepoPath          string
-	WorktreeRoot      string
-	WorktreePath      string
-	Branch            string
-	Remote            string
-	LocalHeadSHA      string
-	ProtectedBranches []string
+	RepoPath              string
+	WorktreeRoot          string
+	WorktreePath          string
+	Branch                string
+	Remote                string
+	LocalHeadSHA          string
+	ExpectedRemoteHeadSHA string
+	ProtectedBranches     []string
 }
 
 type InspectHeadInput struct {
@@ -696,8 +697,9 @@ type checkpointExecution struct {
 }
 
 type checkpointPullPR struct {
-	Number int64  `json:"number,omitempty"`
-	URL    string `json:"url,omitempty"`
+	Number  int64  `json:"number,omitempty"`
+	URL     string `json:"url,omitempty"`
+	HeadSHA string `json:"headSha,omitempty"`
 }
 
 type resumedRunContext struct {
@@ -2141,8 +2143,10 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if checkpoint.PullRequest == nil {
 			checkpoint.PullRequest = &checkpointPullPR{Number: derefInt64(input.Loop.PRNumber), URL: stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])}
 		}
+		validatedHeadSHA := workerValidatedHeadSHA(checkpoint, r.validationCommands)
+		publishedHeadMismatch := validatedHeadSHA != "" && strings.TrimSpace(checkpoint.PullRequest.HeadSHA) != validatedHeadSHA
 		pushedByFallback := false
-		if !checkpoint.Lifecycle.Pushed {
+		if !checkpoint.Lifecycle.Pushed || publishedHeadMismatch {
 			if !r.allowAutoPush {
 				message := fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
 				checkpoint.SkipReason = message
@@ -2153,9 +2157,18 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			if rootErr != nil {
 				return checkpoint, rootErr
 			}
-			if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, LocalHeadSHA: workerValidatedHeadSHA(checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+			publishBranch := worktree.Branch
+			if checkpoint.Lifecycle != nil {
+				publishBranch = firstNonEmpty(checkpoint.Lifecycle.ActiveBranch, checkpoint.Lifecycle.AgentBranch, publishBranch)
+			}
+			expectedRemoteHeadSHA := ""
+			if publishedHeadMismatch {
+				expectedRemoteHeadSHA = strings.TrimSpace(checkpoint.PullRequest.HeadSHA)
+			}
+			if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: publishBranch, LocalHeadSHA: validatedHeadSHA, ExpectedRemoteHeadSHA: expectedRemoteHeadSHA, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
+			checkpoint.PullRequest.HeadSHA = validatedHeadSHA
 			pushedByFallback = true
 		}
 		checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, checkpoint.PullRequest.Number, checkpoint.PullRequest.URL, pushedByFallback, input.Loop.PRNumber != nil)
@@ -3613,7 +3626,7 @@ func (r *Runner) lifecycleAgentCreatedPullRequest(ctx context.Context, currentLo
 				return checkpointPullPR{}, "", false, nil
 			}
 		}
-		return checkpointPullPR{Number: prNumber, URL: firstNonEmpty(strings.TrimSpace(detail.URL), strings.TrimSpace(state.PRURL))}, firstNonEmpty(headBranch, expectedBranch), true, nil
+		return checkpointPullPR{Number: prNumber, URL: firstNonEmpty(strings.TrimSpace(detail.URL), strings.TrimSpace(state.PRURL)), HeadSHA: strings.TrimSpace(detail.HeadSHA)}, firstNonEmpty(headBranch, expectedBranch), true, nil
 	}
 	if prState := strings.TrimSpace(detail.State); prState != "" && !strings.EqualFold(prState, "open") {
 		return reject(fmt.Sprintf("PR is %s", prState))
@@ -3644,7 +3657,7 @@ func (r *Runner) lifecycleAgentCreatedPullRequest(ctx context.Context, currentLo
 	} else if conflict != "" {
 		return reject(conflict)
 	}
-	return checkpointPullPR{Number: prNumber, URL: firstNonEmpty(strings.TrimSpace(detail.URL), strings.TrimSpace(state.PRURL))}, headBranch, true, nil
+	return checkpointPullPR{Number: prNumber, URL: firstNonEmpty(strings.TrimSpace(detail.URL), strings.TrimSpace(state.PRURL)), HeadSHA: headSHA}, headBranch, true, nil
 }
 
 func shouldPersistPullRequestReference(loop storage.LoopRecord, pr checkpointPullPR) bool {
