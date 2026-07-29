@@ -92,7 +92,18 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
 	}
 	git := &fakeGitGateway{}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, RetryMaxAttempts: -1, Logger: fixture.logger, Now: fixture.now, Sleep: func(time.Duration) {}})
+	var wakeStatuses []string
+	var wakeErr error
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, RetryMaxAttempts: -1, Logger: fixture.logger, Now: fixture.now, Sleep: func(time.Duration) {}, OnQueueItemEnqueued: func() {
+		persisted, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+		if err != nil {
+			wakeErr = err
+			return
+		}
+		if persisted != nil {
+			wakeStatuses = append(wakeStatuses, persisted.Status)
+		}
+	}})
 
 	failedQueue, breakerStreak, err := runner.failQueueItemWithBreaker(context.Background(), loop, queue, failedRun.ID, checkpoint, stepValidate, &loopError{message: "validation failed", kind: FailureRetryableTransient})
 	if err != nil || breakerStreak != maxConsecutiveFixerFailures || failedQueue == nil || failedQueue.Status != "manual_intervention" {
@@ -108,6 +119,9 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	resumed, err := runner.finishFailureStreakBreaker(context.Background(), *project, paused, queue, &checkpoint)
 	if err != nil || !resumed {
 		t.Fatalf("finishFailureStreakBreaker() = (%v, %v), want immediate pending resume", resumed, err)
+	}
+	if wakeErr != nil || len(wakeStatuses) != 1 || wakeStatuses[0] != "queued" {
+		t.Fatalf("scheduler wake observed statuses %v (err %v), want one durable queued status", wakeStatuses, wakeErr)
 	}
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("cleanup calls = %#v, want one inline breaker cleanup", git.cleanupCalls)
@@ -137,6 +151,39 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	}
 	if got := parseCheckpoint(persistedRun.CheckpointJSON).ResumePolicy; got != "restart_from_discover" {
 		t.Fatalf("resume policy = %q, want restart_from_discover", got)
+	}
+}
+
+func TestProcessClaimedItemDefersWhileLoopIsPaused(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	projectID := "project_1"
+	repo := "acme/looper"
+	prNumber := int64(94)
+	loopID := "loop_paused_claim_gate"
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: loopID, Seq: 211, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_paused_claim_gate", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:paused-claim-gate", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, RetryMaxAttempts: -1, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err != nil || result.Status != "queued" {
+		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want deferred queued result", result, err)
+	}
+	persisted, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || persisted == nil || persisted.Status != "queued" || persisted.Attempts != queue.Attempts {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queued with unchanged attempts", persisted, err)
+	}
+	runs, err := fixture.repos.Runs.ListByLoop(context.Background(), loopID)
+	if err != nil || len(runs) != 0 {
+		t.Fatalf("Runs.ListByLoop() = (%#v, %v), want no run before resume is durable", runs, err)
 	}
 }
 

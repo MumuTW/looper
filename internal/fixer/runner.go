@@ -2012,6 +2012,26 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
+	// The loop record is the execution authority. A queue row can become
+	// visible while a resume handoff is still persisting its metadata and loop
+	// status, so a claimed row must not bypass a durable pause. Requeue it
+	// without spending an attempt; the completed handoff will wake the
+	// scheduler after changing the loop to queued.
+	if loop.Status == "paused" {
+		availableAt := eventlog.FormatJavaScriptISOString(r.now().Add(r.retryBaseDelay).UTC())
+		message := "fixer loop remains paused while resume handoff is incomplete"
+		if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{
+			ID:           queueItem.ID,
+			AvailableAt:  availableAt,
+			Attempts:     queueItem.Attempts,
+			ErrorMessage: &message,
+			ErrorKind:    string(FailureRetryableAfterResume),
+			UpdatedAt:    r.nowISO(),
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "queued"}, nil
+	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
 		return ProcessResult{}, err
@@ -5622,6 +5642,10 @@ type enqueueInput struct {
 }
 
 func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
+	return r.enqueueWithWake(ctx, input, true)
+}
+
+func (r *Runner) enqueueWithWake(ctx context.Context, input enqueueInput, wake bool) (storage.QueueItemRecord, error) {
 	dedupeKey := buildFixerDedupeKey(input.ProjectID, input.LoopID, input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash)
 	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
 	if err != nil {
@@ -5641,7 +5665,9 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				return storage.QueueItemRecord{}, err
 			}
 			updated = persisted
-			r.wakeSchedulerAfterEnqueue()
+			if wake {
+				r.wakeSchedulerAfterEnqueue()
+			}
 			return updated, nil
 		}
 		return *existing, nil
@@ -5680,7 +5706,9 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				return storage.QueueItemRecord{}, err
 			}
 			updated = persisted
-			r.wakeSchedulerAfterEnqueue()
+			if wake {
+				r.wakeSchedulerAfterEnqueue()
+			}
 			return updated, nil
 		}
 		return *activeForLoop, nil
@@ -5695,7 +5723,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
-	if created {
+	if created && wake {
 		r.wakeSchedulerAfterEnqueue()
 	}
 	return persisted, nil
@@ -5738,7 +5766,7 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 		return false, err
 	}
 	availableAt := r.now()
-	queued, err := r.enqueue(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt})
+	queued, err := r.enqueueWithWake(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt}, false)
 	if err != nil {
 		return false, err
 	}
@@ -5762,6 +5790,7 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 	if err != nil {
 		return false, err
 	}
+	r.wakeSchedulerAfterEnqueue()
 	return true, nil
 }
 
