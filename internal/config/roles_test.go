@@ -54,6 +54,17 @@ func TestCodingRolesFromLegacyProjectsSourceAndFields(t *testing.T) {
 	if fixer.Discovery.AuthorFilter != AuthorFilterCurrentUser {
 		t.Errorf("fixer authorFilter = %q, want %q", fixer.Discovery.AuthorFilter, AuthorFilterCurrentUser)
 	}
+
+	gatekeeper, ok := coding[RoleGatekeeper]
+	if !ok {
+		t.Fatal("gatekeeper missing from projected roles")
+	}
+	if !gatekeeper.Discovery.Enabled || gatekeeper.Discovery.Source != WorkSourcePullRequest {
+		t.Fatalf("gatekeeper discovery = %#v, want enabled pull-request source", gatekeeper.Discovery)
+	}
+	if len(gatekeeper.Discovery.Labels) != 0 {
+		t.Fatalf("gatekeeper labels = %v, want source-based discovery without label gate", gatekeeper.Discovery.Labels)
+	}
 }
 
 // Labels must be copied, not aliased: the scheduler hands discovery inputs to
@@ -156,8 +167,8 @@ func TestEffectiveCodingRolesFallsBackToLegacy(t *testing.T) {
 
 	effective := EffectiveCodingRoles(roles)
 
-	if len(effective) != 4 {
-		t.Fatalf("got %d roles, want the 4 shipped roles", len(effective))
+	if len(effective) != 5 {
+		t.Fatalf("got %d roles, want the 5 shipped roles", len(effective))
 	}
 	if !effective[CodingRolePlanner].Discovery.Enabled {
 		t.Errorf("planner autoDiscovery was not carried into the fallback")

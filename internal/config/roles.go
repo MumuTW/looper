@@ -5,15 +5,18 @@ import (
 	"strings"
 )
 
-// WorkSource is the kind of remote object a coding role scans for work.
+// WorkSource is the kind of remote object a discovery role scans for work.
 // It is the real axis along which discovery settings differ: planner and
-// worker watch issues, reviewer and fixer watch pull requests. Role names
-// carry no discovery semantics of their own.
+// worker watch issues; reviewer, fixer, and Gatekeeper watch pull requests.
+// Role names carry no discovery semantics of their own.
 type WorkSource string
 
 const (
 	WorkSourceIssue       WorkSource = "issue"
 	WorkSourcePullRequest WorkSource = "pull_request"
+	// RoleGatekeeper is a compiled-in policy role. It has no agent binding and
+	// discovers every open pull request from the source rather than a label.
+	RoleGatekeeper = "gatekeeper"
 )
 
 // AuthorFilter scopes pull-request discovery by who opened the PR.
@@ -55,7 +58,9 @@ type RoleDiscoveryConfig struct {
 	EnableSelfReview     bool         `json:"enableSelfReview,omitempty"`
 }
 
-// CodingRoleConfig is the per-role configuration common to every coding role.
+// CodingRoleConfig is the per-role configuration consumed by the discovery
+// registry. Agent-free policy roles such as Gatekeeper leave Agent and
+// Instructions empty.
 //
 // Behaviour that only one role's runner implements (reviewer auto-merge,
 // publish mode, spec-review labels) deliberately stays out of this struct:
@@ -97,6 +102,7 @@ const (
 	PriorityCoordinator = 20
 	PriorityReviewer    = 30
 	PriorityFixer       = 40
+	PriorityGatekeeper  = 45
 	PriorityWorker      = 50
 )
 
@@ -148,7 +154,7 @@ func NormalizeRoleName(raw string) string {
 // other consumer still reads the named fields, so the projection is a
 // migration step and not yet the authority.
 func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
-	out := make(map[string]CodingRoleConfig, 4)
+	out := make(map[string]CodingRoleConfig, 5)
 
 	out[CodingRolePlanner] = CodingRoleConfig{
 		Priority:     PriorityPlanner,
@@ -204,6 +210,16 @@ func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 			IncludeDrafts:        roles.Reviewer.Discovery.Triggers.IncludeDrafts,
 			RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
 			EnableSelfReview:     roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+		},
+	}
+
+	out[RoleGatekeeper] = CodingRoleConfig{
+		Priority: PriorityGatekeeper,
+		Discovery: RoleDiscoveryConfig{
+			Enabled:       true,
+			Source:        WorkSourcePullRequest,
+			Labels:        []string{},
+			IncludeDrafts: true,
 		},
 	}
 

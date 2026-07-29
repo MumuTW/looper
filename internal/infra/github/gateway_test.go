@@ -600,7 +600,7 @@ func TestGetBranchProtection(t *testing.T) {
 		if args != "api repos/acme/looper/branches/main/protection" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
-		return shell.Result{Stdout: `{"required_status_checks":{"checks":[{"context":"ci"}]}}`}, nil
+		return shell.Result{Stdout: `{"required_status_checks":{"checks":[{"context":"ci"}]},"required_pull_request_reviews":{"required_approving_review_count":2}}`}, nil
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
@@ -608,8 +608,8 @@ func TestGetBranchProtection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetBranchProtection() error = %v", err)
 	}
-	if !protection.Enabled || !protection.HasRequiredChecks {
-		t.Fatalf("GetBranchProtection() = %#v, want enabled protection with required checks", protection)
+	if !protection.Enabled || !protection.HasRequiredChecks || !protection.HasRequiredReviews || protection.RequiredApprovingReviewCount != 2 {
+		t.Fatalf("GetBranchProtection() = %#v, want enabled protection with required checks and two approvals", protection)
 	}
 }
 

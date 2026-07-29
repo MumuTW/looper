@@ -1,0 +1,297 @@
+package gatekeeper
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"slices"
+	"testing"
+	"time"
+
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/storage"
+)
+
+func TestEvaluatePullRequestPersistsEligibleReportBoundToHead(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	report, err := fixture.runner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID:       "project_1",
+		Repo:            "acme/looper",
+		PRNumber:        42,
+		ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if !report.Eligible || report.Status != StatusEligible || len(report.Reasons) != 0 {
+		t.Fatalf("report = %#v, want eligible without reasons", report)
+	}
+	if report.ObservedHeadSHA != "head-1" || !report.RequiresFreshRevalidation || report.Mode != ModeObserveOnly {
+		t.Fatalf("report binding = %#v, want observe-only head-bound report", report)
+	}
+
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != GateReportEventType {
+		t.Fatalf("events = %#v, want one durable gate report", events)
+	}
+	var persisted Report
+	if err := json.Unmarshal([]byte(events[0].PayloadJSON), &persisted); err != nil {
+		t.Fatalf("decode persisted report: %v", err)
+	}
+	if !persisted.Eligible || persisted.ObservedHeadSHA != "head-1" {
+		t.Fatalf("persisted report = %#v, want eligible at head-1", persisted)
+	}
+}
+
+func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*gatekeeperFixture)
+		input  EvaluationInput
+		want   []ReasonCode
+	}{
+		{
+			name:  "head changed since trigger",
+			input: EvaluationInput{ExpectedHeadSHA: "old-head"},
+			want:  []ReasonCode{ReasonHeadStale},
+		},
+		{
+			name: "head changes during evaluation",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.finalHeadSHA = "head-2"
+			},
+			want: []ReasonCode{ReasonHeadStale},
+		},
+		{
+			name: "pending required check",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.checks.CheckRuns[0] = githubinfra.PullRequestCheckRun{Name: "ci", Status: "in_progress"}
+			},
+			want: []ReasonCode{ReasonCheckPending},
+		},
+		{
+			name: "cancelled required check",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.checks.CheckRuns[0] = githubinfra.PullRequestCheckRun{Name: "ci", Status: "completed", Conclusion: "cancelled"}
+			},
+			want: []ReasonCode{ReasonCheckCancelled},
+		},
+		{
+			name: "failed required check",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.checks.CheckRuns[0] = githubinfra.PullRequestCheckRun{Name: "ci", Status: "completed", Conclusion: "failure"}
+			},
+			want: []ReasonCode{ReasonCheckFailed},
+		},
+		{
+			name: "missing required check",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.checks.CheckRuns = nil
+			},
+			want: []ReasonCode{ReasonCheckMissing},
+		},
+		{
+			name: "unresolved review thread",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.threads = []githubinfra.ReviewThread{{ID: "thread-1", IsResolved: false}}
+			},
+			want: []ReasonCode{ReasonUnresolvedReviewThread},
+		},
+		{
+			name: "required review missing",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.detail.ReviewDecision = "REVIEW_REQUIRED"
+			},
+			want: []ReasonCode{ReasonReviewRequired},
+		},
+		{
+			name: "merge conflict",
+			mutate: func(f *gatekeeperFixture) {
+				mergeable := false
+				f.github.mergeable.Mergeable = &mergeable
+				f.github.mergeable.MergeableState = "dirty"
+			},
+			want: []ReasonCode{ReasonMergeConflict},
+		},
+		{
+			name: "mergeability is not clean",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.mergeable.MergeableState = "behind"
+			},
+			want: []ReasonCode{ReasonMergeabilityNotClean},
+		},
+		{
+			name: "provider policy blocker is ambiguous",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.mergeable.MergeableState = "blocked"
+			},
+			want: []ReasonCode{ReasonProviderStateAmbiguous},
+		},
+		{
+			name: "global hold",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.detail.Labels = []string{"looper:hold"}
+			},
+			want: []ReasonCode{ReasonHold},
+		},
+		{
+			name: "provider mergeability is ambiguous",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.mergeable.Mergeable = nil
+				f.github.mergeable.MergeableState = "unknown"
+			},
+			want: []ReasonCode{ReasonProviderStateAmbiguous},
+		},
+		{
+			name: "provider state is unavailable",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.protectionErr = errors.New("provider unavailable")
+			},
+			want: []ReasonCode{ReasonProviderStateUnavailable},
+		},
+		{
+			name: "draft pull request",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.detail.IsDraft = true
+			},
+			want: []ReasonCode{ReasonPullRequestDraft},
+		},
+		{
+			name: "closed pull request",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.detail.State = "CLOSED"
+			},
+			want: []ReasonCode{ReasonPullRequestNotOpen},
+		},
+		{
+			name: "project policy denies target",
+			mutate: func(f *gatekeeperFixture) {
+				f.policyPermits = false
+			},
+			want: []ReasonCode{ReasonProjectPolicyDenied},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newGatekeeperFixture(t)
+			if tc.mutate != nil {
+				tc.mutate(fixture)
+			}
+			input := tc.input
+			input.ProjectID = "project_1"
+			input.Repo = "acme/looper"
+			input.PRNumber = 42
+			report, err := fixture.runner().EvaluatePullRequest(context.Background(), input)
+			if err != nil {
+				t.Fatalf("EvaluatePullRequest() error = %v", err)
+			}
+			if report.Eligible || report.Status != StatusBlocked {
+				t.Fatalf("report = %#v, want blocked", report)
+			}
+			got := reasonCodes(report.Reasons)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("reason codes = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+type gatekeeperFixture struct {
+	repos         *storage.Repositories
+	github        *fakeGatekeeperGitHub
+	now           time.Time
+	policyPermits bool
+}
+
+func newGatekeeperFixture(t *testing.T) *gatekeeperFixture {
+	t.Helper()
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "gatekeeper.sqlite"), storage.SQLiteCoordinatorOptions{BackupDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 30, 10, 0, 0, 0, time.UTC)
+	nowISO := now.Format(time.RFC3339Nano)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	mergeable := true
+	return &gatekeeperFixture{
+		repos: repos,
+		now:   now,
+		github: &fakeGatekeeperGitHub{
+			detail:    githubinfra.PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", BaseRefName: "main", ReviewDecision: "APPROVED"},
+			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", Mergeable: &mergeable, MergeableState: "clean"},
+			protection: githubinfra.BranchProtection{
+				Enabled: true, HasRequiredChecks: true, RequiredChecks: []string{"ci"},
+				HasRequiredReviews: true, RequiredApprovingReviewCount: 1,
+			},
+			checks:       githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "success"}}},
+			finalHeadSHA: "head-1",
+		},
+		policyPermits: true,
+	}
+}
+
+func (f *gatekeeperFixture) runner() *Runner {
+	return New(Options{
+		Repos:  f.repos,
+		GitHub: f.github,
+		Now:    func() time.Time { return f.now },
+		PolicyPermitsTarget: func(string, string, string) bool {
+			return f.policyPermits
+		},
+	})
+}
+
+type fakeGatekeeperGitHub struct {
+	openPullRequests []githubinfra.PullRequestSummary
+	detail           githubinfra.PullRequestDetail
+	mergeable        githubinfra.PullRequestDetail
+	protection       githubinfra.BranchProtection
+	checks           githubinfra.PullRequestCheckRuns
+	threads          []githubinfra.ReviewThread
+	finalHeadSHA     string
+	protectionErr    error
+}
+
+func (f *fakeGatekeeperGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
+	return f.openPullRequests, nil
+}
+func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	return f.detail, nil
+}
+func (f *fakeGatekeeperGitHub) ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	return f.mergeable, nil
+}
+func (f *fakeGatekeeperGitHub) GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	return f.protection, f.protectionErr
+}
+func (f *fakeGatekeeperGitHub) ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error) {
+	return f.checks, nil
+}
+func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
+	return f.threads, nil
+}
+func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {
+	return f.finalHeadSHA, nil
+}
+
+func reasonCodes(reasons []Reason) []ReasonCode {
+	out := make([]ReasonCode, 0, len(reasons))
+	for _, reason := range reasons {
+		out = append(out, reason.Code)
+	}
+	return out
+}

@@ -33,11 +33,12 @@ const (
 )
 
 var (
-	prListJSONFields          = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
-	prDiscoveryListJSONFields = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
-	prViewMetadataJSONFields  = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
-	prViewFixerJSONFields     = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
-	prViewReviewerJSONFields  = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
+	prListJSONFields           = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
+	prDiscoveryListJSONFields  = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
+	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
+	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
+	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -285,9 +286,11 @@ type BranchProtectionInput struct {
 }
 
 type BranchProtection struct {
-	Enabled           bool
-	HasRequiredChecks bool
-	RequiredChecks    []string
+	Enabled                      bool
+	HasRequiredChecks            bool
+	RequiredChecks               []string
+	HasRequiredReviews           bool
+	RequiredApprovingReviewCount int
 }
 
 type IssueSummary struct {
@@ -1459,7 +1462,15 @@ func (g *Gateway) GetBranchProtection(ctx context.Context, input BranchProtectio
 			}
 		}
 	}
-	return BranchProtection{Enabled: true, HasRequiredChecks: hasRequiredChecks, RequiredChecks: uniqueStrings(requiredChecks)}, nil
+	requiredPullRequestReviews, _ := row["required_pull_request_reviews"].(map[string]any)
+	requiredApprovingReviewCount := int(asInt64(requiredPullRequestReviews["required_approving_review_count"]))
+	return BranchProtection{
+		Enabled:                      true,
+		HasRequiredChecks:            hasRequiredChecks,
+		RequiredChecks:               uniqueStrings(requiredChecks),
+		HasRequiredReviews:           requiredPullRequestReviews != nil,
+		RequiredApprovingReviewCount: requiredApprovingReviewCount,
+	}, nil
 }
 
 func compactIssueAssignees(values []string) []string {
@@ -1486,6 +1497,12 @@ func (g *Gateway) ViewPullRequestForFixer(ctx context.Context, input ViewPullReq
 
 func (g *Gateway) ViewPullRequestForReviewer(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	return g.viewPullRequestWithFields(ctx, input, prViewReviewerJSONFields, true, true)
+}
+
+func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	// Gate decisions must bypass the per-tick discovery snapshot: this method
+	// is the fresh provider read that binds a report to the current head.
+	return g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
 }
 
 func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
@@ -1582,6 +1599,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		CreatedAt:      firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
 		UpdatedAt:      firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
 		ClosedAt:       firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
+		IsDraft:        asBool(row["draft"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
