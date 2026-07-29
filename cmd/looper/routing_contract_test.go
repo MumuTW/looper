@@ -465,17 +465,17 @@ func TestVersionFlagStillWorksBeforeTheVerb(t *testing.T) {
 // deadline the other verbs use. The daemon reads the request context, so a
 // client-side timeout does not merely lose the report — it aborts the sweep.
 //
-// The subtests are each other's mutation check: dropping the workload-derived
+// The subtests are each other's mutation check: dropping the longer report
 // budget fails the first, and applying it to every request fails the second.
 func TestBulkStopOutlivesTheSingleLoopDeadline(t *testing.T) {
 	const daemonWork = 400 * time.Millisecond
 
-	original, originalBulkStop := requestTimeout, bulkStopPerRunBudget
+	original, originalBulkStop := requestTimeout, bulkStopRequestTimeout
 	requestTimeout = 80 * time.Millisecond
-	bulkStopPerRunBudget = 240 * time.Millisecond
+	bulkStopRequestTimeout = 800 * time.Millisecond
 	t.Cleanup(func() {
 		requestTimeout = original
-		bulkStopPerRunBudget = originalBulkStop
+		bulkStopRequestTimeout = originalBulkStop
 	})
 
 	t.Run("stop all waits", func(t *testing.T) {
@@ -508,7 +508,7 @@ func TestBulkStopOutlivesTheSingleLoopDeadline(t *testing.T) {
 	})
 
 	t.Run("stop all still has an upper bound", func(t *testing.T) {
-		bulkStopPerRunBudget = 0
+		bulkStopRequestTimeout = requestTimeout
 		fixture := newContractFixture(t)
 		fixture.controlDelay = daemonWork
 		configPath, _ := serveContract(t, fixture)
@@ -521,25 +521,6 @@ func TestBulkStopOutlivesTheSingleLoopDeadline(t *testing.T) {
 			t.Fatalf("stderr = %q, want a deadline failure", stderr.String())
 		}
 	})
-}
-
-func TestBulkStopDeadlineScalesWithAllConcurrentExecutions(t *testing.T) {
-	originalRequest, originalPerRun := requestTimeout, bulkStopPerRunBudget
-	requestTimeout = 30 * time.Second
-	bulkStopPerRunBudget = 20 * time.Second
-	t.Cleanup(func() {
-		requestTimeout = originalRequest
-		bulkStopPerRunBudget = originalPerRun
-	})
-
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.Scheduler.MaxConcurrentRuns = 31
-	if got, want := bulkStopRequestTimeout(cfg), 10*time.Minute+50*time.Second; got != want {
-		t.Fatalf("bulkStopRequestTimeout() = %s, want %s for all 31 kill budgets plus request slack", got, want)
-	}
 }
 
 // writeContractConfig points the CLI's own config loading at a running server,

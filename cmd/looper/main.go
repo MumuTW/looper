@@ -46,12 +46,13 @@ import (
 // It is a var only so tests can shorten it; nothing reassigns it at runtime.
 var requestTimeout = 30 * time.Second
 
-// bulkStopPerRunBudget mirrors the runtime's maximum containment-kill budget.
-// stop-all walks active executions sequentially, so the client deadline must
-// scale with scheduler.maxConcurrentRuns instead of imposing a fixed cap.
+// bulkStopRequestTimeout bounds how long an interactive client waits for the
+// summary. The daemon deliberately detaches the stop-all sweep from client
+// cancellation, so exceeding this deadline loses only the report and never
+// truncates the operation.
 //
 // It is a var only so tests can shorten it; nothing reassigns it at runtime.
-var bulkStopPerRunBudget = 20 * time.Second
+var bulkStopRequestTimeout = 10 * time.Minute
 
 // projectAddTimeout is longer than requestTimeout because POST /api/v1/projects
 // is not a control call. The daemon commits the project and only then discovers
@@ -888,24 +889,9 @@ func dialHost(host string) string {
 func post(ctx context.Context, cfg config.Config, call apiRequest) (string, error) {
 	timeout := requestTimeout
 	if call.LongRunning {
-		timeout = bulkStopRequestTimeout(cfg)
+		timeout = bulkStopRequestTimeout
 	}
 	return doHTTPWithin(ctx, timeout, cfg, http.MethodPost, call.Path, call.Body)
-}
-
-func bulkStopRequestTimeout(cfg config.Config) time.Duration {
-	concurrent := cfg.Scheduler.MaxConcurrentRuns
-	if concurrent < 1 {
-		concurrent = 1
-	}
-	if bulkStopPerRunBudget <= 0 {
-		return requestTimeout
-	}
-	const maxDuration = time.Duration(1<<63 - 1)
-	if requestTimeout >= maxDuration || time.Duration(concurrent) > (maxDuration-requestTimeout)/bulkStopPerRunBudget {
-		return maxDuration
-	}
-	return requestTimeout + time.Duration(concurrent)*bulkStopPerRunBudget
 }
 
 func get(ctx context.Context, cfg config.Config, path string) (string, error) {

@@ -1132,6 +1132,34 @@ func TestStopAllLoopsHandlesMixedTypesPartialFailureAndRepeatedCalls(t *testing.
 	assertStopAllItemResult(t, repeated.Items, "loop_future", string(stopAllResultAlreadyStopping))
 }
 
+func TestStopAllRequestFinishesAfterClientCancellation(t *testing.T) {
+	setupCtx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	insertStopAllTestLoop(t, setupCtx, repos, now, stopAllLoopFixture{loopID: "loop_first", seq: 1, loopType: "worker", loopStatus: "running", runID: "run_first", runStatus: "running", executionID: "exec_first", executionStatus: "running", pid: 5101})
+	insertStopAllTestLoop(t, setupCtx, repos, now, stopAllLoopFixture{loopID: "loop_second", seq: 2, loopType: "fixer", loopStatus: "running", runID: "run_second", runStatus: "running", executionID: "exec_second", executionStatus: "running", pid: 5102})
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var signaled []int
+	response, err := stopAllLoopsForRequest(requestCtx, services, "Stopped after disconnect", func() time.Time { return now }, func(pid int, _ syscall.Signal) error {
+		signaled = append(signaled, pid)
+		return syscall.ESRCH
+	}, func(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error) {
+		return true, true, nil
+	})
+	if err != nil {
+		t.Fatalf("stopAllLoopsForRequest() error = %v", err)
+	}
+	if response.Summary.Total != 2 || response.Summary.Stopped != 2 {
+		t.Fatalf("stopAllLoopsForRequest() summary = %#v, want both candidates stopped", response.Summary)
+	}
+	firstReached := slices.Contains(signaled, -5101) || slices.Contains(signaled, 5101)
+	secondReached := slices.Contains(signaled, -5102) || slices.Contains(signaled, 5102)
+	if !firstReached || !secondReached {
+		t.Fatalf("signals = %#v, want both candidates reached after client cancellation", signaled)
+	}
+}
+
 func TestStopAllLoopsReportsPausedOnlyWhenPIDVerificationRejectsOwnership(t *testing.T) {
 	ctx := context.Background()
 	services, repos, now := newStopAllTestServices(t)
