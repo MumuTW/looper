@@ -2915,7 +2915,7 @@ func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) 
 }
 
 func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, LocalHeadSHA: input.LocalHeadSHA, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, LocalHeadSHA: input.LocalHeadSHA, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, ProtectedBranches: input.ProtectedBranches})
 }
 
 type workerAgentExecutorAdapter struct {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/lifecycle"
 )
 
 func TestRunValidationRunsConfiguredCommands(t *testing.T) {
@@ -23,6 +24,45 @@ func TestRunValidationRunsConfiguredCommands(t *testing.T) {
 	}
 	if !result.Passed {
 		t.Fatalf("runValidation() result = %#v, want passed", result)
+	}
+}
+
+func TestValidatedAgentCreatedPRPublishesExactValidatedHead(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	worktreePath := filepath.Join(t.TempDir(), "wt")
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head", WorktreeID: "worktree_1"},
+		inspectResult: InspectHeadResult{HeadSHA: "validated-head", NewCommitSHAs: []string{"validated-head"}},
+	}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 311, URL: "https://example/pr/311", State: "open", HeadRefName: "looper/feature", BaseRefName: "main", HeadSHA: "agent-pushed-head"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed",
+		Lifecycle: &lifecycle.State{Branch: "looper/feature", BaseBranch: "main", CommitSHAs: []string{"agent-pushed-head"}, Pushed: true, PRNumber: 311, PRURL: "https://example/pr/311", Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceAgent, Push: lifecycle.ActionSourceAgent, PR: lifecycle.ActionSourceAgent}},
+	}}}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent,
+		Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true,
+		OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationCommands: []string{"go test ./..."},
+		ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+			return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+		},
+	})
+
+	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" || result.PullRequestNumber != 311 {
+		t.Fatalf("result = %#v, want adopted PR success", result)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("push calls = %d, want daemon correction push", len(git.pushCalls))
+	}
+	if got := git.pushCalls[0]; got.LocalHeadSHA != "validated-head" || got.ExpectedRemoteHeadSHA != "agent-pushed-head" || got.Branch != "looper/feature" {
+		t.Fatalf("push = %#v, want validated-head to looper/feature with lease on agent-pushed-head", got)
 	}
 }
 

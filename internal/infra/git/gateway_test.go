@@ -367,6 +367,33 @@ func TestGatewayPushPublishesPinnedCommitWhenHeadAdvances(t *testing.T) {
 	}
 }
 
+func TestGatewayPinnedPushSetsAttachedBranchUpstream(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "worker/pinned-upstream", BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	writeFile(t, filepath.Join(worktree.WorktreePath, "README.md"), "validated\n")
+	if _, err := gateway.Commit(ctx, CommitInput{WorktreePath: worktree.WorktreePath, Message: "validated"}); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	validatedSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
+
+	if err := gateway.Push(ctx, PushInput{WorktreePath: worktree.WorktreePath, Branch: "worker/pinned-upstream", LocalHeadSHA: validatedSHA}); err != nil {
+		t.Fatalf("Push() error = %v", err)
+	}
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")); got != "origin/worker/pinned-upstream" {
+		t.Fatalf("upstream = %q, want origin/worker/pinned-upstream", got)
+	}
+}
+
 func TestGatewayDetachedWorktreeFallsBackToRemoteOnlyBaseBranch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)

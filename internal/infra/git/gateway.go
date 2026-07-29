@@ -671,10 +671,30 @@ func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 			}
 			return err
 		}
-		return nil
+		return g.setPinnedPushUpstream(ctx, input.WorktreePath, remote, input.Branch, sourceRef)
 	}
 
-	return g.runGit(ctx, input.WorktreePath, nil, "push", "-u", remote, fmt.Sprintf("%s:refs/heads/%s", sourceRef, input.Branch))
+	if err := g.runGit(ctx, input.WorktreePath, nil, "push", "-u", remote, fmt.Sprintf("%s:refs/heads/%s", sourceRef, input.Branch)); err != nil {
+		return err
+	}
+	return g.setPinnedPushUpstream(ctx, input.WorktreePath, remote, input.Branch, sourceRef)
+}
+
+func (g *Gateway) setPinnedPushUpstream(ctx context.Context, worktreePath, remote, destinationBranch, sourceRef string) error {
+	if sourceRef == "HEAD" {
+		return nil
+	}
+	currentBranch, err := g.getCurrentBranch(ctx, worktreePath)
+	if err != nil {
+		return fmt.Errorf("resolve attached branch after pinned push: %w", err)
+	}
+	if currentBranch == "" {
+		return nil
+	}
+	if err := g.runGit(ctx, worktreePath, nil, "branch", "--set-upstream-to="+remote+"/"+destinationBranch, currentBranch); err != nil {
+		return fmt.Errorf("set upstream for pinned push branch %s: %w", currentBranch, err)
+	}
+	return nil
 }
 
 func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {
