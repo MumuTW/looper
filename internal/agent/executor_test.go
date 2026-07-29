@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -24,6 +25,20 @@ import (
 func customOwner() *config.AgentVendor {
 	v := config.AgentVendor("custom")
 	return &v
+}
+
+// advancingNow returns a Now function that advances by step on each call.
+// Executor goroutines invoke Now concurrently, so the test clock must be
+// synchronized.
+func advancingNow(start time.Time, step time.Duration) func() time.Time {
+	var mu sync.Mutex
+	now := start
+	return func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(step)
+		return now
+	}
 }
 
 func codexOwner() *config.AgentVendor {
@@ -491,12 +506,9 @@ func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 		t.Fatalf("WriteFile(scriptPath) error = %v", err)
 	}
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
-		Repos:  repos,
-		Now: func() time.Time {
-			now = now.Add(10 * time.Millisecond)
-			return now
-		},
+		Config:            ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:             repos,
+		Now:               advancingNow(now, 10*time.Millisecond),
 		ParamsOwnerVendor: codexOwner(),
 	})
 
@@ -566,12 +578,9 @@ func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 		t.Fatalf("WriteFile(scriptPath) error = %v", err)
 	}
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
-		Repos:  repos,
-		Now: func() time.Time {
-			now = now.Add(10 * time.Millisecond)
-			return now
-		},
+		Config:            ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:             repos,
+		Now:               advancingNow(now, 10*time.Millisecond),
 		ParamsOwnerVendor: codexOwner(),
 	})
 
@@ -642,12 +651,9 @@ func TestExecutorNativeResumeFailureAfterAttachDoesNotFallback(t *testing.T) {
 		t.Fatalf("WriteFile(scriptPath) error = %v", err)
 	}
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
-		Repos:  repos,
-		Now: func() time.Time {
-			now = now.Add(10 * time.Millisecond)
-			return now
-		},
+		Config:            ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:             repos,
+		Now:               advancingNow(now, 10*time.Millisecond),
 		ParamsOwnerVendor: codexOwner(),
 	})
 
@@ -723,13 +729,10 @@ func TestExecutorRefusedFallbackRebindSurfacesKilled(t *testing.T) {
 
 	owner := &refuseRebindOwner{}
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
-		Repos:  repos,
-		Owner:  owner,
-		Now: func() time.Time {
-			now = now.Add(10 * time.Millisecond)
-			return now
-		},
+		Config:            ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:             repos,
+		Owner:             owner,
+		Now:               advancingNow(now, 10*time.Millisecond),
 		ParamsOwnerVendor: codexOwner(),
 	})
 
@@ -845,12 +848,9 @@ func TestExecutorFallbackTimeoutPropagatesTimeoutTypeToLifecycle(t *testing.T) {
 		t.Fatalf("WriteFile(scriptPath) error = %v", err)
 	}
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
-		Repos:  repos,
-		Now: func() time.Time {
-			now = now.Add(10 * time.Millisecond)
-			return now
-		},
+		Config:            ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:             repos,
+		Now:               advancingNow(now, 10*time.Millisecond),
 		ParamsOwnerVendor: codexOwner(),
 	})
 
@@ -881,12 +881,9 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'ok\n'; printf '__LOOPER_RESULT__={"summary":"done","artifacts":["spec.md"],"changedFiles":["main.go"],"commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","base_branch":"main","commit_shas":["abc123"],"pushed":true,"pr_number":84,"pr_url":"https://github.com/nexu-io/looper/pull/84","actions":{"commit":"agent","push":"agent","pr":"agent"}}}\n'`}}},
-		Repos:  repos,
-		Now: func() time.Time {
-			now = now.Add(10 * time.Millisecond)
-			return now
-		},
+		Config:            ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'ok\n'; printf '__LOOPER_RESULT__={"summary":"done","artifacts":["spec.md"],"changedFiles":["main.go"],"commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","base_branch":"main","commit_shas":["abc123"],"pushed":true,"pr_number":84,"pr_url":"https://github.com/nexu-io/looper/pull/84","actions":{"commit":"agent","push":"agent","pr":"agent"}}}\n'`}}},
+		Repos:             repos,
+		Now:               advancingNow(now, 10*time.Millisecond),
 		ParamsOwnerVendor: customOwner(),
 	})
 
@@ -1538,14 +1535,19 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
+	var degradedMu sync.Mutex
 	var degraded []error
 	executor := New(ExecutorOptions{
 		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
 			"command": "/bin/sh", "args": []any{"-c", "sleep 0.05; printf 'done\\n'"},
 		}},
-		Repos:                repos,
-		ParamsOwnerVendor:    customOwner(),
-		OnHardPersistFailure: func(err error) { degraded = append(degraded, err) },
+		Repos:             repos,
+		ParamsOwnerVendor: customOwner(),
+		OnHardPersistFailure: func(err error) {
+			degradedMu.Lock()
+			defer degradedMu.Unlock()
+			degraded = append(degraded, err)
+		},
 	})
 	handle, err := executor.Start(context.Background(), RunInput{
 		ExecutionID: "agent_terminal_persist_failure", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second,
@@ -1564,6 +1566,8 @@ func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "persist terminal agent execution") {
 		t.Fatalf("Wait() error = %v, want terminal persistence message", err)
 	}
+	degradedMu.Lock()
+	defer degradedMu.Unlock()
 	if len(degraded) == 0 {
 		t.Fatal("OnHardPersistFailure was not called for terminal hard failure")
 	}
@@ -1572,14 +1576,24 @@ func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {
 func TestExecutorMidLifeHardPersistFailureReportsDegradeHook(t *testing.T) {
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
+	var degradedMu sync.Mutex
 	var degraded []error
+	degradedCount := func() int {
+		degradedMu.Lock()
+		defer degradedMu.Unlock()
+		return len(degraded)
+	}
 	executor := New(ExecutorOptions{
 		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
 			"command": "/bin/sh", "args": []any{"-c", `i=0; while [ $i -lt 50 ]; do printf 'tick %s\n' "$i"; i=$((i+1)); sleep 0.02; done`},
 		}},
-		Repos:                repos,
-		ParamsOwnerVendor:    customOwner(),
-		OnHardPersistFailure: func(err error) { degraded = append(degraded, err) },
+		Repos:             repos,
+		ParamsOwnerVendor: customOwner(),
+		OnHardPersistFailure: func(err error) {
+			degradedMu.Lock()
+			defer degradedMu.Unlock()
+			degraded = append(degraded, err)
+		},
 	})
 	handle, err := executor.Start(context.Background(), RunInput{
 		ExecutionID: "agent_midlife_persist_failure", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 3 * time.Second,
@@ -1592,10 +1606,10 @@ func TestExecutorMidLifeHardPersistFailureReportsDegradeHook(t *testing.T) {
 		t.Fatalf("coordinator.Close() error = %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && len(degraded) == 0 {
+	for time.Now().Before(deadline) && degradedCount() == 0 {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if len(degraded) == 0 {
+	if degradedCount() == 0 {
 		_ = handle.Kill("test cleanup")
 		_, _ = handle.Wait(context.Background())
 		t.Fatal("OnHardPersistFailure was not called for mid-life hard failure")
