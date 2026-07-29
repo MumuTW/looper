@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/reviewsubmit"
 )
 
@@ -22,6 +23,19 @@ import (
 // forge.applyTrustedReviewProxyPolicy for the argv it appends and
 // reviewer.buildReviewPrompt for the argv it tells agents to type.
 
+// isReviewCapabilityProbe matches the daemon's `looper review capability`
+// probe, which asks whether this binary can serve as the trusted review-submit
+// wrapper before the reviewer prompt is told to publish through it.
+//
+// The match is deliberately exact rather than tolerant of leading global flags.
+// The daemon issues the bare form, and answering must stay free of config
+// loading, network access and every other side effect: the probe runs against a
+// binary the daemon has not yet decided to trust. Anything else falls through to
+// review submit and is refused there.
+func isReviewCapabilityProbe(args []string) bool {
+	return len(args) == 2 && args[0] == "review" && args[1] == "capability"
+}
+
 // reviewSubmitValueFlags are the flags that take a value; --reviewer-manual is
 // the only boolean, and the proxy appends it with no argument.
 var reviewSubmitValueFlags = map[string]func(*reviewsubmit.Options, string){
@@ -32,8 +46,13 @@ var reviewSubmitValueFlags = map[string]func(*reviewsubmit.Options, string){
 	"--reviewer-run-id":       func(o *reviewsubmit.Options, v string) { o.ReviewerRunID = v },
 }
 
-// runReview executes `looper review submit`. It returns the process exit code.
+// runReview executes the review verbs. It returns the process exit code.
 func runReview(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if isReviewCapabilityProbe(args) {
+		_, _ = fmt.Fprintln(stdout, forge.TrustedReviewCapabilityToken)
+		return 0
+	}
+
 	opts, err := parseReviewSubmit(args)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)

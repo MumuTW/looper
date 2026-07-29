@@ -288,12 +288,29 @@ func trustedReviewChildEnv(cfg config.Config) map[string]string {
 	return env
 }
 
-// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path.
+// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path, or ""
+// when the configured binary cannot serve as the trusted review-submit wrapper.
+// tools.looperPath is auto-detected from PATH, so it can name a looper build
+// that predates `review submit`; returning "" routes the reviewer prompt to its
+// fail-closed branch instead of letting a full review run and only fail at
+// publication time.
+//
 // Agents always receive the real configured looper path — never a secret-bearing
 // wrapper path. Provider tokens for `looper review submit` are supplied through
 // a per-run daemon-side trusted review proxy socket bound to the selected PR.
-func resolveTrustedLooperCLIPath(cfg config.Config) string {
-	return strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+func resolveTrustedLooperCLIPath(cfg config.Config, logger bootstrap.Logger) string {
+	configured := strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+	if configured == "" {
+		return ""
+	}
+	capable, reason, changed := trustedReviewCapability(configured)
+	if changed {
+		logTrustedReviewCapabilityVerdict(logger, configured, capable, reason)
+	}
+	if !capable {
+		return ""
+	}
+	return configured
 }
 
 // mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
@@ -3157,7 +3174,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
 
-	looperCLIPath := resolveTrustedLooperCLIPath(cfg)
+	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
 	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of shared agent executor env so
 	// planner/worker/fixer cannot publish reviews. Inject only via the
 	// reviewer adapter, which mints a per-run proxy bound to the selected PR.
