@@ -19,7 +19,7 @@ const feedbackRepo = "mumutw/looper"
 
 const feedbackCommandTimeout = 5 * time.Minute
 
-var feedbackIssueURLPattern = regexp.MustCompile(`https://github\.com/` + regexp.QuoteMeta(feedbackRepo) + `/issues/\d+`)
+var feedbackIssueURLPattern = regexp.MustCompile(`(?i)https://github\.com/` + regexp.QuoteMeta(feedbackRepo) + `/issues/\d+`)
 
 type feedbackOutput struct {
 	Repo      string `json:"repo"`

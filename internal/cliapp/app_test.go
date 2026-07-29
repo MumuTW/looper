@@ -661,7 +661,7 @@ func TestFeedbackCommandRunsAgentAndPrintsIssueURL(t *testing.T) {
 		"#!/bin/sh",
 		"printf 'agent started\\n'",
 		"printf 'https://github.com/mumutw/looper/issues/42\\n'",
-		"printf 'https://github.com/mumutw/looper/issues/321\\n'",
+		"printf 'https://github.com/MumuTW/looper/issues/321\\n'",
 		"printf '%s{\"summary\":\"created issue\"}\\n' \"$LOOPER_COMPLETION_MARKER\"",
 	}, "\n")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
@@ -677,7 +677,7 @@ func TestFeedbackCommandRunsAgentAndPrintsIssueURL(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([feedback ...]) stderr = %q, want empty string", stderr)
 	}
-	if got, want := stdout, "https://github.com/mumutw/looper/issues/321\n"; got != want {
+	if got, want := stdout, "https://github.com/MumuTW/looper/issues/321\n"; got != want {
 		t.Fatalf("Run([feedback ...]) stdout = %q, want %q", got, want)
 	}
 
@@ -691,7 +691,7 @@ func TestFeedbackCommandRunsAgentAndPrintsIssueURL(t *testing.T) {
 	assertJSONContains(t, stdout, "repo", "mumutw/looper")
 	assertJSONContains(t, stdout, "titleHint", "CLI Feedback")
 	assertJSONContains(t, stdout, "message", "Great tool")
-	assertJSONContains(t, stdout, "issueUrl", "https://github.com/mumutw/looper/issues/321")
+	assertJSONContains(t, stdout, "issueUrl", "https://github.com/MumuTW/looper/issues/321")
 	assertJSONContains(t, stdout, "summary", "created issue")
 }
 
