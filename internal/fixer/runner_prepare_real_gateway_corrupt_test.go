@@ -10,6 +10,7 @@ import (
 
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 // Real gateway lifecycle: .git points at an existing but empty/corrupt private
@@ -30,6 +31,77 @@ func TestRunPrepareWorktreeStepRealGatewayRecreatesCorruptLinkedGitdir(t *testin
 		t.Fatal("isMissingOrUnusableFixerWorktree = false for corrupt linked gitdir, want true")
 	}
 	assertRealGatewayRecreatesUnusableWorktree(t, f)
+}
+
+// A symbolic HEAD pointing to a .lock ref is not a valid Git ref name even
+// though it otherwise resembles a normal refs/* path. The linked worktree
+// must be classified unusable and rebuilt instead of repeatedly retrying
+// prepare.
+func TestRunPrepareWorktreeStepRealGatewayRecreatesLinkedLockRefHEAD(t *testing.T) {
+	t.Parallel()
+
+	f := setupRealLinkedWorktree(t, "project_real_linked_lock_ref", "feature/fix-42")
+	if err := os.WriteFile(filepath.Join(f.gitdir, "HEAD"), []byte("ref: refs/heads/fix.lock\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile private HEAD: %v", err)
+	}
+	if err := tryRunGit(f.wtPath, "check-ref-format", "refs/heads/fix.lock"); err == nil {
+		t.Fatal("git check-ref-format accepted linked .lock HEAD ref, want failure")
+	}
+	stripWorktreeExceptGit(t, f.wtPath)
+
+	probeErr := errors.New("fatal: not a git repository (or any of the parent directories): .git")
+	if worktreesafety.LocalFixerWorktreeCheckoutUsable(f.wtPath) {
+		t.Fatal("LocalFixerWorktreeCheckoutUsable = true for linked .lock HEAD, want false")
+	}
+	if !worktreesafety.IsMissingOrUnusableFixerWorktree(f.wtPath, probeErr) {
+		t.Fatal("IsMissingOrUnusableFixerWorktree = false for linked .lock HEAD, want true")
+	}
+	assertRealGatewayRecreatesUnusableWorktree(t, f)
+}
+
+// An ordinary checkout has the same symbolic-HEAD rule. Exercise the full
+// cleanup/recreate path rather than merely asserting the metadata probe.
+func TestRunPrepareWorktreeStepRealGatewayRecreatesOrdinaryLockRefHEAD(t *testing.T) {
+	t.Parallel()
+
+	root, _, repoPath, headSHA := setupRealRepoWithBranch(t, "feature/fix-42")
+	projectID := "project_real_ordinary_lock_ref"
+	worktreeRoot := filepath.Join(root, "worktrees")
+	stalePath := filepath.Join(worktreeRoot, fmt.Sprintf("looper-fix-%s-pr-%d-detached", projectID, 42))
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	mustRunGit(t, worktreeRoot, "clone", repoPath, stalePath)
+	if err := os.WriteFile(filepath.Join(stalePath, ".git", "HEAD"), []byte("ref: refs/heads/fix.lock\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile ordinary HEAD: %v", err)
+	}
+	if err := tryRunGit(stalePath, "check-ref-format", "refs/heads/fix.lock"); err == nil {
+		t.Fatal("git check-ref-format accepted ordinary .lock HEAD ref, want failure")
+	}
+	stripWorktreeExceptGit(t, stalePath)
+
+	probeErr := errors.New("fatal: not a git repository (or any of the parent directories): .git")
+	if worktreesafety.LocalFixerWorktreeCheckoutUsable(stalePath) {
+		t.Fatal("LocalFixerWorktreeCheckoutUsable = true for ordinary .lock HEAD, want false")
+	}
+	if !worktreesafety.IsMissingOrUnusableFixerWorktree(stalePath, probeErr) {
+		t.Fatal("IsMissingOrUnusableFixerWorktree = false for ordinary .lock HEAD, want true")
+	}
+
+	adapter := &countingRealGitGateway{inner: gitinfra.New(gitinfra.Options{GitPath: "git"})}
+	runner := New(Options{Git: adapter})
+	metadata := worktreeRootMetadataJSON(worktreeRoot)
+	checkpoint, prepErr := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:     storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: headSHA, HeadRefName: "feature/fix-42", BaseRefName: "main"},
+			Worktree: &checkpointWorktree{Path: stalePath, Branch: "feature/fix-42"},
+		},
+	})
+	assertPreparedRecreatedWorktree(t, checkpoint, prepErr, adapter, stalePath)
 }
 
 // Real gateway lifecycle: linked private gitdir still has HEAD but lost
@@ -67,7 +139,7 @@ func TestRunPrepareWorktreeStepRealGatewayRecreatesCorruptCommonRepo(t *testing.
 	t.Parallel()
 
 	f := setupRealLinkedWorktree(t, "project_real_corrupt_common", "feature/fix-42")
-	if !localGitRepositoryMetadataUsable(resolveLinkedCommonDir(t, f.gitdir)) {
+	if !worktreesafety.LocalGitRepositoryMetadataUsable(resolveLinkedCommonDir(t, f.gitdir)) {
 		t.Fatal("common repo not usable before corruption")
 	}
 	// HEAD-only common: missing objects/ (and refs/) — Git rejects as not a repo.

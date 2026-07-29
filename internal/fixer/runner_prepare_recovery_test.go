@@ -11,6 +11,21 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+// writeMinimalGitRepoMetadata creates non-remote repository integrity metadata
+// (HEAD + objects/ + refs/) that Git 2.43 accepts as a repository root.
+func writeMinimalGitRepoMetadata(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "objects"), 0o755); err != nil {
+		t.Fatalf("MkdirAll objects: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "refs"), 0o755); err != nil {
+		t.Fatalf("MkdirAll refs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile HEAD: %v", err)
+	}
+}
+
 // Prepare probe failures on rewind (fetch/transport/remote-head/ssh) never read
 // worktree status, so CleanupWorktree must not run — that would destroy
 // interrupted-repair dirt that the dirty-adopt path never got to evaluate.

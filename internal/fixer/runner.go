@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -2263,7 +2264,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if errors.As(err, &labelMismatchErr) {
 				return r.finishLabelMismatchFixerQueueItem(ctx, *project, *loop, &run, queueItem, checkpoint, labelMismatchErr.summary)
 			}
-			failure := r.classifyFailureWithBoundary(err, fixerFailureBoundaryForStep(step))
+			failure := r.classifyFailureWithBoundary(err, failurepolicy.BoundaryForStep(string(step)))
 			latest := checkpoint
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
@@ -2389,6 +2390,22 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 	status := statusForSkip(checkpoint.SkipReason)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+}
+
+func pendingFixerRediscoveryHandoffInFlight(loop storage.LoopRecord, queueItem storage.QueueItemRecord) bool {
+	if loop.Status != "paused" || queueItem.Repo == nil || queueItem.PRNumber == nil {
+		return false
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	pauseReason, _ := stringFromAny(metadata["pauseReason"])
+	if pauseReason != failureStreakPauseReason {
+		return false
+	}
+	pending, ok := parsePendingFixerRediscoveryState(metadata)
+	if !ok {
+		return false
+	}
+	return queueItem.DedupeKey == buildFixerDedupeKey(loop.ProjectID, loop.ID, *queueItem.Repo, *queueItem.PRNumber, pending.HeadSHA, pending.FixItemsStateHash)
 }
 
 func statusForSkip(skipReason string) string {
@@ -2808,7 +2825,12 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 	if shouldRebuildWorktree(checkpoint) && checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.Branch != "" {
 		existingPath := checkpoint.Worktree.Path
 		existingBranch := firstNonEmpty(checkpoint.Worktree.Branch, branch)
-		if !isMissingOrUnusableFixerWorktree(existingPath, nil) {
+		// A malformed local .git/HEAD is authoritative before PrepareWorktree:
+		// Git may otherwise describe it as a dirty checkout rather than returning
+		// an integrity error, which would preserve a path that cannot be safely
+		// resumed. Paths without .git still enter PrepareWorktree so remote/fetch
+		// errors do not trigger destructive cleanup.
+		if !worktreesafety.HasMalformedLocalGitHEAD(existingPath) && !isMissingOrUnusableFixerWorktree(existingPath, nil) {
 			preparedExisting, prepErr := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{
 				RepoPath:        input.Project.RepoPath,
 				WorktreeRoot:    worktreeRoot,
@@ -2850,7 +2872,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 			}
 		}
 		if err := clearUnusableFixerWorktreePath(existingPath); err != nil {
-			if errors.Is(err, errUnusableFixerWorktreePreserved) {
+			if errors.Is(err, worktreesafety.ErrUnusableFixerWorktreePreserved) {
 				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 				return checkpoint, &loopError{message: err.Error(), kind: FailureManualIntervention}
 			}
@@ -3215,9 +3237,9 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 	}
 	checkpoint.Validation = &result
 	if !result.Passed {
-		failure := classifyFixerValidationFailure(result)
-		checkpoint.ResumePolicy = failure.resumePolicy
-		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+		d := failurepolicy.ClassifyValidation(result.FailureCategory, result.Summary)
+		checkpoint.ResumePolicy = d.ResumePolicy
+		return checkpoint, &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
 	}
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
 	if err != nil {
@@ -3240,9 +3262,9 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		}
 		checkpoint.Validation = &second
 		if !second.Passed {
-			failure := classifyFixerValidationFailure(second)
-			checkpoint.ResumePolicy = failure.resumePolicy
-			return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+			d := failurepolicy.ClassifyValidation(second.FailureCategory, second.Summary)
+			checkpoint.ResumePolicy = d.ResumePolicy
+			return checkpoint, &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
 		}
 		finalInspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
 		if err != nil {
@@ -3489,9 +3511,9 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 			return false, checkpoint, &loopError{message: "Validation produced uncommitted changes after adopting agent-pushed head", kind: FailureRetryableAfterResume}
 		}
 		if !validation.Passed {
-			failure := classifyFixerValidationFailure(validation)
-			checkpoint.ResumePolicy = failure.resumePolicy
-			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: failure.kind}
+			failure := failurepolicy.ClassifyValidation(validation.FailureCategory, validation.Summary)
+			checkpoint.ResumePolicy = failure.ResumePolicy
+			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: fixerFailureKind(failure.Kind)}
 		}
 		if validation.HeadSHA != adoptedHead {
 			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: FailureRetryableAfterResume}
@@ -6419,22 +6441,6 @@ func (r *Runner) recordPendingFixerRediscovery(ctx context.Context, loop storage
 	return r.mergeLoopMetadata(ctx, loop, map[string]any{"pendingFixerRediscovery": state})
 }
 
-func pendingFixerRediscoveryHandoffInFlight(loop storage.LoopRecord, queueItem storage.QueueItemRecord) bool {
-	if loop.Status != "paused" || queueItem.Repo == nil || queueItem.PRNumber == nil {
-		return false
-	}
-	metadata := parseJSONObject(loop.MetadataJSON)
-	pauseReason, _ := stringFromAny(metadata["pauseReason"])
-	if pauseReason != failureStreakPauseReason {
-		return false
-	}
-	pending, ok := parsePendingFixerRediscoveryState(metadata)
-	if !ok {
-		return false
-	}
-	return queueItem.DedupeKey == buildFixerDedupeKey(loop.ProjectID, loop.ID, *queueItem.Repo, *queueItem.PRNumber, pending.HeadSHA, pending.FixItemsStateHash)
-}
-
 func (r *Runner) clearPendingFixerRediscovery(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
 	return r.clearPendingFixerRediscoveryIfMatch(ctx, loop, pendingFixerRediscoveryState{})
 }
@@ -6648,32 +6654,8 @@ func (r *Runner) classifyFailureWithBoundary(err error, boundary failureclass.Bo
 	if errors.As(err, &typed) {
 		return typed
 	}
-	message := err.Error()
-	if strings.Contains(strings.ToLower(message), "remote head changed") {
-		return &loopError{message: message, kind: FailureRetryableAfterResume}
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return &loopError{message: message, kind: FailureRetryableTransient}
-	}
-	if githubinfra.IsTransientError(err) {
-		return &loopError{message: message, kind: FailureRetryableTransient}
-	}
-	return &loopError{message: message, kind: fixerFailureKind(failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: boundary}))}
-}
-
-func fixerFailureBoundaryForStep(step FixerStep) failureclass.Boundary {
-	switch step {
-	case stepDiscoverPR, stepClaimPR, stepCollectFixes, stepResolveComments, stepRecheck:
-		return failureclass.BoundaryGitHubAPI
-	case stepPrepareWorktree, stepPush:
-		return failureclass.BoundaryGitRemote
-	case stepRepair:
-		return failureclass.BoundaryModelProvider
-	case stepValidate, stepReconcileCommits:
-		return failureclass.BoundaryAgentProcess
-	default:
-		return failureclass.BoundaryUnknown
-	}
+	d := failurepolicy.ClassifyError(err, boundary)
+	return &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
 }
 
 func fixerFailureKind(kind failureclass.Kind) QueueFailureKind {
@@ -6776,39 +6758,7 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 // interrupted agent dirt. When error text merely *looks* like a local integrity
 // failure, confirm with localFixerWorktreeCheckoutUsable before recreating.
 func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return true
-	}
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return true
-		}
-		// Permission/IO errors are not "missing"; let prepare surface them.
-	}
-	if prepErr == nil {
-		// Path present: try prepare in place. Local usability is decided only
-		// after prepare fails (via a non-remote probe, not error text alone).
-		return false
-	}
-	// Path may have vanished during prepare; re-stat the checkout itself.
-	if _, err := os.Stat(path); err != nil {
-		return os.IsNotExist(err)
-	}
-	msg := strings.ToLower(prepErr.Error())
-	// Integrity-looking phrases are necessary but not sufficient: remote
-	// helpers/servers can emit the same text. Do not substring-match generic
-	// existence phrases either — external dependency errors share that wording.
-	// "invalid gitfile format" is Git's distinct message for a .git file that is
-	// not a gitdir: pointer (malformed retained metadata).
-	looksLikeLocalIntegrity := strings.Contains(msg, "not a working tree") ||
-		strings.Contains(msg, "not a git repository") ||
-		strings.Contains(msg, "invalid gitfile format")
-	if !looksLikeLocalIntegrity {
-		return false
-	}
-	// Confirm with a non-remote local probe before force-cleaning.
-	return !localFixerWorktreeCheckoutUsable(path)
+	return worktreesafety.IsMissingOrUnusableFixerWorktree(path, prepErr)
 }
 
 // localFixerWorktreeCheckoutUsable reports whether path has local git metadata
@@ -6823,107 +6773,8 @@ func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 // reports "fatal: invalid gitfile format" and prepare must recreate rather than
 // retry forever on retained broken metadata.
 func localFixerWorktreeCheckoutUsable(path string) bool {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return false
-	}
-	gitMeta := filepath.Join(path, ".git")
-	info, err := os.Lstat(gitMeta)
-	if err != nil {
-		return false
-	}
-	if info.IsDir() {
-		// Ordinary checkout: require full local repository metadata.
-		return localGitRepositoryMetadataUsable(gitMeta)
-	}
-	// Linked worktree or gitfile: .git is a regular file (or symlink to one).
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Stat(gitMeta)
-		if err != nil {
-			return false
-		}
-		if target.IsDir() {
-			return localGitRepositoryMetadataUsable(gitMeta)
-		}
-	}
-	data, err := os.ReadFile(gitMeta)
-	if err != nil {
-		return false
-	}
-	line := strings.TrimSpace(string(data))
-	if line == "" {
-		return false
-	}
-	const prefix = "gitdir:"
-	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
-		// Malformed gitfile: real Git rejects non-gitdir: content as
-		// "invalid gitfile format". Treat as unusable so prepare can recreate.
-		return false
-	}
-	gitdir := strings.TrimSpace(line[len(prefix):])
-	if gitdir == "" {
-		return false
-	}
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(path, gitdir)
-	}
-	// Linked private gitdir must look like a real git dir (HEAD), not merely exist.
-	// An empty/corrupt gitdir still makes `git` report "not a git repository"; if
-	// we only checked existence, prepare would retry forever without recreating.
-	if _, err = os.Stat(filepath.Join(gitdir, "HEAD")); err != nil {
-		return false
-	}
-	// commondir is required for linked worktrees: without it (or when it does not
-	// resolve to a common repo with full local integrity), Git 2.43+ still fails
-	// with "fatal: not a git repository" even though private HEAD remains.
-	return linkedPrivateGitdirCommonUsable(gitdir)
+	return worktreesafety.LocalFixerWorktreeCheckoutUsable(path)
 }
-
-// localGitRepositoryMetadataUsable is a non-remote integrity probe for a Git
-// repository directory (ordinary .git or a linked worktree common repo).
-// HEAD alone is insufficient: Git 2.43+ also requires objects/ and refs/ and
-// reports "fatal: not a git repository" when either directory is missing.
-func localGitRepositoryMetadataUsable(dir string) bool {
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
-		return false
-	}
-	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil {
-		return false
-	}
-	objects, err := os.Stat(filepath.Join(dir, "objects"))
-	if err != nil || !objects.IsDir() {
-		return false
-	}
-	refs, err := os.Stat(filepath.Join(dir, "refs"))
-	if err != nil || !refs.IsDir() {
-		return false
-	}
-	return true
-}
-
-// linkedPrivateGitdirCommonUsable reports whether a linked worktree private
-// gitdir has a readable commondir that resolves to a common repository with
-// non-remote integrity (HEAD + objects/ + refs/).
-func linkedPrivateGitdirCommonUsable(gitdir string) bool {
-	data, err := os.ReadFile(filepath.Join(gitdir, "commondir"))
-	if err != nil {
-		return false
-	}
-	common := strings.TrimSpace(string(data))
-	if common == "" {
-		return false
-	}
-	if !filepath.IsAbs(common) {
-		common = filepath.Join(gitdir, common)
-	}
-	common = filepath.Clean(common)
-	return localGitRepositoryMetadataUsable(common)
-}
-
-// errUnusableFixerWorktreePreserved signals that an unusable worktree path still
-// holds content after CleanupWorktree and must not be recreated over.
-var errUnusableFixerWorktreePreserved = errors.New("unusable fixer worktree path preserved")
 
 // clearUnusableFixerWorktreePath handles filesystem leftovers after CleanupWorktree
 // on a missing/unusable checkout. Git's `worktree remove --force` only removes
@@ -6935,48 +6786,7 @@ var errUnusableFixerWorktreePreserved = errors.New("unusable fixer worktree path
 // can reuse the managed path. Preserve any other populated path for manual
 // intervention (may hold interrupted agent output even without a usable .git).
 func clearUnusableFixerWorktreePath(path string) error {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, errUnusableFixerWorktreePreserved)
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return err
-	}
-	if len(entries) == 0 {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
-	}
-	// Only corrupt/empty git metadata: safe to remove so prepare can recreate.
-	if onlyUnusableLocalGitMetadata(path, entries) {
-		if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
-	}
-	return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, errUnusableFixerWorktreePreserved)
-}
-
-// onlyUnusableLocalGitMetadata is true when path holds nothing but a non-usable
-// .git file/dir (and optional nested empties under an ordinary .git dir). Any
-// other entry is treated as possible agent dirt and must be preserved.
-func onlyUnusableLocalGitMetadata(path string, entries []os.DirEntry) bool {
-	if len(entries) != 1 || entries[0].Name() != ".git" {
-		return false
-	}
-	return !localFixerWorktreeCheckoutUsable(path)
+	return worktreesafety.ClearUnusableFixerWorktreePath(path)
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
@@ -7036,42 +6846,6 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 		Output:          vresult.Output,
 		FailureCategory: vresult.FailureCategory,
 	}, nil
-}
-
-type fixerValidationFailure struct {
-	message      string
-	kind         QueueFailureKind
-	resumePolicy string
-}
-
-func classifyFixerValidationFailure(result ValidationResult) fixerValidationFailure {
-	if result.FailureCategory != "" {
-		policy := validation.PolicyFor(result.FailureCategory)
-		return fixerValidationFailure{
-			message:      firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed"),
-			kind:         QueueFailureKind(policy.FailureKind),
-			resumePolicy: policy.ResumePolicy,
-		}
-	}
-
-	message := firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed")
-	if strings.HasPrefix(result.Summary, "Validation timed out:") {
-		return fixerValidationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
-	}
-	summary := strings.ToLower(strings.TrimSpace(result.Summary))
-	if containsAnyFixerValidationHint(summary, []string{"command not found", "executable file not found", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
-		return fixerValidationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
-	}
-	return fixerValidationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
-}
-
-func containsAnyFixerValidationHint(message string, hints []string) bool {
-	for _, hint := range hints {
-		if strings.Contains(message, hint) {
-			return true
-		}
-	}
-	return false
 }
 
 type eventInput struct {
