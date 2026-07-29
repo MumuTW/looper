@@ -25,7 +25,6 @@ import (
 	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/runs"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
 )
@@ -121,7 +120,6 @@ type Services struct {
 	Repositories     *storage.Repositories
 	Projects         *projects.Service
 	Loops            *loops.Service
-	Runs             *runs.Service
 	ActiveExecutions *ActiveExecutionRegistry
 }
 
@@ -930,7 +928,6 @@ func (r *Runtime) start(ctx context.Context) error {
 		AfterPublishProjects: r.afterProjectsPublished,
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
-	runService := &runs.Service{DB: coordinator.DB(), Repos: repositories, Loops: loopService, Now: r.now}
 	startedAt := r.now().UTC()
 	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
 		return err
@@ -959,7 +956,6 @@ func (r *Runtime) start(ctx context.Context) error {
 		Repositories:     repositories,
 		Projects:         projectService,
 		Loops:            loopService,
-		Runs:             runService,
 		ActiveExecutions: r.activeExecutions,
 	}
 	schedulerDisabled := false
