@@ -1,0 +1,216 @@
+package projects
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/nexu-io/looper/internal/storage"
+)
+
+func TestServiceAddProjectDoesNotWaitForOtherProjectDiscovery(t *testing.T) {
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	discoveryStarted := make(chan struct{})
+	releaseDiscovery := make(chan struct{})
+	var scheduled sync.Once
+	var discoveries sync.WaitGroup
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		ListWorktrees: func(_ context.Context, repoPath string) ([]WorktreeListEntry, error) {
+			if repoPath == "/tmp/project-a" {
+				close(discoveryStarted)
+				<-releaseDiscovery
+			}
+			return nil, nil
+		},
+		ScheduleDiscovery: func(run func()) {
+			scheduled.Do(func() {
+				discoveries.Add(1)
+				go func() {
+					defer discoveries.Done()
+					run()
+				}()
+			})
+		},
+	}
+	t.Cleanup(func() {
+		close(releaseDiscovery)
+		discoveries.Wait()
+	})
+
+	if _, err := service.AddProject(context.Background(), AddInput{ID: "project-a", Name: "Project A", RepoPath: "/tmp/project-a", BaseBranch: "main"}); err != nil {
+		t.Fatalf("AddProject(project A) error = %v", err)
+	}
+	select {
+	case <-discoveryStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("project A discovery did not start")
+	}
+
+	added := make(chan error, 1)
+	go func() {
+		_, err := service.AddProject(context.Background(), AddInput{ID: "project-b", Name: "Project B", RepoPath: "/tmp/project-b", BaseBranch: "main"})
+		added <- err
+	}()
+	select {
+	case err := <-added:
+		if err != nil {
+			t.Fatalf("AddProject(project B) error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("project B registration waited for project A discovery")
+	}
+}
+
+func TestServiceDiscoverProjectSerializesSameProjectRetries(t *testing.T) {
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	defer release()
+
+	var callsMu sync.Mutex
+	calls := 0
+	service := &Service{
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		ScheduleDiscovery: func(func()) {},
+		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
+			callsMu.Lock()
+			calls++
+			call := calls
+			callsMu.Unlock()
+			switch call {
+			case 1:
+				close(firstStarted)
+				<-releaseFirst
+			case 2:
+				close(secondStarted)
+			}
+			return nil, nil
+		},
+	}
+	if _, err := service.AddProject(context.Background(), AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main"}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := service.DiscoverProject(context.Background(), DiscoverInput{ProjectID: "looper"})
+		firstDone <- err
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first discovery did not start")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := service.DiscoverProject(context.Background(), DiscoverInput{ProjectID: "looper"})
+		secondDone <- err
+	}()
+	select {
+	case <-secondStarted:
+		t.Fatal("same-project retry entered discovery before the first run finished")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	release()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first DiscoverProject() error = %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second DiscoverProject() error = %v", err)
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 2 {
+		t.Fatalf("ListWorktrees calls = %d, want 2 serialized retries", calls)
+	}
+}
+
+func TestServiceDiscoverProjectRetriesListFailures(t *testing.T) {
+	tests := []struct {
+		name            string
+		fail            func() error
+		wantWorktrees   int
+		wantPullRequest int
+	}{
+		{name: "worktree list", fail: func() error { return errors.New("git worktree failed") }, wantPullRequest: 1},
+		{name: "pull request list", fail: func() error { return errors.New("gh pr list failed") }, wantWorktrees: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator := openCoordinator(t)
+			repos := storage.NewRepositories(coordinator.DB())
+			shouldFail := true
+			service := &Service{
+				DB:                coordinator.DB(),
+				Repos:             repos,
+				ScheduleDiscovery: func(func()) {},
+				ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
+					if test.name == "worktree list" && shouldFail {
+						return nil, test.fail()
+					}
+					return []WorktreeListEntry{{Path: "/tmp/looper", Branch: "main", HeadSHA: "abc123"}}, nil
+				},
+				ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+					if test.name == "pull request list" && shouldFail {
+						return nil, test.fail()
+					}
+					return []PullRequestSummary{{Number: 1, State: "OPEN"}}, nil
+				},
+			}
+			repo := "acme/looper"
+			if _, err := service.AddProject(context.Background(), AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo}); err != nil {
+				t.Fatalf("AddProject() error = %v", err)
+			}
+
+			failed, err := service.DiscoverProject(context.Background(), DiscoverInput{ProjectID: "looper"})
+			if err == nil || !strings.Contains(err.Error(), test.fail().Error()) {
+				t.Fatalf("DiscoverProject() error = %v, want %q", err, test.fail())
+			}
+			if failed.Discovery.Status != DiscoveryStatusFailed || !strings.Contains(failed.Discovery.Error, test.fail().Error()) {
+				t.Fatalf("failed discovery = %#v, want failed state with %q", failed.Discovery, test.fail())
+			}
+			if failed.Discovery.DiscoveredWorktrees != test.wantWorktrees || failed.Discovery.DiscoveredPullRequests != test.wantPullRequest {
+				t.Fatalf("failed discovery counts = %#v, want worktrees=%d pullRequests=%d", failed.Discovery, test.wantWorktrees, test.wantPullRequest)
+			}
+			if len(failed.Discovery.Warnings) != 1 || !strings.Contains(failed.Discovery.Warnings[0], test.fail().Error()) {
+				t.Fatalf("failed discovery warnings = %#v, want command warning with %q", failed.Discovery.Warnings, test.fail())
+			}
+			stored, err := repos.Projects.GetByID(context.Background(), "looper")
+			if err != nil || stored == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v), want stored project", stored, err)
+			}
+			if got := DiscoveryStateFromRecord(*stored); got.Status != DiscoveryStatusFailed || !strings.Contains(got.Error, test.fail().Error()) {
+				t.Fatalf("persisted discovery = %#v, want failed state with %q", got, test.fail())
+			}
+
+			shouldFail = false
+			retried, err := service.DiscoverProject(context.Background(), DiscoverInput{ProjectID: "looper"})
+			if err != nil {
+				t.Fatalf("DiscoverProject() retry error = %v", err)
+			}
+			if retried.Discovery.Status != DiscoveryStatusSucceeded {
+				t.Fatalf("retry discovery = %#v, want succeeded", retried.Discovery)
+			}
+			stored, err = repos.Projects.GetByID(context.Background(), "looper")
+			if err != nil || stored == nil {
+				t.Fatalf("Projects.GetByID() after retry = (%#v, %v), want stored project", stored, err)
+			}
+			if got := DiscoveryStateFromRecord(*stored); got.Status != DiscoveryStatusSucceeded {
+				t.Fatalf("persisted retry discovery = %#v, want succeeded", got)
+			}
+		})
+	}
+}

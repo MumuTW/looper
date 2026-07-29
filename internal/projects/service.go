@@ -103,6 +103,7 @@ type DiscoveryState struct {
 
 type Service struct {
 	mutationMu   sync.Mutex
+	projectLocks sync.Map // map[string]*sync.Mutex
 	DB           *sql.DB
 	Repos        *storage.Repositories
 	Logger       bootstrap.Logger
@@ -129,6 +130,43 @@ type Service struct {
 	// background goroutine so registration never waits on discovery. Tests may
 	// replace it to run inline or to suppress automatic discovery.
 	ScheduleDiscovery func(func())
+}
+
+// lockProjectOperations serializes discovery with mutations for the supplied
+// Projects. The locks are process-local coordination only; SQLite remains the
+// Project authority.
+func (s *Service) lockProjectOperations(ids ...string) func() {
+	unique := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			unique[id] = struct{}{}
+		}
+	}
+	if len(unique) == 0 {
+		return func() {}
+	}
+
+	orderedIDs := make([]string, 0, len(unique))
+	for id := range unique {
+		orderedIDs = append(orderedIDs, id)
+	}
+	sort.Strings(orderedIDs)
+
+	locks := make([]*sync.Mutex, 0, len(orderedIDs))
+	for _, id := range orderedIDs {
+		value, _ := s.projectLocks.LoadOrStore(id, &sync.Mutex{})
+		locks = append(locks, value.(*sync.Mutex))
+	}
+
+	for _, lock := range locks {
+		lock.Lock()
+	}
+
+	return func() {
+		for index := len(locks) - 1; index >= 0; index-- {
+			locks[index].Unlock()
+		}
+	}
 }
 
 type AddInput struct {
@@ -190,14 +228,16 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		return AddResult{}, fmt.Errorf("projects repository is not configured")
 	}
 	s.mutationMu.Lock()
+	unlockProjects := s.lockProjectOperations(input.ID, normalizeProjectID(input))
 	result, discoverInput, err := s.addProjectLocked(ctx, input)
+	unlockProjects()
 	s.mutationMu.Unlock()
 	if err != nil {
 		return AddResult{}, err
 	}
 	if discoverInput != nil {
-		// Schedule only after releasing mutationMu so a synchronous test runner
-		// can call DiscoverProject without deadlocking.
+		// Schedule only after releasing the mutation and project locks so a
+		// synchronous test runner can call DiscoverProject without deadlocking.
 		s.scheduleDiscovery(*discoverInput)
 	}
 	return result, nil
@@ -389,13 +429,14 @@ func (s *Service) DiscoverProject(ctx context.Context, input DiscoverInput) (Dis
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return DiscoverResult{}, fmt.Errorf("projects repository is not configured")
 	}
-	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
 
 	projectID := strings.TrimSpace(input.ProjectID)
 	if projectID == "" {
 		return DiscoverResult{}, ProjectValidationError{Message: "project id is required"}
 	}
+	unlockProject := s.lockProjectOperations(projectID)
+	defer unlockProject()
+
 	project, err := s.Repos.Projects.GetByID(ctx, projectID)
 	if err != nil {
 		return DiscoverResult{}, err
@@ -498,6 +539,8 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 	if project == nil {
 		return storage.ProjectRecord{}, ProjectNotFoundError{Identifier: trimmed}
 	}
+	unlockProject := s.lockProjectOperations(project.ID)
+	defer unlockProject()
 	if source, _ := parseMetadata(project.MetadataJSON)["source"].(string); source == "config" {
 		return storage.ProjectRecord{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be removed from the CLI", project.ID)}
 	}
@@ -604,6 +647,15 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	if err != nil {
 		return err
 	}
+	projectIDs := make([]string, 0, len(existingProjects)+len(cfg.Projects))
+	for _, project := range existingProjects {
+		projectIDs = append(projectIDs, project.ID)
+	}
+	for _, project := range cfg.Projects {
+		projectIDs = append(projectIDs, project.ID)
+	}
+	unlockProjects := s.lockProjectOperations(projectIDs...)
+	defer unlockProjects()
 	desiredIDs := make(map[string]struct{}, len(cfg.Projects))
 	existingByID := make(map[string]*storage.ProjectRecord, len(existingProjects))
 	for index := range existingProjects {
@@ -1047,7 +1099,7 @@ func (s *Service) discoverWorktrees(ctx context.Context, project storage.Project
 			s.Logger.Warn("failed to discover worktrees for project", map[string]any{"projectId": project.ID, "repoPath": project.RepoPath, "message": message})
 		}
 		*warnings = append(*warnings, fmt.Sprintf("Could not discover worktrees: %s", message))
-		return 0, nil
+		return 0, err
 	}
 
 	discovered := 0
@@ -1116,7 +1168,7 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 			s.Logger.Warn("failed to discover pull requests for project", map[string]any{"projectId": project.ID, "repo": *repo, "message": message})
 		}
 		*warnings = append(*warnings, fmt.Sprintf("Could not discover pull requests: %s", message))
-		return 0, 0, 0, nil
+		return 0, 0, 0, err
 	}
 
 	discovered := 0

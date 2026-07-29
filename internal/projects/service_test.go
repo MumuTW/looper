@@ -440,7 +440,7 @@ func TestServiceAddProjectSnapshotModeOffSkipsPullRequestDiscovery(t *testing.T)
 	}
 }
 
-func TestServiceAddProjectReturnsDiscoveryWarnings(t *testing.T) {
+func TestServiceDiscoverProjectRecordsListErrorsAsFailure(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -468,8 +468,14 @@ func TestServiceAddProjectReturnsDiscoveryWarnings(t *testing.T) {
 		t.Fatalf("AddProject() error = %v", err)
 	}
 	result, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeFull})
-	if err != nil {
-		t.Fatalf("DiscoverProject() error = %v", err)
+	if err == nil {
+		t.Fatal("DiscoverProject() error = nil, want command discovery failure")
+	}
+	if result.Discovery.Status != DiscoveryStatusFailed {
+		t.Fatalf("DiscoverProject().Discovery.Status = %q, want failed", result.Discovery.Status)
+	}
+	if result.Discovery.Error != "git worktree failed" {
+		t.Fatalf("DiscoverProject().Discovery.Error = %q, want worktree command error", result.Discovery.Error)
 	}
 	if result.Discovery.DiscoveredWorktrees != 0 {
 		t.Fatalf("DiscoverProject().DiscoveredWorktrees = %d, want 0", result.Discovery.DiscoveredWorktrees)
