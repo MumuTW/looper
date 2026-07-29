@@ -1106,7 +1106,7 @@ func TestSubmitReviewNormalizesLinkedHTMLInlineDisclosureWhenInlineVisibleDisabl
 	disclosureCfg := config.DefaultDisclosureConfig()
 	disclosureCfg.Channels.InlineCommentVisible = false
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Please fix `value`.\n\n<!-- looper:stamp v=1 -->\n<sub>🔁 Powered by <a href=\"https://github.com/nexu-io/looper\">Looper</a> · runner=reviewer · An autonomous AI dev team for your GitHub repos.</sub>", Path: "app.go", Line: 1, Side: "RIGHT"}}, Anchors: &anchors, Disclosure: disclosureCfg})
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Please fix `value`.\n\n<!-- looper:stamp v=1 -->\n<sub>🔁 Powered by <a href=\"https://github.com/mumutw/looper\">Looper</a> · runner=reviewer · An autonomous AI dev team for your GitHub repos.</sub>", Path: "app.go", Line: 1, Side: "RIGHT"}}, Anchors: &anchors, Disclosure: disclosureCfg})
 	if err != nil {
 		t.Fatalf("SubmitReview() error = %v", err)
 	}
@@ -1202,11 +1202,11 @@ func TestSubmitReviewNormalizesPoweredMarkdownInlineDisclosureWhenInlineVisibleD
 	disclosureCfg := config.DefaultDisclosureConfig()
 	disclosureCfg.Channels.InlineCommentVisible = false
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Please fix `value`.\n\n<sub>Powered by [Looper](https://github.com/nexu-io/looper) · runner=reviewer · An autonomous AI dev team for your GitHub repos.</sub>", Path: "app.go", Line: 1, Side: "RIGHT"}}, Anchors: &anchors, Disclosure: disclosureCfg})
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Needs work", CommitID: "abc123", Comments: []ReviewComment{{Body: "Please fix `value`.\n\n<sub>Powered by [Looper](https://github.com/mumutw/looper) · runner=reviewer · An autonomous AI dev team for your GitHub repos.</sub>", Path: "app.go", Line: 1, Side: "RIGHT"}}, Anchors: &anchors, Disclosure: disclosureCfg})
 	if err != nil {
 		t.Fatalf("SubmitReview() error = %v", err)
 	}
-	if !strings.Contains(runner.stdin, "looper:stamp") || strings.Contains(runner.stdin, "Powered by [Looper](https://github.com/nexu-io/looper)") || !strings.Contains(runner.stdin, "Please fix `value`.") {
+	if !strings.Contains(runner.stdin, "looper:stamp") || strings.Contains(runner.stdin, "Powered by [Looper](https://github.com/mumutw/looper)") || !strings.Contains(runner.stdin, "Please fix `value`.") {
 		t.Fatalf("review payload = %s, want powered markdown inline disclosure normalized to hidden marker", runner.stdin)
 	}
 }

@@ -20,7 +20,7 @@ There are **two ways to run this**. Pick one in Step 0, then execute it.
    - "in the background", "while I'm away", "even after I close this", "set and forget" → **Mode B**.
    - "watch it", "do it now", "in here" → **Mode A**.
 2. Otherwise default to **Mode A** (zero install, uses your already-authenticated session). Mention in one line that Mode B exists for unattended runs, and switch only if they ask.
-3. Choose **Mode B** only if `command -v looper` succeeds *and* the user wants it unattended. If they want unattended but Looper isn't installed, tell them to install it (`https://github.com/nexu-io/looper`) or fall back to Mode A.
+3. Choose **Mode B** only if `command -v looper` succeeds *and* the user wants it unattended. If they want unattended but Looper isn't installed, tell them to install it (`https://github.com/mumutw/looper`) or fall back to Mode A.
 
 Keep this lightweight — ask at most one short question, and only when the user gave no signal.
 
@@ -154,13 +154,13 @@ Poll on an interval instead of spinning. Use your agent's own loop/scheduler if 
 ## More detail
 
 Extended `gh` / GraphQL recipes: `references/github-commands.md` (when installed as a skill), or fetch
-`https://raw.githubusercontent.com/nexu-io/looper/main/skills/pr-takeover/references/github-commands.md`.
+`https://raw.githubusercontent.com/mumutw/looper/main/skills/pr-takeover/references/github-commands.md`.
 
 ## One universal prompt (for a bot to post under a PR)
 
 Works in any agent, with or without this skill installed — it just points the agent at this file:
 
-> Take over this PR until it merges — read https://raw.githubusercontent.com/nexu-io/looper/main/skills/pr-takeover/SKILL.md and follow it.
+> Take over this PR until it merges — read https://raw.githubusercontent.com/mumutw/looper/main/skills/pr-takeover/SKILL.md and follow it.
 
 If your agent can't fetch URLs, paste this instead:
 

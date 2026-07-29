@@ -131,7 +131,7 @@ func TestCLIGoldenOutputs(t *testing.T) {
 						switch req.URL.String() {
 						case "http://127.0.0.1:4321/api/v1/status":
 							return nil, os.ErrNotExist
-						case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+						case "https://api.github.com/repos/mumutw/looper/releases/latest":
 							return jsonResponse(t, http.StatusOK, `{"tag_name":"v0.3.0","assets":[]}`), nil
 						default:
 							t.Fatalf("unexpected request URL %q", req.URL.String())

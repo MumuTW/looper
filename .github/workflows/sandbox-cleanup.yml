@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'nexu-io/looper-sandbox' }}
+      SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'mumutw/looper-sandbox' }}
 
     steps:
       - name: Resolve sandbox repository target

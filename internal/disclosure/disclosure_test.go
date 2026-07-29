@@ -37,7 +37,7 @@ func TestMarkdownFooterIsIdempotent(t *testing.T) {
 	if strings.Count(second, Marker) != 1 {
 		t.Fatalf("duplicate marker: %q", second)
 	}
-	if !strings.Contains(second, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.`) {
+	if !strings.Contains(second, `🔁 Powered by <a href="https://github.com/mumutw/looper">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.`) {
 		t.Fatalf("footer was not replaced: %q", second)
 	}
 }
@@ -57,7 +57,7 @@ func TestMarkdownFooterReplacesLegacyLinkedFooter(t *testing.T) {
 func TestMarkdownFooterLinksToLooperRepository(t *testing.T) {
 	s := testStamper()
 	got := s.Markdown("Body", "worker", ChannelPullRequest)
-	if !strings.Contains(got, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.`) {
+	if !strings.Contains(got, `🔁 Powered by <a href="https://github.com/mumutw/looper">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.`) {
 		t.Fatalf("footer missing repository link: %q", got)
 	}
 	if !strings.Contains(got, Slogan) {
@@ -70,15 +70,15 @@ func TestMarkdownFooterLinksToLooperRepository(t *testing.T) {
 
 func TestMarkdownFooterReplacesEscapedAgentAuthoredFooter(t *testing.T) {
 	s := testStamper()
-	body := "Body\n\n" + Marker + "\n<sub>🔁 Powered by <a href=\\\"https://github.com/nexu-io/looper\\\">Looper</a> · runner=worker · agent=opencode · An autonomous AI dev team for your GitHub repos.</sub>"
+	body := "Body\n\n" + Marker + "\n<sub>🔁 Powered by <a href=\\\"https://github.com/mumutw/looper\\\">Looper</a> · runner=worker · agent=opencode · An autonomous AI dev team for your GitHub repos.</sub>"
 	got := s.Markdown(body, "worker", ChannelPullRequest)
 	if strings.Count(got, Marker) != 1 {
 		t.Fatalf("duplicate marker: %q", got)
 	}
-	if strings.Contains(got, `href=\"https://github.com/nexu-io/looper\"`) {
+	if strings.Contains(got, `href=\"https://github.com/mumutw/looper\"`) {
 		t.Fatalf("escaped footer was not removed: %q", got)
 	}
-	if !strings.Contains(got, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.`) {
+	if !strings.Contains(got, `🔁 Powered by <a href="https://github.com/mumutw/looper">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.`) {
 		t.Fatalf("footer was not normalized: %q", got)
 	}
 	if strings.Count(got, `<sub>`) != 1 {
@@ -107,7 +107,7 @@ func TestDisclosureIncludesAgentVendorAndModelSeparately(t *testing.T) {
 	s.Version = "1.2.3"
 
 	footer := s.Markdown("Body", "worker", ChannelPullRequest)
-	if !strings.Contains(footer, `🔁 Powered by <a href="https://github.com/nexu-io/looper">Looper</a> · runner=worker · agent=opencode · An autonomous AI dev team for your GitHub repos.`) {
+	if !strings.Contains(footer, `🔁 Powered by <a href="https://github.com/mumutw/looper">Looper</a> · runner=worker · agent=opencode · An autonomous AI dev team for your GitHub repos.`) {
 		t.Fatalf("footer missing linked slogan disclosure: %q", footer)
 	}
 	if !strings.Contains(footer, "agent=opencode") {
@@ -233,7 +233,7 @@ func TestHasMarkdownStampRequiresFooter(t *testing.T) {
 		t.Fatalf("HasMarkdownStamp() = true, want false for generic subtext")
 	}
 
-	stamped := body + "\n<sub>🔁 Powered by <a href=\"https://github.com/nexu-io/looper\">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.</sub>"
+	stamped := body + "\n<sub>🔁 Powered by <a href=\"https://github.com/mumutw/looper\">Looper</a> · runner=worker · agent=claude-code · An autonomous AI dev team for your GitHub repos.</sub>"
 	if !HasMarkdownStamp(stamped) {
 		t.Fatalf("HasMarkdownStamp() = false, want true for stamped footer")
 	}
