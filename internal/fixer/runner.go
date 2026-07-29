@@ -2012,12 +2012,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
-	// The loop record is the execution authority. A queue row can become
-	// visible while a resume handoff is still persisting its metadata and loop
-	// status, so a claimed row must not bypass a durable pause. Requeue it
-	// without spending an attempt; the completed handoff will wake the
-	// scheduler after changing the loop to queued.
-	if loop.Status == "paused" {
+	// A pending-rediscovery queue row can become visible while its resume
+	// handoff is still clearing metadata and changing the loop to queued.
+	// Requeue only that row without spending an attempt; other paused loops
+	// retain their durable pause semantics.
+	if pendingFixerRediscoveryHandoffInFlight(*loop, queueItem) {
 		availableAt := eventlog.FormatJavaScriptISOString(r.now().Add(r.retryBaseDelay).UTC())
 		message := "fixer loop remains paused while resume handoff is incomplete"
 		if err := r.repos.Queue.MarkRetryIfRunning(ctx, storage.QueueMarkRetryInput{
@@ -2034,6 +2033,21 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if persisted, err := r.repos.Queue.GetByID(ctx, queueItem.ID); err != nil {
 			return ProcessResult{}, err
 		} else if persisted != nil {
+			status = persisted.Status
+		}
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: status}, nil
+	}
+	if loop.Status == "paused" {
+		reason := "fixer loop is paused"
+		if _, err := r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &reason); err != nil {
+			return ProcessResult{}, err
+		}
+		status := "cancelled"
+		persisted, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if persisted != nil {
 			status = persisted.Status
 		}
 		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: status}, nil
@@ -6359,6 +6373,22 @@ func (r *Runner) recordPendingFixerRediscovery(ctx context.Context, loop storage
 		return loop, nil
 	}
 	return r.mergeLoopMetadata(ctx, loop, map[string]any{"pendingFixerRediscovery": state})
+}
+
+func pendingFixerRediscoveryHandoffInFlight(loop storage.LoopRecord, queueItem storage.QueueItemRecord) bool {
+	if loop.Status != "paused" || queueItem.Repo == nil || queueItem.PRNumber == nil {
+		return false
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	pauseReason, _ := stringFromAny(metadata["pauseReason"])
+	if pauseReason != failureStreakPauseReason {
+		return false
+	}
+	pending, ok := parsePendingFixerRediscoveryState(metadata)
+	if !ok {
+		return false
+	}
+	return queueItem.DedupeKey == buildFixerDedupeKey(loop.ProjectID, loop.ID, *queueItem.Repo, *queueItem.PRNumber, pending.HeadSHA, pending.FixItemsStateHash)
 }
 
 func (r *Runner) clearPendingFixerRediscovery(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {

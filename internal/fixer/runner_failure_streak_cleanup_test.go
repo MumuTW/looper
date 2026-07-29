@@ -154,7 +154,7 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	}
 }
 
-func TestProcessClaimedItemDefersWhileLoopIsPaused(t *testing.T) {
+func TestProcessClaimedItemDefersDuringPendingRediscoveryHandoff(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
@@ -163,11 +163,21 @@ func TestProcessClaimedItemDefersWhileLoopIsPaused(t *testing.T) {
 	prNumber := int64(94)
 	loopID := "loop_paused_claim_gate"
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
-	loop := storage.LoopRecord{ID: loopID, Seq: 211, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}
+	headSHA := "head-pending"
+	stateHash := "resume-handoff-state"
+	metadata := mustMarshalJSON(map[string]any{
+		"pauseReason": failureStreakPauseReason,
+		"pendingFixerRediscovery": pendingFixerRediscoveryState{
+			HeadSHA:           headSHA,
+			FixItemsStateHash: stateHash,
+			RecordedAt:        nowISO,
+		},
+	})
+	loop := storage.LoopRecord{ID: loopID, Seq: 211, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_paused_claim_gate", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:paused-claim-gate", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_paused_claim_gate", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, headSHA, stateHash), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -184,6 +194,84 @@ func TestProcessClaimedItemDefersWhileLoopIsPaused(t *testing.T) {
 	runs, err := fixture.repos.Runs.ListByLoop(context.Background(), loopID)
 	if err != nil || len(runs) != 0 {
 		t.Fatalf("Runs.ListByLoop() = (%#v, %v), want no run before resume is durable", runs, err)
+	}
+}
+
+func TestProcessClaimedItemCancelsPersistentPausedLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	projectID := "project_1"
+	repo := "acme/looper"
+	prNumber := int64(95)
+	loopID := "loop_persistent_pause"
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	metadata := mustMarshalJSON(map[string]any{
+		"pauseReason": "operator_pause",
+		// A pending rediscovery may be present on a real paused loop, but it is
+		// not an authority to resume a running claim.
+		"pendingFixerRediscovery": pendingFixerRediscoveryState{HeadSHA: "head-95", FixItemsStateHash: "operator-state", RecordedAt: nowISO},
+	})
+	loop := storage.LoopRecord{ID: loopID, Seq: 212, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_persistent_pause", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, "head-95", "operator-state"), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err != nil || result.Status != "cancelled" {
+		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want persistent paused claim cancelled", result, err)
+	}
+	persisted, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || persisted == nil || persisted.Status != "cancelled" {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want durable cancelled claim", persisted, err)
+	}
+}
+
+func TestProcessClaimedItemResumeHandoffPreservesConcurrentStopCancellation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	projectID := "project_1"
+	repo := "acme/looper"
+	prNumber := int64(96)
+	loopID := "loop_resume_handoff_stop"
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	headSHA := "head-96"
+	stateHash := "resume-stop-state"
+	metadata := mustMarshalJSON(map[string]any{
+		"pauseReason": failureStreakPauseReason,
+		"pendingFixerRediscovery": pendingFixerRediscoveryState{
+			HeadSHA:           headSHA,
+			FixItemsStateHash: stateHash,
+			RecordedAt:        nowISO,
+		},
+	})
+	loop := storage.LoopRecord{ID: loopID, Seq: 213, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_resume_handoff_stop", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, headSHA, stateHash), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	reason := "operator stop"
+	if _, err := fixture.repos.Queue.CancelByLoop(context.Background(), loopID, nowISO, &reason); err != nil {
+		t.Fatalf("Queue.CancelByLoop() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err != nil || result.Status != "cancelled" {
+		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want cancelled concurrent-stop result", result, err)
+	}
+	persisted, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || persisted == nil || persisted.Status != "cancelled" {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want stop cancellation preserved", persisted, err)
 	}
 }
 
