@@ -37,6 +37,7 @@ func TestPerfBudgets(t *testing.T) {
 
 	server := httptest.NewServer(h)
 	t.Cleanup(server.Close)
+	client := &http.Client{Timeout: 5 * time.Second}
 
 	endpoints := []struct {
 		name string
@@ -62,13 +63,13 @@ func TestPerfBudgets(t *testing.T) {
 
 	for _, endpoint := range endpoints {
 		t.Run(endpoint.name, func(t *testing.T) {
-			p95 := measurePerfSequentialP95(t, server.URL+endpoint.path, sequentialRequests)
+			p95 := measurePerfSequentialP95(t, client, server.URL+endpoint.path, sequentialRequests)
 			t.Logf("sequential: p95=%s (budget %s, ceiling %s)", p95.Round(time.Millisecond), p95Budget, p95Ceiling)
 			if p95 > p95Ceiling {
 				t.Fatalf("sequential p95 = %s exceeds ceiling %s (10x budget)", p95, p95Ceiling)
 			}
 
-			throughput := measurePerfConcurrentThroughput(t, server.URL+endpoint.path, concurrentReaders, requestsPerReader)
+			throughput := measurePerfConcurrentThroughput(t, client, server.URL+endpoint.path, concurrentReaders, requestsPerReader)
 			t.Logf("concurrent(%d readers): throughput=%.0f req/s (budget %.0f req/s, floor %.0f req/s)", concurrentReaders, throughput, throughputBudget, throughputFloor)
 			if throughput < throughputFloor {
 				t.Fatalf("concurrent throughput = %.0f req/s below floor %.0f req/s (budget/10)", throughput, throughputFloor)
@@ -94,12 +95,15 @@ func seedPerfBudgetEvents(t *testing.T, repos *storage.Repositories, count int) 
 	}
 }
 
-func measurePerfSequentialP95(t *testing.T, url string, requests int) time.Duration {
+func measurePerfSequentialP95(t *testing.T, client *http.Client, url string, requests int) time.Duration {
 	t.Helper()
 	latencies := make([]time.Duration, 0, requests)
 	for i := 0; i < requests; i++ {
 		start := time.Now()
-		statusCode := perfGET(t, url)
+		statusCode, err := perfGET(client, url)
+		if err != nil {
+			t.Fatalf("GET %s error = %v", url, err)
+		}
 		latencies = append(latencies, time.Since(start))
 		if statusCode != http.StatusOK {
 			t.Fatalf("GET %s status = %d, want 200", url, statusCode)
@@ -109,9 +113,11 @@ func measurePerfSequentialP95(t *testing.T, url string, requests int) time.Durat
 	return latencies[int(float64(len(latencies))*0.95)-1]
 }
 
-func measurePerfConcurrentThroughput(t *testing.T, url string, readers, requestsPerReader int) float64 {
+func measurePerfConcurrentThroughput(t *testing.T, client *http.Client, url string, readers, requestsPerReader int) float64 {
 	t.Helper()
 	var failures atomic.Int64
+	var firstFailure string
+	var firstFailureOnce sync.Once
 	start := time.Now()
 	var wg sync.WaitGroup
 	for reader := 0; reader < readers; reader++ {
@@ -119,8 +125,16 @@ func measurePerfConcurrentThroughput(t *testing.T, url string, readers, requests
 		go func() {
 			defer wg.Done()
 			for i := 0; i < requestsPerReader; i++ {
-				if statusCode := perfGET(t, url); statusCode != http.StatusOK {
+				statusCode, err := perfGET(client, url)
+				if err != nil || statusCode != http.StatusOK {
 					failures.Add(1)
+					firstFailureOnce.Do(func() {
+						if err != nil {
+							firstFailure = err.Error()
+						} else {
+							firstFailure = fmt.Sprintf("status %d", statusCode)
+						}
+					})
 				}
 			}
 		}()
@@ -130,18 +144,19 @@ func measurePerfConcurrentThroughput(t *testing.T, url string, readers, requests
 
 	total := readers * requestsPerReader
 	if got := failures.Load(); got > 0 {
-		t.Fatalf("GET %s returned non-200 for %d/%d concurrent requests", url, got, total)
+		t.Fatalf("GET %s failed for %d/%d concurrent requests (first failure: %s)", url, got, total, firstFailure)
 	}
 	return float64(total) / elapsed.Seconds()
 }
 
-func perfGET(t *testing.T, url string) int {
-	t.Helper()
-	resp, err := http.Get(url) //nolint:bodyclose // body closed below
+func perfGET(client *http.Client, url string) (int, error) {
+	resp, err := client.Get(url) //nolint:bodyclose // body closed below
 	if err != nil {
-		t.Fatalf("GET %s error = %v", url, err)
+		return 0, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return 0, err
+	}
+	return resp.StatusCode, nil
 }
