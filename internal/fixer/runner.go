@@ -613,9 +613,6 @@ type Runner struct {
 	consecutiveFailureThreshold int
 	onAgentExecutionStarted     AgentExecutionStartedFunc
 	onQueueItemEnqueued         func()
-	// failureStreakHandoffReadHook is an in-package test seam for the
-	// read-to-handoff race. Production leaves it nil.
-	failureStreakHandoffReadHook func()
 }
 
 type DiscoveryInput struct {
@@ -1928,7 +1925,8 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	if failErr != nil {
 		return nil, failErr
 	}
-	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue); err != nil {
+	breakerPause, err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue)
+	if err != nil {
 		return nil, err
 	}
 	if breakerStreak > 0 && breakerLoop != nil && runFailure != nil {
@@ -1953,8 +1951,8 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 					return nil, projectErr
 				}
 				if project != nil {
-					if breakerStreak > 0 {
-						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &runFailure.checkpoint)
+					if breakerStreak > 0 && breakerPause != nil {
+						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, &runFailure.checkpoint)
 						if resumeErr != nil {
 							return nil, resumeErr
 						}
@@ -1974,21 +1972,21 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 }
 
-func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord) error {
+func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord) (*storage.LoopRecord, error) {
 	if queueItem.LoopID == nil {
-		return nil
+		return nil, nil
 	}
 	loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// A run is created before the loop is flipped to running. If that status
 	// write itself fails, the run is still a genuine failed run and its breaker
 	// result must reconcile the still-queued loop.
 	if loop == nil || (loop.Status != "running" && loop.Status != "queued") {
-		return nil
+		return nil, nil
 	}
-	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	updated, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.LastRunAt = stringPtr(r.nowISO())
 		if failedQueue != nil && failedQueue.Status == "queued" {
 			updated.Status = "queued"
@@ -1999,7 +1997,10 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.NextRunAt = nil
 		}
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return &updated, nil
 }
 
 func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (result ProcessResult, retErr error) {
@@ -2157,7 +2158,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if breakerStreak > 0 {
 			r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-			if _, err := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &latest); err != nil {
+			if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, &latest); err != nil {
 				return ProcessResult{}, err
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -2296,7 +2297,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			if breakerStreak > 0 {
 				r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-				if _, err := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &latest); err != nil {
+				if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, &latest); err != nil {
 					return ProcessResult{}, err
 				}
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -5266,7 +5267,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			if err != nil {
 				return loopUpsertResult{}, err
 			}
-			updatedLoop.UpdatedAt = nowISO
+			updatedLoop.UpdatedAt = eventlog.NextJavaScriptISOString(now, updatedLoop.UpdatedAt)
 			if err := r.repos.Loops.Upsert(ctx, updatedLoop); err != nil {
 				return loopUpsertResult{}, err
 			}
@@ -5274,7 +5275,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 		updatedLoop.Status = "queued"
 		updatedLoop.NextRunAt = &availableAtISO
-		updatedLoop.UpdatedAt = nowISO
+		updatedLoop.UpdatedAt = eventlog.NextJavaScriptISOString(now, updatedLoop.UpdatedAt)
 		if err := r.repos.Loops.Upsert(ctx, updatedLoop); err != nil {
 			return loopUpsertResult{}, err
 		}
@@ -5798,15 +5799,16 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 	if r.db == nil || r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
 		return false, nil
 	}
-	observed, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil {
-		return false, err
-	}
-	if observed == nil {
+	// The breaker pause is the handoff authority. Do not re-read here and make
+	// a newer operator pause the baseline: that would allow a completed stop to
+	// be resumed before the handoff's first durable comparison.
+	if loop.Status != "paused" {
 		return false, nil
 	}
-	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(observed.MetadataJSON))
-	if !ok || strings.TrimSpace(pending.FixItemsStateHash) == "" {
+	authorityMetadata := parseJSONObject(loop.MetadataJSON)
+	pauseReason, _ := stringFromAny(authorityMetadata["pauseReason"])
+	pending, ok := parsePendingFixerRediscoveryState(authorityMetadata)
+	if pauseReason != failureStreakPauseReason || !ok || strings.TrimSpace(pending.FixItemsStateHash) == "" {
 		return false, nil
 	}
 	failedStateHash := ""
@@ -5816,22 +5818,18 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 	if strings.TrimSpace(pending.FixItemsStateHash) == strings.TrimSpace(failedStateHash) {
 		return false, nil
 	}
-	if r.failureStreakHandoffReadHook != nil {
-		r.failureStreakHandoffReadHook()
-	}
-
 	resumed := false
-	err = storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+	err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
 		repos := storage.NewRepositories(tx)
 		current, err := repos.Loops.GetByID(ctx, loop.ID)
 		if err != nil {
 			return err
 		}
 		// Pause/terminate owns cancellation. A handoff may only proceed from the
-		// exact paused row observed above; UpdatedAt is the existing durable CAS
-		// revision, so an operator pause that retains the same status/metadata
-		// cannot be mistaken for the breaker handoff.
-		if current == nil || current.Status != "paused" || current.UpdatedAt != observed.UpdatedAt {
+		// exact breaker transition passed by the caller. UpdatedAt is its durable
+		// CAS revision, so any later pause/terminate keeps ownership even when it
+		// retains the same status and breaker metadata.
+		if current == nil || current.Status != "paused" || current.UpdatedAt != loop.UpdatedAt {
 			return nil
 		}
 		metadata := parseJSONObject(current.MetadataJSON)
@@ -5864,7 +5862,7 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 		current.Status = "queued"
 		current.LastRunAt = stringPtr(r.nowISO())
 		current.NextRunAt = &nextRunAt
-		current.UpdatedAt = r.nowISO()
+		current.UpdatedAt = eventlog.NextJavaScriptISOString(r.now(), current.UpdatedAt)
 		if err := repos.Loops.Upsert(ctx, *current); err != nil {
 			return err
 		}
@@ -5959,7 +5957,7 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 		updated = *current
 	}
 	mutate(&updated)
-	updated.UpdatedAt = r.nowISO()
+	updated.UpdatedAt = eventlog.NextJavaScriptISOString(r.now(), updated.UpdatedAt)
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
 	}
@@ -6503,7 +6501,7 @@ func (r *Runner) mergeLoopMetadata(ctx context.Context, loop storage.LoopRecord,
 		return storage.LoopRecord{}, err
 	}
 	updated.MetadataJSON = stringPtr(metadataJSON)
-	updated.UpdatedAt = r.nowISO()
+	updated.UpdatedAt = eventlog.NextJavaScriptISOString(r.now(), updated.UpdatedAt)
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
 	}

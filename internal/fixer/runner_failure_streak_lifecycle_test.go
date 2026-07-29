@@ -204,7 +204,7 @@ func TestRecoveredRunFailureReconcilesStillQueuedLoop(t *testing.T) {
 	terminal := queue
 	terminal.Status = "manual_intervention"
 
-	if err := runner.reconcileRecoveredLoop(context.Background(), queue, &terminal); err != nil {
+	if _, err := runner.reconcileRecoveredLoop(context.Background(), queue, &terminal); err != nil {
 		t.Fatalf("reconcileRecoveredLoop() error = %v", err)
 	}
 	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
