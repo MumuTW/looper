@@ -2020,7 +2020,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if loop.Status == "paused" {
 		availableAt := eventlog.FormatJavaScriptISOString(r.now().Add(r.retryBaseDelay).UTC())
 		message := "fixer loop remains paused while resume handoff is incomplete"
-		if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{
+		if err := r.repos.Queue.MarkRetryIfRunning(ctx, storage.QueueMarkRetryInput{
 			ID:           queueItem.ID,
 			AvailableAt:  availableAt,
 			Attempts:     queueItem.Attempts,
@@ -2030,7 +2030,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}); err != nil {
 			return ProcessResult{}, err
 		}
-		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "queued"}, nil
+		status := "queued"
+		if persisted, err := r.repos.Queue.GetByID(ctx, queueItem.ID); err != nil {
+			return ProcessResult{}, err
+		} else if persisted != nil {
+			status = persisted.Status
+		}
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: status}, nil
 	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
