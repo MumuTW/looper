@@ -40,6 +40,8 @@ type ReadProcessCommandFunc func(context.Context, int) (string, error)
 
 type ReadProcessStartFunc func(context.Context, int) (int64, error)
 
+type ReadProcessBootIDFunc func(context.Context, int) (string, error)
+
 type SignalProcessFunc func(int, syscall.Signal) error
 
 type RecoverySummary struct {
@@ -86,7 +88,7 @@ type RecoveryOrphanAgentCleanup struct {
 	QuarantinedCount int64 `json:"quarantinedCount"`
 	// Classification counts for active execution evidence (ADR-0015 R8 / #581).
 	// ConfirmedDead includes durable terminal/current-daemon drain authority and
-	// Issue #22's expired-lease + invalid-identity composite authority.
+	// active rows are never promoted here from PID/lease evidence alone.
 	ConfirmedDeadCount int64  `json:"confirmedDeadCount"`
 	ObservedLiveCount  int64  `json:"observedLiveCount"`
 	UncertainCount     int64  `json:"uncertainCount"`
@@ -115,6 +117,7 @@ type Options struct {
 	RunSchedulerTick            RunSchedulerTickFunc
 	ReadProcessCommand          ReadProcessCommandFunc
 	ReadProcessStart            ReadProcessStartFunc
+	ReadProcessBootID           ReadProcessBootIDFunc
 	SignalProcess               SignalProcessFunc
 	DeferRecovery               bool
 }
@@ -161,6 +164,7 @@ type Runtime struct {
 	customSchedulerTick    bool
 	readProcessCommand     ReadProcessCommandFunc
 	readProcessStart       ReadProcessStartFunc
+	readProcessBootID      ReadProcessBootIDFunc
 	signalProcess          SignalProcessFunc
 	shutdownTimeout        time.Duration
 	deferRecovery          bool
@@ -249,6 +253,10 @@ func New(options Options) *Runtime {
 	if readProcessStart == nil {
 		readProcessStart = defaultReadProcessStart
 	}
+	readProcessBootID := options.ReadProcessBootID
+	if readProcessBootID == nil {
+		readProcessBootID = defaultReadProcessBootID
+	}
 
 	signalProcess := options.SignalProcess
 	if signalProcess == nil {
@@ -288,6 +296,7 @@ func New(options Options) *Runtime {
 		customSchedulerTick:         customSchedulerTick,
 		readProcessCommand:          readProcessCommand,
 		readProcessStart:            readProcessStart,
+		readProcessBootID:           readProcessBootID,
 		signalProcess:               signalProcess,
 		shutdownTimeout:             shutdownTimeout,
 		worktreeCleanupInitialDelay: options.WorktreeCleanupInitialDelay,
@@ -1658,7 +1667,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	uncertainAgentRunIDs := make(map[string]struct{})
 	activeAgentRunIDs := make(map[string]struct{})
 	quarantinedLoopIDs := make(map[string]struct{})
-	var startupStaleExecutions []storage.AgentExecutionRecord
 	if repositories.AgentExecutions != nil {
 		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
 		if err != nil {
@@ -1672,8 +1680,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			eventsWritten += observedEvents
 			classification := assessment.Classification
 			switch assessment.Disposition {
-			case executionLivenessStale:
-				summary.OrphanAgentCleanup.ConfirmedDeadCount += 1
 			case executionLivenessActive:
 				summary.OrphanAgentCleanup.ObservedLiveCount += 1
 				if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
@@ -1684,11 +1690,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			}
 
 			switch assessment.Disposition {
-			case executionLivenessStale:
-				// Let the shared run reconciler finalize tied executions first,
-				// so it retains the stale evidence needed to release a prior
-				// liveness-only quarantine and report stale_requeued.
-				startupStaleExecutions = append(startupStaleExecutions, execution)
 			case executionLivenessActive, executionLivenessNeedsConfirmation:
 				reason := "startup recovery: matching live process from previous daemon"
 				if assessment.Disposition == executionLivenessNeedsConfirmation {
@@ -1752,20 +1753,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary.InterruptedRunsMarked += staleSummary.InterruptedRuns
 	summary.LoopsRequeued += staleSummary.LoopsRequeued
 	eventsWritten += staleSummary.EventsWritten
-	for _, execution := range startupStaleExecutions {
-		current, err := repositories.AgentExecutions.GetByID(ctx, execution.ID)
-		if err != nil {
-			return RecoverySummary{}, err
-		}
-		if current != nil && (current.Status == "running" || current.Status == "cancelling") {
-			message := "Liveness lease expired and persisted process identity is invalid"
-			if err := r.markStaleExecutionTerminal(ctx, repositories, *current, nowISO, message); err != nil {
-				return RecoverySummary{}, err
-			}
-		}
-		summary.OrphanAgentCleanup.CleanedCount += 1
-	}
-
 	loops, err := repositories.Loops.List(ctx)
 	if err != nil {
 		return RecoverySummary{}, err
@@ -2272,17 +2259,6 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		if !decision.Interrupt {
 			continue
 		}
-		for _, execution := range decision.CleanupExecutions {
-			message := decision.ExecutionMessage
-			if strings.TrimSpace(message) == "" {
-				message = "Liveness lease expired and persisted process identity is invalid"
-			}
-			if err := r.markStaleExecutionTerminal(ctx, repositories, execution, nowISO, message); err != nil {
-				return StaleRunReconcileSummary{}, err
-			}
-			summary.CleanedExecutions += 1
-			summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
-		}
 		if err := interruptRecoveryRun(ctx, repositories, run, *loop, nowISO, decision.Message); err != nil {
 			return StaleRunReconcileSummary{}, err
 		}
@@ -2300,7 +2276,7 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			summary.EventsWritten += verification.EventsWritten
 			latestRunBlocksRequeue = verification.Live || verification.Uncertain
 		}
-		queueRepair, err := r.repairStaleRunQueueState(ctx, repositories, *loop, latestRun, latestRunBlocksRequeue, len(decision.CleanupExecutions) > 0, nowISO)
+		queueRepair, err := r.repairStaleRunQueueState(ctx, repositories, *loop, latestRun, latestRunBlocksRequeue, nowISO)
 		if err != nil {
 			return StaleRunReconcileSummary{}, err
 		}
@@ -2308,17 +2284,6 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		summary.QueueItemsRequeued += queueRepair.QueueItemsRequeued
 		summary.QueueItemsCancelled += queueRepair.QueueItemsCancelled
 		summary.EventsWritten += queueRepair.EventsWritten
-		if queueRepair.LoopsRequeued > 0 {
-			for _, execution := range decision.CleanupExecutions {
-				wrote, err := r.appendExecutionStaleRequeuedEvent(ctx, repositories, execution, nowISO, queueRepair)
-				if err != nil {
-					return StaleRunReconcileSummary{}, err
-				}
-				if wrote {
-					summary.EventsWritten += 1
-				}
-			}
-		}
 	}
 	if repositories.Queue != nil {
 		loops, err := repositories.Loops.List(ctx)
@@ -2368,8 +2333,6 @@ type staleRunCandidateDecision struct {
 	Interrupt              bool
 	Uncertain              bool
 	Message                string
-	ExecutionMessage       string
-	CleanupExecutions      []storage.AgentExecutionRecord
 	ConfirmationExecutions []storage.AgentExecutionRecord
 	EventsWritten          int64
 }
@@ -2407,16 +2370,14 @@ func (r *Runtime) evaluateStaleRunCandidate(ctx context.Context, repositories *s
 			return staleRunCandidateDecision{}, err
 		}
 		decision.EventsWritten += verification.EventsWritten
+		if verification.Live {
+			return staleRunCandidateDecision{}, nil
+		}
 		if verification.Uncertain {
 			decision.Uncertain = true
 			decision.ConfirmationExecutions = append(decision.ConfirmationExecutions, verification.ConfirmationExecutions...)
 			return decision, nil
 		}
-		if verification.Live {
-			return staleRunCandidateDecision{}, nil
-		}
-		decision.CleanupExecutions = append(decision.CleanupExecutions, verification.StaleExecutions...)
-		decision.ExecutionMessage = "Liveness lease expired and persisted process identity is invalid"
 	}
 	decision.Interrupt = true
 	if mode == staleRunReconcileModeStartup {
@@ -2434,7 +2395,6 @@ type executionLivenessResult struct {
 	// Uncertain is true when any execution lacks the two-signal Authority needed
 	// for stale recovery.
 	Uncertain              bool
-	StaleExecutions        []storage.AgentExecutionRecord
 	ConfirmationExecutions []storage.AgentExecutionRecord
 	EventsWritten          int64
 }
@@ -2450,9 +2410,6 @@ func (r *Runtime) verifyRunExecutionLiveness(ctx context.Context, repositories *
 		switch assessment.Disposition {
 		case executionLivenessActive:
 			result.Live = true
-			continue
-		case executionLivenessStale:
-			result.StaleExecutions = append(result.StaleExecutions, execution)
 			continue
 		case executionLivenessNeedsConfirmation:
 			result.Uncertain = true
@@ -2535,7 +2492,7 @@ func (r *Runtime) currentDaemonOwnsExecution(execution storage.AgentExecutionRec
 	)
 }
 
-func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, latestRun *storage.RunRecord, latestRunHasLiveAgent bool, releaseLivenessQuarantine bool, nowISO string) (staleRunQueueRepairSummary, error) {
+func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, latestRun *storage.RunRecord, latestRunHasLiveAgent bool, nowISO string) (staleRunQueueRepairSummary, error) {
 	summary := staleRunQueueRepairSummary{}
 	if repositories == nil || repositories.Queue == nil {
 		return summary, nil
@@ -2544,14 +2501,7 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 	if err != nil {
 		return staleRunQueueRepairSummary{}, err
 	}
-	releaseLivenessQuarantine = releaseLivenessQuarantine && isExecutionLivenessQuarantine(latestQueue)
-	if releaseLivenessQuarantine && loop.Status == "paused" {
-		// This pause was created only to prevent overlap while liveness was
-		// uncertain. Once the same reconciler proves the execution stale, it may
-		// repair run/queue state. Unrelated manual/risky/dirty pauses stay parked.
-		loop.Status = "running"
-	}
-	if latestQueueIsManualIntervention(latestQueue) && !releaseLivenessQuarantine {
+	if latestQueueIsManualIntervention(latestQueue) {
 		if loop.Status == "running" || loop.Status == "queued" {
 			if latestQueue.Status == "manual_intervention" {
 				normalizedLoop := loop
@@ -2680,7 +2630,7 @@ func (r *Runtime) repairInterruptedLoopQueueIfNeeded(ctx context.Context, reposi
 	if activeCount == 0 && !shouldRequeueLoop(loop, latestRun, false) {
 		return staleRunQueueRepairSummary{}, nil
 	}
-	return r.repairStaleRunQueueState(ctx, repositories, loop, latestRun, false, false, nowISO)
+	return r.repairStaleRunQueueState(ctx, repositories, loop, latestRun, false, nowISO)
 }
 
 func isAgentBackedRunStep(loop storage.LoopRecord, run storage.RunRecord) bool {
@@ -2806,8 +2756,6 @@ func (r *Runtime) appendExecutionLivenessEvent(ctx context.Context, repositories
 	switch assessment.Disposition {
 	case executionLivenessActive:
 		eventType = "looperd.recovery.execution_active"
-	case executionLivenessStale:
-		eventType = "looperd.recovery.execution_stale"
 	}
 	payload := map[string]any{
 		"status":         string(assessment.Disposition),
@@ -2849,48 +2797,6 @@ func (r *Runtime) appendExecutionLivenessEvent(ctx context.Context, repositories
 		return false, err
 	}
 	return true, nil
-}
-
-func (r *Runtime) appendExecutionStaleRequeuedEvent(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, nowISO string, repair staleRunQueueRepairSummary) (bool, error) {
-	payloadJSON := mustMarshalJSON(map[string]any{
-		"status":              "stale_requeued",
-		"queueItemsRequeued":  repair.QueueItemsRequeued,
-		"queueItemsCancelled": repair.QueueItemsCancelled,
-	})
-	if repositories.Events != nil {
-		events, err := repositories.Events.ListByEntity(ctx, "agent_execution", execution.ID)
-		if err != nil {
-			return false, err
-		}
-		for _, event := range events {
-			if event.EventType == "looperd.recovery.execution_stale_requeued" {
-				return false, nil
-			}
-		}
-	}
-	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-		ID:          newRuntimeEventID(),
-		EventType:   "looperd.recovery.execution_stale_requeued",
-		ProjectID:   execution.ProjectID,
-		LoopID:      execution.LoopID,
-		RunID:       execution.RunID,
-		EntityType:  stringPtr("agent_execution"),
-		EntityID:    stringPtr(execution.ID),
-		PayloadJSON: payloadJSON,
-		CreatedAt:   nowISO,
-	}); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (r *Runtime) markStaleExecutionTerminal(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, nowISO, message string) error {
-	stale := execution
-	stale.Status = "failed"
-	stale.ErrorMessage = stringPtr(message)
-	stale.EndedAt = stringPtr(nowISO)
-	stale.UpdatedAt = nowISO
-	return repositories.AgentExecutions.Upsert(ctx, stale)
 }
 
 func (r *Runtime) markRecoveredExecutionTerminal(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, pid int, nowISO string, message string) error {
@@ -3325,38 +3231,51 @@ func (r *Runtime) executionMatchesProcess(ctx context.Context, execution storage
 	if processCommand == "" {
 		return false, false, nil
 	}
-	expectedTokens, err := expectedExecutionCommandTokens(execution)
-	if err != nil {
-		return false, true, err
-	}
-	actualTokens := splitProcessCommand(processCommand)
-	if !commandPrefixMatches(expectedTokens, actualTokens) {
-		return false, true, nil
-	}
-	expectedStart, ok := executionProcessStart(execution)
+	expectedBirth, ok := executionProcessBirth(execution)
 	if !ok {
 		return false, true, fmt.Errorf("missing durable process start identity")
+	}
+	if processidentity.RequiresBootID() && expectedBirth.BootID == "" {
+		return false, true, fmt.Errorf("missing durable Linux boot identity")
 	}
 	actualStart, err := r.readProcessStart(ctx, pid)
 	if err != nil {
 		return false, true, fmt.Errorf("read process start identity: %w", err)
 	}
-	return actualStart == expectedStart, true, nil
+	if actualStart != expectedBirth.StartTime {
+		return false, true, nil
+	}
+	if expectedBirth.BootID != "" {
+		actualBootID, err := r.readProcessBootID(ctx, pid)
+		if err != nil {
+			return false, true, fmt.Errorf("read process boot identity: %w", err)
+		}
+		if strings.TrimSpace(actualBootID) != expectedBirth.BootID {
+			return false, true, nil
+		}
+	}
+	// The birth token, not argv, is process identity. A shebang wrapper can exec
+	// the real CLI in place while retaining the same PID and birth token.
+	return true, true, nil
 }
 
-func executionProcessStart(execution storage.AgentExecutionRecord) (int64, bool) {
+func executionProcessBirth(execution storage.AgentExecutionRecord) (processidentity.Birth, bool) {
 	if execution.MetadataJSON == nil || strings.TrimSpace(*execution.MetadataJSON) == "" {
-		return 0, false
+		return processidentity.Birth{}, false
 	}
 	var payload struct {
 		ProcessIdentity struct {
-			StartTime int64 `json:"startTime"`
+			StartTime int64  `json:"startTime"`
+			BootID    string `json:"bootId"`
 		} `json:"processIdentity"`
 	}
 	if json.Unmarshal([]byte(*execution.MetadataJSON), &payload) != nil || payload.ProcessIdentity.StartTime <= 0 {
-		return 0, false
+		return processidentity.Birth{}, false
 	}
-	return payload.ProcessIdentity.StartTime, true
+	return processidentity.Birth{
+		StartTime: payload.ProcessIdentity.StartTime,
+		BootID:    strings.TrimSpace(payload.ProcessIdentity.BootID),
+	}, true
 }
 
 func expectedExecutionCommandTokens(execution storage.AgentExecutionRecord) ([]string, error) {
@@ -3472,6 +3391,13 @@ func defaultReadProcessStart(ctx context.Context, pid int) (int64, error) {
 		return 0, err
 	}
 	return processidentity.StartTime(pid)
+}
+
+func defaultReadProcessBootID(ctx context.Context, _ int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return processidentity.LinuxBootID()
 }
 
 func defaultSignalProcess(pid int, signal syscall.Signal) error {
@@ -3977,15 +3903,6 @@ func normalizeStaleQueuedLoopStatus(loop storage.LoopRecord, latestRun storage.R
 
 func latestQueueIsManualIntervention(queue *storage.QueueItemRecord) bool {
 	return queue != nil && (queue.Status == "manual_intervention" || (queue.LastErrorKind != nil && *queue.LastErrorKind == "manual_intervention"))
-}
-
-func isExecutionLivenessQuarantine(queue *storage.QueueItemRecord) bool {
-	if queue == nil || !latestQueueIsManualIntervention(queue) {
-		return false
-	}
-	reason := strings.TrimSpace(derefString(queue.LastError))
-	return strings.HasPrefix(reason, "needs confirmation:") ||
-		strings.HasPrefix(reason, "startup recovery: matching live process from previous daemon")
 }
 
 func derefRunOrZero(run *storage.RunRecord) storage.RunRecord {

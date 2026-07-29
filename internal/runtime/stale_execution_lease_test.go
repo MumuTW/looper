@@ -10,7 +10,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestRuntimeReconcileStaleRunningRunsRequeuesExpiredMissingPIDExecution(t *testing.T) {
+func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMissingPIDExecution(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
@@ -38,42 +38,39 @@ func TestRuntimeReconcileStaleRunningRunsRequeuesExpiredMissingPIDExecution(t *t
 	if err != nil {
 		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
 	}
-	if summary.InterruptedRuns != 1 || summary.LoopsRequeued != 1 || summary.CleanedExecutions != 1 {
-		t.Fatalf("summary = %#v, want expired execution finalized and work requeued", summary)
+	if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 || summary.InterruptedRuns != 0 {
+		t.Fatalf("summary = %#v, want expired leader-only evidence quarantined", summary)
 	}
 
 	execution, err := repos.AgentExecutions.GetByID(context.Background(), "execution_missing_pid")
 	if err != nil {
 		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
 	}
-	if execution == nil || execution.Status != "failed" || execution.EndedAt == nil {
-		t.Fatalf("execution = %#v, want terminal failed stale execution", execution)
+	if execution == nil || execution.Status != "running" || execution.EndedAt != nil {
+		t.Fatalf("execution = %#v, want retryable active evidence", execution)
 	}
 	run, _ := repos.Runs.GetByID(context.Background(), runID)
 	loop, _ := repos.Loops.GetByID(context.Background(), loopID)
 	queue, _ := repos.Queue.GetByID(context.Background(), queueID)
-	if run == nil || run.Status != "interrupted" {
-		t.Fatalf("run = %#v, want interrupted", run)
+	if run == nil || run.Status != "running" {
+		t.Fatalf("run = %#v, want running quarantine", run)
 	}
-	if loop == nil || loop.Status != "queued" {
-		t.Fatalf("loop = %#v, want queued", loop)
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused", loop)
 	}
-	if queue == nil || queue.Status != "queued" {
-		t.Fatalf("queue = %#v, want queued", queue)
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want manual intervention", queue)
 	}
 	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_missing_pid")
 	if err != nil {
 		t.Fatalf("Events.ListByEntity() error = %v", err)
 	}
-	if !containsEventType(events, "looperd.recovery.execution_stale") {
-		t.Fatalf("events = %#v, want operator-visible execution_stale event", events)
-	}
-	if !containsEventType(events, "looperd.recovery.execution_stale_requeued") {
-		t.Fatalf("events = %#v, want operator-visible stale-requeued outcome", events)
+	if !containsEventType(events, "looperd.recovery.execution_confirmation_needed") {
+		t.Fatalf("events = %#v, want operator-visible confirmation-needed outcome", events)
 	}
 }
 
-func TestRuntimeReconcileStaleRunningRunsRequeuesExpiredMismatchedPID(t *testing.T) {
+func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMismatchedPID(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -98,7 +95,7 @@ func TestRuntimeReconcileStaleRunningRunsRequeuesExpiredMismatchedPID(t *testing
 			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
 				ID: "execution_mismatched_" + tc.name, ProjectID: stringPtr("project_1"),
 				LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
-				PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`),
+				PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":2201,"bootId":"boot-a"}}`),
 				LastHeartbeatAt: &oldISO, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
 			}); err != nil {
 				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
@@ -108,8 +105,8 @@ func TestRuntimeReconcileStaleRunningRunsRequeuesExpiredMismatchedPID(t *testing
 			if err != nil {
 				t.Fatalf("reconcile error = %v", err)
 			}
-			if summary.InterruptedRuns != 1 || summary.LoopsRequeued != 1 || summary.CleanedExecutions != 1 {
-				t.Fatalf("summary = %#v, want expired mismatched execution requeued", summary)
+			if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 || summary.InterruptedRuns != 0 {
+				t.Fatalf("summary = %#v, want expired mismatched execution quarantined", summary)
 			}
 		})
 	}
@@ -129,7 +126,7 @@ func TestRuntimeReconcileStaleRunningRunsNeverOverlapsMatchingLiveProcess(t *tes
 		ID: "execution_matching_live", ProjectID: stringPtr("project_1"),
 		LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
 		PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`),
-		MetadataJSON:    stringPtr(`{"processIdentity":{"startTime":2202}}`),
+		MetadataJSON:    stringPtr(`{"processIdentity":{"startTime":2202,"bootId":"boot-a"}}`),
 		LastHeartbeatAt: &oldISO, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
@@ -191,7 +188,7 @@ func TestRuntimeReconcileStaleRunningRunsParksFreshInvalidIdentityForConfirmatio
 	}
 }
 
-func TestRuntimeReconcileStaleRunningRunsReleasesLivenessQuarantineAfterExpiry(t *testing.T) {
+func TestRuntimeReconcileStaleRunningRunsPreservesQuarantineAfterExpiry(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
@@ -210,6 +207,17 @@ func TestRuntimeReconcileStaleRunningRunsReleasesLivenessQuarantineAfterExpiry(t
 	}
 
 	later := now.Add(executionLivenessLeaseTTL + time.Minute)
+	operatorPausedAt := formatJavaScriptISOString(now.Add(5 * time.Minute))
+	loop, _ := repos.Loops.GetByID(context.Background(), loopID)
+	loop.Status = "paused"
+	loop.UpdatedAt = operatorPausedAt
+	if err := repos.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("record operator pause: %v", err)
+	}
+	reason := "Paused by operator after recovery quarantine"
+	if _, err := repos.Queue.CancelByLoop(context.Background(), loopID, operatorPausedAt, &reason); err != nil {
+		t.Fatalf("CancelByLoop() error = %v", err)
+	}
 	rt.mu.Lock()
 	rt.now = func() time.Time { return later }
 	rt.mu.Unlock()
@@ -217,17 +225,17 @@ func TestRuntimeReconcileStaleRunningRunsReleasesLivenessQuarantineAfterExpiry(t
 	if err != nil {
 		t.Fatalf("second reconcile error = %v", err)
 	}
-	if summary.CleanedExecutions != 1 || summary.LoopsRequeued != 1 || summary.QueueItemsRequeued != 1 {
-		t.Fatalf("summary = %#v, want confirmation quarantine released and work requeued", summary)
+	if summary.CleanedExecutions != 0 || summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
+		t.Fatalf("summary = %#v, want expired evidence to remain quarantined", summary)
 	}
-	loop, _ := repos.Loops.GetByID(context.Background(), loopID)
-	activeQueue, _ := repos.Queue.FindActiveByLoopID(context.Background(), loopID)
-	if loop == nil || loop.Status != "queued" || activeQueue == nil || activeQueue.Status != "queued" {
-		t.Fatalf("loop = %#v activeQueue = %#v, want queued recovery", loop, activeQueue)
+	loop, _ = repos.Loops.GetByID(context.Background(), loopID)
+	latestQueue, _ := repos.Queue.GetLatestByLoopID(context.Background(), loopID)
+	execution, _ := repos.AgentExecutions.GetByID(context.Background(), "execution_confirmation_then_expired")
+	if loop == nil || loop.Status != "paused" || latestQueue == nil || latestQueue.Status != "manual_intervention" || execution == nil || execution.Status != "running" {
+		t.Fatalf("loop = %#v queue = %#v execution = %#v, want durable quarantine", loop, latestQueue, execution)
 	}
-	events, _ := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_confirmation_then_expired")
-	if !containsEventType(events, "looperd.recovery.execution_stale_requeued") {
-		t.Fatalf("events = %#v, want stale-requeued outcome", events)
+	if loop.UpdatedAt != operatorPausedAt {
+		t.Fatalf("loop.UpdatedAt = %q, want later operator pause %q preserved", loop.UpdatedAt, operatorPausedAt)
 	}
 }
 
@@ -245,8 +253,10 @@ func newStaleExecutionLeaseRuntime(t *testing.T, now time.Time, readProcess Read
 		Config:             cfg,
 		Logger:             &testLogger{},
 		Now:                func() time.Time { return now },
+		RunSchedulerTick:   func(context.Context, Services) error { return nil },
 		ReadProcessCommand: readProcess,
 		ReadProcessStart:   func(context.Context, int) (int64, error) { return 2202, nil },
+		ReadProcessBootID:  func(context.Context, int) (string, error) { return "boot-a", nil },
 	})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)

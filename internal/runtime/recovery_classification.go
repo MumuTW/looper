@@ -15,7 +15,6 @@ type executionLivenessDisposition string
 
 const (
 	executionLivenessActive            executionLivenessDisposition = "active"
-	executionLivenessStale             executionLivenessDisposition = "stale"
 	executionLivenessNeedsConfirmation executionLivenessDisposition = "needs_confirmation"
 )
 
@@ -185,7 +184,6 @@ func (r *Runtime) assessExecutionLiveness(ctx context.Context, execution storage
 		return assessment, nil
 	}
 	if classification.Class == ContainmentConfirmedDead {
-		assessment.Disposition = executionLivenessStale
 		return assessment, nil
 	}
 
@@ -200,10 +198,9 @@ func (r *Runtime) assessExecutionLiveness(ctx context.Context, execution storage
 	if now.UTC().Before(expiresAt) {
 		return assessment, nil
 	}
-	switch classification.Reason {
-	case "pid_absent", "pid_not_running_not_confirmed_dead", "process_identity_mismatch":
-		assessment.Disposition = executionLivenessStale
-	}
+	// An expired lease schedules observation and operator-visible quarantine,
+	// but it is not process-containment Authority. In particular, leader exit,
+	// PID reuse, or argv drift cannot prove that background descendants drained.
 	return assessment, nil
 }
 

@@ -11,6 +11,48 @@ import (
 	"time"
 )
 
+// Birth identifies one process incarnation. Linux start time is relative to
+// boot, so BootID is required there to keep a persisted identity from matching
+// a different process after a reboot.
+type Birth struct {
+	StartTime int64
+	BootID    string
+}
+
+// RequiresBootID reports whether the platform's start token is boot-relative.
+func RequiresBootID() bool { return runtime.GOOS == "linux" }
+
+// Read returns the operating-system process birth identity for pid.
+func Read(pid int) (Birth, error) {
+	start, err := StartTime(pid)
+	if err != nil {
+		return Birth{}, err
+	}
+	identity := Birth{StartTime: start}
+	if !RequiresBootID() {
+		return identity, nil
+	}
+	bootID, err := LinuxBootID()
+	if err != nil {
+		return Birth{}, err
+	}
+	identity.BootID = bootID
+	return identity, nil
+}
+
+// LinuxBootID returns the kernel boot UUID paired with /proc start ticks.
+func LinuxBootID() (string, error) {
+	value, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return "", fmt.Errorf("process identity: read Linux boot id: %w", err)
+	}
+	bootID := strings.TrimSpace(string(value))
+	if bootID == "" {
+		return "", fmt.Errorf("process identity: empty Linux boot id")
+	}
+	return bootID, nil
+}
+
 // StartTime returns an operating-system process birth token for pid.
 func StartTime(pid int) (int64, error) {
 	if pid <= 0 {

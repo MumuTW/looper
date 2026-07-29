@@ -10,7 +10,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestRuntimeStartupRequeuesExpiredExecutionWithInvalidIdentity(t *testing.T) {
+func TestRuntimeStartupQuarantinesExitedLeaderBecauseDescendantsAreUnproven(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -54,29 +54,29 @@ func TestRuntimeStartupRequeuesExpiredExecutionWithInvalidIdentity(t *testing.T)
 	run, _ := repos.Runs.GetByID(context.Background(), runID)
 	loop, _ := repos.Loops.GetByID(context.Background(), loopID)
 	queue, _ := repos.Queue.GetByID(context.Background(), queueID)
-	if execution == nil || execution.Status != "failed" {
-		t.Fatalf("execution = %#v, want failed stale execution", execution)
+	if execution == nil || execution.Status != "running" {
+		t.Fatalf("execution = %#v, want active evidence retained for retry", execution)
 	}
-	if run == nil || run.Status != "interrupted" {
-		t.Fatalf("run = %#v, want interrupted", run)
+	if run == nil || run.Status != "running" {
+		t.Fatalf("run = %#v, want running quarantine", run)
 	}
-	if loop == nil || loop.Status != "queued" {
-		t.Fatalf("loop = %#v, want queued", loop)
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused", loop)
 	}
-	if queue == nil || queue.Status != "queued" {
-		t.Fatalf("queue = %#v, want queued", queue)
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want manual intervention", queue)
 	}
 	recovery := rt.RecoverySummary()
-	if recovery.InterruptedRunsMarked != 1 || recovery.LoopsRequeued != 1 || recovery.OrphanAgentCleanup.CleanedCount != 1 {
-		t.Fatalf("RecoverySummary() = %#v, want startup stale execution repaired", recovery)
+	if recovery.InterruptedRunsMarked != 0 || recovery.LoopsRequeued != 0 || recovery.OrphanAgentCleanup.CleanedCount != 0 || recovery.OrphanAgentCleanup.QuarantinedCount != 1 {
+		t.Fatalf("RecoverySummary() = %#v, want conservative descendant-safe quarantine", recovery)
 	}
 	events, _ := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_startup_stale")
-	if !containsEventType(events, "looperd.recovery.execution_stale_requeued") {
-		t.Fatalf("events = %#v, want startup stale-requeued outcome", events)
+	if !containsEventType(events, "looperd.recovery.execution_confirmation_needed") {
+		t.Fatalf("events = %#v, want confirmation-needed outcome", events)
 	}
 }
 
-func TestRuntimeStartupReleasesPriorLivenessQuarantineAfterLeaseExpires(t *testing.T) {
+func TestRuntimeStartupPreservesPriorLivenessQuarantineAfterLeaseExpires(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -123,15 +123,15 @@ func TestRuntimeStartupReleasesPriorLivenessQuarantineAfterLeaseExpires(t *testi
 	repos = second.Services().Repositories
 	execution, _ := repos.AgentExecutions.GetByID(context.Background(), "execution_restart_after_confirmation")
 	loop, _ = repos.Loops.GetByID(context.Background(), loopID)
-	activeQueue, _ := repos.Queue.FindActiveByLoopID(context.Background(), loopID)
-	if execution == nil || execution.Status != "failed" {
-		t.Fatalf("execution = %#v, want stale terminal", execution)
+	latestQueue, _ := repos.Queue.GetLatestByLoopID(context.Background(), loopID)
+	if execution == nil || execution.Status != "running" {
+		t.Fatalf("execution = %#v, want retryable active evidence", execution)
 	}
-	if loop == nil || loop.Status != "queued" || activeQueue == nil || activeQueue.Status != "queued" {
-		t.Fatalf("loop = %#v activeQueue = %#v, want restart recovery queued", loop, activeQueue)
+	if loop == nil || loop.Status != "paused" || latestQueue == nil || latestQueue.Status != "manual_intervention" {
+		t.Fatalf("loop = %#v queue = %#v, want restart quarantine preserved", loop, latestQueue)
 	}
 	events, _ := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_restart_after_confirmation")
-	if !containsEventType(events, "looperd.recovery.execution_stale_requeued") {
-		t.Fatalf("events = %#v, want stale-requeued outcome after restart", events)
+	if containsEventType(events, "looperd.recovery.execution_stale_requeued") {
+		t.Fatalf("events = %#v, must not claim stale-requeued without containment Authority", events)
 	}
 }

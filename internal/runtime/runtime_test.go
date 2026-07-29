@@ -1498,7 +1498,7 @@ func TestRepairStaleRunQueueStateFallsBackForQueuedManualInterventionRetry(t *te
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
-	summary, err := rt.repairStaleRunQueueState(context.Background(), repos, loop, latestRun, false, false, nowISO)
+	summary, err := rt.repairStaleRunQueueState(context.Background(), repos, loop, latestRun, false, nowISO)
 	if err != nil {
 		t.Fatalf("repairStaleRunQueueState() error = %v", err)
 	}
@@ -2301,7 +2301,7 @@ func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T
 			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 			pid := int64(5151)
 
-			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 515100, nil }})
+			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, RunSchedulerTick: func(context.Context, Services) error { return nil }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 515100, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
 			if err := rt.Start(context.Background()); err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
@@ -2319,7 +2319,7 @@ func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T
 			if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_live_execution", LoopID: "loop_live_execution", Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 				t.Fatalf("Runs.Upsert() error = %v", err)
 			}
-			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_live_execution", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_live_execution"), RunID: stringPtr("run_live_execution"), Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":515100}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_live_execution", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_live_execution"), RunID: stringPtr("run_live_execution"), Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":515100,"bootId":"boot-test"}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 			}
 
@@ -2374,6 +2374,7 @@ func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *test
 				Config:             cfg,
 				Logger:             &testLogger{},
 				Now:                func() time.Time { return now },
+				RunSchedulerTick:   func(context.Context, Services) error { return nil },
 				ReadProcessCommand: func(context.Context, int) (string, error) { return "", nil },
 				SignalProcess: func(int, syscall.Signal) error {
 					t.Fatal("SignalProcess called, want no recovery PID action after dead probe")
@@ -2501,7 +2502,7 @@ func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecu
 			completedISO := formatJavaScriptISOString(now.Add(-10 * time.Minute))
 			pid := int64(5252)
 
-			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 525200, nil }})
+			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, RunSchedulerTick: func(context.Context, Services) error { return nil }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 525200, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
 			if err := rt.Start(context.Background()); err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
@@ -2522,7 +2523,7 @@ func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecu
 			if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_superseded_latest", LoopID: "loop_superseded_live", Status: "success", StartedAt: completedISO, EndedAt: stringPtr(completedISO), CreatedAt: completedISO, UpdatedAt: completedISO}); err != nil {
 				t.Fatalf("Runs.Upsert(latest) error = %v", err)
 			}
-			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_superseded_live", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_superseded_live"), RunID: stringPtr("run_superseded_old"), Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":525200}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_superseded_live", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_superseded_live"), RunID: stringPtr("run_superseded_old"), Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":525200,"bootId":"boot-test"}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 			}
 
@@ -2579,7 +2580,7 @@ func TestRepairStaleRunQueueStateDoesNotRequeueLoopWhileNewerRunIsLive(t *testin
 	}
 	latestRun := &storage.RunRecord{ID: "run_superseded_latest_live", LoopID: loopID, Status: "running", CurrentStep: stringPtr("review"), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
 
-	summary, err := rt.repairStaleRunQueueState(context.Background(), repos, loop, latestRun, true, false, nowISO)
+	summary, err := rt.repairStaleRunQueueState(context.Background(), repos, loop, latestRun, true, nowISO)
 	if err != nil {
 		t.Fatalf("repairStaleRunQueueState() error = %v", err)
 	}
@@ -2629,7 +2630,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 			default:
 				return "", nil
 			}
-		}, ReadProcessStart: func(context.Context, int) (int64, error) { return 535300, nil }})
+		}, ReadProcessStart: func(context.Context, int) (int64, error) { return 535300, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }, RunSchedulerTick: func(context.Context, Services) error { return nil }})
 		if err := rt.Start(context.Background()); err != nil {
 			t.Fatalf("Start() error = %v", err)
 		}
@@ -2647,7 +2648,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 		if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_multi_exec_live", LoopID: "loop_multi_exec_live", Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 			t.Fatalf("Runs.Upsert() error = %v", err)
 		}
-		for _, exec := range []storage.AgentExecutionRecord{{ID: "exec_multi_live", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_multi_exec_live"), RunID: stringPtr("run_multi_exec_live"), Vendor: "codex", Status: "running", PID: &livePID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":535300}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}, {ID: "exec_multi_dead", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_multi_exec_live"), RunID: stringPtr("run_multi_exec_live"), Vendor: "codex", Status: "running", PID: &deadPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}} {
+		for _, exec := range []storage.AgentExecutionRecord{{ID: "exec_multi_live", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_multi_exec_live"), RunID: stringPtr("run_multi_exec_live"), Vendor: "codex", Status: "running", PID: &livePID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":535300,"bootId":"boot-test"}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}, {ID: "exec_multi_dead", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_multi_exec_live"), RunID: stringPtr("run_multi_exec_live"), Vendor: "codex", Status: "running", PID: &deadPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}} {
 			if err := repos.AgentExecutions.Upsert(context.Background(), exec); err != nil {
 				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 			}
@@ -2735,7 +2736,7 @@ func TestRuntimeReconcileStaleRunningRunsCancelsDuplicateActiveQueueItems(t *tes
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, RunSchedulerTick: func(context.Context, Services) error { return nil }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2857,7 +2858,7 @@ func TestRuntimeReconcileStaleRunningRunsDedupesUncertainIdentityEvents(t *testi
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 	ambiguousPID := int64(5651)
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "python unrelated.py", nil }})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, RunSchedulerTick: func(context.Context, Services) error { return nil }, ReadProcessCommand: func(context.Context, int) (string, error) { return "python unrelated.py", nil }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}

@@ -718,7 +718,7 @@ type execution struct {
 	nativeResumeMode        string
 	nativeResumeStatus      string
 	nativeResumeError       string
-	processStart            int64
+	processBirth            processidentity.Birth
 	leaseReleased           bool
 	toolSandbox             *validationcmd.Sandbox
 
@@ -1176,7 +1176,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.nativeResumeError = nativeError
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
-	x.processStart = 0
+	x.processBirth = processidentity.Birth{}
 	x.mu.Unlock()
 
 	if err := cmd.Start(); err != nil {
@@ -1881,8 +1881,12 @@ func (x *execution) executionMetadata(timeoutType string) map[string]any {
 			"maxRuntimeSeconds":  durationSeconds(x.timeout),
 		},
 	}
-	if processStart := x.processStartSnapshot(); processStart > 0 {
-		metadata["processIdentity"] = map[string]any{"startTime": processStart}
+	if birth := x.processBirthSnapshot(); birth.StartTime > 0 {
+		identity := map[string]any{"startTime": birth.StartTime}
+		if birth.BootID != "" {
+			identity["bootId"] = birth.BootID
+		}
+		metadata["processIdentity"] = identity
 	}
 	if timeoutType != "" {
 		metadata["timeout"] = map[string]any{
@@ -1900,19 +1904,19 @@ func (x *execution) captureProcessStart() {
 	if x == nil || x.process == nil || x.process.Process == nil {
 		return
 	}
-	start, err := processidentity.StartTime(x.process.Process.Pid)
+	birth, err := processidentity.Read(x.process.Process.Pid)
 	if err != nil {
 		return
 	}
 	x.mu.Lock()
-	x.processStart = start
+	x.processBirth = birth
 	x.mu.Unlock()
 }
 
-func (x *execution) processStartSnapshot() int64 {
+func (x *execution) processBirthSnapshot() processidentity.Birth {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	return x.processStart
+	return x.processBirth
 }
 
 func durationSeconds(duration time.Duration) int64 {
