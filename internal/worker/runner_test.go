@@ -927,14 +927,14 @@ func TestReadSpecBlockRejectsAbsolutePath(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	block, err := readSpecBlock(repo, outside)
-	if err != nil {
-		t.Fatalf("readSpecBlock() error = %v", err)
+	if err == nil {
+		t.Fatal("readSpecBlock() error = nil, want rejected absolute path")
 	}
-	if want := fmt.Sprintf("Spec path: %s", outside); block != want {
-		t.Fatalf("readSpecBlock() = %q, want fallback %q", block, want)
+	if block != "" {
+		t.Fatalf("readSpecBlock() = %q, want no agent instruction", block)
 	}
-	if strings.Contains(block, "top secret") {
-		t.Fatalf("readSpecBlock() leaked absolute-path content:\n%s", block)
+	if !strings.Contains(err.Error(), "repository-relative") {
+		t.Fatalf("readSpecBlock() error = %v, want repository-relative rejection", err)
 	}
 }
 
@@ -951,14 +951,11 @@ func TestReadSpecBlockRejectsParentTraversal(t *testing.T) {
 		t.Fatalf("filepath.Rel() = %q, %v; want a ../ path", rel, err)
 	}
 	block, err := readSpecBlock(repo, rel)
-	if err != nil {
-		t.Fatalf("readSpecBlock() error = %v", err)
+	if err == nil {
+		t.Fatal("readSpecBlock() error = nil, want rejected traversal")
 	}
-	if want := fmt.Sprintf("Spec path: %s", rel); block != want {
-		t.Fatalf("readSpecBlock() = %q, want fallback %q", block, want)
-	}
-	if strings.Contains(block, "top secret") {
-		t.Fatalf("readSpecBlock() leaked traversal content:\n%s", block)
+	if block != "" || strings.Contains(err.Error(), "top secret") {
+		t.Fatalf("readSpecBlock() = %q, %v; want no untrusted path or content", block, err)
 	}
 }
 
@@ -974,18 +971,35 @@ func TestReadSpecBlockRejectsSymlinkEscape(t *testing.T) {
 		t.Fatalf("Symlink() error = %v", err)
 	}
 	block, err := readSpecBlock(repo, "linked.md")
-	if err != nil {
-		t.Fatalf("readSpecBlock() error = %v", err)
+	if err == nil {
+		t.Fatal("readSpecBlock() error = nil, want rejected symlink")
 	}
-	if want := "Spec path: linked.md"; block != want {
-		t.Fatalf("readSpecBlock() = %q, want fallback %q", block, want)
-	}
-	if strings.Contains(block, "top secret") {
-		t.Fatalf("readSpecBlock() leaked symlink target content:\n%s", block)
+	if block != "" || strings.Contains(err.Error(), "top secret") {
+		t.Fatalf("readSpecBlock() = %q, %v; want no symlink target content", block, err)
 	}
 }
 
-func TestReadSpecBlockAllowsInRepoSymlink(t *testing.T) {
+func TestReadSpecBlockRejectsSymlinkedAncestor(t *testing.T) {
+	t.Parallel()
+
+	repo := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.md"), []byte("top secret"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repo, "specs")); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+	block, err := readSpecBlock(repo, "specs/secret.md")
+	if err == nil {
+		t.Fatal("readSpecBlock() error = nil, want rejected symlinked ancestor")
+	}
+	if block != "" || strings.Contains(err.Error(), "top secret") {
+		t.Fatalf("readSpecBlock() = %q, %v; want no symlink target content", block, err)
+	}
+}
+
+func TestReadSpecBlockRejectsInRepoSymlink(t *testing.T) {
 	t.Parallel()
 
 	repo := t.TempDir()
@@ -996,11 +1010,11 @@ func TestReadSpecBlockAllowsInRepoSymlink(t *testing.T) {
 		t.Fatalf("Symlink() error = %v", err)
 	}
 	block, err := readSpecBlock(repo, "linked.md")
-	if err != nil {
-		t.Fatalf("readSpecBlock() error = %v", err)
+	if err == nil {
+		t.Fatal("readSpecBlock() error = nil, want rejected symlink")
 	}
-	if want := "Spec (linked.md):\nspec body"; block != want {
-		t.Fatalf("readSpecBlock() = %q, want %q", block, want)
+	if block != "" {
+		t.Fatalf("readSpecBlock() = %q, want no agent instruction", block)
 	}
 }
 
@@ -1012,11 +1026,11 @@ func TestReadSpecBlockRejectsNonRegularFile(t *testing.T) {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
 	block, err := readSpecBlock(repo, "specs")
-	if err != nil {
-		t.Fatalf("readSpecBlock() error = %v", err)
+	if err == nil {
+		t.Fatal("readSpecBlock() error = nil, want rejected directory")
 	}
-	if want := "Spec path: specs"; block != want {
-		t.Fatalf("readSpecBlock() = %q, want fallback %q", block, want)
+	if block != "" {
+		t.Fatalf("readSpecBlock() = %q, want no agent instruction", block)
 	}
 }
 
@@ -1028,15 +1042,23 @@ func TestReadSpecBlockRejectsOversizedSpec(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	block, err := readSpecBlock(repo, "huge.md")
-	if err != nil {
-		t.Fatalf("readSpecBlock() error = %v", err)
+	if err == nil {
+		t.Fatal("readSpecBlock() error = nil, want rejected oversized file")
 	}
-	if want := "Spec path: huge.md"; block != want {
-		t.Fatalf("readSpecBlock() = %q, want fallback %q", block, want)
+	if block != "" {
+		t.Fatalf("readSpecBlock() = %q, want no agent instruction", block)
 	}
 }
 
-func TestBuildWorkerPromptDoesNotEmbedRejectedSpecPath(t *testing.T) {
+func TestReadBoundedSpecRejectsOverflowSentinel(t *testing.T) {
+	t.Parallel()
+
+	if _, err := readBoundedSpec(strings.NewReader(strings.Repeat("x", maxSpecFileBytes+1))); err == nil {
+		t.Fatal("readBoundedSpec() error = nil, want overflow sentinel rejection")
+	}
+}
+
+func TestBuildWorkerPromptRejectsUntrustedSpecPath(t *testing.T) {
 	t.Parallel()
 
 	repo := t.TempDir()
@@ -1046,14 +1068,25 @@ func TestBuildWorkerPromptDoesNotEmbedRejectedSpecPath(t *testing.T) {
 	}
 	work := workerInput{Repo: "acme/looper", Title: "fix bug", Branch: "looper/fix", BaseBranch: "main", SpecPath: outside}
 	prompt, err := buildWorkerPrompt(repo, work, nil, false, config.DefaultDisclosureConfig(), "opencode", "")
+	if err == nil {
+		t.Fatal("buildWorkerPrompt() error = nil, want rejected spec path")
+	}
+	if prompt != "" || strings.Contains(err.Error(), "top secret") {
+		t.Fatalf("buildWorkerPrompt() = %q, %v; want no agent prompt or secret", prompt, err)
+	}
+}
+
+func TestRunPlanStepDoesNotPreserveSpecPathAsAgentInstruction(t *testing.T) {
+	t.Parallel()
+
+	specPath := filepath.Join(t.TempDir(), "secret.txt")
+	runner := &Runner{}
+	checkpoint, err := runner.runPlanStep(stepInput{Checkpoint: workerCheckpoint{Work: &workerInput{Title: "fix bug", SpecPath: specPath}}})
 	if err != nil {
-		t.Fatalf("buildWorkerPrompt() error = %v", err)
+		t.Fatalf("runPlanStep() error = %v", err)
 	}
-	if strings.Contains(prompt, "top secret") {
-		t.Fatalf("prompt leaked absolute-path spec content:\n%s", prompt)
-	}
-	if !strings.Contains(prompt, fmt.Sprintf("Spec path: %s", outside)) {
-		t.Fatalf("prompt missing spec-path fallback line:\n%s", prompt)
+	if checkpoint.Plan == nil || len(checkpoint.Plan.Items) != 1 || checkpoint.Plan.Items[0] != "fix bug" {
+		t.Fatalf("runPlanStep() plan = %#v, want title only", checkpoint.Plan)
 	}
 }
 

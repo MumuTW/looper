@@ -1711,7 +1711,6 @@ func (r *Runner) runPlanStep(input stepInput) (workerCheckpoint, error) {
 	}
 	items := compactStrings([]string{
 		prefixIfPresent("Implement: ", work.Prompt),
-		prefixIfPresent("Follow spec: ", work.SpecPath),
 	})
 	if len(items) == 0 {
 		items = []string{work.Title}
@@ -3726,7 +3725,11 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 	if work.ExecutionMode == "push-existing" && work.SpecPath != "" {
 		parts = append(parts, fmt.Sprintf("Do not modify the spec file at %s.", work.SpecPath))
 	}
-	if specBlock, err := readSpecBlock(repoRootPath, work.SpecPath); err == nil && specBlock != "" {
+	specBlock, err := readSpecBlock(repoRootPath, work.SpecPath)
+	if err != nil {
+		return "", config.CustomInstructionBlock{}, err
+	}
+	if specBlock != "" {
 		parts = append(parts, specBlock)
 	}
 	if plan != nil && len(plan.Items) > 0 {
@@ -3847,34 +3850,29 @@ func readSpecBlock(projectRepoPath, specPath string) (string, error) {
 	}
 	content, err := readSpecFile(projectRepoPath, specPath)
 	if err != nil {
-		return fmt.Sprintf("Spec path: %s", specPath), nil
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read worker spec: %w", err)
 	}
 	return fmt.Sprintf("Spec (%s):\n%s", specPath, string(content)), nil
 }
 
 // readSpecFile reads a repository-relative spec file under projectRepoPath.
-// Absolute paths, paths escaping the repo root (including via symlinks),
-// non-regular files, and files larger than maxSpecFileBytes are rejected so
-// worker metadata cannot make the daemon embed arbitrary local files into a
-// prompt sent to a model provider.
+// Absolute paths, paths escaping the repo root, symlinks, non-regular files,
+// and files larger than maxSpecFileBytes are rejected so worker metadata
+// cannot make the daemon embed arbitrary local files into a model prompt.
 func readSpecFile(projectRepoPath, specPath string) ([]byte, error) {
 	if filepath.IsAbs(specPath) {
 		return nil, fmt.Errorf("spec path must be repository-relative: %s", specPath)
 	}
-	repoRoot, err := filepath.EvalSymlinks(projectRepoPath)
-	if err != nil {
-		return nil, fmt.Errorf("resolve repository root: %w", err)
-	}
-	resolved, err := filepath.EvalSymlinks(filepath.Join(repoRoot, specPath))
-	if err != nil {
-		return nil, fmt.Errorf("resolve spec path %s: %w", specPath, err)
-	}
-	if resolved != repoRoot && !strings.HasPrefix(resolved, repoRoot+string(os.PathSeparator)) {
+	cleanPath := filepath.Clean(specPath)
+	if cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(os.PathSeparator)) {
 		return nil, fmt.Errorf("spec path escapes repository root: %s", specPath)
 	}
-	file, err := os.Open(resolved)
+	file, err := openSpecFileBeneath(projectRepoPath, cleanPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open spec path %s: %w", specPath, err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
@@ -3887,7 +3885,22 @@ func readSpecFile(projectRepoPath, specPath string) ([]byte, error) {
 	if info.Size() > maxSpecFileBytes {
 		return nil, fmt.Errorf("spec file exceeds %d bytes: %s", maxSpecFileBytes, specPath)
 	}
-	return io.ReadAll(io.LimitReader(file, maxSpecFileBytes+1))
+	content, err := readBoundedSpec(file)
+	if err != nil {
+		return nil, fmt.Errorf("read spec file %s: %w", specPath, err)
+	}
+	return content, nil
+}
+
+func readBoundedSpec(reader io.Reader) ([]byte, error) {
+	content, err := io.ReadAll(io.LimitReader(reader, maxSpecFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > maxSpecFileBytes {
+		return nil, fmt.Errorf("spec content exceeds %d bytes", maxSpecFileBytes)
+	}
+	return content, nil
 }
 
 func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *checkpointExecution) string {
