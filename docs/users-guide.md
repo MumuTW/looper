@@ -80,18 +80,16 @@ Operator recovery rules:
 - if webhook ingress or SSE wakeups degrade, polling continues as a fallback so Coordinator can repair drift
 - if a stale target label remains after lease loss or a partial GitHub mutation, let Coordinator reconciliation repair or remove it before retrying
 
-## 2. Project auto-detection from the current directory
+## 2. How work is targeted
 
-Looper can often infer the target project from your current working directory.
+There is no `--project` flag, and your working directory does not select a project. The stripped CLI (`cmd/looper`) accepts only `--config`, `--host`, and `--port`, and every control verb takes a positional `<selector>` that is a loop id or sequence number — a selector containing `/` (such as `owner/repo#42`) is rejected outright, because the daemon resolves loops, not pull request URLs.
 
-In practice, this means that if you run commands from inside a registered project repo, you can usually omit `--project`.
+Work is targeted in one of two ways:
 
-This works best when:
+- **Roles pick work up themselves**, via the labels, assignees, and review requests described in [section 3](#3-what-each-role-does).
+- **You create a loop explicitly**, via the dashboard or `POST /api/v1/loops` (and the role-specific `POST /api/v1/planners` / `POST /api/v1/workers`), where the project is the `projectId` field in the request body.
 
-- your current directory is inside exactly one registered project repo
-- that project has a configured GitHub repo mapping
-
-If no project matches the current directory, or multiple projects match, pass `--project` explicitly.
+The current directory matters in exactly one place: a relative `--config` path is resolved against it. With no `--config` and no `LOOPER_CONFIG`, the default config path is discovered independently of where you are.
 
 ## 3. What each role does
 
@@ -214,7 +212,7 @@ Autonomous dispatch stops immediately when any veto signal is present:
 
 This creates a `planner` loop targeting that issue.
 
-For `plan`, it is safest to pass `--project` explicitly.
+When you create the planner loop through the API rather than by labelling, set the project explicitly in the request body.
 
 ### Auto-discovery conditions
 
@@ -349,12 +347,6 @@ In practice, `reviewer` and `fixer` often alternate until the spec PR is ready f
 ```
 
 This is the recommended entrypoint.
-
-If you are already inside the target repo, you can usually omit `--project`:
-
-```bash
-# intent: worker for issue 123 — label looper:worker-ready or looper:spec-ready
-```
 
 If that issue already has a related planner loop, worker will try to reuse planner output, including:
 
