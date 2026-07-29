@@ -61,6 +61,9 @@ func TestRunCommandsDistinguishesSupervisorTimeoutFromContextDeadline(t *testing
 	if timeoutResult.FailureCategory != FailureSupervisorTimeout {
 		t.Fatalf("timeout FailureCategory = %q, want %q", timeoutResult.FailureCategory, FailureSupervisorTimeout)
 	}
+	if timeoutResult.Summary != "Validation timed out: sleep 1" {
+		t.Fatalf("timeout Summary = %q, want timeout-specific summary", timeoutResult.Summary)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
