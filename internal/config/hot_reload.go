@@ -291,25 +291,57 @@ func appendCodingRoleRegistryGuards(oldConfig Config, newConfig Config, seen map
 	newLegacy := CodingRolesFromLegacy(newConfig.Roles)
 	for name, oldRole := range oldRoles {
 		newRole, ok := newRoles[name]
-		if !ok || !reflect.DeepEqual(oldRole, newRole) {
-			_, oldAuthored := oldConfig.Roles.Coding[name]
-			_, newAuthored := newConfig.Roles.Coding[name]
-			oldIsLegacy := reflect.DeepEqual(oldRole, oldLegacy[name])
-			newIsLegacy := ok && reflect.DeepEqual(newRole, newLegacy[name])
-			if oldAuthored && !oldIsLegacy || newAuthored && !newIsLegacy {
+		if !ok {
+			if !reflect.DeepEqual(oldRole, oldLegacy[name]) {
 				markCodingRoleRestart(seen, restartRequired, name)
 			}
+			continue
+		}
+		if codingRoleChangeUsesAuthoredField(oldRole, newRole, oldLegacy[name], newLegacy[name]) {
+			markCodingRoleRestart(seen, restartRequired, name)
 		}
 	}
 	for name, newRole := range newRoles {
 		if _, ok := oldRoles[name]; ok {
 			continue
 		}
-		_, authored := newConfig.Roles.Coding[name]
-		if authored && !reflect.DeepEqual(newRole, newLegacy[name]) {
+		if !reflect.DeepEqual(newRole, newLegacy[name]) {
 			markCodingRoleRestart(seen, restartRequired, name)
 		}
 	}
+}
+
+func codingRoleChangeUsesAuthoredField(oldRole, newRole, oldLegacy, newLegacy CodingRoleConfig) bool {
+	return changedValueUsesAuthoredField(
+		reflect.ValueOf(oldRole),
+		reflect.ValueOf(newRole),
+		reflect.ValueOf(oldLegacy),
+		reflect.ValueOf(newLegacy),
+	)
+}
+
+func changedValueUsesAuthoredField(oldValue, newValue, oldLegacy, newLegacy reflect.Value) bool {
+	if oldValue.Kind() == reflect.Struct {
+		for i := 0; i < oldValue.NumField(); i++ {
+			if changedValueUsesAuthoredField(
+				oldValue.Field(i),
+				newValue.Field(i),
+				oldLegacy.Field(i),
+				newLegacy.Field(i),
+			) {
+				return true
+			}
+		}
+		return false
+	}
+	if oldValue.Kind() == reflect.Pointer && !oldValue.IsNil() && !newValue.IsNil() && !oldLegacy.IsNil() && !newLegacy.IsNil() {
+		return changedValueUsesAuthoredField(oldValue.Elem(), newValue.Elem(), oldLegacy.Elem(), newLegacy.Elem())
+	}
+	if reflect.DeepEqual(oldValue.Interface(), newValue.Interface()) {
+		return false
+	}
+	return !reflect.DeepEqual(oldValue.Interface(), oldLegacy.Interface()) ||
+		!reflect.DeepEqual(newValue.Interface(), newLegacy.Interface())
 }
 
 func markCodingRoleRestart(seen map[string]struct{}, restartRequired *[]string, name string) {
