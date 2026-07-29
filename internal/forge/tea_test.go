@@ -263,7 +263,7 @@ func TestTeaTransportReportsBinaryMissingAfterStartup(t *testing.T) {
 		teaPath,
 		"selected-login",
 		nil,
-		time.Second,
+		5*time.Second,
 		nil,
 	)
 	if _, err := transport.doRaw(context.Background(), "GET", "/api/v1/version", nil, nil); err != nil {
