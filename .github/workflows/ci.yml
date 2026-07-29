@@ -87,10 +87,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # TODO(#44): add ./internal/runtime and ./internal/agent once PR #40
-      # (fix/cq-003-test-fixture-races) lands; they still carry fixture races.
       - name: Run focused race-detector tests
-        run: go test -race -count=1 ./internal/storage ./internal/api ./internal/forge ./internal/infra/shell
+        run: go test -race -count=1 ./internal/storage ./internal/api ./internal/forge ./internal/infra/shell ./internal/runtime ./internal/agent
 
   detect-e2e-changes:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
