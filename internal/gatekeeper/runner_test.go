@@ -69,21 +69,21 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 		{
 			name: "pending required check",
 			mutate: func(f *gatekeeperFixture) {
-				f.github.checks.CheckRuns[0] = githubinfra.PullRequestCheckRun{Name: "ci", Status: "in_progress"}
+				f.github.checks.CheckRuns[0] = githubinfra.PullRequestCheckRun{Name: "ci", Status: "in_progress", AppID: 15368}
 			},
 			want: []ReasonCode{ReasonCheckPending},
 		},
 		{
 			name: "cancelled required check",
 			mutate: func(f *gatekeeperFixture) {
-				f.github.checks.CheckRuns[0] = githubinfra.PullRequestCheckRun{Name: "ci", Status: "completed", Conclusion: "cancelled"}
+				f.github.checks.CheckRuns[0] = githubinfra.PullRequestCheckRun{Name: "ci", Status: "completed", Conclusion: "cancelled", AppID: 15368}
 			},
 			want: []ReasonCode{ReasonCheckCancelled},
 		},
 		{
 			name: "failed required check",
 			mutate: func(f *gatekeeperFixture) {
-				f.github.checks.CheckRuns[0] = githubinfra.PullRequestCheckRun{Name: "ci", Status: "completed", Conclusion: "failure"}
+				f.github.checks.CheckRuns[0] = githubinfra.PullRequestCheckRun{Name: "ci", Status: "completed", Conclusion: "failure", AppID: 15368}
 			},
 			want: []ReasonCode{ReasonCheckFailed},
 		},
@@ -91,8 +91,23 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 			name: "missing required check",
 			mutate: func(f *gatekeeperFixture) {
 				f.github.checks.CheckRuns = nil
+				f.github.checks.TotalCount = 0
 			},
 			want: []ReasonCode{ReasonCheckMissing},
+		},
+		{
+			name: "same named check from wrong app does not satisfy protection",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.checks.CheckRuns[0].AppID = 99999
+			},
+			want: []ReasonCode{ReasonCheckMissing},
+		},
+		{
+			name: "truncated check state is ambiguous",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.checks.TotalCount = 2
+			},
+			want: []ReasonCode{ReasonProviderStateAmbiguous},
 		},
 		{
 			name: "unresolved review thread",
@@ -235,9 +250,10 @@ func newGatekeeperFixture(t *testing.T) *gatekeeperFixture {
 			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", Mergeable: &mergeable, MergeableState: "clean"},
 			protection: githubinfra.BranchProtection{
 				Enabled: true, HasRequiredChecks: true, RequiredChecks: []string{"ci"},
+				RequiredCheckRules: []githubinfra.RequiredCheckRule{{Context: "ci", AppID: 15368}},
 				HasRequiredReviews: true, RequiredApprovingReviewCount: 1,
 			},
-			checks:       githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "success"}}},
+			checks:       githubinfra.PullRequestCheckRuns{TotalCount: 1, CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "success", AppID: 15368}}},
 			finalHeadSHA: "head-1",
 		},
 		policyPermits: true,

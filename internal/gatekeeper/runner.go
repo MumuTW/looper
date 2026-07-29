@@ -51,6 +51,7 @@ type Reason struct {
 
 type CheckEvidence struct {
 	Name       string `json:"name"`
+	AppID      int64  `json:"appId,omitempty"`
 	Status     string `json:"status,omitempty"`
 	Conclusion string `json:"conclusion,omitempty"`
 }
@@ -276,7 +277,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "checks")
 	}
-	checkReasons, checkEvidence := evaluateRequiredChecks(report.Evidence.RequiredChecks, checks)
+	if checks.TotalCount > len(checks.CheckRuns) {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "checks_truncated")
+	}
+	requiredCheckRules := protection.RequiredCheckRules
+	if len(requiredCheckRules) == 0 {
+		requiredCheckRules = make([]githubinfra.RequiredCheckRule, 0, len(report.Evidence.RequiredChecks))
+		for _, name := range report.Evidence.RequiredChecks {
+			requiredCheckRules = append(requiredCheckRules, githubinfra.RequiredCheckRule{Context: name})
+		}
+	}
+	checkReasons, checkEvidence := evaluateRequiredChecks(requiredCheckRules, checks)
 	report.Reasons = append(report.Reasons, checkReasons...)
 	report.Evidence.Checks = checkEvidence
 
@@ -356,10 +367,13 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	return report, nil
 }
 
-func evaluateRequiredChecks(required []string, checks githubinfra.PullRequestCheckRuns) ([]Reason, []CheckEvidence) {
-	runs := make(map[string]githubinfra.PullRequestCheckRun, len(checks.CheckRuns))
+func evaluateRequiredChecks(required []githubinfra.RequiredCheckRule, checks githubinfra.PullRequestCheckRuns) ([]Reason, []CheckEvidence) {
+	runs := make(map[string][]githubinfra.PullRequestCheckRun, len(checks.CheckRuns))
 	for _, check := range checks.CheckRuns {
-		runs[strings.ToLower(strings.TrimSpace(check.Name))] = check
+		key := strings.ToLower(strings.TrimSpace(check.Name))
+		if key != "" {
+			runs[key] = append(runs[key], check)
+		}
 	}
 	statuses := make(map[string]githubinfra.PullRequestStatus, len(checks.Statuses))
 	for _, status := range checks.Statuses {
@@ -367,39 +381,84 @@ func evaluateRequiredChecks(required []string, checks githubinfra.PullRequestChe
 	}
 	reasons := make([]Reason, 0)
 	evidence := make([]CheckEvidence, 0, len(required))
-	for _, name := range required {
-		key := strings.ToLower(strings.TrimSpace(name))
-		if check, ok := runs[key]; ok {
-			status := strings.ToLower(strings.TrimSpace(check.Status))
-			conclusion := strings.ToLower(strings.TrimSpace(check.Conclusion))
-			evidence = append(evidence, CheckEvidence{Name: name, Status: status, Conclusion: conclusion})
-			switch {
-			case status != "completed":
-				reasons = append(reasons, Reason{Code: ReasonCheckPending, Subject: name})
-			case conclusion == "success":
-			case conclusion == "cancelled":
-				reasons = append(reasons, Reason{Code: ReasonCheckCancelled, Subject: name})
-			default:
-				reasons = append(reasons, Reason{Code: ReasonCheckFailed, Subject: name})
+	for _, rule := range required {
+		name := strings.TrimSpace(rule.Context)
+		key := strings.ToLower(name)
+		subject := requiredCheckSubject(name, rule.AppID)
+		matchingRuns := matchingCheckRuns(runs[key], rule.AppID)
+		if len(matchingRuns) > 0 {
+			status, conclusion, code := aggregateCheckRuns(matchingRuns)
+			evidence = append(evidence, CheckEvidence{Name: name, AppID: rule.AppID, Status: status, Conclusion: conclusion})
+			if code != "" {
+				reasons = append(reasons, Reason{Code: code, Subject: subject})
 			}
 			continue
 		}
-		if status, ok := statuses[key]; ok {
-			state := strings.ToLower(strings.TrimSpace(status.State))
-			evidence = append(evidence, CheckEvidence{Name: name, Status: state})
-			switch state {
-			case "success":
-			case "pending":
-				reasons = append(reasons, Reason{Code: ReasonCheckPending, Subject: name})
-			default:
-				reasons = append(reasons, Reason{Code: ReasonCheckFailed, Subject: name})
+		if rule.AppID == 0 {
+			if status, ok := statuses[key]; ok {
+				state := strings.ToLower(strings.TrimSpace(status.State))
+				evidence = append(evidence, CheckEvidence{Name: name, Status: state})
+				switch state {
+				case "success":
+				case "pending":
+					reasons = append(reasons, Reason{Code: ReasonCheckPending, Subject: subject})
+				default:
+					reasons = append(reasons, Reason{Code: ReasonCheckFailed, Subject: subject})
+				}
+				continue
 			}
-			continue
 		}
-		evidence = append(evidence, CheckEvidence{Name: name})
-		reasons = append(reasons, Reason{Code: ReasonCheckMissing, Subject: name})
+		evidence = append(evidence, CheckEvidence{Name: name, AppID: rule.AppID})
+		reasons = append(reasons, Reason{Code: ReasonCheckMissing, Subject: subject})
 	}
 	return reasons, evidence
+}
+
+func matchingCheckRuns(checks []githubinfra.PullRequestCheckRun, appID int64) []githubinfra.PullRequestCheckRun {
+	if appID == 0 {
+		return checks
+	}
+	out := make([]githubinfra.PullRequestCheckRun, 0, len(checks))
+	for _, check := range checks {
+		if check.AppID == appID {
+			out = append(out, check)
+		}
+	}
+	return out
+}
+
+func aggregateCheckRuns(checks []githubinfra.PullRequestCheckRun) (string, string, ReasonCode) {
+	status := "completed"
+	conclusion := "success"
+	for _, check := range checks {
+		checkStatus := strings.ToLower(strings.TrimSpace(check.Status))
+		checkConclusion := strings.ToLower(strings.TrimSpace(check.Conclusion))
+		if checkStatus != "completed" {
+			return checkStatus, checkConclusion, ReasonCheckPending
+		}
+		if checkConclusion == "cancelled" {
+			status, conclusion = checkStatus, checkConclusion
+			continue
+		}
+		if checkConclusion != "success" && conclusion == "success" {
+			status, conclusion = checkStatus, checkConclusion
+		}
+	}
+	switch conclusion {
+	case "success":
+		return status, conclusion, ""
+	case "cancelled":
+		return status, conclusion, ReasonCheckCancelled
+	default:
+		return status, conclusion, ReasonCheckFailed
+	}
+}
+
+func requiredCheckSubject(name string, appID int64) string {
+	if appID == 0 {
+		return name
+	}
+	return fmt.Sprintf("%s@app:%d", name, appID)
 }
 
 func sortedUnique(values []string) []string {
