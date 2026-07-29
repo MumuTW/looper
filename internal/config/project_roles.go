@@ -27,7 +27,7 @@ func ProjectRoleConfigs(cfg Config, projectID string) RoleConfigs {
 // named overrides onto a copy of the global registry.
 func projectCodingRoleConfigs(global RoleConfigs, partial PartialRoleConfigs) map[string]CodingRoleConfig {
 	registry := cloneCodingRoleRegistry(EffectiveCodingRoles(global))
-	for name, override := range projectCodingRoleOverrides(partial) {
+	for name, override := range legacyCodingRoleOverrides(partial) {
 		base, ok := registry[name]
 		if !ok {
 			continue
@@ -45,17 +45,23 @@ func cloneCodingRoleRegistry(registry map[string]CodingRoleConfig) map[string]Co
 	return cloned
 }
 
-func projectCodingRoleOverrides(roles PartialRoleConfigs) map[string]PartialCodingRoleConfig {
+// legacyCodingRoleOverrides translates the shared fields of legacy named role
+// sections into registry overlays. Agent bindings reflect the supplied input;
+// project callers pass stripRoleAgentBindings output, so their global-only
+// bindings remain excluded.
+func legacyCodingRoleOverrides(roles PartialRoleConfigs) map[string]PartialCodingRoleConfig {
 	overrides := make(map[string]PartialCodingRoleConfig, 4)
 	if roles.Planner != nil {
 		overrides[CodingRolePlanner] = PartialCodingRoleConfig{
 			Instructions: roles.Planner.Instructions,
+			Agent:        roles.Planner.Agent,
 			Discovery:    partialIssueCodingDiscovery(roles.Planner.AutoDiscovery, roles.Planner.Triggers),
 		}
 	}
 	if roles.Worker != nil {
 		overrides[CodingRoleWorker] = PartialCodingRoleConfig{
 			Instructions: roles.Worker.Instructions,
+			Agent:        roles.Worker.Agent,
 			Discovery:    partialIssueCodingDiscovery(roles.Worker.AutoDiscovery, roles.Worker.Triggers),
 		}
 	}
@@ -63,12 +69,14 @@ func projectCodingRoleOverrides(roles PartialRoleConfigs) map[string]PartialCodi
 		partial := roles.Reviewer
 		overrides[CodingRoleReviewer] = PartialCodingRoleConfig{
 			Instructions: partial.Instructions,
+			Agent:        partial.Agent,
 			Discovery:    partialReviewerCodingDiscovery(partial.Discovery),
 		}
 	}
 	if roles.Fixer != nil {
 		overrides[CodingRoleFixer] = PartialCodingRoleConfig{
 			Instructions: roles.Fixer.Instructions,
+			Agent:        roles.Fixer.Agent,
 			Discovery:    partialFixerCodingDiscovery(roles.Fixer.AutoDiscovery, roles.Fixer.Triggers),
 		}
 	}
