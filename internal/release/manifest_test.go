@@ -20,8 +20,6 @@ func TestBuildManifestCollectsArtifactsAndDerivesDefaults(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "12",
-		MinCliForDaemon:   "0.2.0",
-		MinDaemonForCli:   "0.2.0",
 		Repo:              "nexu-io/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64", "looperd-darwin-arm64"},
@@ -35,6 +33,9 @@ func TestBuildManifestCollectsArtifactsAndDerivesDefaults(t *testing.T) {
 	}
 	if manifest.Channel != "beta" {
 		t.Fatalf("manifest.Channel = %q, want %q", manifest.Channel, "beta")
+	}
+	if manifest.MinCliForDaemon != "" || manifest.MinDaemonForCli != "" {
+		t.Fatalf("min versions = %q/%q, want empty (unenforced, not published)", manifest.MinCliForDaemon, manifest.MinDaemonForCli)
 	}
 	if manifest.Artifacts["looper-darwin-arm64"].SHA256 != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("looper sha = %q, want %q", manifest.Artifacts["looper-darwin-arm64"].SHA256, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -73,8 +74,6 @@ func TestBuildManifestRejectsInvalidTag(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "0007_agent_execution_run_index",
-		MinCliForDaemon:   "0.2.0",
-		MinDaemonForCli:   "0.2.0",
 		Repo:              "nexu-io/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64"},
@@ -94,8 +93,6 @@ func TestBuildManifestRejectsInvalidChecksum(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "0007_agent_execution_run_index",
-		MinCliForDaemon:   "0.2.0",
-		MinDaemonForCli:   "0.2.0",
 		Repo:              "nexu-io/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64"},
@@ -112,6 +109,48 @@ func TestCurrentSchemaVersionUsesLatestEmbeddedMigration(t *testing.T) {
 }
 
 func TestEncodeManifestProducesStableJSONShape(t *testing.T) {
+	manifest := Manifest{
+		ManifestVersion: 1,
+		Version:         "1.2.3",
+		Tag:             "v1.2.3",
+		Released:        "2026-04-22T12:00:00Z",
+		Channel:         "stable",
+		APIVersion:      "v1",
+		SchemaVersion:   "12",
+		Artifacts: map[string]Artifact{
+			"looper-darwin-arm64": {
+				URL:    "https://example.test/looper",
+				SHA256: "abc",
+				Size:   1,
+			},
+		},
+	}
+
+	encoded, err := EncodeManifest(manifest)
+	if err != nil {
+		t.Fatalf("EncodeManifest(...) error = %v", err)
+	}
+
+	decoded := map[string]any{}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(...) error = %v", err)
+	}
+
+	if decoded["channel"] != "stable" {
+		t.Fatalf("channel = %v, want stable", decoded["channel"])
+	}
+	if decoded["apiVersion"] != "v1" {
+		t.Fatalf("apiVersion = %v, want v1", decoded["apiVersion"])
+	}
+	if _, ok := decoded["minCliForDaemon"]; ok {
+		t.Fatalf("minCliForDaemon present = %v, want omitted", decoded["minCliForDaemon"])
+	}
+	if _, ok := decoded["minDaemonForCli"]; ok {
+		t.Fatalf("minDaemonForCli present = %v, want omitted", decoded["minDaemonForCli"])
+	}
+}
+
+func TestEncodeManifestIncludesOptionalMinVersionsWhenSet(t *testing.T) {
 	manifest := Manifest{
 		ManifestVersion: 1,
 		Version:         "1.2.3",
@@ -140,12 +179,11 @@ func TestEncodeManifestProducesStableJSONShape(t *testing.T) {
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatalf("json.Unmarshal(...) error = %v", err)
 	}
-
-	if decoded["channel"] != "stable" {
-		t.Fatalf("channel = %v, want stable", decoded["channel"])
+	if decoded["minCliForDaemon"] != "0.2.0" {
+		t.Fatalf("minCliForDaemon = %v, want 0.2.0", decoded["minCliForDaemon"])
 	}
-	if decoded["apiVersion"] != "v1" {
-		t.Fatalf("apiVersion = %v, want v1", decoded["apiVersion"])
+	if decoded["minDaemonForCli"] != "0.2.0" {
+		t.Fatalf("minDaemonForCli = %v, want 0.2.0", decoded["minDaemonForCli"])
 	}
 }
 
@@ -165,8 +203,6 @@ func TestBuildManifestIncludesTarGzArchives(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "12",
-		MinCliForDaemon:   "0.2.0",
-		MinDaemonForCli:   "0.2.0",
 		Repo:              "nexu-io/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64", "looper-darwin-arm64.tar.gz", "looperd-darwin-arm64", "looperd-darwin-arm64.tar.gz"},
