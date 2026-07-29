@@ -1,4 +1,5 @@
 import { act, cleanup, render, screen } from "@testing-library/react";
+import { useEffect } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ToastProvider, useToast } from "./toast";
 
@@ -14,6 +15,14 @@ function Pusher({ message }: { message: string }) {
       push
     </button>
   );
+}
+
+function Retainer({ retain }: { retain: (push: () => void) => void }) {
+  const toast = useToast();
+  useEffect(() => {
+    retain(() => toast.info("late"));
+  }, [retain, toast]);
+  return null;
 }
 
 describe("ToastProvider", () => {
@@ -72,6 +81,26 @@ describe("ToastProvider", () => {
     expect(vi.getTimerCount()).toBe(2);
 
     unmount();
+
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("ignores a retained push after unmount", () => {
+    vi.useFakeTimers();
+    let pushAfterUnmount: (() => void) | undefined;
+    const retain = (push: () => void) => {
+      pushAfterUnmount = push;
+    };
+    const { unmount } = render(
+      <ToastProvider>
+        <Retainer retain={retain} />
+      </ToastProvider>,
+    );
+    unmount();
+
+    act(() => {
+      pushAfterUnmount?.();
+    });
 
     expect(vi.getTimerCount()).toBe(0);
   });
