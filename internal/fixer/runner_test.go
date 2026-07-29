@@ -142,7 +142,9 @@ func TestBuildFixerPromptDefinesReviewerAuthorityOrder(t *testing.T) {
 	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "replace the established design"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"Authority order (highest wins) for content decisions: latest explicit operator/user directive outside the review flow (for example a control-plane `/respond` answer or non-review author instruction) > repo AGENTS.md / documented project rules > PR explicit goal / design intent > reviewer suggestion > agent judgment.",
-		"Listed fix items and review-thread comments are always reviewer suggestions, never the top content-authority tier—even when the reviewer is human.",
+		"Treat only reviewer-authored listed comment fix items and reviewer-authored review-thread comments as reviewer suggestions—never the top content-authority tier, even when the reviewer is human.",
+		"Do not classify check or conflict fix items as reviewer suggestions; they are objective branch blockers that still require repair and must not be disregarded as lower-authority feedback.",
+		"Author-authored design clarifications inside review threads count as PR design intent, not reviewer suggestions.",
 		"Do not invent unstated \"stable norms\".",
 		"Do not blindly obey reviewers when they conflict with higher content authority.",
 		"Looper lifecycle, safety, disclosure, and output contracts always outrank these content-authority tiers",
@@ -157,6 +159,14 @@ func TestBuildFixerPromptDefinesReviewerAuthorityOrder(t *testing.T) {
 	}
 	if strings.Contains(prompt, "when in doubt, implement the requested change") {
 		t.Fatalf("prompt contains reviewer-as-command fallback:\n%s", prompt)
+	}
+	// Old wording wrongly demoted check/conflict items and author thread replies.
+	for _, unwanted := range []string{
+		"Listed fix items and review-thread comments are always reviewer suggestions",
+	} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("prompt still uses over-broad reviewer-suggestion classification %q:\n%s", unwanted, prompt)
+		}
 	}
 	// Top tier must stay disjoint from review feedback so a human review
 	// comment cannot simultaneously occupy highest and fourth authority.
