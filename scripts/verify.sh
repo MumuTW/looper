@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local mirror of CI's `verify` job — run this before you push and CI won't
 # surprise you. Same gates, same order as .github/workflows/ci.yml:
-#   dashboard (pnpm install/test/build + artifact checks)
+#   optional gofmt -w → dashboard (pnpm install/test/build + artifact checks)
 #   → gofmt -l  →  go vet  →  go test  →  go build (with release ldflags)
 #
 # Usage:
@@ -28,11 +28,26 @@ done
 
 step() { printf '\n\033[1m▸ %s\033[0m\n' "$1"; }
 
+if [ "$FIX" -eq 1 ]; then
+  step "gofmt --fix"
+  gofmt -w .
+  echo "  gofmt -w applied"
+fi
+
+for tool in node pnpm; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "missing required dashboard tool: $tool (see CONTRIBUTING.md prerequisites)" >&2
+    exit 1
+  fi
+done
+
 step "dashboard (pnpm install/test/build + artifact checks)"
 (
   cd web/dashboard
   pnpm install --frozen-lockfile
   pnpm test
+  rm -rf ../../internal/dashboard/assets/assets
+  rm -f ../../internal/dashboard/assets/.production ../../internal/dashboard/assets/index.html
   pnpm run build
   test -f ../../internal/dashboard/assets/.production
   test -f ../../internal/dashboard/assets/index.html
@@ -40,10 +55,6 @@ step "dashboard (pnpm install/test/build + artifact checks)"
 echo "  clean"
 
 step "gofmt"
-if [ "$FIX" -eq 1 ]; then
-  gofmt -w .
-  echo "  gofmt -w applied"
-fi
 unformatted="$(gofmt -l .)"
 if [ -n "$unformatted" ]; then
   printf '  these files need gofmt (run: scripts/verify.sh --fix):\n%s\n' "$unformatted" >&2

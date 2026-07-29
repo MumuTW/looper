@@ -18,6 +18,7 @@ For non-trivial changes, please open an issue first so we can align on scope bef
 ## Prerequisites
 
 - Go 1.22+ (see `go.mod`)
+- Node.js 22+ and pnpm 10 (the same dashboard toolchain used by CI)
 - `git`
 - `gh` (GitHub CLI), authenticated — Looper relies on it at runtime
 - macOS or Linux. macOS notification features additionally require `osascript`
