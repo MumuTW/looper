@@ -653,7 +653,10 @@ func TestExecutorRefusedFallbackRebindSurfacesKilled(t *testing.T) {
 		LoopID:           "loop_1",
 		WorkingDirectory: t.TempDir(),
 		Prompt:           "continue work",
-		Timeout:          5 * time.Second,
+		// Backstop only: the refused rebind is what ends this run. Keep it far
+		// above the contended worst case so a slow machine cannot turn the
+		// expected kill into a timeout.
+		Timeout:          60 * time.Second,
 		GracefulShutdown: 50 * time.Millisecond,
 	})
 	if err != nil {
