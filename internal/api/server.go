@@ -10,20 +10,22 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 )
 
 type Server struct {
 	config   config.Config
 	handler  http.Handler
+	logger   bootstrap.Logger
 	mu       sync.Mutex
 	listener net.Listener
 	server   *http.Server
 	done     chan struct{}
 }
 
-func NewServer(cfg config.Config, handler http.Handler) *Server {
-	return &Server{config: cfg, handler: handler}
+func NewServer(cfg config.Config, handler http.Handler, logger bootstrap.Logger) *Server {
+	return &Server{config: cfg, handler: handler, logger: logger}
 }
 
 func (s *Server) Start() error {
@@ -52,7 +54,15 @@ func (s *Server) Start() error {
 	go func() {
 		defer close(done)
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			// Best-effort background serve error path; Start only reports listen errors.
+			// Serve only returns here on an unexpected accept/serve failure;
+			// without this log the API surface disappears silently while the
+			// daemon stays alive.
+			if s.logger != nil {
+				s.logger.Error("api server stopped unexpectedly", map[string]any{
+					"error": err.Error(),
+					"addr":  listener.Addr().String(),
+				})
+			}
 		}
 	}()
 
