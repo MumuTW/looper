@@ -114,7 +114,8 @@ func LocalFixerWorktreeCheckoutUsable(path string) bool {
 	// Linked private gitdir must look like a real git dir (HEAD), not merely exist.
 	// An empty/corrupt gitdir still makes `git` report "not a git repository"; if
 	// we only checked existence, prepare would retry forever without recreating.
-	if _, err = os.Stat(filepath.Join(gitdir, "HEAD")); err != nil {
+	privateHead, err := os.Stat(filepath.Join(gitdir, "HEAD"))
+	if err != nil || !privateHead.Mode().IsRegular() {
 		return false
 	}
 	// commondir is required for linked worktrees: without it (or when it does not
@@ -132,7 +133,8 @@ func LocalGitRepositoryMetadataUsable(dir string) bool {
 	if dir == "" {
 		return false
 	}
-	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil {
+	head, err := os.Stat(filepath.Join(dir, "HEAD"))
+	if err != nil || !head.Mode().IsRegular() {
 		return false
 	}
 	objects, err := os.Stat(filepath.Join(dir, "objects"))
