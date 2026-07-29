@@ -288,12 +288,29 @@ func trustedReviewChildEnv(cfg config.Config) map[string]string {
 	return env
 }
 
-// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path.
+// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path, or ""
+// when the configured binary cannot serve as the trusted review-submit wrapper.
+// tools.looperPath is auto-detected from PATH, so it can name a looper build
+// that predates `review submit`; returning "" routes the reviewer prompt to its
+// fail-closed branch instead of letting a full review run and only fail at
+// publication time.
+//
 // Agents always receive the real configured looper path — never a secret-bearing
 // wrapper path. Provider tokens for `looper review submit` are supplied through
 // a per-run daemon-side trusted review proxy socket bound to the selected PR.
-func resolveTrustedLooperCLIPath(cfg config.Config) string {
-	return strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+func resolveTrustedLooperCLIPath(cfg config.Config, logger bootstrap.Logger) string {
+	configured := strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+	if configured == "" {
+		return ""
+	}
+	capable, reason, changed := trustedReviewCapability(configured)
+	if changed {
+		logTrustedReviewCapabilityVerdict(logger, configured, capable, reason)
+	}
+	if !capable {
+		return ""
+	}
+	return configured
 }
 
 // mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
@@ -1975,10 +1992,25 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
+		// Refuse before the agent starts rather than spend a run reviewing a PR
+		// it has no way to publish to. resolveTrustedLooperCLIPath has already
+		// logged which binary failed and why; this is the per-run consequence.
+		//
+		// The text is the prompt's wording verbatim, deliberately without the
+		// "install run-bound trusted review proxy" prefix its neighbours carry.
+		// Runs that never mint a proxy report the same condition from the agent
+		// side instead, and an operator should not need to know which half they
+		// are looking at to search for it.
+		if strings.TrimSpace(a.realLooper) == "" {
+			return nil, errors.New(reviewer.TrustedWrapperUnavailableMessage)
+		}
 		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
 		configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
 		var err error
 		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
+		// Past the wrapper check a failure is the daemon's own — socket, binding
+		// or policy — and keeps the prefix, because it is not the condition the
+		// prompt describes and must not be searched for as if it were.
 		if err != nil {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
 		}
@@ -3157,7 +3189,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
 
-	looperCLIPath := resolveTrustedLooperCLIPath(cfg)
+	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
 	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of shared agent executor env so
 	// planner/worker/fixer cannot publish reviews. Inject only via the
 	// reviewer adapter, which mints a per-run proxy bound to the selected PR.
