@@ -7300,6 +7300,67 @@ func TestRunPushStepRecordsPushEvidenceBeforePostPushHold(t *testing.T) {
 	}
 }
 
+func TestRunPushStepRevalidatesHeadThatChangedAfterValidation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopMetadata := `{}`
+	loopTarget := buildPullRequestTargetID("acme/looper", 42)
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_revalidate_push", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_revalidate_push", LoopID: "loop_revalidate_push", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{
+		{Number: 42, State: "OPEN", HeadSHA: "late-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"},
+		{Number: 42, State: "OPEN", HeadSHA: "late-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"},
+		{Number: 42, State: "OPEN", HeadSHA: "late-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"},
+	}}
+	git := &fakeGitGateway{inspectResults: []InspectHeadResult{
+		{HeadSHA: "late-head", NewCommitSHAs: []string{"late-head"}},
+		{HeadSHA: "late-head", NewCommitSHAs: []string{"late-head"}},
+		{HeadSHA: "late-head", NewCommitSHAs: []string{"late-head"}},
+		{HeadSHA: "late-head"},
+	}}
+	validationCalls := 0
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git,
+		ValidationCommands: []string{"go test ./..."},
+		ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+			validationCalls++
+			return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+		},
+		AllowAutoCommit: true, AllowAutoPush: true, Now: fixture.now, Logger: fixture.logger,
+	})
+	checkpoint := fixerCheckpoint{
+		Detail:           &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+		Worktree:         &checkpointWorktree{Path: t.TempDir(), Branch: "feature/fix-42", BaseHeadSHA: "base-head"},
+		FixItemsHash:     "fix-hash",
+		Repair:           &checkpointRepair{Status: "completed"},
+		Validation:       &ValidationResult{Passed: true, HeadSHA: "validated-head"},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "validated-head", NewCommitSHAs: []string{"validated-head"}, WorkingTreeClean: true, CompletedAt: fixture.nowISO()},
+	}
+
+	updated, err := runner.runPushStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{ID: "loop_revalidate_push", MetadataJSON: &loopMetadata}, Run: run, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runPushStep() error = %v", err)
+	}
+	if validationCalls != 1 {
+		t.Fatalf("validation calls = %d, want resumed push to revalidate changed head once", validationCalls)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("push calls = %d, want 1 after revalidation", len(git.pushCalls))
+	}
+	if updated.Validation == nil || updated.Validation.HeadSHA != "late-head" || updated.ReconcileCommits == nil || updated.ReconcileCommits.FinalHeadSHA != "late-head" {
+		t.Fatalf("updated validation/reconcile = %#v / %#v, want push bound to late-head", updated.Validation, updated.ReconcileCommits)
+	}
+	if updated.Push == nil || !updated.Push.Pushed || updated.Push.HeadSHA != "late-head" {
+		t.Fatalf("updated.Push = %#v, want late-head pushed", updated.Push)
+	}
+}
+
 func TestRunPushStepDoesNotAdoptAgentLifecyclePushEvidenceOnLiveHeadMismatch(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "other-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"}}}

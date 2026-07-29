@@ -111,6 +111,15 @@ func TestClassifyValidationFailureParksDeterministicFailures(t *testing.T) {
 	}
 }
 
+func TestClassifyValidationFailureDoesNotInferTimeoutFromTestOutput(t *testing.T) {
+	t.Parallel()
+
+	failure := classifyValidationFailure(ValidationResult{Passed: false, Summary: "go test failed", Output: "--- FAIL: TestTimeoutPolicy"})
+	if failure.kind != FailureManualIntervention || failure.resumePolicy != "manual_intervention" {
+		t.Fatalf("classifyValidationFailure() = %#v, want deterministic failure parked", failure)
+	}
+}
+
 func TestProcessClaimedItemRevalidatesChangesCreatedByValidation(t *testing.T) {
 	t.Parallel()
 
