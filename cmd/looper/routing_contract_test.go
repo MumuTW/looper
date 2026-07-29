@@ -134,6 +134,10 @@ type contractFixture struct {
 	config        config.Config
 	stoppedLoopID string
 	stoppedAll    bool
+	// controlDelay makes the daemon's lifecycle hooks take real time, which is
+	// what a stop of an unresponsive agent does. Set it before the fixture
+	// serves anything.
+	controlDelay time.Duration
 }
 
 // assertRouteResolves checks the two failures a routing bug produces: the path
@@ -217,16 +221,25 @@ func newContractFixture(t *testing.T) *contractFixture {
 	fixture.handler = api.NewHandler(api.Context{
 		Config:  cfg,
 		Runtime: runtime,
-		StopLoop: func(_ context.Context, loopID string, _ string) (any, error) {
+		StopLoop: func(ctx context.Context, loopID string, _ string) (any, error) {
+			if err := fixture.workFor(ctx); err != nil {
+				return nil, err
+			}
 			fixture.stoppedLoopID = loopID
 			return map[string]any{"stopped": true}, nil
 		},
 		CloseLoop: func(_ context.Context, loopID string, _ string) (any, error) {
 			return map[string]any{"closed": loopID}, nil
 		},
-		StopAll: func(context.Context, string) (any, error) {
+		StopAll: func(ctx context.Context, _ string) (any, error) {
+			if err := fixture.workFor(ctx); err != nil {
+				return nil, err
+			}
 			fixture.stoppedAll = true
-			return map[string]any{"stopped": 0}, nil
+			// The real bulk stop answers with counters the CLI reads to decide
+			// whether a 200 was actually a full stop; a bare object would make
+			// every stop-all here fail on "missing summary" instead.
+			return map[string]any{"summary": map[string]any{"total": 0, "stopped": 0, "pausedOnly": 0, "failed": 0}}, nil
 		},
 		TakeoverLoop: func(_ context.Context, loopID string, _ string) (api.TakeoverResult, error) {
 			return api.TakeoverResult{LoopID: loopID}, nil
@@ -319,6 +332,21 @@ func TestRetryReachesTheDaemonRoutes(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "Unknown route") {
 		t.Fatalf("retry hit an unknown route: %s", stderr.String())
+	}
+}
+
+// workFor makes a lifecycle hook occupy the daemon for controlDelay, aborting
+// if the client hangs up first. The daemon runs these on the request context,
+// so a client-side deadline really does cut a stop short.
+func (f *contractFixture) workFor(ctx context.Context) error {
+	if f.controlDelay <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(f.controlDelay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -429,6 +457,51 @@ func TestVersionFlagStillWorksBeforeTheVerb(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBulkStopOutlivesTheSingleLoopDeadline is the finding this fix answers: the
+// daemon stops candidates one at a time, each worth up to the runtime's 20s kill
+// budget, so a bulk stop of a handful of unresponsive agents runs past the
+// deadline the other verbs use. The daemon reads the request context, so a
+// client-side timeout does not merely lose the report — it aborts the sweep.
+//
+// The two subtests are each other's mutation check: making every call unbounded
+// fails the second, and dropping Unbounded fails the first.
+func TestBulkStopOutlivesTheSingleLoopDeadline(t *testing.T) {
+	const daemonWork = 400 * time.Millisecond
+
+	original := requestTimeout
+	requestTimeout = 80 * time.Millisecond
+	t.Cleanup(func() { requestTimeout = original })
+
+	t.Run("stop all waits", func(t *testing.T) {
+		fixture := newContractFixture(t)
+		fixture.controlDelay = daemonWork
+		configPath, seen := serveContract(t, fixture)
+
+		stderr := &bytes.Buffer{}
+		code := run([]string{"stop", "all", "--config", configPath}, strings.NewReader(""), io.Discard, stderr)
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0: bulk stop was cut off after %s (stderr %q)", code, requestTimeout, stderr.String())
+		}
+		if _, ok := seen()["POST /api/v1/runs/active/stop-all"]; !ok {
+			t.Fatalf("stop all never reached the bulk route; saw %v", seen())
+		}
+	})
+
+	t.Run("single loop stop still times out", func(t *testing.T) {
+		fixture := newContractFixture(t)
+		fixture.controlDelay = daemonWork
+		configPath, _ := serveContract(t, fixture)
+
+		stderr := &bytes.Buffer{}
+		if code := run([]string{"stop", "12", "--config", configPath}, strings.NewReader(""), io.Discard, stderr); code == 0 {
+			t.Fatal("exit = 0: an ordinary stop lost its deadline")
+		}
+		if !strings.Contains(stderr.String(), "deadline exceeded") {
+			t.Fatalf("stderr = %q, want a deadline failure", stderr.String())
+		}
+	})
 }
 
 // writeContractConfig points the CLI's own config loading at a running server,

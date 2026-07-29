@@ -39,7 +39,19 @@ import (
 	"github.com/nexu-io/looper/internal/version"
 )
 
-const requestTimeout = 30 * time.Second
+// requestTimeout bounds a single call. Those are one storage transaction and at
+// most one process signal, so a daemon that has not answered in 30s is wedged,
+// not busy.
+//
+// It is a var only so tests can shorten it; nothing reassigns it at runtime.
+var requestTimeout = 30 * time.Second
+
+// bulkStopRequestTimeout allows the daemon to spend several per-loop kill
+// budgets completing the sequential stop-all sweep, while still giving
+// noninteractive callers an upper bound if the daemon never responds.
+//
+// It is a var only so tests can shorten it; nothing reassigns it at runtime.
+var bulkStopRequestTimeout = 10 * time.Minute
 
 // projectAddTimeout is longer than requestTimeout because POST /api/v1/projects
 // is not a control call. The daemon commits the project and only then discovers
@@ -133,7 +145,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	// stop-all answers HTTP 200 even when some loops only paused or failed;
 	// the old CLI exited nonzero so automation cannot treat "partial stop" as success.
-	if request.Path == "/api/v1/runs/active/stop-all" {
+	if request.Path == stopAllPath {
 		if err := stopAllPartialFailure(body); err != nil {
 			_, _ = fmt.Fprintln(stdout, strings.TrimSpace(body))
 			_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
@@ -178,7 +190,14 @@ func badUsage(format string, args ...any) error {
 type apiRequest struct {
 	Path string
 	Body []byte
+	// LongRunning selects the larger finite request budget used only for a
+	// bulk stop, whose runtime includes one kill budget per active loop.
+	LongRunning bool
 }
+
+// stopAllPath is the daemon's bulk stop route. The CLI branches on it twice —
+// for the deadline and for the partial-failure check — so it is named once.
+const stopAllPath = "/api/v1/runs/active/stop-all"
 
 // respondBody mirrors the daemon's respondLoopRequest. It is restated rather
 // than imported because internal/api is not importable from cmd, and the
@@ -310,8 +329,17 @@ func routeForVerb(verb string, args []string) (apiRequest, error) {
 		// Bulk stop is its own selector on the daemon, not a selector named
 		// "all" with a /stop suffix: that path parses as a single-loop stop
 		// and dies resolving a loop literally called "all".
+		//
+		// It also gets a longer finite deadline. The daemon stops candidates one at a time and
+		// each one may spend up to the runtime's kill budget (20s, see
+		// internal/runtime defaultKillTimeout) draining a containment handle,
+		// so two unresponsive agents already outlast the 30s deadline the other
+		// verbs use. Timing out here does not merely lose the report: the
+		// daemon runs the sweep on the request context, so the CLI's deadline
+		// aborts it partway and no summary says which loops were stopped.
+		// Ctrl-C still cancels — run()'s context is signal-bound.
 		if strings.TrimSpace(args[0]) == "all" && verb == "stop" {
-			return apiRequest{Path: "/api/v1/runs/active/stop-all"}, nil
+			return apiRequest{Path: stopAllPath, LongRunning: true}, nil
 		}
 		segment, err := selectorPathSegment(args[0])
 		if err != nil {
@@ -878,7 +906,11 @@ func dialHost(host string) string {
 // post issues a control verb's request and returns the daemon's raw body, which
 // those verbs echo verbatim rather than reformat.
 func post(ctx context.Context, cfg config.Config, call apiRequest) (string, error) {
-	return doHTTP(ctx, cfg, http.MethodPost, call.Path, call.Body)
+	timeout := requestTimeout
+	if call.LongRunning {
+		timeout = bulkStopRequestTimeout
+	}
+	return doHTTPWithin(ctx, timeout, cfg, http.MethodPost, call.Path, call.Body)
 }
 
 func get(ctx context.Context, cfg config.Config, path string) (string, error) {
