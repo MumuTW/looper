@@ -20,7 +20,12 @@
 
 Global flags (before or after the verb): `--config <path>`, `--host <host>`, `--port <port>`.
 
-A **selector** is a loop sequence number (`12`) or loop id (`loop_…`). Pull request URLs are rejected.
+A **selector** is a loop sequence number (`12`) or loop id (`loop_…`). Pull request URLs are rejected. `stop all` is not a loop named "all" — it is a distinct selector that routes to the daemon's bulk-stop endpoint.
+
+Argument parsing, which decides whether a command reaches the daemon at all:
+
+- **An unrecognised flag is refused, never read as a selector.** `looper stop --bogus 12` exits 2 with `unknown flag "--bogus"` rather than treating `--bogus` as the loop to stop.
+- **`--` ends flag parsing; everything after it is an operand.** This is the only way to pass an argument that begins with a dash. `looper respond 12 -oops` fails with `unknown flag "-oops"`; `looper respond -- 12 -oops` reaches the daemon. Reach for it whenever a `respond` answer could start with a dash.
 
 ## Machine-only
 
