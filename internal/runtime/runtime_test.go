@@ -2136,6 +2136,11 @@ func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
 	}
 }
 
+func newManualReconcileRuntime(options Options) *Runtime {
+	options.RunSchedulerTick = func(context.Context, Services) error { return nil }
+	return New(options)
+}
+
 func TestRuntimeReconcileLiveStaleRunningRunsInterruptsAgentBackedRunWithoutExecution(t *testing.T) {
 	t.Parallel()
 
@@ -2151,7 +2156,7 @@ func TestRuntimeReconcileLiveStaleRunningRunsInterruptsAgentBackedRunWithoutExec
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2208,7 +2213,7 @@ func TestRuntimeReconcileLiveStaleRunningRunsSkipsNonAgentRunWithoutExecution(t 
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2248,7 +2253,7 @@ func TestRuntimeReconcileLiveStaleRunningRunsInterruptsWorkerExecuteRunWithoutEx
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2557,7 +2562,7 @@ func TestRepairStaleRunQueueStateDoesNotRequeueLoopWhileNewerRunIsLive(t *testin
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2934,7 +2939,7 @@ func TestRuntimeReconcileStaleRunningRunsRepairsInterruptedLoopQueueOnLaterPass(
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2990,7 +2995,7 @@ func TestRuntimeReconcileStaleRunningRunsRecreatesQueuedItemForInterruptedQueued
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
