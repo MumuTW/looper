@@ -46,10 +46,24 @@ type PendingConfirm =
 
 type InspectGuidance = {
   worktree: LoopWorktreeStatus;
-  jumpCommand: string;
-  /** When false, hide discard CLI hint (unmanaged paths). */
+  cdCommand: string;
+  /** When false, hide the discard-and-retry hint (unmanaged paths). */
   offerDiscard: boolean;
 } | null;
+
+/**
+ * POSIX-safe single-quoted path for paste into a shell. Always quotes so
+ * spaces and metacharacters cannot break the copied command.
+ */
+function quoteShellArg(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Shell command to open the worktree; empty when the path is unknown. */
+function cdCommandFor(worktree: LoopWorktreeStatus): string {
+  const path = worktree.worktreePath?.trim();
+  return path ? `cd -- ${quoteShellArg(path)}` : "";
+}
 
 const LABELS: Record<LoopAction, string> = {
   pause: "Pause",
@@ -95,6 +109,11 @@ export function LoopActionBar({
   const enabled = useMemo(
     () => actionsForLoopStatus(status, { hasActiveRun }),
     [status, hasActiveRun],
+  );
+  const discardRetryRequest = useMemo(
+    () =>
+      `POST /api/v1/loops/${encodeURIComponent(selector)}/retry {"discardWorktreeChanges": true}`,
+    [selector],
   );
 
   const [pending, setPending] = useState<LoopAction | null>(null);
@@ -192,7 +211,7 @@ export function LoopActionBar({
       if (decision === "inspect-only") {
         setInspectGuidance({
           worktree,
-          jumpCommand: `looper jump ${selector}`,
+          cdCommand: cdCommandFor(worktree),
           offerDiscard: false,
         });
         toast.error(
@@ -324,7 +343,7 @@ export function LoopActionBar({
               setConfirm(null);
               setInspectGuidance({
                 worktree: wt,
-                jumpCommand: `looper jump ${selector}`,
+                cdCommand: cdCommandFor(wt),
                 offerDiscard: true,
               });
               return;
@@ -383,7 +402,7 @@ export function LoopActionBar({
           <div className="flex flex-col gap-2">
             <p className="m-0 text-[var(--text-muted)]">
               {inspectGuidance.offerDiscard
-                ? "Review local changes in the worktree, then retry again. Use jump from a terminal on this machine."
+                ? "Review local changes in the worktree, then retry again. Open the path below in a terminal on this machine."
                 : "This path is not a Looper-managed worktree, so discard is unavailable. Inspect manually, then retry only after the tree is clean or the path is fixed."}
             </p>
             {inspectGuidance.worktree.branch ? (
@@ -404,26 +423,34 @@ export function LoopActionBar({
                 {inspectGuidance.worktree.worktreePath || "—"}
               </p>
             </div>
-            {inspectGuidance.worktree.present ? (
+            {inspectGuidance.worktree.present && inspectGuidance.cdCommand ? (
               <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-                    Jump command
+                    Open in terminal
                   </span>
-                  <CopyButton text={inspectGuidance.jumpCommand} />
+                  <CopyButton text={inspectGuidance.cdCommand} />
                 </div>
                 <p className="m-0 break-all mono text-[11px]">
-                  {inspectGuidance.jumpCommand}
+                  {inspectGuidance.cdCommand}
                 </p>
               </div>
             ) : null}
             {inspectGuidance.offerDiscard ? (
-              <p className="m-0 text-[11px] text-[var(--text-muted)]">
-                After fixing or deciding to drop changes: Retry again, or run{" "}
-                <span className="mono">
-                  looper retry {selector} --discard-worktree-changes --confirm
-                </span>
-              </p>
+              <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                    Discard and retry
+                  </span>
+                  <CopyButton text={discardRetryRequest} />
+                </div>
+                <p className="m-0 break-all mono text-[11px]">
+                  {discardRetryRequest}
+                </p>
+                <p className="m-0 mt-1 text-[11px] text-[var(--text-muted)]">
+                  Or click Retry again and choose Discard &amp; retry.
+                </p>
+              </div>
             ) : null}
           </div>
         </ConfirmDialog>

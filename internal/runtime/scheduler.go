@@ -288,12 +288,29 @@ func trustedReviewChildEnv(cfg config.Config) map[string]string {
 	return env
 }
 
-// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path.
+// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path, or ""
+// when the configured binary cannot serve as the trusted review-submit wrapper.
+// tools.looperPath is auto-detected from PATH, so it can name a looper build
+// that predates `review submit`; returning "" routes the reviewer prompt to its
+// fail-closed branch instead of letting a full review run and only fail at
+// publication time.
+//
 // Agents always receive the real configured looper path — never a secret-bearing
 // wrapper path. Provider tokens for `looper review submit` are supplied through
 // a per-run daemon-side trusted review proxy socket bound to the selected PR.
-func resolveTrustedLooperCLIPath(cfg config.Config) string {
-	return strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+func resolveTrustedLooperCLIPath(cfg config.Config, logger bootstrap.Logger) string {
+	configured := strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+	if configured == "" {
+		return ""
+	}
+	capable, reason, changed := trustedReviewCapability(configured)
+	if changed {
+		logTrustedReviewCapabilityVerdict(logger, configured, capable, reason)
+	}
+	if !capable {
+		return ""
+	}
+	return configured
 }
 
 // mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
@@ -1975,10 +1992,25 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
+		// Refuse before the agent starts rather than spend a run reviewing a PR
+		// it has no way to publish to. resolveTrustedLooperCLIPath has already
+		// logged which binary failed and why; this is the per-run consequence.
+		//
+		// The text is the prompt's wording verbatim, deliberately without the
+		// "install run-bound trusted review proxy" prefix its neighbours carry.
+		// Runs that never mint a proxy report the same condition from the agent
+		// side instead, and an operator should not need to know which half they
+		// are looking at to search for it.
+		if strings.TrimSpace(a.realLooper) == "" {
+			return nil, errors.New(reviewer.TrustedWrapperUnavailableMessage)
+		}
 		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
 		configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
 		var err error
 		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
+		// Past the wrapper check a failure is the daemon's own — socket, binding
+		// or policy — and keeps the prefix, because it is not the condition the
+		// prompt describes and must not be searched for as if it were.
 		if err != nil {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
 		}
@@ -3157,7 +3189,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
 
-	looperCLIPath := resolveTrustedLooperCLIPath(cfg)
+	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
 	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of shared agent executor env so
 	// planner/worker/fixer cannot publish reviews. Inject only via the
 	// reviewer adapter, which mints a per-run proxy bound to the selected PR.
@@ -3731,84 +3763,38 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}
 			continue
 		}
-		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
-			if err := admissionRefuseWork(input); err != nil {
-				break
+		admissionClosed := false
+		for _, lane := range codingDiscoveryLanes(input) {
+			if !lane.Present {
+				continue
 			}
-			appendErr(runSchedulerLane(input, "planner discovery", project.ID, repo, func() error {
-				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-				trackRunnableDiscovery(result.QueueItems)
-				return wrapSchedulerError("planner discovery", project.ID, repo, err)
-			}))
-			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_planner_discovery", input, discoveredRunnableIDs, true)
-			recordClaim(claimedCount, availableSlots, err)
-		} else if input.Planner != nil && input.Logger != nil {
-			input.Logger.Debug("planner auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
-		}
-		if input.Coordinator != nil && coordinatorEnabledForProject(input, project.ID) {
-			if !providerHasGitHubPullRequests(providerKind) {
+			if !lane.Enabled(project.ID) {
+				if lane.LogWhenDisabled && input.Logger != nil {
+					input.Logger.Debug(lane.Name+" auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
+				}
+				continue
+			}
+			if lane.Supported != nil && !lane.Supported(providerKind) {
 				if input.Logger != nil {
-					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "coordinator discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
+					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": lane.laneLabel(), "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
-			} else {
-				if err := admissionRefuseWork(input); err != nil {
-					break
-				}
-				appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
-					_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-					return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
-				}))
-				claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_coordinator_discovery", input, discoveredRunnableIDs, true)
-				recordClaim(claimedCount, availableSlots, err)
+				continue
 			}
-		}
-		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
 			if err := admissionRefuseWork(input); err != nil {
+				admissionClosed = true
 				break
 			}
-			appendErr(runSchedulerLane(input, "reviewer discovery", project.ID, repo, func() error {
-				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-				trackRunnableDiscovery(result.QueueItems)
-				return wrapSchedulerError("reviewer discovery", project.ID, repo, err)
+			label := lane.laneLabel()
+			appendErr(runSchedulerLane(input, label, project.ID, repo, func() error {
+				items, err := lane.Discover(ctx, project.ID, repo, snapshot)
+				trackRunnableDiscovery(items)
+				return wrapSchedulerError(label, project.ID, repo, err)
 			}))
-			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_reviewer_discovery", input, discoveredRunnableIDs, true)
+			claimedCount, availableSlots, err = executeClaimPhase(ctx, lane.claimPhaseLabel(), input, discoveredRunnableIDs, true)
 			recordClaim(claimedCount, availableSlots, err)
-		} else if input.Reviewer != nil && input.Logger != nil {
-			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
-		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
-			if !providerSupportsFixerDiscovery(providerKind) {
-				if input.Logger != nil {
-					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "fixer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
-				}
-			} else {
-				if err := admissionRefuseWork(input); err != nil {
-					break
-				}
-				appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
-					result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-					trackRunnableDiscovery(result.QueueItems)
-					return wrapSchedulerError("fixer discovery", project.ID, repo, err)
-				}))
-				claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_fixer_discovery", input, discoveredRunnableIDs, true)
-				recordClaim(claimedCount, availableSlots, err)
-			}
-		} else if input.Fixer != nil && input.Logger != nil {
-			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
-		}
-		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok && discoveryEnabled(input.WorkerDiscoveryEnabled) {
-			if err := admissionRefuseWork(input); err != nil {
-				break
-			}
-			appendErr(runSchedulerLane(input, "worker issue discovery", project.ID, repo, func() error {
-				result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-				trackRunnableDiscovery(result.QueueItems)
-				return wrapSchedulerError("worker issue discovery", project.ID, repo, err)
-			}))
-			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_worker_discovery", input, discoveredRunnableIDs, true)
-			recordClaim(claimedCount, availableSlots, err)
-		} else if input.Worker != nil && input.Logger != nil && !discoveryEnabled(input.WorkerDiscoveryEnabled) {
-			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
+		if admissionClosed {
+			break
 		}
 
 		// HITL (github transport): deliver any human answers posted on this

@@ -72,6 +72,16 @@ const (
 	reviewerNativeResumeReasonHeadChange = "head_change"
 )
 
+// TrustedWrapperUnavailableMessage is what a reviewer run reports when no
+// usable `looper review submit` wrapper exists.
+//
+// The condition surfaces from two places. The daemon refuses to start a
+// native-review run without one, and the prompt tells the agent to exit
+// non-zero with this exact text on runs that never mint a proxy. Operators
+// should not have to know which half they are looking at, so both say the same
+// thing and this constant is what keeps that true.
+const TrustedWrapperUnavailableMessage = "trusted looper review submit wrapper unavailable"
+
 type ReviewerStep string
 
 type ReviewEvent string

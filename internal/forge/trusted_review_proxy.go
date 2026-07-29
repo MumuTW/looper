@@ -31,6 +31,21 @@ const TrustedReviewSockEnv = "LOOPER_TRUSTED_REVIEW_SOCK"
 // re-enter the proxy (the child receives provider tokens directly).
 const trustedReviewProxySkipEnv = "LOOPER_TRUSTED_REVIEW_PROXY_CHILD"
 
+// TrustedReviewCapabilityToken is the exact stdout token `looper review
+// capability` prints for a build that implements `looper review submit`.
+//
+// tools.looperPath is auto-detected from PATH, so it can name a looper build
+// that predates review submit — or an unrelated executable of the same name.
+// The daemon probes the binary with this token before telling a reviewer agent
+// to publish through it; requiring the exact token rather than a zero exit is
+// what makes an unrelated `looper` a negative result instead of a trusted one.
+//
+// It lives here, beside the socket and config-descriptor keys, because it is
+// the same kind of thing: a contract between the daemon and the CLI it spawns.
+// Both sides must read it from here — two copies that drift silently disable
+// reviewer publishing, which is the failure this constant exists to prevent.
+const TrustedReviewCapabilityToken = "review-submit/1"
+
 // TrustedReviewConfigFDEnv identifies the inherited, read-only pipe containing
 // the exact materialized config snapshot for a trusted review child. The pipe
 // replaces a named temporary file so the same-UID agent cannot discover or

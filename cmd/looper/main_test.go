@@ -1,241 +1,211 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"net/http"
-	"os"
+	"strings"
 	"testing"
-
-	"github.com/nexu-io/looper/internal/cliapp"
-	"github.com/nexu-io/looper/internal/version"
 )
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
+// TestRouteForVerb pins the whole CLI-to-API contract in one table: every verb
+// the usage text advertises, the selector that routes somewhere else entirely
+// ("stop all"), and the argument shapes that must fail before a request is
+// ever sent.
+func TestRouteForVerb(t *testing.T) {
+	tests := []struct {
+		name     string
+		verb     string
+		args     []string
+		wantPath string
+		wantBody string
+		wantErr  string
+	}{
+		{
+			name:     "stop resolves a selector against active runs",
+			verb:     "stop",
+			args:     []string{"loop-1"},
+			wantPath: "/api/v1/runs/active/loop-1/stop",
+		},
+		{
+			// The daemon's bulk stop is the selector "stop-all" on a
+			// single-segment path. Routing "all" as a selector with a /stop
+			// suffix instead lands in the single-loop branch, which 404s on a
+			// loop named "all" — so this assertion is the bug guard, not a
+			// restatement of the obvious.
+			name:     "stop all is the daemon's bulk selector, not a loop named all",
+			verb:     "stop",
+			args:     []string{"all"},
+			wantPath: "/api/v1/runs/active/stop-all",
+		},
+		{
+			// There is no bulk close on the daemon, so this stays an ordinary
+			// selector and fails loudly at resolution rather than quietly
+			// closing everything.
+			name:     "close all stays an ordinary selector",
+			verb:     "close",
+			args:     []string{"all"},
+			wantPath: "/api/v1/runs/active/all/close",
+		},
+		{
+			// See TestPullRequestURLSelectorCannotRoute: the daemon splits the
+			// decoded request path, so a selector with a slash cannot reach a
+			// route however it is encoded.
+			name:    "close refuses a pull request URL the daemon cannot resolve",
+			verb:    "close",
+			args:    []string{"https://github.com/o/r/pull/7"},
+			wantErr: "is not a loop id or sequence number",
+		},
+		{
+			// Escaped rather than concatenated raw: a selector is one path
+			// segment, and "#" would otherwise truncate the path to a fragment.
+			name:     "close escapes a selector that would break the request path",
+			verb:     "close",
+			args:     []string{"loop#7"},
+			wantPath: "/api/v1/runs/active/loop%237/close",
+		},
+		{
+			name:     "takeover targets the loop",
+			verb:     "takeover",
+			args:     []string{"loop-1"},
+			wantPath: "/api/v1/loops/loop-1/takeover",
+		},
+		{
+			name:     "handback targets the loop",
+			verb:     "handback",
+			args:     []string{"loop-1"},
+			wantPath: "/api/v1/loops/loop-1/handback",
+		},
+		{
+			// retry is dispatched to runRetry before routing, so it is not a
+			// verb this function knows. See TestRetryReachesTheDaemonRoutes for
+			// the paths it actually builds.
+			name:    "retry is not routed here",
+			verb:    "retry",
+			args:    []string{"loop-1"},
+			wantErr: `unknown command "retry"`,
+		},
+		{
+			name:     "start targets the loop",
+			verb:     "start",
+			args:     []string{"loop-1"},
+			wantPath: "/api/v1/loops/loop-1/start",
+		},
+		{
+			name:     "pause targets the loop",
+			verb:     "pause",
+			args:     []string{"loop-1"},
+			wantPath: "/api/v1/loops/loop-1/pause",
+		},
+		{
+			name:     "respond carries the answer as a json body",
+			verb:     "respond",
+			args:     []string{"loop-1", "ship it"},
+			wantPath: "/api/v1/loops/loop-1/respond",
+			wantBody: `{"answer":"ship it"}`,
+		},
+		{
+			name:     "respond escapes an answer containing quotes",
+			verb:     "respond",
+			args:     []string{"loop-1", `he said "no"`},
+			wantPath: "/api/v1/loops/loop-1/respond",
+			wantBody: `{"answer":"he said \"no\""}`,
+		},
+		{
+			name:     "respond trims the answer the daemon would trim anyway",
+			verb:     "respond",
+			args:     []string{"loop-1", "  yes  "},
+			wantPath: "/api/v1/loops/loop-1/respond",
+			wantBody: `{"answer":"yes"}`,
+		},
+		{
+			name:    "respond rejects a whitespace-only answer before the round trip",
+			verb:    "respond",
+			args:    []string{"loop-1", "   "},
+			wantErr: "non-empty answer",
+		},
+		{
+			name:    "respond rejects an unquoted multi-word answer rather than truncating it",
+			verb:    "respond",
+			args:    []string{"loop-1", "ship", "it"},
+			wantErr: "one quoted answer",
+		},
+		{
+			name:    "respond rejects a missing answer",
+			verb:    "respond",
+			args:    []string{"loop-1"},
+			wantErr: "one quoted answer",
+		},
+		{
+			name:    "stop rejects a missing selector",
+			verb:    "stop",
+			args:    nil,
+			wantErr: "stop requires exactly one selector",
+		},
+		{
+			name:    "close names itself in its arity error",
+			verb:    "close",
+			args:    []string{"a", "b"},
+			wantErr: "close requires exactly one selector",
+		},
+		{
+			name:    "pause names itself in its arity error",
+			verb:    "pause",
+			args:    []string{},
+			wantErr: "pause requires exactly one loop id",
+		},
+		{
+			name:    "takeover rejects a whitespace-only loop id",
+			verb:    "takeover",
+			args:    []string{"   "},
+			wantErr: "takeover requires exactly one loop id",
+		},
+		{
+			name:    "unknown verbs are refused",
+			verb:    "resume",
+			args:    []string{"loop-1"},
+			wantErr: `unknown command "resume"`,
+		},
+	}
 
-func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return fn(req)
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := routeForVerb(tc.verb, tc.args)
 
-type contextKey struct{}
-
-type fakeApp struct {
-	run func(context.Context, []string) int
-}
-
-func (f fakeApp) Run(ctx context.Context, args []string) int {
-	return f.run(ctx, args)
-}
-
-func TestRunWithDepsBuildsAppWithInjectedStreams(t *testing.T) {
-	t.Parallel()
-
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	ctx := context.WithValue(context.Background(), contextKey{}, "sentinel")
-	called := false
-
-	exitCode := runWithDeps([]string{"status", "--json"}, stdout, stderr, runDeps{
-		ctx: ctx,
-		newApp: func(deps cliapp.Deps) appRunner {
-			called = true
-			if _, err := deps.Stdout.Write([]byte("stdout-ready\n")); err != nil {
-				t.Fatalf("write stdout sentinel: %v", err)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got request %+v", tc.wantErr, got)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %q, want it to contain %q", err.Error(), tc.wantErr)
+				}
+				return
 			}
-			if _, err := deps.Stderr.Write([]byte("stderr-ready\n")); err != nil {
-				t.Fatalf("write stderr sentinel: %v", err)
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
-
-			return fakeApp{run: func(runCtx context.Context, args []string) int {
-				if runCtx != ctx {
-					t.Fatalf("run context = %v, want injected context", runCtx)
-				}
-				if got, want := len(args), 2; got != want {
-					t.Fatalf("len(args) = %d, want %d", got, want)
-				}
-				if got, want := args[0], "status"; got != want {
-					t.Fatalf("args[0] = %q, want %q", got, want)
-				}
-				if got, want := args[1], "--json"; got != want {
-					t.Fatalf("args[1] = %q, want %q", got, want)
-				}
-				return 23
-			}}
-		},
-	})
-
-	if !called {
-		t.Fatal("newApp was not called")
-	}
-	if got, want := exitCode, 23; got != want {
-		t.Fatalf("runWithDeps(...) exit code = %d, want %d", got, want)
-	}
-	if got, want := stdout.String(), "stdout-ready\n"; got != want {
-		t.Fatalf("stdout = %q, want %q", got, want)
-	}
-	if got, want := stderr.String(), "stderr-ready\n"; got != want {
-		t.Fatalf("stderr = %q, want %q", got, want)
+			if got.Path != tc.wantPath {
+				t.Errorf("path = %q, want %q", got.Path, tc.wantPath)
+			}
+			if string(got.Body) != tc.wantBody {
+				t.Errorf("body = %q, want %q", string(got.Body), tc.wantBody)
+			}
+		})
 	}
 }
 
-func TestRunWithDepsUsesBackgroundContextByDefault(t *testing.T) {
-	t.Parallel()
-
-	exitCode := runWithDeps(nil, &bytes.Buffer{}, &bytes.Buffer{}, runDeps{
-		newApp: func(cliapp.Deps) appRunner {
-			return fakeApp{run: func(ctx context.Context, _ []string) int {
-				if ctx == nil {
-					t.Fatal("context = nil, want background context")
-				}
-				if deadline, ok := ctx.Deadline(); ok {
-					t.Fatalf("context deadline = %v, want none", deadline)
-				}
-				select {
-				case <-ctx.Done():
-					t.Fatalf("context done unexpectedly: %v", ctx.Err())
-				default:
-				}
-				return 0
-			}}
-		},
-	})
-
-	if exitCode != 0 {
-		t.Fatalf("runWithDeps(nil, ...) exit code = %d, want 0", exitCode)
-	}
-}
-
-func TestRunUsesDefaultCLIAppFactory(t *testing.T) {
-	t.Parallel()
-
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-
-	exitCode := run([]string{"--help"}, stdout, stderr)
-
-	if exitCode != 0 {
-		t.Fatalf("run([--help]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
-	}
-	if got := stderr.String(); got != "" {
-		t.Fatalf("run([--help]) stderr = %q, want empty string", got)
-	}
-	if got := stdout.String(); got == "" {
-		t.Fatal("run([--help]) stdout = empty string, want help output")
-	}
-	for _, want := range []string{"Usage:", "Subcommands:", "Flags:"} {
-		if !bytes.Contains(stdout.Bytes(), []byte(want)) {
-			t.Fatalf("run([--help]) stdout = %q, want to contain %q", stdout.String(), want)
-		}
-	}
-}
-
-func TestRunWithDepsVersionShortCircuitsBeforeAppConstruction(t *testing.T) {
-	t.Parallel()
-
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	called := false
-
-	exitCode := runWithDeps([]string{"--version"}, stdout, stderr, runDeps{
-		newApp: func(cliapp.Deps) appRunner {
-			called = true
-			return fakeApp{run: func(context.Context, []string) int { return 99 }}
-		},
-	})
-
-	if exitCode != 0 {
-		t.Fatalf("runWithDeps([--version]) exit code = %d, want 0", exitCode)
-	}
-	if called {
-		t.Fatal("newApp was called for --version")
-	}
-	if got, want := stdout.String(), version.Value+"\n"; got != want {
-		t.Fatalf("stdout = %q, want %q", got, want)
-	}
-	if got := stderr.String(); got != "" {
-		t.Fatalf("stderr = %q, want empty string", got)
-	}
-}
-
-func TestRunWithDepsVersionShortCircuitsBeforeTrailingFlags(t *testing.T) {
-	t.Parallel()
-
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	called := false
-
-	exitCode := runWithDeps([]string{"--version", "--json"}, stdout, stderr, runDeps{
-		newApp: func(cliapp.Deps) appRunner {
-			called = true
-			return fakeApp{run: func(context.Context, []string) int { return 99 }}
-		},
-	})
-
-	if exitCode != 0 {
-		t.Fatalf("runWithDeps([--version --json]) exit code = %d, want 0", exitCode)
-	}
-	if called {
-		t.Fatal("newApp was called for --version with trailing flags")
-	}
-	if got, want := stdout.String(), version.Value+"\n"; got != want {
-		t.Fatalf("stdout = %q, want %q", got, want)
-	}
-	if got := stderr.String(); got != "" {
-		t.Fatalf("stderr = %q, want empty string", got)
-	}
-}
-
-func TestRunWithDepsVersionShortCircuitsAfterLeadingGlobalFlags(t *testing.T) {
-	t.Parallel()
-
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	called := false
-
-	exitCode := runWithDeps([]string{"--json", "--config", "/tmp/looper.json", "--version"}, stdout, stderr, runDeps{
-		newApp: func(cliapp.Deps) appRunner {
-			called = true
-			return fakeApp{run: func(context.Context, []string) int { return 99 }}
-		},
-	})
-
-	if exitCode != 0 {
-		t.Fatalf("runWithDeps([--json --config /tmp/looper.json --version]) exit code = %d, want 0", exitCode)
-	}
-	if called {
-		t.Fatal("newApp was called for --version after global flags")
-	}
-	if got, want := stdout.String(), version.Value+"\n"; got != want {
-		t.Fatalf("stdout = %q, want %q", got, want)
-	}
-	if got := stderr.String(); got != "" {
-		t.Fatalf("stderr = %q, want empty string", got)
-	}
-}
-
-func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
-	t.Setenv("PATH", "")
-
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-
-	exitCode := runWithDeps([]string{"version"}, stdout, stderr, runDeps{
-		newApp: func(deps cliapp.Deps) appRunner {
-			deps.HomeDir = t.TempDir()
-			deps.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				return nil, os.ErrNotExist
-			})}
-			return cliapp.New(deps)
-		},
-	})
-
-	if exitCode != 0 {
-		t.Fatalf("run([version]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
-	}
-	if got := stderr.String(); got != "" {
-		t.Fatalf("run([version]) stderr = %q, want empty string", got)
-	}
-	if got, want := stdout.String(), "CLI version: "+version.Value+"\nlooperd server version: unavailable\n"; got != want {
-		t.Fatalf("run([version]) stdout = %q, want %q", got, want)
+// TestRouteForVerbBareVerbsSendNoBody guards the split between the verbs that
+// carry a payload and those that do not: handback reaches a daemon path that
+// peeks at the body for discardWorktreeChanges, so a stray payload on a bare
+// verb would be interpreted rather than ignored.
+func TestRouteForVerbBareVerbsSendNoBody(t *testing.T) {
+	for _, verb := range []string{"stop", "close", "takeover", "handback", "start", "pause"} {
+		t.Run(verb, func(t *testing.T) {
+			got, err := routeForVerb(verb, []string{"loop-1"})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Body != nil {
+				t.Errorf("body = %q, want nil", string(got.Body))
+			}
+		})
 	}
 }

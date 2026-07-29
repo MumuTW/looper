@@ -61,7 +61,7 @@ func TestResolveSpawnVendorParity(t *testing.T) {
 	if command != "codex" {
 		t.Fatalf("codex command = %q, want codex", command)
 	}
-	if got, want := strings.Join(args, " "), "exec --model gpt-5 hello"; got != want {
+	if got, want := strings.Join(args, " "), "exec --model gpt-5 -s workspace-write -c sandbox_workspace_write.network_access=true hello"; got != want {
 		t.Fatalf("codex args = %q, want %q", got, want)
 	}
 
@@ -94,7 +94,7 @@ func TestResolveSpawnCodexDoesNotDuplicateExecSubcommand(t *testing.T) {
 	if command != "codex" {
 		t.Fatalf("codex command = %q, want codex", command)
 	}
-	if strings.Join(args, " ") != "--model gpt-5 --profile test exec hello" {
+	if strings.Join(args, " ") != "--model gpt-5 --profile test exec -s workspace-write -c sandbox_workspace_write.network_access=true hello" {
 		t.Fatalf("codex args = %#v, want single exec subcommand preserved", args)
 	}
 }
@@ -125,7 +125,7 @@ func TestResolveSpawnWithNativeResumeVendorArgs(t *testing.T) {
 		want   string
 	}{
 		{name: "claude", vendor: config.AgentVendorClaudeCode, want: "--resume session-123 --print hello --dangerously-skip-permissions"},
-		{name: "codex", vendor: config.AgentVendorCodex, want: "exec resume session-123 hello"},
+		{name: "codex", vendor: config.AgentVendorCodex, want: "exec -s workspace-write -c sandbox_workspace_write.network_access=true resume session-123 hello"},
 		{name: "opencode", vendor: config.AgentVendorOpenCode, want: "run --dir /tmp/looper-worktree --session session-123 hello"},
 		{name: "cursor", vendor: config.AgentVendorCursorCLI, want: "--resume session-123 --print hello"},
 	}
@@ -150,7 +150,7 @@ func TestResolveSpawnWithNativeResumeCodexPreservesExecOptions(t *testing.T) {
 		Model:  &model,
 		Params: map[string]any{"args": []any{"exec", "--json", "--sandbox", "workspace-write"}},
 	}, "/tmp/looper-worktree", "hello", "session-123", true)
-	if got, want := strings.Join(args, " "), "exec --model gpt-5 --json --sandbox workspace-write resume session-123 hello"; got != want {
+	if got, want := strings.Join(args, " "), "exec --model gpt-5 --json --sandbox workspace-write -c sandbox_workspace_write.network_access=true resume session-123 hello"; got != want {
 		t.Fatalf("args = %q, want %q", got, want)
 	}
 }
@@ -430,7 +430,7 @@ func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(argsPath) error = %v", err)
 	}
-	if got, want := strings.TrimSpace(string(argsBytes)), "exec resume codex-session-1 continue work"; got != want {
+	if got, want := strings.TrimSpace(string(argsBytes)), "exec -s workspace-write -c sandbox_workspace_write.network_access=true resume codex-session-1 continue work"; got != want {
 		t.Fatalf("resume args = %q, want %q", got, want)
 	}
 	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_resumed")
@@ -513,7 +513,7 @@ func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 		t.Fatalf("ReadFile(argsPath) error = %v", err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(argsBytes)), "\n")
-	if len(lines) != 2 || lines[0] != "exec resume codex-session-1 continue work" || lines[1] != "exec full checkpoint prompt" {
+	if len(lines) != 2 || lines[0] != "exec -s workspace-write -c sandbox_workspace_write.network_access=true resume codex-session-1 continue work" || lines[1] != "exec -s workspace-write -c sandbox_workspace_write.network_access=true full checkpoint prompt" {
 		t.Fatalf("spawned args = %#v, want native resume then immediate checkpoint restart", lines)
 	}
 }
@@ -589,7 +589,7 @@ func TestExecutorNativeResumeFailureAfterAttachDoesNotFallback(t *testing.T) {
 		t.Fatalf("ReadFile(argsPath) error = %v", err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(argsBytes)), "\n")
-	if len(lines) != 1 || lines[0] != "exec resume codex-session-1 continue work" {
+	if len(lines) != 1 || lines[0] != "exec -s workspace-write -c sandbox_workspace_write.network_access=true resume codex-session-1 continue work" {
 		t.Fatalf("spawned args = %#v, want only native resume invocation", lines)
 	}
 }
@@ -1711,5 +1711,52 @@ func TestLastNonEmptyLines(t *testing.T) {
 	}
 	if lastNonEmptyLines("   \n  \n+ \n}", 3) != nil {
 		t.Fatalf("blank/noise-only input should yield nil")
+	}
+}
+
+// The sandbox defaults exist because `codex exec` otherwise denies network
+// access and every role's prompt makes the agent stop before editing when it
+// cannot reach the forge. An operator who says something about the sandbox
+// keeps their choice, including deliberately leaving networking off.
+func TestResolveCodexArgsRespectsOperatorSandboxChoice(t *testing.T) {
+	cases := []struct {
+		name    string
+		params  []string
+		wantHas []string
+		wantNot []string
+	}{
+		{
+			name:    "defaults grant networking inside a workspace-write sandbox",
+			params:  nil,
+			wantHas: []string{"-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"},
+		},
+		{
+			name:    "explicit sandbox mode is not overridden",
+			params:  []string{"-s", "read-only"},
+			wantHas: []string{"-s", "read-only"},
+			wantNot: []string{"workspace-write"},
+		},
+		{
+			name:    "explicit network_access is not duplicated",
+			params:  []string{"-c", "sandbox_workspace_write.network_access=false"},
+			wantHas: []string{"sandbox_workspace_write.network_access=false"},
+			wantNot: []string{"sandbox_workspace_write.network_access=true"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.Join(resolveCodexArgs(ExecutorConfig{}, tc.params, "prompt"), " ")
+			for _, want := range tc.wantHas {
+				if !strings.Contains(got, want) {
+					t.Errorf("args %q missing %q", got, want)
+				}
+			}
+			for _, unwanted := range tc.wantNot {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("args %q should not contain %q", got, unwanted)
+				}
+			}
+		})
 	}
 }

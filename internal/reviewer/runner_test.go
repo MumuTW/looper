@@ -8016,7 +8016,10 @@ func TestBuildReviewPromptOmitsSubmitPathInstructionWhenTrustedWrapperUnavailabl
 
 	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "")
 
-	if !strings.Contains(prompt, "trusted looper review submit wrapper unavailable") {
+	// Asserted against the constant, not a literal: the daemon reports the same
+	// condition with the same text, so the prompt drifting away from it would
+	// split one searchable phrase into two.
+	if !strings.Contains(prompt, TrustedWrapperUnavailableMessage) {
 		t.Fatalf("prompt missing trusted wrapper unavailable failure instruction:\n%s", prompt)
 	}
 	for _, want := range []string{

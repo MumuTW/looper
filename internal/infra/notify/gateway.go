@@ -1162,7 +1162,7 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	// One-command local takeover of the agent session (runs on the daemon host).
 	// Offered only while the loop is live; dropped once it reaches a terminal state.
 	if !feishuLoopStatusTerminal(loop.Status) {
-		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "💻 本地接管:`looper resume " + strconv.FormatInt(loop.Seq, 10) + "`"}}})
+		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "💻 本地接管:`looper takeover " + strconv.FormatInt(loop.Seq, 10) + "`"}}})
 	}
 	template, label := feishuLoopStatusStyle(loop.Status)
 	cardObj := map[string]any{

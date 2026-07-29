@@ -52,7 +52,7 @@ const (
 	// Only reachable when hitl.enabled is true.
 	LoopStatusAwaitingHuman LoopStatus = "awaiting_human"
 	// LoopStatusHumanTakeover means a human has taken the loop's agent session
-	// over interactively (via `looper resume <seq>`): the daemon's in-flight run
+	// over interactively (via `looper takeover <seq>`): the daemon's in-flight run
 	// was stopped and the scheduler leaves the loop alone until the human hands it
 	// back (POST /api/v1/loops/{seq}/handback → queued). The native session id and
 	// worktree are preserved so the daemon resumes seeing the human's turns.

@@ -87,10 +87,18 @@ export default function App() {
           <p className="m-0 mb-1 font-medium">Recovery</p>
           <ol className="m-0 list-decimal pl-4 text-[var(--text-muted)]">
             <li>
-              Re-open via CLI:{" "}
-              <code className="mono text-[var(--text)]">looper dashboard</code>
+              Mint a fresh one-shot code with your{" "}
+              <code className="mono text-[var(--text)]">server.localToken</code>
+              :{" "}
+              <code className="mono text-[var(--text)]">
+                POST /api/v1/dashboard/bootstrap/code
+              </code>
+              , then open{" "}
+              <code className="mono text-[var(--text)]">
+                /dashboard/?code=…
+              </code>
             </li>
-            <li>Ensure the bootstrap code was not already used or expired</li>
+            <li>Ensure the previous code was not already used or expired</li>
           </ol>
         </div>
       </div>

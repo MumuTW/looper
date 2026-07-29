@@ -2018,11 +2018,52 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 	if cfg.LiveToolEvents && !containsArg(resolved, "--json") {
 		resolved = append(resolved, "--json")
 	}
+	// `codex exec` picks its own sandbox regardless of the sandbox setting in
+	// the user's codex config, and its default denies network access. Every
+	// role's prompt tells the agent to verify PR state with `gh` and to fail
+	// fast if it cannot reach the forge, so a sandbox without networking does
+	// not degrade the run — it stops it before any edit, and the runner then
+	// reports the agent's empty output as a contract violation and retries
+	// forever against a sandbox that will never change.
+	//
+	// Set the mode explicitly and grant only networking: writes stay confined
+	// to the worktree and the temporary directories.
+	resolved = appendCodexSandboxDefaults(resolved)
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
 	if hasAnyFlag(withModel, []string{"-"}) {
 		return withModel
 	}
 	return append(withModel, prompt)
+}
+
+// appendCodexSandboxDefaults sets the sandbox mode and grants networking
+// unless the operator already spoke about either.
+func appendCodexSandboxDefaults(args []string) []string {
+	if !hasAnyFlag(args, []string{"-s", "--sandbox", "--dangerously-bypass-approvals-and-sandbox"}) {
+		args = append(args, "-s", "workspace-write")
+	}
+	if !codexConfiguresNetworkAccess(args) {
+		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
+	}
+	return args
+}
+
+// codexConfiguresNetworkAccess reports whether the operator already said
+// something about sandbox networking through agent.params args, in which case
+// their choice — including deliberately leaving it off — wins.
+func codexConfiguresNetworkAccess(args []string) bool {
+	for i, arg := range args {
+		if arg != "-c" && arg != "--config" {
+			if strings.Contains(arg, "network_access") {
+				return true
+			}
+			continue
+		}
+		if i+1 < len(args) && strings.Contains(args[i+1], "network_access") {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveOpenCodeArgs(cfg ExecutorConfig, args []string, workingDirectory string, prompt string) []string {
@@ -2089,6 +2130,10 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args [
 		resolved := removeFirstArg(args, "exec")
 		resolved = removeFirstArg(resolved, "resume")
 		withModel := prependModelFlag(append([]string{"exec"}, resolved...), cfg.Model, "--model", []string{"--model", "-m"})
+		// A resumed session is sandboxed exactly like a fresh one, so it
+		// needs the same networking grant; without it, resume would fail in
+		// the one way the fresh path was just fixed for.
+		withModel = appendCodexSandboxDefaults(withModel)
 		base := append(withModel, "resume")
 		base = append(base, sessionID)
 		if containsArg(withModel, "-") {
