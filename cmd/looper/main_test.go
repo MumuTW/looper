@@ -15,6 +15,7 @@ func TestRouteForVerb(t *testing.T) {
 		verb     string
 		args     []string
 		wantPath string
+		wantBody string
 		wantErr  string
 	}{
 		{
@@ -80,6 +81,45 @@ func TestRouteForVerb(t *testing.T) {
 			wantPath: "/api/v1/loops/loop-1/pause",
 		},
 		{
+			name:     "respond carries the answer as a json body",
+			verb:     "respond",
+			args:     []string{"loop-1", "ship it"},
+			wantPath: "/api/v1/loops/loop-1/respond",
+			wantBody: `{"answer":"ship it"}`,
+		},
+		{
+			name:     "respond escapes an answer containing quotes",
+			verb:     "respond",
+			args:     []string{"loop-1", `he said "no"`},
+			wantPath: "/api/v1/loops/loop-1/respond",
+			wantBody: `{"answer":"he said \"no\""}`,
+		},
+		{
+			name:     "respond trims the answer the daemon would trim anyway",
+			verb:     "respond",
+			args:     []string{"loop-1", "  yes  "},
+			wantPath: "/api/v1/loops/loop-1/respond",
+			wantBody: `{"answer":"yes"}`,
+		},
+		{
+			name:    "respond rejects a whitespace-only answer before the round trip",
+			verb:    "respond",
+			args:    []string{"loop-1", "   "},
+			wantErr: "non-empty answer",
+		},
+		{
+			name:    "respond rejects an unquoted multi-word answer rather than truncating it",
+			verb:    "respond",
+			args:    []string{"loop-1", "ship", "it"},
+			wantErr: "one quoted answer",
+		},
+		{
+			name:    "respond rejects a missing answer",
+			verb:    "respond",
+			args:    []string{"loop-1"},
+			wantErr: "one quoted answer",
+		},
+		{
 			name:    "stop rejects a missing selector",
 			verb:    "stop",
 			args:    nil,
@@ -117,7 +157,7 @@ func TestRouteForVerb(t *testing.T) {
 
 			if tc.wantErr != "" {
 				if err == nil {
-					t.Fatalf("expected error containing %q, got path %q", tc.wantErr, got)
+					t.Fatalf("expected error containing %q, got request %+v", tc.wantErr, got)
 				}
 				if !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("error = %q, want it to contain %q", err.Error(), tc.wantErr)
@@ -128,8 +168,29 @@ func TestRouteForVerb(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got != tc.wantPath {
-				t.Errorf("path = %q, want %q", got, tc.wantPath)
+			if got.Path != tc.wantPath {
+				t.Errorf("path = %q, want %q", got.Path, tc.wantPath)
+			}
+			if string(got.Body) != tc.wantBody {
+				t.Errorf("body = %q, want %q", string(got.Body), tc.wantBody)
+			}
+		})
+	}
+}
+
+// TestRouteForVerbBareVerbsSendNoBody guards the split between the verbs that
+// carry a payload and those that do not: handback reaches a daemon path that
+// peeks at the body for discardWorktreeChanges, so a stray payload on a bare
+// verb would be interpreted rather than ignored.
+func TestRouteForVerbBareVerbsSendNoBody(t *testing.T) {
+	for _, verb := range []string{"stop", "close", "takeover", "handback", "retry", "start", "pause"} {
+		t.Run(verb, func(t *testing.T) {
+			got, err := routeForVerb(verb, []string{"loop-1"})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Body != nil {
+				t.Errorf("body = %q, want nil", string(got.Body))
 			}
 		})
 	}

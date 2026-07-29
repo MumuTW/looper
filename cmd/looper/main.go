@@ -56,7 +56,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	verb := args[0]
 	rest := args[1:]
 
-	route, err := routeForVerb(verb, rest)
+	request, err := routeForVerb(verb, rest)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
 		usage(stderr)
@@ -69,7 +69,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	body, err := post(ctx, cfg, route)
+	body, err := post(ctx, cfg, request)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
 		return 1
@@ -78,30 +78,65 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// routeForVerb maps a control verb to its API path. Selectors are passed
+// apiRequest is the single daemon call one CLI invocation makes. Body is nil
+// for the bare control verbs; carrying it here rather than assembling it at
+// the call site keeps routeForVerb a pure function, so the entire
+// argument-to-request mapping is testable without a running daemon.
+type apiRequest struct {
+	Path string
+	Body []byte
+}
+
+// respondBody mirrors the daemon's respondLoopRequest. It is restated rather
+// than imported because internal/api is not importable from cmd, and the
+// field is one string: a drift here fails loudly as "respond requires a
+// non-empty answer" from the daemon, not silently.
+type respondBody struct {
+	Answer string `json:"answer"`
+}
+
+// routeForVerb maps a control verb to its API request. Selectors are passed
 // through unvalidated: the daemon resolves them (loop id, PR URL, shorthand)
 // and is the only component that can say authoritatively what a selector
 // means, so validating here would only invent a second, staler answer.
-func routeForVerb(verb string, args []string) (string, error) {
+// Emptiness and argument count are checked locally because those are decidable
+// here and cost a round trip otherwise.
+func routeForVerb(verb string, args []string) (apiRequest, error) {
 	switch verb {
 	case "stop", "close":
 		if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-			return "", fmt.Errorf("%s requires exactly one selector", verb)
+			return apiRequest{}, fmt.Errorf("%s requires exactly one selector", verb)
 		}
 		// Bulk stop is its own selector on the daemon, not a selector named
 		// "all" with a /stop suffix: that path parses as a single-loop stop
 		// and dies resolving a loop literally called "all".
 		if strings.TrimSpace(args[0]) == "all" && verb == "stop" {
-			return "/api/v1/runs/active/stop-all", nil
+			return apiRequest{Path: "/api/v1/runs/active/stop-all"}, nil
 		}
-		return "/api/v1/runs/active/" + args[0] + "/" + verb, nil
+		return apiRequest{Path: "/api/v1/runs/active/" + args[0] + "/" + verb}, nil
 	case "takeover", "retry", "start", "pause", "handback":
 		if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-			return "", fmt.Errorf("%s requires exactly one loop id", verb)
+			return apiRequest{}, fmt.Errorf("%s requires exactly one loop id", verb)
 		}
-		return "/api/v1/loops/" + args[0] + "/" + verb, nil
+		return apiRequest{Path: "/api/v1/loops/" + args[0] + "/" + verb}, nil
+	case "respond":
+		// The answer is one argument, not the joined tail: a loop waiting on a
+		// human is answered with prose, and joining would turn a forgotten
+		// quote into a silently truncated answer instead of an error.
+		if len(args) != 2 || strings.TrimSpace(args[0]) == "" {
+			return apiRequest{}, fmt.Errorf("respond requires a loop id and one quoted answer")
+		}
+		answer := strings.TrimSpace(args[1])
+		if answer == "" {
+			return apiRequest{}, fmt.Errorf("respond requires a non-empty answer")
+		}
+		body, err := json.Marshal(respondBody{Answer: answer})
+		if err != nil {
+			return apiRequest{}, fmt.Errorf("encode answer: %w", err)
+		}
+		return apiRequest{Path: "/api/v1/loops/" + args[0] + "/respond", Body: body}, nil
 	default:
-		return "", fmt.Errorf("unknown command %q", verb)
+		return apiRequest{}, fmt.Errorf("unknown command %q", verb)
 	}
 }
 
@@ -121,17 +156,17 @@ func loadConfig(args []string) (config.Config, error) {
 	return loaded.Config, nil
 }
 
-func post(ctx context.Context, cfg config.Config, path string) (string, error) {
+func post(ctx context.Context, cfg config.Config, call apiRequest) (string, error) {
 	host := strings.TrimSpace(cfg.Server.Host)
 	if host == "" {
 		host = "127.0.0.1"
 	}
-	endpoint := "http://" + net.JoinHostPort(host, strconv.Itoa(cfg.Server.Port)) + path
+	endpoint := "http://" + net.JoinHostPort(host, strconv.Itoa(cfg.Server.Port)) + call.Path
 
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(nil))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(call.Body))
 	if err != nil {
 		return "", err
 	}
@@ -184,9 +219,12 @@ Usage:
   looper retry <loop-id>       Requeue a paused or parked loop
   looper start <loop-id>       Start a loop now
   looper pause <loop-id>       Pause a loop
+  looper respond <loop-id> "<answer>"
+                               Answer a loop waiting on a human and resume it
   looper version               Print the looper version
 
 Selectors are resolved by the daemon; a loop id or a pull request URL both work.
+The respond answer is a single argument, so quote anything with spaces.
 `)
 }
 
