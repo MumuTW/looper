@@ -5561,7 +5561,7 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	if h.context.TakeoverLoop == nil {
 		return takeoverLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusServiceUnavailable, message: "Takeover is not available on this daemon"}
 	}
-	result, err := h.context.TakeoverLoop(ctx, loopID, "Taken over by a human via looper resume")
+	result, err := h.context.TakeoverLoop(ctx, loopID, "Taken over by a human via looper takeover")
 	if err != nil {
 		return takeoverLoopResponse{}, err
 	}
