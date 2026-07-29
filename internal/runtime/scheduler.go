@@ -3731,84 +3731,38 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}
 			continue
 		}
-		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
-			if err := admissionRefuseWork(input); err != nil {
-				break
+		admissionClosed := false
+		for _, lane := range codingDiscoveryLanes(input) {
+			if !lane.Present {
+				continue
 			}
-			appendErr(runSchedulerLane(input, "planner discovery", project.ID, repo, func() error {
-				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-				trackRunnableDiscovery(result.QueueItems)
-				return wrapSchedulerError("planner discovery", project.ID, repo, err)
-			}))
-			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_planner_discovery", input, discoveredRunnableIDs, true)
-			recordClaim(claimedCount, availableSlots, err)
-		} else if input.Planner != nil && input.Logger != nil {
-			input.Logger.Debug("planner auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
-		}
-		if input.Coordinator != nil && coordinatorEnabledForProject(input, project.ID) {
-			if !providerHasGitHubPullRequests(providerKind) {
+			if !lane.Enabled(project.ID) {
+				if lane.LogWhenDisabled && input.Logger != nil {
+					input.Logger.Debug(lane.Name+" auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
+				}
+				continue
+			}
+			if lane.Supported != nil && !lane.Supported(providerKind) {
 				if input.Logger != nil {
-					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "coordinator discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
+					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": lane.laneLabel(), "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
-			} else {
-				if err := admissionRefuseWork(input); err != nil {
-					break
-				}
-				appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
-					_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-					return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
-				}))
-				claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_coordinator_discovery", input, discoveredRunnableIDs, true)
-				recordClaim(claimedCount, availableSlots, err)
+				continue
 			}
-		}
-		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
 			if err := admissionRefuseWork(input); err != nil {
+				admissionClosed = true
 				break
 			}
-			appendErr(runSchedulerLane(input, "reviewer discovery", project.ID, repo, func() error {
-				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-				trackRunnableDiscovery(result.QueueItems)
-				return wrapSchedulerError("reviewer discovery", project.ID, repo, err)
+			label := lane.laneLabel()
+			appendErr(runSchedulerLane(input, label, project.ID, repo, func() error {
+				items, err := lane.Discover(ctx, project.ID, repo, snapshot)
+				trackRunnableDiscovery(items)
+				return wrapSchedulerError(label, project.ID, repo, err)
 			}))
-			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_reviewer_discovery", input, discoveredRunnableIDs, true)
+			claimedCount, availableSlots, err = executeClaimPhase(ctx, lane.claimPhaseLabel(), input, discoveredRunnableIDs, true)
 			recordClaim(claimedCount, availableSlots, err)
-		} else if input.Reviewer != nil && input.Logger != nil {
-			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
-		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
-			if !providerSupportsFixerDiscovery(providerKind) {
-				if input.Logger != nil {
-					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "fixer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
-				}
-			} else {
-				if err := admissionRefuseWork(input); err != nil {
-					break
-				}
-				appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
-					result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-					trackRunnableDiscovery(result.QueueItems)
-					return wrapSchedulerError("fixer discovery", project.ID, repo, err)
-				}))
-				claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_fixer_discovery", input, discoveredRunnableIDs, true)
-				recordClaim(claimedCount, availableSlots, err)
-			}
-		} else if input.Fixer != nil && input.Logger != nil {
-			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
-		}
-		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok && discoveryEnabled(input.WorkerDiscoveryEnabled) {
-			if err := admissionRefuseWork(input); err != nil {
-				break
-			}
-			appendErr(runSchedulerLane(input, "worker issue discovery", project.ID, repo, func() error {
-				result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
-				trackRunnableDiscovery(result.QueueItems)
-				return wrapSchedulerError("worker issue discovery", project.ID, repo, err)
-			}))
-			claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_worker_discovery", input, discoveredRunnableIDs, true)
-			recordClaim(claimedCount, availableSlots, err)
-		} else if input.Worker != nil && input.Logger != nil && !discoveryEnabled(input.WorkerDiscoveryEnabled) {
-			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
+		if admissionClosed {
+			break
 		}
 
 		// HITL (github transport): deliver any human answers posted on this
