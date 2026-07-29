@@ -186,3 +186,35 @@ func TestRunValidateStepParksValidationThatRepeatedlyDirtiesWorktree(t *testing.
 		t.Fatalf("validation calls=%d commit calls=%d, want 2/1", validationCalls, len(git.commitCalls))
 	}
 }
+
+func TestRunValidateStepRefreshesReconcileMetadataWhenValidationCommitsCleanly(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	git := &fakeGitGateway{inspectResults: []InspectHeadResult{{
+		HeadSHA: "validation-head", NewCommitSHAs: []string{"repair-head", "validation-head"}, ChangedFiles: []string{"generated.go"},
+	}}}
+	runner := New(Options{
+		Git: git,
+		ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+			return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+		},
+	})
+	checkpoint, err := runner.runValidateStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Checkpoint: fixerCheckpoint{
+			Detail:           &checkpointDetail{BaseRefName: "main"},
+			Worktree:         &checkpointWorktree{Path: worktree, Branch: "feature/fix", BaseHeadSHA: "base-head"},
+			ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "repair-head", NewCommitSHAs: []string{"repair-head"}, WorkingTreeClean: true, CompletedAt: "2026-07-29T00:00:00Z"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runValidateStep() error = %v", err)
+	}
+	if checkpoint.Validation == nil || checkpoint.Validation.HeadSHA != "validation-head" {
+		t.Fatalf("Validation = %#v, want validation-head", checkpoint.Validation)
+	}
+	if checkpoint.ReconcileCommits == nil || checkpoint.ReconcileCommits.FinalHeadSHA != "validation-head" || !checkpoint.ReconcileCommits.WorkingTreeClean {
+		t.Fatalf("ReconcileCommits = %#v, want refreshed clean validation head", checkpoint.ReconcileCommits)
+	}
+}

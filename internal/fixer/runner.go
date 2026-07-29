@@ -427,6 +427,7 @@ type PushInput struct {
 	Branch                string
 	Remote                string
 	ExpectedRemoteHeadSHA string
+	LocalHeadSHA          string
 	ProtectedBranches     []string
 }
 
@@ -463,16 +464,17 @@ type MergeBaseResult struct {
 }
 
 type AgentRunInput struct {
-	ExecutionID      string
-	ProjectID        string
-	LoopID           string
-	RunID            string
-	Prompt           string
-	WorkingDirectory string
-	Timeout          time.Duration
-	HeartbeatTimeout time.Duration
-	Metadata         map[string]any
-	IdempotencyKey   string
+	ExecutionID         string
+	ProjectID           string
+	LoopID              string
+	RunID               string
+	Prompt              string
+	WorkingDirectory    string
+	Timeout             time.Duration
+	HeartbeatTimeout    time.Duration
+	Metadata            map[string]any
+	IdempotencyKey      string
+	RestrictToolNetwork bool
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot    bool
@@ -493,6 +495,11 @@ type AgentResult struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 }
+
+const validationGatedLocalOnlyPrompt = `
+
+VALIDATION-GATED LOCAL-ONLY EXECUTION:
+Looper's daemon already fetched the PR head and supplied the review items above. Tool network access is intentionally disabled. Do not run gh, git fetch/pull/push, access remote URLs, or fail merely because the forge is unavailable. Use the local checkout and supplied PR seed, edit, test, and commit locally only; Looper will validate the exact commit and publish it afterward.`
 
 type AgentExecution interface {
 	Wait(context.Context) (AgentResult, error)
@@ -3018,6 +3025,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// the content that passed.
 	agentMayPush := fixerAgentMayPush(r.allowAutoPush, r.validationCommands)
 	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, agentMayPush, r.disclosure, agentVendor, derefString(agentModel))
+	if len(r.validationCommands) > 0 {
+		prompt += validationGatedLocalOnlyPrompt
+	}
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -3032,7 +3042,8 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown")),
-		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		RestrictToolNetwork: len(r.validationCommands) > 0,
+		UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 	})
 	if err != nil {
 		return checkpoint, err
@@ -3163,6 +3174,19 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
+	if checkpoint.ReconcileCommits != nil && checkpoint.ReconcileCommits.FinalHeadSHA != inspect.HeadSHA {
+		checkpoint.ReconcileCommits.FinalHeadSHA = inspect.HeadSHA
+		checkpoint.ReconcileCommits.NewCommitSHAs = append([]string(nil), inspect.NewCommitSHAs...)
+		checkpoint.ReconcileCommits.CommittedByAgent = len(inspect.NewCommitSHAs) > 0
+		checkpoint.ReconcileCommits.WorkingTreeClean = true
+		checkpoint.ReconcileCommits.ChangedFiles = append([]string(nil), inspect.ChangedFiles...)
+		checkpoint.ReconcileCommits.CompletedAt = r.nowISO()
+		checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
+		checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
+		if len(inspect.NewCommitSHAs) > 0 && checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
+			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
+		}
+	}
 	result.HeadSHA = inspect.HeadSHA
 	checkpoint.Validation = &result
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -3239,7 +3263,14 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
-	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: branch, ExpectedRemoteHeadSHA: worktree.BaseHeadSHA}); err != nil {
+	localHeadSHA := ""
+	if len(r.validationCommands) > 0 {
+		if checkpoint.Validation == nil || !checkpoint.Validation.Passed || strings.TrimSpace(checkpoint.Validation.HeadSHA) == "" {
+			return checkpoint, &loopError{message: "Missing validated head SHA for push step", kind: FailureRetryableAfterResume}
+		}
+		localHeadSHA = checkpoint.Validation.HeadSHA
+	}
+	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: branch, ExpectedRemoteHeadSHA: worktree.BaseHeadSHA, LocalHeadSHA: localHeadSHA}); err != nil {
 		message := err.Error()
 		eventType := "fixer.push.retryable"
 		if strings.Contains(strings.ToLower(message), "remote head changed") {

@@ -318,6 +318,7 @@ type PushInput struct {
 	WorktreePath      string
 	Branch            string
 	Remote            string
+	LocalHeadSHA      string
 	ProtectedBranches []string
 }
 
@@ -356,18 +357,19 @@ type GitGateway interface {
 }
 
 type AgentRunInput struct {
-	ExecutionID        string
-	ProjectID          string
-	LoopID             string
-	RunID              string
-	Prompt             string
-	NativeResumePrompt string
-	NativeSessionID    string
-	WorkingDirectory   string
-	Timeout            time.Duration
-	HeartbeatTimeout   time.Duration
-	Metadata           map[string]any
-	IdempotencyKey     string
+	ExecutionID         string
+	ProjectID           string
+	LoopID              string
+	RunID               string
+	Prompt              string
+	NativeResumePrompt  string
+	NativeSessionID     string
+	WorkingDirectory    string
+	Timeout             time.Duration
+	HeartbeatTimeout    time.Duration
+	Metadata            map[string]any
+	IdempotencyKey      string
+	RestrictToolNetwork bool
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot    bool
@@ -391,6 +393,11 @@ type AgentResult struct {
 	LastProgressAt               string
 }
 
+const validationGatedLocalOnlyPrompt = `
+
+VALIDATION-GATED LOCAL-ONLY EXECUTION:
+Looper's daemon already fetched and prepared the repository state. Tool network access is intentionally disabled. Do not run gh, git fetch/pull/push, access remote URLs, or fail merely because the forge is unavailable. Use the local checkout and the context already supplied in this prompt. Edit, test, and commit locally only; Looper will validate the exact commit and publish it afterward.`
+
 type AgentExecution interface {
 	Wait(context.Context) (AgentResult, error)
 	Kill(string) error
@@ -404,6 +411,7 @@ type ValidationResult struct {
 	Passed  bool   `json:"passed"`
 	Summary string `json:"summary,omitempty"`
 	Output  string `json:"output,omitempty"`
+	HeadSHA string `json:"headSha,omitempty"`
 }
 
 type ValidationInput struct {
@@ -1743,6 +1751,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, err
 		}
+		if len(r.validationCommands) > 0 {
+			prompt += validationGatedLocalOnlyPrompt
+		}
 		// HITL (gated): let the agent pause to ask a human, and on resume feed the
 		// human's answer back into the same agent session.
 		nativeResumePrompt := ""
@@ -1802,7 +1813,8 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID,
 			WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 			Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID),
-			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+			RestrictToolNetwork: len(r.validationCommands) > 0,
+			UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 		})
 		if err != nil {
 			return checkpoint, err
@@ -1991,6 +2003,20 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 			return checkpoint, &loopError{message: "Validation keeps producing uncommitted changes after an extra reconcile pass", kind: FailureManualIntervention}
 		}
 	}
+	worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
+	if rootErr != nil {
+		return checkpoint, rootErr
+	}
+	inspect, inspectErr := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)})
+	if inspectErr != nil {
+		return checkpoint, inspectErr
+	}
+	if inspect.HasUncommittedChanges {
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, &loopError{message: "Validation left uncommitted changes after reconcile", kind: FailureManualIntervention}
+	}
+	result.HeadSHA = inspect.HeadSHA
+	checkpoint.Validation = &result
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -2055,6 +2081,25 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 			return checkpoint, &loopError{message: "Validation produced uncommitted changes immediately before publishing", kind: FailureManualIntervention}
 		}
+		result.HeadSHA = inspect.HeadSHA
+		checkpoint.Validation = &result
+	}
+	if len(r.validationCommands) > 0 {
+		worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
+		if rootErr != nil {
+			return checkpoint, rootErr
+		}
+		inspect, inspectErr := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)})
+		if inspectErr != nil {
+			return checkpoint, inspectErr
+		}
+		if checkpoint.Validation == nil || !checkpoint.Validation.Passed || checkpoint.Validation.HeadSHA != inspect.HeadSHA || inspect.HasUncommittedChanges {
+			input.Checkpoint = checkpoint
+			checkpoint, err = r.runValidateStep(ctx, input)
+			if err != nil {
+				return checkpoint, err
+			}
+		}
 	}
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2104,7 +2149,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			if rootErr != nil {
 				return checkpoint, rootErr
 			}
-			if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+			if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, LocalHeadSHA: workerValidatedHeadSHA(checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			pushedByFallback = true
@@ -2140,7 +2185,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if rootErr != nil {
 			return checkpoint, rootErr
 		}
-		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(work.Branch, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(work.Branch, worktree.Branch), LocalHeadSHA: workerValidatedHeadSHA(checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		prURL := stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])
@@ -2185,7 +2230,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, rootErr
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
-		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(existing.HeadRefName, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(existing.HeadRefName, worktree.Branch), LocalHeadSHA: workerValidatedHeadSHA(checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
 				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 			}
@@ -2210,7 +2255,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
 	}
-	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, LocalHeadSHA: workerValidatedHeadSHA(checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 		if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
 			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		}
@@ -2283,6 +2328,13 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 	return checkpoint, nil
+}
+
+func workerValidatedHeadSHA(checkpoint workerCheckpoint, validationCommands []string) string {
+	if len(validationCommands) == 0 || checkpoint.Validation == nil || !checkpoint.Validation.Passed {
+		return ""
+	}
+	return strings.TrimSpace(checkpoint.Validation.HeadSHA)
 }
 
 func (r *Runner) workerHoldSummary(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint) (bool, string, error) {

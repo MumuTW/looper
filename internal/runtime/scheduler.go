@@ -2437,7 +2437,7 @@ func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (f
 }
 
 func (a fixerGitAdapter) Push(ctx context.Context, input fixer.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ExpectedRemoteHeadSHA: input.ExpectedRemoteHeadSHA, LocalHeadSHA: input.LocalHeadSHA, ProtectedBranches: input.ProtectedBranches})
 }
 
 func (a fixerGitAdapter) FetchBranch(ctx context.Context, repoPath, remote, branch string) error {
@@ -2468,7 +2468,8 @@ func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentR
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
 		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
-		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		RestrictToolNetwork: input.RestrictToolNetwork,
+		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
 	if err != nil {
 		return nil, err
@@ -2914,7 +2915,7 @@ func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) 
 }
 
 func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) error {
-	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
+	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, LocalHeadSHA: input.LocalHeadSHA, ProtectedBranches: input.ProtectedBranches})
 }
 
 type workerAgentExecutorAdapter struct {
@@ -2932,7 +2933,8 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
 		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
-		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		RestrictToolNetwork: input.RestrictToolNetwork,
+		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
 	if err != nil {
 		return nil, err

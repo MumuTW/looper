@@ -125,7 +125,8 @@ func TestProcessClaimedItemRevalidatesChangesCreatedByValidation(t *testing.T) {
 
 	fixture := newRunnerFixture(t)
 	git := &fakeGitGateway{
-		createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head", WorktreeID: "worktree_1"},
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head", WorktreeID: "worktree_1"},
+		inspectResult: InspectHeadResult{HeadSHA: "validated-head"},
 		inspectResults: []InspectHeadResult{
 			{HeadSHA: "agent-head"},
 			{HeadSHA: "agent-head", HasUncommittedChanges: true},
@@ -161,6 +162,9 @@ func TestProcessClaimedItemRevalidatesChangesCreatedByValidation(t *testing.T) {
 	if len(git.commitCalls) != 1 || len(git.pushCalls) != 1 {
 		t.Fatalf("commit calls=%d push calls=%d, want reconciled commit published once", len(git.commitCalls), len(git.pushCalls))
 	}
+	if git.pushCalls[0].LocalHeadSHA != "validated-head" {
+		t.Fatalf("push local head = %q, want validated-head", git.pushCalls[0].LocalHeadSHA)
+	}
 }
 
 func TestProcessClaimedItemRevalidatesCleanCommitObservedAfterValidation(t *testing.T) {
@@ -168,7 +172,8 @@ func TestProcessClaimedItemRevalidatesCleanCommitObservedAfterValidation(t *test
 
 	fixture := newRunnerFixture(t)
 	git := &fakeGitGateway{
-		createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head", WorktreeID: "worktree_1"},
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head", WorktreeID: "worktree_1"},
+		inspectResult: InspectHeadResult{HeadSHA: "late-head", NewCommitSHAs: []string{"agent-head", "late-head"}},
 		inspectResults: []InspectHeadResult{
 			{HeadSHA: "agent-head", NewCommitSHAs: []string{"agent-head"}},
 			{HeadSHA: "agent-head", NewCommitSHAs: []string{"agent-head"}},
@@ -202,5 +207,8 @@ func TestProcessClaimedItemRevalidatesCleanCommitObservedAfterValidation(t *test
 	}
 	if len(git.commitCalls) != 0 || len(git.pushCalls) != 1 {
 		t.Fatalf("commit calls=%d push calls=%d, want clean late commit revalidated and pushed", len(git.commitCalls), len(git.pushCalls))
+	}
+	if git.pushCalls[0].LocalHeadSHA != "late-head" {
+		t.Fatalf("push local head = %q, want late-head", git.pushCalls[0].LocalHeadSHA)
 	}
 }

@@ -1080,6 +1080,10 @@ validationCommands = ["test -z \"$(gofmt -l .)\"", "go vet ./...", "go test ./..
 
 The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides). The command strings come from daemon configuration, but commands such as `make check` and `go test ./...` intentionally execute repository-controlled code. Validation subprocesses therefore use the execution-safe environment filter and process containment; configure this gate only for repositories whose code you are willing to execute on the daemon host.
 
+When this gate is configured, Looper is the fetch-and-publish authority. The daemon prepares the worktree before execution, the coding agent edits and commits locally with tool networking disabled, and Looper pushes the exact commit SHA that passed validation. A later local `HEAD` change is not included in that push. This mode currently supports only the Codex executor; other coding vendors fail closed because Looper cannot yet enforce the same tool-level network boundary for them.
+
+The trade-off is deliberate: the gated agent cannot fetch new remote state, query the forge, or download dependencies while it runs. Required dependencies must already be cached, and remote context must be present in the daemon-supplied prompt and prepared checkout. If a task needs fresh remote information, let the daemon rediscover/restart it rather than weakening the gate. The agent receives a non-secret local Git identity so local commits still work; remote credentials remain daemon-side authority.
+
 The default is empty, which keeps the historical behavior: the validate step passes without running anything and "done" is only the agent's own self-assessment. `looperd` logs a startup warning while the list is empty so the no-op is visible. The field is restart-bound.
 
 ### `roles`

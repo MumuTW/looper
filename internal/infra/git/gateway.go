@@ -142,7 +142,10 @@ type PushInput struct {
 	Branch                string
 	Remote                string
 	ExpectedRemoteHeadSHA string
-	ProtectedBranches     []string
+	// LocalHeadSHA pins the source commit. When set, Push publishes this exact
+	// object instead of resolving HEAD again after validation.
+	LocalHeadSHA      string
+	ProtectedBranches []string
 }
 
 type WorktreeListEntry struct {
@@ -629,9 +632,20 @@ func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 	if strings.TrimSpace(remote) == "" {
 		remote = "origin"
 	}
+	sourceRef := "HEAD"
+	if requested := strings.TrimSpace(input.LocalHeadSHA); requested != "" {
+		resolved, err := g.getRevision(ctx, input.WorktreePath, requested+"^{commit}")
+		if err != nil {
+			return fmt.Errorf("resolve pinned push commit %s: %w", requested, err)
+		}
+		if resolved != requested {
+			return fmt.Errorf("pinned push commit resolved to %s, want %s", resolved, requested)
+		}
+		sourceRef = requested
+	}
 
 	if input.ExpectedRemoteHeadSHA != "" {
-		isExpectedAncestor, err := g.isAncestor(ctx, input.WorktreePath, input.ExpectedRemoteHeadSHA, "HEAD")
+		isExpectedAncestor, err := g.isAncestor(ctx, input.WorktreePath, input.ExpectedRemoteHeadSHA, sourceRef)
 		if err != nil {
 			return err
 		}
@@ -645,7 +659,7 @@ func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 			fmt.Sprintf("--force-with-lease=refs/heads/%s:%s", input.Branch, input.ExpectedRemoteHeadSHA),
 			"-u",
 			remote,
-			fmt.Sprintf("HEAD:refs/heads/%s", input.Branch),
+			fmt.Sprintf("%s:refs/heads/%s", sourceRef, input.Branch),
 		)
 		if err != nil {
 			if pushConflictErrorPattern.MatchString(err.Error()) {
@@ -660,7 +674,7 @@ func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 		return nil
 	}
 
-	return g.runGit(ctx, input.WorktreePath, nil, "push", "-u", remote, fmt.Sprintf("HEAD:refs/heads/%s", input.Branch))
+	return g.runGit(ctx, input.WorktreePath, nil, "push", "-u", remote, fmt.Sprintf("%s:refs/heads/%s", sourceRef, input.Branch))
 }
 
 func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {

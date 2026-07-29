@@ -99,6 +99,35 @@ func TestResolveSpawnCodexDoesNotDuplicateExecSubcommand(t *testing.T) {
 	}
 }
 
+func TestEnforceCodexToolNetworkDeniedOverridesUnsafeOperatorArgs(t *testing.T) {
+	t.Parallel()
+
+	args := []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "--add-dir", "/tmp/escape", "--profile", "unsafe", "--enable", "enable_mcp_apps", "--sandbox", "danger-full-access", "-c", "sandbox_workspace_write.network_access=true", "-c", "sandbox_permissions=[\"disk-full-read-access\"]", "-c", "mcp_servers.github.command=\"unsafe\"", "-c", "model_reasoning_effort=high", "hello"}
+	got := enforceCodexToolNetworkDenied(args, "hello")
+	joined := strings.Join(got, " ")
+	if strings.Contains(joined, "dangerously-bypass") || strings.Contains(joined, "danger-full-access") || strings.Contains(joined, "network_access=true") || strings.Contains(joined, "/tmp/escape") || strings.Contains(joined, "sandbox_permissions") || strings.Contains(joined, "mcp_servers") || strings.Contains(joined, "enable_mcp_apps") || strings.Contains(joined, "unsafe") {
+		t.Fatalf("restricted args retain an unsafe override: %q", joined)
+	}
+	for _, want := range []string{"--ignore-user-config", "-s workspace-write", "-c sandbox_workspace_write.network_access=false", "--disable browser_use", "--disable in_app_browser", "-c model_reasoning_effort=high"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("restricted args = %q, missing %q", joined, want)
+		}
+	}
+	if got[len(got)-1] != "hello" {
+		t.Fatalf("restricted args = %#v, prompt must remain last", got)
+	}
+}
+
+func TestConfiguredExecutorRejectsRestrictedNonCodexAgent(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorClaudeCode}})
+	_, err := executor.Start(context.Background(), RunInput{Prompt: "hello", WorkingDirectory: t.TempDir(), RestrictToolNetwork: true})
+	if err == nil || !strings.Contains(err.Error(), "supported only for codex") {
+		t.Fatalf("Start() error = %v, want fail-closed unsupported-vendor error", err)
+	}
+}
+
 func TestResolveSpawnOpenCodeDoesNotDuplicateRunSubcommand(t *testing.T) {
 	t.Parallel()
 
