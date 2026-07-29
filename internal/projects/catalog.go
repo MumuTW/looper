@@ -15,6 +15,7 @@ import (
 // operation's lifetime.
 type ConfigSource interface {
 	Snapshot() config.Config
+	View() OperationView
 }
 
 // Catalog owns the immutable runtime configuration view. Publish and

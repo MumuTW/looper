@@ -3082,6 +3082,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		}
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
+	view := projects.OperationViewFromConfig(cfg)
 	// Always build coding-role runners, even when live ResolveAgent fails.
 	// Sticky retries of failed/interrupted runs copy runs.agent_snapshot_json and
 	// execute via UseSnapshot; omitting runners strands those queue items after
@@ -3579,11 +3580,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			// Live discovery requires a currently resolvable agent; sticky retries
 			// still claim via always-present runners when vendor was removed
 			// (claimTypeSetsFromInput restricts unconfigured roles to snapshot items).
-			PlannerDiscoveryEnabled:  boolPtr(plannerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
-			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
-			ReviewerDiscoveryEnabled: boolPtr(reviewerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
-			FixerDiscoveryEnabled:    boolPtr(fixerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
-			WorkerDiscoveryEnabled:   boolPtr(workerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			PlannerDiscoveryEnabled:  boolPtr(plannerConfigured && view.AnyProjectRoleAutoDiscovery("planner")),
+			CoordinatorEnabled:       func(projectID string) bool { return view.RolePolicy(projectID).Roles.Coordinator.Enabled },
+			ReviewerDiscoveryEnabled: boolPtr(reviewerConfigured && view.AnyProjectRoleAutoDiscovery("reviewer")),
+			FixerDiscoveryEnabled:    boolPtr(fixerConfigured && view.AnyProjectRoleAutoDiscovery("fixer")),
+			WorkerDiscoveryEnabled:   boolPtr(workerConfigured && view.AnyProjectRoleAutoDiscovery("worker")),
 			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 		}

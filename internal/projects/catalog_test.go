@@ -356,3 +356,176 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 		t.Fatalf("materialized policy = %#v, want persisted project policy", materialized)
 	}
 }
+
+func TestCatalogViewCapturesCoherentGeneration(t *testing.T) {
+	t.Parallel()
+
+	vendor := config.AgentVendorCodex
+	cfg := config.Config{
+		Agent:     config.AgentConfig{Vendor: &vendor, Params: map[string]any{"nested": map[string]any{"value": "original"}}},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}},
+		Projects:  []config.ProjectRefConfig{{ID: "import-input"}},
+	}
+	catalog := NewCatalog(cfg)
+	catalog.Publish([]config.ProjectRefConfig{{ID: "database", Repo: "core/database", Provider: "forgejo-main", Roles: &config.PartialRoleConfigs{}}})
+
+	view := catalog.View()
+
+	catalog.Publish([]config.ProjectRefConfig{{ID: "replaced"}})
+	newModel := "replaced"
+	catalog.PublishGlobals(config.Config{Agent: config.AgentConfig{Model: &newModel}})
+
+	project, ok := view.Project("database")
+	if !ok || project.Project.ID != "database" {
+		t.Fatalf("view.Project(\"database\") = (%#v, %v), want database project", project, ok)
+	}
+	if project.Provider.ID != "forgejo-main" {
+		t.Fatalf("view.Project(\"database\").Provider = %#v, want forgejo-main", project.Provider)
+	}
+
+	rolePolicy := view.RolePolicy("database")
+	if rolePolicy.ProjectID != "database" {
+		t.Fatalf("view.RolePolicy(\"database\").ProjectID = %q, want database", rolePolicy.ProjectID)
+	}
+
+	if view.generation.Agent.Model != nil && *view.generation.Agent.Model == "replaced" {
+		t.Fatalf("view observed a later global publication")
+	}
+	if view.generation.Agent.Params["nested"].(map[string]any)["value"] != "original" {
+		t.Fatalf("view generation was mutated by publication")
+	}
+}
+
+func TestCatalogViewProjectsAreDetachedAndImmutable(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		Projects: []config.ProjectRefConfig{{
+			ID: "demo", Repo: "nexu-io/looper", Roles: &config.PartialRoleConfigs{
+				Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: boolPtr(true)}},
+			},
+		}},
+		Roles: config.RoleConfigs{
+			Reviewer: config.ReviewerRoleConfig{
+				Discovery: config.ReviewerRoleDiscoveryConfig{AutoDiscovery: true},
+			},
+		},
+	}
+	catalog := NewCatalog(cfg)
+
+	view := catalog.View()
+	project, ok := view.Project("demo")
+	if !ok {
+		t.Fatal("view.Project(\"demo\") not found")
+	}
+	project.Project.Repo = "mutated/repo"
+	project.Roles.Reviewer.Discovery.AutoDiscovery = false
+	project.Roles.Reviewer.Discovery.Triggers.Labels = []string{"mutated"}
+
+	got, ok := catalog.View().Project("demo")
+	if !ok {
+		t.Fatal("catalog.View().Project(\"demo\") not found")
+	}
+	if got.Project.Repo != "nexu-io/looper" {
+		t.Fatalf("view Project.Repo = %q, want original", got.Project.Repo)
+	}
+	if !got.Roles.Reviewer.Discovery.AutoDiscovery {
+		t.Fatalf("view role policy was mutated through returned view")
+	}
+	if len(got.Roles.Reviewer.Discovery.Triggers.Labels) != 0 {
+		t.Fatalf("view role labels were mutated through returned view")
+	}
+}
+
+func TestCatalogViewRolePolicyMergesProjectOverrides(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		Projects: []config.ProjectRefConfig{{
+			ID: "demo", Repo: "nexu-io/looper", Roles: &config.PartialRoleConfigs{
+				Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{
+					AutoDiscovery: boolPtr(false),
+					Triggers: &config.PartialReviewerRoleTriggersConfig{
+						Labels: &[]string{"project-review"},
+					},
+				}},
+			},
+		}},
+		Roles: config.RoleConfigs{
+			Reviewer: config.ReviewerRoleConfig{
+				Discovery: config.ReviewerRoleDiscoveryConfig{
+					AutoDiscovery: true,
+					Triggers: config.ReviewerRoleTriggersConfig{
+						Labels:        []string{"review"},
+						LabelMode:     config.LabelModeAll,
+						IncludeDrafts: true,
+					},
+				},
+			},
+		},
+	}
+	catalog := NewCatalog(cfg)
+
+	view := catalog.View()
+	policy := view.RolePolicy("demo")
+	if policy.Roles.Reviewer.Discovery.AutoDiscovery {
+		t.Fatalf("project role override was not applied: autoDiscovery = true")
+	}
+	if len(policy.Roles.Reviewer.Discovery.Triggers.Labels) != 1 || policy.Roles.Reviewer.Discovery.Triggers.Labels[0] != "project-review" {
+		t.Fatalf("project role labels = %v, want project override", policy.Roles.Reviewer.Discovery.Triggers.Labels)
+	}
+	if policy.Roles.Reviewer.Discovery.Triggers.LabelMode != config.LabelModeAll {
+		t.Fatalf("global role field was not inherited: labelMode = %q", policy.Roles.Reviewer.Discovery.Triggers.LabelMode)
+	}
+	if !policy.Roles.Reviewer.Discovery.Triggers.IncludeDrafts {
+		t.Fatalf("global role field was not inherited: includeDrafts = false")
+	}
+}
+
+func TestCatalogViewProviderPolicy(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{
+			ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.test",
+		}},
+		Projects: []config.ProjectRefConfig{{
+			ID: "demo", Repo: "NEXU-IO/LOOPER", Provider: "forgejo-main",
+		}},
+	}
+	catalog := NewCatalog(cfg)
+
+	view := catalog.View()
+	policy, ok := view.ProviderPolicy("demo")
+	if !ok {
+		t.Fatal("view.ProviderPolicy(\"demo\") not found")
+	}
+	if policy.Provider.ID != "forgejo-main" || policy.ProviderKind != config.ProviderKindForgejo {
+		t.Fatalf("view.ProviderPolicy(\"demo\") = %#v, want forgejo-main", policy)
+	}
+	if policy.Provider.BaseURL != "https://code.example.test" {
+		t.Fatalf("provider base url was not preserved")
+	}
+}
+
+func TestCatalogViewProviderByRemoteHost(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{
+			ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.test",
+		}},
+	}
+	catalog := NewCatalog(cfg)
+
+	view := catalog.View()
+	policy, ok := view.ProviderByRemoteHost("ssh.code.example.test")
+	if !ok {
+		t.Fatal("view.ProviderByRemoteHost(\"ssh.code.example.test\") not found")
+	}
+	if policy.Provider.ID != "forgejo-main" || policy.ProviderKind != config.ProviderKindForgejo {
+		t.Fatalf("view.ProviderByRemoteHost = %#v, want forgejo-main", policy)
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }

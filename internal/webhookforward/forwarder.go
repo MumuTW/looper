@@ -13,6 +13,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/fixer"
+	projectcatalog "github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -106,14 +107,10 @@ type TargetedFixer interface {
 	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
 }
 
-type ConfigSource interface {
-	Snapshot() config.Config
-}
-
 type Options struct {
 	Repos              *storage.Repositories
 	Config             config.Config
-	ConfigSource       ConfigSource
+	ConfigSource       projectcatalog.ConfigSource
 	Reviewer           TargetedReviewer
 	Fixer              TargetedFixer
 	Logger             bootstrap.Logger
@@ -227,7 +224,7 @@ type checkRunEnvelope struct {
 type forwarder struct {
 	repos              *storage.Repositories
 	cfg                config.Config
-	configSource       ConfigSource
+	configSource       projectcatalog.ConfigSource
 	reviewer           TargetedReviewer
 	fixer              TargetedFixer
 	logger             bootstrap.Logger
@@ -454,22 +451,24 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 	candidates := make([]candidate, 0, len(projects))
 	newQueueEntries := 0
 	matched := 0
-	cfg := f.cfg
+	view := projectcatalog.OperationViewFromConfig(f.cfg)
 	if f.configSource != nil {
-		cfg = f.configSource.Snapshot()
+		view = f.configSource.View()
 	}
 	for _, project := range projects {
 		if project.Archived {
 			continue
 		}
-		if configured, ok := configuredProjectByID(cfg, project.ID); ok && config.ResolvedProjectProviderKind(cfg, configured) == config.ProviderKindForgejo {
+		projectView, configured := view.Project(project.ID)
+		if configured && projectView.ProviderKind == config.ProviderKindForgejo {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
 		if !strings.EqualFold(repo, routed.repo) {
 			continue
 		}
-		lanes := enabledLanesForProject(cfg, project.ID, routed.lanes)
+		rolePolicy := view.RolePolicy(project.ID)
+		lanes := enabledLanesForProject(rolePolicy, routed.lanes)
 		if len(lanes) == 0 {
 			continue
 		}
@@ -525,15 +524,6 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 		f.cond.Signal()
 	}
 	return matched, nil
-}
-
-func configuredProjectByID(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
-	for _, project := range cfg.Projects {
-		if project.ID == projectID {
-			return project, true
-		}
-	}
-	return config.ProjectRefConfig{}, false
 }
 
 func (f *forwarder) worker() {
@@ -825,13 +815,12 @@ func isFailingCheckConclusion(conclusion string) bool {
 	}
 }
 
-func enabledLanesForProject(cfg config.Config, projectID string, lanes map[Lane]struct{}) map[Lane]struct{} {
-	roles := config.ProjectRoleConfigs(cfg, projectID)
+func enabledLanesForProject(policy projectcatalog.RolePolicyView, lanes map[Lane]struct{}) map[Lane]struct{} {
 	result := map[Lane]struct{}{}
-	if _, ok := lanes[LaneReviewer]; ok && roles.Reviewer.Discovery.AutoDiscovery {
+	if _, ok := lanes[LaneReviewer]; ok && policy.Roles.Reviewer.Discovery.AutoDiscovery {
 		result[LaneReviewer] = struct{}{}
 	}
-	if _, ok := lanes[LaneFixer]; ok && roles.Fixer.AutoDiscovery {
+	if _, ok := lanes[LaneFixer]; ok && policy.Roles.Fixer.AutoDiscovery {
 		result[LaneFixer] = struct{}{}
 	}
 	return result
