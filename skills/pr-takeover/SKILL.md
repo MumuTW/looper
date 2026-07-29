@@ -1,28 +1,13 @@
 ---
 name: pr-takeover
-description: Use when asked to take over, adopt, or babysit a GitHub pull request until it merges — read review feedback, fix it, resolve threads, dismiss unreasonable change requests, and merge once approved and green. Picks between driving the PR live in this session or handing it to the Looper daemon for unattended background runs, confirming with the user when unclear. Triggers on "take over this PR", "接管这个 PR", "持续修复 review 直到合并", or a Looper takeover bot comment. Works in any coding agent (Claude Code, Codex, opencode, Gemini, …) using gh + git.
+description: Use when asked to take over, adopt, or babysit a GitHub pull request until it merges — read review feedback, fix it, resolve threads, dismiss unreasonable change requests, and merge once approved and green. Drive the PR live in this session with gh + git. Triggers on "take over this PR", "接管这个 PR", "持续修复 review 直到合并", or a Looper takeover bot comment. Works in any coding agent (Claude Code, Codex, opencode, Gemini, …).
 ---
 
 # PR Takeover
 
 Drive one pull request to merge: continuously read the live review state, fix what reviewers ask for, reply to and resolve threads, dismiss change requests you can justify as wrong, and merge once the PR is approved and all required checks pass — looping until it lands.
 
-There are **two ways to run this**. Pick one in Step 0, then execute it.
-
-| Mode | Who runs the agent | Lifetime | Needs |
-| --- | --- | --- | --- |
-| **A · Live** (default) | *you*, in this session | until your session ends | `gh` + `git` only |
-| **B · Background** | the Looper daemon | survives you leaving; runs for days | Looper installed |
-
-## Step 0 — Choose the mode (confirm with the user only if unclear)
-
-1. If the user already signalled a preference, honor it:
-   - "in the background", "while I'm away", "even after I close this", "set and forget" → **Mode B**.
-   - "watch it", "do it now", "in here" → **Mode A**.
-2. Otherwise default to **Mode A** (zero install, uses your already-authenticated session). Mention in one line that Mode B exists for unattended runs, and switch only if they ask.
-3. Choose **Mode B** only if `command -v looper` succeeds *and* the user wants it unattended. If they want unattended but Looper isn't installed, tell them to install it (`https://github.com/mumutw/looper`) or fall back to Mode A.
-
-Keep this lightweight — ask at most one short question, and only when the user gave no signal.
+This skill runs **live in this session** with `gh` + `git`. The old unattended `looper takeover <owner>/<repo>#<pr> --merge` background path was removed with the CLI strip; do not offer or invent that command.
 
 ## Prerequisites
 
@@ -41,21 +26,7 @@ If no PR exists for the branch, stop and ask the user to open one.
 
 ---
 
-## Mode B — Background (Looper daemon)
-
-Hand the PR to Looper and you're done; it runs the reviewer + fixer loops itself.
-
-```bash
-looper takeover <owner>/<repo>#<num> --merge   # --merge enables auto-merge once approved + green
-looper takeover list                           # check status later
-looper takeover stop <owner>/<repo>#<num>      # stop it
-```
-
-Scopes Looper to just this PR (it won't touch other PRs). Note: Looper runs **its own** agent headlessly, so its configured agent vendor must be authenticated for non-interactive use. Report the loop ids it prints, then stop — the rest happens in the background.
-
----
-
-## Mode A — Live (this session)
+## Live loop (this session)
 
 Loop until the PR is **merged** or a **hard blocker** needs a human. Each iteration:
 

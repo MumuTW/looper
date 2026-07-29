@@ -3,6 +3,10 @@ name: looper
 description: Use when installing, bootstrapping, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, cursor-cli, or Grok Build; when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing status, logs, osascript, git, gh, LOOPER_TOKEN, writable path, or daemon startup issues.
 ---
 
+> **CLI strip notice (read first).** The managed install verbs this skill historically used — `looper bootstrap`, `looper daemon install|start|…`, `looper project add`, `looper status` — are gone on the stripped CLI. Install both binaries yourself, write `~/.looper/config.toml`, run `looperd`, and register projects via the dashboard or `POST /api/v1/projects`. The surviving operator verbs are `stop` / `close` / `start` / `pause` / `retry` / `takeover` / `handback` / `respond` / `version` (plus machine-only `review submit`). Prefer [docs/installation.md](../../docs/installation.md) and [docs/configuration.md](../../docs/configuration.md) over any bootstrap recipe below.
+
+
+
 # Looper
 
 Use this skill when an agent needs to install, configure, start, check, operate, or troubleshoot Looper (`looper` CLI, `looperd` daemon, or files under `~/.looper`).

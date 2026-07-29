@@ -16,7 +16,7 @@ Looper turns that idea into a local AI dev team. Register the repos you want it 
 Looper ships two binaries:
 
 - `looperd` — the background daemon that polls GitHub or Forgejo, runs loops, and manages worktrees
-- `looper` — the CLI for setup, control, inspection, and manual loop starts
+- `looper` — a thin CLI for loop control (`stop`, `close`, `start`, `pause`, `retry`, `takeover`, `handback`, `respond`) against a running `looperd`
 
 ## Four loops, four success criteria
 
@@ -36,7 +36,7 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 - 🛰️ **Many repos, one daemon.** Register your projects once — Looper watches them together and runs loops across repos in parallel.
 - 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents work across issues and repos without stepping on each other.
 - 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`, `grok-build`) so you're not locked into one model or CLI.
-- 🧰 **Local, inspectable, stoppable.** Daemon on your machine, thin CLI to drive it. `looper ps`, `looper logs`, `looper stop` — no hosted control plane.
+- 🧰 **Local, inspectable, stoppable.** Daemon on your machine, thin CLI and dashboard to drive it. `looper stop` / `pause` / `retry`, plus the local dashboard — no hosted control plane.
 
 ## Quick start
 
@@ -48,111 +48,79 @@ If you're an AI coding agent (Claude Code, OpenCode, Codex, Cursor, etc.) helpin
 https://github.com/mumutw/looper/blob/main/skills/looper/SKILL.md
 ```
 
-It contains a one-shot, step-by-step flow (preflight → install → bootstrap → vendor credentials → verify → first loop) plus a troubleshooting matrix. Confirm destructive steps with the user before running them.
+It contains a step-by-step flow (preflight → install both binaries → write config → start the daemon → register a repo → first loop) plus a troubleshooting matrix. Confirm destructive steps with the user before running them.
 
 ### For humans
 
-Fast path (macOS `darwin-arm64` or Linux `linux-amd64`):
+Setup is manual: install both binaries, write a config, start `looperd`, then register projects. There is no bootstrap wizard and no managed daemon lifecycle.
 
 ```bash
+# 1. CLI (macOS darwin-arm64 or Linux linux-amd64)
 curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/install.sh | sh
-looper bootstrap
-looper project add /path/to/your/local/repo
+
+# 2. Daemon — same release's looperd-<target>.tar.gz onto PATH, or:
+#    go build -o ~/.local/bin/looperd ./cmd/looperd
+
+# 3. Config (minimal; see docs/configuration.md)
+mkdir -p ~/.looper
+cat > ~/.looper/config.toml <<'EOF'
+[server]
+host = "127.0.0.1"
+port = 17310
+
+[agent]
+vendor = "claude-code"   # or codex / opencode / cursor-cli / grok-build
+EOF
+
+# 4. Run the daemon (foreground)
+looperd
 ```
 
-`bootstrap` interactively writes your config, installs the managed daemon, and starts `looperd`. Use `--yes` only for scripts or other non-interactive installs.
-
-`/path/to/your/local/repo` means the local git checkout you want Looper to watch — the directory that contains that repo's `.git` folder, not a GitHub URL. For example:
+In another shell, register a local git checkout (directory containing `.git`) via the dashboard at `http://127.0.0.1:17310/dashboard/`, or:
 
 ```bash
-looper project add ~/src/my-app
-# or, from inside the repo:
-looper project add .
+curl -sS -X POST http://127.0.0.1:17310/api/v1/projects \
+  -H 'Content-Type: application/json' \
+  -d '{"repoPath":"/absolute/path/to/your/local/repo"}'
 ```
 
-Add each repo you want Looper to watch after bootstrap. Full install, upgrade, uninstall, and from-source instructions: **[docs/installation.md](docs/installation.md)**.
-
-Once `looper status` succeeds and your forge credentials are configured (`gh auth status` for GitHub, or a configured Forgejo token environment variable), drive loops manually:
+Once the daemon is healthy and forge credentials are configured (`gh auth status` for GitHub, or a configured Forgejo token environment variable), loops start from the forge itself: label an issue and assign it, and `looperd`'s discovery picks it up. The CLI controls loops the daemon already owns:
 
 ```bash
-# plan a spec from an issue
-looper plan --project <id> --issue <num>
-
-# review a PR — one-shot, or keep looping as new commits land
-looper review <owner>/<repo>#<pr>
-looper review <owner>/<repo>#<pr> --loop
-
-# implement from an issue (reuses planner's spec PR if one exists)
-looper work --project <id> --issue <num>
+looper stop 12
+looper pause 12
+looper retry 12
+looper takeover 12     # park an existing loop for manual worktree work
+looper handback 12     # return a parked loop to the daemon
+looper respond 12 "lgtm — ship it"
 ```
 
-Inside a registered repo, `--project` is usually optional for `review` and `work`, and you can drop the `<owner>/<repo>` prefix on PR refs. Pass them explicitly from outside the repo or when multiple projects could match.
-
-The full workflow — label conventions, assignment rules, how planner / reviewer / fixer / worker hand off — is in **[docs/users-guide.md](docs/users-guide.md)**.
+Full install detail: **[docs/installation.md](docs/installation.md)**. Label conventions and role hand-offs: **[docs/users-guide.md](docs/users-guide.md)**.
 
 ## Take over a single PR
 
-Want to babysit *one* pull request — review it, fix review threads, dismiss unreasonable change requests, and keep going until it merges?
+Want to babysit *one* pull request until it merges?
 
 **The simplest path is one prompt.** Paste this into whatever coding agent you already run (Claude Code, Codex, opencode, Gemini, …):
 
 > Take over this PR until it merges — read https://raw.githubusercontent.com/mumutw/looper/main/skills/pr-takeover/SKILL.md and follow it.
 
-That points the agent at the [`pr-takeover` skill](skills/pr-takeover/SKILL.md), which decides — confirming with you when unclear — between two modes:
+That points the agent at the [`pr-takeover` skill](skills/pr-takeover/SKILL.md). Live mode (default) drives the PR with `gh` + `git` in your session.
 
-- **Live (default, zero install)** — your own session drives the PR with `gh` + `git`. Uses your already-authenticated agent; runs while your session is alive.
-- **Background (unattended)** — hands the PR to the `looper takeover` command below, so the `looperd` daemon runs the reviewer + fixer loops on their own and it survives you closing your terminal.
+> **The one-command background PR takeover is gone.** The old `looper takeover <owner>/<repo>#<pr>` — which installed the daemon, registered the repo scoped to one PR, and ran reviewer + fixer unattended — lived in the CLI that was removed ahead of the role-model rewrite, along with `scripts/takeover.sh`.
 
-The rest of this section covers the `looper takeover` command that powers the background mode. Run it from inside the checkout:
+`looper takeover <selector>` still exists, but it now **parks an existing loop** so you can work in its worktree by hand; `looper handback <selector>` returns it to the daemon. It does not create loops, adopt a PR URL, or accept `--merge`.
 
-```bash
-# detect the current branch's PR automatically
-looper takeover
-
-# or target an explicit PR
-looper takeover acme/repo#42
-```
-
-`takeover` is the one-command path that, behind the scenes:
-
-- installs/starts the managed `looperd` daemon if it isn't already running;
-- registers the repository **scoped to that single PR** — every autonomous discovery loop is disabled, so Looper only touches the PR you named, never the rest of the repo;
-- starts a continuous **reviewer** loop and **fixer** loop on the PR, which ping-pong until the review comes back clean;
-- with `--merge`, lets the reviewer enable GitHub auto-merge so the PR merges itself once it's approved and green.
-
-It picks your coding agent automatically when exactly one of `claude` / `codex` / `grok` / `opencode` is on `PATH`, prompts when it's ambiguous, and accepts `--agent-vendor` / `--yes` for non-interactive (agent-driven) runs:
-
-```bash
-looper takeover acme/repo#42 --merge --agent-vendor claude-code
-looper takeover --yes --agent-vendor codex          # fully non-interactive
-```
-
-List and stop takeovers:
-
-```bash
-looper takeover list                 # active takeovers + live loop status
-looper takeover stop acme/repo#42    # stop this takeover's reviewer + fixer loops
-looper takeover stop --all
-```
+To get unattended reviewer/fixer loops on a PR today, register the repo and let the daemon's discovery claim the PR through the normal label and review-request flow.
 
 Requirements: `git`, an authenticated `gh`, and one supported agent CLI installed locally (the agent runs on your machine with your own credentials). Grok Build from xAI uses `agent.vendor = "grok-build"` and the `grok` executable; see [Grok Build configuration](docs/configuration.md#grok-build-xai) for daemon authentication and automation limits.
-
-### One-liner for not-yet-installed users
-
-For someone who doesn't have Looper yet, a single piped command installs the CLI and hands off to `takeover`. This is what an automation/bot can drop into a PR comment so the author can adopt the PR in one step (run it from inside the repo checkout):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/takeover.sh | sh -s -- acme/repo#42
-```
-
-Everything after `--` is forwarded to `looper takeover`, so `--merge` and `--agent-vendor` work there too.
 
 ## Agent skills
 
 Looper ships installable agent skills:
 
-- **`looper`** — setup, status, config, daemon lifecycle, and troubleshooting guidance.
-- **`pr-takeover`** — drive a single PR to merge (read review feedback → fix → resolve threads → dismiss unreasonable change requests → merge when approved and green). One skill, two modes: it runs **live** in your own agent session (`gh` + `git`, zero install) or hands off to the **background** `looper takeover` daemon, confirming with you when unclear. Works in any agent via one universal prompt — see [`skills/pr-takeover/SKILL.md`](skills/pr-takeover/SKILL.md).
+- **`looper`** — install, config, starting the daemon, registering projects, and troubleshooting guidance. Note: the skill text still mentions some pre-strip CLI verbs in places; prefer **[docs/installation.md](docs/installation.md)** and the command cheatsheet above for the current surface.
+- **`pr-takeover`** — drive a single PR to merge (read review feedback → fix → resolve threads → dismiss unreasonable change requests → merge when approved and green). Prefer **live** mode (`gh` + `git` in your session); the old unattended `looper takeover <pr>` background path was removed with the CLI strip.
 
 ```bash
 npx skills add ./skills/looper
@@ -214,53 +182,25 @@ For setup, identity strategy, recovery steps, and `loopernet` deployment, see **
 
 ## Command cheatsheet
 
-**Setup & health**
+This is the whole operator CLI after the strip. Every verb except `version` talks to a running `looperd` over its local HTTP API.
 
 ```bash
-looper bootstrap            # first-run setup
-looper status               # daemon + config health
 looper version
-looper project list
-looper project add /path/to/repo
+looper stop <selector>                 # "all" stops every active run
+looper close <selector>
+looper start <selector>
+looper pause <selector>
+looper retry <selector>
+looper takeover <selector>             # park an existing loop for manual work
+looper handback <selector>
+looper respond <selector> "<answer>"   # answer a loop waiting on a human
 ```
 
-**Start loops manually**
+A selector is a loop sequence number (`looper stop 12`) or a loop id (`looper stop loop_1cf3`). Pull request URLs are rejected — they cannot be placed in the path the daemon parses.
 
-```bash
-looper takeover [<owner>/<repo>#<pr>] [--merge]   # adopt one PR until it merges
-looper plan   --project <id> --issue <num>
-looper review <owner>/<repo>#<pr> [--loop]
-looper work   --project <id> --issue <num>
-looper loop start --type fixer --pr <owner>/<repo>#<pr>
-```
+There is one more command that is not for operators: `looper review submit`, which publishes a reviewer agent's pull request review. Reviewer agents reach it through a wrapper the daemon writes; run directly it has no provider credentials and fails.
 
-`--project` can be omitted for `plan` / `work` when run from inside a uniquely registered repo; `review` can also omit the `<owner>/<repo>` prefix in that case, but `loop start --pr` always requires `<owner>/<repo>#<pr>`.
-
-**Inspect PRs**
-
-```bash
-looper pr list
-looper pr show   <owner>/<repo>#<pr>
-looper pr status <owner>/<repo>#<pr>
-```
-
-**Manage running loops**
-
-```bash
-looper ps                   # list active loops
-looper logs <id> --follow   # stream logs
-looper jump <id>            # jump into a loop's worktree
-looper stop <id>
-looper run reconcile-stale  # recover stale running loops after sleep/wake
-```
-
-**Daemon control**
-
-```bash
-looper daemon install|start|stop|restart|status
-```
-
-If `looper ps` shows stale `running` work with no live agent after sleep/wake, run `looper run reconcile-stale` first. `looper daemon restart` remains a reasonable fallback when you want a full daemon restart.
+**Not in the CLI.** Bootstrap, managed daemon install/start, project add/list, plan/review/work, ps/logs/jump, provider/webhook/network administration, and upgrade lived in the CLI that was removed. Loop inspection is available through the dashboard and the daemon's HTTP API; install and supervise `looperd` yourself.
 
 ## Configuration
 
@@ -311,8 +251,8 @@ Build artifacts go to `dist/` and are gitignored — don't edit generated files.
 ## Runtime notes
 
 - `looperd` fails fast on invalid config; runtime paths must be writable
-- The managed daemon binary lives at `~/.looper/bin/looperd`
+- You install and supervise `looperd` yourself; there is no managed daemon install path
 - Daemon-managed worktrees live under `~/.looper/worktrees/`, grouped by repo and project
-- `looper worktree cleanup` dry-runs Looper-managed worktree cleanup; `--confirm` removes eligible clean terminal worktrees without deleting branches
+- Worktree cleanup runs inside the daemon on the `daemon.worktreeCleanup` schedule; the CLI no longer has a `worktree cleanup` verb
 - When `notifications.osascript.enabled=true`, `osascript` must resolve on startup
 - Automation is poll-driven by default — keep `looperd` running and provider credentials available; GitHub projects require `gh`, while Forgejo-only installs do not

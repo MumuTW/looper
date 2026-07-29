@@ -4,15 +4,11 @@ This document explains Looper's canonical config taxonomy, default config locati
 
 ## Install layout notes
 
-For the default supported macOS install flow:
+For the default supported install flow:
 
-- `looper` is installed from a GitHub Release Go binary
-- `looper daemon install` installs the managed daemon binary to `~/.looper/bin/looperd`
-- `looper daemon start` writes its pid file to `~/.looper/looperd.pid`
-- `looper daemon start` writes lifecycle diagnostics to `~/.looper/looperd.state.json`
+- `looper` and `looperd` are installed as separate GitHub Release Go binaries (or built from source)
+- you write the config file and start `looperd` yourself — there is no managed daemon install or `looper daemon *` lifecycle
 - when webhook mode is enabled, `looperd` holds `~/.looper/looperd.lock` (beside the SQLite DB path) to prevent two local daemons from racing on the same webhook forwarders
-
-The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`.
 
 Keep the runtime directory (`~/.looper` by default, or the directory containing `storage.dbPath`) on a local filesystem. The webhook forwarder lock uses OS file locking and is not designed for NFS-style shared filesystems. Tunnel-mode webhook secrets live under the same runtime directory in `secrets/` and must be mode `0600`.
 
