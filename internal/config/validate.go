@@ -295,6 +295,13 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
 	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
+	// Every registry entry's discovery block must match its work source.
+	// Normalize already rejects invalid TOML-authored roles; this covers
+	// Configs assembled without normalization.
+	effectiveCodingRoles := EffectiveCodingRoles(config.Roles)
+	for _, name := range CodingRoleNames(config.Roles) {
+		issues = append(issues, ValidateRoleDiscovery("roles.coding."+name, effectiveCodingRoles[name].Discovery)...)
+	}
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 	} else if config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) {

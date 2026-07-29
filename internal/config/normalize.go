@@ -12,23 +12,61 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		return Config{}, err
 	}
 
+	normalizedLayers := make([]PartialConfig, 0, len(partials))
 	for _, partial := range partials {
 		if issues := validateLegacyProjectInstructionRoleKeys(partial); len(issues) > 0 {
 			return Config{}, &ConfigValidationError{Issues: issues}
 		}
-		mergeConfig(&config, normalizeLayerPartial(partial))
+		if issues := validateProjectCodingRoleSections(partial); len(issues) > 0 {
+			return Config{}, &ConfigValidationError{Issues: issues}
+		}
+		normalized := normalizeLayerPartial(partial)
+		mergeConfig(&config, normalized)
+		normalizedLayers = append(normalizedLayers, normalized)
 	}
 
 	if err := applyProviderProfiles(&config, partials...); err != nil {
 		return Config{}, err
 	}
 
-	// Project the named role structs onto the role map last, so it reflects
-	// the fully merged config rather than any single layer. Consumers read
-	// the map; the named fields are the legacy input shape.
-	config.Roles.Coding = CodingRolesFromLegacy(config.Roles)
+	// Build the canonical role registry last, so it reflects the fully merged
+	// config rather than any single layer: the named legacy role structs are
+	// projected first, then the TOML-authored roles.coding.* sections are
+	// overlaid. Consumers read the map; the named fields are the legacy input
+	// shape.
+	authored, issues := collectAuthoredCodingRoles(normalizedLayers...)
+	if len(issues) > 0 {
+		return Config{}, &ConfigValidationError{Issues: issues}
+	}
+	codingRoles, issues := resolveCodingRoles(CodingRolesFromLegacy(config.Roles), authored)
+	if len(issues) > 0 {
+		return Config{}, &ConfigValidationError{Issues: issues}
+	}
+	config.Roles.Coding = codingRoles
 
 	return config, nil
+}
+
+// validateProjectCodingRoleSections rejects roles.coding.* under a project:
+// the coding-role registry is global, so a project-scoped section would be
+// configured but inert. Project overrides of the shipped roles keep using the
+// legacy named sections (projects[].roles.planner and friends).
+func validateProjectCodingRoleSections(partial PartialConfig) []ValidationIssue {
+	if partial.Projects == nil {
+		return nil
+	}
+
+	issues := make([]ValidationIssue, 0)
+	for index, project := range *partial.Projects {
+		if project.Roles != nil && len(project.Roles.Coding) > 0 {
+			issues = append(issues, ValidationIssue{
+				Path:    fmt.Sprintf("projects[%d].roles.coding", index),
+				Message: "coding roles are global-only; author roles.coding.* at the top level",
+			})
+		}
+	}
+
+	return issues
 }
 
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {

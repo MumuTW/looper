@@ -473,6 +473,36 @@ All role-specific config lives under `roles.<role>`.
 - runtime behavior lives at `roles.<role>.behavior.*` when that split is useful for the role
 - coding-role agent identity overlays live at `roles.{planner,worker,reviewer,fixer}.agent` (profile ref and/or inline vendor/model); see [Multi-role agent vendor and model](#multi-role-agent-vendor-and-model)
 
+### TOML-authored coding roles (`roles.coding.<name>`)
+
+Coding roles can also be authored directly as `[roles.coding.<name>]` sections. These feed the canonical coding-role registry that orders the scheduler's discovery lanes; each entry carries `priority` (required; lower runs first), an optional `discovery` block (same shape as the role discovery model: `enabled`, `source` = `issue` | `pull_request`, label gating, and the per-source fields), optional `instructions`, and an optional `agent` binding.
+
+Precedence rules when both forms are present:
+
+- For a shipped role name (`planner`, `worker`, `reviewer`, `fixer`), only `priority` may be set — it overrides the compiled-in lane priority. Discovery, instructions, and agent keep coming from the legacy `roles.<name>.*` section; setting them under `roles.coding.<name>` is a load-time error, because those consumers still read the named section and the values would be inert.
+- `roles.coding.coordinator` is rejected — Coordinator is not a coding role.
+- Any other name authors a custom role. `priority` and `discovery.source` are required, fields that belong to the other work source are rejected (an issue-source role may not set `includeDrafts`, and so on), and discovery fields merge field-by-field across config layers with later layers winning.
+- `roles.coding.*` is global-only: `projects[].roles.coding` is rejected.
+
+A custom role with no compiled-in runner is registered and ordered but its discovery lane is skipped — the section is the configuration half of adding a role; the runner half still ships with the binary. `roles.coding.*` edits are restart-bound.
+
+```toml
+# Reorder lanes: run worker before reviewer.
+[roles.coding.worker]
+priority = 25
+
+# Register a custom role (lane skips until a runner exists for it).
+[roles.coding.auditor]
+priority = 60
+instructions = "audit the diff"
+
+[roles.coding.auditor.discovery]
+enabled = true
+source = "issue"
+labels = ["looper:audit"]
+labelMode = "any"
+```
+
 ## Coordinator config reference
 
 Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes `triaged` plus the coordinator-owned label namespace. Dispatch consumes `triaged` + `dispatch/*` and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels.

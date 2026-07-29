@@ -274,8 +274,43 @@ func RestartRequiredChanges(oldConfig Config, newConfig Config) []string {
 	// resolved vendors stay stable while a hot global vendor edit would still
 	// rebind coordinator and params under a new CLI.
 	appendResolvedVendorRestartGuards(oldConfig, newConfig, seen, &restartRequired)
+	appendCodingRoleRegistryGuards(oldConfig, newConfig, seen, &restartRequired)
 	sort.Strings(restartRequired)
 	return restartRequired
+}
+
+// appendCodingRoleRegistryGuards marks TOML-authored coding-role changes as
+// restart-bound. Roles.Coding is derived, non-serialized state, so the JSON
+// diff above cannot see it; without this guard an edit to roles.coding.* would
+// apply neither hot nor via a restart prompt — configured but inert.
+//
+// Only the registry's own state is compared — which roles exist and their
+// priorities. Discovery, instructions, and agent of the shipped roles mirror
+// the legacy named fields, which the JSON diff already classifies (several
+// are hot); comparing them here would mark hot edits restart-bound.
+func appendCodingRoleRegistryGuards(oldConfig Config, newConfig Config, seen map[string]struct{}, restartRequired *[]string) {
+	oldRoles := EffectiveCodingRoles(oldConfig.Roles)
+	newRoles := EffectiveCodingRoles(newConfig.Roles)
+	for name, oldRole := range oldRoles {
+		newRole, ok := newRoles[name]
+		if !ok || oldRole.Priority != newRole.Priority {
+			markCodingRoleRestart(seen, restartRequired, name)
+		}
+	}
+	for name := range newRoles {
+		if _, ok := oldRoles[name]; !ok {
+			markCodingRoleRestart(seen, restartRequired, name)
+		}
+	}
+}
+
+func markCodingRoleRestart(seen map[string]struct{}, restartRequired *[]string, name string) {
+	path := "roles.coding." + name
+	if _, exists := seen[path]; exists {
+		return
+	}
+	seen[path] = struct{}{}
+	*restartRequired = append(*restartRequired, path)
 }
 
 func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen map[string]struct{}, restartRequired *[]string) {

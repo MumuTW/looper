@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCodingRolesFromLegacyProjectsSourceAndFields(t *testing.T) {
 	roles := RoleConfigs{
@@ -129,9 +132,14 @@ func TestValidateRoleDiscoveryRejectsCrossSourceFields(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			issues := ValidateRoleDiscovery("myrole", tc.discovery)
+			issues := ValidateRoleDiscovery("roles.coding.myrole", tc.discovery)
 			if len(issues) != tc.wantCount {
 				t.Errorf("got %d issues %v, want %d", len(issues), issues, tc.wantCount)
+			}
+			for _, issue := range issues {
+				if !strings.HasPrefix(issue.Path, "roles.coding.myrole.") {
+					t.Errorf("issue path %q does not point into roles.coding.myrole", issue.Path)
+				}
 			}
 		})
 	}
