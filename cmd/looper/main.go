@@ -41,17 +41,6 @@ import (
 
 const requestTimeout = 30 * time.Second
 
-// projectAddTimeout is longer than requestTimeout because POST /api/v1/projects
-// is not a control call. The daemon commits the project and only then discovers
-// its worktrees and open pull requests, which under defaults.addSnapshotMode =
-// "full" walks every open PR on the repo. Cutting that off at the control-verb
-// deadline reports a failure for work that already landed; see runProjectAdd.
-//
-// A var, not a const, only so a test can shrink it: the timeout branch is the
-// one that must not read as a plain failure, and ten real minutes is not
-// something a test can wait out.
-var projectAddTimeout = 10 * time.Minute
-
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
@@ -631,7 +620,7 @@ func runStatus(ctx context.Context, global []string, operands []string, stdout i
 
 func runProject(ctx context.Context, global []string, operands []string, stdout io.Writer) error {
 	if len(operands) == 0 {
-		return badUsage("project requires a subcommand (add, list)")
+		return badUsage("project requires a subcommand (add, list, discover)")
 	}
 	switch operands[0] {
 	case "list":
@@ -644,6 +633,11 @@ func runProject(ctx context.Context, global []string, operands []string, stdout 
 			return badUsage("project add requires exactly one repository path")
 		}
 		return runProjectAdd(ctx, global, operands[1], stdout)
+	case "discover":
+		if len(operands) != 2 || strings.TrimSpace(operands[1]) == "" {
+			return badUsage("project discover requires exactly one project id")
+		}
+		return runProjectDiscover(ctx, global, operands[1], stdout)
 	default:
 		return badUsage("unknown project subcommand %q", operands[0])
 	}
@@ -703,16 +697,8 @@ func runProjectAdd(ctx context.Context, global []string, repoPath string, stdout
 	if err != nil {
 		return err
 	}
-	created, err := requestJSONWithin[createProjectResponse](ctx, projectAddTimeout, cfg, http.MethodPost, "/api/v1/projects", payload)
+	created, err := requestJSON[createProjectResponse](ctx, cfg, http.MethodPost, "/api/v1/projects", payload)
 	if err != nil {
-		// The daemon commits and publishes the project before it discovers
-		// worktrees and pull requests, so a deadline that expires during
-		// discovery reports a failure for a registration that already landed.
-		// Say so: a plain error would send the operator into a retry that can
-		// only answer "already registered".
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("registering %s did not finish within %s; the daemon records a project before it finishes discovering its worktrees and pull requests, so this may already have succeeded — run `looper project list` before retrying", resolved, projectAddTimeout)
-		}
 		return err
 	}
 
@@ -722,7 +708,39 @@ func runProjectAdd(ctx context.Context, global []string, repoPath string, stdout
 	if created.Repo != nil && strings.TrimSpace(*created.Repo) != "" {
 		_, _ = fmt.Fprintf(stdout, "  repo:       %s\n", *created.Repo)
 	}
+	// Registration completed; worktree/PR discovery runs post-commit in the
+	// daemon and never gates this result.
+	if created.Discovery != nil && created.Discovery.Status != "" {
+		_, _ = fmt.Fprintf(stdout, "  discovery:  %s (post-commit; retry with `looper project discover %s` if it fails)\n", created.Discovery.Status, created.ID)
+	}
 	for _, warning := range created.Warnings {
+		_, _ = fmt.Fprintf(stdout, "  warning:    %s\n", singleLine(warning))
+	}
+	return nil
+}
+
+func runProjectDiscover(ctx context.Context, global []string, identifier string, stdout io.Writer) error {
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+	result, err := requestJSON[createProjectResponse](ctx, cfg, http.MethodPost, "/api/v1/projects/"+url.PathEscape(identifier)+"/discover", nil)
+	if err != nil {
+		return err
+	}
+	if result.Discovery == nil {
+		_, _ = fmt.Fprintf(stdout, "discovery for project %s: unknown (daemon did not report discovery status)\n", result.ID)
+		return nil
+	}
+	_, _ = fmt.Fprintf(stdout, "discovery for project %s: %s\n", result.ID, result.Discovery.Status)
+	if result.Discovery.Error != "" {
+		_, _ = fmt.Fprintf(stdout, "  error:      %s\n", singleLine(result.Discovery.Error))
+	}
+	if result.Discovery.Status == "succeeded" {
+		_, _ = fmt.Fprintf(stdout, "  worktrees:  %d\n", result.Discovery.DiscoveredWorktrees)
+		_, _ = fmt.Fprintf(stdout, "  pullRequests: %d\n", result.Discovery.DiscoveredPullRequests)
+	}
+	for _, warning := range result.Discovery.Warnings {
 		_, _ = fmt.Fprintf(stdout, "  warning:    %s\n", singleLine(warning))
 	}
 	return nil
@@ -845,7 +863,16 @@ type projectsListResponse struct {
 
 type createProjectResponse struct {
 	projectResponse
-	Warnings []string `json:"warnings"`
+	Discovery *discoveryResponse `json:"discovery"`
+	Warnings  []string           `json:"warnings"`
+}
+
+type discoveryResponse struct {
+	Status                 string   `json:"status"`
+	Error                  string   `json:"error"`
+	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
+	DiscoveredWorktrees    int      `json:"discoveredWorktrees"`
+	Warnings               []string `json:"warnings"`
 }
 
 // daemonBaseURL is where this CLI expects the daemon to answer.
@@ -1063,6 +1090,7 @@ Usage:
   looper status                Report config, daemon reachability, and projects
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
+  looper project discover <id> Retry post-commit worktree/PR discovery for a project
   looper stop <selector>       Stop the active run for a loop ("all" stops every run)
   looper close <selector>      Stop the active run and close the loop
   looper takeover <selector>   Take a loop over for manual work

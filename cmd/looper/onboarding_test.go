@@ -21,7 +21,6 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
-	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/version"
@@ -37,9 +36,6 @@ type fakeDaemon struct {
 	createBody   map[string]any
 	createStatus int
 	createError  string
-	// createDelay stands in for the worktree and pull request discovery the
-	// daemon runs after it has already committed the project.
-	createDelay time.Duration
 }
 
 func newFakeDaemon(t *testing.T) *fakeDaemon {
@@ -58,13 +54,6 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 				t.Errorf("decode create project body: %v", err)
 			}
 			daemon.createBody = body
-			if daemon.createDelay > 0 {
-				select {
-				case <-time.After(daemon.createDelay):
-				case <-r.Context().Done():
-					return
-				}
-			}
 			if daemon.createStatus != 0 {
 				w.WriteHeader(daemon.createStatus)
 				_ = json.NewEncoder(w).Encode(map[string]any{
@@ -80,6 +69,7 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 				"repoPath":   repoPath,
 				"baseBranch": "main",
 				"archived":   false,
+				"discovery":  map[string]any{"status": "pending"},
 				"warnings":   []string{"Could not detect repository from git remote"},
 			})
 		default:
@@ -737,27 +727,23 @@ func TestProjectAddSendsCanonicalRepoPath(t *testing.T) {
 	}
 }
 
-// TestProjectAddReportsTimeoutAsPossiblySucceeded guards the one failure that
-// must not read as a failure. The daemon records and publishes the project
-// before it discovers worktrees and pull requests, so a deadline that expires
-// during discovery leaves a registration that landed and an operator told it
-// did not — who then retries and is told only that the checkout is already
-// registered.
-func TestProjectAddReportsTimeoutAsPossiblySucceeded(t *testing.T) {
+// TestProjectAddReportsDiscoveryAsPostCommit guards the registration
+// boundary: `project add` succeeds once the daemon has validated, committed,
+// and published the project, and worktree/PR discovery is reported as
+// pending post-commit work rather than something the CLI waits on.
+func TestProjectAddReportsDiscoveryAsPostCommit(t *testing.T) {
 	daemon := newFakeDaemon(t)
-	daemon.createDelay = time.Second
 	configForDaemon(t, daemon.server.URL)
 
-	previous := projectAddTimeout
-	projectAddTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { projectAddTimeout = previous })
-
-	code, _, stderr := runCLI(t, "project", "add", gitRepo(t))
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	code, stdout, _ := runCLI(t, "project", "add", gitRepo(t))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(stderr, "may already have succeeded") || !strings.Contains(stderr, "looper project list") {
-		t.Fatalf("stderr = %q, want a timeout that points at project list rather than reading as a plain failure", stderr)
+	if !strings.Contains(stdout, "registered project repo") {
+		t.Fatalf("stdout = %q, want registration success", stdout)
+	}
+	if !strings.Contains(stdout, "pending") || !strings.Contains(stdout, "looper project discover") {
+		t.Fatalf("stdout = %q, want pending discovery with a discover retry hint", stdout)
 	}
 }
 

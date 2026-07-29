@@ -24,7 +24,12 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
-	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	service := &Service{
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
+	}
 
 	result, err := service.AddProject(ctx, AddInput{
 		ID:         "looper",
@@ -38,8 +43,15 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	if result.Project.ID != "looper" {
 		t.Fatalf("AddProject().Project.ID = %q, want looper", result.Project.ID)
 	}
-	if result.Project.MetadataJSON == nil || *result.Project.MetadataJSON != `{"repo":null,"worktreeRoot":null,"source":"api"}` {
-		t.Fatalf("AddProject().Project.MetadataJSON = %v, want api metadata", result.Project.MetadataJSON)
+	if result.Discovery.Status != DiscoveryStatusPending {
+		t.Fatalf("AddProject().Discovery.Status = %q, want pending", result.Discovery.Status)
+	}
+	metadata := parseMetadata(result.Project.MetadataJSON)
+	if metadataString(metadata, "source") != "api" {
+		t.Fatalf("metadata source = %#v, want api", metadata["source"])
+	}
+	if DiscoveryStateFromRecord(result.Project).Status != DiscoveryStatusPending {
+		t.Fatalf("persisted discovery = %#v, want pending", DiscoveryStateFromRecord(result.Project))
 	}
 }
 
@@ -237,10 +249,11 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
 	service := &Service{
-		DB:         coordinator.DB(),
-		Repos:      repos,
-		Now:        func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (DetectedRepo, error) { return DetectedRepo{Repo: "nexu-io/looper"}, nil },
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
+		DetectRepo:        func(context.Context, string) (DetectedRepo, error) { return DetectedRepo{Repo: "nexu-io/looper"}, nil },
 		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
 			return []WorktreeListEntry{{Path: "/tmp/looper", Branch: "main", HeadSHA: "abc123"}, {Path: "/tmp/looper-pr-1", Branch: "pr-1", HeadSHA: "def456"}}, nil
 		},
@@ -253,21 +266,29 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 		},
 	}
 
-	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", SnapshotMode: SnapshotModeFull})
+	added, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", SnapshotMode: SnapshotModeFull})
 	if err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
-	if result.Repo == nil || *result.Repo != "nexu-io/looper" {
-		t.Fatalf("AddProject().Repo = %v, want nexu-io/looper", result.Repo)
+	if added.Repo == nil || *added.Repo != "nexu-io/looper" {
+		t.Fatalf("AddProject().Repo = %v, want nexu-io/looper", added.Repo)
 	}
-	if result.DiscoveredWorktrees != 2 {
-		t.Fatalf("AddProject().DiscoveredWorktrees = %d, want 2", result.DiscoveredWorktrees)
+	if added.Discovery.Status != DiscoveryStatusPending {
+		t.Fatalf("AddProject().Discovery.Status = %q, want pending", added.Discovery.Status)
 	}
-	if result.DiscoveredPullRequests != 1 {
-		t.Fatalf("AddProject().DiscoveredPullRequests = %d, want 1", result.DiscoveredPullRequests)
+
+	result, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeFull})
+	if err != nil {
+		t.Fatalf("DiscoverProject() error = %v", err)
 	}
-	if len(result.Warnings) != 0 {
-		t.Fatalf("AddProject().Warnings = %#v, want none", result.Warnings)
+	if result.Discovery.DiscoveredWorktrees != 2 {
+		t.Fatalf("DiscoverProject().DiscoveredWorktrees = %d, want 2", result.Discovery.DiscoveredWorktrees)
+	}
+	if result.Discovery.DiscoveredPullRequests != 1 {
+		t.Fatalf("DiscoverProject().DiscoveredPullRequests = %d, want 1", result.Discovery.DiscoveredPullRequests)
+	}
+	if len(result.Discovery.Warnings) != 0 {
+		t.Fatalf("DiscoverProject().Warnings = %#v, want none", result.Discovery.Warnings)
 	}
 
 	worktrees, err := repos.Worktrees.ListByProject(ctx, "looper")
@@ -295,9 +316,10 @@ func TestServiceAddProjectDefaultAsyncEnqueuesSnapshotsWithoutCapturing(t *testi
 	captured := false
 	repo := "nexu-io/looper"
 	service := &Service{
-		DB:    coordinator.DB(),
-		Repos: repos,
-		Now:   func() time.Time { return time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC) },
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC) },
+		ScheduleDiscovery: func(func()) {},
 		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 			return []PullRequestSummary{{Number: 1, State: "OPEN", IsDraft: false}, {Number: 2, State: "OPEN", IsDraft: true}}, nil
 		},
@@ -307,15 +329,18 @@ func TestServiceAddProjectDefaultAsyncEnqueuesSnapshotsWithoutCapturing(t *testi
 		},
 	}
 
-	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
-	if err != nil {
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
+	}
+	result, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper"})
+	if err != nil {
+		t.Fatalf("DiscoverProject() error = %v", err)
 	}
 	if captured {
 		t.Fatal("CapturePullRequestSnapshot called in default async mode")
 	}
-	if result.DiscoveredPullRequests != 1 || result.PendingSnapshots != 1 || result.CapturedSnapshots != 0 {
-		t.Fatalf("AddProject() counts = discovered %d pending %d captured %d, want 1/1/0", result.DiscoveredPullRequests, result.PendingSnapshots, result.CapturedSnapshots)
+	if result.Discovery.DiscoveredPullRequests != 1 || result.Discovery.PendingSnapshots != 1 || result.Discovery.CapturedSnapshots != 0 {
+		t.Fatalf("DiscoverProject() counts = discovered %d pending %d captured %d, want 1/1/0", result.Discovery.DiscoveredPullRequests, result.Discovery.PendingSnapshots, result.Discovery.CapturedSnapshots)
 	}
 	items, err := repos.Queue.List(ctx)
 	if err != nil {
@@ -341,9 +366,10 @@ func TestServiceAddProjectAsyncFallsBackToFullWhenQueueDisabled(t *testing.T) {
 	repo := "nexu-io/looper"
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
 	service := &Service{
-		DB:    coordinator.DB(),
-		Repos: repos,
-		Now:   func() time.Time { return now },
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
 		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 			return []PullRequestSummary{{Number: 1, State: "OPEN", IsDraft: false}}, nil
 		},
@@ -354,15 +380,18 @@ func TestServiceAddProjectAsyncFallsBackToFullWhenQueueDisabled(t *testing.T) {
 		AsyncSnapshotQueueEnabled: func() bool { return false },
 	}
 
-	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeAsync})
-	if err != nil {
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeAsync}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
-	if result.DiscoveredPullRequests != 1 || result.PendingSnapshots != 0 || result.CapturedSnapshots != 1 {
-		t.Fatalf("AddProject() counts = discovered %d pending %d captured %d, want 1/0/1", result.DiscoveredPullRequests, result.PendingSnapshots, result.CapturedSnapshots)
+	result, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeAsync})
+	if err != nil {
+		t.Fatalf("DiscoverProject() error = %v", err)
 	}
-	if len(result.Warnings) != 1 || result.Warnings[0] != "Async snapshot mode requires the scheduler; capturing snapshots synchronously instead." {
-		t.Fatalf("AddProject().Warnings = %#v, want async fallback warning", result.Warnings)
+	if result.Discovery.DiscoveredPullRequests != 1 || result.Discovery.PendingSnapshots != 0 || result.Discovery.CapturedSnapshots != 1 {
+		t.Fatalf("DiscoverProject() counts = discovered %d pending %d captured %d, want 1/0/1", result.Discovery.DiscoveredPullRequests, result.Discovery.PendingSnapshots, result.Discovery.CapturedSnapshots)
+	}
+	if len(result.Discovery.Warnings) != 1 || result.Discovery.Warnings[0] != "Async snapshot mode requires the scheduler; capturing snapshots synchronously instead." {
+		t.Fatalf("DiscoverProject().Warnings = %#v, want async fallback warning", result.Discovery.Warnings)
 	}
 	items, err := repos.Queue.List(ctx)
 	if err != nil {
@@ -388,17 +417,26 @@ func TestServiceAddProjectSnapshotModeOffSkipsPullRequestDiscovery(t *testing.T)
 	repos := storage.NewRepositories(coordinator.DB())
 	listed := false
 	repo := "nexu-io/looper"
-	service := &Service{DB: coordinator.DB(), Repos: repos, Now: time.Now, ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
-		listed = true
-		return nil, nil
-	}}
+	service := &Service{
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               time.Now,
+		ScheduleDiscovery: func(func()) {},
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			listed = true
+			return nil, nil
+		},
+	}
 
-	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeOff})
-	if err != nil {
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeOff}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
-	if listed || result.DiscoveredPullRequests != 0 || result.PendingSnapshots != 0 {
-		t.Fatalf("off mode listed=%v counts=%#v, want no discovery", listed, result)
+	result, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeOff})
+	if err != nil {
+		t.Fatalf("DiscoverProject() error = %v", err)
+	}
+	if listed || result.Discovery.DiscoveredPullRequests != 0 || result.Discovery.PendingSnapshots != 0 {
+		t.Fatalf("off mode listed=%v discovery=%#v, want no discovery", listed, result.Discovery)
 	}
 }
 
@@ -410,9 +448,10 @@ func TestServiceAddProjectReturnsDiscoveryWarnings(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
 	service := &Service{
-		DB:    coordinator.DB(),
-		Repos: repos,
-		Now:   func() time.Time { return now },
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
 		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
 			return nil, errors.New("git worktree failed")
 		},
@@ -425,24 +464,27 @@ func TestServiceAddProjectReturnsDiscoveryWarnings(t *testing.T) {
 	}
 	repo := "nexu-io/looper"
 
-	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
-	if err != nil {
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
-	if result.DiscoveredWorktrees != 0 {
-		t.Fatalf("AddProject().DiscoveredWorktrees = %d, want 0", result.DiscoveredWorktrees)
+	result, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeFull})
+	if err != nil {
+		t.Fatalf("DiscoverProject() error = %v", err)
 	}
-	if result.DiscoveredPullRequests != 0 {
-		t.Fatalf("AddProject().DiscoveredPullRequests = %d, want 0", result.DiscoveredPullRequests)
+	if result.Discovery.DiscoveredWorktrees != 0 {
+		t.Fatalf("DiscoverProject().DiscoveredWorktrees = %d, want 0", result.Discovery.DiscoveredWorktrees)
 	}
-	if len(result.Warnings) != 2 {
-		t.Fatalf("len(AddProject().Warnings) = %d, want 2", len(result.Warnings))
+	if result.Discovery.DiscoveredPullRequests != 0 {
+		t.Fatalf("DiscoverProject().DiscoveredPullRequests = %d, want 0", result.Discovery.DiscoveredPullRequests)
 	}
-	if result.Warnings[0] != "Could not discover worktrees: git worktree failed" {
-		t.Fatalf("Warnings[0] = %q, want worktree warning", result.Warnings[0])
+	if len(result.Discovery.Warnings) != 2 {
+		t.Fatalf("len(DiscoverProject().Warnings) = %d, want 2", len(result.Discovery.Warnings))
 	}
-	if result.Warnings[1] != "Could not discover pull requests: gh pr list failed" {
-		t.Fatalf("Warnings[1] = %q, want pull request warning", result.Warnings[1])
+	if result.Discovery.Warnings[0] != "Could not discover worktrees: git worktree failed" {
+		t.Fatalf("Warnings[0] = %q, want worktree warning", result.Discovery.Warnings[0])
+	}
+	if result.Discovery.Warnings[1] != "Could not discover pull requests: gh pr list failed" {
+		t.Fatalf("Warnings[1] = %q, want pull request warning", result.Discovery.Warnings[1])
 	}
 }
 
@@ -454,9 +496,10 @@ func TestServiceAddProjectWarnsWhenPullRequestSnapshotFails(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
 	service := &Service{
-		DB:    coordinator.DB(),
-		Repos: repos,
-		Now:   func() time.Time { return now },
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
 		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 			return []PullRequestSummary{{Number: 73, State: "OPEN", IsDraft: false}}, nil
 		},
@@ -466,19 +509,22 @@ func TestServiceAddProjectWarnsWhenPullRequestSnapshotFails(t *testing.T) {
 	}
 	repo := "nexu-io/looper"
 
-	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
-	if err != nil {
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
-	if result.DiscoveredPullRequests != 1 {
-		t.Fatalf("AddProject().DiscoveredPullRequests = %d, want 1", result.DiscoveredPullRequests)
+	result, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeFull})
+	if err != nil {
+		t.Fatalf("DiscoverProject() error = %v", err)
 	}
-	if len(result.Warnings) != 1 {
-		t.Fatalf("len(AddProject().Warnings) = %d, want 1", len(result.Warnings))
+	if result.Discovery.DiscoveredPullRequests != 1 {
+		t.Fatalf("DiscoverProject().DiscoveredPullRequests = %d, want 1", result.Discovery.DiscoveredPullRequests)
+	}
+	if len(result.Discovery.Warnings) != 1 {
+		t.Fatalf("len(DiscoverProject().Warnings) = %d, want 1", len(result.Discovery.Warnings))
 	}
 	wantWarning := "Could not snapshot pull request #73: could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)"
-	if result.Warnings[0] != wantWarning {
-		t.Fatalf("Warnings[0] = %q, want %q", result.Warnings[0], wantWarning)
+	if result.Discovery.Warnings[0] != wantWarning {
+		t.Fatalf("Warnings[0] = %q, want %q", result.Discovery.Warnings[0], wantWarning)
 	}
 	stored, getErr := repos.Projects.GetByID(ctx, "looper")
 	if getErr != nil {
@@ -496,7 +542,7 @@ func TestServiceAddProjectWarnsWhenPullRequestSnapshotFails(t *testing.T) {
 	}
 }
 
-func TestServiceAddProjectPropagatesPullRequestSnapshotCancellation(t *testing.T) {
+func TestServiceAddProjectSucceedsIndependentlyOfDiscoveryCancellation(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -504,9 +550,10 @@ func TestServiceAddProjectPropagatesPullRequestSnapshotCancellation(t *testing.T
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
 	service := &Service{
-		DB:    coordinator.DB(),
-		Repos: repos,
-		Now:   func() time.Time { return now },
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
 		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 			return []PullRequestSummary{{Number: 73, State: "OPEN", IsDraft: false}}, nil
 		},
@@ -516,13 +563,88 @@ func TestServiceAddProjectPropagatesPullRequestSnapshotCancellation(t *testing.T
 	}
 	repo := "nexu-io/looper"
 
-	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
+	added, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v, want registration success", err)
+	}
+	if added.Discovery.Status != DiscoveryStatusPending {
+		t.Fatalf("AddProject().Discovery.Status = %q, want pending", added.Discovery.Status)
+	}
+	stored, getErr := repos.Projects.GetByID(ctx, "looper")
+	if getErr != nil || stored == nil || stored.Archived {
+		t.Fatalf("registered project = %#v err=%v, want active project", stored, getErr)
+	}
+
+	_, err = service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeFull})
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("AddProject() error = %v, want context.Canceled", err)
+		t.Fatalf("DiscoverProject() error = %v, want context.Canceled", err)
+	}
+	stored, getErr = repos.Projects.GetByID(ctx, "looper")
+	if getErr != nil || stored == nil {
+		t.Fatalf("Projects.GetByID() after discovery failure = %#v err=%v", stored, getErr)
+	}
+	discovery := DiscoveryStateFromRecord(*stored)
+	if discovery.Status != DiscoveryStatusFailed {
+		t.Fatalf("discovery status = %q, want failed", discovery.Status)
 	}
 }
 
-func TestServiceAddProjectPropagatesSnapshotCommandErrorCancellation(t *testing.T) {
+func TestServiceDiscoverProjectRetryIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	listCalls := 0
+	service := &Service{
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
+		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
+			return []WorktreeListEntry{{Path: "/tmp/looper", Branch: "main", HeadSHA: "abc123"}}, nil
+		},
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			listCalls++
+			return []PullRequestSummary{{Number: 1, State: "OPEN", IsDraft: false}}, nil
+		},
+	}
+	repo := "nexu-io/looper"
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	first, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper"})
+	if err != nil {
+		t.Fatalf("DiscoverProject() first error = %v", err)
+	}
+	second, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper"})
+	if err != nil {
+		t.Fatalf("DiscoverProject() second error = %v", err)
+	}
+	if listCalls != 2 {
+		t.Fatalf("ListOpenPullRequests calls = %d, want 2", listCalls)
+	}
+	if first.Discovery.DiscoveredPullRequests != 1 || second.Discovery.DiscoveredPullRequests != 1 {
+		t.Fatalf("discovery counts = %#v / %#v, want 1 each", first.Discovery, second.Discovery)
+	}
+	items, err := repos.Queue.List(ctx)
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue items = %#v, want one deduped snapshot", items)
+	}
+	worktrees, err := repos.Worktrees.ListByProject(ctx, "looper")
+	if err != nil {
+		t.Fatalf("Worktrees.ListByProject() error = %v", err)
+	}
+	if len(worktrees) != 1 {
+		t.Fatalf("worktrees = %#v, want one upserted worktree", worktrees)
+	}
+}
+
+func TestServiceDiscoverProjectRecordsCommandErrorCancellationAsFailure(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -530,9 +652,10 @@ func TestServiceAddProjectPropagatesSnapshotCommandErrorCancellation(t *testing.
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
 	service := &Service{
-		DB:    coordinator.DB(),
-		Repos: repos,
-		Now:   func() time.Time { return now },
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
 		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 			return []PullRequestSummary{{Number: 73, State: "OPEN", IsDraft: false}}, nil
 		},
@@ -542,10 +665,19 @@ func TestServiceAddProjectPropagatesSnapshotCommandErrorCancellation(t *testing.
 		},
 	}
 	repo := "nexu-io/looper"
-
-	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
+	if _, err := service.AddProject(context.Background(), AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	_, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeFull})
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("AddProject() error = %v, want context.Canceled", err)
+		t.Fatalf("DiscoverProject() error = %v, want context.Canceled", err)
+	}
+	stored, getErr := repos.Projects.GetByID(context.Background(), "looper")
+	if getErr != nil || stored == nil {
+		t.Fatalf("project after discovery cancel = %#v err=%v", stored, getErr)
+	}
+	if DiscoveryStateFromRecord(*stored).Status != DiscoveryStatusFailed {
+		t.Fatalf("discovery = %#v, want failed", DiscoveryStateFromRecord(*stored))
 	}
 }
 

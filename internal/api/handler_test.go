@@ -2033,10 +2033,9 @@ func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 		addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
 			metadataJSON := `{"repo":null,"worktreeRoot":null,"source":"api"}`
 			return projects.AddResult{
-				Project:                storage.ProjectRecord{ID: "looper-repo", Name: "looper-repo", RepoPath: `C:\\tmp/repos/Looper Repo`, BaseBranch: stringPtr(fixture.config.Defaults.BaseBranch), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
-				DiscoveredPullRequests: 0,
-				DiscoveredWorktrees:    0,
-				Warnings:               nil,
+				Project:   storage.ProjectRecord{ID: "looper-repo", Name: "looper-repo", RepoPath: `C:\\tmp/repos/Looper Repo`, BaseBranch: stringPtr(fixture.config.Defaults.BaseBranch), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				Discovery: projects.DiscoveryState{Status: projects.DiscoveryStatusPending},
+				Warnings:  nil,
 			}, nil
 		},
 	}}).ServeHTTP(recorder, req)
@@ -2058,8 +2057,14 @@ func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 	if data["worktreeRoot"] != nil {
 		t.Fatalf("worktreeRoot = %#v, want nil", data["worktreeRoot"])
 	}
-	assertEqual(t, data["discoveredPullRequests"], float64(0))
-	assertEqual(t, data["discoveredWorktrees"], float64(0))
+	discovery, ok := data["discovery"].(map[string]any)
+	if !ok {
+		t.Fatalf("discovery = %#v, want object", data["discovery"])
+	}
+	assertEqual(t, discovery["status"], string(projects.DiscoveryStatusPending))
+	if _, present := discovery["discoveredPullRequests"]; present {
+		t.Fatalf("discoveredPullRequests = %#v, want omitted while pending", discovery["discoveredPullRequests"])
+	}
 	warnings, ok := data["warnings"].([]any)
 	if !ok || len(warnings) != 0 {
 		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
@@ -2078,11 +2083,14 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 			repo := "acme/looper"
 			metadataJSON := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
 			return projects.AddResult{
-				Project:                storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
-				Repo:                   &repo,
-				DiscoveredPullRequests: 2,
-				DiscoveredWorktrees:    3,
-				Warnings:               []string{"warn 1", "warn 2"},
+				Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				Repo:    &repo,
+				Discovery: projects.DiscoveryState{
+					Status:                 projects.DiscoveryStatusSucceeded,
+					DiscoveredPullRequests: 2,
+					DiscoveredWorktrees:    3,
+					Warnings:               []string{"warn 1", "warn 2"},
+				},
 			}, nil
 		},
 	}}).ServeHTTP(recorder, req)
@@ -2094,11 +2102,16 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	data := body["data"].(map[string]any)
 	assertEqual(t, data["id"], "looper")
 	assertEqual(t, data["repo"], "acme/looper")
-	assertEqual(t, data["discoveredPullRequests"], float64(2))
-	assertEqual(t, data["discoveredWorktrees"], float64(3))
-	warnings, ok := data["warnings"].([]any)
-	if !ok || !reflect.DeepEqual(warnings, []any{"warn 1", "warn 2"}) {
-		t.Fatalf("warnings = %#v, want [warn 1 warn 2]", data["warnings"])
+	discovery, ok := data["discovery"].(map[string]any)
+	if !ok {
+		t.Fatalf("discovery = %#v, want object", data["discovery"])
+	}
+	assertEqual(t, discovery["status"], string(projects.DiscoveryStatusSucceeded))
+	assertEqual(t, discovery["discoveredPullRequests"], float64(2))
+	assertEqual(t, discovery["discoveredWorktrees"], float64(3))
+	discoveryWarnings, ok := discovery["warnings"].([]any)
+	if !ok || !reflect.DeepEqual(discoveryWarnings, []any{"warn 1", "warn 2"}) {
+		t.Fatalf("discovery.warnings = %#v, want [warn 1 warn 2]", discovery["warnings"])
 	}
 }
 
@@ -2160,11 +2173,60 @@ func TestHandlerProjectsCreateRouteReturnsSuccessWhenWebhookRefreshFails(t *test
 	assertEqual(t, data["repoPath"], "/tmp/repos/looper")
 	assertEqual(t, data["baseBranch"], "main")
 	assertEqual(t, data["archived"], false)
-	assertEqual(t, data["discoveredPullRequests"], float64(0))
-	assertEqual(t, data["discoveredWorktrees"], float64(0))
+	if _, ok := data["discovery"].(map[string]any); !ok {
+		t.Fatalf("discovery = %#v, want object", data["discovery"])
+	}
 	warnings, ok := data["warnings"].([]any)
 	if !ok || len(warnings) != 0 {
 		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
+	}
+}
+
+func TestHandlerProjectDiscoverRouteRetriesDiscovery(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/looper/discover", nil)
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{
+		discoverProject: func(_ context.Context, input projects.DiscoverInput) (projects.DiscoverResult, error) {
+			if input.ProjectID != "looper" {
+				t.Fatalf("DiscoverProject().ProjectID = %q, want looper", input.ProjectID)
+			}
+			metadataJSON := `{"repo":"acme/looper","source":"api"}`
+			return projects.DiscoverResult{
+				Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				Discovery: projects.DiscoveryState{
+					Status:              projects.DiscoveryStatusSucceeded,
+					DiscoveredWorktrees: 2,
+				},
+			}, nil
+		},
+	}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "looper")
+	discovery, ok := data["discovery"].(map[string]any)
+	if !ok {
+		t.Fatalf("discovery = %#v, want object", data["discovery"])
+	}
+	assertEqual(t, discovery["status"], string(projects.DiscoveryStatusSucceeded))
+	assertEqual(t, discovery["discoveredWorktrees"], float64(2))
+}
+
+func TestHandlerProjectDiscoverRouteRejectsGet(t *testing.T) {
+	fixture := newTestFixture(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/looper/discover", nil)
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", recorder.Code)
 	}
 }
 
@@ -7881,9 +7943,10 @@ func seedConflictProject(t *testing.T, service *projects.Service) {
 }
 
 type fakeProjectService struct {
-	list          func(context.Context) ([]storage.ProjectRecord, error)
-	addProject    func(context.Context, projects.AddInput) (projects.AddResult, error)
-	removeProject func(context.Context, string) (storage.ProjectRecord, error)
+	list            func(context.Context) ([]storage.ProjectRecord, error)
+	addProject      func(context.Context, projects.AddInput) (projects.AddResult, error)
+	removeProject   func(context.Context, string) (storage.ProjectRecord, error)
+	discoverProject func(context.Context, projects.DiscoverInput) (projects.DiscoverResult, error)
 }
 
 func (f fakeProjectService) List(ctx context.Context) ([]storage.ProjectRecord, error) {
@@ -7905,6 +7968,13 @@ func (f fakeProjectService) RemoveProject(ctx context.Context, identifier string
 		return f.removeProject(ctx, identifier)
 	}
 	return storage.ProjectRecord{}, nil
+}
+
+func (f fakeProjectService) DiscoverProject(ctx context.Context, input projects.DiscoverInput) (projects.DiscoverResult, error) {
+	if f.discoverProject != nil {
+		return f.discoverProject(ctx, input)
+	}
+	return projects.DiscoverResult{}, nil
 }
 
 type errorArtifactCase struct {

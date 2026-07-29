@@ -76,6 +76,31 @@ type CapturePullRequestSnapshotInput struct {
 	CapturedAt string
 }
 
+type DiscoveryStatus string
+
+const (
+	DiscoveryStatusPending   DiscoveryStatus = "pending"
+	DiscoveryStatusRunning   DiscoveryStatus = "running"
+	DiscoveryStatusSucceeded DiscoveryStatus = "succeeded"
+	DiscoveryStatusFailed    DiscoveryStatus = "failed"
+
+	registrationDiscoveryMetadataKey = "registrationDiscovery"
+)
+
+// DiscoveryState is the observable post-commit worktree/PR discovery contract.
+// It is stored on the Project metadata and never gates registration success.
+type DiscoveryState struct {
+	Status                 DiscoveryStatus `json:"status"`
+	SnapshotMode           SnapshotMode    `json:"snapshotMode,omitempty"`
+	UpdatedAt              string          `json:"updatedAt,omitempty"`
+	Error                  string          `json:"error,omitempty"`
+	DiscoveredPullRequests int             `json:"discoveredPullRequests,omitempty"`
+	DiscoveredWorktrees    int             `json:"discoveredWorktrees,omitempty"`
+	PendingSnapshots       int             `json:"pendingSnapshots,omitempty"`
+	CapturedSnapshots      int             `json:"capturedSnapshots,omitempty"`
+	Warnings               []string        `json:"warnings,omitempty"`
+}
+
 type Service struct {
 	mutationMu   sync.Mutex
 	DB           *sql.DB
@@ -100,6 +125,10 @@ type Service struct {
 	// external reconciliation or other potentially blocking follow-up here;
 	// PublishProjects itself is part of the atomic config/catalog publication.
 	AfterPublishProjects func()
+	// ScheduleDiscovery runs post-commit discovery. The default starts a
+	// background goroutine so registration never waits on discovery. Tests may
+	// replace it to run inline or to suppress automatic discovery.
+	ScheduleDiscovery func(func())
 }
 
 type AddInput struct {
@@ -115,14 +144,23 @@ type AddInput struct {
 }
 
 type AddResult struct {
-	Project                storage.ProjectRecord
-	Repo                   *string
-	Provider               *string
-	DiscoveredPullRequests int
-	DiscoveredWorktrees    int
-	PendingSnapshots       int
-	CapturedSnapshots      int
-	Warnings               []string
+	Project  storage.ProjectRecord
+	Repo     *string
+	Provider *string
+	// Discovery is pending when registration returns; progress is observable on
+	// the Project record and via DiscoverProject retries.
+	Discovery DiscoveryState
+	Warnings  []string
+}
+
+type DiscoverInput struct {
+	ProjectID    string
+	SnapshotMode SnapshotMode
+}
+
+type DiscoverResult struct {
+	Project   storage.ProjectRecord
+	Discovery DiscoveryState
 }
 
 type ProjectIDCollisionError struct{ ProjectID string }
@@ -152,11 +190,23 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		return AddResult{}, fmt.Errorf("projects repository is not configured")
 	}
 	s.mutationMu.Lock()
-	defer s.mutationMu.Unlock()
-
-	existing, err := s.Repos.Projects.GetByID(ctx, input.ID)
+	result, discoverInput, err := s.addProjectLocked(ctx, input)
+	s.mutationMu.Unlock()
 	if err != nil {
 		return AddResult{}, err
+	}
+	if discoverInput != nil {
+		// Schedule only after releasing mutationMu so a synchronous test runner
+		// can call DiscoverProject without deadlocking.
+		s.scheduleDiscovery(*discoverInput)
+	}
+	return result, nil
+}
+
+func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResult, *DiscoverInput, error) {
+	existing, err := s.Repos.Projects.GetByID(ctx, input.ID)
+	if err != nil {
+		return AddResult{}, nil, err
 	}
 	projectID := input.ID
 	if existing == nil {
@@ -165,29 +215,29 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if existing == nil && projectID != input.ID {
 		normalizedExisting, err := s.Repos.Projects.GetByID(ctx, projectID)
 		if err != nil {
-			return AddResult{}, err
+			return AddResult{}, nil, err
 		}
 		if normalizedExisting != nil {
 			metadata := parseMetadata(normalizedExisting.MetadataJSON)
 			if normalized, _ := metadata["normalizedDerivedId"].(bool); !normalized {
-				return AddResult{}, ProjectIDCollisionError{ProjectID: projectID}
+				return AddResult{}, nil, ProjectIDCollisionError{ProjectID: projectID}
 			}
 			existing = normalizedExisting
 		}
 	}
 	if existing != nil && metadataString(parseMetadata(existing.MetadataJSON), "source") == "config" {
-		return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", existing.ID)}
+		return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", existing.ID)}
 	}
 	if existing != nil && !existing.Archived {
 		derivedReusesSameCheckout := input.IDSource == "derived" && sameProjectRepoPath(existing.RepoPath, input.RepoPath)
 		if !derivedReusesSameCheckout {
-			return AddResult{}, ProjectIDCollisionError{ProjectID: projectID}
+			return AddResult{}, nil, ProjectIDCollisionError{ProjectID: projectID}
 		}
 	}
 
 	if existing == nil {
 		if err := assertValidProjectID(projectID); err != nil {
-			return AddResult{}, err
+			return AddResult{}, nil, err
 		}
 	}
 
@@ -206,26 +256,26 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 					if detectedProvider == "" {
 						detectedProvider = "the GitHub default"
 					}
-					return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("detected origin belongs to %s, not provider %q; pass --repo owner/name explicitly or use a checkout whose origin matches the provider", detectedProvider, strings.TrimSpace(*provider))}
+					return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("detected origin belongs to %s, not provider %q; pass --repo owner/name explicitly or use a checkout whose origin matches the provider", detectedProvider, strings.TrimSpace(*provider))}
 				}
 				value := strings.TrimSpace(detected.Repo)
 				repo = &value
 				if provider == nil && strings.TrimSpace(detected.Provider) != "" {
-					return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin matches provider %q; rerun with --provider %s to confirm the binding", strings.TrimSpace(detected.Provider), strings.TrimSpace(detected.Provider))}
+					return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin matches provider %q; rerun with --provider %s to confirm the binding", strings.TrimSpace(detected.Provider), strings.TrimSpace(detected.Provider))}
 				}
 			}
 		}
 	}
 	if err := validateExplicitProvider(cfg, provider); err != nil {
-		return AddResult{}, err
+		return AddResult{}, nil, err
 	}
 	if provider != nil && (repo == nil || strings.TrimSpace(*repo) == "") {
-		return AddResult{}, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
+		return AddResult{}, nil, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
 	}
 
 	if !isForgejoProvider(cfg, provider) {
 		if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
-			return AddResult{}, err
+			return AddResult{}, nil, err
 		}
 	}
 
@@ -273,9 +323,16 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	} else {
 		metadata["source"] = "api"
 	}
+	snapshotMode := snapshotModeOrDefault(input.SnapshotMode)
+	discovery := DiscoveryState{
+		Status:       DiscoveryStatusPending,
+		SnapshotMode: snapshotMode,
+		UpdatedAt:    nowISO,
+	}
+	metadata[registrationDiscoveryMetadataKey] = discoveryStateMap(discovery)
 	metadataJSON, err := buildAddProjectMetadataJSON(metadata)
 	if err != nil {
-		return AddResult{}, fmt.Errorf("marshal project metadata: %w", err)
+		return AddResult{}, nil, fmt.Errorf("marshal project metadata: %w", err)
 	}
 
 	record := storage.ProjectRecord{
@@ -309,33 +366,93 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		return nil
 	})
 	if err != nil {
-		return AddResult{}, err
+		return AddResult{}, nil, err
 	}
 	if publishedProjects && s.AfterPublishProjects != nil {
 		s.AfterPublishProjects()
 	}
 
-	discoveredWorktrees, err := s.discoverWorktrees(ctx, record, nowISO, &warnings)
-	if err != nil {
-		return AddResult{}, err
-	}
-	var discoveredPullRequests, pendingSnapshots, capturedSnapshots int
-	if !isForgejoProvider(cfg, provider) {
-		discoveredPullRequests, pendingSnapshots, capturedSnapshots, err = s.discoverPullRequests(ctx, record, repo, snapshotModeOrDefault(input.SnapshotMode), &warnings)
-		if err != nil {
-			return AddResult{}, err
-		}
-	}
+	job := DiscoverInput{ProjectID: projectID, SnapshotMode: snapshotMode}
 	return AddResult{
-		Project:                record,
-		Repo:                   repo,
-		Provider:               provider,
+		Project:   record,
+		Repo:      repo,
+		Provider:  provider,
+		Discovery: discovery,
+		Warnings:  warnings,
+	}, &job, nil
+}
+
+// DiscoverProject runs (or retries) post-commit worktree/PR discovery for an
+// already-registered Project. It is idempotent for worktree upserts and
+// snapshot queue dedupe, and never archives or unpublishes the Project.
+func (s *Service) DiscoverProject(ctx context.Context, input DiscoverInput) (DiscoverResult, error) {
+	if s.Repos == nil || s.Repos.Projects == nil {
+		return DiscoverResult{}, fmt.Errorf("projects repository is not configured")
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	projectID := strings.TrimSpace(input.ProjectID)
+	if projectID == "" {
+		return DiscoverResult{}, ProjectValidationError{Message: "project id is required"}
+	}
+	project, err := s.Repos.Projects.GetByID(ctx, projectID)
+	if err != nil {
+		return DiscoverResult{}, err
+	}
+	if project == nil || project.Archived {
+		return DiscoverResult{}, ProjectNotFoundError{Identifier: projectID}
+	}
+
+	existingDiscovery := discoveryStateFromMetadata(parseMetadata(project.MetadataJSON))
+	snapshotMode := existingDiscovery.SnapshotMode
+	if input.SnapshotMode != "" {
+		snapshotMode = input.SnapshotMode
+	}
+	snapshotMode = snapshotModeOrDefault(snapshotMode)
+
+	nowISO := currentISO(s.Now)
+	running := DiscoveryState{Status: DiscoveryStatusRunning, SnapshotMode: snapshotMode, UpdatedAt: nowISO}
+	if err := s.writeDiscoveryState(ctx, project, running); err != nil {
+		return DiscoverResult{}, err
+	}
+
+	warnings := []string{}
+	discoveredWorktrees, worktreeErr := s.discoverWorktrees(ctx, *project, nowISO, &warnings)
+	var discoveredPullRequests, pendingSnapshots, capturedSnapshots int
+	var pullRequestErr error
+	cfg := s.currentConfig()
+	provider := stringMetadataPtr(project.MetadataJSON, "provider")
+	repo := stringMetadataPtr(project.MetadataJSON, "repo")
+	if !isForgejoProvider(cfg, provider) {
+		discoveredPullRequests, pendingSnapshots, capturedSnapshots, pullRequestErr = s.discoverPullRequests(ctx, *project, repo, snapshotMode, &warnings)
+	}
+
+	discovery := DiscoveryState{
+		Status:                 DiscoveryStatusSucceeded,
+		SnapshotMode:           snapshotMode,
+		UpdatedAt:              currentISO(s.Now),
 		DiscoveredPullRequests: discoveredPullRequests,
 		DiscoveredWorktrees:    discoveredWorktrees,
 		PendingSnapshots:       pendingSnapshots,
 		CapturedSnapshots:      capturedSnapshots,
-		Warnings:               warnings,
-	}, nil
+		Warnings:               append([]string{}, warnings...),
+	}
+	if worktreeErr != nil || pullRequestErr != nil {
+		discovery.Status = DiscoveryStatusFailed
+		discovery.Error = firstErrorMessage(worktreeErr, pullRequestErr)
+		if writeErr := s.writeDiscoveryState(ctx, project, discovery); writeErr != nil {
+			return DiscoverResult{}, writeErr
+		}
+		if worktreeErr != nil {
+			return DiscoverResult{Project: *project, Discovery: discovery}, worktreeErr
+		}
+		return DiscoverResult{Project: *project, Discovery: discovery}, pullRequestErr
+	}
+	if err := s.writeDiscoveryState(ctx, project, discovery); err != nil {
+		return DiscoverResult{}, err
+	}
+	return DiscoverResult{Project: *project, Discovery: discovery}, nil
 }
 
 func (s *Service) Get(ctx context.Context, id string) (*storage.ProjectRecord, error) {
@@ -1189,4 +1306,139 @@ func worktreeCreatedAt(existing *storage.WorktreeRecord, nowISO string) string {
 		return existing.CreatedAt
 	}
 	return nowISO
+}
+
+func (s *Service) scheduleDiscovery(input DiscoverInput) {
+	run := func() {
+		_, err := s.DiscoverProject(context.Background(), input)
+		if err == nil || s.Logger == nil {
+			return
+		}
+		s.Logger.Warn("post-commit project discovery failed", map[string]any{
+			"projectId": input.ProjectID,
+			"message":   err.Error(),
+		})
+	}
+	if s.ScheduleDiscovery != nil {
+		s.ScheduleDiscovery(run)
+		return
+	}
+	go run()
+}
+
+func (s *Service) writeDiscoveryState(ctx context.Context, project *storage.ProjectRecord, discovery DiscoveryState) error {
+	if project == nil || s.Repos == nil || s.Repos.Projects == nil {
+		return fmt.Errorf("projects repository is not configured")
+	}
+	metadata := parseMetadata(project.MetadataJSON)
+	metadata[registrationDiscoveryMetadataKey] = discoveryStateMap(discovery)
+	metadataJSON, err := buildAddProjectMetadataJSON(metadata)
+	if err != nil {
+		return fmt.Errorf("marshal project metadata: %w", err)
+	}
+	project.MetadataJSON = stringPointer(metadataJSON)
+	project.UpdatedAt = discovery.UpdatedAt
+	if discovery.UpdatedAt == "" {
+		project.UpdatedAt = currentISO(s.Now)
+	}
+	// Persist discovery status independently of the caller's context so a
+	// canceled discovery request cannot leave status stuck at running.
+	return s.Repos.Projects.Upsert(context.Background(), *project)
+}
+
+// DiscoveryStateFromRecord returns the persisted post-commit discovery state.
+func DiscoveryStateFromRecord(project storage.ProjectRecord) DiscoveryState {
+	return discoveryStateFromMetadata(parseMetadata(project.MetadataJSON))
+}
+
+func discoveryStateFromMetadata(metadata map[string]any) DiscoveryState {
+	raw, _ := metadata[registrationDiscoveryMetadataKey].(map[string]any)
+	if raw == nil {
+		return DiscoveryState{}
+	}
+	status, _ := raw["status"].(string)
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return DiscoveryState{}
+	}
+	snapshotMode, _ := raw["snapshotMode"].(string)
+	updatedAt, _ := raw["updatedAt"].(string)
+	errText, _ := raw["error"].(string)
+	state := DiscoveryState{
+		Status:                 DiscoveryStatus(status),
+		SnapshotMode:           SnapshotMode(strings.TrimSpace(snapshotMode)),
+		UpdatedAt:              strings.TrimSpace(updatedAt),
+		Error:                  strings.TrimSpace(errText),
+		DiscoveredPullRequests: intFromAny(raw["discoveredPullRequests"]),
+		DiscoveredWorktrees:    intFromAny(raw["discoveredWorktrees"]),
+		PendingSnapshots:       intFromAny(raw["pendingSnapshots"]),
+		CapturedSnapshots:      intFromAny(raw["capturedSnapshots"]),
+	}
+	if warnings, ok := raw["warnings"].([]any); ok {
+		for _, warning := range warnings {
+			text, _ := warning.(string)
+			text = strings.TrimSpace(text)
+			if text != "" {
+				state.Warnings = append(state.Warnings, text)
+			}
+		}
+	}
+	return state
+}
+
+func discoveryStateMap(discovery DiscoveryState) map[string]any {
+	out := map[string]any{
+		"status":    string(discovery.Status),
+		"updatedAt": discovery.UpdatedAt,
+	}
+	if discovery.SnapshotMode != "" {
+		out["snapshotMode"] = string(discovery.SnapshotMode)
+	}
+	if discovery.Error != "" {
+		out["error"] = discovery.Error
+	}
+	if discovery.DiscoveredPullRequests != 0 {
+		out["discoveredPullRequests"] = discovery.DiscoveredPullRequests
+	}
+	if discovery.DiscoveredWorktrees != 0 {
+		out["discoveredWorktrees"] = discovery.DiscoveredWorktrees
+	}
+	if discovery.PendingSnapshots != 0 {
+		out["pendingSnapshots"] = discovery.PendingSnapshots
+	}
+	if discovery.CapturedSnapshots != 0 {
+		out["capturedSnapshots"] = discovery.CapturedSnapshots
+	}
+	if len(discovery.Warnings) > 0 {
+		out["warnings"] = append([]string{}, discovery.Warnings...)
+	}
+	return out
+}
+
+func intFromAny(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return 0
+		}
+		return int(parsed)
+	default:
+		return 0
+	}
+}
+
+func firstErrorMessage(errs ...error) string {
+	for _, err := range errs {
+		if err != nil {
+			return err.Error()
+		}
+	}
+	return ""
 }
