@@ -2697,6 +2697,9 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 				if output == "" {
 					output = commandErr.Error()
 				}
+				if strings.EqualFold(strings.TrimSpace(commandErr.Message), "command timed out") {
+					return ValidationResult{Passed: false, Summary: fmt.Sprintf("Validation timed out: %s", command), Output: output}, nil
+				}
 			} else {
 				output = err.Error()
 			}
@@ -2721,14 +2724,17 @@ type validationFailure struct {
 
 func classifyValidationFailure(result ValidationResult) validationFailure {
 	message := firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed")
-	details := strings.ToLower(strings.TrimSpace(strings.Join([]string{result.Summary, result.Output}, "\n")))
-	if containsAnyValidationHint(details, []string{"dirty worktree", "uncommitted changes", "merge conflict", "conflict markers", "ambiguous repo", "unsafe repo"}) {
+	summary := strings.ToLower(strings.TrimSpace(result.Summary))
+	if containsAnyValidationHint(summary, []string{"dirty worktree", "uncommitted changes", "merge conflict", "conflict markers", "ambiguous repo", "unsafe repo"}) {
 		return validationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
 	}
-	if containsAnyValidationHint(details, []string{"stale checkpoint", "stale repo", "stale repo context", "stale worktree", "head changed", "base changed", "branch changed", "out of date", "no longer matches"}) {
+	if containsAnyValidationHint(summary, []string{"stale checkpoint", "stale repo", "stale repo context", "stale worktree", "head changed", "base changed", "branch changed", "out of date", "no longer matches"}) {
 		return validationFailure{message: message, kind: FailureRetryableAfterResume, resumePolicy: loops.ResumePolicyRestartFromDiscover}
 	}
-	if containsAnyValidationHint(details, []string{"command not found", "executable file not found", "timed out", "timeout", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
+	if strings.HasPrefix(result.Summary, "Validation timed out:") {
+		return validationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
+	}
+	if containsAnyValidationHint(summary, []string{"command not found", "executable file not found", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
 		return validationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
 	}
 	return validationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}

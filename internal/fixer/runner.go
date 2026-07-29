@@ -3128,9 +3128,8 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		return checkpoint, err
 	}
 	if inspect.HasUncommittedChanges {
-		if checkpoint.Validation != nil && strings.Contains(strings.ToLower(checkpoint.Validation.Summary), "extra reconcile") {
-			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: FailureRetryableAfterResume}
-		}
+		baseHeadSHA := reconcileBaseHeadSHA(checkpoint.ReconcileCommits)
+		checkpoint.ReconcileCommits = &checkpointReconcileCommits{BaseHeadSHA: baseHeadSHA}
 		checkpoint, err = r.reconcileCommits(ctx, input.Project, checkpoint, buildFixerCommitMessage(input.PRNumber), input.Run)
 		if err != nil {
 			return input.Checkpoint, err
@@ -3154,7 +3153,9 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 			return checkpoint, err
 		}
 		if finalInspect.HasUncommittedChanges {
-			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: FailureRetryableAfterResume}
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
+			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: FailureManualIntervention}
 		}
 		second.HeadSHA = finalInspect.HeadSHA
 		second.Summary = firstNonEmpty(second.Summary, "Validation passed after extra reconcile")
@@ -3197,6 +3198,25 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	}
 	if checkpoint.ReconcileCommits == nil {
 		return checkpoint, &loopError{message: "Missing reconcile-commits checkpoint for push step", kind: FailureRetryableAfterResume}
+	}
+	if len(r.validationCommands) > 0 {
+		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
+		if err != nil {
+			return checkpoint, err
+		}
+		if checkpoint.Validation == nil || !checkpoint.Validation.Passed || checkpoint.Validation.HeadSHA != inspect.HeadSHA || inspect.HasUncommittedChanges {
+			baseHeadSHA := reconcileBaseHeadSHA(checkpoint.ReconcileCommits)
+			checkpoint.ReconcileCommits = &checkpointReconcileCommits{BaseHeadSHA: baseHeadSHA}
+			checkpoint, err = r.reconcileCommits(ctx, input.Project, checkpoint, buildFixerCommitMessage(input.PRNumber), input.Run)
+			if err != nil {
+				return input.Checkpoint, err
+			}
+			input.Checkpoint = checkpoint
+			checkpoint, err = r.runValidateStep(ctx, input)
+			if err != nil {
+				return checkpoint, err
+			}
+		}
 	}
 	if !checkpoint.ReconcileCommits.WorkingTreeClean {
 		return checkpoint, &loopError{message: "Working tree must be clean before push", kind: FailureRetryableAfterResume}
@@ -6542,6 +6562,9 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 				if output == "" {
 					output = commandErr.Error()
 				}
+				if strings.EqualFold(strings.TrimSpace(commandErr.Message), "command timed out") {
+					return ValidationResult{Passed: false, Summary: fmt.Sprintf("Validation timed out: %s", command), Output: output}, nil
+				}
 			} else {
 				output = err.Error()
 			}
@@ -6566,8 +6589,11 @@ type fixerValidationFailure struct {
 
 func classifyFixerValidationFailure(result ValidationResult) fixerValidationFailure {
 	message := firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed")
-	details := strings.ToLower(strings.TrimSpace(strings.Join([]string{result.Summary, result.Output}, "\n")))
-	if containsAnyFixerValidationHint(details, []string{"command not found", "executable file not found", "timed out", "timeout", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
+	if strings.HasPrefix(result.Summary, "Validation timed out:") {
+		return fixerValidationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
+	}
+	summary := strings.ToLower(strings.TrimSpace(result.Summary))
+	if containsAnyFixerValidationHint(summary, []string{"command not found", "executable file not found", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
 		return fixerValidationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
 	}
 	return fixerValidationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}

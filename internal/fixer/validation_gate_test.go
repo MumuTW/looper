@@ -106,6 +106,15 @@ func TestClassifyFixerValidationFailureParksDeterministicFailures(t *testing.T) 
 	}
 }
 
+func TestClassifyFixerValidationFailureDoesNotInferTimeoutFromTestOutput(t *testing.T) {
+	t.Parallel()
+
+	failure := classifyFixerValidationFailure(ValidationResult{Passed: false, Summary: "go test failed", Output: "--- FAIL: TestTimeoutPolicy"})
+	if failure.kind != FailureManualIntervention || failure.resumePolicy != "manual_intervention" {
+		t.Fatalf("classifyFixerValidationFailure() = %#v, want deterministic failure parked", failure)
+	}
+}
+
 func TestConfiguredGateKeepsFixerAgentFromPushing(t *testing.T) {
 	t.Parallel()
 
@@ -136,5 +145,44 @@ func TestRunValidateStepPreservesFailedOutput(t *testing.T) {
 	}
 	if checkpoint.Validation == nil || checkpoint.Validation.Output != "expected 2, got 3" {
 		t.Fatalf("checkpoint.Validation = %#v, want failed diagnostics preserved", checkpoint.Validation)
+	}
+}
+
+func TestRunValidateStepParksValidationThatRepeatedlyDirtiesWorktree(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	validationCalls := 0
+	git := &fakeGitGateway{inspectResults: []InspectHeadResult{
+		{HeadSHA: "repair-head", HasUncommittedChanges: true},
+		{HeadSHA: "repair-head", HasUncommittedChanges: true, ChangedFiles: []string{"generated.go"}},
+		{HeadSHA: "validation-head", NewCommitSHAs: []string{"validation-head"}},
+		{HeadSHA: "validation-head", HasUncommittedChanges: true, ChangedFiles: []string{"generated.go"}},
+	}}
+	runner := New(Options{
+		Git:             git,
+		AllowAutoCommit: true,
+		ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+			validationCalls++
+			return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+		},
+	})
+	checkpoint, err := runner.runValidateStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Run:     storage.RunRecord{ID: "run_1"},
+		Checkpoint: fixerCheckpoint{
+			Worktree:         &checkpointWorktree{Path: worktree, Branch: "feature/fix", BaseHeadSHA: "base-head"},
+			ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "repair-head", WorkingTreeClean: true, CompletedAt: "2026-07-29T00:00:00Z"},
+		},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		t.Fatalf("runValidateStep() error = %v, want manual intervention", err)
+	}
+	if checkpoint.ResumePolicy != "manual_intervention" || checkpoint.Pause == nil || checkpoint.Pause.Reason != string(checkpointPauseReasonDirtyWorktree) {
+		t.Fatalf("checkpoint lifecycle = policy %q pause %#v, want dirty-worktree manual intervention", checkpoint.ResumePolicy, checkpoint.Pause)
+	}
+	if validationCalls != 2 || len(git.commitCalls) != 1 {
+		t.Fatalf("validation calls=%d commit calls=%d, want 2/1", validationCalls, len(git.commitCalls))
 	}
 }
