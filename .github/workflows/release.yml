@@ -30,10 +30,6 @@ permissions:
   contents: write
   packages: write
 
-env:
-  LOOPER_BUILD_MIN_CLI_FOR_DAEMON: "0.2.0"
-  LOOPER_BUILD_MIN_DAEMON_FOR_CLI: "0.2.0"
-
 jobs:
   sandbox-preflight:
     runs-on: ubuntu-latest
@@ -581,8 +577,6 @@ jobs:
             -released "${{ needs.prepare-go-release.outputs.release-timestamp }}" \
             -channel "${{ needs.prepare-go-release.outputs.release-channel }}" \
             -api-version v1 \
-            -min-cli-for-daemon "$LOOPER_BUILD_MIN_CLI_FOR_DAEMON" \
-            -min-daemon-for-cli "$LOOPER_BUILD_MIN_DAEMON_FOR_CLI" \
             -assets-dir release-assets \
             -required-assets "looper-darwin-arm64.tar.gz,looper-linux-amd64.tar.gz,looperd-darwin-arm64.tar.gz,looperd-linux-amd64.tar.gz" \
             -output release-assets/manifest.json
@@ -608,8 +602,9 @@ jobs:
           )
           expected_schema_version = migration_files[-1].removesuffix(".sql")
           assert m["schemaVersion"] == expected_schema_version, f"schemaVersion mismatch: {m['schemaVersion']}"
-          assert m["minCliForDaemon"], "minCliForDaemon missing"
-          assert m["minDaemonForCli"], "minDaemonForCli missing"
+          # Unenforced compatibility floors are no longer published (DC-003).
+          assert "minCliForDaemon" not in m, "minCliForDaemon should be omitted"
+          assert "minDaemonForCli" not in m, "minDaemonForCli should be omitted"
           required = {
               "looper-darwin-arm64.tar.gz",
               "looper-linux-amd64.tar.gz",
