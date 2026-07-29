@@ -33,10 +33,10 @@ import (
 const requestTimeout = 30 * time.Second
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		usage(stderr)
 		return 2
@@ -62,6 +62,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
+	if request.Local {
+		return runReview(ctx, args, stdin, stdout, stderr)
+	}
 
 	cfg, err := loadConfig(args)
 	if err != nil {
@@ -85,6 +88,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 type apiRequest struct {
 	Path string
 	Body []byte
+	// Local marks a verb this binary serves itself instead of by calling the
+	// daemon. Routing it here rather than short-circuiting earlier keeps
+	// routeForVerb the one place that decides what an argv means, so the
+	// trusted review proxy's argv is provably routable without a daemon.
+	Local bool
 }
 
 // respondBody mirrors the daemon's respondLoopRequest. It is restated rather
@@ -135,6 +143,15 @@ func routeForVerb(verb string, args []string) (apiRequest, error) {
 			return apiRequest{}, fmt.Errorf("encode answer: %w", err)
 		}
 		return apiRequest{Path: "/api/v1/loops/" + args[0] + "/respond", Body: body}, nil
+	case "review":
+		// Publishing a review is not a daemon API call: the daemon's trusted
+		// review proxy execs this binary with captured provider credentials and
+		// the review is submitted from this process. runReview names the
+		// subcommand it cannot serve, so only the empty shape fails here.
+		if len(args) == 0 {
+			return apiRequest{}, fmt.Errorf("review requires a subcommand")
+		}
+		return apiRequest{Local: true}, nil
 	default:
 		return apiRequest{}, fmt.Errorf("unknown command %q", verb)
 	}
@@ -208,6 +225,10 @@ func apiErrorMessage(payload []byte) string {
 	return strings.TrimSpace(string(payload))
 }
 
+// usage lists the operator verbs only. `review submit` and `review capability`
+// are deliberately absent: they are machine interfaces the daemon's trusted
+// review proxy execs on behalf of a reviewer agent, and an operator running
+// either by hand would only publish an unvalidated review or probe a constant.
 func usage(w io.Writer) {
 	_, _ = fmt.Fprint(w, `looper - control a running looperd
 
