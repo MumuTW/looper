@@ -134,7 +134,10 @@ afterEach(() => {
   window.history.replaceState({}, "", "/");
 });
 
-describe("ConfigPage", () => {
+// These multi-step form flows honestly take seconds each, so Vitest's 5s
+// default sits inside their normal range on a loaded machine. Keep the larger
+// backstop local to this suite instead of weakening every dashboard test.
+describe("ConfigPage", { timeout: 30_000 }, () => {
   it("renders the /config route and its navigation item", async () => {
     window.history.replaceState({}, "", "/dashboard/config");
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
