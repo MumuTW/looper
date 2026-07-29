@@ -2,19 +2,25 @@
 //
 // This is the minimal surface deliberately kept after the full cobra CLI was
 // removed: the loop control verbs, which are the only ones the daemon has no
-// other client for. Everything else the old CLI did (config editing, project
-// and provider management, network and webhook administration) is either the
-// dashboard's job or not yet reimplemented.
+// other client for, plus the few onboarding verbs a first-time operator needs
+// before the dashboard is reachable (init, status, project add/list).
+// Everything else the old CLI did (config editing, provider management, network
+// and webhook administration, daemon supervision) is either the dashboard's job
+// or not yet reimplemented.
 //
 // Control is exercised over the daemon's HTTP API rather than by touching
 // SQLite or signalling processes directly, because the daemon owns run
-// ownership and containment; a second writer would race it.
+// ownership and containment; a second writer would race it. Project
+// registration follows the same rule: the daemon materializes its project
+// catalog from SQLite, so a project written into the config file would only
+// take effect on restart, while POST /api/v1/projects is live.
 package main
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -75,6 +82,25 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// The onboarding verbs take no flags of their own — only the global ones —
+	// so they are routed after splitGlobalFlags like the control verbs, and
+	// unlike `review`. That is what keeps `looper --config /p status` and
+	// `looper status --config /p` the same invocation, keeps an unknown flag
+	// refused rather than read as an operand, and hands config.LoadFile only
+	// the global flags instead of the whole command line.
+	//
+	// They are dispatched here rather than through routeForVerb because none of
+	// them is a single daemon call: init touches no daemon at all, while status
+	// and project compose several calls and report them.
+	switch parsed.Verb {
+	case "init":
+		return reportError(stderr, runInit(parsed.Global, parsed.Operands, stdout))
+	case "status":
+		return reportError(stderr, runStatus(ctx, parsed.Global, parsed.Operands, stdout))
+	case "project":
+		return reportError(stderr, runProject(ctx, parsed.Global, parsed.Operands, stdout))
+	}
+
 	request, err := routeForVerb(parsed.Verb, parsed.Operands)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
@@ -104,6 +130,33 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	_, _ = fmt.Fprintln(stdout, strings.TrimSpace(body))
 	return 0
+}
+
+// reportError turns a verb's error into the process exit code, keeping the two
+// failure kinds a script can act on distinct: 2 for an invocation the CLI
+// refused to run, 1 for one that ran and failed.
+func reportError(stderr io.Writer, err error) int {
+	if err == nil {
+		return 0
+	}
+	var usageErr usageError
+	if errors.As(err, &usageErr) {
+		_, _ = fmt.Fprintf(stderr, "looper: %v\n", usageErr.err)
+		usage(stderr)
+		return 2
+	}
+	_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
+	return 1
+}
+
+// usageError marks an operator mistake in the invocation itself, which exits 2
+// with the usage text, as opposed to a runtime failure, which exits 1.
+type usageError struct{ err error }
+
+func (e usageError) Error() string { return e.err.Error() }
+
+func badUsage(format string, args ...any) error {
+	return usageError{err: fmt.Errorf(format, args...)}
 }
 
 // apiRequest is the single daemon call one CLI invocation makes. Body is nil
@@ -309,20 +362,346 @@ func selectorPathSegment(selector string) (string, error) {
 	return url.PathEscape(trimmed), nil
 }
 
-func loadConfig(args []string) (config.Config, error) {
+func loadOptions(args []string) (config.LoadFileOptions, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return config.Config{}, fmt.Errorf("determine working directory: %w", err)
+		return config.LoadFileOptions{}, fmt.Errorf("determine working directory: %w", err)
 	}
-	loaded, err := config.LoadFile(config.LoadFileOptions{
+	return config.LoadFileOptions{
 		CWD:       cwd,
 		Args:      append([]string(nil), args...),
 		LookupEnv: os.LookupEnv,
-	})
+	}, nil
+}
+
+func loadConfig(args []string) (config.Config, error) {
+	options, err := loadOptions(args)
+	if err != nil {
+		return config.Config{}, err
+	}
+	loaded, err := config.LoadFile(options)
 	if err != nil {
 		return config.Config{}, err
 	}
 	return loaded.Config, nil
+}
+
+// --- init ------------------------------------------------------------------
+
+// starterConfig is the file `looper init` writes. It is a commented template
+// rather than a marshalled config.Config because the point of the file is to
+// show an operator which knobs matter; encoding a fully defaulted struct would
+// emit hundreds of fields and no explanation, and no encoder preserves
+// comments. Everything omitted here falls back to the built-in defaults.
+const starterConfig = `# looper configuration
+#
+# Only the fields you want to change need to be present; anything omitted uses
+# looper's built-in defaults. See docs/configuration.md for the full reference.
+
+[server]
+# Address looperd listens on, and the address ` + "`looper`" + ` talks to.
+host = "127.0.0.1"
+port = 17310
+
+[agent]
+# The coding agent looperd drives. One of:
+#   claude-code, codex, opencode, cursor-cli, grok-build
+vendor = "claude-code"
+# model = "opus"
+
+[defaults]
+# Branch new work is based on when a project does not override it.
+baseBranch = "main"
+
+# Projects are normally registered against the running daemon with
+#   looper project add /path/to/repo
+# which stores them in looper's database and takes effect immediately.
+#
+# Pin a project to this file instead only if you want it managed as
+# configuration; file-managed projects are read at daemon startup and cannot be
+# changed through the API.
+#
+# [[projects]]
+# id = "my-project"
+# name = "My Project"
+# repoPath = "/absolute/path/to/repo"
+# repo = "owner/name"
+`
+
+func runInit(global []string, operands []string, stdout io.Writer) error {
+	if len(operands) != 0 {
+		return badUsage("init takes no arguments")
+	}
+	options, err := loadOptions(global)
+	if err != nil {
+		return err
+	}
+	path, err := config.SelectConfigPath(options)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(filepath.Ext(path), ".toml") {
+		return fmt.Errorf("init writes TOML, but the selected config path is %s; pass --config <file>.toml or write %s by hand", path, path)
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("config already exists at %s; edit that file instead (init never overwrites)", path)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("check %s: %w", path, err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	}
+	// O_EXCL closes the window between the stat above and the write: a config
+	// that appeared in between must not be clobbered.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("config already exists at %s; edit that file instead (init never overwrites)", path)
+		}
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	if _, err := io.WriteString(file, starterConfig); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+
+	_, _ = fmt.Fprintf(stdout, "wrote starter config to %s\n", path)
+	_, _ = fmt.Fprintf(stdout, "next: edit it, start looperd, then run `looper project add <repo>` and `looper status`\n")
+	return nil
+}
+
+// --- status ----------------------------------------------------------------
+
+func runStatus(ctx context.Context, global []string, operands []string, stdout io.Writer) error {
+	if len(operands) != 0 {
+		return badUsage("status takes no arguments")
+	}
+	options, err := loadOptions(global)
+	if err != nil {
+		return err
+	}
+
+	path, pathErr := config.SelectConfigPath(options)
+	if pathErr != nil {
+		path = "(unknown)"
+	}
+
+	// The config is reported even when it fails to load, because "which file is
+	// broken" is the answer the operator needs. The daemon is not probed in that
+	// case: the config is what says where the daemon listens, so any address
+	// tried here would be a guess reported as fact.
+	var cfg config.Config
+	loadErr := pathErr
+	if loadErr == nil {
+		loaded, err := config.LoadFile(options)
+		if err != nil {
+			loadErr = err
+		} else {
+			cfg = loaded.Config
+			path = loaded.Metadata.ConfigPath
+		}
+	}
+
+	if loadErr != nil {
+		_, _ = fmt.Fprintf(stdout, "config:   %s\n", path)
+		_, _ = fmt.Fprintf(stdout, "          FAILED: %v\n", singleLine(loadErr.Error()))
+		_, _ = fmt.Fprintf(stdout, "daemon:   unknown (no usable config to say where it listens)\n")
+		_, _ = fmt.Fprintf(stdout, "projects: unknown\n")
+		return fmt.Errorf("config at %s did not load", path)
+	}
+
+	state := "ok"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		state = "not found, using built-in defaults"
+	}
+	_, _ = fmt.Fprintf(stdout, "config:   %s (%s)\n", path, state)
+
+	endpoint := daemonBaseURL(cfg)
+	health, healthErr := requestJSON[healthResponse](ctx, cfg, http.MethodGet, "/api/v1/healthz", nil)
+	if healthErr != nil {
+		_, _ = fmt.Fprintf(stdout, "daemon:   %s (unreachable)\n", endpoint)
+		_, _ = fmt.Fprintf(stdout, "          %v\n", singleLine(healthErr.Error()))
+		_, _ = fmt.Fprintf(stdout, "projects: unknown (needs a running daemon)\n")
+		return fmt.Errorf("looperd is not reachable at %s", endpoint)
+	}
+
+	daemonState := "healthy"
+	if !health.Healthy {
+		daemonState = "degraded"
+	}
+	_, _ = fmt.Fprintf(stdout, "daemon:   %s (reachable, %s)\n", endpoint, daemonState)
+
+	projects, projectsErr := requestJSON[projectsListResponse](ctx, cfg, http.MethodGet, "/api/v1/projects", nil)
+	if projectsErr != nil {
+		_, _ = fmt.Fprintf(stdout, "projects: unavailable: %v\n", singleLine(projectsErr.Error()))
+		return projectsErr
+	}
+	_, _ = fmt.Fprintf(stdout, "projects: %d\n", len(projects.Items))
+	for _, project := range projects.Items {
+		_, _ = fmt.Fprintf(stdout, "  - %s\n", describeProject(project))
+	}
+
+	return nil
+}
+
+// --- project ---------------------------------------------------------------
+
+func runProject(ctx context.Context, global []string, operands []string, stdout io.Writer) error {
+	if len(operands) == 0 {
+		return badUsage("project requires a subcommand (add, list)")
+	}
+	switch operands[0] {
+	case "list":
+		if len(operands) != 1 {
+			return badUsage("project list takes no arguments")
+		}
+		return runProjectList(ctx, global, stdout)
+	case "add":
+		if len(operands) != 2 || strings.TrimSpace(operands[1]) == "" {
+			return badUsage("project add requires exactly one repository path")
+		}
+		return runProjectAdd(ctx, global, operands[1], stdout)
+	default:
+		return badUsage("unknown project subcommand %q", operands[0])
+	}
+}
+
+func runProjectList(ctx context.Context, global []string, stdout io.Writer) error {
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+	projects, err := requestJSON[projectsListResponse](ctx, cfg, http.MethodGet, "/api/v1/projects", nil)
+	if err != nil {
+		return err
+	}
+	if len(projects.Items) == 0 {
+		_, _ = fmt.Fprintln(stdout, "no projects registered")
+		return nil
+	}
+	for _, project := range projects.Items {
+		_, _ = fmt.Fprintln(stdout, describeProject(project))
+	}
+	return nil
+}
+
+func runProjectAdd(ctx context.Context, global []string, repoPath string, stdout io.Writer) error {
+	resolved, err := resolveRepoRoot(repoPath)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+
+	// The daemon rejects a colliding project id, but two ids can point at the
+	// same checkout, which is the duplicate an operator actually creates by
+	// re-running the command. Refuse it here where the comparison is possible.
+	existing, err := requestJSON[projectsListResponse](ctx, cfg, http.MethodGet, "/api/v1/projects", nil)
+	if err != nil {
+		return err
+	}
+	for _, project := range existing.Items {
+		if project.Archived {
+			continue
+		}
+		if sameRepoPath(project.RepoPath, resolved) {
+			return fmt.Errorf("%s is already registered as project %q", resolved, project.ID)
+		}
+	}
+
+	payload, err := json.Marshal(map[string]string{"repoPath": resolved})
+	if err != nil {
+		return err
+	}
+	created, err := requestJSON[createProjectResponse](ctx, cfg, http.MethodPost, "/api/v1/projects", payload)
+	if err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(stdout, "registered project %s\n", created.ID)
+	_, _ = fmt.Fprintf(stdout, "  repoPath:   %s\n", created.RepoPath)
+	_, _ = fmt.Fprintf(stdout, "  baseBranch: %s\n", created.BaseBranch)
+	if created.Repo != nil && strings.TrimSpace(*created.Repo) != "" {
+		_, _ = fmt.Fprintf(stdout, "  repo:       %s\n", *created.Repo)
+	}
+	for _, warning := range created.Warnings {
+		_, _ = fmt.Fprintf(stdout, "  warning:    %s\n", singleLine(warning))
+	}
+	return nil
+}
+
+// resolveRepoRoot turns an operator-supplied path into the absolute repository
+// root the daemon should store. Only a root is accepted: looperd creates
+// worktrees from this path, and a subdirectory would silently produce a project
+// whose worktrees do not match its checkout.
+func resolveRepoRoot(repoPath string) (string, error) {
+	resolved, err := filepath.Abs(strings.TrimSpace(repoPath))
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", repoPath, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("%s does not exist", resolved)
+		}
+		return "", fmt.Errorf("inspect %s: %w", resolved, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", resolved)
+	}
+	// A linked worktree records .git as a file, not a directory, so both are
+	// accepted; only its absence disqualifies the path.
+	if _, err := os.Stat(filepath.Join(resolved, ".git")); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("%s is not a git repository root (no .git entry)", resolved)
+		}
+		return "", fmt.Errorf("inspect %s: %w", filepath.Join(resolved, ".git"), err)
+	}
+	return resolved, nil
+}
+
+func sameRepoPath(left string, right string) bool {
+	return filepath.Clean(strings.TrimSpace(left)) == filepath.Clean(strings.TrimSpace(right))
+}
+
+func describeProject(project projectResponse) string {
+	line := fmt.Sprintf("%s\t%s", project.ID, project.RepoPath)
+	if project.Archived {
+		line += "\t(archived)"
+	}
+	return line
+}
+
+// --- HTTP ------------------------------------------------------------------
+
+type healthResponse struct {
+	Healthy bool `json:"healthy"`
+}
+
+type projectResponse struct {
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	RepoPath   string  `json:"repoPath"`
+	BaseBranch string  `json:"baseBranch"`
+	Archived   bool    `json:"archived"`
+	Repo       *string `json:"repo"`
+}
+
+type projectsListResponse struct {
+	Items []projectResponse `json:"items"`
+}
+
+type createProjectResponse struct {
+	projectResponse
+	Warnings []string `json:"warnings"`
 }
 
 // daemonBaseURL is where this CLI expects the daemon to answer.
@@ -352,12 +731,39 @@ func dialHost(host string) string {
 	}
 }
 
+// post issues a control verb's request and returns the daemon's raw body, which
+// those verbs echo verbatim rather than reformat.
 func post(ctx context.Context, cfg config.Config, call apiRequest) (string, error) {
 	return doHTTP(ctx, cfg, http.MethodPost, call.Path, call.Body)
 }
 
 func get(ctx context.Context, cfg config.Config, path string) (string, error) {
 	return doHTTP(ctx, cfg, http.MethodGet, path, nil)
+}
+
+// requestJSON performs a request and unwraps the daemon's success envelope, so
+// callers work with the payload the API documents rather than with transport
+// shape. The control verbs stop at doHTTP instead, because they echo the raw
+// body rather than reading fields out of it.
+func requestJSON[T any](ctx context.Context, cfg config.Config, method string, path string, body []byte) (T, error) {
+	var value T
+	payload, err := doHTTP(ctx, cfg, method, path, body)
+	if err != nil {
+		return value, err
+	}
+	envelope := struct {
+		Data json.RawMessage `json:"data"`
+	}{}
+	if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
+		return value, fmt.Errorf("decode response from %s: %w", path, err)
+	}
+	if len(envelope.Data) == 0 {
+		return value, fmt.Errorf("response from %s carried no data", path)
+	}
+	if err := json.Unmarshal(envelope.Data, &value); err != nil {
+		return value, fmt.Errorf("decode response from %s: %w", path, err)
+	}
+	return value, nil
 }
 
 func doHTTP(ctx context.Context, cfg config.Config, method, path string, body []byte) (string, error) {
@@ -465,10 +871,20 @@ func apiErrorMessage(payload []byte) string {
 	return strings.TrimSpace(string(payload))
 }
 
+// singleLine keeps multi-line validation errors from breaking the aligned
+// status report into unreadable fragments.
+func singleLine(text string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(text, "\n", " ")), " ")
+}
+
 func usage(w io.Writer) {
 	_, _ = fmt.Fprint(w, `looper - control a running looperd
 
 Usage:
+  looper init                  Write a starter config file (never overwrites)
+  looper status                Report config, daemon reachability, and projects
+  looper project add <path>    Register a git repository root with the daemon
+  looper project list          List registered projects
   looper stop <selector>       Stop the active run for a loop ("all" stops every run)
   looper close <selector>      Stop the active run and close the loop
   looper takeover <selector>   Take a loop over for manual work
@@ -501,6 +917,8 @@ There is one more command, which is not for operators:
 A selector is a loop sequence number (looper stop 12) or a loop id
 (looper stop loop_1cf3); those are what the daemon resolves.
 The respond answer is a single argument, so quote anything with spaces.
+Every verb except init and version talks to looperd over HTTP and needs it
+running.
 `)
 }
 
