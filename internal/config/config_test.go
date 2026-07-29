@@ -3852,7 +3852,55 @@ func TestNormalizeAppliesLayersInOrder(t *testing.T) {
 	}
 }
 
+func TestDefaultPathsPreferLooperHomeOverride(t *testing.T) {
+	homeDir := t.TempDir()
+	looperHome := filepath.Join(t.TempDir(), "isolated-looper-home")
+	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_HOME", looperHome)
+
+	gotHome, err := DefaultLooperHome()
+	if err != nil {
+		t.Fatalf("DefaultLooperHome() error = %v", err)
+	}
+	if gotHome != looperHome {
+		t.Fatalf("DefaultLooperHome() = %q, want %q", gotHome, looperHome)
+	}
+
+	configPath, err := DefaultConfigPath()
+	if err != nil {
+		t.Fatalf("DefaultConfigPath() error = %v", err)
+	}
+	if want := filepath.Join(looperHome, "config.toml"); configPath != want {
+		t.Fatalf("DefaultConfigPath() = %q, want %q", configPath, want)
+	}
+
+	worktreeRoot, err := DefaultProjectWorktreeRoot("example-project", "/tmp/example-repo")
+	if err != nil {
+		t.Fatalf("DefaultProjectWorktreeRoot() error = %v", err)
+	}
+	wantWorktreeRoot := filepath.Join(looperHome, "worktrees", ToRepoWorktreeDirectoryName("/tmp/example-repo"), "example-project")
+	if worktreeRoot != wantWorktreeRoot {
+		t.Fatalf("DefaultProjectWorktreeRoot() = %q, want %q", worktreeRoot, wantWorktreeRoot)
+	}
+
+	defaults, err := DefaultConfig("/tmp/looper")
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	if want := filepath.Join(looperHome, "looper.sqlite"); defaults.Storage.DBPath != want {
+		t.Fatalf("DefaultConfig().Storage.DBPath = %q, want %q", defaults.Storage.DBPath, want)
+	}
+	if defaults.Storage.BackupDir == nil || *defaults.Storage.BackupDir != filepath.Join(looperHome, "backups") {
+		t.Fatalf("DefaultConfig().Storage.BackupDir = %v, want %q", defaults.Storage.BackupDir, filepath.Join(looperHome, "backups"))
+	}
+	if want := filepath.Join(looperHome, "logs"); defaults.Daemon.LogDir != want {
+		t.Fatalf("DefaultConfig().Daemon.LogDir = %q, want %q", defaults.Daemon.LogDir, want)
+	}
+}
+
 func TestDefaultPathHelpersMatchTSLayout(t *testing.T) {
+	t.Setenv("LOOPER_HOME", "")
+
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatalf("os.UserHomeDir() error = %v", err)
