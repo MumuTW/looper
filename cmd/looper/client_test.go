@@ -201,6 +201,30 @@ func TestDaemonBaseURL(t *testing.T) {
 	}
 }
 
+func TestApplyEndpointOverridesPreservesUnchangedBaseURLComponents(t *testing.T) {
+	tests := []struct {
+		name   string
+		global []string
+		host   string
+		port   int
+		want   string
+	}{
+		{name: "port keeps scheme host and path", global: []string{"--port", "18443"}, host: "127.0.0.1", port: 18443, want: "https://daemon.example:18443/looper"},
+		{name: "host keeps scheme port and path", global: []string{"--host", "other.example"}, host: "other.example", port: 17310, want: "https://other.example:9443/looper"},
+		{name: "both replace host and port", global: []string{"--host", "other.example", "--port", "18443"}, host: "other.example", port: 18443, want: "https://other.example:18443/looper"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			baseURL := "https://daemon.example:9443/looper"
+			cfg := config.Config{Server: config.ServerConfig{Host: testCase.host, Port: testCase.port, BaseURL: &baseURL}}
+
+			if got := daemonBaseURL(applyEndpointOverrides(cfg, testCase.global)); got != testCase.want {
+				t.Fatalf("daemonBaseURL = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
 // TestPostAuthorizationHeader pins when the local token is sent. A token set in
 // config but not selected by authMode is not a credential this daemon asked
 // for, and attaching it anyway hands it to whatever answers the address.
