@@ -69,6 +69,54 @@ func ResolveConfigPath(path string, cwd string) string {
 	return filepath.Join(cwd, path)
 }
 
+// SelectConfigPath answers which file LoadFile would read for these options,
+// without decoding or validating it. Callers that must name the file even when
+// it fails to load — `looper status`, `looper init` — use this rather than
+// re-deriving the precedence order and drifting from it.
+func SelectConfigPath(options LoadFileOptions) (string, error) {
+	cwd := options.CWD
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("determine current working directory: %w", err)
+		}
+	}
+
+	lookupEnv := options.LookupEnv
+	if lookupEnv == nil {
+		lookupEnv = os.LookupEnv
+	}
+
+	parsedCLI, err := parseCLIArgs(options.Args)
+	if err != nil {
+		return "", err
+	}
+
+	configPath := ""
+	if options.ConfigPathOverride != "" {
+		configPath = options.ConfigPathOverride
+	} else if parsedCLI.hasConfigPath {
+		configPath = parsedCLI.configPath
+	} else if envConfigPath, ok := lookupEnv("LOOPER_CONFIG"); ok && strings.TrimSpace(envConfigPath) != "" {
+		configPath = envConfigPath
+	} else if options.ConfigPath != "" {
+		configPath = options.ConfigPath
+	} else if options.DefaultConfigPath != "" {
+		configPath = options.DefaultConfigPath
+	}
+	if configPath == "" {
+		defaultConfigPath, err := DiscoverDefaultConfigPath()
+		if err != nil {
+			return "", fmt.Errorf("determine default config path: %w", err)
+		}
+
+		configPath = defaultConfigPath
+	}
+
+	return ResolveConfigPath(configPath, cwd), nil
+}
+
 func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	cwd := options.CWD
 	if cwd == "" {
@@ -89,28 +137,13 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		return LoadedFileConfig{}, err
 	}
 
-	configPath := ""
-	if options.ConfigPathOverride != "" {
-		configPath = options.ConfigPathOverride
-	} else if parsedCLI.hasConfigPath {
-		configPath = parsedCLI.configPath
-	} else if envConfigPath, ok := lookupEnv("LOOPER_CONFIG"); ok && strings.TrimSpace(envConfigPath) != "" {
-		configPath = envConfigPath
-	} else if options.ConfigPath != "" {
-		configPath = options.ConfigPath
-	} else if options.DefaultConfigPath != "" {
-		configPath = options.DefaultConfigPath
+	pathOptions := options
+	pathOptions.CWD = cwd
+	pathOptions.LookupEnv = lookupEnv
+	resolvedConfigPath, err := SelectConfigPath(pathOptions)
+	if err != nil {
+		return LoadedFileConfig{}, err
 	}
-	if configPath == "" {
-		defaultConfigPath, err := DiscoverDefaultConfigPath()
-		if err != nil {
-			return LoadedFileConfig{}, fmt.Errorf("determine default config path: %w", err)
-		}
-
-		configPath = defaultConfigPath
-	}
-
-	resolvedConfigPath := ResolveConfigPath(configPath, cwd)
 	partialConfig, present, revision, err := readConfigFileGeneration(resolvedConfigPath)
 	if err != nil {
 		return LoadedFileConfig{}, err

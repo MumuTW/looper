@@ -4,9 +4,9 @@ This guide is for everyday users. It focuses on how `coordinator`, `planner`, `r
 
 > **CLI strip (read first).** The full `looper` CLI was removed ahead of the role-model rewrite. The **only** operator verbs are:
 >
-> `start` · `pause` · `retry` · `stop` · `close` · `takeover` · `handback` · `respond` · `version`
+> `init` · `status` · `project add|list` · `start` · `pause` · `retry` · `stop` · `close` · `takeover` · `handback` · `respond` · `version`
 >
-> (plus machine-only `review submit`). There is no `bootstrap`, `init`, `status`, `project add`, `daemon *`, `ps`, `logs`, `jump`, `plan`, `review`, `work`, or `webhook`/`provider`/`network` admin. Where this guide still shows an old command, treat it as **intent** and do the equivalent via forge labels, the config file, the dashboard, or the daemon HTTP API. Current install surface: [installation.md](installation.md) and the repository README.
+> (plus machine-only `review submit`). There is no `bootstrap`, `daemon *`, `ps`, `logs`, `jump`, `plan`, `review`, `work`, or `webhook`/`provider`/`network` admin. Where this guide still shows an old command, treat it as **intent** and do the equivalent via forge labels, the config file, the dashboard, or the daemon HTTP API. Current install surface: [installation.md](installation.md) and the repository README.
 
 ## 1. Prerequisites
 
@@ -14,18 +14,17 @@ Make sure these work first:
 
 ```bash
 command -v looperd
-command -v looper
+looper status   # config file, daemon reachability, registered projects
 gh auth status  # GitHub projects only
-curl -sS "http://127.0.0.1:17310/api/v1/healthz"   # daemon must be running
 ```
 
-If the project is not registered yet, use the dashboard or:
+If the project is not registered yet:
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:17310/api/v1/projects" \
-  -H 'Content-Type: application/json' \
-  -d '{"repoPath":"/absolute/path/to/repo"}'
+looper project add /absolute/path/to/repo
 ```
+
+That path must be the repository root — the directory containing `.git`. The dashboard and `POST /api/v1/projects` register the same way and additionally accept an explicit id, base branch, and provider.
 
 Webhook mode is configured in the config file (`webhook.mode` and per-project overrides). Observe health with `GET /api/v1/webhook/status` or the dashboard. Clearing stale GitHub CLI forwarder hooks is a manual `gh api` operation after you confirm the dry-run payload — there is no `looper webhook cleanup`.
 
@@ -39,7 +38,7 @@ Also make sure:
 
 Forgejo projects are onboarded by editing the config file's `providers` and `projects` sections (or importing `[[projects]]` at daemon startup). There is no `looper bootstrap --provider forgejo` and no `looper provider` CLI. See [configuration](configuration.md#provider-support).
 
-Provider health is visible on the dashboard and via `GET /api/v1/status`; the stripped CLI has no `looper status` verb.
+Provider health is visible on the dashboard and via `GET /api/v1/status`. `looper status` reports the config file, daemon reachability, and the registered projects, but not per-provider health.
 
 ### Grok Build (xAI)
 
