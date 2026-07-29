@@ -88,8 +88,11 @@ func routeForVerb(verb string, args []string) (string, error) {
 		if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 			return "", fmt.Errorf("%s requires exactly one selector", verb)
 		}
+		// Bulk stop is its own selector on the daemon, not a selector named
+		// "all" with a /stop suffix: that path parses as a single-loop stop
+		// and dies resolving a loop literally called "all".
 		if strings.TrimSpace(args[0]) == "all" && verb == "stop" {
-			return "/api/v1/runs/active/all/stop", nil
+			return "/api/v1/runs/active/stop-all", nil
 		}
 		return "/api/v1/runs/active/" + args[0] + "/" + verb, nil
 	case "takeover":
