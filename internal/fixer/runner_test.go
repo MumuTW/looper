@@ -1365,7 +1365,7 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 	}
 	stdout := fmt.Sprintf(`__LOOPER_RESULT__={"summary":"applied fixes","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Adjusted the off-by-one handling and verified the fix.","threadCommentsObserved":"%s"}]}`+"\n", hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}}))
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationCommands: []string{"go test ./..."}, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
@@ -1384,6 +1384,9 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 	}
 	if len(agent.starts) != 1 || len(git.pushCalls) != 1 || len(github.resolveCalls) != 1 {
 		t.Fatalf("agent starts=%d push calls=%d resolve calls=%d, want 1/1/1", len(agent.starts), len(git.pushCalls), len(github.resolveCalls))
+	}
+	if !strings.Contains(agent.starts[0].Prompt, "Do not push the branch") {
+		t.Fatalf("agent prompt allowed publishing before validation:\n%s", agent.starts[0].Prompt)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
@@ -5639,7 +5642,7 @@ func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowRiskyFixes: true, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
 		validationCalls++
 		if validationCalls == 1 {
-			return ValidationResult{Passed: false, Summary: "Validation failed"}, nil
+			return ValidationResult{Passed: false, Summary: "Validation failed: connection refused"}, nil
 		}
 		return ValidationResult{Passed: true, Summary: "ok"}, nil
 	}})
@@ -5655,8 +5658,8 @@ func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 	}
-	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
-		t.Fatalf("first = %#v, want retryable-after-resume validation failure", first)
+	if first.Status != "failed" || first.FailureKind != FailureRetryableTransient {
+		t.Fatalf("first = %#v, want retryable-transient validation failure", first)
 	}
 	fixture.advance(5 * time.Second)
 	claim2, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")

@@ -2206,6 +2206,10 @@ func BuildCommandEnv(workingDirectory string, prompt string, envSources ...map[s
 	return buildCommandEnv(workingDirectory, prompt, envSources...)
 }
 
+func BuildCommandEnvMap(workingDirectory string, prompt string, envSources ...map[string]string) map[string]string {
+	return envSliceToMap(buildCommandEnv(workingDirectory, prompt, envSources...))
+}
+
 func envSliceToMap(env []string) map[string]string {
 	envMap := make(map[string]string, len(env))
 	for _, entry := range env {

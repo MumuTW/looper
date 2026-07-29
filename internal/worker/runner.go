@@ -1867,7 +1867,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	if err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run); err != nil {
+	if _, err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run); err != nil {
 		return checkpoint, err
 	}
 	checkpoint.Execution.GitReconciled = true
@@ -1875,20 +1875,20 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	return checkpoint, nil
 }
 
-func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, run storage.RunRecord) error {
+func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, run storage.RunRecord) (bool, error) {
 	checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 	if r.git == nil {
-		return nil
+		return false, nil
 	}
 	baseRef := firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)
 	worktreeRoot, rootErr := workerWorktreeRoot(project)
 	if rootErr != nil {
-		return &loopError{message: rootErr.Error(), kind: FailureRetryableTransient}
+		return false, &loopError{message: rootErr.Error(), kind: FailureRetryableTransient}
 	}
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: baseRef})
 	if err != nil {
 		checkpoint.Lifecycle.LastError = err.Error()
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if !inspect.HasUncommittedChanges {
 		checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
@@ -1899,28 +1899,28 @@ func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *worker
 		checkpoint.Lifecycle.ReconciledBy = "worker"
 		checkpoint.Lifecycle.LastError = ""
 		checkpoint.Lifecycle.Normalize()
-		return nil
+		return false, nil
 	}
 	if !r.allowAutoCommit {
 		message := fmt.Sprintf("Worker worktree has uncommitted changes before PR push for branch %s", firstNonEmpty(work.Branch, worktree.Branch))
 		checkpoint.Lifecycle.LastError = message
-		return &loopError{message: message, kind: FailureManualIntervention}
+		return false, &loopError{message: message, kind: FailureManualIntervention}
 	}
 	agent, model := r.disclosureIdentity(run)
 	committed, err := r.git.Commit(ctx, CommitInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: buildWorkerFallbackCommitMessage(work), DisclosureAgent: agent, DisclosureModel: model})
 	if err != nil {
 		checkpoint.Lifecycle.LastError = err.Error()
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	finalInspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: baseRef})
 	if err != nil {
 		checkpoint.Lifecycle.LastError = err.Error()
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if finalInspect.HasUncommittedChanges {
 		message := fmt.Sprintf("Worker fallback commit left uncommitted changes in branch %s", firstNonEmpty(work.Branch, worktree.Branch))
 		checkpoint.Lifecycle.LastError = message
-		return &loopError{message: message, kind: FailureManualIntervention}
+		return false, &loopError{message: message, kind: FailureManualIntervention}
 	}
 	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
 	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, finalInspect.NewCommitSHAs...)
@@ -1934,7 +1934,7 @@ func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *worker
 	checkpoint.Lifecycle.ReconciledBy = "worker"
 	checkpoint.Lifecycle.LastError = ""
 	checkpoint.Lifecycle.Normalize()
-	return nil
+	return true, nil
 }
 
 func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
@@ -1960,6 +1960,34 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 		failure := classifyValidationFailure(result)
 		checkpoint.ResumePolicy = failure.resumePolicy
 		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+	}
+	reconciled, err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run)
+	if err != nil {
+		return checkpoint, err
+	}
+	if reconciled {
+		result, err = r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: r.validationCommands})
+		if err != nil {
+			return checkpoint, err
+		}
+		checkpoint.Validation = &result
+		if !result.Passed {
+			failure := classifyValidationFailure(result)
+			checkpoint.ResumePolicy = failure.resumePolicy
+			return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+		}
+		worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
+		if rootErr != nil {
+			return checkpoint, rootErr
+		}
+		inspect, inspectErr := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)})
+		if inspectErr != nil {
+			return checkpoint, inspectErr
+		}
+		if inspect.HasUncommittedChanges {
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			return checkpoint, &loopError{message: "Validation keeps producing uncommitted changes after an extra reconcile pass", kind: FailureManualIntervention}
+		}
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
@@ -1998,8 +2026,33 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 		return checkpoint, err
 	}
-	if err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run); err != nil {
+	reconciled, err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run)
+	if err != nil {
 		return checkpoint, err
+	}
+	if reconciled && len(r.validationCommands) > 0 {
+		result, validationErr := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: r.validationCommands})
+		if validationErr != nil {
+			return checkpoint, validationErr
+		}
+		checkpoint.Validation = &result
+		if !result.Passed {
+			failure := classifyValidationFailure(result)
+			checkpoint.ResumePolicy = failure.resumePolicy
+			return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+		}
+		worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
+		if rootErr != nil {
+			return checkpoint, rootErr
+		}
+		inspect, inspectErr := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)})
+		if inspectErr != nil {
+			return checkpoint, inspectErr
+		}
+		if inspect.HasUncommittedChanges {
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			return checkpoint, &loopError{message: "Validation produced uncommitted changes immediately before publishing", kind: FailureManualIntervention}
+		}
 	}
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2625,6 +2678,7 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 			Command: "/bin/sh",
 			Args:    []string{"-c", command},
 			CWD:     input.CWD,
+			Env:     agent.BuildCommandEnvMap(input.CWD, ""),
 			// Supervisor-owned validation: track handle so shutdown retain-storage
 			// sees Kill/Drain failures even when validation collapses them to Passed=false.
 			Tracker: r.containmentTracker,
@@ -2668,7 +2722,7 @@ func classifyValidationFailure(result ValidationResult) validationFailure {
 	if containsAnyValidationHint(details, []string{"command not found", "executable file not found", "timed out", "timeout", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
 		return validationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
 	}
-	return validationFailure{message: message, kind: FailureRetryableAfterResume, resumePolicy: loops.ResumePolicyReplayStep}
+	return validationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
 }
 
 func containsAnyValidationHint(message string, hints []string) bool {

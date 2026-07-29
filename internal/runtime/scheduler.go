@@ -2977,6 +2977,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	claimMu := &sync.Mutex{}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
+	if len(config.ResolveValidationCommands(source.Snapshot())) == 0 && logger != nil {
+		logger.Warn("worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything", nil)
+	}
 	// Trusted review proxies are minted per reviewer agent run (bound to that
 	// run's PR). Catalog snapshots reuse claim serialization and notification
 	// transport continuity while retaining config-specific policy.
@@ -3406,14 +3409,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			},
 		})
 	}
-	// The worker and fixer share one mechanical gate: without it, "done" is only
-	// the agent's own self-assessment, so an empty list is worth surfacing once
-	// at wiring time rather than silently passing every validate step.
 	validationCommands := config.ResolveValidationCommands(cfg)
-	if len(validationCommands) == 0 && logger != nil {
-		logger.Warn("worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything", nil)
-	}
-
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
 		resolved := resolvedFixer
