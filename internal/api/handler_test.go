@@ -1093,12 +1093,14 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	service := data["service"].(map[string]any)
 	outstanding := service["recovery"].(map[string]any)["outstanding"].(map[string]any)
 	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(1))
-	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
+	// Quarantine deliberately leaves uncertain execution/run evidence active;
+	// this counter exists to surface the resulting active-runs inflation.
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
 	if !strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
 		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
 	}
-	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "interrupted" {
-		t.Fatalf("run after reconcile = %#v, %v; want interrupted", run, err)
+	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "running" {
+		t.Fatalf("run after reconcile = %#v, %v; want running quarantine evidence", run, err)
 	}
 }
 
