@@ -470,9 +470,13 @@ func TestVersionFlagStillWorksBeforeTheVerb(t *testing.T) {
 func TestBulkStopOutlivesTheSingleLoopDeadline(t *testing.T) {
 	const daemonWork = 400 * time.Millisecond
 
-	original := requestTimeout
+	original, originalBulkStop := requestTimeout, bulkStopRequestTimeout
 	requestTimeout = 80 * time.Millisecond
-	t.Cleanup(func() { requestTimeout = original })
+	bulkStopRequestTimeout = 800 * time.Millisecond
+	t.Cleanup(func() {
+		requestTimeout = original
+		bulkStopRequestTimeout = originalBulkStop
+	})
 
 	t.Run("stop all waits", func(t *testing.T) {
 		fixture := newContractFixture(t)
@@ -497,6 +501,21 @@ func TestBulkStopOutlivesTheSingleLoopDeadline(t *testing.T) {
 		stderr := &bytes.Buffer{}
 		if code := run([]string{"stop", "12", "--config", configPath}, strings.NewReader(""), io.Discard, stderr); code == 0 {
 			t.Fatal("exit = 0: an ordinary stop lost its deadline")
+		}
+		if !strings.Contains(stderr.String(), "deadline exceeded") {
+			t.Fatalf("stderr = %q, want a deadline failure", stderr.String())
+		}
+	})
+
+	t.Run("stop all still has an upper bound", func(t *testing.T) {
+		bulkStopRequestTimeout = requestTimeout
+		fixture := newContractFixture(t)
+		fixture.controlDelay = daemonWork
+		configPath, _ := serveContract(t, fixture)
+
+		stderr := &bytes.Buffer{}
+		if code := run([]string{"stop", "all", "--config", configPath}, strings.NewReader(""), io.Discard, stderr); code == 0 {
+			t.Fatal("exit = 0: bulk stop waited forever for a daemon that did not answer")
 		}
 		if !strings.Contains(stderr.String(), "deadline exceeded") {
 			t.Fatalf("stderr = %q, want a deadline failure", stderr.String())

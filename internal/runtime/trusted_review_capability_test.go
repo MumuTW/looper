@@ -168,20 +168,18 @@ func countProbes(t *testing.T, probeLog string) int {
 	return len(strings.Fields(string(contents)))
 }
 
-// TestTrustedReviewCapabilityDoesNotCacheTransientProbeFailure is the finding
-// this guards. The cache key is the binary's own identity — path, size,
-// modtime — so a verdict cached for a binary nobody is going to rebuild is a
-// permanent one. A probe that lost its deadline under load would therefore
-// disable reviewer publishing for the rest of the daemon's life, because
-// resolveTrustedLooperCLIPath returns "" on a false verdict and every later
-// tick reads it back from the cache without re-probing.
-//
-// The binary is left byte-identical between resolves, so the only thing that
-// can make the second one probe again is the verdict not having been cached.
-func TestTrustedReviewCapabilityDoesNotCacheTransientProbeFailure(t *testing.T) {
-	originalTimeout := trustedReviewCapabilityProbeTimeout
+// TestTrustedReviewCapabilityBacksOffTransientProbeFailure guards both sides of
+// transient recovery: scheduler ticks inside the cooldown do not launch another
+// slow subprocess or repeat the warning, and a later tick probes again without
+// requiring a daemon restart or binary rewrite.
+func TestTrustedReviewCapabilityBacksOffTransientProbeFailure(t *testing.T) {
+	originalTimeout, originalRetryDelay := trustedReviewCapabilityProbeTimeout, trustedReviewCapabilityRetryDelay
 	trustedReviewCapabilityProbeTimeout = 500 * time.Millisecond
-	t.Cleanup(func() { trustedReviewCapabilityProbeTimeout = originalTimeout })
+	trustedReviewCapabilityRetryDelay = 100 * time.Millisecond
+	t.Cleanup(func() {
+		trustedReviewCapabilityProbeTimeout = originalTimeout
+		trustedReviewCapabilityRetryDelay = originalRetryDelay
+	})
 
 	dir := t.TempDir()
 	looperPath := filepath.Join(dir, "looper")
@@ -208,8 +206,19 @@ func TestTrustedReviewCapabilityDoesNotCacheTransientProbeFailure(t *testing.T) 
 			t.Fatalf("resolveTrustedLooperCLIPath() attempt %d = %q, want \"\" while the probe cannot answer", attempt, got)
 		}
 	}
+	if probes := countProbes(t, probeLog); probes != 1 {
+		t.Fatalf("probe count = %d, want 1 during the transient retry cooldown", probes)
+	}
+	if count := logger.countMessage("reviewer publishing disabled: configured looper binary cannot serve `looper review submit`"); count != 1 {
+		t.Fatalf("verdict log count = %d, want 1 during the transient retry cooldown", count)
+	}
+
+	time.Sleep(2 * trustedReviewCapabilityRetryDelay)
+	if got := resolveTrustedLooperCLIPath(cfg, logger); got != "" {
+		t.Fatalf("resolveTrustedLooperCLIPath() after retry delay = %q, want \"\" while the probe still cannot answer", got)
+	}
 	if probes := countProbes(t, probeLog); probes != 2 {
-		t.Fatalf("probe count = %d, want 2: a timed-out probe was cached as a verdict about the binary", probes)
+		t.Fatalf("probe count = %d, want 2 after the transient retry cooldown", probes)
 	}
 
 	// Recovery: the same configured path now answers, and the reviewer is

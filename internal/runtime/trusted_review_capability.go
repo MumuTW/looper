@@ -26,6 +26,14 @@ import (
 // It is a var only so tests can shorten it; nothing reassigns it at runtime.
 var trustedReviewCapabilityProbeTimeout = 5 * time.Second
 
+// trustedReviewCapabilityRetryDelay prevents one persistently hung configured
+// binary from consuming a full probe timeout on every scheduler tick. A binary
+// identity change bypasses this delay, so replacement with a working binary
+// recovers immediately.
+//
+// It is a var only so tests can shorten it; nothing reassigns it at runtime.
+var trustedReviewCapabilityRetryDelay = 30 * time.Second
+
 // trustedReviewCapabilityDiagnosticLimit caps how much probe output is kept for
 // the operator-facing reason; probe output is agent-adjacent and unbounded.
 const trustedReviewCapabilityDiagnosticLimit = 200
@@ -45,6 +53,10 @@ type trustedReviewCapabilityEntry struct {
 	identity trustedReviewCapabilityIdentity
 	capable  bool
 	reason   string
+	// retryAfter is nonzero only for a transient probe failure. It is
+	// deliberately in-memory: this cooldown controls scheduler load, not the
+	// durable authority for whether the binary supports review submission.
+	retryAfter time.Time
 }
 
 // trustedReviewCapabilityCache is keyed by configured path so an upgrade
@@ -74,24 +86,27 @@ func trustedReviewCapability(configuredPath string) (capable bool, reason string
 
 	previous, hadPrevious := trustedReviewCapabilityCache.entries[configuredPath]
 	if hadPrevious && previous.identity == identity {
-		return previous.capable, previous.reason, false
+		if previous.retryAfter.IsZero() || time.Now().Before(previous.retryAfter) {
+			return previous.capable, previous.reason, false
+		}
 	}
 
 	capable, reason, transient := probeTrustedReviewCapability(identity)
 	// A transient failure is not a verdict about the binary, and caching one
-	// would be permanent: the cache key is the binary's own identity, which
-	// does not change because the machine was briefly out of process slots. One
-	// fork/exec EAGAIN, or one probe that lost its 5s race under load, would
-	// otherwise leave reviewer publishing fail-closed for the rest of the
-	// daemon's life — every later tick reads the cached "no" without re-probing.
-	// Leaving the entry unwritten costs one subprocess on the next tick and lets
-	// the verdict recover on its own.
-	//
-	// Retrying in place instead would hold this mutex, which every concurrent
-	// reviewer tick is queued behind, across the backoff.
-	if !transient {
-		trustedReviewCapabilityCache.entries[configuredPath] = trustedReviewCapabilityEntry{identity: identity, capable: capable, reason: reason}
+	// as a durable verdict would be permanent: the cache key is the binary's
+	// own identity, which does not change because the machine was briefly out
+	// of process slots. One fork/exec EAGAIN, or one probe that lost its 5s
+	// race under load, would otherwise leave reviewer publishing fail-closed
+	// for the rest of the daemon's life.
+	// A short in-memory cooldown avoids spending the full probe timeout on every
+	// scheduler tick while still re-probing the unchanged binary automatically.
+	// Retrying in place would hold this mutex, which every concurrent reviewer
+	// tick is queued behind, across the backoff.
+	entry := trustedReviewCapabilityEntry{identity: identity, capable: capable, reason: reason}
+	if transient {
+		entry.retryAfter = time.Now().Add(trustedReviewCapabilityRetryDelay)
 	}
+	trustedReviewCapabilityCache.entries[configuredPath] = entry
 	return capable, reason, !hadPrevious || previous.capable != capable
 }
 
