@@ -21,7 +21,7 @@ type Resolver struct {
 }
 
 func NewResolver(cfg config.Config) Resolver {
-	return Resolver{config: cfg}
+	return Resolver{config: config.CloneConfig(cfg)}
 }
 
 // Selection is the immutable result of resolving one configured project. A

@@ -94,3 +94,22 @@ func TestResolverCWDSelectionIsAuthoritative(t *testing.T) {
 		t.Fatal("configured GitHub CWD fell through to same-slug Forgejo project")
 	}
 }
+
+func TestResolverDetachesCapturedConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test"}},
+		Projects:  []config.ProjectRefConfig{{ID: "project", Provider: "forgejo", Repo: "acme/repo", RepoPath: t.TempDir()}},
+	}
+	resolver := NewResolver(cfg)
+
+	cfg.Providers[0].Kind = config.ProviderKindGitHub
+	cfg.Projects[0].Provider = ""
+	cfg.Projects[0].Repo = "mutated/repo"
+
+	selection := resolver.ForProject("project")
+	if !selection.UsesNativePullRequestAPI() || selection.TaskSourceName() != "Forgejo" {
+		t.Fatalf("selection changed with caller config mutation: %#v", selection)
+	}
+}
