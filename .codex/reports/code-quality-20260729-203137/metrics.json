@@ -1,23 +1,23 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-29T12:31:46.473215+00:00",
+  "generated_at": "2026-07-29T12:39:13.524651+00:00",
   "root": "/Users/johnson/dev/mine/looper",
   "discovery": "git",
   "totals": {
-    "files": 495,
-    "lines": 217513,
-    "nonblank_lines": 200397,
+    "files": 496,
+    "lines": 217602,
+    "nonblank_lines": 200469,
     "test_files": 252,
-    "source_files": 243
+    "source_files": 244
   },
   "size_bands": {
-    "up_to_300": 366,
+    "up_to_300": 367,
     "301_to_500": 55,
     "501_to_1000": 29,
     "over_1000": 45
   },
   "lines_by_extension": {
-    ".go": 204294,
+    ".go": 204383,
     ".tsx": 7032,
     ".ts": 3919,
     ".sql": 1276,
@@ -78,8 +78,8 @@
     {
       "path": "internal/runtime/scheduler.go",
       "extension": ".go",
-      "lines": 4939,
-      "nonblank_lines": 4661,
+      "lines": 4893,
+      "nonblank_lines": 4615,
       "is_test": false,
       "is_generated_or_vendor": false
     },
