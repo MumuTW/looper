@@ -31,8 +31,8 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 
 ## Features
 
-- 🚢 **Start from an issue, not a prompt.** Label an issue `looper:plan`, assign it to yourself, and a spec PR shows up. Once it reaches `looper:spec-ready`, implementation begins.
-- 🐙 **The forge is the source of truth.** Issues, PRs, labels, reviews, and assignees *are* the workflow — no external task tracker, no YAML pipeline. GitHub is fully supported; Forgejo supports planner, worker, native reviewer requests/reviews, and summary-comment compatibility flows.
+- 🚢 **Start from an issue, not a prompt.** On GitHub, the internal Triager turns a clear, low-risk new or reopened issue directly into Planner work; risky or underspecified reports wait with an auditable local triage report. Label-and-assign discovery remains available as an explicit manual route. Once a spec reaches `looper:spec-ready`, implementation begins.
+- 🐙 **Durable workflow state stays inspectable.** Issues, PRs, reviews, and assignees remain the shared forge workflow; local `triage.report` events are the semantic authority for internal GitHub intake, so routing labels are optional projections rather than hidden prerequisites. GitHub is fully supported; Forgejo supports planner, worker, native reviewer requests/reviews, and summary-comment compatibility flows.
 - 🛰️ **Many repos, one daemon.** Register your projects once — Looper watches them together and runs loops across repos in parallel.
 - 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents work across issues and repos without stepping on each other.
 - 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`, `grok-build`) so you're not locked into one model or CLI.
@@ -213,6 +213,7 @@ There is one more command that is not for operators: `looper review submit`, whi
 - Canonical default path: `~/.looper/config.toml`
 - Supported formats: `.toml`, `.yaml`, `.yml`, `.json`
 - Config source selection precedence: `--config` → `LOOPER_CONFIG` → default-path discovery
+- State directory: `~/.looper`, overridable with `LOOPER_HOME` (takes precedence over `HOME`). It moves the whole set of default-derived paths together — config discovery, database, logs, and worktree roots — so a second instance never writes into the first one's state
 - Provider support: legacy GitHub projects keep working through `gh`; Forgejo projects require an explicit provider, `baseUrl`, `repo`, and either `tokenEnv` (`auth=token-env`) or `teaLogin` (`auth=tea`)
 - All role-specific config lives under `roles.<role>`; canonical reviewer behavior lives under `roles.reviewer.behavior.*`
 - Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path

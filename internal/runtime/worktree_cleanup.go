@@ -30,16 +30,14 @@ type WorktreeCleanupStatus struct {
 }
 
 func (r *Runtime) WorktreeCleanupStatus() WorktreeCleanupStatus {
+	// Read the published config before taking r.mu: Config() may take the same
+	// RLock when no project catalog is installed.
+	cleanup := r.Config().Daemon.WorktreeCleanup
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	status := r.worktreeCleanupStatusLocked()
-	return status
-}
-
-func (r *Runtime) worktreeCleanupStatusLocked() WorktreeCleanupStatus {
 	status := r.worktreeCleanupStatus
-	status.Enabled = r.config.Daemon.WorktreeCleanup.Enabled
-	status.DryRun = r.config.Daemon.WorktreeCleanup.DryRun
+	status.Enabled = cleanup.Enabled
+	status.DryRun = cleanup.DryRun
 	if status.LastStatus == "" {
 		status.LastStatus = "idle"
 	}
@@ -49,14 +47,11 @@ func (r *Runtime) worktreeCleanupStatusLocked() WorktreeCleanupStatus {
 func (r *Runtime) startWorktreeCleanupLoop() {
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
+	wakeCh := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	initialDelay := r.worktreeCleanupInitialDelay
 	if initialDelay == 0 {
 		initialDelay = time.Minute
-	}
-	interval, err := time.ParseDuration(r.config.Daemon.WorktreeCleanup.Interval)
-	if err != nil || interval <= 0 {
-		interval = time.Hour
 	}
 
 	r.mu.Lock()
@@ -67,38 +62,68 @@ func (r *Runtime) startWorktreeCleanupLoop() {
 	}
 	r.worktreeCleanupStop = stopCh
 	r.worktreeCleanupDone = doneCh
+	r.worktreeCleanupWake = wakeCh
 	r.worktreeCleanupCancel = cancel
 	r.mu.Unlock()
 
 	go func() {
 		defer close(doneCh)
-		if initialDelay > 0 {
-			timer := time.NewTimer(initialDelay)
-			select {
-			case <-stopCh:
-				timer.Stop()
-				return
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-			}
-		}
-		r.executeWorktreeCleanupPass(ctx)
-
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		// enabled and interval are hot-editable, so the loop always runs and
+		// rereads both every iteration instead of capturing them at start. A
+		// reload wakes the timer (TriggerWorktreeCleanup) so a newly enabled or
+		// shortened schedule does not have to wait out the previous interval —
+		// without that, a 24h interval means restarts are the only real trigger.
+		timer := time.NewTimer(initialDelay)
+		defer timer.Stop()
 		for {
 			select {
 			case <-stopCh:
 				return
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-wakeCh:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			case <-timer.C:
+			}
+			if r.Config().Daemon.WorktreeCleanup.Enabled {
 				r.executeWorktreeCleanupPass(ctx)
 			}
+			timer.Reset(worktreeCleanupInterval(r.Config()))
 		}
 	}()
+}
+
+// TriggerWorktreeCleanup asks the cleanup loop to reevaluate now instead of at
+// its next scheduled wake. Dropping the signal when one is already pending is
+// correct: the loop rereads the current config when it wakes.
+func (r *Runtime) TriggerWorktreeCleanup() {
+	r.mu.RLock()
+	if r.stopped {
+		r.mu.RUnlock()
+		return
+	}
+	wakeCh := r.worktreeCleanupWake
+	r.mu.RUnlock()
+	if wakeCh == nil {
+		return
+	}
+	select {
+	case wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+func worktreeCleanupInterval(cfg config.Config) time.Duration {
+	interval, err := time.ParseDuration(cfg.Daemon.WorktreeCleanup.Interval)
+	if err != nil || interval <= 0 {
+		return time.Hour
+	}
+	return interval
 }
 
 func (r *Runtime) stopWorktreeCleanupLoop() {
@@ -108,6 +133,7 @@ func (r *Runtime) stopWorktreeCleanupLoop() {
 	cancel := r.worktreeCleanupCancel
 	r.worktreeCleanupStop = nil
 	r.worktreeCleanupDone = nil
+	r.worktreeCleanupWake = nil
 	r.worktreeCleanupCancel = nil
 	r.mu.Unlock()
 

@@ -57,7 +57,7 @@ func TestStartupRecoveryExitedLeaderDoesNotConfirmDeadOrAct(t *testing.T) {
 	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
 		ID: "agent_leader_exit", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
 		PID: &deadLeaderPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir),
-		HeartbeatCount: 0, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
+		HeartbeatCount: 0, LastHeartbeatAt: &nowISO, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
@@ -186,7 +186,7 @@ func TestStartupRecoveryObservedLiveNoSignalNoRequeue(t *testing.T) {
 	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
 		ID: "agent_observed_live", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
 		PID: &livePID, CommandJSON: stringPtr(`{"command":"codex","args":["exec","--term-resistant"]}`), CWD: stringPtr(workingDir),
-		HeartbeatCount: 1, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
+		HeartbeatCount: 1, MetadataJSON: stringPtr(`{"processIdentity":{"startTime":888800,"bootId":"boot-test"}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
@@ -208,6 +208,8 @@ func TestStartupRecoveryObservedLiveNoSignalNoRequeue(t *testing.T) {
 			}
 			return "codex exec --term-resistant", nil
 		},
+		ReadProcessStart:  func(context.Context, int) (int64, error) { return 888800, nil },
+		ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil },
 		SignalProcess: func(pid int, sig syscall.Signal) error {
 			signaled = append(signaled, struct {
 				pid int

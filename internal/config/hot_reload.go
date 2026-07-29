@@ -26,6 +26,16 @@ var hotEditablePaths = map[string]struct{}{
 	"scheduler.maxConcurrentRuns":       {},
 	"scheduler.slowLaneWarnThresholdMs": {},
 
+	// The cleanup loop rereads these each iteration and a reload wakes it, so
+	// none of them replace a process-owned resource. Only the leaves are hot;
+	// the daemon.worktreeCleanup object itself stays restart-bound.
+	"daemon.worktreeCleanup.enabled":        {},
+	"daemon.worktreeCleanup.interval":       {},
+	"daemon.worktreeCleanup.retentionDays":  {},
+	"daemon.worktreeCleanup.maxPerTick":     {},
+	"daemon.worktreeCleanup.includeOrphans": {},
+	"daemon.worktreeCleanup.dryRun":         {},
+
 	"notifications.inApp":                           {},
 	"notifications.osascript.enabled":               {},
 	"notifications.osascript.soundForLevels":        {},

@@ -481,7 +481,7 @@ func TestIndependentClaimPassClaimsQueuedWorkWhileDiscoveryIsBlocked(t *testing.
 	}
 }
 
-func TestRunDefaultSchedulerTickReconcilesLiveStaleRunsWhenCapacityIsFull(t *testing.T) {
+func TestRunDefaultSchedulerTickReconcilesLiveStaleRunsWithSpareCapacity(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -514,7 +514,7 @@ func TestRunDefaultSchedulerTickReconcilesLiveStaleRunsWhenCapacityIsFull(t *tes
 	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
 		Repos:             repos,
 		Now:               func() time.Time { return now },
-		MaxConcurrentRuns: 1,
+		MaxConcurrentRuns: 2,
 		AsyncRunner:       immediateSchedulerRunner{},
 		ReconcileStaleRuns: func(context.Context) (StaleRunReconcileSummary, error) {
 			reconcileCalls++
@@ -527,8 +527,8 @@ func TestRunDefaultSchedulerTickReconcilesLiveStaleRunsWhenCapacityIsFull(t *tes
 	}); err != nil {
 		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
 	}
-	if reconcileCalls == 0 {
-		t.Fatal("reconcile calls = 0, want at least one live reconcile attempt")
+	if reconcileCalls != 1 {
+		t.Fatalf("reconcile calls = %d, want one capacity-independent live reconcile attempt", reconcileCalls)
 	}
 	waitForSchedulerCondition(t, func() bool { return workerRunner.processItemCount() == 1 })
 	if workerRunner.processItemCount() != 1 || workerRunner.processedItems[0] != "queue_worker_after_reconcile" {

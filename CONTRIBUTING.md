@@ -95,6 +95,16 @@ After `--install-hooks`, the tracked `.githooks/pre-commit` reformats and re-sta
 - Keep default tests hermetic: no network, no real forge calls, no writes outside `t.TempDir()`.
 - Run `go test ./...` locally before opening a PR.
 
+Tests must never write into the developer's real `~/.looper`. Runners fall back to `config.DefaultProjectWorktreeRoot` whenever a project record carries no `worktreeRoot` metadata, so a fixture that omits it creates worktrees under the real state directory, where nothing collects them. Any package whose tests can reach that fallback gets a `TestMain` that calls `testenv.RunTestMain`, which points `LOOPER_HOME` at a throwaway directory for the whole binary:
+
+```go
+func TestMain(m *testing.M) {
+	os.Exit(testenv.RunTestMain(m))
+}
+```
+
+Tests that assert `HOME`-derived default paths should clear `LOOPER_HOME` (`t.Setenv("LOOPER_HOME", "")`), the same way they clear `LOOPER_CONFIG`.
+
 Provider e2e coverage has two layers:
 
 ```bash
