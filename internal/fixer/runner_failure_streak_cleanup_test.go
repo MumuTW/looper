@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,7 +155,7 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	}
 }
 
-func TestProcessClaimedItemDefersWhileLoopIsPaused(t *testing.T) {
+func TestProcessClaimedItemDefersDuringPendingRediscoveryHandoff(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
@@ -162,12 +163,22 @@ func TestProcessClaimedItemDefersWhileLoopIsPaused(t *testing.T) {
 	repo := "acme/looper"
 	prNumber := int64(94)
 	loopID := "loop_paused_claim_gate"
+	headSHA := "head-pending"
+	stateHash := "state-pending"
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
-	loop := storage.LoopRecord{ID: loopID, Seq: 211, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}
+	metadata := mustMarshalJSON(map[string]any{
+		"pauseReason": failureStreakPauseReason,
+		"pendingFixerRediscovery": pendingFixerRediscoveryState{
+			HeadSHA:           headSHA,
+			FixItemsStateHash: stateHash,
+			RecordedAt:        nowISO,
+		},
+	})
+	loop := storage.LoopRecord{ID: loopID, Seq: 211, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_paused_claim_gate", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:paused-claim-gate", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_paused_claim_gate", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, headSHA, stateHash), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -184,6 +195,45 @@ func TestProcessClaimedItemDefersWhileLoopIsPaused(t *testing.T) {
 	runs, err := fixture.repos.Runs.ListByLoop(context.Background(), loopID)
 	if err != nil || len(runs) != 0 {
 		t.Fatalf("Runs.ListByLoop() = (%#v, %v), want no run before resume is durable", runs, err)
+	}
+}
+
+func TestProcessClaimedItemDoesNotRequeueDurablePause(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	projectID := "project_1"
+	repo := "acme/looper"
+	prNumber := int64(95)
+	loopID := "loop_durable_pause"
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	headSHA := "head-quarantined"
+	stateHash := "state-quarantined"
+	metadata := mustMarshalJSON(map[string]any{
+		"pauseReason": "operator_quarantine",
+		"pendingFixerRediscovery": pendingFixerRediscoveryState{
+			HeadSHA:           headSHA,
+			FixItemsStateHash: stateHash,
+		},
+	})
+	loop := storage.LoopRecord{ID: loopID, Seq: 212, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_durable_pause", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, headSHA, stateHash), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{currentUserErr: errors.New("github timeout")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, RetryMaxAttempts: -1, Logger: fixture.logger, Now: fixture.now})
+
+	_, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err == nil || !strings.Contains(err.Error(), "github timeout") {
+		t.Fatalf("ProcessClaimedItem() error = %v, want existing processing path", err)
+	}
+	persisted, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || persisted == nil || persisted.Status != "running" {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want durable pause left out of transient requeue", persisted, err)
 	}
 }
 
