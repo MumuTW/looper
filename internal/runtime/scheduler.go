@@ -1992,27 +1992,27 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
-		// A missing or unusable wrapper is not a daemon fault, so it does not
-		// abort the run here. resolveTrustedLooperCLIPath already reported why
-		// and handed the prompt the same empty path, which means the agent has
-		// been told to fail closed with the exact `trusted looper review submit
-		// wrapper unavailable` message. Minting would only fail and kill the run
-		// before the agent could deliver it, leaving the reviewer's one
-		// well-defined unavailable path reachable on some runs and not others.
+		// Refuse before the agent starts rather than spend a run reviewing a PR
+		// it has no way to publish to. resolveTrustedLooperCLIPath has already
+		// logged which binary failed and why; this is the per-run consequence.
 		//
-		// Skipping grants nothing: without a socket there is no publish
-		// capability, which is the same position a comment-only run is in.
-		if strings.TrimSpace(a.realLooper) != "" {
-			vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
-			configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
-			var err error
-			sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
-			// Past the wrapper check a failure is the daemon's own — socket,
-			// binding or policy — and must still abort rather than hide behind a
-			// review that reports the wrapper as unavailable.
-			if err != nil {
-				return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
-			}
+		// The text is the prompt's wording verbatim, deliberately without the
+		// "install run-bound trusted review proxy" prefix its neighbours carry.
+		// Runs that never mint a proxy report the same condition from the agent
+		// side instead, and an operator should not need to know which half they
+		// are looking at to search for it.
+		if strings.TrimSpace(a.realLooper) == "" {
+			return nil, errors.New(reviewer.TrustedWrapperUnavailableMessage)
+		}
+		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
+		configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
+		var err error
+		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
+		// Past the wrapper check a failure is the daemon's own — socket, binding
+		// or policy — and keeps the prefix, because it is not the condition the
+		// prompt describes and must not be searched for as if it were.
+		if err != nil {
+			return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
 		}
 	}
 	execution, err := a.executor.Start(ctx, agent.RunInput{

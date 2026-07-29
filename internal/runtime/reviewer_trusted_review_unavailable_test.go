@@ -43,27 +43,21 @@ func nativeReviewAdapterInput(workDir string) reviewer.AgentRunInput {
 	}
 }
 
-// When no usable wrapper exists, resolveTrustedLooperCLIPath hands the reviewer
-// prompt an empty path, which makes the prompt instruct the agent to fail
-// closed with `trusted looper review submit wrapper unavailable`. The agent has
-// to actually run to deliver that, so Start must not abort trying to mint a
-// proxy it already knows cannot work — otherwise the reviewer's one
-// well-defined unavailable path is reachable on comment-only runs but not on
-// the native-review runs it was written for.
-func TestReviewerAgentStartsWithoutSocketWhenWrapperUnavailable(t *testing.T) {
+// A native-review run without a usable wrapper is refused before the agent
+// starts, so no run is spent reviewing a PR it cannot publish to.
+//
+// The message matters as much as the refusal. Runs that never mint a proxy —
+// comment-only publish, thread-resolution classifiers — report this same
+// condition from the agent side, quoting the prompt. Asserting equality with
+// reviewer.TrustedWrapperUnavailableMessage is what keeps one phrase covering
+// both surfaces, so an operator finds every affected run with one search
+// instead of learning which half produced which wording.
+func TestReviewerAgentStartRefusesWithThePromptsWordingWhenWrapperUnavailable(t *testing.T) {
 	workDir := t.TempDir()
-	scriptDir := t.TempDir()
-	outputPath := filepath.Join(scriptDir, "child.env")
-	scriptPath := filepath.Join(scriptDir, "dump-env")
-	script := "#!/bin/sh\nif [ -n \"$LOOPER_TRUSTED_REVIEW_SOCK\" ]; then printf 'sock=set\\n' > \"" + outputPath + "\"; else printf 'sock=\\n' > \"" + outputPath + "\"; fi\nprintf '__LOOPER_RESULT__={\"summary\":\"done\"}\\n'\n"
-	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile(scriptPath) error = %v", err)
-	}
-
 	customVendor := config.AgentVendor("custom")
 	adapter := reviewerAgentExecutorAdapter{
 		executor: agent.New(agent.ExecutorOptions{
-			Config:            agent.ExecutorConfig{Vendor: customVendor, Params: map[string]any{"command": scriptPath}},
+			Config:            agent.ExecutorConfig{Vendor: customVendor, Params: map[string]any{"command": "/bin/true"}},
 			ParamsOwnerVendor: &customVendor,
 		}),
 		// Empty because the capability probe rejected the binary, or none was
@@ -73,26 +67,12 @@ func TestReviewerAgentStartsWithoutSocketWhenWrapperUnavailable(t *testing.T) {
 		config:     nativeReviewAdapterConfig(workDir),
 	}
 
-	execHandle, err := adapter.Start(context.Background(), nativeReviewAdapterInput(workDir))
-	if err != nil {
-		t.Fatalf("Start() error = %v; want the run to proceed so the agent can report the wrapper as unavailable", err)
+	_, err := adapter.Start(context.Background(), nativeReviewAdapterInput(workDir))
+	if err == nil {
+		t.Fatal("Start() error = nil, want refusal before the agent runs")
 	}
-	result, err := execHandle.Wait(context.Background())
-	if err != nil {
-		t.Fatalf("Wait() error = %v", err)
-	}
-	if result.Status != "completed" {
-		t.Fatalf("result.Status = %q stderr=%q, want completed", result.Status, result.Stderr)
-	}
-
-	data, err := os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatalf("ReadFile(outputPath) error = %v", err)
-	}
-	// Publish capability is the thing that must not appear. Skipping the mint
-	// grants nothing; it leaves the agent exactly where a comment-only run is.
-	if string(data) != "sock=\n" {
-		t.Fatalf("child env dump = %q, want no trusted review socket", string(data))
+	if err.Error() != reviewer.TrustedWrapperUnavailableMessage {
+		t.Fatalf("Start() error = %q, want exactly %q so the daemon and the agent report this condition identically", err, reviewer.TrustedWrapperUnavailableMessage)
 	}
 }
 
