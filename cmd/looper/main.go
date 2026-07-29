@@ -54,9 +54,10 @@ var requestTimeout = 30 * time.Second
 // It is a var only so tests can shorten it; nothing reassigns it at runtime.
 var bulkStopRequestTimeout = 10 * time.Minute
 
-// Explicit discovery may walk and snapshot every open pull request. Give that
-// operator-requested blocking action a deliberate long deadline while caller
-// cancellation remains authoritative.
+// projectDiscoveryTimeout bounds only the explicit post-registration discovery
+// request. Registration itself uses requestTimeout because it commits before
+// returning; discovery may scan every open pull request and needs a larger
+// finite budget.
 var projectDiscoveryTimeout = 10 * time.Minute
 
 func main() {
