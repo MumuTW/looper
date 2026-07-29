@@ -353,10 +353,23 @@ type DiscoveryInput struct {
 	Snapshot  *githubinfra.DiscoverySnapshot
 }
 
+// RouteIssueInput is an explicit, report-authorized route into Planner.
+// Unlike discovery, it deliberately does not consult labels or assignees:
+// Authority names the persisted semantic decision that authorized the route.
+type RouteIssueInput struct {
+	ProjectID string
+	Repo      string
+	Issue     IssueSummary
+	Authority string
+}
+
 type DiscoveryResult struct {
 	QueueItems     []storage.QueueItemRecord
 	CreatedLoopIDs []string
 	Skipped        int
+	// ProjectionAccepted is true only for an explicit route that has reached
+	// its authority-bound loop/queue idempotency boundary.
+	ProjectionAccepted bool
 }
 
 type ProcessResult struct {
@@ -556,30 +569,90 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			continue
 		}
 		fingerprint := buildPlannerDiscoveryFingerprint(input.Repo, r.now(), issue)
-		loopResult, err := r.ensureLoopForIssue(ctx, *project, input.Repo, issue, fingerprint)
+		materialized, err := r.materializeIssue(ctx, *project, input.Repo, issue, login, fingerprint, "")
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		if loopResult.created {
-			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
-		}
-		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "awaiting_human" {
-			result.Skipped++
-			continue
-		}
-		// Anti-thrash: skip enqueue when ensureLoopForIssue left a previously
-		// failed loop in place because its discovery inputs match the last
-		// terminal failure.
-		if loopResult.record.Status == "failed" {
-			result.Skipped++
-			continue
-		}
-		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "title": issue.Title, "body": issue.Body, "url": issue.URL, "assignees": issue.Assignees, "labels": issue.Labels, "currentUserLogin": login, plannerQueuePayloadFPKey: fingerprint}})
-		if err != nil {
-			return DiscoveryResult{}, err
-		}
-		result.QueueItems = append(result.QueueItems, queueItem)
+		result.QueueItems = append(result.QueueItems, materialized.QueueItems...)
+		result.CreatedLoopIDs = append(result.CreatedLoopIDs, materialized.CreatedLoopIDs...)
+		result.Skipped += materialized.Skipped
 	}
+	return result, nil
+}
+
+// RouteIssue projects a persisted routing authority into Planner's durable
+// loop and queue. The loop and queue repositories provide the idempotency
+// boundary, so callers may safely replay the same authority after a partial
+// failure.
+func (r *Runner) RouteIssue(ctx context.Context, input RouteIssueInput) (DiscoveryResult, error) {
+	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil {
+		return DiscoveryResult{}, fmt.Errorf("planner repositories are not configured")
+	}
+	if strings.TrimSpace(input.Authority) == "" {
+		return DiscoveryResult{}, fmt.Errorf("planner route authority is required")
+	}
+	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if project == nil {
+		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
+	}
+	if project.Archived || domain.IsAutoLaneHeld(domain.LoopTypePlanner, input.Issue.Labels) {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	fingerprint := loops.ComputeDiscoveryFingerprint(
+		"planner",
+		"explicit-route",
+		strings.TrimSpace(input.Authority),
+	)
+	return r.materializeIssue(ctx, *project, input.Repo, input.Issue, "", fingerprint, strings.TrimSpace(input.Authority))
+}
+
+func (r *Runner) materializeIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentUserLogin, fingerprint, authority string) (DiscoveryResult, error) {
+	loopResult, err := r.ensureLoopForIssueWithAuthority(ctx, project, repo, issue, fingerprint, authority)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	result := DiscoveryResult{}
+	if loopResult.blocked {
+		result.Skipped = 1
+		return result, nil
+	}
+	if loopResult.created {
+		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+	}
+	switch loopResult.record.Status {
+	case "paused", "completed", "awaiting_human", "failed":
+		result.Skipped = 1
+		result.ProjectionAccepted = authority != "" && loopResult.authorityMatch
+		return result, nil
+	}
+	payload := map[string]any{
+		"issueNumber":            issue.Number,
+		"title":                  issue.Title,
+		"body":                   issue.Body,
+		"url":                    issue.URL,
+		"assignees":              issue.Assignees,
+		"labels":                 issue.Labels,
+		"currentUserLogin":       currentUserLogin,
+		plannerQueuePayloadFPKey: fingerprint,
+	}
+	if authority != "" {
+		payload[plannerQueueRoutingAuthorityKey] = authority
+	}
+	queueItem, err := r.enqueue(ctx, enqueueInput{
+		ProjectID:   project.ID,
+		LoopID:      loopResult.record.ID,
+		Repo:        repo,
+		IssueNumber: issue.Number,
+		Payload:     payload,
+	})
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	result.QueueItems = append(result.QueueItems, queueItem)
+	result.ProjectionAccepted = authority != ""
 	return result, nil
 }
 
@@ -859,8 +932,9 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		}
 	}()
 	manual := isManualPlannerQueue(payload)
+	reportAuthorized := plannerQueueRoutingAuthority(payload) != ""
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if currentLogin == "" && (manual || policy.RequireAssigneeCurrentUser || hasRequestedReviewerSources(input.Project, input.Loop, detail.Assignees)) {
+	if currentLogin == "" && (manual || (!reportAuthorized && policy.RequireAssigneeCurrentUser) || hasRequestedReviewerSources(input.Project, input.Loop, detail.Assignees)) {
 		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d: %v", repo, issueNumber, err), kind: FailureRetryableAfterResume}
@@ -870,7 +944,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
 		}
 	}
-	if !manual && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !manual && !reportAuthorized && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey
@@ -879,7 +953,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		releaseOnError = false
 		return checkpoint, nil
 	}
-	if !manual && policy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+	if !manual && !reportAuthorized && policy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey
@@ -1629,19 +1703,46 @@ func (r *Runner) appendEvent(ctx context.Context, input eventInput) {
 }
 
 type loopUpsertResult struct {
-	record  storage.LoopRecord
-	created bool
+	record         storage.LoopRecord
+	created        bool
+	authorityMatch bool
+	blocked        bool
 }
 
 func (r *Runner) ensureLoopForIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentFingerprint string) (loopUpsertResult, error) {
+	return r.ensureLoopForIssueWithAuthority(ctx, project, repo, issue, currentFingerprint, "")
+}
+
+func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentFingerprint, authority string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
 	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
+	matching := make([]storage.LoopRecord, 0)
 	for _, existing := range existingLoops {
 		if existing.Type == "planner" && existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID {
+			matching = append(matching, existing)
+		}
+	}
+	if authority != "" {
+		for _, existing := range matching {
+			if plannerLoopRoutingAuthority(existing.MetadataJSON) == authority {
+				updated, err := r.refreshIssueLoop(ctx, existing, repo, issue, nowISO, currentFingerprint, authority)
+				if err != nil {
+					return loopUpsertResult{}, err
+				}
+				return loopUpsertResult{record: updated, authorityMatch: true}, nil
+			}
+		}
+		for _, existing := range matching {
+			if !plannerLoopTerminal(existing.Status) {
+				return loopUpsertResult{record: existing, blocked: true}, nil
+			}
+		}
+	} else {
+		for _, existing := range matching {
 			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed" || existing.Status == "awaiting_human"
 			updated := existing
 			updated.Repo = stringPtr(repo)
@@ -1665,13 +1766,50 @@ func (r *Runner) ensureLoopForIssue(ctx context.Context, project storage.Project
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	meta := mustMarshalJSON(map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)})
+	metadata := map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)}
+	if authority != "" {
+		metadata[plannerQueueRoutingAuthorityKey] = authority
+	}
+	meta := mustMarshalJSON(metadata)
 	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "planner", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "queued", MetadataJSON: &meta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
 		return loopUpsertResult{}, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.created", projectID: project.ID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"type": "planner", "repo": repo, "issueNumber": issue.Number}})
-	return loopUpsertResult{record: loop, created: true}, nil
+	return loopUpsertResult{record: loop, created: true, authorityMatch: authority != ""}, nil
+}
+
+func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopRecord, repo string, issue IssueSummary, nowISO, currentFingerprint, authority string) (storage.LoopRecord, error) {
+	pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed" || existing.Status == "awaiting_human"
+	updated := existing
+	updated.Repo = stringPtr(repo)
+	suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
+	if !pausedOrCompleted && !suppressFailedRevival && updated.Status != "running" {
+		updated.Status = "queued"
+		updated.NextRunAt = &nowISO
+	}
+	metadata := map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)}
+	if authority != "" {
+		metadata[plannerQueueRoutingAuthorityKey] = authority
+	}
+	metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, metadata)
+	if err == nil {
+		updated.MetadataJSON = stringPtr(metadataJSON)
+	}
+	updated.UpdatedAt = nowISO
+	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+		return storage.LoopRecord{}, err
+	}
+	return updated, nil
+}
+
+func plannerLoopTerminal(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "failed", "stopped", "terminated", "cancelled":
+		return true
+	default:
+		return false
+	}
 }
 
 type enqueueInput struct {
@@ -2170,7 +2308,10 @@ func buildIssueTargetID(repo string, issueNumber int64) string {
 // plannerQueuePayloadFPKey is the JSON key used to forward the planner
 // discovery fingerprint into the queue payload so failure handlers can stamp
 // it onto the loop without recomputing inputs from scratch.
-const plannerQueuePayloadFPKey = "discoveryFingerprint"
+const (
+	plannerQueuePayloadFPKey        = "discoveryFingerprint"
+	plannerQueueRoutingAuthorityKey = "routingAuthority"
+)
 
 // buildPlannerDiscoveryFingerprint returns a stable fingerprint over the
 // inputs that planner discovery uses to decide whether a previously-failed
@@ -2210,6 +2351,15 @@ func plannerQueueDiscoveryFingerprint(payloadJSON *string) string {
 	}
 	value, _ := parsed[plannerQueuePayloadFPKey].(string)
 	return strings.TrimSpace(value)
+}
+
+func plannerQueueRoutingAuthority(payload map[string]any) string {
+	value, _ := payload[plannerQueueRoutingAuthorityKey].(string)
+	return strings.TrimSpace(value)
+}
+
+func plannerLoopRoutingAuthority(metadataJSON *string) string {
+	return plannerQueueRoutingAuthority(parseJSONObject(metadataJSON))
 }
 
 // stampFailedDiscoveryFingerprint records the queue item's discovery

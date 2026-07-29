@@ -94,10 +94,11 @@ type CodingRoleConfig struct {
 // skipped, so the set below is closed. Spaced by 10 so reordering means
 // editing one constant rather than renumbering the block.
 //
-// Coordinator is listed here to keep the whole tick order readable in one
-// place, but it does not travel through CodingRoleConfig.Priority like the
-// others: it is not a coding role, so coordinatorLane applies it directly.
+// Internal Triager and Coordinator are listed here to keep the whole tick
+// order readable in one place, but they do not travel through
+// CodingRoleConfig.Priority: their internal lanes apply these values directly.
 const (
+	PriorityTriager     = 5
 	PriorityPlanner     = 10
 	PriorityCoordinator = 20
 	PriorityReviewer    = 30
