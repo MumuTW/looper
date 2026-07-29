@@ -94,9 +94,9 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, RetryMaxAttempts: -1, Logger: fixture.logger, Now: fixture.now, Sleep: func(time.Duration) {}})
 
-	failedQueue, tripped, err := runner.failQueueItemWithBreaker(context.Background(), loop, queue, failedRun.ID, checkpoint, stepValidate, &loopError{message: "validation failed", kind: FailureRetryableTransient})
-	if err != nil || !tripped || failedQueue == nil || failedQueue.Status != "manual_intervention" {
-		t.Fatalf("failQueueItemWithBreaker() = (%#v, %v, %v), want breaker terminal", failedQueue, tripped, err)
+	failedQueue, breakerStreak, err := runner.failQueueItemWithBreaker(context.Background(), loop, queue, failedRun.ID, checkpoint, stepValidate, &loopError{message: "validation failed", kind: FailureRetryableTransient})
+	if err != nil || breakerStreak != maxConsecutiveFixerFailures || failedQueue == nil || failedQueue.Status != "manual_intervention" {
+		t.Fatalf("failQueueItemWithBreaker() = (%#v, %d, %v), want breaker terminal", failedQueue, breakerStreak, err)
 	}
 	paused, err := runner.updateLoop(context.Background(), loop, func(updated *storage.LoopRecord) {
 		updated.Status = "paused"

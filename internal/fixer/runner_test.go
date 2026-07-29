@@ -6986,6 +6986,17 @@ func TestProcessClaimedItemPausesAfterCustomConsecutiveFailureThreshold(t *testi
 	if got, _ := stringFromAny(parseJSONObject(loop.MetadataJSON)["pauseReason"]); got != failureStreakPauseReason {
 		t.Fatalf("pauseReason = %q, want %q", got, failureStreakPauseReason)
 	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "loop", loop.ID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundPaused := false
+	for _, event := range events {
+		foundPaused = foundPaused || event.EventType == "loop.paused"
+	}
+	if !foundPaused {
+		t.Fatalf("events = %#v, want loop.paused after the loop pause is durable", events)
+	}
 }
 
 func TestProcessClaimedItemClearsFailureStreakOnSuccess(t *testing.T) {

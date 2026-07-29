@@ -1889,7 +1889,8 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	var activeErr *activeRunError
 	var runFailure *claimedRunFailureError
 	var failedQueue *storage.QueueItemRecord
-	breakerTripped := false
+	var breakerLoop *storage.LoopRecord
+	breakerStreak := 0
 	var failErr error
 	if errors.As(err, &activeErr) {
 		failedQueue, failErr = r.requeueQueueItem(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts)
@@ -1899,7 +1900,8 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			return nil, loopErr
 		}
 		if loop != nil {
-			failedQueue, breakerTripped, failErr = r.failQueueItemWithBreaker(ctx, *loop, queueItem, runFailure.runID, runFailure.checkpoint, runFailure.step, failure)
+			breakerLoop = loop
+			failedQueue, breakerStreak, failErr = r.failQueueItemWithBreaker(ctx, *loop, queueItem, runFailure.runID, runFailure.checkpoint, runFailure.step, failure)
 		} else {
 			failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
 		}
@@ -1925,6 +1927,15 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue); err != nil {
 		return nil, err
 	}
+	if breakerStreak > 0 && breakerLoop != nil && runFailure != nil {
+		durableLoop, loopErr := r.repos.Loops.GetByID(ctx, breakerLoop.ID)
+		if loopErr != nil {
+			return nil, loopErr
+		}
+		if durableLoop != nil {
+			r.appendFailureStreakPausedEvent(ctx, *durableLoop, runFailure.runID, runFailure.checkpoint, breakerStreak)
+		}
+	}
 	recoveredRunTerminal := runFailure != nil && failedQueue != nil && failedQueue.Status == "manual_intervention"
 	if queueItem.LoopID != nil && queueItem.Repo != nil && queueItem.PRNumber != nil && (queueResultIsTerminalForCleanup(failedQueue) || recoveredRunTerminal) {
 		loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
@@ -1938,7 +1949,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 					return nil, projectErr
 				}
 				if project != nil {
-					if breakerTripped {
+					if breakerStreak > 0 {
 						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &runFailure.checkpoint)
 						if resumeErr != nil {
 							return nil, resumeErr
@@ -2082,11 +2093,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 			return ProcessResult{}, err
 		}
-		failedQueue, breakerTripped, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, resumedRun.StartStep, failure)
+		failedQueue, breakerStreak, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, resumedRun.StartStep, failure)
 		if err != nil {
 			return ProcessResult{}, err
 		}
-		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		pausedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 			updated.LastRunAt = stringPtr(r.nowISO())
 			if failedQueue != nil && failedQueue.Status == "queued" {
 				updated.Status = "queued"
@@ -2096,10 +2107,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 				updated.NextRunAt = nil
 			}
-		}); err != nil {
+		})
+		if err != nil {
 			return ProcessResult{}, err
 		}
-		if breakerTripped {
+		if breakerStreak > 0 {
+			r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
 			if _, err := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &latest); err != nil {
 				return ProcessResult{}, err
 			}
@@ -2219,11 +2232,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			// Consecutive-failure circuit breaker: once the same step/head/fix-items
 			// state has failed r.consecutiveFailureThreshold runs in a row, stop
 			// requeueing and park the loop until discovery sees new feedback.
-			failedQueue, breakerTripped, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
+			failedQueue, breakerStreak, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
 			if err != nil {
 				return ProcessResult{}, err
 			}
-			if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			pausedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
 				if failedQueue != nil && failedQueue.Status == "queued" {
 					updated.Status = "queued"
@@ -2233,10 +2246,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 					updated.NextRunAt = nil
 				}
-			}); err != nil {
+			})
+			if err != nil {
 				return ProcessResult{}, err
 			}
-			if breakerTripped {
+			if breakerStreak > 0 {
+				r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
 				if _, err := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &latest); err != nil {
 					return ProcessResult{}, err
 				}
@@ -5755,26 +5770,32 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 	return r.requeueOrFailQueueItem(ctx, queueItem, kind, message, nextAttempts)
 }
 
-func (r *Runner) failQueueItemWithBreaker(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep, failure *loopError) (*storage.QueueItemRecord, bool, error) {
+func (r *Runner) failQueueItemWithBreaker(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep, failure *loopError) (*storage.QueueItemRecord, int, error) {
 	streak, streakLoop, err := r.recordFixerFailureStreak(ctx, loop, queueItem, runID, checkpoint, step)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
 	if streak < r.consecutiveFailureThreshold {
 		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
-		return failedQueue, false, err
+		return failedQueue, 0, err
 	}
 	r.logError("fixer consecutive-failure circuit breaker tripped", map[string]any{"projectId": loop.ProjectID, "loopId": loop.ID, "runId": runID, "queueItemId": queueItem.ID, "consecutiveCount": streak, "headSha": detailHeadSHA(checkpoint.Detail), "fixItemsStateHash": hashFixItemsState(checkpoint.FixItems), "pauseReason": failureStreakPauseReason})
-	r.appendEvent(ctx, eventInput{eventType: "loop.paused", projectID: loop.ProjectID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"pauseReason": failureStreakPauseReason, "consecutiveCount": streak, "headSha": detailHeadSHA(checkpoint.Detail), "fixItemsStateHash": hashFixItemsState(checkpoint.FixItems)}})
 	// Persist the loop-side pause intent before terminalizing the queue row. If
 	// either write fails, recovery can still observe an active queue item or the
 	// durable terminal row and reconcile the loop; it cannot be stranded as
 	// running with only an inactive queue item.
 	if _, err := r.mergeLoopMetadata(ctx, streakLoop, map[string]any{"pauseReason": failureStreakPauseReason}); err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
 	failedQueue, err := r.failQueueItemTerminal(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts+1)
-	return failedQueue, true, err
+	return failedQueue, streak, err
+}
+
+func (r *Runner) appendFailureStreakPausedEvent(ctx context.Context, loop storage.LoopRecord, runID string, checkpoint fixerCheckpoint, streak int) {
+	if loop.Status != "paused" {
+		return
+	}
+	r.appendEvent(ctx, eventInput{eventType: "loop.paused", projectID: loop.ProjectID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"pauseReason": failureStreakPauseReason, "consecutiveCount": streak, "headSha": detailHeadSHA(checkpoint.Detail), "fixItemsStateHash": hashFixItemsState(checkpoint.FixItems)}})
 }
 
 func (r *Runner) requeueQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, attempts int64) (*storage.QueueItemRecord, error) {
