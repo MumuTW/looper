@@ -965,6 +965,21 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 	if repair.ParseStatus == "parsed" {
 		return nil
 	}
+	// Network/auth/unreachable errors are not transient — retrying won't fix them.
+	// Classify them as NonRetryable to avoid infinite retry loops.
+	summary := strings.ToLower(firstNonEmpty(repair.Summary, ""))
+	for _, fragment := range []string{
+		"network", "unreachable", "could not connect", "api.github.com",
+		"authentication failed", "bad credentials", "token expired",
+		"gh could not connect", "github was unreachable", "github api access failed",
+	} {
+		if strings.Contains(summary, fragment) {
+			return &loopError{
+				message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent could not reach GitHub (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
+				kind:    FailureNonRetryable,
+			}
+		}
+	}
 	return &loopError{
 		message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent completed without valid structured result (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
 		kind:    FailureRetryableTransient,
