@@ -180,6 +180,21 @@ func (t *codexJSONLTranslator) ingestAll(blob string) {
 	}
 }
 
+// FinalMessage returns the final assistant message from Codex JSONL output.
+// Plain-text vendors (and Codex without --json) fall back to stdout unchanged.
+func FinalMessage(stdout string) string {
+	stdout = strings.TrimSpace(stdout)
+	if stdout == "" {
+		return ""
+	}
+	tr := newCodexJSONLTranslator()
+	tr.ingestAll(stdout)
+	if final := strings.TrimSpace(tr.finalText); final != "" {
+		return final
+	}
+	return stdout
+}
+
 // extractCodexThreadID scans a codex --json stdout blob for the session id from
 // the thread.started event, so a live run can persist its session id BEFORE
 // completion (needed for mid-run human takeover). Returns the first id found and

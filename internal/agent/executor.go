@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/processidentity"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/validationcmd"
 )
@@ -621,6 +622,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			return nil, fmt.Errorf("start agent command: %w", err)
 		}
 	}
+	x.captureProcessStart()
 
 	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
 		GracePeriod:  grace,
@@ -716,6 +718,7 @@ type execution struct {
 	nativeResumeMode        string
 	nativeResumeStatus      string
 	nativeResumeError       string
+	processBirth            processidentity.Birth
 	leaseReleased           bool
 	toolSandbox             *validationcmd.Sandbox
 
@@ -1173,6 +1176,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.nativeResumeError = nativeError
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
+	x.processBirth = processidentity.Birth{}
 	x.mu.Unlock()
 
 	if err := cmd.Start(); err != nil {
@@ -1183,6 +1187,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		x.mu.Unlock()
 		return Result{}, "", false, nil
 	}
+	x.captureProcessStart()
 
 	grace := x.gracefulShutdown
 	if grace <= 0 {
@@ -1876,6 +1881,13 @@ func (x *execution) executionMetadata(timeoutType string) map[string]any {
 			"maxRuntimeSeconds":  durationSeconds(x.timeout),
 		},
 	}
+	if birth := x.processBirthSnapshot(); birth.StartTime > 0 {
+		identity := map[string]any{"startTime": birth.StartTime}
+		if birth.BootID != "" {
+			identity["bootId"] = birth.BootID
+		}
+		metadata["processIdentity"] = identity
+	}
 	if timeoutType != "" {
 		metadata["timeout"] = map[string]any{
 			"type":                         timeoutType,
@@ -1886,6 +1898,25 @@ func (x *execution) executionMetadata(timeoutType string) map[string]any {
 		}
 	}
 	return metadata
+}
+
+func (x *execution) captureProcessStart() {
+	if x == nil || x.process == nil || x.process.Process == nil {
+		return
+	}
+	birth, err := processidentity.Read(x.process.Process.Pid)
+	if err != nil {
+		return
+	}
+	x.mu.Lock()
+	x.processBirth = birth
+	x.mu.Unlock()
+}
+
+func (x *execution) processBirthSnapshot() processidentity.Birth {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.processBirth
 }
 
 func durationSeconds(duration time.Duration) int64 {
