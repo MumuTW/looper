@@ -135,6 +135,27 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 	}
 }
 
+func TestBuildFixerPromptDefinesReviewerAuthorityOrder(t *testing.T) {
+	t.Parallel()
+
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "thread-1", Summary: "replace the established design"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	for _, want := range []string{
+		"Authority order (highest wins): latest explicit human instruction > repo AGENTS.md / documented project rules > PR explicit goal / design intent > reviewer suggestion > agent judgment.",
+		"Do not invent unstated \"stable norms\".",
+		"Do not blindly obey reviewers when they conflict with higher authority.",
+		"demonstrably unreasonable or incorrect with clear public evidence",
+		"Do not implement a change you know is wrong just because a reviewer asked.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing authority contract %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "when in doubt, implement the requested change") {
+		t.Fatalf("prompt contains reviewer-as-command fallback:\n%s", prompt)
+	}
+}
+
 func TestFixerRepairScopeInstructionAllowsCollateralWithoutDriveBy(t *testing.T) {
 	t.Parallel()
 
