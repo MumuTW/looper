@@ -137,6 +137,11 @@ func TestNonMutatingCoverageDegradedPausesClaimPump(t *testing.T) {
 	if err := rt.CompleteStartup(context.Background()); err != nil {
 		t.Fatalf("CompleteStartup() error = %v", err)
 	}
+	// The production claim pump invokes executeSchedulerClaimPass immediately
+	// and on a ticker. Stop that background loop before installing the counting
+	// stub so this test deterministically exercises the exact pass used by the
+	// pump instead of racing an unrelated initial/ticker invocation under -race.
+	rt.stopSchedulerLoop()
 
 	var claimCalls atomic.Int64
 	rt.mu.Lock()
