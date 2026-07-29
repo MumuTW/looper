@@ -220,6 +220,7 @@ func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 			Enabled:       true,
 			Source:        WorkSourcePullRequest,
 			Labels:        []string{},
+			LabelMode:     LabelModeAll,
 			IncludeDrafts: true,
 		},
 	}

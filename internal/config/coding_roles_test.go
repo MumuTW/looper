@@ -92,7 +92,7 @@ profile = "fast"
 	}
 
 	// Priority 25 sits between planner (10) and reviewer (30).
-	wantOrder := []string{"planner", "auditor", "reviewer", "fixer", "worker"}
+	wantOrder := []string{"planner", "auditor", "reviewer", "fixer", RoleGatekeeper, "worker"}
 	gotOrder := CodingRoleNames(cfg.Roles)
 	if len(gotOrder) != len(wantOrder) {
 		t.Fatalf("lane order = %v, want %v", gotOrder, wantOrder)

@@ -65,6 +65,9 @@ func TestCodingRolesFromLegacyProjectsSourceAndFields(t *testing.T) {
 	if !gatekeeper.Discovery.Enabled || gatekeeper.Discovery.Source != WorkSourcePullRequest {
 		t.Fatalf("gatekeeper discovery = %#v, want enabled pull-request source", gatekeeper.Discovery)
 	}
+	if gatekeeper.Discovery.LabelMode != LabelModeAll {
+		t.Fatalf("gatekeeper label mode = %q, want %q", gatekeeper.Discovery.LabelMode, LabelModeAll)
+	}
 	if len(gatekeeper.Discovery.Labels) != 0 {
 		t.Fatalf("gatekeeper labels = %v, want source-based discovery without label gate", gatekeeper.Discovery.Labels)
 	}
