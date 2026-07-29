@@ -2306,7 +2306,7 @@ func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T
 			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 			pid := int64(5151)
 
-			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, RunSchedulerTick: func(context.Context, Services) error { return nil }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 515100, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
+			rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 515100, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
 			if err := rt.Start(context.Background()); err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
@@ -2375,7 +2375,7 @@ func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *test
 			// PID gone: empty process command probes as dead (not uncertain).
 			deadPID := int64(6161)
 
-			rt := New(Options{
+			rt := newManualReconcileRuntime(Options{
 				Config:             cfg,
 				Logger:             &testLogger{},
 				Now:                func() time.Time { return now },
@@ -2507,7 +2507,7 @@ func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecu
 			completedISO := formatJavaScriptISOString(now.Add(-10 * time.Minute))
 			pid := int64(5252)
 
-			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, RunSchedulerTick: func(context.Context, Services) error { return nil }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 525200, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
+			rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 525200, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
 			if err := rt.Start(context.Background()); err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
@@ -2626,7 +2626,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 		livePID := int64(5353)
 		deadPID := int64(5354)
 
-		rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
+		rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
 			switch pid {
 			case int(livePID):
 				return "codex exec", nil
@@ -2683,7 +2683,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 		ambiguousPID := int64(5453)
 		deadPID := int64(5454)
 
-		rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
+		rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
 			switch pid {
 			case int(ambiguousPID):
 				return "python unrelated.py", nil
@@ -2741,7 +2741,7 @@ func TestRuntimeReconcileStaleRunningRunsCancelsDuplicateActiveQueueItems(t *tes
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, RunSchedulerTick: func(context.Context, Services) error { return nil }})
+	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2809,12 +2809,7 @@ func TestRuntimeReconcileStaleRunningRunsIsIdempotent(t *testing.T) {
 			nowISO := formatJavaScriptISOString(now)
 			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-			rt := New(Options{
-				Config:           cfg,
-				Logger:           &testLogger{},
-				Now:              func() time.Time { return now },
-				RunSchedulerTick: func(context.Context, Services) error { return nil },
-			})
+			rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 			if err := rt.Start(context.Background()); err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
@@ -2868,7 +2863,7 @@ func TestRuntimeReconcileStaleRunningRunsDedupesUncertainIdentityEvents(t *testi
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 	ambiguousPID := int64(5651)
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, RunSchedulerTick: func(context.Context, Services) error { return nil }, ReadProcessCommand: func(context.Context, int) (string, error) { return "python unrelated.py", nil }})
+	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "python unrelated.py", nil }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
