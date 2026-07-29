@@ -446,6 +446,34 @@ priority = 15
 	}
 }
 
+func TestNormalizeCodingRolesDoesNotMutateInputLayers(t *testing.T) {
+	t.Parallel()
+
+	base := mustDecodeTOML(t, `
+[roles.coding.auditor]
+priority = 60
+[roles.coding.auditor.discovery]
+source = "issue"
+labels = ["base"]
+`)
+	override := mustDecodeTOML(t, `
+[roles.coding.auditor.discovery]
+labels = ["override"]
+[roles.coding.auditor.agent]
+profile = "fast"
+`)
+
+	merged := mustNormalize(t, base, override)
+	if got := merged.Roles.Coding["auditor"]; len(got.Discovery.Labels) != 1 || got.Discovery.Labels[0] != "override" || got.Agent == nil {
+		t.Fatalf("merged coding role = %#v, want override fields", got)
+	}
+	replayed := mustNormalize(t, base)
+	got := replayed.Roles.Coding["auditor"]
+	if len(got.Discovery.Labels) != 1 || got.Discovery.Labels[0] != "base" || got.Agent != nil {
+		t.Fatalf("base layer after prior Normalize = %#v, want original fields", got)
+	}
+}
+
 // Role names are normalized case-insensitively, matching how the legacy
 // sections and map keys compare.
 func TestNormalizeCodingRoleNameCaseInsensitive(t *testing.T) {
@@ -536,6 +564,23 @@ profile = "missing"
 		if !hasIssuePath(paths, want) {
 			t.Errorf("issue paths = %v, want %s (err = %v)", paths, want, err)
 		}
+	}
+}
+
+func TestValidateRejectsProjectScopedCodingRoles(t *testing.T) {
+	t.Parallel()
+
+	cfg := mustNormalize(t)
+	cfg.Projects = []ProjectRefConfig{{
+		ID: "demo", Name: "Demo", RepoPath: t.TempDir(),
+		Roles: &PartialRoleConfigs{Coding: map[string]PartialCodingRoleConfig{
+			"auditor": {Priority: intPtr(60)},
+		}},
+	}}
+
+	err := Validate(cfg)
+	if !hasIssuePath(normalizeIssuePaths(err), "projects[0].roles.coding") {
+		t.Fatalf("issue paths = %v, want projects[0].roles.coding (err = %v)", normalizeIssuePaths(err), err)
 	}
 }
 

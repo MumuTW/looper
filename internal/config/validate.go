@@ -698,6 +698,7 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 	if roles == nil {
 		return
 	}
+	validateProjectCodingRoleOverrides(roles, prefix, issues)
 	if roles.Planner != nil {
 		validateProjectRoleInstruction(prefix+".planner.instructions", "planner", roles.Planner.Instructions, maxInstructionBytes, issues)
 		if roles.Planner.Triggers != nil {

@@ -20,7 +20,7 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		if issues := validateProjectCodingRoleSections(partial); len(issues) > 0 {
 			return Config{}, &ConfigValidationError{Issues: issues}
 		}
-		normalized := normalizeLayerPartial(partial)
+		normalized := normalizeLayerPartial(clonePartialConfig(partial))
 		mergeConfig(&config, normalized)
 		normalizedLayers = append(normalizedLayers, normalized)
 	}
@@ -58,15 +58,20 @@ func validateProjectCodingRoleSections(partial PartialConfig) []ValidationIssue 
 
 	issues := make([]ValidationIssue, 0)
 	for index, project := range *partial.Projects {
-		if project.Roles != nil && len(project.Roles.Coding) > 0 {
-			issues = append(issues, ValidationIssue{
-				Path:    fmt.Sprintf("projects[%d].roles.coding", index),
-				Message: "coding roles are global-only; author roles.coding.* at the top level",
-			})
-		}
+		validateProjectCodingRoleOverrides(project.Roles, fmt.Sprintf("projects[%d].roles", index), &issues)
 	}
 
 	return issues
+}
+
+func validateProjectCodingRoleOverrides(roles *PartialRoleConfigs, prefix string, issues *[]ValidationIssue) {
+	if roles == nil || len(roles.Coding) == 0 {
+		return
+	}
+	*issues = append(*issues, ValidationIssue{
+		Path:    prefix + ".coding",
+		Message: "coding roles are global-only; author roles.coding.* at the top level",
+	})
 }
 
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
