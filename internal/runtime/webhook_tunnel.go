@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
 )
@@ -538,8 +539,9 @@ func (w *webhookRuntime) updateTunnelDegradedReasons(states []WebhookTunnelState
 func configuredWebhookReposForMode(cfg config.Config, mode config.WebhookMode) []string {
 	seen := map[string]struct{}{}
 	repos := make([]string, 0, len(cfg.Projects))
+	providers := forge.NewResolver(cfg)
 	for _, project := range cfg.Projects {
-		if config.ResolvedProjectProviderKind(cfg, project) == config.ProviderKindForgejo || webhookModeForProject(cfg, project.ID) != mode {
+		if providers.ForProject(project.ID).UsesNativePullRequestAPI() || webhookModeForProject(cfg, project.ID) != mode {
 			continue
 		}
 		repo := strings.TrimSpace(project.Repo)

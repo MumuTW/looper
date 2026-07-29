@@ -379,15 +379,10 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 }
 
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
-	provider, ok, err := forgejoProviderForRepo(cfg, repo)
-	if !ok || err != nil {
-		return nil, ok, err
+	if cfg == nil {
+		return nil, false, nil
 	}
-	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(repo))
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
+	return forge.NewResolver(*cfg).ForgejoForLocation(repo, "")
 }
 
 // forgejoReviewerDiscoveryLabelsForRepo returns configured reviewer trigger
@@ -398,33 +393,17 @@ func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo, cwd string)
 	if cfg == nil {
 		return nil
 	}
-	repo = strings.TrimSpace(repo)
-	if strings.TrimSpace(cwd) != "" {
-		for _, project := range cfg.Projects {
-			if cwdBelongsToProject(project, cwd) {
-				return forgejoReviewerDiscoveryLabelsForProject(*cfg, project)
-			}
-		}
+	selection, matched, err := forge.NewResolver(*cfg).ForLocation(repo, cwd)
+	if err != nil || !matched || !selection.UsesNativePullRequestAPI() {
+		return nil
 	}
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return nil
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		return forgejoReviewerDiscoveryLabelsForProject(*cfg, *matched)
-	}
-	return nil
+	project, _ := selection.Project()
+	return forgejoReviewerDiscoveryLabelsForProject(*cfg, project)
 }
 
 func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.ProjectRefConfig) []string {
-	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+	selection, err := forge.NewResolver(cfg).ForProjectRef(project)
+	if err != nil || !selection.UsesNativePullRequestAPI() {
 		return nil
 	}
 	labels := config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.Labels
@@ -478,156 +457,27 @@ func forgejoReviewerRequireReviewRequestForRepo(cfg *config.Config, repo, cwd st
 	if cfg == nil {
 		return true
 	}
-	repo = strings.TrimSpace(repo)
-	if strings.TrimSpace(cwd) != "" {
-		for _, project := range cfg.Projects {
-			if cwdBelongsToProject(project, cwd) {
-				return forgejoReviewerRequireReviewRequestForProject(*cfg, project)
-			}
-		}
+	selection, matched, err := forge.NewResolver(*cfg).ForLocation(repo, cwd)
+	if err != nil || !matched || !selection.UsesNativePullRequestAPI() {
+		return true
 	}
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return true
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		return forgejoReviewerRequireReviewRequestForProject(*cfg, *matched)
-	}
-	return true
+	project, _ := selection.Project()
+	return forgejoReviewerRequireReviewRequestForProject(*cfg, project)
 }
 
 func forgejoReviewerRequireReviewRequestForProject(cfg config.Config, project config.ProjectRefConfig) bool {
-	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+	selection, err := forge.NewResolver(cfg).ForProjectRef(project)
+	if err != nil || !selection.UsesNativePullRequestAPI() {
 		return true
 	}
 	return config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.RequireReviewRequest
 }
 
 func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
-	project, provider, ok, err := forgejoProjectProviderForCWD(cfg, cwd)
-	if !ok || err != nil {
-		return nil, ok, err
-	}
-	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(project.Repo))
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
-}
-
-func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, bool, error) {
 	if cfg == nil {
-		return config.ProviderConfig{}, false, nil
+		return nil, false, nil
 	}
-	repo = strings.TrimSpace(repo)
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return config.ProviderConfig{}, false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindForgejo {
-			return config.ProviderConfig{}, false, nil
-		}
-		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
-		if !ok {
-			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", matched.Provider, repo)
-		}
-		return provider, true, nil
-	}
-	return config.ProviderConfig{}, false, nil
-}
-
-func forgejoProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
-	if cfg == nil {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-	}
-	project, matched, err := projectForCWD(*cfg, cwd)
-	if err != nil || !matched {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
-	}
-	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-	}
-	provider, ok := forgejoProviderByID(*cfg, project.Provider)
-	if !ok {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for project %s", project.Provider, project.ID)
-	}
-	if strings.TrimSpace(project.Repo) == "" {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo project %s is missing repo", project.ID)
-	}
-	return project, provider, true, nil
-}
-
-func projectForCWD(cfg config.Config, cwd string) (config.ProjectRefConfig, bool, error) {
-	matches := make([]config.ProjectRefConfig, 0, 1)
-	for _, project := range cfg.Projects {
-		if cwdBelongsToProject(project, cwd) {
-			matches = append(matches, project)
-		}
-	}
-	if len(matches) == 0 {
-		return config.ProjectRefConfig{}, false, nil
-	}
-	if len(matches) > 1 {
-		ids := make([]string, 0, len(matches))
-		for _, project := range matches {
-			ids = append(ids, project.ID)
-		}
-		return config.ProjectRefConfig{}, false, fmt.Errorf("working directory %s matches multiple projects: %s", strings.TrimSpace(cwd), strings.Join(ids, ", "))
-	}
-	return matches[0], true, nil
-}
-
-func cwdBelongsToProject(project config.ProjectRefConfig, cwd string) bool {
-	cwd = filepath.Clean(strings.TrimSpace(cwd))
-	if cwd == "." || cwd == "" {
-		return false
-	}
-	repoPath := filepath.Clean(strings.TrimSpace(project.RepoPath))
-	if repoPath != "." && cwd == repoPath {
-		return true
-	}
-	worktreeRoot := ""
-	if project.WorktreeRoot != nil {
-		worktreeRoot = strings.TrimSpace(*project.WorktreeRoot)
-	}
-	if worktreeRoot == "" {
-		resolved, err := config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
-		if err != nil {
-			return false
-		}
-		worktreeRoot = resolved
-	}
-	worktreeRoot = filepath.Clean(worktreeRoot)
-	relative, err := filepath.Rel(worktreeRoot, cwd)
-	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
-}
-
-func forgejoProviderByID(cfg config.Config, providerID string) (config.ProviderConfig, bool) {
-	providerID = strings.TrimSpace(providerID)
-	if providerID == "" {
-		return config.ProviderConfig{}, false
-	}
-	for _, provider := range cfg.Providers {
-		if provider.ID == providerID {
-			return provider, true
-		}
-	}
-	return config.ProviderConfig{}, false
+	return forge.NewResolver(*cfg).ForgejoForLocation("", cwd)
 }
 
 // planeClientForRepo returns a Plane task-source client for a project whose
@@ -635,77 +485,17 @@ func forgejoProviderByID(cfg config.Config, providerID string) (config.ProviderC
 // matches repo. The second return is false when repo is not a plane project, in
 // which case callers fall through to the GitHub/forgejo path.
 func planeClientForRepo(cfg *config.Config, repo string) (*forge.PlaneClient, bool, error) {
-	provider, codeRepo, ok, err := planeProviderForRepo(cfg, repo)
-	if !ok || err != nil {
-		return nil, ok, err
+	if cfg == nil {
+		return nil, false, nil
 	}
-	client, err := forge.NewPlaneClientFromConfig(provider, codeRepo)
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
+	return forge.NewResolver(*cfg).PlaneForLocation(repo, "")
 }
 
 func planeClientForCWD(cfg *config.Config, cwd string) (*forge.PlaneClient, bool, error) {
-	project, provider, ok, err := planeProjectProviderForCWD(cfg, cwd)
-	if !ok || err != nil {
-		return nil, ok, err
-	}
-	client, err := forge.NewPlaneClientFromConfig(provider, strings.TrimSpace(project.Repo))
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
-}
-
-func planeProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, string, bool, error) {
 	if cfg == nil {
-		return config.ProviderConfig{}, "", false, nil
+		return nil, false, nil
 	}
-	repo = strings.TrimSpace(repo)
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return config.ProviderConfig{}, "", false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindPlane {
-			return config.ProviderConfig{}, "", false, nil
-		}
-		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
-		if !ok {
-			return config.ProviderConfig{}, "", false, fmt.Errorf("plane provider %q not configured for repo %s", matched.Provider, repo)
-		}
-		return provider, strings.TrimSpace(matched.Repo), true, nil
-	}
-	return config.ProviderConfig{}, "", false, nil
-}
-
-func planeProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
-	if cfg == nil {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-	}
-	project, matched, err := projectForCWD(*cfg, cwd)
-	if err != nil || !matched {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
-	}
-	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindPlane {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-	}
-	provider, ok := forgejoProviderByID(*cfg, project.Provider)
-	if !ok {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane provider %q not configured for project %s", project.Provider, project.ID)
-	}
-	if strings.TrimSpace(project.Repo) == "" {
-		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane project %s is missing repo", project.ID)
-	}
-	return project, provider, true, nil
+	return forge.NewResolver(*cfg).PlaneForLocation("", cwd)
 }
 
 func forgeIdentityLogins(identities []forge.Identity) []string {
@@ -775,23 +565,11 @@ func forgejoSummaryCommentMode(cfg *config.Config, repo, cwd string) bool {
 	if cfg == nil {
 		return false
 	}
-	project, matched, err := projectForCWD(*cfg, cwd)
-	if err != nil {
+	selection, matched, err := forge.NewResolver(*cfg).ForLocation(repo, cwd)
+	if err != nil || !matched || !selection.UsesNativePullRequestAPI() {
 		return false
 	}
-	if !matched {
-		repo = strings.TrimSpace(repo)
-		for _, candidate := range cfg.Projects {
-			if strings.EqualFold(strings.TrimSpace(candidate.Repo), repo) {
-				project = candidate
-				matched = true
-				break
-			}
-		}
-	}
-	if !matched || config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
-		return false
-	}
+	project, _ := selection.Project()
 	return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
 }
 
@@ -816,35 +594,36 @@ func forgeNetworkPolicyUsers(users []forge.Identity) []networkpolicy.GitHubUser 
 }
 
 func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
-	return client, ok, err
+	return forgejoClientForLocation(a.config, repo, cwd)
 }
 
 // plane returns a Plane task-source client when repo belongs to a plane-kind
 // project. Issue-side reads/mutations for such projects are served by Plane;
 // pull-request operations are left to the GitHub path (repo is the code repo).
 func (a plannerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, planeClientForCWD, planeClientForRepo)
-	return client, ok, err
+	return planeClientForLocation(a.config, repo, cwd)
 }
 
-func forgeClientForLocation[T any](cfg *config.Config, repo string, cwd []string, byCWD func(*config.Config, string) (*T, bool, error), byRepo func(*config.Config, string) (*T, bool, error)) (*T, bool, error) {
-	if len(cwd) > 0 && strings.TrimSpace(cwd[0]) != "" {
-		client, ok, err := byCWD(cfg, cwd[0])
-		if ok || err != nil {
-			return client, ok, err
-		}
-		// A configured project path is authoritative even when it belongs to
-		// GitHub; do not fall through and select a same-slug Forgejo project.
-		if cfg != nil {
-			for _, project := range cfg.Projects {
-				if cwdBelongsToProject(project, cwd[0]) {
-					return nil, false, nil
-				}
-			}
-		}
+func forgejoClientForLocation(cfg *config.Config, repo string, cwd []string) (*forge.ForgejoClient, bool, error) {
+	if cfg == nil {
+		return nil, false, nil
 	}
-	return byRepo(cfg, repo)
+	location := ""
+	if len(cwd) > 0 {
+		location = cwd[0]
+	}
+	return forge.NewResolver(*cfg).ForgejoForLocation(repo, location)
+}
+
+func planeClientForLocation(cfg *config.Config, repo string, cwd []string) (*forge.PlaneClient, bool, error) {
+	if cfg == nil {
+		return nil, false, nil
+	}
+	location := ""
+	if len(cwd) > 0 {
+		location = cwd[0]
+	}
+	return forge.NewResolver(*cfg).PlaneForLocation(repo, location)
 }
 
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
@@ -1151,8 +930,7 @@ type reviewerGitHubAdapter struct {
 }
 
 func (a reviewerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
-	return client, ok, err
+	return forgejoClientForLocation(a.config, repo, cwd)
 }
 
 func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input reviewer.ListOpenPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
@@ -2090,8 +1868,7 @@ type fixerGitHubAdapter struct {
 }
 
 func (a fixerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
-	return client, ok, err
+	return forgejoClientForLocation(a.config, repo, cwd)
 }
 
 func (a fixerGitHubAdapter) forgejoForCWD(ctx context.Context, cwd string) (*forge.ForgejoClient, bool, error) {
@@ -2302,14 +2079,17 @@ func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input 
 }
 
 func (a fixerGitHubAdapter) ProbeNativeReviewCommentResolution(ctx context.Context, input fixer.ListNativeReviewCommentsInput) (forge.ProbeState, error) {
-	_, provider, ok, err := forgejoProjectProviderForCWD(a.config, input.CWD)
+	if a.config == nil {
+		return forge.ProbeStateSupported, nil
+	}
+	selection, matched, err := forge.NewResolver(*a.config).ForLocation(input.Repo, input.CWD)
 	if err != nil {
 		return forge.ProbeStateUnknown, err
 	}
-	if !ok {
+	if !matched {
 		return forge.ProbeStateSupported, nil
 	}
-	return forge.ProbeForgejoReviewCommentResolution(ctx, provider, input.Repo)
+	return selection.ProbeNativeReviewCommentResolution(ctx)
 }
 
 func (a fixerGitHubAdapter) ResolveNativeReviewComment(ctx context.Context, input fixer.ResolveNativeReviewCommentInput) error {
@@ -2522,16 +2302,14 @@ type workerGitHubAdapter struct {
 }
 
 func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
-	return client, ok, err
+	return forgejoClientForLocation(a.config, repo, cwd)
 }
 
 // plane returns a Plane task-source client when repo belongs to a plane-kind
 // project. The worker reads issues and posts issue-side comments/labels through
 // Plane; pull-request creation stays on the GitHub code repo.
 func (a workerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
-	client, ok, err := forgeClientForLocation(a.config, repo, cwd, planeClientForCWD, planeClientForRepo)
-	return client, ok, err
+	return planeClientForLocation(a.config, repo, cwd)
 }
 
 func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input worker.ListOpenPullRequestsInput) ([]worker.PullRequestSummary, error) {
@@ -2792,18 +2570,6 @@ func (a workerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input wor
 		return fmt.Errorf("github gateway is not configured")
 	}
 	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
-}
-
-// providerHasGitHubPullRequests reports whether a project of this provider kind
-// has its pull requests on GitHub — so the coordinator/fixer PR-follow-up lanes
-// apply. GitHub projects obviously do; Plane projects too (Plane is the task
-// source, but the code + PRs live on the bound GitHub repo).
-func providerHasGitHubPullRequests(kind config.ProviderKind) bool {
-	return kind == config.ProviderKindGitHub || kind == config.ProviderKindPlane
-}
-
-func providerSupportsFixerDiscovery(kind config.ProviderKind) bool {
-	return providerHasGitHubPullRequests(kind) || kind == config.ProviderKindForgejo
 }
 
 // hitlGitHubSettings maps the HITL GitHub config into the worker's settings.
@@ -3132,13 +2898,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	})
 	var gatekeeperRunner gatekeeperScheduler
 	if githubGateway != nil {
+		providers := forge.NewResolver(cfg)
 		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{
 			Repos:  repos,
 			GitHub: githubGateway,
 			Now:    now,
 			PolicyPermitsTarget: func(projectID, repo, baseRefName string) bool {
 				project, ok := runtimeProjectBinding(cfg, projectID)
-				if !ok || !providerHasGitHubPullRequests(config.ResolvedProjectProviderKind(cfg, project)) {
+				if !ok || !providers.ForProject(projectID).Capabilities().GitHubPullRequests {
 					return false
 				}
 				if !strings.EqualFold(strings.TrimSpace(project.Repo), strings.TrimSpace(repo)) {
@@ -3854,7 +3621,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		if project.Archived {
 			continue
 		}
-		providerKind := config.ProviderKindGitHub
+		provider := forge.NewResolver(config.Config{}).ForProject(project.ID)
 		repo := repoFromProjectMetadata(project.MetadataJSON)
 		if input.Config != nil {
 			binding, ok := runtimeProjectBinding(*input.Config, project.ID)
@@ -3864,11 +3631,11 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				}
 				continue
 			}
-			providerKind = config.ResolvedProjectProviderKind(*input.Config, binding)
+			provider = forge.NewResolver(*input.Config).ForProject(project.ID)
 			repo = strings.TrimSpace(binding.Repo)
 		}
 		var snapshot *githubinfra.DiscoverySnapshot
-		if providerKind == config.ProviderKindGitHub {
+		if provider.Capabilities().GitHubCLIPullRequestCreation {
 			snapshot = projectSnapshot(project.ID)
 		}
 		if repo == "" {
@@ -3888,9 +3655,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				}
 				continue
 			}
-			if lane.Supported != nil && !lane.Supported(providerKind) {
+			if lane.Supported != nil && !lane.Supported(provider.Capabilities()) {
 				if input.Logger != nil {
-					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": lane.laneLabel(), "projectId": project.ID, "repo": repo, "provider": providerKind})
+					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": lane.laneLabel(), "projectId": project.ID, "repo": repo, "provider": provider.TaskSourceName()})
 				}
 				continue
 			}

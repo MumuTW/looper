@@ -23,6 +23,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -588,16 +589,11 @@ type Runner struct {
 	hitlGitHub              HITLGitHubSettings
 }
 
-func (r *Runner) providerKindForProject(projectID string) config.ProviderKind {
+func (r *Runner) providerSelectionForProject(projectID string) forge.Selection {
 	if r == nil || r.projectRoleConfig == nil {
-		return config.ProviderKindGitHub
+		return forge.NewResolver(config.Config{}).ForProject(projectID)
 	}
-	for _, project := range r.projectRoleConfig.Projects {
-		if project.ID == projectID {
-			return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project)
-		}
-	}
-	return config.ProviderKindGitHub
+	return forge.NewResolver(*r.projectRoleConfig).ForProject(projectID)
 }
 
 type ProcessResult struct {
@@ -961,7 +957,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	isPlane := config.ProjectProviderKind(*r.projectRoleConfig, projectID) == config.ProviderKindPlane
+	isPlane := r.providerSelectionForProject(projectID).UsesExternalTaskSource()
 	return DiscoveryPolicy{AutoDiscovery: roles.Worker.AutoDiscovery, Labels: append([]string(nil), roles.Worker.Triggers.Labels...), LabelMode: roles.Worker.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Worker.Triggers.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), IsPlane: isPlane, PlaneAssigneeID: strings.TrimSpace(roles.Worker.Triggers.PlaneAssigneeID)}
 }
 
@@ -1465,8 +1461,8 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	providerKind := r.providerKindForProject(input.Project.ID)
-	if providerKind == config.ProviderKindForgejo && work.IssueNumber > 0 && r.github != nil {
+	provider := r.providerSelectionForProject(input.Project.ID)
+	if provider.UsesNativePullRequestAPI() && work.IssueNumber > 0 && r.github != nil {
 		stillAssigned, err := r.workerIssueAssignedToCurrentUser(ctx, work, input.Project.RepoPath)
 		if err != nil {
 			_ = r.repos.Locks.Release(context.Background(), lockKey)
@@ -2229,7 +2225,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
-	if r.providerKindForProject(input.Project.ID) == config.ProviderKindGitHub && !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
+	if r.providerSelectionForProject(input.Project.ID).Capabilities().GitHubCLIPullRequestCreation && !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
 		message := fmt.Sprintf("GitHub CLI unavailable; PR opening is manual for worker %s", input.Loop.ID)
 		checkpoint.SkipReason = message
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
@@ -3701,17 +3697,8 @@ func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPl
 	return prompt, err
 }
 
-func providerKindForProject(cfg config.Config, projectID string) config.ProviderKind {
-	for _, project := range cfg.Projects {
-		if project.ID == projectID {
-			return config.ResolvedProjectProviderKind(cfg, project)
-		}
-	}
-	return config.ProviderKindGitHub
-}
-
 func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock, error) {
-	providerKind := providerKindForProject(instructionConfig, projectID)
+	providerCapabilities := forge.NewResolver(instructionConfig).ForProject(projectID).Capabilities()
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
 		parts = append(parts, fmt.Sprintf("Continue implementing on existing pull request %s#%d.", work.Repo, work.PRNumber))
@@ -3744,7 +3731,7 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		parts = append(parts, instructionBlock.Text)
 	}
 	if allowAgentPRCreation {
-		parts = append(parts, buildAgentPullRequestInstruction(work, providerKind))
+		parts = append(parts, buildAgentPullRequestInstruction(work, providerCapabilities.GitHubCLIPullRequestCreation))
 		parts = append(parts, "Make the necessary code changes, validate them, and ensure the branch and pull request are left in a consistent state.")
 		parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
 	} else {
@@ -3774,14 +3761,14 @@ func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, discl
 	}, "\n")
 }
 
-func buildAgentPullRequestInstruction(work workerInput, providerKind config.ProviderKind) string {
+func buildAgentPullRequestInstruction(work workerInput, githubCLIRequired bool) string {
 	parts := []string{
 		"When the implementation is ready and validation passes, create the pull request yourself using the configured provider tooling.",
 		"Before creating a PR, check whether one already exists for the current branch and avoid duplicates.",
 		"Write a concise, accurate PR title and a structured body that explains the actual changes and why they were made.",
 		fmt.Sprintf("Target base branch: %s.", work.BaseBranch),
 	}
-	if providerKind == config.ProviderKindGitHub {
+	if githubCLIRequired {
 		parts[0] = "When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself."
 	}
 	if work.IssueNumber > 0 {

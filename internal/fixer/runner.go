@@ -1615,7 +1615,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 }
 
 func (r *Runner) isForgejoProject(projectID string) bool {
-	return r.projectRoleConfig != nil && config.ProjectProviderKind(*r.projectRoleConfig, projectID) == config.ProviderKindForgejo
+	return r.projectRoleConfig != nil && forge.NewResolver(*r.projectRoleConfig).ForProject(projectID).UsesNativePullRequestAPI()
 }
 
 func defaultDiscoveryLimit(limit int) int {

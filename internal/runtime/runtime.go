@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -1196,25 +1197,13 @@ func asyncSnapshotQueueEnabled(customSchedulerTick bool, cfg config.Config) bool
 }
 
 func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
+	providers := forge.NewResolver(cfg)
 	for _, project := range cfg.Projects {
-		switch config.ResolvedProjectProviderKind(cfg, project) {
-		case config.ProviderKindGitHub:
-			return true
-		case config.ProviderKindPlane:
-			// Plane is a task-source only: its pull requests live on the
-			// project's GitHub code repo, so the GitHub gateway is required.
+		if providers.ForProject(project.ID).Capabilities().GitHubPullRequests {
 			return true
 		}
 	}
 	return len(cfg.Projects) == 0
-}
-
-func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
-	project, ok := runtimeProjectBinding(cfg, projectID)
-	if ok {
-		return config.ResolvedProjectProviderKind(cfg, project)
-	}
-	return config.ProviderKindGitHub
 }
 
 func runtimeProjectBinding(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {

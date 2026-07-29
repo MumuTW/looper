@@ -1339,15 +1339,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 }
 
 func (r *Runner) forgejoProject(projectID string) bool {
-	if r.projectRoleConfig == nil {
-		return false
-	}
-	for _, project := range r.projectRoleConfig.Projects {
-		if strings.TrimSpace(project.ID) == strings.TrimSpace(projectID) {
-			return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project) == config.ProviderKindForgejo
-		}
-	}
-	return false
+	return r.projectRoleConfig != nil && forge.NewResolver(*r.projectRoleConfig).ForProject(projectID).UsesNativePullRequestAPI()
 }
 
 func reviewRequestRequiredForCandidate(policy DiscoveryPolicy, labels []string) bool {
@@ -1429,14 +1421,8 @@ func (r *Runner) forgejoCommentOnlyPublishForProject(projectID string) bool {
 	if r.projectRoleConfig == nil {
 		return false
 	}
-	projectID = strings.TrimSpace(projectID)
-	for _, project := range r.projectRoleConfig.Projects {
-		if strings.TrimSpace(project.ID) != projectID {
-			continue
-		}
-		return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project) == config.ProviderKindForgejo && config.ProjectRoleConfigs(*r.projectRoleConfig, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
-	}
-	return false
+	selection := forge.NewResolver(*r.projectRoleConfig).ForProject(projectID)
+	return selection.UsesNativePullRequestAPI() && config.ProjectRoleConfigs(*r.projectRoleConfig, projectID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
 }
 
 func isSelfAuthoredPR(author string, currentLogin string, policy DiscoveryPolicy) bool {
@@ -6563,16 +6549,6 @@ func reviewerAgentSideGitHubFetchContract() string {
 	}, "\n")
 }
 
-func reviewerProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
-	projectID = strings.TrimSpace(projectID)
-	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.ID) == projectID {
-			return config.ResolvedProjectProviderKind(cfg, project)
-		}
-	}
-	return config.ProviderKindGitHub
-}
-
 func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
@@ -6581,7 +6557,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	forgejoNative := reviewerProjectProviderKind(instructionConfig, projectID) == config.ProviderKindForgejo && !commentOnlyPublish
+	forgejoNative := forge.NewResolver(instructionConfig).ForProject(projectID).UsesNativePullRequestAPI() && !commentOnlyPublish
 	forgeName := "GitHub"
 	if forgejoNative {
 		forgeName = "Forgejo"
