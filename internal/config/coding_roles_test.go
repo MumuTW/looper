@@ -198,6 +198,31 @@ enabled = true
 	}
 }
 
+func TestNormalizeRejectsGatekeeperPolicyOverridesWithoutInventingLegacyPath(t *testing.T) {
+	t.Parallel()
+
+	partial := mustDecodeTOML(t, `
+[roles.coding.gatekeeper]
+priority = 44
+instructions = "not supported"
+`)
+	_, err := Normalize(t.TempDir(), partial)
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("Normalize() error = %T %v, want ConfigValidationError", err, err)
+	}
+	for _, issue := range validationErr.Issues {
+		if issue.Path != "roles.coding.gatekeeper.instructions" {
+			continue
+		}
+		if strings.Contains(issue.Message, "roles.gatekeeper") || !strings.Contains(issue.Message, "compiled in") {
+			t.Fatalf("gatekeeper validation message = %q, want compiled-in policy guidance without a nonexistent roles.gatekeeper path", issue.Message)
+		}
+		return
+	}
+	t.Fatalf("validation issues = %#v, want gatekeeper instructions issue", validationErr.Issues)
+}
+
 // An unset priority must not default to zero: zero sorts ahead of every
 // shipped role, silently claiming the first lane.
 func TestNormalizeRejectsCustomRoleWithoutPriority(t *testing.T) {

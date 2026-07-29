@@ -479,12 +479,14 @@ Coding roles can also be authored directly as `[roles.coding.<name>]` sections. 
 
 Precedence rules when both forms are present:
 
-- For a shipped role name (`planner`, `worker`, `reviewer`, `fixer`), only `priority` may be set — it overrides the compiled-in lane priority. Discovery, instructions, and agent keep coming from the legacy `roles.<name>.*` section; setting them under `roles.coding.<name>` is a load-time error, because those consumers still read the named section and the values would be inert.
+- For a shipped role name (`planner`, `worker`, `reviewer`, `fixer`, `gatekeeper`), only `priority` may be set — it overrides the compiled-in lane priority. Discovery, instructions, and agent for the four agent-backed roles keep coming from the legacy `roles.<name>.*` section; Gatekeeper's policy is compiled in. Setting those fields under `roles.coding.<name>` is a load-time error because the values would be inert.
 - `roles.coding.coordinator` is rejected — Coordinator is not a coding role.
 - Any other name authors a custom role. `priority` and `discovery.source` are required, fields that belong to the other work source are rejected (an issue-source role may not set `includeDrafts`, and so on), and discovery fields merge field-by-field across config layers with later layers winning.
 - `roles.coding.*` is global-only: `projects[].roles.coding` is rejected.
 
 A custom role with no compiled-in runner is registered and ordered but its discovery lane is skipped — the section is the configuration half of adding a role; the runner half still ships with the binary. `roles.coding.*` edits are restart-bound.
+
+When `labelMode` is omitted it defaults to `all`. Cross-source fields are rejected even when explicitly set to `false` or an empty string, so configuration never accepts a key that the selected source would ignore.
 
 ```toml
 # Reorder lanes: run worker before reviewer.

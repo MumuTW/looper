@@ -405,19 +405,19 @@ func resolveCodingRoles(legacy map[string]CodingRoleConfig, authored map[string]
 			if role.Discovery != nil {
 				issues = append(issues, ValidationIssue{
 					Path:    pathPrefix + ".discovery",
-					Message: "does not apply to the shipped " + name + " role; configure roles." + name + ".* instead (only priority may be set here)",
+					Message: shippedCodingRoleFieldMessage(name, "discovery"),
 				})
 			}
 			if role.Instructions != nil {
 				issues = append(issues, ValidationIssue{
 					Path:    pathPrefix + ".instructions",
-					Message: "does not apply to the shipped " + name + " role; configure roles." + name + ".instructions instead (only priority may be set here)",
+					Message: shippedCodingRoleFieldMessage(name, "instructions"),
 				})
 			}
 			if role.Agent != nil {
 				issues = append(issues, ValidationIssue{
 					Path:    pathPrefix + ".agent",
-					Message: "does not apply to the shipped " + name + " role; configure roles." + name + ".agent instead (only priority may be set here)",
+					Message: shippedCodingRoleFieldMessage(name, "agent"),
 				})
 			}
 			if role.Priority != nil {
@@ -460,6 +460,13 @@ func resolveCodingRoles(legacy map[string]CodingRoleConfig, authored map[string]
 		return nil, issues
 	}
 	return resolved, nil
+}
+
+func shippedCodingRoleFieldMessage(name, field string) string {
+	if name == RoleGatekeeper {
+		return "does not apply to the shipped gatekeeper role; its policy is compiled in (only priority may be set here)"
+	}
+	return "does not apply to the shipped " + name + " role; configure roles." + name + "." + field + " instead (only priority may be set here)"
 }
 
 func roleDiscoveryConfigFromPartial(partial *PartialRoleDiscoveryConfig) RoleDiscoveryConfig {
