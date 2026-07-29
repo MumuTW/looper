@@ -23,6 +23,11 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		return Config{}, err
 	}
 
+	// Project the named role structs onto the role map last, so it reflects
+	// the fully merged config rather than any single layer. Consumers read
+	// the map; the named fields are the legacy input shape.
+	config.Roles.Coding = CodingRolesFromLegacy(config.Roles)
+
 	return config, nil
 }
 

@@ -66,16 +66,56 @@ type CodingRoleConfig struct {
 	Discovery    RoleDiscoveryConfig `json:"discovery"`
 	Instructions string              `json:"instructions,omitempty"`
 	Agent        *RoleAgentConfig    `json:"agent,omitempty"`
+
+	// Priority orders this role's discovery lane within a scheduler tick.
+	// Lower runs first. Order is load-bearing rather than cosmetic: a claim
+	// phase runs between consecutive lanes, so an earlier role gets first
+	// call on the free run slots. A new role declares where it belongs
+	// instead of inheriting whatever order a map happened to produce.
+	Priority int `json:"priority"`
 }
 
-// CodingRoleNames returns the configured coding role names in a stable order
-// so scheduler lanes, validation errors, and logs stay deterministic.
+// Lane priorities for the roles looper ships with. Spaced so a custom role
+// can be slotted between two of them without renumbering.
+const (
+	PriorityPlanner     = 10
+	PriorityCoordinator = 20
+	PriorityReviewer    = 30
+	PriorityFixer       = 40
+	PriorityWorker      = 50
+)
+
+// EffectiveCodingRoles returns the role map, projecting it from the legacy
+// named fields when it is empty.
+//
+// Normalize populates the map, but a Config assembled directly — tests, and
+// any caller that builds the struct rather than loading a file — would
+// otherwise present zero roles, which reads as "discovery is off" instead of
+// "this config never went through normalization". Silently running no lanes
+// is a far worse failure than projecting on demand.
+func EffectiveCodingRoles(roles RoleConfigs) map[string]CodingRoleConfig {
+	if len(roles.Coding) > 0 {
+		return roles.Coding
+	}
+	return CodingRolesFromLegacy(roles)
+}
+
+// CodingRoleNames returns the configured coding role names ordered by lane
+// priority, falling back to the name so equal priorities stay deterministic
+// across runs rather than following Go's randomized map iteration.
 func CodingRoleNames(roles RoleConfigs) []string {
-	names := make([]string, 0, len(roles.Coding))
-	for name := range roles.Coding {
+	effective := EffectiveCodingRoles(roles)
+	names := make([]string, 0, len(effective))
+	for name := range effective {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	sort.Slice(names, func(i, j int) bool {
+		left, right := effective[names[i]], effective[names[j]]
+		if left.Priority != right.Priority {
+			return left.Priority < right.Priority
+		}
+		return names[i] < names[j]
+	})
 	return names
 }
 
@@ -93,6 +133,7 @@ func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 	out := make(map[string]CodingRoleConfig, 4)
 
 	out[CodingRolePlanner] = CodingRoleConfig{
+		Priority:     PriorityPlanner,
 		Instructions: roles.Planner.Instructions,
 		Agent:        roles.Planner.Agent,
 		Discovery: RoleDiscoveryConfig{
@@ -106,6 +147,7 @@ func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 	}
 
 	out[CodingRoleWorker] = CodingRoleConfig{
+		Priority:     PriorityWorker,
 		Instructions: roles.Worker.Instructions,
 		Agent:        roles.Worker.Agent,
 		Discovery: RoleDiscoveryConfig{
@@ -119,6 +161,7 @@ func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 	}
 
 	out[CodingRoleFixer] = CodingRoleConfig{
+		Priority:     PriorityFixer,
 		Instructions: roles.Fixer.Instructions,
 		Agent:        roles.Fixer.Agent,
 		Discovery: RoleDiscoveryConfig{
@@ -132,6 +175,7 @@ func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 	}
 
 	out[CodingRoleReviewer] = CodingRoleConfig{
+		Priority:     PriorityReviewer,
 		Instructions: roles.Reviewer.Instructions,
 		Agent:        roles.Reviewer.Agent,
 		Discovery: RoleDiscoveryConfig{

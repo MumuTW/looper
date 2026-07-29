@@ -595,7 +595,12 @@ type RoleConfigs struct {
 	// authority the scheduler and agent resolution read from; the named
 	// fields below are the legacy shape, retained only until the remaining
 	// consumers are migrated off them.
-	Coding map[string]CodingRoleConfig `json:"coding,omitempty"`
+	//
+	// Not serialized: while it is still derived from the named fields by
+	// Normalize, emitting it would duplicate them in every config payload
+	// and in the frozen parity fixtures. Once roles are authored directly
+	// as TOML sections this becomes real input and gains a JSON tag.
+	Coding map[string]CodingRoleConfig `json:"-"`
 
 	Planner     PlannerRoleConfig     `json:"planner"`
 	Reviewer    ReviewerRoleConfig    `json:"reviewer"`

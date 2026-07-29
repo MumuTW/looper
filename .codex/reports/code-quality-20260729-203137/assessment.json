@@ -1,0 +1,327 @@
+{
+  "title": "Looper Code Quality Audit",
+  "repository": {
+    "name": "looper",
+    "path": "/Users/johnson/dev/mine/looper",
+    "revision": "strip/core-only @ dad443ce00404c6a9401fc3b5f80ea888820ab21",
+    "scope": "Entire tracked repository: Go daemon and libraries, React/Vite dashboard, tests, scripts, documentation, and release configuration",
+    "generated_at": "2026-07-29T20:42:00+08:00"
+  },
+  "summary": {
+    "verdict": "Overall score 59/100 (high maintenance risk): the repository has unusually strong domain documentation, a passing full CI-equivalent verification suite, and broad automated coverage, but it exposes an unauthenticated network path on wildcard binds, permits unconstrained spec file reads, and concentrates core behavior in several very large, high-complexity modules.",
+    "strengths": [
+      "The repository documents its domain vocabulary, authorities, state transitions, lifecycle rules, and architectural decisions in CONTEXT.md and ADRs instead of leaving those contracts implicit.",
+      "Verification breadth is substantial: 252 test files were discovered, the full CI-equivalent Go verification passed, and all 97 dashboard tests plus the production dashboard build passed.",
+      "Process and secret handling include concrete safety measures: bounded command output, process-group containment, context cancellation, restricted temporary secret files, trusted proxy argument validation, and constant-time token comparison.",
+      "The daemon exposes health, status, event-log, and runtime-admission concepts that support production diagnosis."
+    ],
+    "risks": [
+      "With server.host set to a wildcard address and authMode=none, a remote client can spoof a loopback Host header and pass authorization for ordinary API routes; a focused probe returned HTTP 200 from a non-loopback RemoteAddr.",
+      "Worker specPath handling permits absolute paths, parent traversal, symlink escape, and unbounded reads before including the contents in an external-agent prompt.",
+      "Twenty-four production Go files exceed 1,000 lines and several central functions have cyclomatic complexity between 76 and 139, increasing change coupling and review cost.",
+      "Two focused race-detector runs report races in test fixtures, preventing the race detector from acting as a clean regression gate."
+    ],
+    "limitations": [
+      "This was a static and automated repository audit, not a production load test, penetration test, or manual validation against live GitHub, Feishu, or model-provider accounts.",
+      "Performance was assessed from resource-management code and complexity evidence; no representative workload or latency/throughput target was available.",
+      "The branch changed during the audit from d956657 through edfe055 to dad443c. Metrics were refreshed by the concurrent work, and the full verification suite was rerun successfully after cmd/looper was restored. Additional uncommitted role-registry work appeared after the snapshot and is intentionally excluded from the findings.",
+      "The pnpm advisory is present in the resolved dependency graph, but reachability is inferred to be unlikely because the dashboard is a Vite SPA and no unstable React Server Components APIs were found."
+    ]
+  },
+  "dimensions": [
+    {
+      "id": "correctness",
+      "name": "Correctness and reliability",
+      "weight": 20,
+      "status": "assessed",
+      "score": 4,
+      "confidence": "high",
+      "summary": "The CI-equivalent verification suite, release build, and focused packages pass, with extensive invariant and failure-path tests; remaining correctness concerns are localized rather than systemic.",
+      "evidence": [
+        "scripts/verify.sh — gofmt, go vet, go test ./..., and the release-ldflags build all passed on dad443c.",
+        "internal/e2e and internal/e2e/githubcontract passed after the minimal cmd/looper control CLI was restored.",
+        "CONTEXT.md and package tests encode lifecycle authorities, state transitions, retry behavior, containment, and failure semantics.",
+        "The focused race run exposed two test-fixture races, but did not demonstrate a production data race."
+      ]
+    },
+    {
+      "id": "understandability",
+      "name": "Understandability",
+      "weight": 15,
+      "status": "assessed",
+      "score": 3,
+      "confidence": "high",
+      "summary": "Domain language and architectural intent are documented well, but oversized central files and extreme branch complexity make local reasoning expensive.",
+      "evidence": [
+        "CONTEXT.md — explicitly defines domain vocabulary, state authorities, runtime lifecycle, and invariants.",
+        "docs/adr — records architectural choices and their tradeoffs.",
+        "internal/api/handler.go — 7,547 lines and 231 function declarations combine many API concerns.",
+        "gocyclo measured complexity 139 for config.ValidateWithOptions and 118 for config.parseCLIArgs."
+      ]
+    },
+    {
+      "id": "maintainability",
+      "name": "Maintainability and change safety",
+      "weight": 15,
+      "status": "assessed",
+      "score": 2,
+      "confidence": "high",
+      "summary": "Package boundaries are meaningful, but concentrated runner, API, runtime, storage, and gateway modules create broad change surfaces and make cross-cutting contract changes expensive.",
+      "evidence": [
+        "metrics.json — 45 source-like files exceed 1,000 lines; 24 of those are production Go files.",
+        "internal/fixer/runner.go — 8,998 lines and 357 function declarations.",
+        "internal/reviewer/runner.go — 7,283 lines and 322 function declarations.",
+        "Several runner steps combine state-machine transitions, persistence, worktree operations, provider I/O, recovery, and prompt construction in the same module."
+      ]
+    },
+    {
+      "id": "design",
+      "name": "Design and modularity",
+      "weight": 15,
+      "status": "assessed",
+      "score": 3,
+      "confidence": "medium",
+      "summary": "The top-level domain, infrastructure, storage, runtime, and role packages are sensibly separated, but a partially introduced role registry currently creates two claimed configuration authorities.",
+      "evidence": [
+        "internal/config/types.go:593 — RoleConfigs.Coding is documented as the scheduler and agent-resolution authority.",
+        "internal/config/normalize.go:9 — normalization does not populate or reconcile RoleConfigs.Coding.",
+        "internal/runtime/discovery_lanes.go:59 — discovery still hardcodes the five role lanes rather than deriving them from the new registry.",
+        "Internal packages isolate storage, provider gateways, role runners, runtime orchestration, and HTTP delivery at a useful architectural level."
+      ]
+    },
+    {
+      "id": "testability",
+      "name": "Testability and verification",
+      "weight": 15,
+      "status": "assessed",
+      "score": 3,
+      "confidence": "high",
+      "summary": "The test investment is broad and the full CI-equivalent suite passes, but two test-fixture races still prevent a clean race-detection gate.",
+      "evidence": [
+        "metrics.json — 252 test files and 244 non-test source files were discovered.",
+        "web/dashboard — 12 Vitest files and 97 tests passed.",
+        "go test ./internal/config ./internal/runtime passed after the concurrent runtime refactor.",
+        "internal/runtime/webhook_runtime_test.go:768 and internal/agent/executor_test.go:1494 participate in two independently reported race-detector failures."
+      ]
+    },
+    {
+      "id": "security",
+      "name": "Security",
+      "weight": 10,
+      "status": "assessed",
+      "score": 2,
+      "confidence": "high",
+      "summary": "Several defensive controls are strong and govulncheck found no known Go vulnerabilities, but the verified wildcard-bind authorization weakness and unconstrained spec file read are material data and control-plane risks.",
+      "evidence": [
+        "internal/api/browser_guard.go:55 — an Origin-less request is accepted when its request-controlled Host looks loopback.",
+        "internal/api/handler.go:835 — authMode other than local-token returns authorized after the Host check for ordinary routes.",
+        "A focused httptest probe used RemoteAddr 203.0.113.10 with Host localhost against wildcard bind/authMode=none and received HTTP 200 from /api/v1/version.",
+        "internal/worker/runner.go:3687 — readSpecBlock accepts absolute and escaping paths and reads the entire file.",
+        "govulncheck ./... reported no vulnerabilities."
+      ]
+    },
+    {
+      "id": "performance",
+      "name": "Performance and resource behavior",
+      "weight": 5,
+      "status": "assessed",
+      "score": 3,
+      "confidence": "medium",
+      "summary": "The code shows intentional process and output bounding, but no workload measurements were available and spec file ingestion is unbounded.",
+      "evidence": [
+        "internal/infra/shell/runner.go — bounds captured output, propagates context cancellation, and drains/kills process groups.",
+        "internal/worker/runner.go:3695 — os.ReadFile loads an operator-supplied path without a byte limit.",
+        "No benchmark, load-test result, or production latency budget was found for the audited snapshot."
+      ]
+    },
+    {
+      "id": "operability",
+      "name": "Operability and consistency",
+      "weight": 5,
+      "status": "assessed",
+      "score": 3,
+      "confidence": "high",
+      "summary": "Operational concepts and diagnostics are substantial, but background HTTP serving can fail silently and no runtime propagation exists for that failure.",
+      "evidence": [
+        "internal/api/server.go:52 — non-shutdown Serve errors are discarded without logging, health-state propagation, or daemon termination.",
+        "Runtime admission, health, status, structured logs, and event-log facilities provide multiple diagnostic surfaces.",
+        "scripts/verify.sh provides a single CI-equivalent local verification entry point and passed on the frozen snapshot."
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "id": "CQ-001",
+      "title": "Require peer authentication or loopback locality on wildcard binds",
+      "severity": "high",
+      "confidence": "high",
+      "category": "security",
+      "file": "internal/api/handler.go",
+      "line": 813,
+      "evidence": "For authMode=none, authorization relies on Host/Origin validation and then returns nil. An Origin-less remote request can choose Host localhost. A focused probe configured host 0.0.0.0 and authMode none, set RemoteAddr to 203.0.113.10 and Host to localhost, and received HTTP 200 from /api/v1/version.",
+      "impact": "A daemon bound to a LAN/public interface without local-token auth can expose read and most mutation APIs to remote non-browser clients. Only PATCH /config receives a separate direct-loopback restriction.",
+      "recommendation": "Reject wildcard or non-loopback binds unless token authentication is enabled, or enforce actual RemoteAddr loopback for every ordinary route when authMode=none. Never use Host as proof of client locality. Add regression tests using a remote peer address plus a spoofed loopback Host for reads and mutations.",
+      "status": "verified"
+    },
+    {
+      "id": "CQ-002",
+      "title": "Confine and bound worker spec file reads",
+      "severity": "medium",
+      "confidence": "high",
+      "category": "security",
+      "file": "internal/worker/runner.go",
+      "line": 3687,
+      "evidence": "readSpecBlock accepts absolute paths, joins relative paths without rejecting parent traversal, does not resolve symlink escape, and calls os.ReadFile without a size cap before embedding the result in the worker prompt.",
+      "impact": "A caller able to enqueue worker metadata can disclose any daemon-readable file to the configured model provider or consume excessive memory with a large file. The impact compounds with CQ-001 on exposed deployments.",
+      "recommendation": "Accept only repository-relative paths; resolve and compare the canonical target to the canonical repository root; reject absolute, escaping, and non-regular targets; read through an explicit byte limit; and test traversal, symlink, and oversized-file cases.",
+      "status": "verified"
+    },
+    {
+      "id": "CQ-003",
+      "title": "Eliminate test-fixture races so race detection becomes a usable gate",
+      "severity": "medium",
+      "confidence": "high",
+      "category": "testability",
+      "file": "internal/runtime/webhook_runtime_test.go",
+      "line": 768,
+      "evidence": "The focused race run reports one race between cleanup mutation of a webhook liveness probe and a background lifecycle read, and a second race between an executor test callback appending to a slice and the test polling its length at internal/agent/executor_test.go:1507.",
+      "impact": "Race output cannot distinguish new production regressions from known test harness noise, so teams are likely to stop using or trusting the race detector.",
+      "recommendation": "Protect test-double state with a mutex/atomic or synchronize goroutine shutdown, and replace shared-slice polling with a channel or locked accessor. Add the focused race command to CI after both fixtures are deterministic.",
+      "status": "verified"
+    },
+    {
+      "id": "CQ-004",
+      "title": "Finish or clearly stage the coding-role registry migration",
+      "severity": "medium",
+      "confidence": "high",
+      "category": "design",
+      "file": "internal/config/types.go",
+      "line": 593,
+      "evidence": "RoleConfigs.Coding is documented as the scheduler and agent-resolution authority, but normalization does not populate it, partial config cannot express it, validation still targets legacy named roles, and runtime discovery builds a hardcoded five-lane list.",
+      "impact": "Two representations can drift while comments claim one is authoritative, making future role additions or source-specific behavior appear configured while runtime consumers continue using legacy fields.",
+      "recommendation": "Complete the migration as one contract change: expose a source-aware partial schema, normalize and validate into one canonical registry, and have scheduler/agent consumers iterate it. If the feature is intentionally staged, mark it internal/non-authoritative until consumers migrate.",
+      "status": "verified"
+    },
+    {
+      "id": "CQ-005",
+      "title": "Decompose high-change mega-modules around stable responsibilities",
+      "severity": "medium",
+      "confidence": "high",
+      "category": "maintainability",
+      "file": "internal/api/handler.go",
+      "line": 274,
+      "evidence": "There are 24 production Go files over 1,000 lines. handler.go has 7,547 lines and 231 functions; fixer/runner.go has 8,998 lines and 357 functions; reviewer/runner.go has 7,283 lines and 322 functions. gocyclo reports central function complexity up to 139, including serveHTTP at 78.",
+      "impact": "Unrelated changes share the same files and branch-heavy control flows, increasing merge conflicts, review burden, regression radius, and the cost of proving lifecycle invariants.",
+      "recommendation": "Use characterization tests, then extract API route families and use cases, runner step policies/state transitions, and configuration parsing/validation phases behind explicit contracts. Preserve cohesive package-level flows rather than splitting mechanically by line count.",
+      "status": "verified"
+    },
+    {
+      "id": "CQ-006",
+      "title": "Propagate background HTTP serve failures",
+      "severity": "low",
+      "confidence": "high",
+      "category": "operability",
+      "file": "internal/api/server.go",
+      "line": 52,
+      "evidence": "The background goroutine ignores every server.Serve error except recognizing normal shutdown; Start reports only listener creation errors.",
+      "impact": "An unexpected accept/serve failure can remove the API surface while the daemon remains alive without an actionable log or unhealthy state.",
+      "recommendation": "Send unexpected Serve errors to the runtime supervisor or structured logger, transition health/admission state, and choose an explicit restart or daemon-shutdown policy. Cover the path with an injected failing listener.",
+      "status": "verified"
+    },
+    {
+      "id": "CQ-007",
+      "title": "Resolve or document the React Router production advisory",
+      "severity": "low",
+      "confidence": "medium",
+      "category": "security",
+      "file": "web/dashboard/package.json",
+      "line": 16,
+      "evidence": "pnpm audit --prod reports GHSA-qwww-vcr4-c8h2 against resolved react-router 7.18.1. The advisory affects unstable React Server Components APIs; this repository uses a Vite SPA and no such APIs were found.",
+      "impact": "The current application path is probably not reachable, but the high-severity dependency alert remains noisy and could become applicable if the rendering architecture changes.",
+      "recommendation": "Upgrade to a patched compatible React Router release when available in the supported range, or record a time-bounded non-applicability decision with the no-RSC evidence and keep dependency monitoring enabled.",
+      "status": "risk"
+    }
+  ],
+  "checks": [
+    {
+      "command": "./scripts/verify.sh",
+      "status": "passed",
+      "summary": "gofmt, go vet, go test ./..., all integration/E2E packages, and the release-ldflags build passed on dad443c."
+    },
+    {
+      "command": "go build ./...",
+      "status": "passed",
+      "summary": "All currently discoverable Go packages built successfully."
+    },
+    {
+      "command": "gofmt -l .",
+      "status": "passed",
+      "summary": "No formatting differences were reported on the final audited snapshot."
+    },
+    {
+      "command": "go vet ./...",
+      "status": "passed",
+      "summary": "Go vet completed without diagnostics."
+    },
+    {
+      "command": "go test ./internal/config ./internal/runtime",
+      "status": "passed",
+      "summary": "Focused config and runtime suites passed after the concurrent role/runtime refactor."
+    },
+    {
+      "command": "pnpm install --frozen-lockfile && pnpm test && pnpm run build",
+      "status": "passed",
+      "summary": "Lockfile install passed; 12 Vitest files and 97 tests passed; TypeScript and Vite production build succeeded."
+    },
+    {
+      "command": "go test -race ./internal/runtime ./internal/storage ./internal/api ./internal/agent ./internal/forge ./internal/infra/shell",
+      "status": "failed",
+      "summary": "Storage, API, forge, and shell passed; runtime and agent tests reported two test-fixture data races."
+    },
+    {
+      "command": "go run golang.org/x/vuln/cmd/govulncheck@latest ./...",
+      "status": "passed",
+      "summary": "No known Go vulnerabilities were found."
+    },
+    {
+      "command": "pnpm audit --prod",
+      "status": "failed",
+      "summary": "One high advisory was reported for React Router 7.18.1; the affected unstable RSC mode was not found in this Vite SPA."
+    },
+    {
+      "command": "go run github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0 -top 20 -avg internal cmd",
+      "status": "passed",
+      "summary": "Average complexity was 6.08; the top functions ranged from 65 to 139."
+    },
+    {
+      "command": "focused authMode=none wildcard-bind httptest probe",
+      "status": "failed",
+      "summary": "A non-loopback RemoteAddr with Host localhost received HTTP 200 from /api/v1/version, confirming CQ-001."
+    }
+  ],
+  "priorities": [
+    {
+      "horizon": "Now",
+      "items": [
+        "CQ-001 — close wildcard/non-loopback authMode=none access and add remote-peer spoofed-Host regression tests.",
+        "CQ-002 — confine specPath to the repository and enforce an explicit read-size limit."
+      ]
+    },
+    {
+      "horizon": "Next",
+      "items": [
+        "CQ-003 — remove both test-fixture races, then establish the focused race command as a required gate.",
+        "CQ-004 — complete or explicitly stage the role-registry migration so there is one configuration authority.",
+        "CQ-006 — propagate unexpected HTTP serve failures into logs, health, and supervision."
+      ]
+    },
+    {
+      "horizon": "Later",
+      "items": [
+        "CQ-005 — incrementally extract stable route, state-transition, and validation responsibilities from the largest modules with characterization tests.",
+        "CQ-007 — upgrade React Router or document and periodically revalidate the RSC non-applicability decision.",
+        "Add representative performance budgets and load tests before assigning a higher-confidence resource/performance score."
+      ]
+    }
+  ]
+}

@@ -126,6 +126,44 @@ func TestValidateRoleDiscoveryRejectsCrossSourceFields(t *testing.T) {
 	}
 }
 
+// Lane order comes from priority, not the role name. A custom role must be
+// able to sit between two shipped roles, which alphabetical ordering could
+// never express.
+func TestCodingRoleNamesOrdersByPriority(t *testing.T) {
+	roles := RoleConfigs{Coding: map[string]CodingRoleConfig{
+		"worker":   {Priority: PriorityWorker},
+		"planner":  {Priority: PriorityPlanner},
+		"auditor":  {Priority: PriorityReviewer - 1},
+		"fixer":    {Priority: PriorityFixer},
+		"reviewer": {Priority: PriorityReviewer},
+	}}
+
+	got := CodingRoleNames(roles)
+	want := []string{"planner", "auditor", "reviewer", "fixer", "worker"}
+
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("lane order = %v, want %v", got, want)
+		}
+	}
+}
+
+// A Config that never went through Normalize must still yield the shipped
+// roles: presenting zero roles would read as "discovery is off" rather than
+// "this config was assembled directly".
+func TestEffectiveCodingRolesFallsBackToLegacy(t *testing.T) {
+	roles := RoleConfigs{Planner: PlannerRoleConfig{AutoDiscovery: true}}
+
+	effective := EffectiveCodingRoles(roles)
+
+	if len(effective) != 4 {
+		t.Fatalf("got %d roles, want the 4 shipped roles", len(effective))
+	}
+	if !effective[CodingRolePlanner].Discovery.Enabled {
+		t.Errorf("planner autoDiscovery was not carried into the fallback")
+	}
+}
+
 func TestCodingRoleNamesIsSorted(t *testing.T) {
 	roles := RoleConfigs{Coding: map[string]CodingRoleConfig{
 		"worker": {}, "planner": {}, "auditor": {},
