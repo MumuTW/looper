@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/version"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
@@ -133,6 +134,10 @@ type contractFixture struct {
 	config        config.Config
 	stoppedLoopID string
 	stoppedAll    bool
+	// controlDelay makes the daemon's lifecycle hooks take real time, which is
+	// what a stop of an unresponsive agent does. Set it before the fixture
+	// serves anything.
+	controlDelay time.Duration
 }
 
 // assertRouteResolves checks the two failures a routing bug produces: the path
@@ -220,16 +225,25 @@ func newContractFixture(t *testing.T) *contractFixture {
 	fixture.handler = api.NewHandler(api.Context{
 		Config:  cfg,
 		Runtime: runtime,
-		StopLoop: func(_ context.Context, loopID string, _ string) (any, error) {
+		StopLoop: func(ctx context.Context, loopID string, _ string) (any, error) {
+			if err := fixture.workFor(ctx); err != nil {
+				return nil, err
+			}
 			fixture.stoppedLoopID = loopID
 			return map[string]any{"stopped": true}, nil
 		},
 		CloseLoop: func(_ context.Context, loopID string, _ string) (any, error) {
 			return map[string]any{"closed": loopID}, nil
 		},
-		StopAll: func(context.Context, string) (any, error) {
+		StopAll: func(ctx context.Context, _ string) (any, error) {
+			if err := fixture.workFor(ctx); err != nil {
+				return nil, err
+			}
 			fixture.stoppedAll = true
-			return map[string]any{"stopped": 0}, nil
+			// The real bulk stop answers with counters the CLI reads to decide
+			// whether a 200 was actually a full stop; a bare object would make
+			// every stop-all here fail on "missing summary" instead.
+			return map[string]any{"summary": map[string]any{"total": 0, "stopped": 0, "pausedOnly": 0, "failed": 0}}, nil
 		},
 		TakeoverLoop: func(_ context.Context, loopID string, _ string) (api.TakeoverResult, error) {
 			return api.TakeoverResult{LoopID: loopID}, nil
@@ -323,6 +337,194 @@ func TestRetryReachesTheDaemonRoutes(t *testing.T) {
 	if strings.Contains(stderr.String(), "Unknown route") {
 		t.Fatalf("retry hit an unknown route: %s", stderr.String())
 	}
+}
+
+// workFor makes a lifecycle hook occupy the daemon for controlDelay, aborting
+// if the client hangs up first. The daemon runs these on the request context,
+// so a client-side deadline really does cut a stop short.
+func (f *contractFixture) workFor(ctx context.Context) error {
+	if f.controlDelay <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(f.controlDelay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// serveContract exposes the fixture's real handler over HTTP and records what
+// the CLI sent, so a test can assert on the request the daemon actually
+// received rather than on one the test invented.
+func serveContract(t *testing.T, fixture *contractFixture) (configPath string, seen func() map[string]string) {
+	t.Helper()
+
+	var mu sync.Mutex
+	bodies := map[string]string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(payload))
+
+		mu.Lock()
+		bodies[r.Method+" "+r.URL.Path] = string(payload)
+		mu.Unlock()
+
+		recorder := httptest.NewRecorder()
+		fixture.handler.ServeHTTP(recorder, r)
+		for key, values := range recorder.Header() {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(recorder.Code)
+		_, _ = w.Write(recorder.Body.Bytes())
+	}))
+	t.Cleanup(server.Close)
+
+	configPath = writeContractConfig(t, server.URL)
+	t.Setenv("HOME", t.TempDir())
+	return configPath, func() map[string]string {
+		mu.Lock()
+		defer mu.Unlock()
+		out := map[string]string{}
+		for key, value := range bodies {
+			out[key] = value
+		}
+		return out
+	}
+}
+
+// TestVersionFlagDoesNotSwallowOperands pins the half of --version handling a
+// unit test on the parser cannot see: the operand still reaches the daemon.
+//
+// The check used to scan the whole command line, so an answer of "--version"
+// printed the version and the loop was never answered — a silent no-op rather
+// than an error the operator could act on. `--` is how the CLI already
+// documents passing a dash-leading answer, and it is what the old scan ignored.
+func TestVersionFlagDoesNotSwallowOperands(t *testing.T) {
+	fixture := newContractFixture(t)
+	configPath, seen := serveContract(t, fixture)
+
+	stdout := &bytes.Buffer{}
+	run([]string{"--config", configPath, "respond", "12", "--", "--version"}, strings.NewReader(""), stdout, io.Discard)
+
+	body, ok := seen()["POST /api/v1/loops/12/respond"]
+	if !ok {
+		t.Fatalf("respond never reached the daemon; saw %v (stdout %q)", seen(), stdout.String())
+	}
+	var answer respondBody
+	if err := json.Unmarshal([]byte(body), &answer); err != nil {
+		t.Fatalf("decode respond body %q: %v", body, err)
+	}
+	if answer.Answer != "--version" {
+		t.Fatalf("answer = %q, want %q", answer.Answer, "--version")
+	}
+	if strings.Contains(stdout.String(), version.Value) {
+		t.Fatalf("stdout printed the version instead of routing: %q", stdout.String())
+	}
+}
+
+// TestVersionFlagAfterAVerbIsRefused covers the unquoted spelling. It cannot
+// route — --version is not a flag any verb takes — but the failure an operator
+// needs is "unknown flag", not a version string printed while the loop stays
+// unanswered.
+func TestVersionFlagAfterAVerbIsRefused(t *testing.T) {
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := run([]string{"respond", "12", "--version"}, strings.NewReader(""), stdout, stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (stdout %q)", code, stdout.String())
+	}
+	if strings.Contains(stdout.String(), version.Value) {
+		t.Fatalf("stdout printed the version for an operand-position flag: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown flag") {
+		t.Fatalf("stderr = %q, want an unknown-flag error", stderr.String())
+	}
+}
+
+// TestVersionFlagStillWorksBeforeTheVerb is the other side of that fix: nothing
+// but a global flag may precede --version, and a global flag must not break it.
+func TestVersionFlagStillWorksBeforeTheVerb(t *testing.T) {
+	for _, args := range [][]string{
+		{"--version"},
+		{"--config", "/nonexistent.toml", "--version"},
+		{"--config=/nonexistent.toml", "--version"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			stdout := &bytes.Buffer{}
+			if code := run(args, strings.NewReader(""), stdout, io.Discard); code != 0 {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			if strings.TrimSpace(stdout.String()) != version.Value {
+				t.Fatalf("stdout = %q, want %q", stdout.String(), version.Value)
+			}
+		})
+	}
+}
+
+// TestBulkStopOutlivesTheSingleLoopDeadline is the finding this fix answers: the
+// daemon stops candidates one at a time, each worth up to the runtime's 20s kill
+// budget, so a bulk stop of a handful of unresponsive agents runs past the
+// deadline the other verbs use. The daemon reads the request context, so a
+// client-side timeout does not merely lose the report — it aborts the sweep.
+//
+// The subtests are each other's mutation check: dropping the longer report
+// budget fails the first, and applying it to every request fails the second.
+func TestBulkStopOutlivesTheSingleLoopDeadline(t *testing.T) {
+	const daemonWork = 400 * time.Millisecond
+
+	original, originalBulkStop := requestTimeout, bulkStopRequestTimeout
+	requestTimeout = 80 * time.Millisecond
+	bulkStopRequestTimeout = 800 * time.Millisecond
+	t.Cleanup(func() {
+		requestTimeout = original
+		bulkStopRequestTimeout = originalBulkStop
+	})
+
+	t.Run("stop all waits", func(t *testing.T) {
+		fixture := newContractFixture(t)
+		fixture.controlDelay = daemonWork
+		configPath, seen := serveContract(t, fixture)
+
+		stderr := &bytes.Buffer{}
+		code := run([]string{"stop", "all", "--config", configPath}, strings.NewReader(""), io.Discard, stderr)
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0: bulk stop was cut off after %s (stderr %q)", code, requestTimeout, stderr.String())
+		}
+		if _, ok := seen()["POST /api/v1/runs/active/stop-all"]; !ok {
+			t.Fatalf("stop all never reached the bulk route; saw %v", seen())
+		}
+	})
+
+	t.Run("single loop stop still times out", func(t *testing.T) {
+		fixture := newContractFixture(t)
+		fixture.controlDelay = daemonWork
+		configPath, _ := serveContract(t, fixture)
+
+		stderr := &bytes.Buffer{}
+		if code := run([]string{"stop", "12", "--config", configPath}, strings.NewReader(""), io.Discard, stderr); code == 0 {
+			t.Fatal("exit = 0: an ordinary stop lost its deadline")
+		}
+		if !strings.Contains(stderr.String(), "deadline exceeded") {
+			t.Fatalf("stderr = %q, want a deadline failure", stderr.String())
+		}
+	})
+
+	t.Run("stop all still has an upper bound", func(t *testing.T) {
+		bulkStopRequestTimeout = requestTimeout
+		fixture := newContractFixture(t)
+		fixture.controlDelay = daemonWork
+		configPath, _ := serveContract(t, fixture)
+
+		stderr := &bytes.Buffer{}
+		if code := run([]string{"stop", "all", "--config", configPath}, strings.NewReader(""), io.Discard, stderr); code == 0 {
+			t.Fatal("exit = 0: bulk stop waited forever for a daemon that did not answer")
+		}
+		if !strings.Contains(stderr.String(), "deadline exceeded") {
+			t.Fatalf("stderr = %q, want a deadline failure", stderr.String())
+		}
+	})
 }
 
 // writeContractConfig points the CLI's own config loading at a running server,
