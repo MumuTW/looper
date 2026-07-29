@@ -91,9 +91,13 @@ func RunCommands(ctx context.Context, input Input, options *Options) (Result, er
 				if output == "" {
 					output = commandErr.Error()
 				}
+				summary := "Validation failed: " + command
+				if commandErr.Category == shell.FailureSupervisorTimeout {
+					summary = "Validation timed out: " + command
+				}
 				return Result{
 					Passed:          false,
-					Summary:         "Validation failed: " + command,
+					Summary:         summary,
 					Output:          output,
 					FailureCategory: FailureCategory(commandErr.Category),
 				}, nil
