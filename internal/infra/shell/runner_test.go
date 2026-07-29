@@ -87,6 +87,9 @@ func TestRunReturnsCommandExecutionErrorOnNonZeroExit(t *testing.T) {
 	if !errors.As(err, &commandErr) {
 		t.Fatalf("error = %v, want CommandExecutionError", err)
 	}
+	if commandErr.Category != FailureNonZeroExit {
+		t.Fatalf("Category = %q, want %q", commandErr.Category, FailureNonZeroExit)
+	}
 	if commandErr.Result.ExitCode != 7 {
 		t.Fatalf("ExitCode = %d, want 7", commandErr.Result.ExitCode)
 	}
@@ -131,6 +134,9 @@ func TestRunTimesOutAndPreservesCapturedOutput(t *testing.T) {
 	if commandErr.Message != "Command timed out" {
 		t.Fatalf("Message = %q, want timeout", commandErr.Message)
 	}
+	if commandErr.Category != FailureSupervisorTimeout {
+		t.Fatalf("Category = %q, want %q", commandErr.Category, FailureSupervisorTimeout)
+	}
 	if !strings.Contains(commandErr.Result.Stdout, "start") {
 		t.Fatalf("Stdout = %q, want captured prefix", commandErr.Result.Stdout)
 	}
@@ -171,6 +177,26 @@ func TestRunRespectsContextCancellation(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	var commandErr *CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("error = %v, want CommandExecutionError", err)
+	}
+	if commandErr.Category != FailureContextCanceled {
+		t.Fatalf("Category = %q, want %q", commandErr.Category, FailureContextCanceled)
+	}
+}
+
+func TestRunClassifiesProcessStartFailureAsInfrastructure(t *testing.T) {
+	t.Parallel()
+
+	_, err := Run(context.Background(), Options{Command: filepath.Join(t.TempDir(), "missing")})
+	var commandErr *CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("error = %v, want CommandExecutionError", err)
+	}
+	if commandErr.Category != FailureInfrastructure {
+		t.Fatalf("Category = %q, want %q", commandErr.Category, FailureInfrastructure)
 	}
 }
 

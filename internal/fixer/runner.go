@@ -28,14 +28,13 @@ import (
 	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/validationcmd"
+	"github.com/nexu-io/looper/internal/validation"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
@@ -512,10 +511,11 @@ type AgentExecutor interface {
 }
 
 type ValidationResult struct {
-	Passed  bool   `json:"passed"`
-	Summary string `json:"summary,omitempty"`
-	Output  string `json:"output,omitempty"`
-	HeadSHA string `json:"headSha,omitempty"`
+	Passed          bool                       `json:"passed"`
+	Summary         string                     `json:"summary,omitempty"`
+	Output          string                     `json:"output,omitempty"`
+	HeadSHA         string                     `json:"headSha,omitempty"`
+	FailureCategory validation.FailureCategory `json:"failureCategory,omitempty"`
 }
 
 type ValidationRunner func(context.Context, ValidationInput) (ValidationResult, error)
@@ -3150,7 +3150,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 	}
 	checkpoint.Validation = &result
 	if !result.Passed {
-		d := failurepolicy.ClassifyValidation(result.Summary, result.Output)
+		d := failurepolicy.ClassifyValidation(result.FailureCategory, result.Summary)
 		checkpoint.ResumePolicy = d.ResumePolicy
 		return checkpoint, &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
 	}
@@ -3175,7 +3175,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		}
 		checkpoint.Validation = &second
 		if !second.Passed {
-			d := failurepolicy.ClassifyValidation(second.Summary, second.Output)
+			d := failurepolicy.ClassifyValidation(second.FailureCategory, second.Summary)
 			checkpoint.ResumePolicy = d.ResumePolicy
 			return checkpoint, &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
 		}
@@ -3423,7 +3423,12 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 		if inspect.HasUncommittedChanges {
 			return false, checkpoint, &loopError{message: "Validation produced uncommitted changes after adopting agent-pushed head", kind: FailureRetryableAfterResume}
 		}
-		if !validation.Passed || validation.HeadSHA != adoptedHead {
+		if !validation.Passed {
+			failure := failurepolicy.ClassifyValidation(validation.FailureCategory, validation.Summary)
+			checkpoint.ResumePolicy = failure.ResumePolicy
+			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: fixerFailureKind(failure.Kind)}
+		}
+		if validation.HeadSHA != adoptedHead {
 			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: FailureRetryableAfterResume}
 		}
 		checkpoint.Worktree.HeadSHA = adoptedHead
@@ -6684,49 +6689,25 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	if r.validationRunner != nil {
 		return r.validationRunner(ctx, input)
 	}
-	if len(input.Commands) == 0 {
-		return ValidationResult{Passed: true, Summary: "No validation commands configured"}, nil
+
+	vresult, err := validation.RunCommands(ctx, validation.Input{
+		Commands:       input.Commands,
+		CommandTimeout: r.agentTimeout,
+	}, &validation.Options{
+		CWD:          input.CWD,
+		CodexCommand: r.validationCodexCommand,
+		Tracker:      r.containmentTracker,
+	})
+	if err != nil {
+		return ValidationResult{}, err
 	}
 
-	outputs := make([]string, 0, len(input.Commands)*2)
-	for _, command := range input.Commands {
-		result, err := validationcmd.Run(ctx, validationcmd.Options{
-			CWD:          input.CWD,
-			Command:      command,
-			Timeout:      r.agentTimeout,
-			CodexCommand: r.validationCodexCommand,
-			// Supervisor-owned validation: track handle so shutdown retain-storage
-			// sees Kill/Drain failures even when validation collapses them to Passed=false.
-			Tracker: r.containmentTracker,
-		})
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return ValidationResult{}, err
-			}
-			output := "Unknown validation failure"
-			var commandErr *shell.CommandExecutionError
-			if errors.As(err, &commandErr) {
-				output = strings.TrimSpace(strings.Join([]string{commandErr.Result.Stdout, commandErr.Result.Stderr}, "\n"))
-				if output == "" {
-					output = commandErr.Error()
-				}
-				if strings.EqualFold(strings.TrimSpace(commandErr.Message), "command timed out") {
-					return ValidationResult{Passed: false, Summary: fmt.Sprintf("Validation timed out: %s", command), Output: output}, nil
-				}
-			} else {
-				output = err.Error()
-			}
-			return ValidationResult{Passed: false, Summary: fmt.Sprintf("Validation failed: %s", command), Output: output}, nil
-		}
-		if stdout := strings.TrimSpace(result.Stdout); stdout != "" {
-			outputs = append(outputs, stdout)
-		}
-		if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
-			outputs = append(outputs, stderr)
-		}
-	}
-
-	return ValidationResult{Passed: true, Summary: "Validation passed", Output: strings.Join(outputs, "\n")}, nil
+	return ValidationResult{
+		Passed:          vresult.Passed,
+		Summary:         vresult.Summary,
+		Output:          vresult.Output,
+		FailureCategory: vresult.FailureCategory,
+	}, nil
 }
 
 type eventInput struct {

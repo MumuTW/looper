@@ -11,6 +11,7 @@ import (
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validation"
 )
 
 func TestRunValidationRunsConfiguredCommands(t *testing.T) {
@@ -95,7 +96,7 @@ func TestRunValidationBoundsCommandRuntime(t *testing.T) {
 	t.Parallel()
 
 	runner := New(Options{AgentTimeout: 20 * time.Millisecond, ValidationCommands: []string{"sleep 5"}, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
-		return ValidationResult{Passed: false, Summary: "Validation timed out: sleep 5", Output: "Command timed out"}, nil
+		return ValidationResult{Passed: false, Summary: "Validation timed out: sleep 5", Output: "Command timed out", FailureCategory: validation.FailureSupervisorTimeout}, nil
 	}})
 	result, err := runner.runValidation(context.Background(), ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
 	if err != nil {
@@ -104,7 +105,7 @@ func TestRunValidationBoundsCommandRuntime(t *testing.T) {
 	if result.Passed || !strings.Contains(strings.ToLower(result.Output), "timed out") {
 		t.Fatalf("runValidation() result = %#v, want bounded timeout failure", result)
 	}
-	failure := failurepolicy.ClassifyValidation(result.Summary, result.Output)
+	failure := failurepolicy.ClassifyValidation(result.FailureCategory, result.Summary)
 	if failure.Kind != failureclass.RetryableTransient {
 		t.Fatalf("ClassifyValidation() = %#v, want retryable timeout", failure)
 	}
@@ -113,7 +114,7 @@ func TestRunValidationBoundsCommandRuntime(t *testing.T) {
 func TestClassifyFixerValidationFailureParksDeterministicFailures(t *testing.T) {
 	t.Parallel()
 
-	failure := failurepolicy.ClassifyValidation("go test failed", "assertion mismatch")
+	failure := failurepolicy.ClassifyValidation(validation.FailureNonZeroExit, "go test failed")
 	if failure.Kind != failureclass.ManualIntervention || failure.ResumePolicy != loops.ResumePolicyManualIntervention {
 		t.Fatalf("ClassifyValidation() = %#v, want manual intervention", failure)
 	}
@@ -122,7 +123,7 @@ func TestClassifyFixerValidationFailureParksDeterministicFailures(t *testing.T) 
 func TestClassifyFixerValidationFailureDoesNotInferTimeoutFromTestOutput(t *testing.T) {
 	t.Parallel()
 
-	failure := failurepolicy.ClassifyValidation("go test failed", "--- FAIL: TestTimeoutPolicy")
+	failure := failurepolicy.ClassifyValidation(validation.FailureNonZeroExit, "TestTimeoutPolicy: head changed")
 	if failure.Kind != failureclass.ManualIntervention || failure.ResumePolicy != loops.ResumePolicyManualIntervention {
 		t.Fatalf("ClassifyValidation() = %#v, want deterministic failure parked", failure)
 	}

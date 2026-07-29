@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/validation"
 )
 
 // Decision is the structured output of the fixer failure-policy boundary.
@@ -60,41 +60,14 @@ func BoundaryForStep(step string) failureclass.Boundary {
 	}
 }
 
-// ClassifyValidation maps a validation command result to a failure decision.
-// It is the authority for deciding whether a failed validation is a transient
-// tooling problem (replay the step) or a deterministic test/repair failure
-// (manual intervention). It operates on the structured validation summary, not
-// on the raw command output.
-func ClassifyValidation(summary, output string) Decision {
-	_ = output // output is preserved for diagnostics but not used for classification
+// ClassifyValidation translates the shared validation execution category into
+// fixer vocabulary. The shell supervision boundary owns the category; summary
+// remains diagnostic and never changes policy.
+func ClassifyValidation(category validation.FailureCategory, summary string) Decision {
 	message := strings.TrimSpace(summary)
 	if message == "" {
 		message = "Validation failed"
 	}
-	if strings.HasPrefix(summary, "Validation timed out:") {
-		return Decision{Kind: failureclass.RetryableTransient, ResumePolicy: loops.ResumePolicyReplayStep, Message: message}
-	}
-	lowered := strings.ToLower(strings.TrimSpace(summary))
-	if containsAny(lowered, []string{
-		"command not found",
-		"executable file not found",
-		"connection reset",
-		"connection refused",
-		"temporary failure",
-		"service unavailable",
-		"network is unreachable",
-		"transport error",
-	}) {
-		return Decision{Kind: failureclass.RetryableTransient, ResumePolicy: loops.ResumePolicyReplayStep, Message: message}
-	}
-	return Decision{Kind: failureclass.ManualIntervention, ResumePolicy: loops.ResumePolicyManualIntervention, Message: message}
-}
-
-func containsAny(message string, hints []string) bool {
-	for _, hint := range hints {
-		if strings.Contains(message, hint) {
-			return true
-		}
-	}
-	return false
+	policy := validation.PolicyFor(category)
+	return Decision{Kind: failureclass.Kind(policy.FailureKind), ResumePolicy: policy.ResumePolicy, Message: message}
 }

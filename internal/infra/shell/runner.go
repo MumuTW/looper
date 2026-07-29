@@ -26,6 +26,15 @@ const (
 	drainSlack = 15 * time.Second
 )
 
+type FailureCategory string
+
+const (
+	FailureNonZeroExit       FailureCategory = "non_zero_exit"
+	FailureSupervisorTimeout FailureCategory = "supervisor_timeout"
+	FailureContextCanceled   FailureCategory = "context_canceled"
+	FailureInfrastructure    FailureCategory = "infrastructure"
+)
+
 type Result struct {
 	ExitCode        int
 	Stdout          string
@@ -60,11 +69,14 @@ type Options struct {
 }
 
 type CommandExecutionError struct {
-	Message string
-	Result  Result
+	Message  string
+	Category FailureCategory
+	Result   Result
+	Err      error
 }
 
 func (e *CommandExecutionError) Error() string { return e.Message }
+func (e *CommandExecutionError) Unwrap() error { return e.Err }
 
 // Run starts a command under process containment (ADR-0015 / #577).
 //
@@ -91,7 +103,16 @@ func Run(ctx context.Context, options Options) (Result, error) {
 
 	handle, err := startContainedCommand(ctx, options, gracefulShutdown, stdoutBuffer, stderrBuffer)
 	if err != nil {
-		return Result{}, fmt.Errorf("start command: %w", err)
+		category := FailureInfrastructure
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			category = FailureContextCanceled
+		}
+		return Result{}, &CommandExecutionError{
+			Message:  fmt.Sprintf("start command: %v", err),
+			Category: category,
+			Result:   Result{},
+			Err:      err,
+		}
 	}
 	if options.Tracker != nil {
 		release := options.Tracker.Track(handle)
@@ -132,20 +153,21 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}
 
 	if timedOut {
-		timeoutErr := error(&CommandExecutionError{Message: "Command timed out", Result: result})
+		timeoutErr := &CommandExecutionError{Message: "Command timed out", Category: FailureSupervisorTimeout, Result: result}
 		if killErr != nil {
 			return result, errors.Join(timeoutErr, killErr)
 		}
 		return result, timeoutErr
 	}
 	if canceledErr != nil {
+		cancelErr := &CommandExecutionError{Message: "Command cancelled", Category: FailureContextCanceled, Result: result, Err: canceledErr}
 		if killErr != nil {
-			return result, errors.Join(canceledErr, killErr)
+			return result, errors.Join(cancelErr, killErr)
 		}
-		return result, canceledErr
+		return result, cancelErr
 	}
 	if result.ExitCode != 0 {
-		cmdErr := error(&CommandExecutionError{Message: commandFailureMessage(result), Result: result})
+		cmdErr := &CommandExecutionError{Message: commandFailureMessage(result), Category: FailureNonZeroExit, Result: result}
 		// Containment contract: drain failures must surface even when the
 		// leader already failed validation/tool exit.
 		if drainErr != nil {
@@ -154,7 +176,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return result, cmdErr
 	}
 	if waitErr != nil && !isExitError(waitErr) {
-		return result, waitErr
+		return result, &CommandExecutionError{Message: waitErr.Error(), Category: FailureInfrastructure, Result: result, Err: waitErr}
 	}
 	return result, nil
 }

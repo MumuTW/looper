@@ -7,6 +7,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/validation"
 )
 
 func TestClassifyErrorRetriesContextCancellation(t *testing.T) {
@@ -82,7 +83,7 @@ func TestBoundaryForStepMapsPrepareWorktreeToGitRemote(t *testing.T) {
 func TestClassifyValidationParksDeterministicFailures(t *testing.T) {
 	t.Parallel()
 
-	d := ClassifyValidation("go test failed", "assertion mismatch")
+	d := ClassifyValidation(validation.FailureNonZeroExit, "go test failed")
 	if d.Kind != failureclass.ManualIntervention || d.ResumePolicy != loops.ResumePolicyManualIntervention {
 		t.Fatalf("ClassifyValidation() = %#v, want manual intervention", d)
 	}
@@ -91,7 +92,7 @@ func TestClassifyValidationParksDeterministicFailures(t *testing.T) {
 func TestClassifyValidationDoesNotInferTimeoutFromTestOutput(t *testing.T) {
 	t.Parallel()
 
-	d := ClassifyValidation("go test failed", "--- FAIL: TestTimeoutPolicy")
+	d := ClassifyValidation(validation.FailureNonZeroExit, "TestTimeoutPolicy: head changed")
 	if d.Kind != failureclass.ManualIntervention || d.ResumePolicy != loops.ResumePolicyManualIntervention {
 		t.Fatalf("ClassifyValidation() = %#v, want deterministic failure parked", d)
 	}
@@ -100,16 +101,16 @@ func TestClassifyValidationDoesNotInferTimeoutFromTestOutput(t *testing.T) {
 func TestClassifyValidationRecognizesTimeoutSummary(t *testing.T) {
 	t.Parallel()
 
-	d := ClassifyValidation("Validation timed out: sleep 5", "Command timed out")
+	d := ClassifyValidation(validation.FailureSupervisorTimeout, "Validation failed: sleep 5")
 	if d.Kind != failureclass.RetryableTransient || d.ResumePolicy != loops.ResumePolicyReplayStep {
 		t.Fatalf("ClassifyValidation() = %#v, want retryable timeout", d)
 	}
 }
 
-func TestClassifyValidationRecognizesConnectionHints(t *testing.T) {
+func TestClassifyValidationUsesInfrastructureCategoryInsteadOfSummaryHints(t *testing.T) {
 	t.Parallel()
 
-	d := ClassifyValidation("command not found: foobar", "")
+	d := ClassifyValidation(validation.FailureInfrastructure, "validation process failed")
 	if d.Kind != failureclass.RetryableTransient || d.ResumePolicy != loops.ResumePolicyReplayStep {
 		t.Fatalf("ClassifyValidation() = %#v, want retryable transient", d)
 	}
@@ -118,7 +119,7 @@ func TestClassifyValidationRecognizesConnectionHints(t *testing.T) {
 func TestClassifyValidationUsesDefaultMessage(t *testing.T) {
 	t.Parallel()
 
-	d := ClassifyValidation("   ", "")
+	d := ClassifyValidation("", "   ")
 	if d.Message != "Validation failed" {
 		t.Fatalf("ClassifyValidation() message = %q, want %q", d.Message, "Validation failed")
 	}
