@@ -18,6 +18,7 @@ For non-trivial changes, please open an issue first so we can align on scope bef
 ## Prerequisites
 
 - Go 1.22+ (see `go.mod`)
+- Node.js 22+ and pnpm 10 (the same dashboard toolchain used by CI)
 - `git`
 - `gh` (GitHub CLI), authenticated — Looper relies on it at runtime
 - macOS or Linux. macOS notification features additionally require `osascript`
@@ -55,7 +56,7 @@ Default runtime artifacts land in `~/.looper/` (`looper.sqlite`, `backups/`, `lo
 
 ## Local pre-flight (so CI never surprises you)
 
-CI's `verify` job runs, in order: `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build`. Two helpers keep you ahead of it:
+CI's `verify` job runs, in order: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build`. Two helpers keep you ahead of it:
 
 ```bash
 scripts/verify.sh --install-hooks   # one-time per clone: git commits now auto-gofmt
@@ -123,7 +124,7 @@ For GitHub live sandbox tests, prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`; `LOOPER_
 
 1. Fork the repo (or branch directly if you have write access).
 2. Make your changes on a feature branch.
-3. Ensure `gofmt -l .`, `go vet ./...`, `go test ./...`, and `go build ./...` are clean — these are exactly what CI runs.
+3. Ensure `scripts/verify.sh` is clean (dashboard build + `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build ./...`) — these are exactly what CI's `verify` job runs.
 4. Open a PR against `main` with:
    - A semantic title (same rules as commits)
    - A short description of the change and motivation
