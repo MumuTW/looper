@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -59,6 +60,16 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 	if !isValidAuthMode(config.Server.AuthMode) {
 		issues = append(issues, ValidationIssue{Path: "server.authMode", Message: fmt.Sprintf("must be one of: %s, %s", AuthModeNone, AuthModeLocalToken)})
+	}
+	// A peer-address check cannot distinguish a direct local client from a
+	// remote client hidden behind a loopback reverse proxy. It also makes a
+	// concrete LAN-only bind unusable because every accepted peer is non-loopback.
+	// Fail closed at startup instead: token-less mode is intentionally limited
+	// to literal loopback binds. The cost is that wildcard/LAN binds and custom
+	// hostnames require local-token auth, including trusted reverse proxies; this
+	// explicit credential boundary is preferable to guessing request provenance.
+	if config.Server.AuthMode == AuthModeNone && config.Server.Host != "" && !isLoopbackBindHost(config.Server.Host) {
+		issues = append(issues, ValidationIssue{Path: "server.authMode", Message: "none is allowed only when server.host is localhost or a loopback IP; use local-token for wildcard, LAN, public, proxy, or custom-hostname binds"})
 	}
 
 	if config.Server.AuthMode == AuthModeLocalToken && isNilOrEmptyString(config.Server.LocalToken) {
@@ -481,6 +492,15 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	return nil
+}
+
+func isLoopbackBindHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func validateRoutedProjectPrerequisites(config Config, roles RoleConfigs, prefix string, issues *[]ValidationIssue) {

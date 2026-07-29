@@ -124,8 +124,8 @@ func TestSplitGlobalFlags(t *testing.T) {
 // the CLI dials, in both argument orders.
 func TestSplitGlobalFlagsFeedsConfigLoading(t *testing.T) {
 	for _, args := range [][]string{
-		{"--host", "looper.internal", "--port", "9443", "stop", "12"},
-		{"stop", "12", "--host", "looper.internal", "--port", "9443"},
+		{"--host", "127.0.0.2", "--port", "9443", "stop", "12"},
+		{"stop", "12", "--host", "127.0.0.2", "--port", "9443"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			// No config file, so the flags are the only thing that can move the
@@ -139,8 +139,8 @@ func TestSplitGlobalFlagsFeedsConfigLoading(t *testing.T) {
 			if err != nil {
 				t.Fatalf("loadConfig() error = %v", err)
 			}
-			if got := daemonBaseURL(cfg); got != "http://looper.internal:9443" {
-				t.Fatalf("daemonBaseURL = %q, want http://looper.internal:9443", got)
+			if got := daemonBaseURL(cfg); got != "http://127.0.0.2:9443" {
+				t.Fatalf("daemonBaseURL = %q, want http://127.0.0.2:9443", got)
 			}
 		})
 	}
