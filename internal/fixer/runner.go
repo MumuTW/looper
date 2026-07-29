@@ -613,6 +613,9 @@ type Runner struct {
 	consecutiveFailureThreshold int
 	onAgentExecutionStarted     AgentExecutionStartedFunc
 	onQueueItemEnqueued         func()
+	// failureStreakHandoffReadHook is an in-package test seam for the
+	// read-to-handoff race. Production leaves it nil.
+	failureStreakHandoffReadHook func()
 }
 
 type DiscoveryInput struct {
@@ -5380,10 +5383,14 @@ func (r *Runner) resumePausedFailureStreakLoop(ctx context.Context, loop storage
 }
 
 func (r *Runner) restartLatestRunFromDiscover(ctx context.Context, loopID string) error {
-	if r.repos == nil || r.repos.Runs == nil {
+	return restartLatestRunFromDiscover(ctx, r.repos, loopID, r.nowISO())
+}
+
+func restartLatestRunFromDiscover(ctx context.Context, repos *storage.Repositories, loopID, updatedAt string) error {
+	if repos == nil || repos.Runs == nil {
 		return fmt.Errorf("fixer run repository is not configured")
 	}
-	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loopID)
+	latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loopID)
 	if err != nil {
 		return err
 	}
@@ -5405,8 +5412,8 @@ func (r *Runner) restartLatestRunFromDiscover(ctx context.Context, loopID string
 	updated := *latestRun
 	encoded := mustMarshalJSON(checkpoint)
 	updated.CheckpointJSON = &encoded
-	updated.UpdatedAt = r.nowISO()
-	return r.repos.Runs.Upsert(ctx, updated)
+	updated.UpdatedAt = updatedAt
+	return repos.Runs.Upsert(ctx, updated)
 }
 
 func (r *Runner) resumePausedNoopResolveLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string) (bool, storage.LoopRecord, error) {
@@ -5783,17 +5790,17 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 // failed checkpoint is forced back to discover.
 func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint *fixerCheckpoint) (bool, error) {
 	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, checkpoint)
-	if queueItem.Repo == nil || queueItem.PRNumber == nil {
+	if r.db == nil || r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
 		return false, nil
 	}
-	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	observed, err := r.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil {
 		return false, err
 	}
-	if current == nil {
+	if observed == nil {
 		return false, nil
 	}
-	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(current.MetadataJSON))
+	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(observed.MetadataJSON))
 	if !ok || strings.TrimSpace(pending.FixItemsStateHash) == "" {
 		return false, nil
 	}
@@ -5804,36 +5811,68 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 	if strings.TrimSpace(pending.FixItemsStateHash) == strings.TrimSpace(failedStateHash) {
 		return false, nil
 	}
-	if err := r.restartLatestRunFromDiscover(ctx, loop.ID); err != nil {
-		return false, err
+	if r.failureStreakHandoffReadHook != nil {
+		r.failureStreakHandoffReadHook()
 	}
-	availableAt := r.now()
-	queued, err := r.enqueueWithWake(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt}, false)
-	if err != nil {
-		return false, err
-	}
-	if queued.Status != "queued" {
-		return false, fmt.Errorf("pending fixer rediscovery for loop %s did not produce a queued item", loop.ID)
-	}
-	updated, err := r.clearPendingFixerRediscoveryIfMatch(ctx, *current, pending)
-	if err != nil {
-		return false, err
-	}
-	updated, err = r.clearFixerFailureStreakMetadata(ctx, updated)
-	if err != nil {
-		return false, err
-	}
-	nextRunAt := eventlog.FormatJavaScriptISOString(availableAt.UTC())
-	_, err = r.updateLoop(ctx, updated, func(next *storage.LoopRecord) {
-		next.Status = "queued"
-		next.LastRunAt = stringPtr(r.nowISO())
-		next.NextRunAt = &nextRunAt
+
+	resumed := false
+	err = storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+		repos := storage.NewRepositories(tx)
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return err
+		}
+		// Pause/terminate owns cancellation. A handoff may only proceed from the
+		// exact paused row observed above; UpdatedAt is the existing durable CAS
+		// revision, so an operator pause that retains the same status/metadata
+		// cannot be mistaken for the breaker handoff.
+		if current == nil || current.Status != "paused" || current.UpdatedAt != observed.UpdatedAt {
+			return nil
+		}
+		metadata := parseJSONObject(current.MetadataJSON)
+		pauseReason, _ := stringFromAny(metadata["pauseReason"])
+		currentPending, ok := parsePendingFixerRediscoveryState(metadata)
+		if pauseReason != failureStreakPauseReason || !ok || currentPending.HeadSHA != pending.HeadSHA || currentPending.FixItemsStateHash != pending.FixItemsStateHash || !sameStringSlices(currentPending.UnresolvedThreadIDs, pending.UnresolvedThreadIDs) {
+			return nil
+		}
+		if err := restartLatestRunFromDiscover(ctx, repos, current.ID, r.nowISO()); err != nil {
+			return err
+		}
+		transactionalRunner := *r
+		transactionalRunner.repos = repos
+		queued, err := transactionalRunner.enqueueWithWake(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: r.now()}, false)
+		if err != nil {
+			return err
+		}
+		if queued.Status != "queued" {
+			return fmt.Errorf("pending fixer rediscovery for loop %s did not produce a queued item", loop.ID)
+		}
+		delete(metadata, "pendingFixerRediscovery")
+		delete(metadata, "fixerFailureStreak")
+		delete(metadata, "pauseReason")
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+		nextRunAt := eventlog.FormatJavaScriptISOString(r.now().UTC())
+		current.MetadataJSON = stringPtr(string(encoded))
+		current.Status = "queued"
+		current.LastRunAt = stringPtr(r.nowISO())
+		current.NextRunAt = &nextRunAt
+		current.UpdatedAt = r.nowISO()
+		if err := repos.Loops.Upsert(ctx, *current); err != nil {
+			return err
+		}
+		resumed = true
+		return nil
 	})
 	if err != nil {
 		return false, err
 	}
-	r.wakeSchedulerAfterEnqueue()
-	return true, nil
+	if resumed {
+		r.wakeSchedulerAfterEnqueue()
+	}
+	return resumed, nil
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
