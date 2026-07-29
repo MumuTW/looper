@@ -6152,6 +6152,12 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 				return retryResult{}, metadataErr
 			}
 			queueLoop.MetadataJSON = metadataJSON
+		} else if queueLoop.Type == string(domain.LoopTypeFixer) {
+			metadataJSON, metadataErr := resetFixerLoopRetryMetadata(queueLoop.MetadataJSON)
+			if metadataErr != nil {
+				return retryResult{}, metadataErr
+			}
+			queueLoop.MetadataJSON = metadataJSON
 		}
 		var queueRecord storage.QueueItemRecord
 		var ok bool
@@ -6816,6 +6822,23 @@ func resetReviewerLoopRetryMetadata(current *string) (*string, error) {
 	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
 	loopMeta["status"] = "queued"
 	metadata["loop"] = loopMeta
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	value := string(encoded)
+	return &value, nil
+}
+
+func resetFixerLoopRetryMetadata(current *string) (*string, error) {
+	if current == nil || strings.TrimSpace(*current) == "" {
+		return current, nil
+	}
+	metadata := parseJSONObject(current)
+	delete(metadata, "fixerFailureStreak")
+	if pauseReason, _ := metadata["pauseReason"].(string); pauseReason == "agent_failure_streak" {
+		delete(metadata, "pauseReason")
+	}
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return nil, err

@@ -4190,7 +4190,8 @@ func TestProcessClaimedItemSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	loop := storage.LoopRecord{ID: "loop_foreign", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	metadata := mustMarshalJSON(map[string]any{"fixerFailureStreak": failureStreakState{FixItemsStateHash: "items-1", Step: string(stepRepair), ConsecutiveCount: 2, RecordedAt: nowISO}})
+	loop := storage.LoopRecord{ID: "loop_foreign", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -4205,6 +4206,13 @@ func TestProcessClaimedItemSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
 	}
 	if result.Status != "skipped" || !contains(result.Summary, "does not match fixer owner") {
 		t.Fatalf("result = %#v, want skipped foreign PR", result)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", persisted, err)
+	}
+	if _, ok := parseJSONObject(persisted.MetadataJSON)["fixerFailureStreak"]; ok {
+		t.Fatalf("successful ownership skip retained failure streak: %#v", parseJSONObject(persisted.MetadataJSON))
 	}
 }
 
@@ -4400,7 +4408,8 @@ func TestRunDiscoverPRStepLabelMismatchFinalizerPausesLoop(t *testing.T) {
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	loop := storage.LoopRecord{ID: "loop_discover_step_label_mismatch", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	loopMetadata := mustMarshalJSON(map[string]any{"fixerFailureStreak": failureStreakState{FixItemsStateHash: "items-1", Step: string(stepRepair), ConsecutiveCount: 2, RecordedAt: nowISO}})
+	loop := storage.LoopRecord{ID: "loop_discover_step_label_mismatch", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -4413,12 +4422,13 @@ func TestRunDiscoverPRStepLabelMismatchFinalizerPausesLoop(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
-	checkpoint, err := runner.runDiscoverPRStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: loop, Run: run, QueueItem: queue, Repo: repo, PRNumber: prNumber, Checkpoint: fixerCheckpoint{}})
+	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}
+	checkpoint, err := runner.runDiscoverPRStep(context.Background(), stepInput{Project: project, Loop: loop, Run: run, QueueItem: queue, Repo: repo, PRNumber: prNumber, Checkpoint: fixerCheckpoint{}})
 	var mismatchErr *labelMismatchSkipError
 	if !errors.As(err, &mismatchErr) {
 		t.Fatalf("runDiscoverPRStep() error = %v, want labelMismatchSkipError", err)
 	}
-	result, err := runner.finishLabelMismatchFixerQueueItem(context.Background(), loop, &run, queue, checkpoint, mismatchErr.summary)
+	result, err := runner.finishLabelMismatchFixerQueueItem(context.Background(), project, loop, &run, queue, checkpoint, mismatchErr.summary)
 	if err != nil {
 		t.Fatalf("finishLabelMismatchFixerQueueItem() error = %v", err)
 	}
@@ -4435,6 +4445,9 @@ func TestRunDiscoverPRStepLabelMismatchFinalizerPausesLoop(t *testing.T) {
 	metadata := parseJSONObject(persistedLoop.MetadataJSON)
 	if metadata["pauseReason"] != labelMismatchPauseReason {
 		t.Fatalf("metadata = %#v, want label mismatch pause reason", metadata)
+	}
+	if _, ok := metadata["fixerFailureStreak"]; ok {
+		t.Fatalf("successful label-mismatch skip retained failure streak: %#v", metadata)
 	}
 }
 
@@ -6824,6 +6837,280 @@ func TestRecordZeroProgressSuccessResetsCountWhenFixItemStateChanges(t *testing.
 	}
 	if state.FixItemsStateHash != hashFixItemsState(changedItems) {
 		t.Fatalf("FixItemsStateHash = %q, want %q", state.FixItemsStateHash, hashFixItemsState(changedItems))
+	}
+}
+
+func TestProcessClaimedItemPausesAfterConsecutiveFailureStreak(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	view := PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+		viewResponses: []PullRequestDetail{view, view, view, view, view, view, view, view},
+	}
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{
+		{Status: "failed", Summary: "upstream server_error"},
+		{Status: "failed", Summary: "upstream server_error"},
+		{Status: "failed", Summary: "upstream server_error"},
+	}}
+	// RetryMaxAttempts -1 mirrors the incident configuration: the queue retry
+	// budget alone would requeue forever, so only the failure-streak breaker
+	// can park the loop.
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, RetryMaxAttempts: -1, Logger: fixture.logger, Now: fixture.now, Sleep: func(time.Duration) {}})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	var result ProcessResult
+	for attempt := 1; attempt <= maxConsecutiveFixerFailures; attempt++ {
+		claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+		if err != nil || claim == nil {
+			t.Fatalf("attempt %d ClaimNextOfType() = (%#v, %v), want claimed item", attempt, claim, err)
+		}
+		result, err = runner.ProcessClaimedItem(context.Background(), *claim)
+		if err != nil {
+			t.Fatalf("attempt %d ProcessClaimedItem() error = %v", attempt, err)
+		}
+		if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+			t.Fatalf("attempt %d result = %#v, want retryable failed result", attempt, result)
+		}
+		queue, err := fixture.repos.Queue.GetByID(context.Background(), result.QueueItemID)
+		if err != nil {
+			t.Fatalf("Queue.GetByID() error = %v", err)
+		}
+		loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+		if err != nil {
+			t.Fatalf("Loops.GetByID() error = %v", err)
+		}
+		streak, ok := parseFailureStreakState(parseJSONObject(loop.MetadataJSON))
+		if !ok {
+			t.Fatalf("attempt %d: parseFailureStreakState() = false, want persisted streak", attempt)
+		}
+		if streak.ConsecutiveCount != attempt {
+			t.Fatalf("attempt %d: streak count = %d, want %d", attempt, streak.ConsecutiveCount, attempt)
+		}
+		if attempt < maxConsecutiveFixerFailures {
+			if queue == nil || queue.Status != "queued" {
+				t.Fatalf("attempt %d: queue = %#v, want requeued", attempt, queue)
+			}
+			if loop == nil || loop.Status != "queued" {
+				t.Fatalf("attempt %d: loop = %#v, want queued", attempt, loop)
+			}
+			fixture.advance(time.Hour)
+			continue
+		}
+		// Queue.Fail parks the item in manual_intervention, its terminal
+		// state, instead of requeueing it.
+		if queue == nil || queue.Status != "manual_intervention" {
+			t.Fatalf("attempt %d: queue = %#v, want terminal manual_intervention despite unbounded retries", attempt, queue)
+		}
+		if loop == nil || loop.Status != "paused" {
+			t.Fatalf("attempt %d: loop = %#v, want paused", attempt, loop)
+		}
+		if got, _ := stringFromAny(parseJSONObject(loop.MetadataJSON)["pauseReason"]); got != failureStreakPauseReason {
+			t.Fatalf("attempt %d: pauseReason = %q, want %q", attempt, got, failureStreakPauseReason)
+		}
+		if loop.NextRunAt != nil {
+			t.Fatalf("attempt %d: NextRunAt = %v, want nil for parked loop", attempt, *loop.NextRunAt)
+		}
+	}
+}
+
+func TestProcessClaimedItemClearsFailureStreakOnSuccess(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_failure_streak_reset", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{
+		listOpen: []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+		},
+	}
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+		inspectResults: []InspectHeadResult{
+			{HeadSHA: "base-head"},
+			{HeadSHA: "new-head", NewCommitSHAs: []string{"new-head"}},
+			{HeadSHA: "new-head"},
+		},
+	}
+	stdout := fmt.Sprintf(`__LOOPER_RESULT__={"summary":"applied fixes","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Adjusted the off-by-one handling and verified the fix.","threadCommentsObserved":"%s"}]}`+"\n", hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}}))
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-hash-1"}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: fixItems}
+	for i := 0; i < 2; i++ {
+		if _, _, err := runner.recordFixerFailureStreak(context.Background(), loop, storage.QueueItemRecord{}, fmt.Sprintf("run-success-reset-%d", i), checkpoint, stepRepair); err != nil {
+			t.Fatalf("recordFixerFailureStreak() error = %v", err)
+		}
+	}
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := meta["fixerFailureStreak"]; ok {
+		t.Fatalf("fixerFailureStreak still present after successful run: %#v", meta)
+	}
+}
+
+func TestRecordFixerFailureStreakResetsCountWhenFixItemStateChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(83)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_failure_streak_state_reset", Seq: 97, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	baseItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-1"}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: baseItems}
+	for i := 0; i < 2; i++ {
+		// A push changes the PR head and queue-item dedupe key, but it must not
+		// reset the loop-level streak while the feedback and failing step stay
+		// unchanged.
+		checkpoint.Detail.HeadSHA = fmt.Sprintf("head-%d", i+1)
+		streak, _, err := runner.recordFixerFailureStreak(context.Background(), loop, storage.QueueItemRecord{}, fmt.Sprintf("run-state-reset-%d", i), checkpoint, stepRepair)
+		if err != nil {
+			t.Fatalf("recordFixerFailureStreak() error = %v", err)
+		}
+		if streak != i+1 {
+			t.Fatalf("recordFixerFailureStreak() streak = %d on run %d, want %d", streak, i+1, i+1)
+		}
+	}
+	streak, _, err := runner.recordFixerFailureStreak(context.Background(), loop, storage.QueueItemRecord{}, "run-state-reset-step", checkpoint, stepValidate)
+	if err != nil {
+		t.Fatalf("recordFixerFailureStreak() changed step error = %v", err)
+	}
+	if streak != 1 {
+		t.Fatalf("recordFixerFailureStreak() streak = %d, want 1 after step change", streak)
+	}
+
+	// A genuinely new set of failing items starts a fresh streak; note the
+	// head SHA is unchanged on purpose — only the fix-items state matters.
+	changedItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-2"}}
+	changedCheckpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: changedItems}
+	streak, _, err = runner.recordFixerFailureStreak(context.Background(), loop, storage.QueueItemRecord{}, "run-state-reset-feedback", changedCheckpoint, stepValidate)
+	if err != nil {
+		t.Fatalf("recordFixerFailureStreak() changed state error = %v", err)
+	}
+	if streak != 1 {
+		t.Fatalf("recordFixerFailureStreak() streak = %d, want 1 after state change", streak)
+	}
+
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	state, ok := parseFailureStreakState(parseJSONObject(persisted.MetadataJSON))
+	if !ok {
+		t.Fatal("parseFailureStreakState() = false, want persisted streak state")
+	}
+	if state.ConsecutiveCount != 1 {
+		t.Fatalf("ConsecutiveCount = %d, want 1 after state change", state.ConsecutiveCount)
+	}
+	if state.FixItemsStateHash != hashFixItemsState(changedItems) {
+		t.Fatalf("FixItemsStateHash = %q, want %q", state.FixItemsStateHash, hashFixItemsState(changedItems))
+	}
+}
+
+func TestEnsureLoopForPullRequestResumesFailureStreakLoopOnlyOnStateChange(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(84)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	baseItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-1"}}
+	baseStateHash := hashFixItemsState(baseItems)
+	metadata := mustMarshalJSON(map[string]any{
+		"pauseReason": failureStreakPauseReason,
+		"fixerFailureStreak": failureStreakState{
+			LastHeadSHA:       "head-1",
+			FixItemsStateHash: baseStateHash,
+			Step:              string(stepRepair),
+			ConsecutiveCount:  maxConsecutiveFixerFailures,
+			RecordedAt:        fixture.nowISO(),
+		},
+	})
+	loop := storage.LoopRecord{ID: "loop_failure_streak_resume", Seq: 98, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	project := storage.ProjectRecord{ID: "project_1"}
+
+	// Same unresolved feedback: the loop stays parked and nothing is enqueued.
+	same, err := runner.ensureLoopForPullRequest(context.Background(), project, repo, prNumber, "head-1", "fix-hash-1", baseStateHash, baseItems, []string{"t1"})
+	if err != nil {
+		t.Fatalf("ensureLoopForPullRequest(same) error = %v", err)
+	}
+	if same.record.Status != "paused" {
+		t.Fatalf("ensureLoopForPullRequest(same) status = %q, want paused", same.record.Status)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "paused" {
+		t.Fatalf("loop after same-state discovery = %#v, want paused", persisted)
+	}
+
+	// New feedback (a changed fix-items state) resumes the parked loop.
+	changedItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-2"}}
+	changedStateHash := hashFixItemsState(changedItems)
+	resumed, err := runner.ensureLoopForPullRequest(context.Background(), project, repo, prNumber, "head-1", "fix-hash-1", changedStateHash, changedItems, []string{"t1"})
+	if err != nil {
+		t.Fatalf("ensureLoopForPullRequest(changed) error = %v", err)
+	}
+	if resumed.record.Status != "queued" {
+		t.Fatalf("ensureLoopForPullRequest(changed) status = %q, want queued", resumed.record.Status)
+	}
+	persisted, err = fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "queued" {
+		t.Fatalf("loop after changed-state discovery = %#v, want queued", persisted)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := meta["fixerFailureStreak"]; ok {
+		t.Fatalf("fixerFailureStreak still present after resume: %#v", meta)
+	}
+	if _, ok := meta["pauseReason"]; ok {
+		t.Fatalf("pauseReason still present after resume: %#v", meta)
 	}
 }
 

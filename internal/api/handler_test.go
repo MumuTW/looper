@@ -155,6 +155,51 @@ func TestHandlerLoopRetryAllowsFailedReviewerLoop(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryResetsFixerFailureStreak(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_fixer_streak"
+	loopID := "loop_retry_fixer_streak"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	metadata := `{"pauseReason":"agent_failure_streak","fixerFailureStreak":{"lastHeadSha":"head-3","fixItemsStateHash":"items-1","step":"repair","consecutiveCount":3,"recordedAt":"2026-04-11T12:00:00.000Z"},"unrelated":"preserved"}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 45, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	lastErrorKind := "retryable_after_resume"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_retry_fixer_streak_failed", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:retry_fixer_streak", Priority: storage.QueuePriorityFixer, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 3, MaxAttempts: -1, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/45/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	got := parseJSONObject(loop.MetadataJSON)
+	if _, ok := got["fixerFailureStreak"]; ok {
+		t.Fatalf("fixerFailureStreak survived explicit retry: %#v", got)
+	}
+	if _, ok := got["pauseReason"]; ok {
+		t.Fatalf("failure-streak pauseReason survived explicit retry: %#v", got)
+	}
+	if got["unrelated"] != "preserved" {
+		t.Fatalf("unrelated metadata = %#v, want preserved", got["unrelated"])
+	}
+}
+
 func TestHandlerLoopRetryAllowsManualInterventionQueueItem(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
