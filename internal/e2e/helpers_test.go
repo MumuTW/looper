@@ -38,11 +38,17 @@ func newAPIClient(baseURL string) apiClient {
 
 func (c apiClient) get(tb testing.TB, path string, target any) {
 	tb.Helper()
-	req, err := http.NewRequest(http.MethodGet, c.baseURL+path, nil)
-	if err != nil {
-		tb.Fatalf("build GET %s: %v", path, err)
+	if err := c.getContext(context.Background(), path, target); err != nil {
+		tb.Fatalf("GET %s: %v", path, err)
 	}
-	c.do(tb, req, target)
+}
+
+func (c apiClient) getContext(ctx context.Context, path string, target any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return fmt.Errorf("build GET %s: %w", path, err)
+	}
+	return c.doRequest(req, target)
 }
 
 func (c apiClient) post(tb testing.TB, path string, body any, target any) {
@@ -67,31 +73,38 @@ func (c apiClient) post(tb testing.TB, path string, body any, target any) {
 
 func (c apiClient) do(tb testing.TB, req *http.Request, target any) {
 	tb.Helper()
+	if err := c.doRequest(req, target); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+func (c apiClient) doRequest(req *http.Request, target any) error {
 	resp, err := c.client.Do(req)
 	if err != nil {
-		tb.Fatalf("%s %s: %v", req.Method, req.URL.String(), err)
+		return fmt.Errorf("%s %s: %w", req.Method, req.URL.String(), err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		tb.Fatalf("read %s %s: %v", req.Method, req.URL.String(), err)
+		return fmt.Errorf("read %s %s: %w", req.Method, req.URL.String(), err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		tb.Fatalf("%s %s status=%d body=%s", req.Method, req.URL.String(), resp.StatusCode, string(body))
+		return fmt.Errorf("%s %s status=%d body=%s", req.Method, req.URL.String(), resp.StatusCode, string(body))
 	}
 	if target == nil {
-		return
+		return nil
 	}
 	var envelope pkgapi.Envelope[json.RawMessage]
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		tb.Fatalf("decode envelope %s %s: %v\nbody=%s", req.Method, req.URL.String(), err, string(body))
+		return fmt.Errorf("decode envelope %s %s: %w; body=%s", req.Method, req.URL.String(), err, string(body))
 	}
 	if !envelope.OK || envelope.Data == nil {
-		tb.Fatalf("unexpected error envelope %s %s: %s", req.Method, req.URL.String(), string(body))
+		return fmt.Errorf("unexpected error envelope %s %s: %s", req.Method, req.URL.String(), string(body))
 	}
 	if err := json.Unmarshal(*envelope.Data, target); err != nil {
-		tb.Fatalf("decode payload %s %s: %v\nbody=%s", req.Method, req.URL.String(), err, string(body))
+		return fmt.Errorf("decode payload %s %s: %w; body=%s", req.Method, req.URL.String(), err, string(body))
 	}
+	return nil
 }
 
 type loopsListResponse struct {
@@ -130,10 +143,16 @@ type loopView struct {
 
 func waitForRunTerminal(tb testing.TB, client apiClient, loopID string, timeout time.Duration) runView {
 	tb.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
 		var runs runsListResponse
-		client.get(tb, "/api/v1/runs?loopId="+loopID, &runs)
+		if err := client.getContext(ctx, "/api/v1/runs?loopId="+loopID, &runs); err != nil {
+			if ctx.Err() != nil {
+				tb.Fatalf("timed out waiting for loop %s terminal run: %v", loopID, ctx.Err())
+			}
+			tb.Fatalf("poll loop %s terminal run: %v", loopID, err)
+		}
 		if len(runs.Items) > 0 {
 			last := runs.Items[len(runs.Items)-1]
 			switch last.Status {
@@ -141,10 +160,19 @@ func waitForRunTerminal(tb testing.TB, client apiClient, loopID string, timeout 
 				return runView(last)
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		if !waitForAPIPoll(ctx) {
+			tb.Fatalf("timed out waiting for loop %s terminal run: %v", loopID, ctx.Err())
+		}
 	}
-	tb.Fatalf("timed out waiting for loop %s terminal run", loopID)
-	panic("unreachable")
+}
+
+func waitForAPIPoll(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(100 * time.Millisecond):
+		return true
+	}
 }
 
 func loadSingleLoop(tb testing.TB, client apiClient, loopID string) loopView {

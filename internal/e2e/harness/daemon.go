@@ -106,7 +106,11 @@ func (d *DaemonProcess) WaitForReady(ctx context.Context) (map[string]any, error
 			return nil, fmt.Errorf("looperd exited before readiness: %w", err)
 		default:
 		}
-		resp, err := client.Get(statusURL)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build readiness request for %s: %w", statusURL, err)
+		}
+		resp, err := client.Do(req)
 		if err == nil {
 			body, readErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
@@ -122,7 +126,11 @@ func (d *DaemonProcess) WaitForReady(ctx context.Context) (map[string]any, error
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("wait for %s: %w", statusURL, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
