@@ -14,10 +14,12 @@ import (
 func TestNativeResumeFallbackCancelledDoesNotSpawnSecondProcess(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
-	// Short budget: this test intentionally leaves the pending lease open so a
-	// post-stop BindHandle can exercise refuse+kill. Production Start always
-	// Release/BindHandle on cancel and closes spawnDone; here BeginLoopStop's
-	// wait times out and must surface that as a drain error (not silent success).
+	// Short budget for the BeginLoopStop wait only: this test intentionally
+	// leaves the pending lease open so a post-stop BindHandle can exercise
+	// refuse+kill. Production Start always Release/BindHandle on cancel and
+	// closes spawnDone; here BeginLoopStop's wait times out and must surface
+	// that as a drain error (not silent success). The budget is raised again
+	// below before BindHandle so the refuse-path kill is not starved.
 	reg.killTimeout = 40 * time.Millisecond
 
 	// Lease that is already cancelled simulates stop during attach-fail path.
@@ -36,6 +38,14 @@ func TestNativeResumeFallbackCancelledDoesNotSpawnSecondProcess(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("lease context not cancelled")
 	}
+
+	// killBudget() is read when killUnowned runs, so after BeginLoopStop has
+	// consumed the short budget (its spawnDone wait timeout above), raise it
+	// for the refuse-path Kill. A 40ms budget there must cover the whole
+	// TERM/grace/KILL/reap/drain cycle, which -race parallel load can exceed;
+	// Kill then fails and the joined error still matches
+	// ErrSpawnStoppedDuringBind while ConfirmedDead stays false (issue #45).
+	reg.killTimeout = 5 * time.Second
 
 	// BindHandle of a live process during stop must kill, not leave unowned.
 	cmd := exec.Command("sleep", "30")
