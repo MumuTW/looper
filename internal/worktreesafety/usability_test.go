@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -340,5 +341,37 @@ func TestLocalGitRepositoryMetadataUsable(t *testing.T) {
 	}
 	if LocalGitRepositoryMetadataUsable(headOnly) {
 		t.Fatalf("LocalGitRepositoryMetadataUsable(%q) = true, want false", headOnly)
+	}
+}
+
+func TestLocalGitRefNameUsableMatchesGitCheckRefFormat(t *testing.T) {
+	t.Parallel()
+
+	refs := []string{
+		"refs/heads/main",
+		"refs/heads/feature/one",
+		"refs/tags/v1.0.0",
+		"refs/heads/@",
+		"refs/heads/feature-ñ",
+		"refs/heads/fix.lock",
+		"refs/heads/.hidden",
+		"refs/heads/fix.",
+		"refs/heads/fix..again",
+		"refs/heads/fix@{old}",
+		"refs//heads/main",
+		"refs/heads/white space",
+		"refs/heads/a?b",
+		"refs/heads/a\\b",
+		"refs/heads/a:b",
+	}
+	for _, ref := range refs {
+		ref := ref
+		t.Run(ref, func(t *testing.T) {
+			t.Parallel()
+			want := exec.Command("git", "check-ref-format", ref).Run() == nil
+			if got := localGitRefNameUsable(ref); got != want {
+				t.Fatalf("localGitRefNameUsable(%q) = %v, git check-ref-format = %v", ref, got, want)
+			}
+		})
 	}
 }

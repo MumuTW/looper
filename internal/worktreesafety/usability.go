@@ -124,6 +124,48 @@ func LocalFixerWorktreeCheckoutUsable(path string) bool {
 	return linkedPrivateGitdirCommonUsable(gitdir)
 }
 
+// HasMalformedLocalGitHEAD reports only syntactically malformed, readable HEAD
+// metadata. It deliberately does not classify absent or incomplete .git data:
+// callers must still let prepare/fetch errors distinguish a partial path from a
+// remote transport failure before removing anything.
+func HasMalformedLocalGitHEAD(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	gitMeta := filepath.Join(path, ".git")
+	info, err := os.Lstat(gitMeta)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		return localGitHEADMalformed(gitMeta)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Stat(gitMeta)
+		if err != nil || target.IsDir() {
+			return err == nil && localGitHEADMalformed(gitMeta)
+		}
+	}
+	data, err := os.ReadFile(gitMeta)
+	if err != nil {
+		return false
+	}
+	line := strings.TrimSpace(string(data))
+	const prefix = "gitdir:"
+	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+		return false
+	}
+	gitdir := strings.TrimSpace(line[len(prefix):])
+	if gitdir == "" {
+		return false
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(path, gitdir)
+	}
+	return localGitHEADMalformed(gitdir)
+}
+
 // LocalGitRepositoryMetadataUsable is a non-remote integrity probe for a Git
 // repository directory (ordinary .git or a linked worktree common repo).
 // HEAD alone is insufficient: Git 2.43+ also requires objects/ and refs/ and
@@ -168,12 +210,34 @@ func localGitHEADUsable(dir string) bool {
 	return localGitObjectIDUsable(value)
 }
 
+func localGitHEADMalformed(dir string) bool {
+	headPath := filepath.Join(dir, "HEAD")
+	head, err := os.Stat(headPath)
+	if err != nil || !head.Mode().IsRegular() {
+		return false
+	}
+	data, err := os.ReadFile(headPath)
+	if err != nil {
+		return false
+	}
+	value := strings.TrimSpace(string(data))
+	if strings.HasPrefix(value, "ref: ") {
+		return !localGitRefNameUsable(strings.TrimSpace(strings.TrimPrefix(value, "ref: ")))
+	}
+	return value != "" && !localGitObjectIDUsable(value)
+}
+
 func localGitRefNameUsable(ref string) bool {
+	// Equivalent to `git check-ref-format` for symbolic HEAD refs. Keep this
+	// local and allocation-free: this probe runs during recovery and must honor
+	// an explicitly configured Git binary that may not be on PATH.
 	if !strings.HasPrefix(ref, "refs/") || strings.HasSuffix(ref, ".") || strings.Contains(ref, "..") || strings.Contains(ref, "//") || strings.Contains(ref, "@{") {
 		return false
 	}
 	for _, segment := range strings.Split(ref, "/") {
-		if segment == "" || strings.HasPrefix(segment, ".") {
+		// Git rejects empty components, hidden components, and lock-file names
+		// because an update could otherwise collide with its ref lock protocol.
+		if segment == "" || strings.HasPrefix(segment, ".") || strings.HasSuffix(segment, ".lock") {
 			return false
 		}
 	}

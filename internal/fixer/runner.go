@@ -2825,7 +2825,12 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 	if shouldRebuildWorktree(checkpoint) && checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.Branch != "" {
 		existingPath := checkpoint.Worktree.Path
 		existingBranch := firstNonEmpty(checkpoint.Worktree.Branch, branch)
-		if !isMissingOrUnusableFixerWorktree(existingPath, nil) {
+		// A malformed local .git/HEAD is authoritative before PrepareWorktree:
+		// Git may otherwise describe it as a dirty checkout rather than returning
+		// an integrity error, which would preserve a path that cannot be safely
+		// resumed. Paths without .git still enter PrepareWorktree so remote/fetch
+		// errors do not trigger destructive cleanup.
+		if !worktreesafety.HasMalformedLocalGitHEAD(existingPath) && !isMissingOrUnusableFixerWorktree(existingPath, nil) {
 			preparedExisting, prepErr := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{
 				RepoPath:        input.Project.RepoPath,
 				WorktreeRoot:    worktreeRoot,
