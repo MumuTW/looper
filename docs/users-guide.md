@@ -535,57 +535,30 @@ Typical usage (stripped CLI + dashboard):
 
 This is useful when you already have a PR and only want Looper to handle the review/fix cycle.
 
-### Option C: take over one PR in a single command
+### Option C: babysit one PR without repo-wide automation
 
-The one-command PR-scoped background takeover (`looper takeover <owner>/<repo>#<pr>` and `scripts/takeover.sh`) was removed with the old CLI. Today: register the repo, let discovery claim the PR via labels/review-requests, and use the surviving control verbs on **existing** loops. For single-PR babysitting without the daemon, use the live [`pr-takeover` skill](../skills/pr-takeover/SKILL.md) with `gh` + `git`.
+The one-command background path (`looper takeover <owner>/<repo>#<pr>`, `scripts/takeover.sh`, and `takeover list|stop`) was removed with the old CLI.
 
-Historical Option B (`review --loop` + fixer loop start) is also gone as CLI. Prefer discovery + dashboard control. Notes on the old takeover UX (kept for migration context only — commands no longer work):
+Today:
 
-```bash
-# from inside the repo checkout
-looper takeover                 # detect the current branch's PR
-looper takeover owner/repo#42   # or name it explicitly
-looper takeover owner/repo#42 --merge   # also auto-merge once approved + green
-```
-
-`takeover`:
-
-1. installs/starts the managed daemon if needed;
-2. writes (or reuses) `~/.looper/config.json`, registering the repo as a project whose `planner` / `worker` / `fixer` / `reviewer` discovery loops are all disabled — so the daemon never picks up any *other* PR or issue in the repo;
-3. starts a continuous reviewer loop and fixer loop on the target PR (skip the fixer with `--no-fix`);
-4. with `--merge`, sets `roles.reviewer.autoMerge.enabled` for the project so the reviewer enables GitHub auto-merge once the PR is approved and checks are green.
-
-Agent selection: `takeover` reuses the vendor already in your config; otherwise it auto-detects an installed `claude` / `codex` / `grok` / `opencode` CLI, prompts when the choice is ambiguous, and accepts `--agent-vendor` plus `--yes` for non-interactive runs. Auto-merge still depends on the repository allowing it (and, by default, on branch protection with required checks); when GitHub refuses, the reviewer keeps reviewing and reports why instead.
-
-Manage and stop takeovers:
-
-```bash
-# looper takeover list  # removed; use the dashboard loops view
-# looper takeover stop  # removed; use looper stop <selector> on the loops owner/repo#42   # stop this takeover's reviewer + fixer loops
-# looper takeover stop  # removed; use looper stop <selector> on the loops --all           # stop every takeover
-```
-
-`takeover list` / `stop` are backed by a local index at `~/.looper/takeovers.json`; stopping closes the underlying loops by id (so it works even while they are idle/waiting between commits).
+1. Register the repo (dashboard or `POST /api/v1/projects`).
+2. Let discovery claim the PR via labels / review-requests, **or** drive the PR live with the [`pr-takeover` skill](../skills/pr-takeover/SKILL.md) (`gh` + `git` in your agent session).
+3. Control **existing** loops with `looper stop|pause|retry|takeover|handback|respond <selector>` — where `takeover` now means *park this loop for manual worktree work*, not “adopt a PR”.
 
 ## 16. Quick decision guide
 
-- You have an issue but no spec yet: use `planner`
-- You have a PR that needs review: use `reviewer`
-- A PR already has review comments to address: use `fixer`
-- The spec is ready and implementation should begin: use `worker`
-- You want Looper on just one PR until it merges (no repo-wide automation): use `takeover`
-
-As a rule of thumb:
-
-- inside a registered repo, you can usually omit `--project` for `review` and `work`
-- use `--project` when you are outside the repo, or when Looper cannot infer the project uniquely
-- for `plan`, prefer passing `--project`
+- You have an issue but no spec yet: label `looper:plan` + assign → planner discovery
+- You have a PR that needs review: review-request / `looper:spec-reviewing` → reviewer discovery
+- A PR already has review comments to address: fixer discovery (or dashboard/API)
+- The spec is ready and implementation should begin: `looper:spec-ready` / `looper:worker-ready` → worker discovery
+- You want a human agent to drive one PR live until merge: [`pr-takeover` skill](../skills/pr-takeover/SKILL.md)
+- You need to pause/stop/retry a running loop: surviving CLI verbs above + dashboard
 
 ## 17. Authentication
 
-Looper uses `gh` for GitHub access, so `gh auth status` should succeed before you start planner / reviewer / fixer / worker workflows.
+Looper uses `gh` for GitHub access, so `gh auth status` should succeed before planner / reviewer / fixer / worker workflows run under `looperd`.
 
-If the daemon is configured with `server.authMode=local-token`, the CLI also needs a matching local token. In that setup, export `LOOPER_TOKEN` before running CLI commands.
+If the daemon is configured with `server.authMode=local-token`, CLI control verbs need a matching token (`server.localToken` / `LOOPER_TOKEN` depending on how you invoke the client).
 
 Example:
 
