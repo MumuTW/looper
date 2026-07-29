@@ -284,16 +284,21 @@ func RestartRequiredChanges(oldConfig Config, newConfig Config) []string {
 // diff above cannot see it; without this guard an edit to roles.coding.* would
 // apply neither hot nor via a restart prompt — configured but inert.
 //
-// Only the registry's own state is compared — which roles exist and their
-// priorities. Discovery, instructions, and agent of the shipped roles mirror
-// the legacy named fields, which the JSON diff already classifies (several
-// are hot); comparing them here would mark hot edits restart-bound.
+// Shipped roles compare only priority: their discovery, instructions, and
+// agent mirror legacy named fields that the JSON diff already classifies
+// (several are hot). Custom roles have no mirrored input, so every field must
+// be compared or a discovery/instruction/agent edit would be invisible and
+// silently remain on the old runtime snapshot.
 func appendCodingRoleRegistryGuards(oldConfig Config, newConfig Config, seen map[string]struct{}, restartRequired *[]string) {
 	oldRoles := EffectiveCodingRoles(oldConfig.Roles)
 	newRoles := EffectiveCodingRoles(newConfig.Roles)
 	for name, oldRole := range oldRoles {
 		newRole, ok := newRoles[name]
-		if !ok || oldRole.Priority != newRole.Priority {
+		changed := !ok || oldRole.Priority != newRole.Priority
+		if ok && !isCodingRole(name) && !reflect.DeepEqual(oldRole, newRole) {
+			changed = true
+		}
+		if changed {
 			markCodingRoleRestart(seen, restartRequired, name)
 		}
 	}

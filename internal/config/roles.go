@@ -2,6 +2,7 @@ package config
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -269,7 +270,14 @@ func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCo
 		if partial.Roles == nil {
 			continue
 		}
-		for rawName, role := range partial.Roles.Coding {
+		// A map can contain keys that become the same canonical role name
+		// (for example Auditor and auditor). Iterating and merging those keys
+		// would make the winning value depend on Go's randomized map order.
+		// Reject the ambiguous layer instead, and iterate sorted keys so both
+		// diagnostics and valid merges are deterministic.
+		seenInLayer := make(map[string]string, len(partial.Roles.Coding))
+		for _, rawName := range sortedKeys(partial.Roles.Coding) {
+			role := partial.Roles.Coding[rawName]
 			name := NormalizeRoleName(rawName)
 			if name == "" {
 				issues = append(issues, ValidationIssue{
@@ -278,6 +286,14 @@ func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCo
 				})
 				continue
 			}
+			if previous, duplicate := seenInLayer[name]; duplicate && previous != rawName {
+				issues = append(issues, ValidationIssue{
+					Path:    "roles.coding." + name,
+					Message: "role name is ambiguous after case-folding and trimming: " + previous + " and " + rawName,
+				})
+				continue
+			}
+			seenInLayer[name] = rawName
 			if authored == nil {
 				authored = make(map[string]PartialCodingRoleConfig)
 			}
@@ -425,6 +441,7 @@ func resolveCodingRoles(legacy map[string]CodingRoleConfig, authored map[string]
 			})
 			continue
 		}
+		issues = append(issues, validatePartialRoleDiscovery(pathPrefix, role.Discovery)...)
 
 		entry := CodingRoleConfig{Priority: *role.Priority}
 		if role.Instructions != nil {
@@ -434,7 +451,7 @@ func resolveCodingRoles(legacy map[string]CodingRoleConfig, authored map[string]
 			entry.Agent = cloneRoleAgentConfig(role.Agent)
 		}
 		entry.Discovery = roleDiscoveryConfigFromPartial(role.Discovery)
-		issues = append(issues, ValidateRoleDiscovery(pathPrefix, entry.Discovery)...)
+		issues = append(issues, validateCodingRoleDiscoveryCommon(pathPrefix, entry.Discovery)...)
 		resolved[name] = entry
 	}
 
@@ -445,7 +462,10 @@ func resolveCodingRoles(legacy map[string]CodingRoleConfig, authored map[string]
 }
 
 func roleDiscoveryConfigFromPartial(partial *PartialRoleDiscoveryConfig) RoleDiscoveryConfig {
-	discovery := RoleDiscoveryConfig{}
+	// Match the established role-trigger default: omitted labelMode means all.
+	// Leaving the zero value would make an otherwise minimal custom role fail
+	// validation despite the field being documented as optional.
+	discovery := RoleDiscoveryConfig{LabelMode: LabelModeAll}
 	if partial.Enabled != nil {
 		discovery.Enabled = *partial.Enabled
 	}
@@ -477,6 +497,77 @@ func roleDiscoveryConfigFromPartial(partial *PartialRoleDiscoveryConfig) RoleDis
 		discovery.EnableSelfReview = *partial.EnableSelfReview
 	}
 	return discovery
+}
+
+// validatePartialRoleDiscovery checks field presence before pointer values are
+// collapsed into RoleDiscoveryConfig. This is necessary for explicit zero
+// values: includeDrafts=false is still a pull-request-only field and must not
+// be silently accepted on an issue-source role.
+func validatePartialRoleDiscovery(pathPrefix string, d *PartialRoleDiscoveryConfig) []ValidationIssue {
+	if d == nil || d.Source == nil {
+		return nil
+	}
+	var fields []string
+	switch *d.Source {
+	case WorkSourceIssue:
+		if d.IncludeDrafts != nil {
+			fields = append(fields, "includeDrafts")
+		}
+		if d.AuthorFilter != nil {
+			fields = append(fields, "authorFilter")
+		}
+		if d.RequireReviewRequest != nil {
+			fields = append(fields, "requireReviewRequest")
+		}
+		if d.EnableSelfReview != nil {
+			fields = append(fields, "enableSelfReview")
+		}
+	case WorkSourcePullRequest:
+		if d.RequireAssigneeCurrentUser != nil {
+			fields = append(fields, "requireAssigneeCurrentUser")
+		}
+		if d.PlaneAssigneeID != nil {
+			fields = append(fields, "planeAssigneeId")
+		}
+	default:
+		return []ValidationIssue{{
+			Path:    pathPrefix + ".discovery.source",
+			Message: `must be "issue" or "pull_request"`,
+		}}
+	}
+	issues := make([]ValidationIssue, 0, len(fields))
+	for _, field := range fields {
+		issues = append(issues, ValidationIssue{
+			Path:    pathPrefix + ".discovery." + field,
+			Message: "does not apply to source " + strconv.Quote(string(*d.Source)),
+		})
+	}
+	return issues
+}
+
+// validateCodingRoleDiscoveryCommon validates the source-independent trigger
+// contract plus enum values that are meaningful only when present. Source
+// applicability is handled from the partial form during Normalize and by
+// ValidateRoleDiscovery for Config values assembled directly.
+func validateCodingRoleDiscoveryCommon(pathPrefix string, d RoleDiscoveryConfig) []ValidationIssue {
+	var issues []ValidationIssue
+	validateLabelTriggers(d.Labels, d.LabelMode, pathPrefix+".discovery", &issues)
+	if d.Source == WorkSourcePullRequest && d.AuthorFilter != "" && !isValidRoleAuthorFilter(d.AuthorFilter) {
+		issues = append(issues, ValidationIssue{
+			Path:    pathPrefix + ".discovery.authorFilter",
+			Message: `must be "current_user" or "any" when set`,
+		})
+	}
+	return issues
+}
+
+func isValidRoleAuthorFilter(filter AuthorFilter) bool {
+	switch filter {
+	case AuthorFilterCurrentUser, AuthorFilterAny:
+		return true
+	default:
+		return false
+	}
 }
 
 func sortedKeys[V any](values map[string]V) []string {

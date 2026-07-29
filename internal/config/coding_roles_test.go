@@ -248,6 +248,105 @@ includeDrafts = true
 	}
 }
 
+func TestNormalizeRejectsExplicitZeroCrossSourceDiscoveryFields(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		raw      string
+		wantPath string
+	}{
+		{
+			name: "false pull request field on issue source",
+			raw: `
+[roles.coding.auditor]
+priority = 60
+
+[roles.coding.auditor.discovery]
+source = "issue"
+includeDrafts = false
+`,
+			wantPath: "roles.coding.auditor.discovery.includeDrafts",
+		},
+		{
+			name: "false issue field on pull request source",
+			raw: `
+[roles.coding.auditor]
+priority = 60
+
+[roles.coding.auditor.discovery]
+source = "pull_request"
+requireAssigneeCurrentUser = false
+`,
+			wantPath: "roles.coding.auditor.discovery.requireAssigneeCurrentUser",
+		},
+		{
+			name: "empty issue field on pull request source",
+			raw: `
+[roles.coding.auditor]
+priority = 60
+
+[roles.coding.auditor.discovery]
+source = "pull_request"
+planeAssigneeId = ""
+`,
+			wantPath: "roles.coding.auditor.discovery.planeAssigneeId",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Normalize(t.TempDir(), mustDecodeTOML(t, tc.raw))
+			if !hasIssuePath(normalizeIssuePaths(err), tc.wantPath) {
+				t.Fatalf("issue paths = %v, want %s (err = %v)", normalizeIssuePaths(err), tc.wantPath, err)
+			}
+		})
+	}
+}
+
+func TestNormalizeValidatesCustomRoleDiscovery(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		discovery string
+		wantPath  string
+	}{
+		{name: "invalid label mode", discovery: "source = \"issue\"\nlabelMode = \"sometimes\"", wantPath: "roles.coding.auditor.discovery.labelMode"},
+		{name: "blank label", discovery: "source = \"issue\"\nlabels = [\"\"]", wantPath: "roles.coding.auditor.discovery.labels[0]"},
+		{name: "duplicate label", discovery: "source = \"issue\"\nlabels = [\"audit\", \"audit\"]", wantPath: "roles.coding.auditor.discovery.labels"},
+		{name: "invalid author filter", discovery: "source = \"pull_request\"\nauthorFilter = \"somebody_else\"", wantPath: "roles.coding.auditor.discovery.authorFilter"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw := "[roles.coding.auditor]\npriority = 60\n\n[roles.coding.auditor.discovery]\n" + tc.discovery + "\n"
+			_, err := Normalize(t.TempDir(), mustDecodeTOML(t, raw))
+			if !hasIssuePath(normalizeIssuePaths(err), tc.wantPath) {
+				t.Fatalf("issue paths = %v, want %s (err = %v)", normalizeIssuePaths(err), tc.wantPath, err)
+			}
+		})
+	}
+}
+
+func TestNormalizeCustomRoleDefaultsLabelModeToAll(t *testing.T) {
+	t.Parallel()
+
+	cfg := mustNormalize(t, mustDecodeTOML(t, `
+[roles.coding.auditor]
+priority = 60
+
+[roles.coding.auditor.discovery]
+source = "issue"
+labels = ["audit"]
+`))
+	if got := cfg.Roles.Coding["auditor"].Discovery.LabelMode; got != LabelModeAll {
+		t.Fatalf("labelMode = %q, want %q", got, LabelModeAll)
+	}
+}
+
 func TestNormalizeRejectsCoordinatorAsCodingRole(t *testing.T) {
 	t.Parallel()
 
@@ -341,6 +440,80 @@ source = "issue"
 	}
 }
 
+func TestNormalizeRejectsAmbiguousCaseFoldedRoleNames(t *testing.T) {
+	t.Parallel()
+
+	partial := mustDecodeTOML(t, `
+[roles.coding.Auditor]
+priority = 60
+[roles.coding.Auditor.discovery]
+source = "issue"
+
+[roles.coding.auditor]
+priority = 70
+[roles.coding.auditor.discovery]
+source = "pull_request"
+`)
+	_, err := Normalize(t.TempDir(), partial)
+	if !hasIssuePath(normalizeIssuePaths(err), "roles.coding.auditor") {
+		t.Fatalf("issue paths = %v, want roles.coding.auditor (err = %v)", normalizeIssuePaths(err), err)
+	}
+}
+
+func TestCanonicalizePartialForMigrationPreservesCodingRoles(t *testing.T) {
+	t.Parallel()
+
+	partial := mustDecodeTOML(t, `
+[roles.coding.auditor]
+priority = 60
+instructions = "audit"
+
+[roles.coding.auditor.discovery]
+source = "issue"
+labels = ["audit"]
+
+[roles.coding.auditor.agent]
+model = "test-model"
+`)
+	canonical := CanonicalizePartialForMigration(partial)
+	role, ok := canonical.Roles.Coding["auditor"]
+	if !ok || role.Priority == nil || *role.Priority != 60 || role.Discovery == nil || role.Discovery.Labels == nil || role.Agent == nil {
+		t.Fatalf("canonical coding role = %#v, want preserved deep clone", role)
+	}
+
+	*role.Priority = 99
+	*role.Discovery.Source = WorkSourcePullRequest
+	(*role.Discovery.Labels)[0] = "changed"
+	*role.Agent.Model = "changed-model"
+	original := partial.Roles.Coding["auditor"]
+	if *original.Priority != 60 || *original.Discovery.Source != WorkSourceIssue || (*original.Discovery.Labels)[0] != "audit" || *original.Agent.Model != "test-model" {
+		t.Fatalf("CanonicalizePartialForMigration mutated caller: %#v", original)
+	}
+}
+
+func TestValidateRejectsInvalidCustomRoleInstructionsAndAgent(t *testing.T) {
+	t.Parallel()
+
+	cfg := mustNormalize(t, mustDecodeTOML(t, `
+[roles.coding.auditor]
+priority = 60
+instructions = "ignore lifecycle"
+
+[roles.coding.auditor.discovery]
+source = "issue"
+
+[roles.coding.auditor.agent]
+profile = "missing"
+`))
+	err := Validate(cfg)
+	paths := normalizeIssuePaths(err)
+	for _, want := range []string{"roles.coding.auditor.instructions", "roles.coding.auditor.agent.profile"} {
+		if !hasIssuePath(paths, want) {
+			t.Errorf("issue paths = %v, want %s (err = %v)", paths, want, err)
+		}
+	}
+}
+
 // Registry changes are restart-bound: Roles.Coding is not serialized, so the
 // JSON diff cannot see it — the explicit guard keeps an edit to roles.coding.*
 // from applying silently neither hot nor via restart.
@@ -371,5 +544,39 @@ priority = 5
 	// An identical reload reports nothing.
 	if got := RestartRequiredChanges(withCustom, withCustom); len(got) != 0 {
 		t.Errorf("RestartRequiredChanges = %v, want no changes", got)
+	}
+}
+
+func TestRestartRequiredChangesFlagsCustomCodingRoleContent(t *testing.T) {
+	t.Parallel()
+
+	oldConfig := mustNormalize(t, mustDecodeTOML(t, `
+[roles.coding.auditor]
+priority = 60
+instructions = "old"
+[roles.coding.auditor.discovery]
+source = "issue"
+labels = ["old"]
+`))
+	newConfig := mustNormalize(t, mustDecodeTOML(t, `
+[roles.coding.auditor]
+priority = 60
+instructions = "new"
+[roles.coding.auditor.discovery]
+source = "issue"
+labels = ["new"]
+`))
+	if got := RestartRequiredChanges(oldConfig, newConfig); !hasIssuePath(got, "roles.coding.auditor") {
+		t.Fatalf("RestartRequiredChanges = %v, want roles.coding.auditor", got)
+	}
+
+	// A mirrored shipped-role hot field stays governed by the normal JSON
+	// diff and must not be promoted to a restart-bound registry edit.
+	shippedOld := mustNormalize(t)
+	shippedNew := shippedOld
+	shippedNew.Roles.Worker.Instructions = "hot guidance"
+	shippedNew.Roles.Coding = CodingRolesFromLegacy(shippedNew.Roles)
+	if got := RestartRequiredChanges(shippedOld, shippedNew); hasIssuePath(got, "roles.coding.worker") {
+		t.Fatalf("RestartRequiredChanges = %v, roles.coding.worker must remain hot", got)
 	}
 }

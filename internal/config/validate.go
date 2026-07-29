@@ -300,7 +300,22 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	// Configs assembled without normalization.
 	effectiveCodingRoles := EffectiveCodingRoles(config.Roles)
 	for _, name := range CodingRoleNames(config.Roles) {
-		issues = append(issues, ValidateRoleDiscovery("roles.coding."+name, effectiveCodingRoles[name].Discovery)...)
+		role := effectiveCodingRoles[name]
+		path := "roles.coding." + name
+		issues = append(issues, ValidateRoleDiscovery(path, role.Discovery)...)
+		if isCodingRole(name) {
+			// The named role validators above own the mirrored shipped fields.
+			continue
+		}
+		if NormalizeRoleName(name) == "" || NormalizeRoleName(name) != name {
+			issues = append(issues, ValidationIssue{Path: path, Message: "role name must be non-empty, trimmed, and lowercase"})
+		}
+		if name == "coordinator" {
+			issues = append(issues, ValidationIssue{Path: path, Message: "is not a coding role; configure roles.coordinator.* instead"})
+		}
+		issues = append(issues, validateCodingRoleDiscoveryCommon(path, role.Discovery)...)
+		validateCustomCodingRoleInstruction(path+".instructions", role.Instructions, config.Instructions.MaxBytes, &issues)
+		validateRoleAgentBinding(config, path+".agent", role.Agent, &issues)
 	}
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
@@ -810,6 +825,15 @@ func validateInstructionText(path, role, text string, maxBytes int, issues *[]Va
 	}
 }
 
+func validateCustomCodingRoleInstruction(path, text string, maxBytes int, issues *[]ValidationIssue) {
+	if maxBytes > 0 && len([]byte(text)) > maxBytes {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must be at most %d bytes", maxBytes)})
+	}
+	if protected := protectedInstructionPhrase(text); protected != "" {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must not attempt to override protected Looper contract %q", protected)})
+	}
+}
+
 func validateAggregateInstructionBytes(path, globalText, projectText string, maxBytes int, issues *[]ValidationIssue) {
 	if maxBytes <= 0 {
 		return
@@ -966,22 +990,25 @@ func validateRoleAgentBindings(config Config, issues *[]ValidationIssue) {
 		{role: CodingRoleFixer, agent: config.Roles.Fixer.Agent},
 	}
 	for _, binding := range bindings {
-		if binding.agent == nil {
-			continue
+		validateRoleAgentBinding(config, "roles."+binding.role+".agent", binding.agent, issues)
+	}
+}
+
+func validateRoleAgentBinding(config Config, prefix string, agent *RoleAgentConfig, issues *[]ValidationIssue) {
+	if agent == nil {
+		return
+	}
+	if agent.Profile != nil {
+		profileID := *agent.Profile
+		trimmed := strings.TrimSpace(profileID)
+		if trimmed == "" || profileID != trimmed {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: "must be a non-empty trimmed profile id"})
+		} else if _, exists := config.Agent.Profiles[trimmed]; !exists {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: fmt.Sprintf("references unknown agent profile: %s", trimmed)})
 		}
-		prefix := "roles." + binding.role + ".agent"
-		if binding.agent.Profile != nil {
-			profileID := *binding.agent.Profile
-			trimmed := strings.TrimSpace(profileID)
-			if trimmed == "" || profileID != trimmed {
-				*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: "must be a non-empty trimmed profile id"})
-			} else if _, exists := config.Agent.Profiles[trimmed]; !exists {
-				*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: fmt.Sprintf("references unknown agent profile: %s", trimmed)})
-			}
-		}
-		if binding.agent.Vendor != nil && !isValidAgentVendor(*binding.agent.Vendor) {
-			*issues = append(*issues, ValidationIssue{Path: prefix + ".vendor", Message: agentVendorValidationMessage()})
-		}
+	}
+	if agent.Vendor != nil && !isValidAgentVendor(*agent.Vendor) {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".vendor", Message: agentVendorValidationMessage()})
 	}
 }
 

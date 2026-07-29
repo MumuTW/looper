@@ -797,6 +797,12 @@ func canonicalizePartialRoleAgentBindings(roles *PartialRoleConfigs) {
 	if roles == nil {
 		return
 	}
+	for name, role := range roles.Coding {
+		if isEmptyRoleAgentConfig(role.Agent) {
+			role.Agent = nil
+			roles.Coding[name] = role
+		}
+	}
 	if roles.Planner != nil && isEmptyRoleAgentConfig(roles.Planner.Agent) {
 		roles.Planner.Agent = nil
 	}
@@ -1948,6 +1954,20 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		return nil
 	}
 	cloned := PartialRoleConfigs{}
+	if configs.Coding != nil {
+		cloned.Coding = make(map[string]PartialCodingRoleConfig, len(configs.Coding))
+		for name, role := range configs.Coding {
+			clonedRole := role
+			if role.Priority != nil {
+				priority := *role.Priority
+				clonedRole.Priority = &priority
+			}
+			clonedRole.Instructions = cloneStringPtr(role.Instructions)
+			clonedRole.Agent = cloneRoleAgentConfig(role.Agent)
+			clonedRole.Discovery = clonePartialRoleDiscoveryConfig(role.Discovery)
+			cloned.Coding[name] = clonedRole
+		}
+	}
 	if configs.Planner != nil {
 		planner := *configs.Planner
 		if configs.Planner.Triggers != nil {
@@ -2079,6 +2099,51 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		}
 		fixer.Agent = cloneRoleAgentConfig(configs.Fixer.Agent)
 		cloned.Fixer = &fixer
+	}
+	return &cloned
+}
+
+func clonePartialRoleDiscoveryConfig(config *PartialRoleDiscoveryConfig) *PartialRoleDiscoveryConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	if config.Enabled != nil {
+		value := *config.Enabled
+		cloned.Enabled = &value
+	}
+	if config.Source != nil {
+		value := *config.Source
+		cloned.Source = &value
+	}
+	if config.Labels != nil {
+		values := cloneStrings(*config.Labels)
+		cloned.Labels = &values
+	}
+	if config.LabelMode != nil {
+		value := *config.LabelMode
+		cloned.LabelMode = &value
+	}
+	if config.RequireAssigneeCurrentUser != nil {
+		value := *config.RequireAssigneeCurrentUser
+		cloned.RequireAssigneeCurrentUser = &value
+	}
+	cloned.PlaneAssigneeID = cloneStringPtr(config.PlaneAssigneeID)
+	if config.IncludeDrafts != nil {
+		value := *config.IncludeDrafts
+		cloned.IncludeDrafts = &value
+	}
+	if config.AuthorFilter != nil {
+		value := *config.AuthorFilter
+		cloned.AuthorFilter = &value
+	}
+	if config.RequireReviewRequest != nil {
+		value := *config.RequireReviewRequest
+		cloned.RequireReviewRequest = &value
+	}
+	if config.EnableSelfReview != nil {
+		value := *config.EnableSelfReview
+		cloned.EnableSelfReview = &value
 	}
 	return &cloned
 }
