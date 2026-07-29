@@ -16,7 +16,7 @@ Looper turns that idea into a local AI dev team. Register the repos you want it 
 Looper ships two binaries:
 
 - `looperd` — the background daemon that polls GitHub or Forgejo, runs loops, and manages worktrees
-- `looper` — a thin CLI for loop control (`stop`, `close`, `start`, `pause`, `retry`, `takeover`, `handback`, `respond`) against a running `looperd`
+- `looper` — a thin CLI for onboarding (`init`, `status`, `project add|list`) and loop control (`stop`, `close`, `start`, `pause`, `retry`, `takeover`, `handback`, `respond`) against a running `looperd`
 
 ## Four loops, four success criteria
 
@@ -61,28 +61,22 @@ curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/install.
 # 2. Daemon — same release's looperd-<target>.tar.gz onto PATH, or:
 #    go build -o ~/.local/bin/looperd ./cmd/looperd
 
-# 3. Config (minimal; see docs/configuration.md)
-mkdir -p ~/.looper
-cat > ~/.looper/config.toml <<'EOF'
-[server]
-host = "127.0.0.1"
-port = 17310
-
-[agent]
-vendor = "claude-code"   # or codex / opencode / cursor-cli / grok-build
-EOF
+# 3. Config — writes a commented ~/.looper/config.toml, never overwrites one
+looper init
+#    then edit it (agent vendor, base branch); see docs/configuration.md
 
 # 4. Run the daemon (foreground)
 looperd
 ```
 
-In another shell, register a local git checkout (directory containing `.git`) via the dashboard at `http://127.0.0.1:17310/dashboard/`, or:
+In another shell, register a local git checkout — the directory containing `.git`, not a subdirectory:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:17310/api/v1/projects \
-  -H 'Content-Type: application/json' \
-  -d '{"repoPath":"/absolute/path/to/your/local/repo"}'
+looper project add /absolute/path/to/your/local/repo
+looper status                                          # config, daemon, projects
 ```
+
+`looper project add` posts to the running daemon, so the project is live immediately. The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` do the same thing, and are where the options the CLI does not expose (explicit id, base branch, provider) live.
 
 Once the daemon is healthy and forge credentials are configured (`gh auth status` for GitHub, or a configured Forgejo token environment variable), loops start from the forge itself: label an issue and assign it, and `looperd`'s discovery picks it up. The CLI controls loops the daemon already owns:
 
@@ -182,10 +176,14 @@ For setup, identity strategy, recovery steps, and `loopernet` deployment, see **
 
 ## Command cheatsheet
 
-This is the whole operator CLI after the strip. Every verb except `version` talks to a running `looperd` over its local HTTP API.
+This is the whole operator CLI after the strip. Every verb except `init` and `version` talks to a running `looperd` over its local HTTP API.
 
 ```bash
 looper version
+looper init                            # write a starter config; never overwrites
+looper status                          # config, daemon reachability, projects
+looper project add <path>              # register a git repository root
+looper project list
 looper stop <selector>                 # "all" stops every active run
 looper close <selector>
 looper start <selector>
@@ -198,9 +196,11 @@ looper respond <selector> "<answer>"   # answer a loop waiting on a human
 
 A selector is a loop sequence number (`looper stop 12`) or a loop id (`looper stop loop_1cf3`). Pull request URLs are rejected — they cannot be placed in the path the daemon parses.
 
+Global flags, accepted before or after the verb: `--config <path>`, `--host <host>`, `--port <port>`.
+
 There is one more command that is not for operators: `looper review submit`, which publishes a reviewer agent's pull request review. Reviewer agents reach it through a wrapper the daemon writes; run directly it has no provider credentials and fails.
 
-**Not in the CLI.** Bootstrap, managed daemon install/start, project add/list, plan/review/work, ps/logs/jump, provider/webhook/network administration, and upgrade lived in the CLI that was removed. Loop inspection is available through the dashboard and the daemon's HTTP API; install and supervise `looperd` yourself.
+**Not in the CLI.** Bootstrap, managed daemon install/start, plan/review/work, ps/logs/jump, provider/webhook/network administration, and upgrade lived in the CLI that was removed. Loop inspection is available through the dashboard and the daemon's HTTP API; install and supervise `looperd` yourself.
 
 ## Configuration
 

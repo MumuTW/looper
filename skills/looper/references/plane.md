@@ -11,7 +11,7 @@ If issues already live on GitHub, use the default GitHub project setup instead.
 
 ## Write the config by hand
 
-There is no generator for this shape. The `looper bootstrap --provider plane` flow, and every flag it took, was removed with the old CLI. Write `~/.looper/config.toml` by hand (there is no `looper init` on this surface), then add the sections below. A plane project cannot be created via the project API alone: a Plane binding lives in the config file's `providers` + `projects` sections, which the project API refuses to modify.
+There is no generator for this shape. The `looper bootstrap --provider plane` flow, and every flag it took, was removed with the old CLI. Run `looper init` for a starter `~/.looper/config.toml`, then add the sections below by hand. A plane project cannot be created via the project API alone: a Plane binding lives in the config file's `providers` + `projects` sections, which the project API refuses to modify.
 
 | Value you need | Where it goes | How to get it |
 | --- | --- | --- |

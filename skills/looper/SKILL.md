@@ -9,11 +9,11 @@ Use this skill when an agent needs to install, configure, start, check, operate,
 
 > **The CLI is tiny, and installation is manual.** The whole operator surface is:
 >
-> `looper start|pause|retry|stop|close|takeover|handback|respond|version`
+> `looper init|status|project add|project list|start|pause|retry|stop|close|takeover|handback|respond|version`
 >
 > plus machine-only `looper review submit` (never suggest it to a user). Global flags (`--config`, `--host`, `--port`) work before or after the verb. A **selector** is a loop sequence number or a loop id — never a pull request URL.
 >
-> There is **no** `bootstrap`, `init`, `status`, `project add|list`, `daemon install|start|…`, `upgrade`, `config show`, `webhook`/`provider`/`network` administration, or `ps`/`logs`/`jump`/`plan`/`review`/`work`. Those lived in the CLI removed ahead of the role-model rewrite. Do anything else by editing the config file, through the dashboard (`/dashboard/`), through the daemon's HTTP API, or with the user's process manager — never invent a `looper` verb.
+> There is **no** `bootstrap`, `daemon install|start|…`, `upgrade`, `config show`, `webhook`/`provider`/`network` administration, or `ps`/`logs`/`jump`/`plan`/`review`/`work`. Those lived in the CLI removed ahead of the role-model rewrite. Do anything else by editing the config file, through the dashboard (`/dashboard/`), through the daemon's HTTP API, or with the user's process manager — never invent a `looper` verb.
 
 Webhook mode is configured in the config file and observed at `GET /api/v1/webhook/status` or on the dashboard. Stale GitHub CLI forwarder hooks have to be removed with `gh api` by hand after the user confirms.
 
@@ -76,7 +76,7 @@ go build -o ~/.local/bin/looperd ./cmd/looperd
 
 ### Step 3 — Write config
 
-Canonical path: `~/.looper/config.toml`. Never overwrite an existing file without the user's OK.
+Canonical path: `~/.looper/config.toml`. `looper init` writes a commented starter file there and refuses to overwrite an existing one, so it is safe to run first and read the path it prints. Never overwrite an existing file without the user's OK.
 
 ```toml
 [server]
@@ -106,23 +106,24 @@ curl -sS "http://127.0.0.1:17310/api/v1/healthz"
 
 ### Step 5 — Register a project
 
-With the daemon up, either open the dashboard at `http://127.0.0.1:17310/dashboard/`, or:
+With the daemon up:
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:17310/api/v1/projects" \
-  -H 'Content-Type: application/json' \
-  -d '{"repoPath":"/absolute/path/to/repo"}'
+looper project add /absolute/path/to/repo
+looper project list
 ```
 
-`repoPath` must be a git repository root (contains `.git`). For Forgejo/Plane providers, put the provider + project binding in the config file (see [docs/configuration.md](../../docs/configuration.md) and [docs/plane-provider.md](../../docs/plane-provider.md)); the project API will not rewrite file-managed projects.
+The path must be a git repository **root** (contains `.git`); `looper project add` refuses anything else, and refuses a checkout that is already registered. Always pass an absolute path, and confirm it with the user rather than guessing. The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` register the same way, and are where the fields the CLI does not expose (explicit id, name, base branch, worktree root, provider) live. For Forgejo/Plane providers, put the provider + project binding in the config file (see [docs/configuration.md](../../docs/configuration.md) and [docs/plane-provider.md](../../docs/plane-provider.md)); the project API will not rewrite file-managed projects.
 
 ### Step 6 — Verify
 
 ```bash
-curl -sS "http://127.0.0.1:17310/api/v1/status"
-curl -sS "http://127.0.0.1:17310/api/v1/projects"
+looper status   # config file, daemon reachability, registered projects
 looper version
+curl -sS "http://127.0.0.1:17310/api/v1/status"
 ```
+
+`looper status` exits non-zero when the config does not load or the daemon is unreachable, and names the config file it selected either way — that is the fastest way to tell "wrong config" from "daemon down".
 
 Loops start from forge labels/assignments once projects and credentials are good — there is no `looper plan` / `review` / `work`.
 
@@ -154,7 +155,8 @@ Inspect loops in the dashboard or via `GET /api/v1/loops`. Worktree path for a d
 
 ## Anti-patterns
 
-- Reaching for `looper bootstrap`, `daemon start`, `project add`, `ps`, `logs`, `plan`, `review`, `work`, `jump`
+- Reaching for `looper bootstrap`, `daemon start`, `ps`, `logs`, `plan`, `review`, `work`, `jump`
+- Passing `looper project add` a subdirectory instead of the repository root, or expecting it to take an id / base branch / provider — those are API and dashboard fields
 - Telling a user to run `looper review submit`
 - Using a PR URL as a selector
 - Force-pushing or inventing flags the strip CLI does not have

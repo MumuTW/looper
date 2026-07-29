@@ -53,7 +53,7 @@ Release binaries are unsigned. If macOS Gatekeeper blocks the first launch, allo
 
 ### 3. Write a config
 
-Create `~/.looper/config.toml` (or set `LOOPER_CONFIG` / pass `looperd --config`). A minimal starting point:
+Run `looper init` to write a commented `~/.looper/config.toml` and then edit it. `init` refuses to overwrite an existing config and prints the path it chose, so it is safe to run on a machine that may already be set up; `looper init --config <file>.toml` writes somewhere else. Writing the file by hand is equally fine (or set `LOOPER_CONFIG` / pass `looperd --config`). A minimal starting point:
 
 ```toml
 [server]
@@ -90,8 +90,11 @@ Keep it running — every `looper` control verb talks to it. Nothing restarts it
 
 With the daemon up, register a local git repository root either:
 
+- with `looper project add /absolute/path/to/repo`, then `looper project list` to confirm, or
 - through the local operator dashboard (served by `looperd` under `/dashboard/`), or
 - with `POST /api/v1/projects` and a JSON body like `{"repoPath":"/absolute/path/to/repo"}`.
+
+`looper project add` is the API call with the mistakes checked first: it refuses a path that is not a repository root, and refuses a checkout that is already registered. Setting an explicit id, name, base branch, worktree root, or provider is available on the API and the dashboard, not on the CLI.
 
 Projects registered through the API take effect immediately. Projects listed under `[[projects]]` in the config file are imported at daemon startup instead.
 
