@@ -6,7 +6,7 @@ This guide is for everyday users. It focuses on how `coordinator`, `planner`, `r
 >
 > `init` · `status` · `project add|list` · `start` · `pause` · `retry` · `stop` · `close` · `takeover` · `handback` · `respond` · `version`
 >
-> (plus machine-only `review submit`). There is no `bootstrap`, `daemon *`, `ps`, `logs`, `jump`, `plan`, `review`, `work`, or `webhook`/`provider`/`network` admin. Where this guide still shows an old command, treat it as **intent** and do the equivalent via forge labels, the config file, the dashboard, or the daemon HTTP API. Current install surface: [installation.md](installation.md) and the repository README.
+> (plus machine-only `review submit`). There is no `bootstrap`, `daemon *`, `ps`, `logs`, `jump`, `plan`, `review`, `fix`, `work`, or `webhook`/`provider`/`network` admin. Beyond `init`, `status`, and `project add|list`, every verb the CLI kept acts on a loop that **already exists**; nothing in the CLI creates one. Loops start from forge state — labels, assignment, review requests — picked up by daemon discovery, or from the create endpoints (`POST /api/v1/planners`, `POST /api/v1/workers`, or `POST /api/v1/loops` for any role). Inspection is the dashboard and the HTTP API. Where a removed verb still appears below, it is marked as removed and paired with what to do instead. Current install surface: [installation.md](installation.md) and the repository README.
 
 ## 1. Prerequisites
 
@@ -79,18 +79,15 @@ Operator recovery rules:
 - if webhook ingress or SSE wakeups degrade, polling continues as a fallback so Coordinator can repair drift
 - if a stale target label remains after lease loss or a partial GitHub mutation, let Coordinator reconciliation repair or remove it before retrying
 
-## 2. Project auto-detection from the current directory
+## 2. How Looper resolves the project
 
-Looper can often infer the target project from your current working directory.
+Looper only acts on **registered projects**. A project is registered once, from the dashboard or `POST /api/v1/projects` with the repo's absolute `repoPath`; the daemon then polls every registered project on each discovery pass.
 
-In practice, this means that if you run commands from inside a registered project repo, you can usually omit `--project`.
+There is no current-directory inference and no `--project` flag: the stripped CLI has neither, and the daemon's create endpoints take an explicit project id.
 
-This works best when:
-
-- your current directory is inside exactly one registered project repo
-- that project has a configured GitHub repo mapping
-
-If no project matches the current directory, or multiple projects match, pass `--project` explicitly.
+- `POST /api/v1/planners` and `POST /api/v1/loops` require `projectId`; `POST /api/v1/workers` takes `projectId`, or infers it from `repo` + `prNumber`
+- read-only lookups such as `GET /api/v1/pull-requests/{repo}/{number}` accept an optional `projectId`, and fail with a "multiple projects match" conflict when the same repo is registered under more than one project
+- the surviving control verbs (`looper stop`, `pause`, `retry`, …) take a loop selector, not a project — the loop already knows which project it belongs to
 
 ## 3. What each role does
 
@@ -98,15 +95,15 @@ If no project matches the current directory, or multiple projects match, pass `-
 | --- | --- | --- |
 | `coordinator` | Proactively triages fresh issues and commits a Disposition with durable labels | runs automatically inside `looperd` |
 | `planner` | Generates a spec from an issue and opens a spec PR | Label issue `looper:plan` + assign (or `POST /api/v1/planners`) |
-| `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | Review-request / label discovery (or dashboard / API) |
-| `fixer` | Fixes PR issues based on review comments and tries to resolve threads | Discovery on open PRs with actionable threads (or dashboard / API) |
+| `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | Review-request / label discovery (or `POST /api/v1/loops`) |
+| `fixer` | Fixes PR issues based on review comments and tries to resolve threads | Discovery on open PRs with actionable threads (or `POST /api/v1/loops`) |
 | `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | Label `looper:worker-ready` / `looper:spec-ready` (or `POST /api/v1/workers`) |
 
 Forgejo MVP role support:
 
 - Planner and Worker are supported over the Forgejo REST API.
 - Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level Reviewer Summary compatibility protocol.
-- Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and direct/manual fixer loops (dashboard or API, not a `looper fix` verb) also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
+- Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and direct/manual fixer loops (`POST /api/v1/loops`, not a `looper fix` verb) also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
 - Coordinator, auto-merge, routed network mode, and webhook modes remain unsupported for Forgejo.
 - A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
@@ -207,13 +204,15 @@ Autonomous dispatch stops immediately when any veto signal is present:
 
 ### Start it manually
 
+The normal trigger is the label plus the assignment (below). To create the loop immediately instead of waiting for the next discovery poll, post it:
+
 ```bash
-# intent: start planner for issue 123 — label looper:plan + assign, or POST /api/v1/planners
+curl -sS -X POST "http://127.0.0.1:17310/api/v1/planners" \
+  -H 'Content-Type: application/json' \
+  -d '{"projectId":"<project-id>","issueNumber":123}'
 ```
 
-This creates a `planner` loop targeting that issue.
-
-For `plan`, it is safest to pass `--project` explicitly.
+This creates a `planner` loop targeting that issue. `projectId` is required — planner has no repo or current-directory inference.
 
 ### Auto-discovery conditions
 
@@ -244,32 +243,27 @@ If planner cannot assign the issue in GitHub, it reports a retryable failure rat
 
 ## 7. Reviewer: review a spec PR or a normal PR
 
-### One-time review
+### How to get a review
+
+There is no `looper review` verb (`looper review submit` is the machine-only path reviewer agents use to publish, not a way to start one). Reviewer loops come from forge state:
 
 ```bash
-# intent: review that PR — discovery via review-request or looper:spec-reviewing
+gh pr edit 42 --add-reviewer <login>              # any PR: request a review
+gh pr edit 42 --add-label looper:spec-reviewing   # spec PR: mark the review phase
 ```
 
-If you are already inside the registered repo, this usually also works:
+`<login>` is the GitHub user whose Looper instance should do the review: an instance only picks up PRs requested from *its own* authenticated user. GitHub will not let you request a review from a PR's own author, so a self-authored PR needs `roles.reviewer.discovery.triggers.enableSelfReview = true` instead.
 
-```bash
-# intent: review PR 42 in the registered repo
-```
+To create the loop directly rather than wait for the next poll, `POST /api/v1/loops` with `type: "reviewer"`. The dashboard controls existing loops; it cannot create one.
 
-### Continuous review
-
-```bash
-# intent: continuous review — ensure review-request/discovery; use dashboard for loop control
-```
-
-Use this when new commits are expected to keep landing on the PR.
+There is no longer a one-time vs continuous mode to choose: a reviewer loop stays with its PR through the review/fix cycle, and a fixer push queues a fresh review rather than waiting for the next coordinator pass.
 
 ### Reviewer auto-discovery rules
 
 Reviewer mainly watches two kinds of PRs:
 
 - open PRs where the current GitHub user was requested as a reviewer
-- manually-started reviewer loops from this machine, including `# intent: continuous review — ensure review-request/discovery; use dashboard for loop control`
+- reviewer loops that already exist on this machine, which keep following their PR
 
 For the default review-requested path, Looper asks GitHub for PRs requested from the current user instead of only filtering the first page of open PRs locally.
 
@@ -316,7 +310,7 @@ Auto-merge is not engaged for Spec PRs, PRs whose linked Issue has no `## Accept
 
 ## 8. Fixer: repair a PR based on review feedback
 
-There is no `looper fix` CLI. Fixer starts via discovery on open PRs with actionable review threads (authored by the configured user), or via the dashboard / `POST /api/v1/loops` when you need a forced repair pass.
+There is no `looper fix` CLI. Fixer starts via discovery on open PRs with actionable review threads (authored by the configured user), or via `POST /api/v1/loops` with `type: "fixer"` when you need a forced repair pass. The dashboard controls existing loops; it cannot create one.
 
 Fixer will:
 
@@ -343,16 +337,14 @@ In practice, `reviewer` and `fixer` often alternate until the spec PR is ready f
 
 ### Start from an issue
 
-```bash
-# intent: worker for issue 123 — label looper:worker-ready or looper:spec-ready
-```
+Label the issue `looper:worker-ready` (or `looper:spec-ready` once its spec PR is approved) and assign it to the current forge user. Discovery picks it up on the next poll. This is the recommended entrypoint.
 
-This is the recommended entrypoint.
-
-If you are already inside the target repo, you can usually omit `--project`:
+To create the loop directly instead of waiting for discovery:
 
 ```bash
-# intent: worker for issue 123 — label looper:worker-ready or looper:spec-ready
+curl -sS -X POST "http://127.0.0.1:17310/api/v1/workers" \
+  -H 'Content-Type: application/json' \
+  -d '{"projectId":"<project-id>","issueNumber":123}'
 ```
 
 If that issue already has a related planner loop, worker will try to reuse planner output, including:
@@ -368,8 +360,12 @@ For Forgejo projects, Worker does not claim issues by mutating assignees. The is
 
 ### Start directly from a spec
 
+The removed `looper work` verb took a spec path. The daemon endpoint still does — pass `specPath` (with `title` or `prompt`) instead of `issueNumber`:
+
 ```bash
-# intent: worker with explicit spec — use dashboard/API; CLI work verb removed
+curl -sS -X POST "http://127.0.0.1:17310/api/v1/workers" \
+  -H 'Content-Type: application/json' \
+  -d '{"projectId":"<project-id>","title":"Implement the cache layer","specPath":"specs/2026-04-17-cache/spec.md"}'
 ```
 
 ### What happens when worker takes over a `spec-ready` PR
@@ -457,28 +453,30 @@ gh pr view 42
 gh pr checks 42
 ```
 
-Create a reviewer task:
+Get a reviewer onto a PR — there is no `looper review` verb, so this is done on the forge:
 
 ```bash
-# intent: review that PR — discovery via review-request or looper:spec-reviewing
-# intent: continuous review — ensure review-request/discovery; use dashboard for loop control
-# intent: continuous review of PR 42 in the registered repo
+gh pr edit 42 --add-reviewer <login>              # review request: the main reviewer trigger
+gh pr edit 42 --add-label looper:spec-reviewing   # spec PRs: mark the review phase
 ```
 
-Start fixer for an existing PR:
+Get a fixer onto a PR: let the reviewer publish its findings first — fixer discovery reads those and the loop appears on its own. See [section 8](#8-fixer-repair-a-pr-based-on-review-feedback).
 
-```bash
-# looper loop start  # removed — fixer discovery + dashboard control
-```
+Either loop can also be created directly with `POST /api/v1/loops` and the matching `type`, when you do not want to wait for the next discovery poll.
 
 ## 14. How to inspect current activity
 
+Inspection moved to the dashboard and the API; the CLI kept only the verbs that change a loop.
+
 ```bash
+curl -sS "http://127.0.0.1:17310/api/v1/loops"        # what exists
+curl -sS "http://127.0.0.1:17310/api/v1/runs/active"  # what is running now
+looper stop 12                                        # act on one of them
+
 # looper ps  # removed — use dashboard
 # looper describe  # removed — use dashboard
-# intent: stream logs for loop 12 — open the dashboard loop detail view
-# intent: open worktree for loop 12 — copy path from dashboard dirty-worktree dialog
-looper stop 12
+# looper logs  # removed — use the dashboard loop detail view
+# looper jump  # removed — copy the path from the dashboard dirty-worktree dialog
 # looper run reconcile-stale  # removed
 ```
 
@@ -494,45 +492,27 @@ Typical usage (stripped CLI + dashboard):
 
 ## 15. Minimal end-to-end example
 
+Every step below is a forge action. Nothing here needs the CLI: the daemon discovers each stage on its next poll, and you watch the loops on the dashboard.
+
 ### Option A: start from an issue
 
 1. Create GitHub issue `#123`
 2. Add the `looper:plan` label
-3. Assign it to the current `gh` user
-4. Run:
-
-```bash
-# intent: start planner for issue 123 — label looper:plan + assign, or POST /api/v1/planners
-```
-
-5. Wait for planner to open a spec PR
-6. Run reviewer:
-
-```bash
-# intent: review the spec PR — discovery via looper:spec-reviewing / review-request
-```
-
-7. If comments appear, start fixer:
-
-```bash
-# looper loop start  # removed — fixer discovery + dashboard control
-```
-
-8. Once the PR reaches `looper:spec-ready`, start worker:
-
-```bash
-# intent: worker for issue 123 — label looper:worker-ready or looper:spec-ready
-```
+3. Assign it to the current `gh` user — planner needs both the label and the assignment
+4. Planner picks it up and opens a spec PR (or create the loop now with `POST /api/v1/planners`)
+5. Request a review on that spec PR, or label it `looper:spec-reviewing`, so reviewer takes it
+6. If reviewer leaves findings, fixer starts on its own and pushes repairs to the same branch
+7. Reviewer and fixer alternate until the review is clean and the PR reaches `looper:spec-ready`
+8. Worker takes over that PR and implements the spec
 
 ### Option B: manage an existing PR directly
 
-```bash
-# intent: continuous review + fixer on PR 42 —
-# ensure review-request/discovery on a registered project; control loops via dashboard or:
-#   looper stop|pause|retry|takeover <selector>
-```
+You already have a PR and only want Looper to handle the review/fix cycle:
 
-This is useful when you already have a PR and only want Looper to handle the review/fix cycle.
+1. make sure the PR's repo is a registered project
+2. request a review from the intended forge user on the PR — that is what reviewer discovery watches
+3. reviewer runs, fixer follows on its findings, and the two alternate as in Option A
+4. steer the resulting loops with `looper stop|pause|retry|takeover <selector>` or the dashboard
 
 ### Option C: babysit one PR without repo-wide automation
 
