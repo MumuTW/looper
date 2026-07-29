@@ -33,11 +33,12 @@ const (
 )
 
 var (
-	prListJSONFields          = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
-	prDiscoveryListJSONFields = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
-	prViewMetadataJSONFields  = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
-	prViewFixerJSONFields     = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
-	prViewReviewerJSONFields  = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
+	prListJSONFields           = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
+	prDiscoveryListJSONFields  = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
+	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
+	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
+	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -169,6 +170,7 @@ type PullRequestCheckRun struct {
 	Name       string
 	Status     string
 	Conclusion string
+	AppID      int64
 }
 
 type PullRequestStatus struct {
@@ -285,9 +287,19 @@ type BranchProtectionInput struct {
 }
 
 type BranchProtection struct {
-	Enabled           bool
-	HasRequiredChecks bool
-	RequiredChecks    []string
+	Enabled                      bool
+	HasRequiredChecks            bool
+	RequiredChecks               []string
+	RequiredCheckRules           []RequiredCheckRule
+	HasRequiredReviews           bool
+	RequiredApprovingReviewCount int
+}
+
+// RequiredCheckRule preserves GitHub's optional App binding. AppID zero means
+// the legacy context is not bound to a particular GitHub App.
+type RequiredCheckRule struct {
+	Context string
+	AppID   int64
 }
 
 type IssueSummary struct {
@@ -551,6 +563,7 @@ type ListOpenIssuesInput struct {
 	Assignee string
 	Label    string
 	Labels   []string
+	Search   string
 }
 
 type ViewIssueInput struct {
@@ -923,6 +936,9 @@ func (g *Gateway) listOpenIssuesRaw(ctx context.Context, input ListOpenIssuesInp
 	}
 	for _, label := range issueListLabels(input) {
 		args = append(args, "--label", label)
+	}
+	if strings.TrimSpace(input.Search) != "" {
+		args = append(args, "--search", strings.TrimSpace(input.Search))
 	}
 	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}, ","))
 
@@ -1397,6 +1413,17 @@ func (g *Gateway) GetRepositoryPermission(ctx context.Context, input RepositoryP
 	return strings.ToLower(strings.TrimSpace(asString(row["permission"]))), nil
 }
 
+// RepositoryPermissionAllowsWrite is the shared authority predicate for
+// maintainer-confirmed GitHub actions.
+func RepositoryPermissionAllowsWrite(permission string) bool {
+	switch strings.ToLower(strings.TrimSpace(permission)) {
+	case "admin", "maintain", "write":
+		return true
+	default:
+		return false
+	}
+}
+
 func (g *Gateway) GetRepositorySettings(ctx context.Context, input RepositorySettingsInput) (RepositorySettings, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s", repo)}
@@ -1439,11 +1466,13 @@ func (g *Gateway) GetBranchProtection(ctx context.Context, input BranchProtectio
 	requiredStatusChecks, _ := row["required_status_checks"].(map[string]any)
 	hasRequiredChecks := false
 	requiredChecks := []string{}
+	requiredCheckRules := []RequiredCheckRule{}
 	if requiredStatusChecks != nil {
 		for _, check := range toObjectSlice(requiredStatusChecks["checks"]) {
 			name := firstNonEmpty(asString(check["context"]), asString(check["name"]))
 			if strings.TrimSpace(name) != "" {
 				requiredChecks = append(requiredChecks, name)
+				requiredCheckRules = append(requiredCheckRules, RequiredCheckRule{Context: name, AppID: asInt64(check["app_id"])})
 			}
 		}
 		if len(requiredChecks) > 0 {
@@ -1455,11 +1484,21 @@ func (g *Gateway) GetBranchProtection(ctx context.Context, input BranchProtectio
 				name := asString(context)
 				if strings.TrimSpace(name) != "" {
 					requiredChecks = append(requiredChecks, name)
+					requiredCheckRules = append(requiredCheckRules, RequiredCheckRule{Context: name})
 				}
 			}
 		}
 	}
-	return BranchProtection{Enabled: true, HasRequiredChecks: hasRequiredChecks, RequiredChecks: uniqueStrings(requiredChecks)}, nil
+	requiredPullRequestReviews, _ := row["required_pull_request_reviews"].(map[string]any)
+	requiredApprovingReviewCount := int(asInt64(requiredPullRequestReviews["required_approving_review_count"]))
+	return BranchProtection{
+		Enabled:                      true,
+		HasRequiredChecks:            hasRequiredChecks,
+		RequiredChecks:               uniqueStrings(requiredChecks),
+		RequiredCheckRules:           uniqueRequiredCheckRules(requiredCheckRules),
+		HasRequiredReviews:           requiredPullRequestReviews != nil,
+		RequiredApprovingReviewCount: requiredApprovingReviewCount,
+	}, nil
 }
 
 func compactIssueAssignees(values []string) []string {
@@ -1486,6 +1525,12 @@ func (g *Gateway) ViewPullRequestForFixer(ctx context.Context, input ViewPullReq
 
 func (g *Gateway) ViewPullRequestForReviewer(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	return g.viewPullRequestWithFields(ctx, input, prViewReviewerJSONFields, true, true)
+}
+
+func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	// Gate decisions must bypass the per-tick discovery snapshot: this method
+	// is the fresh provider read that binds a report to the current head.
+	return g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
 }
 
 func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
@@ -1582,6 +1627,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		CreatedAt:      firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
 		UpdatedAt:      firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
 		ClosedAt:       firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
+		IsDraft:        asBool(row["draft"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
@@ -1596,7 +1642,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 
 func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullRequestCheckRunsInput) (PullRequestCheckRuns, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	args := []string{"api", fmt.Sprintf("repos/%s/commits/%s/check-runs", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
+	args := []string{"api", fmt.Sprintf("repos/%s/commits/%s/check-runs?filter=latest&per_page=100", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
@@ -1623,7 +1669,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 	checkRuns := toObjectSlice(row["check_runs"])
 	out := PullRequestCheckRuns{TotalCount: int(asInt64(row["total_count"])), CheckRuns: make([]PullRequestCheckRun, 0, len(checkRuns))}
 	for _, checkRun := range checkRuns {
-		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"])})
+		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id")})
 	}
 	statuses := toObjectSlice(statusRow["statuses"])
 	out.Statuses = make([]PullRequestStatus, 0, len(statuses))
@@ -4138,6 +4184,18 @@ func nestedString(value map[string]any, path ...string) string {
 	return asString(current)
 }
 
+func nestedInt64(value map[string]any, path ...string) int64 {
+	current := any(value)
+	for _, part := range path {
+		next, ok := current.(map[string]any)
+		if !ok {
+			return 0
+		}
+		current = next[part]
+	}
+	return asInt64(current)
+}
+
 func extractAutoMerge(value any) *PullRequestAutoMerge {
 	row, ok := value.(map[string]any)
 	if !ok || row == nil {
@@ -4162,6 +4220,24 @@ func uniqueStrings(values []string) []string {
 		}
 		seen[normalized] = struct{}{}
 		out = append(out, strings.TrimSpace(value))
+	}
+	return out
+}
+
+func uniqueRequiredCheckRules(values []RequiredCheckRule) []RequiredCheckRule {
+	seen := map[string]struct{}{}
+	out := make([]RequiredCheckRule, 0, len(values))
+	for _, value := range values {
+		value.Context = strings.TrimSpace(value.Context)
+		if value.Context == "" {
+			continue
+		}
+		key := fmt.Sprintf("%s\x00%d", strings.ToLower(value.Context), value.AppID)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
 	}
 	return out
 }

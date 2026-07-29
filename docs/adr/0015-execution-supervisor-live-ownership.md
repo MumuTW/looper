@@ -64,7 +64,8 @@ must classify durable observations conservatively before mutations are enabled.
 > + operation lease) and its owned containment handle. SQLite rows and PID/PGID
 > probes are recovery evidence only — never live stop, terminal, requeue, or
 > overlap Authority while the daemon is live, and never confirmed-dead Authority
-> after restart solely because a PID is missing or a leader has exited.
+> after restart solely because a PID is missing, an argv changed, a lease expired,
+> or a leader exited.
 
 Why this is not the agent’s structured output: agents do not own process
 lifecycle, queue claims, or stop semantics. Why this is not SQLite alone:
@@ -285,28 +286,47 @@ recovery classifies each durable `agent_executions` observation as one of:
 | **observed_live** | Process probe matched the durable row | Evidence only — never adopt live ownership; quarantine |
 | **uncertain** | Everything else (PID absent, not running, mismatch, probe error, leader-exit-only) | Quarantine; no raw PID/PGID action |
 
+Issue #22 adds shared liveness observation on top of this classification.
+`agent_executions.last_heartbeat_at` (falling back to row timestamps for legacy
+observations) schedules reevaluation after 30 minutes; expiry is not Authority.
+The common executor also records an operating-system birth identity after
+`cmd.Start`: absolute process start time on supported non-Linux platforms, and
+Linux `/proc` start ticks paired with the kernel boot ID. The birth identity is
+authoritative for recognizing the same observed process even when a shebang or
+wrapper `exec`s another argv in place. PID absence, birth mismatch, missing
+identity, and probe errors remain `needs_confirmation` regardless of lease age.
+
+The live scheduler performs this observation on each periodic full tick,
+independently of available capacity. It never overrides a current-daemon-owned
+execution, consumes the active execution row, releases a prior quarantine, or
+requeues inherited work without confirmed containment. A later operator pause
+therefore remains authoritative over the older quarantine reason.
+
 **Authority for `confirmed_dead` after restart:**
 
 | May authorize confirmed-dead | Must not authorize confirmed-dead |
 |------------------------------|-----------------------------------|
 | Durable terminal finalization already committed before crash | PID/PGID missing or not running |
 | A **current-daemon** owned handle that has completed confirmed drain | Probe-then-signal on raw PID/PGID |
+| | Lease expiry, command drift, or invalid birth identity |
 | | Leader exit alone without descendant/containment proof |
 
 Otherwise the row remains **uncertain** (or **observed_live**) and is parked via
 existing `manual_intervention` / `paused` states — no new quarantine ledger.
-Running claims after restart have no live operation lease; reconcile them via
-durable finalize semantics (#578/#579), never by inferring death from PID absence.
+Running claims after restart have no live operation lease; keep them quarantined
+until an operator or a future durable containment Authority resolves them. Never
+consume the active row before all repair is durable, and never infer that repair
+is allowed from PID evidence or lease expiry alone.
 Mutations stay closed until classification finishes (#575/#580).
 
 **Startup recovery concept trade-off (R8):**
 
 | | |
 |--|--|
-| **Failure prevented** | False cleanliness and PID-reuse kills after crash; marking terminal / requeue / overlap from leader exit or PID absence alone; treating observed-live orphans as Supervisor-owned. |
-| **Costs** | More quarantine/`manual_intervention` and less aggressive auto-clean after restart; operators must unstick parked work deliberately. |
-| **Why not simpler** | Trusting PID/PGID probes as Authority reopens reusable-ID kills. Requeueing “dead” leaders without descendant proof leaves live children and starts overlapping work. |
-| **Deletion attempt** | Drop classification and always quarantine — correct but loses the durable-terminal / current-daemon-drain paths that already have Authority; classification keeps those paths explicit and tested. |
+| **Failure prevented** | False cleanliness and overlap after leader exit; cross-boot PID/start-tick collision; wrapper `exec` mistaken for PID reuse; later operator pauses overwritten by stale quarantine provenance. |
+| **Costs** | More durable quarantine and deliberate operator recovery; one boot ID in existing Linux execution metadata; periodic observation and operator events without automatic capacity release. |
+| **Why not simpler** | PID/PGID probes and lease expiry cannot prove descendant drain. Command matching is not birth identity because wrappers legitimately replace argv. |
+| **Deletion attempt** | The invalid-identity auto-finalize/requeue layer was deleted. Existing `paused` / `manual_intervention` states retain retryable evidence without adding a quarantine ledger or inferred Authority. |
 
 ### Full non-mutating coverage when not-ready or degraded (enforced by #580)
 

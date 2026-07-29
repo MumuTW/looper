@@ -24,6 +24,13 @@ _Avoid_: registry, live config projects.
 A reactive Role that produces a Spec from an Issue.
 _Avoid_: designer, architect.
 
+**Triager**:
+An internal proactive Role for the personal GitHub workflow. It consumes new
+and reopened Issue events, persists a structured Triage Report, and projects
+accepted low-risk reports directly into Planner work. It has no configurable
+trigger labels and does not replace Fixer's review-feedback source.
+_Avoid_: coordinator (a separate label/network control-plane role).
+
 **Worker**:
 A reactive Role that implements a Spec or an Issue, producing a Pull Request.
 _Avoid_: implementer, builder, coder.
@@ -36,15 +43,48 @@ _Avoid_: critic, checker.
 A reactive Role that addresses review feedback on a Pull Request.
 _Avoid_: patcher, responder.
 
+**Merge Gatekeeper**:
+A reactive, agent-free policy Role that re-fetches current Pull Request state and writes an observe-only **Gate report**. It never reviews code, repairs a Pull Request, resolves comments, or merges.
+_Avoid_: merger, reviewer, fixer.
+
 **Coordinator**:
-A proactive, LLM-driven Role that performs Triage on fresh Issues and executes Dispatch. In Network mode, Coordinator is also the control plane for Issue admission, PR review assignment, and exact Node targeting, gated by the Network Lease.
+A proactive, LLM-driven Role for the legacy label-mediated intake path that performs Triage on fresh Issues and executes Dispatch. In Network mode, Coordinator is also the control plane for Issue admission, PR review assignment, and exact Node targeting, gated by the Network Lease. The internal Triager stands down while Coordinator is enabled for a Project so the two intake authorities cannot race.
 _Avoid_: manager, commander, maintainer.
 
 ### Issue lifecycle
 
 **Triage**:
-The act of forming an opinion about a fresh Issue: applying classification labels, posting a triage comment, and committing a Disposition. Performed exactly once per Issue by Coordinator.
-_Avoid_: classification (overloaded — see below), assessment.
+The act of forming an opinion about a fresh Issue. In the personal GitHub path,
+Triager persists the opinion as a Triage Report. In the legacy
+Coordinator path, Coordinator applies classification labels, posts a triage
+comment, and commits a Disposition. Each path deduplicates by its own durable
+authority, and they do not run concurrently for one Project.
+_Avoid_: assessment.
+
+**Triage Report**:
+Triager's durable structured record containing classification, scope, risk,
+confidence, missing information, recommended next Role, rationale, the source
+Issue event, idempotency key, and policy outcome. It is stored as a
+`triage.report` event and is the semantic Authority for automatic Planner
+routing. GitHub labels may project its outcome but cannot replace it.
+_Avoid_: routing label, inferred issue state.
+
+**Triage enrollment**:
+Triager's durable record that a specific new/reopened source event entered the
+workflow before any LLM call. `triage.enrolled` provides retry identity across
+agent outages and source-lookback expiry; it does not authorize Planner.
+`triage.routed` acknowledges an accepted projection, while `triage.retired`
+settles a source that closed or was superseded.
+_Avoid_: routing authority, report.
+
+**Triage routing**:
+The projection of an accepted Triage Report into Planner's durable loop and
+queue without consulting Planner's label/assignee discovery filters. This is
+distinct from Coordinator Dispatch, which remains the label-mediated action
+defined below. A report held by policy may instead be authorized by a later
+`triage.confirmed` record derived from an exact `/plan` comment by a repository
+collaborator with write access.
+_Avoid_: Dispatch (reserved for Coordinator).
 
 **Disposition**:
 Coordinator's high-level conclusion about an Issue. One of `valid`, `out-of-scope`, `unclear`. Distinct from `kind`/`area`/`complexity`, which are classification labels applied only when the Disposition is `valid`.
@@ -82,10 +122,17 @@ The GitHub-native state of a Pull Request after `gh pr merge --auto` has been ca
 **Watch marker**:
 The `<!-- looper:coordinator:merge-watch retries=N -->` HTML-comment marker Coordinator places on the linked Issue (not the PR — preserves ADR-0003 Issue-rooted scope) to carry merge-watch retry-counter state across ticks. Public, durable, idempotent — preserves ADR-0001's stateless property.
 
+**Gate report**:
+The durable `pull_request.merge_gate.evaluated` event written by Merge Gatekeeper. It records `eligible` or `blocked`, stable reasons and evidence, and the observed head SHA. It is audit evidence, not merge authority: a future merge path must rerun every gate immediately before merging because holds, reviews, threads, and Project policy can change without moving the head.
+
 ### Authority and statelessness
 
 **Authority**:
 For any side-effecting action, the named, durable, structured signal that justifies the action. Per `AGENTS.md`: "What is the authority for this action, and why is it not the agent's own structured output?" Coordinator's authority for Dispatch is the durable `dispatch/*` label on the Issue, which is the agent's structured output committed to GitHub.
+Triager's authority for Triage routing is the persisted Triage Report; the
+policy outcome is stored before Planner projection and replayed after partial
+failures. When policy requires a human, the report plus its persisted
+write-authorized confirmation is the Authority.
 
 **Stateless Role**:
 A Role whose memory lives entirely in GitHub (labels, comments with markers, event timeline). It owns no private database tables. Coordinator is stateless. Worker, Planner, Reviewer, and Fixer are not — they persist runs in the local SQLite database.
@@ -153,11 +200,14 @@ _Avoid_: local sandbox, mock sandbox.
 
 ## Relationships
 
-- A **Coordinator** performs **Triage** on a fresh **Issue**, producing a **Disposition** plus classification labels
+- A **Triager** performs **Triage** on a new or reopened GitHub **Issue**, producing a persisted **Triage Report**
+- An accepted low-risk **Triage Report** authorizes **Triage routing** directly to **Planner**
+- A **Coordinator** performs label-mediated **Triage** on a fresh **Issue**, producing a **Disposition** plus classification labels
 - A **Coordinator** performs **Dispatch** on a Triaged Issue, producing a **Trigger label** that a **Planner** or **Worker** observes
 - A **Coordinator** may perform **PR review assignment**, producing a GitHub review request that **Reviewer** observes
 - A **Coordinator** consults the **Dependency gate** before performing **Dispatch** when `roles.coordinator.dependencies.enabled = true`
 - **Reviewer** opts approved code PRs (carrying **Auto-merge scope**) into GitHub-native auto-merge after verifying each **Acceptance criterion** has satisfying-evidence in the diff
+- **Merge Gatekeeper** evaluates every active GitHub-backed Project Pull Request from source discovery, then re-evaluates after head, check, review, thread, or hold changes and writes a head-bound **Gate report**
 - **Coordinator**'s per-tick poll classifies **Merge-pending state** PRs into WatchActions, routing mechanical failures (conflict, red CI) to **Fixer** via **Trigger label** and policy failures (branch protection change) to re-Triage by removing the Issue's `triaged` and `dispatch/*` labels
 - The **Watch marker** carries merge-watch retry state on the linked Issue, preserving Coordinator's stateless property
 - A **Veto signal** from a human overrides Coordinator's autonomous Dispatch but does not override **Triage** itself
