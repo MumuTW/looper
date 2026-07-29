@@ -3423,7 +3423,7 @@ func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
 }
 
 // isClosedLoopStatus reports loop statuses that are fully finished and must not
-// appear in the default active-run listing (looper ps). Failed/interrupted loops
+// appear in the default active-run listing. Failed/interrupted loops
 // remain eligible when parked for manual intervention so operators can retry.
 func isClosedLoopStatus(status string) bool {
 	switch domain.LoopStatus(status) {

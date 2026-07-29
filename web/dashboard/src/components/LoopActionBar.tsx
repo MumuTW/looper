@@ -52,8 +52,8 @@ type InspectGuidance = {
 } | null;
 
 /**
- * POSIX-safe single-quoted path for paste into a shell (matches `looper jump`).
- * Always quotes so spaces and metacharacters cannot break the copied command.
+ * POSIX-safe single-quoted path for paste into a shell. Always quotes so
+ * spaces and metacharacters cannot break the copied command.
  */
 function quoteShellArg(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
