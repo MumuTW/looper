@@ -1,4 +1,4 @@
-// Onboarding verbs (init, status, project add|list) and the shared fake daemon
+// Onboarding verbs (init, status, project add|list|discover) and the shared fake daemon
 // they are exercised against. Kept apart from main_test.go, which covers the
 // argument-to-request mapping for the control verbs: the two surfaces fail in
 // different ways — routing is a pure function, onboarding is several daemon
@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/version"
@@ -774,6 +776,72 @@ func TestProjectDiscoverRetriesDiscovery(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "pullRequests: 1") {
 		t.Fatalf("stdout = %q, want discovered pull request count", stdout)
+	}
+}
+
+func TestProjectDiscoverUsesExplicitLongTimeout(t *testing.T) {
+	if projectDiscoveryTimeout != 10*time.Minute {
+		t.Fatalf("projectDiscoveryTimeout = %s, want 10m", projectDiscoveryTimeout)
+	}
+	if projectDiscoveryTimeout <= requestTimeout {
+		t.Fatalf("projectDiscoveryTimeout = %s, want longer than requestTimeout %s", projectDiscoveryTimeout, requestTimeout)
+	}
+}
+
+func TestProjectDiscoverHonorsExplicitTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/projects/repo/discover" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	configForDaemon(t, server.URL)
+	cfg, err := loadConfig(nil)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+
+	_, err = requestProjectDiscoveryWithin(context.Background(), 25*time.Millisecond, cfg, "repo")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("requestProjectDiscoveryWithin() error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestProjectDiscoverHonorsCallerCancellation(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/projects/repo/discover" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		close(started)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	configForDaemon(t, server.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runProjectDiscover(ctx, nil, "repo", io.Discard)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("project discovery request did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runProjectDiscover() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("project discovery did not stop after caller cancellation")
 	}
 }
 

@@ -9,7 +9,7 @@ Use this skill when an agent needs to install, configure, start, check, operate,
 
 > **The CLI is tiny, and installation is manual.** The whole operator surface is:
 >
-> `looper init|status|project add|project list|start|pause|retry|stop|close|takeover|handback|respond|version`
+> `looper init|status|project add|project list|project discover|start|pause|retry|stop|close|takeover|handback|respond|version`
 >
 > plus machine-only `looper review submit` (never suggest it to a user). Global flags (`--config`, `--host`, `--port`) work before or after the verb. A **selector** is a loop sequence number or a loop id — never a pull request URL.
 >

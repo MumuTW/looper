@@ -1812,8 +1812,12 @@ type discoveryResponse struct {
 
 type createProjectResponse struct {
 	projectResponse
-	Discovery discoveryResponse `json:"discovery"`
-	Warnings  []string          `json:"warnings"`
+	Discovery              discoveryResponse `json:"discovery"`
+	DiscoveredPullRequests int               `json:"discoveredPullRequests"`
+	DiscoveredWorktrees    int               `json:"discoveredWorktrees"`
+	PendingSnapshots       int               `json:"pendingSnapshots"`
+	CapturedSnapshots      int               `json:"capturedSnapshots"`
+	Warnings               []string          `json:"warnings"`
 }
 
 type runsListResponse struct {
@@ -2051,9 +2055,13 @@ func (h *Handler) buildProjectDiscoverResponse(r *http.Request, service projectS
 		}
 	}
 	return createProjectResponse{
-		projectResponse: serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
-		Discovery:       serializeDiscovery(result.Discovery),
-		Warnings:        append([]string{}, result.Discovery.Warnings...),
+		projectResponse:        serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
+		Discovery:              serializeDiscovery(result.Discovery),
+		DiscoveredPullRequests: result.Discovery.DiscoveredPullRequests,
+		DiscoveredWorktrees:    result.Discovery.DiscoveredWorktrees,
+		PendingSnapshots:       result.Discovery.PendingSnapshots,
+		CapturedSnapshots:      result.Discovery.CapturedSnapshots,
+		Warnings:               append([]string{}, result.Discovery.Warnings...),
 	}, nil
 }
 
@@ -7240,9 +7248,13 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		}
 	}
 	return createProjectResponse{
-		projectResponse: serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
-		Discovery:       serializeDiscovery(result.Discovery),
-		Warnings:        append([]string{}, result.Warnings...),
+		projectResponse:        serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
+		Discovery:              serializeDiscovery(result.Discovery),
+		DiscoveredPullRequests: result.Discovery.DiscoveredPullRequests,
+		DiscoveredWorktrees:    result.Discovery.DiscoveredWorktrees,
+		PendingSnapshots:       result.Discovery.PendingSnapshots,
+		CapturedSnapshots:      result.Discovery.CapturedSnapshots,
+		Warnings:               append([]string{}, result.Warnings...),
 	}, nil
 }
 

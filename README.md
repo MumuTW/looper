@@ -16,7 +16,7 @@ Looper turns that idea into a local AI dev team. Register the repos you want it 
 Looper ships two binaries:
 
 - `looperd` — the background daemon that polls GitHub or Forgejo, runs loops, and manages worktrees
-- `looper` — a thin CLI for onboarding (`init`, `status`, `project add|list`) and loop control (`stop`, `close`, `start`, `pause`, `retry`, `takeover`, `handback`, `respond`) against a running `looperd`
+- `looper` — a thin CLI for onboarding (`init`, `status`, `project add|list|discover`) and loop control (`stop`, `close`, `start`, `pause`, `retry`, `takeover`, `handback`, `respond`) against a running `looperd`
 
 ## Four loops, four success criteria
 

@@ -1796,6 +1796,28 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 		Config:  fixture.config,
 		Runtime: fixture.runtime,
 		Now:     func() time.Time { return fixture.now },
+		ProjectsService: fakeProjectService{addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+			nowISO := fixture.now.UTC().Format(javaScriptISOString)
+			baseBranch := "main"
+			metadataJSON := `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"api"}`
+			return projects.AddResult{
+				Project: storage.ProjectRecord{
+					ID:           "looper",
+					Name:         "Looper",
+					RepoPath:     "/tmp/repos/looper",
+					BaseBranch:   &baseBranch,
+					MetadataJSON: &metadataJSON,
+					CreatedAt:    nowISO,
+					UpdatedAt:    nowISO,
+				},
+				Discovery: projects.DiscoveryState{
+					Status:       projects.DiscoveryStatusPending,
+					SnapshotMode: projects.SnapshotModeAsync,
+					UpdatedAt:    nowISO,
+				},
+				Warnings: []string{},
+			}, nil
+		}},
 		PatchConfig: func(context.Context, ConfigPatchRequest) error {
 			return nil
 		},
@@ -1804,7 +1826,7 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 		},
 	})
 
-	for _, routeID := range []string{"healthz.get", "status.get", "config.get", "config.patch"} {
+	for _, routeID := range []string{"healthz.get", "status.get", "config.get", "config.patch", "projects.create"} {
 		t.Run(routeID, func(t *testing.T) {
 			path := "/api/v1/healthz"
 			method := http.MethodGet
@@ -1818,11 +1840,18 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 				path = "/api/v1/config"
 				method = http.MethodPatch
 				requestBody = strings.NewReader(marshalArtifactRequestBody(t, requestRoutes, routeID))
+			case "projects.create":
+				path = "/api/v1/projects"
+				method = http.MethodPost
+				requestBody = strings.NewReader(marshalArtifactRequestBody(t, requestRoutes, routeID))
 			}
 
 			req := httptest.NewRequest(method, path, requestBody)
 			if routeID == "config.patch" {
 				req.RemoteAddr = "127.0.0.1:17310"
+			}
+			if requestBody != nil {
+				req.Header.Set("content-type", "application/json")
 			}
 			req.Header.Set("x-request-id", "fixture-request-id")
 			recorder := httptest.NewRecorder()
@@ -2065,6 +2094,10 @@ func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 	if _, present := discovery["discoveredPullRequests"]; present {
 		t.Fatalf("discoveredPullRequests = %#v, want omitted while pending", discovery["discoveredPullRequests"])
 	}
+	assertEqual(t, data["discoveredPullRequests"], float64(0))
+	assertEqual(t, data["discoveredWorktrees"], float64(0))
+	assertEqual(t, data["pendingSnapshots"], float64(0))
+	assertEqual(t, data["capturedSnapshots"], float64(0))
 	warnings, ok := data["warnings"].([]any)
 	if !ok || len(warnings) != 0 {
 		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
@@ -2109,6 +2142,10 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	assertEqual(t, discovery["status"], string(projects.DiscoveryStatusSucceeded))
 	assertEqual(t, discovery["discoveredPullRequests"], float64(2))
 	assertEqual(t, discovery["discoveredWorktrees"], float64(3))
+	assertEqual(t, data["discoveredPullRequests"], float64(2))
+	assertEqual(t, data["discoveredWorktrees"], float64(3))
+	assertEqual(t, data["pendingSnapshots"], float64(0))
+	assertEqual(t, data["capturedSnapshots"], float64(0))
 	discoveryWarnings, ok := discovery["warnings"].([]any)
 	if !ok || !reflect.DeepEqual(discoveryWarnings, []any{"warn 1", "warn 2"}) {
 		t.Fatalf("discovery.warnings = %#v, want [warn 1 warn 2]", discovery["warnings"])

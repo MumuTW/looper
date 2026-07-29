@@ -39,7 +39,10 @@ import (
 	"github.com/nexu-io/looper/internal/version"
 )
 
-const requestTimeout = 30 * time.Second
+const (
+	requestTimeout          = 30 * time.Second
+	projectDiscoveryTimeout = 10 * time.Minute
+)
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -724,7 +727,7 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 	if err != nil {
 		return err
 	}
-	result, err := requestJSON[createProjectResponse](ctx, cfg, http.MethodPost, "/api/v1/projects/"+url.PathEscape(identifier)+"/discover", nil)
+	result, err := requestProjectDiscoveryWithin(ctx, projectDiscoveryTimeout, cfg, identifier)
 	if err != nil {
 		return err
 	}
@@ -744,6 +747,10 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 		_, _ = fmt.Fprintf(stdout, "  warning:    %s\n", singleLine(warning))
 	}
 	return nil
+}
+
+func requestProjectDiscoveryWithin(ctx context.Context, timeout time.Duration, cfg config.Config, identifier string) (createProjectResponse, error) {
+	return requestJSONWithin[createProjectResponse](ctx, timeout, cfg, http.MethodPost, "/api/v1/projects/"+url.PathEscape(identifier)+"/discover", nil)
 }
 
 // resolveRepoRoot turns an operator-supplied path into the absolute repository
@@ -921,8 +928,9 @@ func requestJSON[T any](ctx context.Context, cfg config.Config, method string, p
 }
 
 // requestJSONWithin is requestJSON for a call whose cost is not bounded by the
-// control-verb deadline. Only project creation needs it; everything else is a
-// single daemon lookup or state change.
+// control-verb deadline. Explicit project discovery may enumerate worktrees,
+// pull requests, and snapshots, so it gets a separate long deadline while the
+// parent context still carries operator cancellation.
 func requestJSONWithin[T any](ctx context.Context, timeout time.Duration, cfg config.Config, method string, path string, body []byte) (T, error) {
 	var value T
 	payload, err := doHTTPWithin(ctx, timeout, cfg, method, path, body)
