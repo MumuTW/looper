@@ -1015,46 +1015,14 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
 }
 
-func TestHandlerStatusSurfacesReviewPublishDisabledAndQuarantineDebt(t *testing.T) {
+func TestHandlerStatusSurfacesUnknownReviewPublishWithoutProbing(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	incapable := filepath.Join(t.TempDir(), "old-looper")
-	if err := os.WriteFile(incapable, []byte("#!/bin/sh\necho unknown >&2\nexit 1\n"), 0o755); err != nil {
+	probeLog := filepath.Join(t.TempDir(), "probe-log")
+	if err := os.WriteFile(incapable, []byte("#!/bin/sh\necho probe > "+probeLog+"\necho unknown >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile(looper) error = %v", err)
 	}
 	cfg.Tools.LooperPath = &incapable
-
-	nowISO := time.Now().UTC().Format(time.RFC3339Nano)
-	repos := rt.Services().Repositories
-	projectID := "project_status_debt"
-	loopID := "loop_status_debt"
-	runID := "run_status_debt"
-	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Debt", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Runs.Upsert() error = %v", err)
-	}
-	mi := "manual_intervention"
-	reason := "startup recovery quarantine"
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
-		ID: "queue_status_debt", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
-		DedupeKey: "worker:project_status_debt:loop_status_debt", Priority: storage.QueuePriorityWorker, Status: "manual_intervention",
-		AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastError: &reason, LastErrorKind: &mi, FinishedAt: &nowISO,
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Queue.Upsert() error = %v", err)
-	}
-	pid := int64(9090)
-	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-		ID: "exec_status_debt", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
-		PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(t.TempDir()),
-		HeartbeatCount: 0, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
-	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
 	recorder := httptest.NewRecorder()
@@ -1069,16 +1037,68 @@ func TestHandlerStatusSurfacesReviewPublishDisabledAndQuarantineDebt(t *testing.
 	reviewPublish := tools["reviewPublish"].(map[string]any)
 	assertEqual(t, reviewPublish["publishingDisabled"], true)
 	assertEqual(t, reviewPublish["capable"], false)
-	if reason, _ := reviewPublish["reason"].(string); strings.TrimSpace(reason) == "" {
-		t.Fatalf("reviewPublish.reason empty: %#v", reviewPublish)
+	assertEqual(t, reviewPublish["known"], false)
+	assertEqual(t, reviewPublish["reason"], "capability has not been probed yet")
+	if _, err := os.Stat(probeLog); !os.IsNotExist(err) {
+		t.Fatalf("GET status executed capability probe: Stat(%q) error = %v, want not exist", probeLog, err)
 	}
+	reasons, _ := service["degradedReasons"].([]any)
+	if strings.Contains(fmt.Sprintf("%v", reasons), "review_publish_disabled") {
+		t.Fatalf("degradedReasons = %#v, unknown readiness must not be reported as disabled", reasons)
+	}
+}
+
+func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
+	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
+		options.ReadProcessCommand = func(context.Context, int) (string, error) { return "", nil }
+	})
+	rt, cfg := fixture.runtime, fixture.config
+	repos := rt.Services().Repositories
+	oldISO := fixture.now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	projectID := "project_reconcile_status"
+	loopID := "loop_reconcile_status"
+	runID := "run_reconcile_status"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Reconcile", RepoPath: fixture.rootDir, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("work"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reconcile_status", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "worker:reconcile-status", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: oldISO, StartedAt: &oldISO, MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	pid := int64(9191)
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "execution_reconcile_status", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(fixture.rootDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+	}
+	if summary.QuarantinedExecutions != 1 {
+		t.Fatalf("summary = %#v, want one quarantined execution", summary)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	service := data["service"].(map[string]any)
 	outstanding := service["recovery"].(map[string]any)["outstanding"].(map[string]any)
 	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(1))
-	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
-	reasons, _ := service["degradedReasons"].([]any)
-	joined := fmt.Sprintf("%v", reasons)
-	if !strings.Contains(joined, "review_publish_disabled") || !strings.Contains(joined, "quarantine_orphan_debt") {
-		t.Fatalf("degradedReasons = %#v, want both review and quarantine signals", reasons)
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
+	if !strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
+		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
+	}
+	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "interrupted" {
+		t.Fatalf("run after reconcile = %#v, %v; want interrupted", run, err)
 	}
 }
 

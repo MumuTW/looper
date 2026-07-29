@@ -870,11 +870,12 @@ type statusOutstandingView struct {
 }
 
 type statusToolsView struct {
-	LooperPath    string                  `json:"looperPath"`
-	ReviewPublish statusReviewPublishView `json:"reviewPublish"`
+	LooperPath    string                   `json:"looperPath"`
+	ReviewPublish *statusReviewPublishView `json:"reviewPublish"`
 }
 
 type statusReviewPublishView struct {
+	Known              bool   `json:"known"`
 	Capable            bool   `json:"capable"`
 	Capability         string `json:"capability"`
 	PublishingDisabled bool   `json:"publishingDisabled"`
@@ -883,26 +884,37 @@ type statusReviewPublishView struct {
 
 func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 	review := status.Tools.ReviewPublish
-	switch {
-	case review.PublishingDisabled:
-		reason := strings.TrimSpace(review.Reason)
-		if reason == "" {
-			reason = "capability probe failed"
+	if review != nil {
+		switch {
+		case !review.Known:
+			reason := strings.TrimSpace(review.Reason)
+			if reason == "" {
+				reason = "capability has not been probed yet"
+			}
+			path := strings.TrimSpace(status.Tools.LooperPath)
+			if path != "" {
+				_, _ = fmt.Fprintf(stdout, "review:   publish readiness unknown (%s; looperPath=%s)\n", singleLine(reason), path)
+			} else {
+				_, _ = fmt.Fprintf(stdout, "review:   publish readiness unknown (%s)\n", singleLine(reason))
+			}
+		case review.PublishingDisabled:
+			reason := strings.TrimSpace(review.Reason)
+			if reason == "" {
+				reason = "capability probe failed"
+			}
+			path := strings.TrimSpace(status.Tools.LooperPath)
+			if path != "" {
+				_, _ = fmt.Fprintf(stdout, "review:   publishing disabled (%s; looperPath=%s)\n", singleLine(reason), path)
+			} else {
+				_, _ = fmt.Fprintf(stdout, "review:   publishing disabled (%s)\n", singleLine(reason))
+			}
+		case review.Capable:
+			token := strings.TrimSpace(review.Capability)
+			if token == "" {
+				token = "ok"
+			}
+			_, _ = fmt.Fprintf(stdout, "review:   publish ready (%s)\n", token)
 		}
-		path := strings.TrimSpace(status.Tools.LooperPath)
-		if path != "" {
-			_, _ = fmt.Fprintf(stdout, "review:   publishing disabled (%s; looperPath=%s)\n", singleLine(reason), path)
-		} else {
-			_, _ = fmt.Fprintf(stdout, "review:   publishing disabled (%s)\n", singleLine(reason))
-		}
-	case review.Capable:
-		token := strings.TrimSpace(review.Capability)
-		if token == "" {
-			token = "ok"
-		}
-		_, _ = fmt.Fprintf(stdout, "review:   publish ready (%s)\n", token)
-	default:
-		// Older daemons omit reviewPublish; stay quiet rather than invent state.
 	}
 
 	outstanding := status.Service.Recovery.Outstanding

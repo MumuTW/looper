@@ -213,6 +213,7 @@
             "gh": true,
             "osascript": true,
             "reviewPublish": {
+              "known": true,
               "capable": false,
               "publishingDisabled": true,
               "reason": "trusted looper path is not configured"

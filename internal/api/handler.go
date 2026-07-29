@@ -1682,7 +1682,7 @@ func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.Outstanding
 
 func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt) []string {
 	var reasons []string
-	if reviewPublish.PublishingDisabled && strings.TrimSpace(reviewPublish.LooperPath) != "" {
+	if reviewPublish.Known && reviewPublish.PublishingDisabled && strings.TrimSpace(reviewPublish.LooperPath) != "" {
 		reasons = append(reasons, "review_publish_disabled")
 	}
 	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {

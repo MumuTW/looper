@@ -460,6 +460,48 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	return scanEventLogs(rows)
 }
 
+// ListEntityIDsByType returns the supplied entity IDs that have an event of
+// eventType. It is deliberately a set because callers only need durable
+// evidence, not every historical occurrence of that evidence.
+func (r *EventsRepository) ListEntityIDsByType(ctx context.Context, eventType, entityType string, entityIDs []string) (map[string]struct{}, error) {
+	matched := make(map[string]struct{})
+	if len(entityIDs) == 0 {
+		return matched, nil
+	}
+	for _, chunk := range chunkStrings(entityIDs, sqliteMaxVariables-2) {
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, eventType, entityType)
+		for _, entityID := range chunk {
+			args = append(args, entityID)
+		}
+		rows, err := r.q.QueryContext(ctx, `
+			SELECT DISTINCT entity_id
+			FROM event_logs
+			WHERE event_type = ? AND entity_type = ?
+			AND entity_id IN (`+sqlPlaceholders(len(chunk))+`)
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list entity ids by event type: %w", err)
+		}
+		for rows.Next() {
+			var entityID string
+			if err := rows.Scan(&entityID); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan entity id by event type: %w", err)
+			}
+			matched[entityID] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate entity ids by event type: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close entity ids by event type rows: %w", err)
+		}
+	}
+	return matched, nil
+}
+
 type ProjectsRepository struct{ q sqliteQuerier }
 
 func (r *ProjectsRepository) Upsert(ctx context.Context, record ProjectRecord) error {
@@ -838,6 +880,33 @@ func (r *RunsRepository) GetByID(ctx context.Context, id string) (*RunRecord, er
 	}
 
 	return &record, nil
+}
+
+func (r *RunsRepository) ListByIDs(ctx context.Context, ids []string) ([]RunRecord, error) {
+	if len(ids) == 0 {
+		return []RunRecord{}, nil
+	}
+	runs := make([]RunRecord, 0, len(ids))
+	for _, chunk := range chunkStrings(ids, sqliteMaxVariables) {
+		args := make([]any, 0, len(chunk))
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := r.q.QueryContext(ctx, `SELECT * FROM runs WHERE id IN (`+sqlPlaceholders(len(chunk))+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list runs by ids: %w", err)
+		}
+		chunkRuns, scanErr := scanRuns(rows)
+		closeErr := rows.Close()
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close list runs by ids rows: %w", closeErr)
+		}
+		runs = append(runs, chunkRuns...)
+	}
+	return runs, nil
 }
 
 func (r *RunsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*RunRecord, error) {

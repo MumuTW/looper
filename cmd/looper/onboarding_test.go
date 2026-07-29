@@ -43,6 +43,8 @@ type fakeDaemon struct {
 
 	// Optional /api/v1/status fields for ops-readiness lines on `looper status`.
 	looperPath                  string
+	includeReviewPublish        bool
+	reviewKnown                 bool
 	reviewCapable               bool
 	reviewCapability            string
 	reviewPublishingDisabled    bool
@@ -61,6 +63,16 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		case r.URL.Path == "/api/v1/healthz" && r.Method == http.MethodGet:
 			writeEnvelope(w, http.StatusOK, map[string]any{"healthy": daemon.healthy})
 		case r.URL.Path == "/api/v1/status" && r.Method == http.MethodGet:
+			tools := map[string]any{"looperPath": daemon.looperPath}
+			if daemon.includeReviewPublish {
+				tools["reviewPublish"] = map[string]any{
+					"known":              daemon.reviewKnown,
+					"capable":            daemon.reviewCapable,
+					"capability":         daemon.reviewCapability,
+					"publishingDisabled": daemon.reviewPublishingDisabled,
+					"reason":             daemon.reviewReason,
+				}
+			}
 			writeEnvelope(w, http.StatusOK, map[string]any{
 				"service": map[string]any{
 					"healthy":         daemon.healthy,
@@ -72,15 +84,7 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 						},
 					},
 				},
-				"tools": map[string]any{
-					"looperPath": daemon.looperPath,
-					"reviewPublish": map[string]any{
-						"capable":            daemon.reviewCapable,
-						"capability":         daemon.reviewCapability,
-						"publishingDisabled": daemon.reviewPublishingDisabled,
-						"reason":             daemon.reviewReason,
-					},
-				},
+				"tools": tools,
 			})
 		case r.URL.Path == "/api/v1/projects" && r.Method == http.MethodGet:
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": daemon.projects})
@@ -461,6 +465,8 @@ func TestStatusReportsConfigDaemonAndProjects(t *testing.T) {
 func TestStatusReportsReviewPublishAndOrphanDebt(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	daemon.looperPath = "/opt/old-looper"
+	daemon.includeReviewPublish = true
+	daemon.reviewKnown = true
 	daemon.reviewPublishingDisabled = true
 	daemon.reviewReason = "`looper review capability` failed: exit status 1"
 	daemon.quarantinedActiveExecutions = 2
@@ -480,6 +486,24 @@ func TestStatusReportsReviewPublishAndOrphanDebt(t *testing.T) {
 		"review_publish_disabled",
 		"quarantine_orphan_debt",
 	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("status output missing %q\n%s", want, stdout)
+		}
+	}
+}
+
+func TestStatusReportsUnknownReviewPublishReadiness(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	daemon.looperPath = "/opt/looper"
+	daemon.includeReviewPublish = true
+	daemon.reviewReason = "capability has not been probed yet"
+	configForDaemon(t, daemon.server.URL)
+
+	code, stdout, stderr := runCLI(t, "status")
+	if code != 0 {
+		t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
+	}
+	for _, want := range []string{"publish readiness unknown", "capability has not been probed yet", "/opt/looper"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("status output missing %q\n%s", want, stdout)
 		}

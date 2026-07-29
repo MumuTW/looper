@@ -1,20 +1,45 @@
 package runtime
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
 )
 
-func TestReviewPublishReadinessForCapableBinary(t *testing.T) {
+func TestReviewPublishReadinessForUnknownBinaryDoesNotProbe(t *testing.T) {
+	t.Parallel()
+
+	probeLog := filepath.Join(t.TempDir(), "probe-log")
+	looperPath := writeFakeLooper(t, "#!/bin/sh\necho probe > "+probeLog+"\necho "+forge.TrustedReviewCapabilityToken+"\n")
+	got := ReviewPublishReadinessFor(trustedLooperConfig(looperPath))
+	if got.Known || got.Capable || !got.PublishingDisabled {
+		t.Fatalf("got = %#v, want unknown fail-closed readiness", got)
+	}
+	if got.LooperPath != looperPath {
+		t.Fatalf("LooperPath = %q, want %q", got.LooperPath, looperPath)
+	}
+	if got.Reason != "capability has not been probed yet" {
+		t.Fatalf("Reason = %q, want explicit unknown reason", got.Reason)
+	}
+	if _, err := os.Stat(probeLog); !os.IsNotExist(err) {
+		t.Fatalf("status probed configured binary: Stat(%q) error = %v, want not exist", probeLog, err)
+	}
+}
+
+func TestReviewPublishReadinessForCachedCapableBinary(t *testing.T) {
 	t.Parallel()
 
 	looperPath := writeFakeLooper(t, trustedReviewCapableScript)
+	if got := resolveTrustedLooperCLIPath(trustedLooperConfig(looperPath), nil); got != looperPath {
+		t.Fatalf("resolveTrustedLooperCLIPath() = %q, want %q", got, looperPath)
+	}
 	got := ReviewPublishReadinessFor(trustedLooperConfig(looperPath))
-	if !got.Capable || got.PublishingDisabled {
-		t.Fatalf("got = %#v, want capable publishing", got)
+	if !got.Known || !got.Capable || got.PublishingDisabled {
+		t.Fatalf("got = %#v, want cached capable publishing", got)
 	}
 	if got.LooperPath != looperPath {
 		t.Fatalf("LooperPath = %q, want %q", got.LooperPath, looperPath)
@@ -27,30 +52,11 @@ func TestReviewPublishReadinessForCapableBinary(t *testing.T) {
 	}
 }
 
-func TestReviewPublishReadinessForIncapableBinary(t *testing.T) {
-	t.Parallel()
-
-	looperPath := writeFakeLooper(t, trustedReviewIncapableScript)
-	got := ReviewPublishReadinessFor(trustedLooperConfig(looperPath))
-	if got.Capable || !got.PublishingDisabled {
-		t.Fatalf("got = %#v, want publishing disabled", got)
-	}
-	if got.LooperPath != looperPath {
-		t.Fatalf("LooperPath = %q, want %q", got.LooperPath, looperPath)
-	}
-	if got.Capability != "" {
-		t.Fatalf("Capability = %q, want empty", got.Capability)
-	}
-	if got.Reason == "" {
-		t.Fatal("Reason empty, want probe failure detail")
-	}
-}
-
 func TestReviewPublishReadinessForMissingPath(t *testing.T) {
 	t.Parallel()
 
 	got := ReviewPublishReadinessFor(config.Config{})
-	if got.Capable || !got.PublishingDisabled {
+	if !got.Known || got.Capable || !got.PublishingDisabled {
 		t.Fatalf("got = %#v, want publishing disabled", got)
 	}
 	if got.LooperPath != "" {
@@ -61,15 +67,21 @@ func TestReviewPublishReadinessForMissingPath(t *testing.T) {
 	}
 }
 
-func TestReviewPublishReadinessForMissingBinaryOnDisk(t *testing.T) {
+func TestReviewPublishReadinessForCachedFailureRedactsProbeOutput(t *testing.T) {
 	t.Parallel()
 
-	missing := filepath.Join(t.TempDir(), "missing-looper")
-	got := ReviewPublishReadinessFor(trustedLooperConfig(missing))
-	if got.Capable || !got.PublishingDisabled {
+	looperPath := writeFakeLooper(t, "#!/bin/sh\necho 'TOKEN=super-secret-status-value' >&2\nexit 1\n")
+	if got := resolveTrustedLooperCLIPath(trustedLooperConfig(looperPath), nil); got != "" {
+		t.Fatalf("resolveTrustedLooperCLIPath() = %q, want empty", got)
+	}
+	got := ReviewPublishReadinessFor(trustedLooperConfig(looperPath))
+	if !got.Known || got.Capable || !got.PublishingDisabled {
 		t.Fatalf("got = %#v, want publishing disabled", got)
 	}
-	if got.Reason == "" {
-		t.Fatal("Reason empty, want resolve failure")
+	if got.Reason != "configured looper binary capability probe failed" {
+		t.Fatalf("Reason = %q, want classified failure", got.Reason)
+	}
+	if strings.Contains(got.Reason, "super-secret-status-value") || strings.Contains(got.Reason, "TOKEN=") {
+		t.Fatalf("Reason leaked raw probe output: %q", got.Reason)
 	}
 }
