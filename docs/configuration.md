@@ -793,6 +793,7 @@ allowAutoApprove = true
 allowRiskyFixes = false
 openPrStrategy = "all_done"
 addSnapshotMode = "async"
+validationCommands = ["go build ./...", "go test ./..."]
 
 # `allowAutoApprove` is a legacy compatibility alias.
 # Prefer `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"` in new config.
@@ -1068,6 +1069,19 @@ To restore it by default for all project additions:
 }
 ```
 
+### `defaults.validationCommands`
+
+`defaults.validationCommands` is the mechanical gate the worker and fixer run in the run's worktree before opening a PR or pushing. Each entry is executed with `/bin/sh -c` from the worktree root, in order, and the first non-zero exit fails the validate step; the run never advances to open-pr or push.
+
+```toml
+[defaults]
+validationCommands = ["gofmt -l .", "go vet ./...", "go test ./...", "go build ./..."]
+```
+
+The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides).
+
+The default is empty, which keeps the historical behavior: the validate step passes without running anything and "done" is only the agent's own self-assessment. `looperd` logs a startup warning while the list is empty so the no-op is visible. The field is restart-bound.
+
 ### `roles`
 
 The `roles` section controls scheduler-driven auto-discovery for planner, reviewer, fixer, and worker. It does not block manual commands, direct processing, retries, or already queued work.
@@ -1134,6 +1148,7 @@ looperd \
 - the default worktree root must be writable
 - required tool paths must resolve
 - `notifications.osascript.enabled=true` requires `tools.osascriptPath` to resolve
+- every `defaults.validationCommands[]` entry must be a non-empty string
 
 ## Recommended first-time setup
 

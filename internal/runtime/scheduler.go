@@ -3406,6 +3406,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			},
 		})
 	}
+	// The worker and fixer share one mechanical gate: without it, "done" is only
+	// the agent's own self-assessment, so an empty list is worth surfacing once
+	// at wiring time rather than silently passing every validate step.
+	validationCommands := config.ResolveValidationCommands(cfg)
+	if len(validationCommands) == 0 && logger != nil {
+		logger.Warn("worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything", nil)
+	}
+
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
 		resolved := resolvedFixer
@@ -3432,6 +3440,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
 			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
 			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
+			ValidationCommands: validationCommands,
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: fixer.DiscoveryPolicy{
@@ -3489,13 +3498,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 			},
-			Git:             workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
-			AgentExecutor:   workerAgentExecutorAdapter{executor: workerExecutor},
-			Logger:          logger,
-			Now:             now,
-			AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
-			AllowAutoPush:   cfg.Defaults.AllowAutoPush,
-			OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
+			Git:                workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
+			AgentExecutor:      workerAgentExecutorAdapter{executor: workerExecutor},
+			Logger:             logger,
+			Now:                now,
+			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
+			OpenPRStrategy:     cfg.Defaults.OpenPRStrategy,
+			ValidationCommands: validationCommands,
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: worker.DiscoveryPolicy{

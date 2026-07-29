@@ -1096,6 +1096,10 @@ func mergeDefaultsConfig(config *DefaultsConfig, partial PartialDefaultsConfig) 
 	if partial.AddSnapshotMode != nil {
 		config.AddSnapshotMode = *partial.AddSnapshotMode
 	}
+
+	if partial.ValidationCommands != nil {
+		config.ValidationCommands = append([]string(nil), (*partial.ValidationCommands)...)
+	}
 }
 
 func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) {
