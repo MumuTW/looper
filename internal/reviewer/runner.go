@@ -1333,9 +1333,13 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	labels := append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...)
-	matchAnyTrigger := r.forgejoProject(projectID) && roles.Reviewer.Discovery.Triggers.RequireReviewRequest && len(prQueryLabels(labels)) > 0
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: labels, LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+	role, ok := config.ProjectCodingRoleConfig(*r.projectRoleConfig, projectID, config.CodingRoleReviewer)
+	if !ok {
+		return r.discoveryPolicy
+	}
+	labels := append([]string(nil), role.Discovery.Labels...)
+	matchAnyTrigger := r.forgejoProject(projectID) && role.Discovery.RequireReviewRequest && len(prQueryLabels(labels)) > 0
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, IncludeDrafts: role.Discovery.IncludeDrafts, RequireReviewRequest: role.Discovery.RequireReviewRequest, EnableSelfReview: role.Discovery.EnableSelfReview, Labels: labels, LabelMode: role.Discovery.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
 }
 
 func (r *Runner) forgejoProject(projectID string) bool {

@@ -660,8 +660,11 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if r.projectRoleConfig == nil {
 		return r.discoveryPolicy
 	}
-	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Planner.AutoDiscovery, Labels: append([]string(nil), roles.Planner.Triggers.Labels...), LabelMode: roles.Planner.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Planner.Triggers.RequireAssigneeCurrentUser}
+	role, ok := config.ProjectCodingRoleConfig(*r.projectRoleConfig, projectID, config.CodingRolePlanner)
+	if !ok {
+		return r.discoveryPolicy
+	}
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser}
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {

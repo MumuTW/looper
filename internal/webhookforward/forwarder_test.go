@@ -1102,10 +1102,13 @@ func TestEnabledLanesForProjectUsesNarrowRolePolicy(t *testing.T) {
 	policy := projectcatalog.RolePolicyView{
 		ProjectID: "demo",
 		Roles: config.RoleConfigs{
-			Reviewer: config.ReviewerRoleConfig{
-				Discovery: config.ReviewerRoleDiscoveryConfig{AutoDiscovery: true},
+			Coding: map[string]config.CodingRoleConfig{
+				config.CodingRoleReviewer: {Discovery: config.RoleDiscoveryConfig{Enabled: true}},
+				config.CodingRoleFixer:    {Discovery: config.RoleDiscoveryConfig{Enabled: false}},
 			},
-			Fixer: config.FixerRoleConfig{AutoDiscovery: false},
+			// Opposite legacy values prove the canonical registry is authoritative.
+			Reviewer: config.ReviewerRoleConfig{},
+			Fixer:    config.FixerRoleConfig{AutoDiscovery: true},
 		},
 	}
 

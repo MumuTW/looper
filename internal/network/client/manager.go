@@ -281,10 +281,10 @@ func supportedRoles(cfg config.Config) []string {
 	if cfg.Roles.Coordinator.Enabled {
 		roles = append(roles, "coordinator")
 	}
-	if cfg.Roles.Worker.AutoDiscovery {
+	if worker, ok := config.ProjectCodingRoleConfig(cfg, "", config.CodingRoleWorker); ok && worker.Discovery.Enabled {
 		roles = append(roles, "worker")
 	}
-	if cfg.Roles.Reviewer.Discovery.AutoDiscovery {
+	if reviewer, ok := config.ProjectCodingRoleConfig(cfg, "", config.CodingRoleReviewer); ok && reviewer.Discovery.Enabled {
 		roles = append(roles, "reviewer")
 	}
 	return roles
@@ -307,12 +307,12 @@ func reviewerProjectCapabilities(cfg config.Config) []protocol.ReviewerProjectCa
 		if project.Network.Mode != config.ProjectNetworkModeRouted || strings.TrimSpace(project.ID) == "" {
 			continue
 		}
-		roles := config.ProjectRoleConfigs(cfg, project.ID)
-		if !roles.Reviewer.Discovery.AutoDiscovery {
+		reviewer, ok := config.ProjectCodingRoleConfig(cfg, project.ID, config.CodingRoleReviewer)
+		if !ok || !reviewer.Discovery.Enabled {
 			continue
 		}
-		requireReviewRequest := roles.Reviewer.Discovery.Triggers.RequireReviewRequest
-		capabilities = append(capabilities, protocol.ReviewerProjectCapability{ProjectID: strings.TrimSpace(project.ID), IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: &requireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: string(roles.Reviewer.Discovery.Triggers.LabelMode)})
+		requireReviewRequest := reviewer.Discovery.RequireReviewRequest
+		capabilities = append(capabilities, protocol.ReviewerProjectCapability{ProjectID: strings.TrimSpace(project.ID), IncludeDrafts: reviewer.Discovery.IncludeDrafts, RequireReviewRequest: &requireReviewRequest, EnableSelfReview: reviewer.Discovery.EnableSelfReview, Labels: append([]string(nil), reviewer.Discovery.Labels...), LabelMode: string(reviewer.Discovery.LabelMode)})
 	}
 	slices.SortFunc(capabilities, func(a, b protocol.ReviewerProjectCapability) int {
 		return strings.Compare(a.ProjectID, b.ProjectID)

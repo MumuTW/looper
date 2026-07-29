@@ -870,10 +870,10 @@ func isFailingCheckConclusion(conclusion string) bool {
 
 func enabledLanesForProject(policy projectcatalog.RolePolicyView, lanes map[Lane]struct{}) map[Lane]struct{} {
 	result := map[Lane]struct{}{}
-	if _, ok := lanes[LaneReviewer]; ok && policy.Roles.Reviewer.Discovery.AutoDiscovery {
+	if _, ok := lanes[LaneReviewer]; ok && policy.RoleAutoDiscovery(config.CodingRoleReviewer) {
 		result[LaneReviewer] = struct{}{}
 	}
-	if _, ok := lanes[LaneFixer]; ok && policy.Roles.Fixer.AutoDiscovery {
+	if _, ok := lanes[LaneFixer]; ok && policy.RoleAutoDiscovery(config.CodingRoleFixer) {
 		result[LaneFixer] = struct{}{}
 	}
 	if _, ok := lanes[LaneGatekeeper]; ok {

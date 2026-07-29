@@ -566,6 +566,16 @@ func TestOperationViewFromConfigDetachesCodingRolePolicy(t *testing.T) {
 	if got.Agent == nil || got.Agent.Profile == nil || *got.Agent.Profile != "fast" {
 		t.Fatalf("coding role agent = %#v, want detached fast profile", got.Agent)
 	}
+
+	policy := RolePolicyView{Roles: config.RoleConfigs{
+		Coding: map[string]config.CodingRoleConfig{
+			config.CodingRoleWorker: {Discovery: config.RoleDiscoveryConfig{Enabled: true}},
+		},
+		Worker: config.WorkerRoleConfig{AutoDiscovery: false},
+	}}
+	if !policy.RoleAutoDiscovery(config.CodingRoleWorker) {
+		t.Fatal("RoleAutoDiscovery(worker) ignored canonical coding registry")
+	}
 }
 
 func boolPtr(v bool) *bool { return &v }

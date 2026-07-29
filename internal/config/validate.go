@@ -7,8 +7,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -295,6 +297,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
 	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
+	validateCodingRoleRegistry(config, &issues)
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 	} else if config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) {
@@ -520,10 +523,11 @@ func validateRoutedProjectPrerequisites(config Config, roles RoleConfigs, prefix
 	if strings.TrimSpace(config.Network.GitHubLogin) == "" {
 		*issues = append(*issues, ValidationIssue{Path: "network.githubLogin", Message: fmt.Sprintf("must be configured when %s.network.mode is %s so routed claims can fall back when numeric GitHub IDs are unavailable", prefix, NetworkModeRouted)})
 	}
-	if roles.Planner.AutoDiscovery {
+	registry := EffectiveCodingRoles(roles)
+	if planner := registry[CodingRolePlanner]; planner.Discovery.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.planner.autoDiscovery", Message: "must be false for routed projects; planner routed execution is not supported yet"})
 	}
-	if roles.Fixer.AutoDiscovery {
+	if fixer := registry[CodingRoleFixer]; fixer.Discovery.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.fixer.autoDiscovery", Message: "must be false for routed projects; fixer routed execution is not supported yet"})
 	}
 }
@@ -676,6 +680,7 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 	if roles == nil {
 		return
 	}
+	validateProjectCodingRoleOverrides(roles, prefix, issues)
 	if roles.Planner != nil {
 		validateProjectRoleInstruction(prefix+".planner.instructions", "planner", roles.Planner.Instructions, maxInstructionBytes, issues)
 		if roles.Planner.Triggers != nil {
@@ -757,8 +762,9 @@ func validateInstructions(config Config, issues *[]ValidationIssue) {
 		*issues = append(*issues, ValidationIssue{Path: "instructions.maxBytes", Message: "must be a positive integer"})
 	}
 	for _, roleInstruction := range roleInstructions(config.Roles) {
-		validateInstructionText("roles."+roleInstruction.role+".instructions", roleInstruction.role, roleInstruction.text, config.Instructions.MaxBytes, issues)
-		validateAggregateInstructionBytes("roles."+roleInstruction.role+".instructions", roleInstruction.text, "", config.Instructions.MaxBytes, issues)
+		path := "roles.coding." + roleInstruction.role + ".instructions"
+		validateInstructionText(path, roleInstruction.role, roleInstruction.text, config.Instructions.MaxBytes, issues)
+		validateAggregateInstructionBytes(path, roleInstruction.text, "", config.Instructions.MaxBytes, issues)
 	}
 }
 
@@ -768,33 +774,36 @@ type roleInstruction struct {
 }
 
 func roleInstructions(roles RoleConfigs) []roleInstruction {
+	registry := EffectiveCodingRoles(roles)
 	return []roleInstruction{
-		{role: "planner", text: roles.Planner.Instructions},
-		{role: "worker", text: roles.Worker.Instructions},
-		{role: "reviewer", text: roles.Reviewer.Instructions},
-		{role: "fixer", text: roles.Fixer.Instructions},
+		{role: CodingRolePlanner, text: registry[CodingRolePlanner].Instructions},
+		{role: CodingRoleWorker, text: registry[CodingRoleWorker].Instructions},
+		{role: CodingRoleReviewer, text: registry[CodingRoleReviewer].Instructions},
+		{role: CodingRoleFixer, text: registry[CodingRoleFixer].Instructions},
 	}
 }
 
 func roleInstructionText(roles RoleConfigs, role string) string {
-	switch role {
-	case "planner":
-		return roles.Planner.Instructions
-	case "worker":
-		return roles.Worker.Instructions
-	case "reviewer":
-		return roles.Reviewer.Instructions
-	case "fixer":
-		return roles.Fixer.Instructions
-	default:
+	entry, ok := EffectiveCodingRoles(roles)[role]
+	if !ok || !isCodingRole(role) {
 		return ""
 	}
+	return entry.Instructions
 }
 
 func validateInstructionText(path, role, text string, maxBytes int, issues *[]ValidationIssue) {
 	if !isValidInstructionRole(role) {
 		*issues = append(*issues, ValidationIssue{Path: path, Message: "role must be one of: planner, worker, reviewer, fixer"})
 	}
+	if maxBytes > 0 && len([]byte(text)) > maxBytes {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must be at most %d bytes", maxBytes)})
+	}
+	if protected := protectedInstructionPhrase(text); protected != "" {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must not attempt to override protected Looper contract %q", protected)})
+	}
+}
+
+func validateCustomCodingRoleInstruction(path, text string, maxBytes int, issues *[]ValidationIssue) {
 	if maxBytes > 0 && len([]byte(text)) > maxBytes {
 		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must be at most %d bytes", maxBytes)})
 	}
@@ -959,22 +968,65 @@ func validateRoleAgentBindings(config Config, issues *[]ValidationIssue) {
 		{role: CodingRoleFixer, agent: config.Roles.Fixer.Agent},
 	}
 	for _, binding := range bindings {
-		if binding.agent == nil {
+		validateRoleAgentBinding(config, "roles."+binding.role+".agent", binding.agent, issues)
+	}
+}
+
+// validateCodingRoleRegistry protects callers that assemble Config directly
+// instead of passing source text through Normalize. The compiled runner is the
+// authority for accepted registry names and sources; accepting an arbitrary
+// map entry would create a lane with no executable consumer.
+func validateCodingRoleRegistry(config Config, issues *[]ValidationIssue) {
+	registry := EffectiveCodingRoles(config.Roles)
+	for _, name := range []string{CodingRolePlanner, CodingRoleWorker, CodingRoleReviewer, CodingRoleFixer, RoleGatekeeper} {
+		if _, ok := registry[name]; !ok {
+			*issues = append(*issues, ValidationIssue{Path: "roles.coding." + name, Message: "is required in the canonical registry"})
+		}
+	}
+	for _, name := range CodingRoleNames(config.Roles) {
+		role := registry[name]
+		path := "roles.coding." + name
+		if NormalizeRoleName(name) == "" || NormalizeRoleName(name) != name {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: "role name must be non-empty, trimmed, and lowercase"})
+		}
+		if name == RoleGatekeeper {
+			if !reflect.DeepEqual(role, compiledGatekeeperRole()) {
+				*issues = append(*issues, ValidationIssue{Path: path, Message: "is a compiled-in policy role and cannot be overridden"})
+			}
 			continue
 		}
-		prefix := "roles." + binding.role + ".agent"
-		if binding.agent.Profile != nil {
-			profileID := *binding.agent.Profile
-			trimmed := strings.TrimSpace(profileID)
-			if trimmed == "" || profileID != trimmed {
-				*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: "must be a non-empty trimmed profile id"})
-			} else if _, exists := config.Agent.Profiles[trimmed]; !exists {
-				*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: fmt.Sprintf("references unknown agent profile: %s", trimmed)})
-			}
+		expectedSource, runnerBacked := CodingRoleSource(name)
+		if !runnerBacked {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: "has no compiled runner; roles.coding supports only planner, worker, reviewer, and fixer"})
+			continue
 		}
-		if binding.agent.Vendor != nil && !isValidAgentVendor(*binding.agent.Vendor) {
-			*issues = append(*issues, ValidationIssue{Path: prefix + ".vendor", Message: agentVendorValidationMessage()})
+		if role.Priority <= 0 {
+			*issues = append(*issues, ValidationIssue{Path: path + ".priority", Message: "must be a positive integer"})
 		}
+		if role.Discovery.Source != expectedSource {
+			*issues = append(*issues, ValidationIssue{Path: path + ".discovery.source", Message: "must be " + strconv.Quote(string(expectedSource)) + " for this compiled runner"})
+		}
+		*issues = append(*issues, ValidateRoleDiscovery(path, role.Discovery)...)
+		*issues = append(*issues, validateCodingRoleDiscoveryCommon(path, role.Discovery)...)
+		validateRoleAgentBinding(config, path+".agent", role.Agent, issues)
+	}
+}
+
+func validateRoleAgentBinding(config Config, prefix string, agent *RoleAgentConfig, issues *[]ValidationIssue) {
+	if agent == nil {
+		return
+	}
+	if agent.Profile != nil {
+		profileID := *agent.Profile
+		trimmed := strings.TrimSpace(profileID)
+		if trimmed == "" || profileID != trimmed {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: "must be a non-empty trimmed profile id"})
+		} else if _, exists := config.Agent.Profiles[trimmed]; !exists {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: fmt.Sprintf("references unknown agent profile: %s", trimmed)})
+		}
+	}
+	if agent.Vendor != nil && !isValidAgentVendor(*agent.Vendor) {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".vendor", Message: agentVendorValidationMessage()})
 	}
 }
 

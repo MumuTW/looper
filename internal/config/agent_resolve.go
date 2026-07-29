@@ -21,9 +21,9 @@ type ResolvedAgent struct {
 	ProfileID string // profile selected by the role binding; empty if none
 }
 
-// ResolveAgent overlays global agent vendor/model with the role binding.
-// projectID is reserved; project layers are no-op in v1 (agent is global-only).
-// ok=false when role is not a coding role or vendor is unset after overlay.
+// ResolveAgent overlays global agent vendor/model with the canonical coding
+// role binding. projectID is reserved; agent bindings are global-only.
+// ok=false when role has no compiled runner or vendor is unset after overlay.
 func ResolveAgent(cfg Config, projectID string, role string) (ResolvedAgent, bool) {
 	_ = projectID
 	vendor, model, profileID, ok := overlayAgentIdentity(cfg, role)
@@ -40,8 +40,8 @@ func ResolveAgent(cfg Config, projectID string, role string) (ResolvedAgent, boo
 	}, true
 }
 
-// overlayAgentIdentity returns the post-overlay vendor/model/profile for a coding
-// role without requiring vendor to be set. ok=false only for non-coding roles.
+// overlayAgentIdentity returns the post-overlay vendor/model/profile for a
+// compiled coding role without requiring vendor to be set.
 // Explicit empty-string model suppresses inherited model but stays a non-nil
 // empty pointer so params filtering can strip --model/-m (nil means unset).
 // Used by ResolveAgent and hot-reload restart guards.
@@ -91,12 +91,8 @@ func overlayAgentIdentity(cfg Config, role string) (vendor *AgentVendor, model *
 }
 
 func isCodingRole(role string) bool {
-	switch role {
-	case CodingRolePlanner, CodingRoleWorker, CodingRoleReviewer, CodingRoleFixer:
-		return true
-	default:
-		return false
-	}
+	_, ok := CodingRoleSource(role)
+	return ok
 }
 
 // AnyCodingRoleAgentConfigured returns true if any coding role resolves with a vendor.
@@ -116,16 +112,9 @@ func CodingRoleAgentConfigured(cfg Config, role string) bool {
 }
 
 func codingRoleAgentBinding(roles RoleConfigs, role string) *RoleAgentConfig {
-	switch role {
-	case CodingRolePlanner:
-		return roles.Planner.Agent
-	case CodingRoleWorker:
-		return roles.Worker.Agent
-	case CodingRoleReviewer:
-		return roles.Reviewer.Agent
-	case CodingRoleFixer:
-		return roles.Fixer.Agent
-	default:
+	entry, ok := EffectiveCodingRoles(roles)[role]
+	if !ok || !isCodingRole(role) {
 		return nil
 	}
+	return entry.Agent
 }

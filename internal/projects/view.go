@@ -79,7 +79,11 @@ func (v OperationView) AnyProjectRoleAutoDiscovery(role string) bool {
 }
 
 func roleAutoDiscovery(roles config.RoleConfigs, role string) bool {
-	switch strings.TrimSpace(role) {
+	role = strings.TrimSpace(role)
+	if coding, ok := roles.Coding[role]; ok {
+		return coding.Discovery.Enabled
+	}
+	switch role {
 	case "coordinator":
 		return roles.Coordinator.Enabled
 	case "planner":

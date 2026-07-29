@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCodingRolesFromLegacyProjectsSourceAndFields(t *testing.T) {
 	roles := RoleConfigs{
@@ -61,6 +64,9 @@ func TestCodingRolesFromLegacyProjectsSourceAndFields(t *testing.T) {
 	}
 	if !gatekeeper.Discovery.Enabled || gatekeeper.Discovery.Source != WorkSourcePullRequest {
 		t.Fatalf("gatekeeper discovery = %#v, want enabled pull-request source", gatekeeper.Discovery)
+	}
+	if gatekeeper.Discovery.LabelMode != LabelModeAll {
+		t.Fatalf("gatekeeper label mode = %q, want %q", gatekeeper.Discovery.LabelMode, LabelModeAll)
 	}
 	if len(gatekeeper.Discovery.Labels) != 0 {
 		t.Fatalf("gatekeeper labels = %v, want source-based discovery without label gate", gatekeeper.Discovery.Labels)
@@ -129,9 +135,14 @@ func TestValidateRoleDiscoveryRejectsCrossSourceFields(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			issues := ValidateRoleDiscovery("myrole", tc.discovery)
+			issues := ValidateRoleDiscovery("roles.coding.myrole", tc.discovery)
 			if len(issues) != tc.wantCount {
 				t.Errorf("got %d issues %v, want %d", len(issues), issues, tc.wantCount)
+			}
+			for _, issue := range issues {
+				if !strings.HasPrefix(issue.Path, "roles.coding.myrole.") {
+					t.Errorf("issue path %q does not point into roles.coding.myrole", issue.Path)
+				}
 			}
 		})
 	}
