@@ -27,8 +27,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -39,6 +41,17 @@ import (
 )
 
 const requestTimeout = 30 * time.Second
+
+// projectAddTimeout is longer than requestTimeout because POST /api/v1/projects
+// is not a control call. The daemon commits the project and only then discovers
+// its worktrees and open pull requests, which under defaults.addSnapshotMode =
+// "full" walks every open PR on the repo. Cutting that off at the control-verb
+// deadline reports a failure for work that already landed; see runProjectAdd.
+//
+// A var, not a const, only so a test can shrink it: the timeout branch is the
+// one that must not read as a plain failure, and ten real minutes is not
+// something a test can wait out.
+var projectAddTimeout = 10 * time.Minute
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -383,7 +396,31 @@ func loadConfig(args []string) (config.Config, error) {
 	if err != nil {
 		return config.Config{}, err
 	}
-	return loaded.Config, nil
+	return applyEndpointOverrides(loaded.Config, args), nil
+}
+
+// applyEndpointOverrides makes --host and --port win over a configured
+// server.baseUrl.
+//
+// LoadFile routes those two flags onto Server.Host and Server.Port only, while
+// daemonBaseURL prefers Server.BaseURL whenever it is set. Left alone, that
+// combination sends `looper --host other-box project add /repo` to the daemon
+// named by the config file — a documented override that dials the wrong daemon
+// and mutates the wrong project catalog. Dropping BaseURL is what makes
+// daemonBaseURL fall back to the host and port the operator just typed.
+//
+// The check reads the already-split global flags rather than the raw command
+// line, so `--host` appearing as an operand (after `--`, or as a respond
+// answer) cannot be mistaken for an endpoint override.
+func applyEndpointOverrides(cfg config.Config, global []string) config.Config {
+	for _, arg := range global {
+		name, _, _ := strings.Cut(arg, "=")
+		if name == "--host" || name == "--port" {
+			cfg.Server.BaseURL = nil
+			return cfg
+		}
+	}
+	return cfg
 }
 
 // --- init ------------------------------------------------------------------
@@ -453,8 +490,24 @@ func runInit(global []string, operands []string, stdout io.Writer) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", filepath.Dir(path), err)
 	}
-	// O_EXCL closes the window between the stat above and the write: a config
-	// that appeared in between must not be clobbered.
+	if err := writeNewConfigFile(path, strings.NewReader(starterConfig)); err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(stdout, "wrote starter config to %s\n", path)
+	_, _ = fmt.Fprintf(stdout, "next: edit it, start looperd, then run `looper project add <repo>` and `looper status`\n")
+	return nil
+}
+
+// writeNewConfigFile creates path and fills it, or leaves nothing behind.
+//
+// O_EXCL closes the window between init's stat and this write: a config that
+// appeared in between must not be clobbered. Every failure after that create
+// unlinks the file, because a truncated config is worse than no config at all —
+// init would refuse to repair it (the path exists), and looperd fails fast
+// trying to load it, so the operator is stuck holding a file nothing will
+// accept and nothing will replace.
+func writeNewConfigFile(path string, contents io.Reader) error {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
@@ -462,16 +515,15 @@ func runInit(global []string, operands []string, stdout io.Writer) error {
 		}
 		return fmt.Errorf("create %s: %w", path, err)
 	}
-	if _, err := io.WriteString(file, starterConfig); err != nil {
+	if _, err := io.Copy(file, contents); err != nil {
 		_ = file.Close()
+		_ = os.Remove(path)
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
 		return fmt.Errorf("write %s: %w", path, err)
 	}
-
-	_, _ = fmt.Fprintf(stdout, "wrote starter config to %s\n", path)
-	_, _ = fmt.Fprintf(stdout, "next: edit it, start looperd, then run `looper project add <repo>` and `looper status`\n")
 	return nil
 }
 
@@ -502,7 +554,7 @@ func runStatus(ctx context.Context, global []string, operands []string, stdout i
 		if err != nil {
 			loadErr = err
 		} else {
-			cfg = loaded.Config
+			cfg = applyEndpointOverrides(loaded.Config, global)
 			path = loaded.Metadata.ConfigPath
 		}
 	}
@@ -591,23 +643,31 @@ func runProjectList(ctx context.Context, global []string, stdout io.Writer) erro
 }
 
 func runProjectAdd(ctx context.Context, global []string, repoPath string, stdout io.Writer) error {
-	resolved, err := resolveRepoRoot(repoPath)
-	if err != nil {
-		return err
-	}
-
 	cfg, err := loadConfig(global)
 	if err != nil {
 		return err
 	}
 
-	// The daemon rejects a colliding project id, but two ids can point at the
-	// same checkout, which is the duplicate an operator actually creates by
-	// re-running the command. Refuse it here where the comparison is possible.
+	resolved, err := resolveRepoRoot(ctx, gitExecutable(cfg), repoPath)
+	if err != nil {
+		return err
+	}
+
+	// Authority for both gates below is the daemon and git, not this CLI's own
+	// reading of the filesystem: the catalog compared against is the one
+	// GET /api/v1/projects just returned, and the repository root came from
+	// `git rev-parse` in resolveRepoRoot. They exist because POST
+	// /api/v1/projects cannot refuse either case itself — a path-only add is an
+	// upsert keyed on the derived id, and nothing on that path compares
+	// repoPaths — so without them an "add" silently rebinds a project that
+	// already exists. Neither gate is the final word: the daemon still
+	// validates, and a project registered between this GET and the POST is
+	// caught there rather than here.
 	existing, err := requestJSON[projectsListResponse](ctx, cfg, http.MethodGet, "/api/v1/projects", nil)
 	if err != nil {
 		return err
 	}
+	derived := derivedProjectID(resolved)
 	for _, project := range existing.Items {
 		if project.Archived {
 			continue
@@ -615,14 +675,30 @@ func runProjectAdd(ctx context.Context, global []string, repoPath string, stdout
 		if sameRepoPath(project.RepoPath, resolved) {
 			return fmt.Errorf("%s is already registered as project %q", resolved, project.ID)
 		}
+		// A path-only POST derives the project id from the last path segment,
+		// and the daemon treats an existing *derived* id as an update rather
+		// than a conflict. So /work/acme/api added after /work/other/api would
+		// repoint project "api" at the new checkout and report it as a
+		// successful add. Refuse here, where both paths are still visible.
+		if project.ID == derived {
+			return fmt.Errorf("project %q already registers %s, and %s derives the same project id; adding it would rebind that project instead of creating one. Register this checkout with an explicit id through the dashboard or POST /api/v1/projects", project.ID, project.RepoPath, resolved)
+		}
 	}
 
 	payload, err := json.Marshal(map[string]string{"repoPath": resolved})
 	if err != nil {
 		return err
 	}
-	created, err := requestJSON[createProjectResponse](ctx, cfg, http.MethodPost, "/api/v1/projects", payload)
+	created, err := requestJSONWithin[createProjectResponse](ctx, projectAddTimeout, cfg, http.MethodPost, "/api/v1/projects", payload)
 	if err != nil {
+		// The daemon commits and publishes the project before it discovers
+		// worktrees and pull requests, so a deadline that expires during
+		// discovery reports a failure for a registration that already landed.
+		// Say so: a plain error would send the operator into a retry that can
+		// only answer "already registered".
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("registering %s did not finish within %s; the daemon records a project before it finishes discovering its worktrees and pull requests, so this may already have succeeded — run `looper project list` before retrying", resolved, projectAddTimeout)
+		}
 		return err
 	}
 
@@ -639,10 +715,27 @@ func runProjectAdd(ctx context.Context, global []string, repoPath string, stdout
 }
 
 // resolveRepoRoot turns an operator-supplied path into the absolute repository
-// root the daemon should store. Only a root is accepted: looperd creates
-// worktrees from this path, and a subdirectory would silently produce a project
-// whose worktrees do not match its checkout.
-func resolveRepoRoot(repoPath string) (string, error) {
+// root the daemon should store.
+//
+// Authority is git, asked directly. A path merely *containing* something named
+// .git proves nothing: it can be an empty directory, a plain file, or a
+// worktree pointer into a repository that has since been deleted, and looperd
+// would only discover that after the project was persisted, when discovery or
+// worktree creation fails. `git rev-parse --show-toplevel` is the same question
+// the daemon's own git invocations ask, so a path this accepts is one they can
+// use, and a broken checkout is refused while the operator is still looking at
+// the command that named it.
+//
+// Only a root is accepted: looperd creates worktrees from this path, and a
+// subdirectory would silently produce a project whose worktrees do not match
+// its checkout. rev-parse answers from inside a subdirectory too, which is what
+// lets the refusal name the root the operator probably meant.
+//
+// The root git reports is also the canonical one — symlinks resolved — so it,
+// not the typed path, is what gets stored and compared. /tmp/repo and
+// /private/tmp/repo are one checkout, and two projects for one checkout would
+// discover and operate on the same worktrees.
+func resolveRepoRoot(ctx context.Context, gitPath string, repoPath string) (string, error) {
 	resolved, err := filepath.Abs(strings.TrimSpace(repoPath))
 	if err != nil {
 		return "", fmt.Errorf("resolve %s: %w", repoPath, err)
@@ -657,15 +750,78 @@ func resolveRepoRoot(repoPath string) (string, error) {
 	if !info.IsDir() {
 		return "", fmt.Errorf("%s is not a directory", resolved)
 	}
-	// A linked worktree records .git as a file, not a directory, so both are
-	// accepted; only its absence disqualifies the path.
-	if _, err := os.Stat(filepath.Join(resolved, ".git")); err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("%s is not a git repository root (no .git entry)", resolved)
-		}
-		return "", fmt.Errorf("inspect %s: %w", filepath.Join(resolved, ".git"), err)
+
+	toplevel, err := gitTopLevel(ctx, gitPath, resolved)
+	if err != nil {
+		return "", err
 	}
-	return resolved, nil
+	// Compare against the canonicalized input, not the literal argument:
+	// rev-parse already resolved symlinks, so /tmp/repo would otherwise read as
+	// a subdirectory of /private/tmp/repo.
+	canonical := resolved
+	if evaluated, err := filepath.EvalSymlinks(resolved); err == nil {
+		canonical = evaluated
+	}
+	if filepath.Clean(toplevel) != filepath.Clean(canonical) {
+		return "", fmt.Errorf("%s is inside the repository at %s, not its root; register %s instead", resolved, toplevel, toplevel)
+	}
+	return toplevel, nil
+}
+
+// gitTopLevel asks git for the work-tree root containing dir. A repository
+// without a work tree (a bare one) reports an empty root, which is equally
+// unusable: looperd cannot create worktrees from it.
+func gitTopLevel(ctx context.Context, gitPath string, dir string) (string, error) {
+	command := exec.CommandContext(ctx, gitPath, "-C", dir, "rev-parse", "--show-toplevel")
+	stderr := &bytes.Buffer{}
+	command.Stderr = stderr
+	output, err := command.Output()
+	if err != nil {
+		detail := singleLine(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return "", fmt.Errorf("%s is not a usable git repository: %s", dir, detail)
+	}
+	toplevel := strings.TrimSpace(string(output))
+	if toplevel == "" {
+		return "", fmt.Errorf("%s is not a usable git repository: git reported no work tree", dir)
+	}
+	return toplevel, nil
+}
+
+// gitExecutable prefers the git config.LoadFile detected or the operator
+// configured, so the CLI and the daemon ask the same binary.
+func gitExecutable(cfg config.Config) string {
+	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
+		return strings.TrimSpace(*cfg.Tools.GitPath)
+	}
+	return "git"
+}
+
+// nonProjectIDCharacters mirrors projects.nonProjectIDPattern.
+var nonProjectIDCharacters = regexp.MustCompile(`[^a-z0-9]+`)
+
+// derivedProjectID predicts the id the daemon will derive for a path-only
+// POST /api/v1/projects.
+//
+// It restates projects.deriveProjectIDFromRepoPath, which cmd cannot import.
+// internal/projects stays authoritative — this copy only decides whether to ask
+// at all, never what the id finally is, and the daemon's answer is what gets
+// stored and printed. If the two ever drift, the cost is a collision reported
+// by the daemon instead of here, or a refusal the operator can bypass through
+// the API with an explicit id.
+func derivedProjectID(repoPath string) string {
+	segments := strings.FieldsFunc(repoPath, func(r rune) bool { return r == '/' || r == '\\' })
+	lastSegment := "project"
+	if len(segments) > 0 {
+		lastSegment = segments[len(segments)-1]
+	}
+	normalized := strings.Trim(nonProjectIDCharacters.ReplaceAllString(strings.ToLower(lastSegment), "-"), "-")
+	if normalized == "" {
+		return "project"
+	}
+	return normalized
 }
 
 func sameRepoPath(left string, right string) bool {
@@ -746,8 +902,15 @@ func get(ctx context.Context, cfg config.Config, path string) (string, error) {
 // shape. The control verbs stop at doHTTP instead, because they echo the raw
 // body rather than reading fields out of it.
 func requestJSON[T any](ctx context.Context, cfg config.Config, method string, path string, body []byte) (T, error) {
+	return requestJSONWithin[T](ctx, requestTimeout, cfg, method, path, body)
+}
+
+// requestJSONWithin is requestJSON for a call whose cost is not bounded by the
+// control-verb deadline. Only project creation needs it; everything else is a
+// single daemon lookup or state change.
+func requestJSONWithin[T any](ctx context.Context, timeout time.Duration, cfg config.Config, method string, path string, body []byte) (T, error) {
 	var value T
-	payload, err := doHTTP(ctx, cfg, method, path, body)
+	payload, err := doHTTPWithin(ctx, timeout, cfg, method, path, body)
 	if err != nil {
 		return value, err
 	}
@@ -767,9 +930,13 @@ func requestJSON[T any](ctx context.Context, cfg config.Config, method string, p
 }
 
 func doHTTP(ctx context.Context, cfg config.Config, method, path string, body []byte) (string, error) {
+	return doHTTPWithin(ctx, requestTimeout, cfg, method, path, body)
+}
+
+func doHTTPWithin(ctx context.Context, timeout time.Duration, cfg config.Config, method, path string, body []byte) (string, error) {
 	endpoint := daemonBaseURL(cfg) + path
 
-	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	var reader io.Reader
