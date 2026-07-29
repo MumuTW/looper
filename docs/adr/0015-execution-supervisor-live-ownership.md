@@ -62,9 +62,10 @@ must classify durable observations conservatively before mutations are enabled.
 
 > The Authority for a live action is the Execution Supervisor reservation (admission
 > + operation lease) and its owned containment handle. SQLite rows and PID/PGID
-> probes are recovery evidence only — never live stop, terminal, requeue, or
-> overlap Authority while the daemon is live, and never confirmed-dead Authority
-> after restart solely because a PID is missing or a leader has exited.
+> probes are recovery evidence only — never override a current Supervisor owner
+> or authorize live stop, and never become terminal/requeue Authority from PID
+> evidence or lease expiry alone. Inherited observations may be reconciled only
+> by Issue #22's expired-lease + invalid birth-identity composite.
 
 Why this is not the agent’s structured output: agents do not own process
 lifecycle, queue claims, or stop semantics. Why this is not SQLite alone:
@@ -285,28 +286,48 @@ recovery classifies each durable `agent_executions` observation as one of:
 | **observed_live** | Process probe matched the durable row | Evidence only — never adopt live ownership; quarantine |
 | **uncertain** | Everything else (PID absent, not running, mismatch, probe error, leader-exit-only) | Quarantine; no raw PID/PGID action |
 
+Issue #22 adds a shared liveness reconciliation decision on top of this
+containment classification. `agent_executions.last_heartbeat_at` (falling back
+to the row timestamps for legacy observations) is the renewable durable lease;
+the persisted PID + command + operating-system process start time is the process
+identity. The common executor records start time in execution metadata after
+`cmd.Start`; legacy rows without it remain `needs_confirmation` when the command
+still matches. An execution is recoverably stale only when its 30-minute lease
+is expired **and** that identity is invalid (PID absent, no longer running,
+command mismatch, or process-start mismatch). A matching live identity always
+blocks overlap, even after lease expiry. A fresh or malformed lease, missing
+birth identity, or probe error remains `needs_confirmation`.
+
+While a daemon is live, its Execution Supervisor handle remains the first and
+only Authority: the reconciler never overrides a current-daemon-owned execution.
+The durable composite applies only to inherited observations that have no
+current Supervisor owner, whether encountered during startup, scheduler
+capacity recovery, or an operator-triggered reconcile.
+
 **Authority for `confirmed_dead` after restart:**
 
 | May authorize confirmed-dead | Must not authorize confirmed-dead |
 |------------------------------|-----------------------------------|
 | Durable terminal finalization already committed before crash | PID/PGID missing or not running |
 | A **current-daemon** owned handle that has completed confirmed drain | Probe-then-signal on raw PID/PGID |
+| Expired durable heartbeat lease **and** conclusively invalid persisted process identity (#22) | Lease expiry alone, or invalid identity while the lease is fresh/malformed |
 | | Leader exit alone without descendant/containment proof |
 
 Otherwise the row remains **uncertain** (or **observed_live**) and is parked via
 existing `manual_intervention` / `paused` states — no new quarantine ledger.
 Running claims after restart have no live operation lease; reconcile them via
-durable finalize semantics (#578/#579), never by inferring death from PID absence.
+the shared startup/live/manual primitive and durable finalize semantics
+(#578/#579), never from PID evidence or lease expiry alone.
 Mutations stay closed until classification finishes (#575/#580).
 
 **Startup recovery concept trade-off (R8):**
 
 | | |
 |--|--|
-| **Failure prevented** | False cleanliness and PID-reuse kills after crash; marking terminal / requeue / overlap from leader exit or PID absence alone; treating observed-live orphans as Supervisor-owned. |
-| **Costs** | More quarantine/`manual_intervention` and less aggressive auto-clean after restart; operators must unstick parked work deliberately. |
-| **Why not simpler** | Trusting PID/PGID probes as Authority reopens reusable-ID kills. Requeueing “dead” leaders without descendant proof leaves live children and starts overlapping work. |
-| **Deletion attempt** | Drop classification and always quarantine — correct but loses the durable-terminal / current-daemon-drain paths that already have Authority; classification keeps those paths explicit and tested. |
+| **Failure prevented** | False cleanliness and PID-reuse kills after crash; indefinite capacity loss from expired executions whose persisted identity is conclusively invalid; overlap with a matching live process. |
+| **Costs** | A fixed 30-minute recovery delay; one process-start token in existing execution metadata; OS-specific start-time probing; legacy/malformed identity requires confirmation; operator events must distinguish active, stale-requeued, and `needs_confirmation`. |
+| **Why not simpler** | PID/PGID probes alone reopen reusable-ID failures. Lease expiry alone can overlap a silent but live process. Requiring both signals gives stale work a supported path without weakening ambiguous cases. |
+| **Deletion attempt** | Always quarantine is safe but recreates Issue #22's permanent pause. A new lease table/status was unnecessary because heartbeat is already persisted and renewed; adding only the missing OS birth token closes same-command PID reuse. |
 
 ### Full non-mutating coverage when not-ready or degraded (enforced by #580)
 

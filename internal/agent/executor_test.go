@@ -1163,6 +1163,9 @@ func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
 	if record == nil || record.HeartbeatCount < 3 || record.LastHeartbeatAt == nil {
 		t.Fatalf("heartbeat record = %#v, want >=3 heartbeats with timestamp", record)
 	}
+	if record.MetadataJSON == nil || !strings.Contains(*record.MetadataJSON, `"processIdentity":{"startTime":`) {
+		t.Fatalf("MetadataJSON = %v, want durable process birth identity", record.MetadataJSON)
+	}
 }
 
 func TestExecutorCapturesConcurrentStdoutAndStderr(t *testing.T) {

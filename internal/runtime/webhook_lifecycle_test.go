@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/processidentity"
 )
 
 func TestDaemonLockRejectsSecondHolderAndReacquiresAfterRelease(t *testing.T) {
@@ -62,7 +64,7 @@ func TestPSProcessStartForcesCLocale(t *testing.T) {
 	t.Setenv("LC_ALL", "fr_FR.UTF-8")
 	t.Setenv("TZ", "America/Los_Angeles")
 
-	got, err := psProcessStart(4242)
+	got, err := processidentity.StartTime(4242)
 	if err != nil {
 		t.Fatalf("psProcessStart() error = %v", err)
 	}
