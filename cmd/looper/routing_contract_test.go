@@ -197,6 +197,7 @@ func newContractFixture(t *testing.T) *contractFixture {
 
 	rootDir := t.TempDir()
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LOOPER_HOME", "")
 	cfg, err := config.DefaultConfig(rootDir)
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
@@ -313,6 +314,7 @@ func TestRetryReachesTheDaemonRoutes(t *testing.T) {
 
 	configPath := writeContractConfig(t, server.URL)
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LOOPER_HOME", "")
 
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 	runRetry(context.Background(), []string{"retry", "12", "--config", configPath}, stdout, stderr)

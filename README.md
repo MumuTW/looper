@@ -213,6 +213,7 @@ There is one more command that is not for operators: `looper review submit`, whi
 - Canonical default path: `~/.looper/config.toml`
 - Supported formats: `.toml`, `.yaml`, `.yml`, `.json`
 - Config source selection precedence: `--config` → `LOOPER_CONFIG` → default-path discovery
+- State directory: `~/.looper`, overridable with `LOOPER_HOME` (takes precedence over `HOME`). It moves the whole set of default-derived paths together — config discovery, database, logs, and worktree roots — so a second instance never writes into the first one's state
 - Provider support: legacy GitHub projects keep working through `gh`; Forgejo projects require an explicit provider, `baseUrl`, `repo`, and either `tokenEnv` (`auth=token-env`) or `teaLogin` (`auth=tea`)
 - All role-specific config lives under `roles.<role>`; canonical reviewer behavior lives under `roles.reviewer.behavior.*`
 - Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path

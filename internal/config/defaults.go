@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 const DefaultServerPort = 17310
@@ -13,7 +14,15 @@ const (
 	DefaultReviewerRetryMaxDelayMS         = 300000
 )
 
+// DefaultLooperHome resolves the daemon's state directory. LOOPER_HOME overrides
+// it ahead of HOME, mirroring how LOOPER_CONFIG overrides config discovery, so a
+// second instance — or a test binary — can own its own worktree roots, database,
+// and logs instead of writing into the operator's real ~/.looper.
 func DefaultLooperHome() (string, error) {
+	if override := strings.TrimSpace(os.Getenv("LOOPER_HOME")); override != "" {
+		return override, nil
+	}
+
 	homeDir := os.Getenv("HOME")
 	if homeDir == "" {
 		resolvedHomeDir, err := os.UserHomeDir()

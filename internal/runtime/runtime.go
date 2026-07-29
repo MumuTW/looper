@@ -177,6 +177,7 @@ type Runtime struct {
 	schedulerTasks              *schedulerTaskTracker
 	worktreeCleanupStop         chan struct{}
 	worktreeCleanupDone         chan struct{}
+	worktreeCleanupWake         chan struct{}
 	worktreeCleanupCancel       context.CancelFunc
 	worktreeCleanupRunning      bool
 	worktreeCleanupInitialDelay time.Duration
@@ -1051,9 +1052,9 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		// Keep the loop alive even without an initial vendor so configuring one can
 		// take effect without restarting looperd.
 		r.startSchedulerLoop()
-		if r.config.Daemon.WorktreeCleanup.Enabled {
-			r.startWorktreeCleanupLoop()
-		}
+		// Always start the loop: daemon.worktreeCleanup.enabled is hot-editable,
+		// and the loop itself gates each pass on the current value.
+		r.startWorktreeCleanupLoop()
 		r.startConfigReloadLoop()
 
 		// Open admission only after recovery and producer loops are assembled.
