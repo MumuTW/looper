@@ -24,7 +24,7 @@ If the project is not registered yet:
 looper project add /absolute/path/to/repo
 ```
 
-That path must be the repository root — the directory containing `.git`. The dashboard and `POST /api/v1/projects` register the same way and additionally accept an explicit id, base branch, and provider.
+That path must be the repository root — the directory containing `.git`. For advanced registration, `POST /api/v1/projects` accepts the same `repoPath` plus optional `id`, `baseBranch`, and `provider` fields. The dashboard only lists registered projects; it does not create them.
 
 Webhook mode is configured in the config file (`webhook.mode` and per-project overrides). Observe health with `GET /api/v1/webhook/status` or the dashboard. Clearing stale GitHub CLI forwarder hooks is a manual `gh api` operation after you confirm the dry-run payload — there is no `looper webhook cleanup`.
 
@@ -81,7 +81,7 @@ Operator recovery rules:
 
 ## 2. How Looper resolves the project
 
-Looper only acts on **registered projects**. A project is registered once, from the dashboard or `POST /api/v1/projects` with the repo's absolute `repoPath`; the daemon then polls every registered project on each discovery pass.
+Looper only acts on **registered projects**. Register a project with `looper project add /absolute/path/to/repo`, or use `POST /api/v1/projects` with the repo's absolute `repoPath` when you need the advanced fields. The dashboard only lists registered projects. The daemon polls every registered project on each discovery pass.
 
 There is no current-directory inference and no `--project` flag: the stripped CLI has neither, and the daemon's create endpoints take an explicit project id.
 
@@ -95,9 +95,9 @@ There is no current-directory inference and no `--project` flag: the stripped CL
 | --- | --- | --- |
 | `coordinator` | Proactively triages fresh issues and commits a Disposition with durable labels | runs automatically inside `looperd` |
 | `planner` | Generates a spec from an issue and opens a spec PR | Label issue `looper:plan` + assign (or `POST /api/v1/planners`) |
-| `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | Review-request / label discovery (or `POST /api/v1/loops`) |
+| `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | Review request under the default policy; configured label policy or `POST /api/v1/loops` otherwise |
 | `fixer` | Fixes PR issues based on review comments and tries to resolve threads | Discovery on open PRs with actionable threads (or `POST /api/v1/loops`) |
-| `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | Label `looper:worker-ready` / `looper:spec-ready` (or `POST /api/v1/workers`) |
+| `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | Label the issue `looper:worker-ready` (or `POST /api/v1/workers`) |
 
 Forgejo MVP role support:
 
@@ -118,7 +118,7 @@ Forgejo MVP role support:
 5. Let `reviewer` review the spec PR
 6. Let `fixer` address review comments until the review is clean
 7. The PR gets the `looper:spec-ready` label
-8. `worker` takes over that PR and continues implementation
+8. Add `looper:worker-ready` to the linked issue and keep it assigned; `worker` then reuses the approved spec PR and continues implementation
 
 This is the smoothest current Looper workflow.
 
@@ -252,9 +252,17 @@ gh pr edit 42 --add-reviewer <login>              # any PR: request a review
 gh pr edit 42 --add-label looper:spec-reviewing   # spec PR: mark the review phase
 ```
 
-`<login>` is the GitHub user whose Looper instance should do the review: an instance only picks up PRs requested from *its own* authenticated user. GitHub will not let you request a review from a PR's own author, so a self-authored PR needs `roles.reviewer.discovery.triggers.enableSelfReview = true` instead.
+`<login>` is the GitHub user whose Looper instance should do the review: an instance only picks up PRs requested from *its own* authenticated user. GitHub will not let you request a review from a PR's own author. For automatic self-review, set both `roles.reviewer.discovery.triggers.enableSelfReview = true` and `roles.reviewer.discovery.triggers.requireReviewRequest = false`; changing only `enableSelfReview` still leaves the default review-request gate in place. To avoid broadening automatic discovery, create a manual reviewer loop with `POST /api/v1/loops` instead.
 
-To create the loop directly rather than wait for the next poll, `POST /api/v1/loops` with `type: "reviewer"`. The dashboard controls existing loops; it cannot create one.
+To create the loop directly rather than wait for the next poll, post the required project and PR target explicitly:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:17310/api/v1/loops" \
+  -H 'Content-Type: application/json' \
+  -d '{"projectId":"<project-id>","type":"reviewer","targetType":"pull_request","repo":"owner/repo","prNumber":42}'
+```
+
+The dashboard controls existing loops; it cannot create one.
 
 There is no longer a one-time vs continuous mode to choose: a reviewer loop stays with its PR through the review/fix cycle, and a fixer push queues a fresh review rather than waiting for the next coordinator pass.
 
@@ -337,7 +345,7 @@ In practice, `reviewer` and `fixer` often alternate until the spec PR is ready f
 
 ### Start from an issue
 
-Label the issue `looper:worker-ready` (or `looper:spec-ready` once its spec PR is approved) and assign it to the current forge user. Discovery picks it up on the next poll. This is the recommended entrypoint.
+Label the issue `looper:worker-ready` and assign it to the current forge user. Discovery picks it up on the next poll. This is the recommended entrypoint. `looper:spec-ready` belongs on an approved spec **PR**; worker issue discovery does not consume that label.
 
 To create the loop directly instead of waiting for discovery:
 
@@ -500,10 +508,10 @@ Every step below is a forge action. Nothing here needs the CLI: the daemon disco
 2. Add the `looper:plan` label
 3. Assign it to the current `gh` user — planner needs both the label and the assignment
 4. Planner picks it up and opens a spec PR (or create the loop now with `POST /api/v1/planners`)
-5. Request a review on that spec PR, or label it `looper:spec-reviewing`, so reviewer takes it
+5. Request a review on that spec PR from the GitHub user running reviewer. `looper:spec-reviewing` only marks the phase and does not replace the review request under the default policy; alternatively create a manual reviewer loop with `POST /api/v1/loops`
 6. If reviewer leaves findings, fixer starts on its own and pushes repairs to the same branch
 7. Reviewer and fixer alternate until the review is clean and the PR reaches `looper:spec-ready`
-8. Worker takes over that PR and implements the spec
+8. Add `looper:worker-ready` to the linked issue and keep it assigned. Worker discovery consumes the issue label and reuses the approved spec PR; alternatively create the worker directly with `POST /api/v1/workers`
 
 ### Option B: manage an existing PR directly
 
@@ -520,16 +528,16 @@ The one-command background path (`looper takeover <owner>/<repo>#<pr>`, `scripts
 
 Today:
 
-1. Register the repo (dashboard or `POST /api/v1/projects`).
-2. Let discovery claim the PR via labels / review-requests, **or** drive the PR live with the [`pr-takeover` skill](../skills/pr-takeover/SKILL.md) (`gh` + `git` in your agent session).
+1. Register the repo with `looper project add /absolute/path/to/repo` or `POST /api/v1/projects`.
+2. Let discovery claim the PR through a review request (or an explicitly configured label policy), **or** drive the PR live with the [`pr-takeover` skill](../skills/pr-takeover/SKILL.md) (`gh` + `git` in your agent session).
 3. Control **existing** loops with `looper stop|pause|retry|takeover|handback|respond <selector>` — where `takeover` now means *park this loop for manual worktree work*, not “adopt a PR”.
 
 ## 16. Quick decision guide
 
 - You have an issue but no spec yet: label `looper:plan` + assign → planner discovery
-- You have a PR that needs review: review-request / `looper:spec-reviewing` → reviewer discovery
-- A PR already has review comments to address: fixer discovery (or dashboard/API)
-- The spec is ready and implementation should begin: `looper:spec-ready` / `looper:worker-ready` → worker discovery
+- You have a PR that needs review: request review from the intended forge user → reviewer discovery (`looper:spec-reviewing` only marks a spec PR's phase)
+- A PR already has review comments to address: fixer discovery (or create it directly with `POST /api/v1/loops`)
+- The spec is ready and implementation should begin: keep `looper:spec-ready` on the spec PR, then add `looper:worker-ready` to the linked assigned issue → worker discovery
 - You want a human agent to drive one PR live until merge: [`pr-takeover` skill](../skills/pr-takeover/SKILL.md)
 - You need to pause/stop/retry a running loop: surviving CLI verbs above + dashboard
 
