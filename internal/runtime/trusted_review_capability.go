@@ -3,12 +3,14 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nexu-io/looper/internal/bootstrap"
@@ -17,8 +19,12 @@ import (
 
 // trustedReviewCapabilityProbeTimeout bounds the probe because the reviewer
 // tick path blocks on it. The verb loads no config and touches no network, so
-// anything slower is already a broken binary.
-const trustedReviewCapabilityProbeTimeout = 5 * time.Second
+// anything slower is a broken binary or a machine under enough load that the
+// answer would not be about the binary either way — which is why blowing this
+// deadline counts as transient rather than as a verdict.
+//
+// It is a var only so tests can shorten it; nothing reassigns it at runtime.
+var trustedReviewCapabilityProbeTimeout = 5 * time.Second
 
 // trustedReviewCapabilityDiagnosticLimit caps how much probe output is kept for
 // the operator-facing reason; probe output is agent-adjacent and unbounded.
@@ -71,8 +77,21 @@ func trustedReviewCapability(configuredPath string) (capable bool, reason string
 		return previous.capable, previous.reason, false
 	}
 
-	capable, reason = probeTrustedReviewCapability(identity)
-	trustedReviewCapabilityCache.entries[configuredPath] = trustedReviewCapabilityEntry{identity: identity, capable: capable, reason: reason}
+	capable, reason, transient := probeTrustedReviewCapability(identity)
+	// A transient failure is not a verdict about the binary, and caching one
+	// would be permanent: the cache key is the binary's own identity, which
+	// does not change because the machine was briefly out of process slots. One
+	// fork/exec EAGAIN, or one probe that lost its 5s race under load, would
+	// otherwise leave reviewer publishing fail-closed for the rest of the
+	// daemon's life — every later tick reads the cached "no" without re-probing.
+	// Leaving the entry unwritten costs one subprocess on the next tick and lets
+	// the verdict recover on its own.
+	//
+	// Retrying in place instead would hold this mutex, which every concurrent
+	// reviewer tick is queued behind, across the backoff.
+	if !transient {
+		trustedReviewCapabilityCache.entries[configuredPath] = trustedReviewCapabilityEntry{identity: identity, capable: capable, reason: reason}
+	}
 	return capable, reason, !hadPrevious || previous.capable != capable
 }
 
@@ -94,9 +113,13 @@ func trustedReviewCapabilityIdentityFor(configuredPath string) trustedReviewCapa
 	return trustedReviewCapabilityIdentity{resolvedPath: resolved, modTimeUnixNano: info.ModTime().UnixNano(), size: info.Size()}
 }
 
-func probeTrustedReviewCapability(identity trustedReviewCapabilityIdentity) (bool, string) {
+// probeTrustedReviewCapability runs the verb once. transient reports that the
+// probe never got a verdict out of the binary — see isTransientProbeFailure.
+func probeTrustedReviewCapability(identity trustedReviewCapabilityIdentity) (capable bool, reason string, transient bool) {
 	if identity.resolveError != "" {
-		return false, fmt.Sprintf("resolve looper binary: %s", identity.resolveError)
+		// A resolve error is safe to cache: the identity it produces changes as
+		// soon as the path resolves, so the entry cannot outlive the condition.
+		return false, fmt.Sprintf("resolve looper binary: %s", identity.resolveError), false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), trustedReviewCapabilityProbeTimeout)
@@ -112,17 +135,37 @@ func probeTrustedReviewCapability(identity trustedReviewCapabilityIdentity) (boo
 		if detail == "" {
 			detail = trustedReviewCapabilityDiagnostic(stdout.String())
 		}
+		transient := isTransientProbeFailure(ctx, err)
 		if detail == "" {
-			return false, fmt.Sprintf("`looper review capability` failed: %v", err)
+			return false, fmt.Sprintf("`looper review capability` failed: %v", err), transient
 		}
-		return false, fmt.Sprintf("`looper review capability` failed: %v: %s", err, detail)
+		return false, fmt.Sprintf("`looper review capability` failed: %v: %s", err, detail), transient
 	}
 
 	token := strings.TrimSpace(stdout.String())
 	if token != forge.TrustedReviewCapabilityToken {
-		return false, fmt.Sprintf("`looper review capability` reported %q, want %q", trustedReviewCapabilityDiagnostic(token), forge.TrustedReviewCapabilityToken)
+		return false, fmt.Sprintf("`looper review capability` reported %q, want %q", trustedReviewCapabilityDiagnostic(token), forge.TrustedReviewCapabilityToken), false
 	}
-	return true, ""
+	return true, "", false
+}
+
+// isTransientProbeFailure reports the failures that say nothing about the
+// binary, so the verdict must not be cached against its identity.
+//
+// The list is deliberately short. A binary that is not executable, is the wrong
+// architecture, or exits nonzero has answered the question; re-probing it every
+// reviewer tick would spend a subprocess to be told the same thing. What is
+// left is the machine being briefly unable to start any process, the binary
+// being mid-write — the case a `go build` into the configured path produces —
+// and the probe losing its own deadline under load, which CommandContext
+// reports as a killed process rather than as an error wrapping ctx.Err().
+func isTransientProbeFailure(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	return errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, syscall.ETXTBSY)
 }
 
 func trustedReviewCapabilityDiagnostic(output string) string {
