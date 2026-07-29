@@ -3,7 +3,6 @@ package fixer
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
@@ -73,10 +72,9 @@ func TestFailureStreakHandoffDoesNotOverrideConcurrentOperatorStop(t *testing.T)
 			var wakes int
 			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, OnQueueItemEnqueued: func() { wakes++ }})
 			runner.failureStreakHandoffReadHook = func() {
-				// UpdatedAt is the compare-and-swap authority. Advance time so a pause
-				// with unchanged breaker metadata is still distinguishable from the
-				// handoff's earlier read.
-				fixture.advance(time.Millisecond)
+				// The clock deliberately does not advance: a repeated Pause keeps the
+				// same status and metadata, so only the strictly monotonic loop
+				// revision can prevent the stale handoff from resuming it.
 				reason := "operator stop"
 				service := &loops.Service{DB: fixture.coordinator.DB(), Repos: fixture.repos, Now: fixture.now}
 				if err := tc.stop(service, ctx, loopID, &reason); err != nil {
