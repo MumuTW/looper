@@ -93,6 +93,7 @@ There is no current-directory inference and no `--project` flag: the stripped CL
 
 | Role | Purpose | Common entrypoint |
 | --- | --- | --- |
+| `triager` | Internally classifies new/reopened GitHub issues, persists a triage report, and safely routes eligible reports to Planner | runs automatically when GitHub Planner discovery is enabled and Coordinator is off |
 | `coordinator` | Proactively triages fresh issues and commits a Disposition with durable labels | runs automatically inside `looperd` |
 | `planner` | Generates a spec from an issue and opens a spec PR | Label issue `looper:plan` + assign (or `POST /api/v1/planners`) |
 | `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | Review request under the default policy; configured label policy or `POST /api/v1/loops` otherwise |
@@ -111,16 +112,16 @@ Forgejo MVP role support:
 
 ### Overview
 
-1. Create a GitHub issue
-2. Add the `looper:plan` label
-3. Assign the issue to the currently authenticated `gh` user
-4. Start `planner` so it creates a spec PR
+1. Create a clear GitHub issue
+2. Triager persists a structured report and routes high-confidence, low-risk work directly to Planner
+3. If the report is risky, uncertain, or missing information, inspect the `triage.report` event; a collaborator with write access can confirm that exact report by commenting `/plan`
+4. Planner creates a spec PR
 5. Let `reviewer` review the spec PR
 6. Let `fixer` address review comments until the review is clean
 7. The PR gets the `looper:spec-ready` label
 8. Add `looper:worker-ready` to the linked issue and keep it assigned; `worker` then reuses the approved spec PR and continues implementation
 
-This is the smoothest current Looper workflow.
+Triager reports—not routing labels—are the semantic authority for this automatic GitHub intake path. The existing `looper:plan` label plus assignment remains an explicit label-discovery path and continues to support non-Triager providers.
 
 ## 5. Coordinator: proactive triage on fresh issues
 
@@ -214,9 +215,15 @@ curl -sS -X POST "http://127.0.0.1:17310/api/v1/planners" \
 
 This creates a `planner` loop targeting that issue. `projectId` is required — planner has no repo or current-directory inference.
 
-### Auto-discovery conditions
+### Triager route
 
-For planner auto-discovery, an issue must:
+For a GitHub project with Planner auto-discovery enabled and Coordinator disabled, new and reopened issues enter the internal Triager without a routing label. Each poll searches GitHub's recently updated Issues in updated-event order, with a lookback of at least five minutes, so enabling the role does not sweep the historical open backlog. Triager checks project support, source-event freshness, open-issue state, existing holds, and its persisted idempotency key, then records `triage.enrolled` before calling the LLM. That enrollment remains retryable after the lookback if the agent is unavailable. At most one new triage decision starts per scheduler tick across Projects. Triager revalidates the target after the decision and persists classification, scope, risk, confidence, missing information, recommended next role, rationale, and the policy outcome as a `triage.report` event.
+
+Only an in-scope, low-risk decision with confidence of at least `0.8`, no missing information, and `planner` as the recommended next role is projected directly into Planner's durable queue. Other reports remain `await_human_confirmation` and do not start Planner. A repository collaborator with `write`, `maintain`, or `admin` permission can confirm the persisted report by posting a later comment whose complete body is `/plan`; Looper records a `triage.confirmed` event before routing that report. A successful Planner projection is acknowledged by `triage.routed`, so a crash or route failure replays the report without repeating the LLM decision. The comment is a human confirmation, not a routing label.
+
+### Label-based auto-discovery conditions
+
+For the existing label-based Planner discovery path, an issue must:
 
 - have the `looper:plan` label
 - be assigned to the current GitHub user
@@ -410,7 +417,7 @@ The two most important assignment-related rules are:
 
 ### Planner
 
-For planner auto-discovery, the issue must:
+For label-based planner auto-discovery, the issue must:
 
 - be assigned to the current GitHub user
 - also have `looper:plan`

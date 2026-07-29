@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/gatekeeper"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
@@ -33,6 +34,7 @@ import (
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/triager"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
 	"github.com/nexu-io/looper/internal/worker"
@@ -42,6 +44,10 @@ type plannerScheduler interface {
 	DiscoverIssues(context.Context, planner.DiscoveryInput) (planner.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*planner.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*planner.ProcessResult, error)
+}
+
+type triagerScheduler interface {
+	DiscoverIssues(context.Context, triager.DiscoveryInput) (triager.DiscoveryResult, error)
 }
 
 type coordinatorScheduler interface {
@@ -61,6 +67,11 @@ type fixerScheduler interface {
 	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*fixer.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*fixer.ProcessResult, error)
+}
+
+type gatekeeperScheduler interface {
+	DiscoverPullRequests(context.Context, gatekeeper.DiscoveryInput) (gatekeeper.DiscoveryResult, error)
+	EvaluatePullRequest(context.Context, gatekeeper.EvaluationInput) (gatekeeper.Report, error)
 }
 
 type workerScheduler interface {
@@ -100,14 +111,17 @@ type defaultSchedulerTickInput struct {
 	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
+	Triager                  triagerScheduler
 	Planner                  plannerScheduler
 	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
 	Fixer                    fixerScheduler
+	Gatekeeper               gatekeeperScheduler
 	Worker                   workerScheduler
 	Snapshotter              snapshotScheduler
 	Config                   *config.Config
 	PlannerDiscoveryEnabled  *bool
+	TriagerEnabled           func(string) bool
 	CoordinatorEnabled       func(string) bool
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
@@ -127,6 +141,7 @@ type defaultSchedulerHandlers struct {
 	webhook              WebhookForwarder
 	reviewer             reviewerScheduler
 	fixer                fixerScheduler
+	gatekeeper           gatekeeperScheduler
 	input                func(Services) defaultSchedulerTickInput
 	snapshot             func() defaultSchedulerHandlers
 	notificationGateways *schedulerNotificationGatewayFactory
@@ -149,6 +164,21 @@ func (r catalogWebhookReviewer) DiscoverPullRequest(ctx context.Context, input r
 
 type catalogWebhookFixer struct {
 	snapshot func() fixerScheduler
+}
+
+type catalogWebhookGatekeeper struct {
+	snapshot func() gatekeeperScheduler
+}
+
+func (g catalogWebhookGatekeeper) EvaluatePullRequest(ctx context.Context, input gatekeeper.EvaluationInput) (gatekeeper.Report, error) {
+	if g.snapshot == nil {
+		return gatekeeper.Report{}, fmt.Errorf("gatekeeper is not configured")
+	}
+	runner := g.snapshot()
+	if runner == nil {
+		return gatekeeper.Report{}, fmt.Errorf("gatekeeper is not configured")
+	}
+	return runner.EvaluatePullRequest(ctx, input)
 }
 
 func (f catalogWebhookFixer) DiscoverPullRequest(ctx context.Context, input fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
@@ -3004,6 +3034,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			Fixer: catalogWebhookFixer{snapshot: func() fixerScheduler {
 				return handlers.snapshot().fixer
 			}},
+			Gatekeeper: catalogWebhookGatekeeper{snapshot: func() gatekeeperScheduler {
+				return handlers.snapshot().gatekeeper
+			}},
 			Logger: logger,
 			Now:    now,
 			// Accept-time gate only: once Forward returns accepted/202 the
@@ -3097,6 +3130,28 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Repositories:  repos,
 		Now:           now,
 	})
+	var gatekeeperRunner gatekeeperScheduler
+	if githubGateway != nil {
+		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{
+			Repos:  repos,
+			GitHub: githubGateway,
+			Now:    now,
+			PolicyPermitsTarget: func(projectID, repo, baseRefName string) bool {
+				project, ok := runtimeProjectBinding(cfg, projectID)
+				if !ok || !providerHasGitHubPullRequests(config.ResolvedProjectProviderKind(cfg, project)) {
+					return false
+				}
+				if !strings.EqualFold(strings.TrimSpace(project.Repo), strings.TrimSpace(repo)) {
+					return false
+				}
+				configuredBase := cfg.Defaults.BaseBranch
+				if project.BaseBranch != nil && strings.TrimSpace(*project.BaseBranch) != "" {
+					configuredBase = strings.TrimSpace(*project.BaseBranch)
+				}
+				return strings.EqualFold(strings.TrimSpace(configuredBase), strings.TrimSpace(baseRefName))
+			},
+		})
+	}
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
 	// CURRENT status (colour + label), without disturbing the retained live tail.
 	// The anchor is otherwise only patched opportunistically by the progress ticker
@@ -3188,6 +3243,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		return nil
 	}
 
+	var triagerRunner triagerScheduler
+	var plannerRoleRunner *planner.Runner
 	var plannerRunner plannerScheduler
 	var coordinatorRunner coordinatorScheduler
 	var reviewerRunner reviewerScheduler
@@ -3261,9 +3318,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 
 	// Construct even when live config no longer resolves so sticky snapshot retries remain claimable.
 	resolvedPlanner, plannerConfigured := config.ResolveAgent(cfg, "", config.CodingRolePlanner)
+	var plannerExecutor *agent.ConfiguredExecutor
 	{
 		resolved := resolvedPlanner
-		plannerExecutor := newRoleAgentExecutor(resolved)
+		plannerExecutor = newRoleAgentExecutor(resolved)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
@@ -3274,7 +3332,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if !plannerConfigured {
 			plannerAutoDiscovery = false
 		}
-		plannerRunner = planner.New(planner.Options{
+		plannerRoleRunner = planner.New(planner.Options{
 			DB:                 coordinator.DB(),
 			Repos:              repos,
 			GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: plannerStamper, config: &cfg},
@@ -3302,6 +3360,21 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
+		})
+		plannerRunner = plannerRoleRunner
+	}
+	if plannerConfigured && githubGateway != nil {
+		triagerRunner = triager.New(triager.Options{
+			Repos:   repos,
+			GitHub:  githubGateway,
+			Planner: plannerRoleRunner,
+			LLM: triager.NewAgentLLM(
+				plannerExecutor,
+				time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
+				time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
+			),
+			Now:            now,
+			SourceLookback: time.Duration(maxInt(300, 2*cfg.Scheduler.PollIntervalSeconds)) * time.Second,
 		})
 	}
 
@@ -3569,17 +3642,23 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ReconcileStaleRuns:   reconcileStaleRuns,
 			AsyncRunner:          runner,
 			RequestSchedulerWake: requestWake,
+			Triager:              triagerRunner,
 			Planner:              plannerRunner,
 			Coordinator:          coordinatorRunner,
 			Reviewer:             reviewerRunner,
 			Fixer:                fixerRunner,
+			Gatekeeper:           gatekeeperRunner,
 			Worker:               workerRunner,
 			Snapshotter:          snapshotter,
 			Config:               &cfg,
 			// Live discovery requires a currently resolvable agent; sticky retries
 			// still claim via always-present runners when vendor was removed
 			// (claimTypeSetsFromInput restricts unconfigured roles to snapshot items).
-			PlannerDiscoveryEnabled:  boolPtr(plannerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
+			PlannerDiscoveryEnabled: boolPtr(plannerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
+			TriagerEnabled: func(projectID string) bool {
+				roles := config.ProjectRoleConfigs(cfg, projectID)
+				return plannerConfigured && roles.Planner.AutoDiscovery && !roles.Coordinator.Enabled
+			},
 			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
 			ReviewerDiscoveryEnabled: boolPtr(reviewerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(fixerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
@@ -3608,6 +3687,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		},
 		reviewer:             webhookReviewer,
 		fixer:                webhookFixer,
+		gatekeeper:           gatekeeperRunner,
 		input:                inputForServices,
 		notificationGateways: notificationGateways,
 	}
@@ -3618,6 +3698,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ConfigSource: configSource,
 			Reviewer:     webhookReviewer,
 			Fixer:        webhookFixer,
+			Gatekeeper:   gatekeeperRunner,
 			Logger:       logger,
 			Now:          now,
 		})
@@ -3717,6 +3798,18 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		claimStats.record(claimedCount, availableSlots)
 		appendErr(err)
 	}
+	// Liveness quarantine must be revisited on the scheduler's periodic full
+	// tick, independently of capacity. Tying this to availableSlots == 0 strands
+	// quarantined work forever on otherwise-idle daemons.
+	if input.ReconcileStaleRuns != nil {
+		// Recheck immediately before the mutating reconciliation so shutdown cannot
+		// race past the tick-entry admission check.
+		if err := admissionRefuseWork(input); err != nil {
+			return nil
+		}
+		_, err := input.ReconcileStaleRuns(ctx)
+		appendErr(err)
+	}
 
 	projectsList, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
 	if err != nil {
@@ -3743,6 +3836,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		projectSnapshots[projectID] = snapshot
 		return snapshot
 	}
+	lanes := discoveryLanes(input)
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
 			retErr = errors.Join(append(errs, err)...)
@@ -3784,7 +3878,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		admissionClosed := false
-		for _, lane := range codingDiscoveryLanes(input) {
+		for _, lane := range lanes {
 			if !lane.Present {
 				continue
 			}
@@ -3977,23 +4071,6 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 	if err != nil {
 		logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
 		return 0, 0, err
-	}
-	if availableSlots == 0 && input.ReconcileStaleRuns != nil {
-		// Recheck immediately before stale reconcile: availableSlots can race
-		// with BeginShutdown after the count returns, and ReconcileStaleRuns
-		// mutates runs/queue during the HTTP drain window.
-		if err := admissionRefuseWork(input); err != nil {
-			return 0, 0, nil
-		}
-		if _, err := input.ReconcileStaleRuns(ctx); err != nil {
-			logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
-			return 0, 0, err
-		}
-		availableSlots, err = schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
-		if err != nil {
-			logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
-			return 0, 0, err
-		}
 	}
 	claimedItems := make([]storage.QueueItemRecord, 0)
 	if availableSlots > 0 && input.Repos != nil && input.Repos.Queue != nil {

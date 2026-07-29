@@ -134,6 +134,8 @@ Config source selection precedence is:
 2. `LOOPER_CONFIG`
 3. default-path discovery
 
+`~/.looper` itself is resolved as `LOOPER_HOME` → `HOME` → the OS user home directory. Setting `LOOPER_HOME` relocates every default-derived path together — config discovery, `storage.dbPath`, `daemon.logDir`, `storage.backupDir`, and the worktree roots used when a project record carries no `worktreeRoot` metadata. Use it to run a second instance, or to keep a test binary out of your real state directory; explicit config values still win over the defaults it produces.
+
 Default-path discovery checks, in order:
 
 1. `~/.looper/config.toml`
@@ -281,6 +283,7 @@ Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.m
 - Profile and role agent vendor/model/profile paths are hot-safe for **new claims** after a successful config publication.
 - In-flight runs keep the immutable config snapshot (and durable per-run agent snapshot) they started with; resume/retry copies the predecessor run's agent snapshot rather than re-resolving live config.
 - `agent.params` remain global, file-only, and restart-bound. The dashboard does not edit params.
+- Every `daemon.worktreeCleanup.*` leaf is hot-safe. The cleanup loop always runs and rereads `enabled` and `interval` on each wake, and a successful publication wakes it immediately, so enabling cleanup or shortening its interval takes effect without waiting out the previous schedule or restarting the daemon. The `daemon.worktreeCleanup` object itself stays restart-bound.
 
 ### Example: different reviewer vs worker models
 

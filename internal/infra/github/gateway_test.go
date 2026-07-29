@@ -600,7 +600,7 @@ func TestGetBranchProtection(t *testing.T) {
 		if args != "api repos/acme/looper/branches/main/protection" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
-		return shell.Result{Stdout: `{"required_status_checks":{"checks":[{"context":"ci"}]}}`}, nil
+		return shell.Result{Stdout: `{"required_status_checks":{"checks":[{"context":"ci","app_id":15368}]},"required_pull_request_reviews":{"required_approving_review_count":2}}`}, nil
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
@@ -608,8 +608,11 @@ func TestGetBranchProtection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetBranchProtection() error = %v", err)
 	}
-	if !protection.Enabled || !protection.HasRequiredChecks {
-		t.Fatalf("GetBranchProtection() = %#v, want enabled protection with required checks", protection)
+	if !protection.Enabled || !protection.HasRequiredChecks || !protection.HasRequiredReviews || protection.RequiredApprovingReviewCount != 2 {
+		t.Fatalf("GetBranchProtection() = %#v, want enabled protection with required checks and two approvals", protection)
+	}
+	if len(protection.RequiredCheckRules) != 1 || protection.RequiredCheckRules[0].Context != "ci" || protection.RequiredCheckRules[0].AppID != 15368 {
+		t.Fatalf("GetBranchProtection().RequiredCheckRules = %#v, want app-bound ci rule", protection.RequiredCheckRules)
 	}
 }
 
@@ -657,10 +660,10 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 		args := strings.Join(options.Args, " ")
 		switch call {
 		case 1:
-			if args != "api repos/acme/looper/commits/abc123/check-runs -H Accept: application/vnd.github+json" {
+			if args != "api repos/acme/looper/commits/abc123/check-runs?filter=latest&per_page=100 -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
 			}
-			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success"}]}`}, nil
+			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success","app":{"id":15368}}]}`}, nil
 		case 2:
 			if args != "api repos/acme/looper/commits/abc123/status -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
@@ -679,6 +682,9 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 	}
 	if len(runs.CheckRuns) != 1 || runs.CheckRuns[0].Name != "unit" {
 		t.Fatalf("CheckRuns = %#v, want decoded check run", runs.CheckRuns)
+	}
+	if runs.CheckRuns[0].AppID != 15368 {
+		t.Fatalf("CheckRuns[0].AppID = %d, want 15368", runs.CheckRuns[0].AppID)
 	}
 	if len(runs.Statuses) != 2 || runs.Statuses[0].Context != "legacy-ci" || runs.Statuses[1].Context != "lint" {
 		t.Fatalf("Statuses = %#v, want deduped status contexts in API order", runs.Statuses)
@@ -2629,6 +2635,40 @@ func TestListOpenIssuesPassesAllLabelsToGH(t *testing.T) {
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	if _, err := gateway.ListOpenIssues(context.Background(), ListOpenIssuesInput{Repo: "acme/looper", Assignee: "reviewer", Labels: []string{"bug", "priority"}}); err != nil {
 		t.Fatalf("ListOpenIssues() error = %v", err)
+	}
+}
+
+func TestListOpenIssuesPassesSourceSearchToGH(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		want := "--search updated:>=2026-07-30T11:55:00Z sort:updated-desc"
+		if !strings.Contains(args, want) {
+			t.Fatalf("gh args = %q, want %q", args, want)
+		}
+		return shell.Result{Stdout: `[]`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if _, err := gateway.ListOpenIssues(context.Background(), ListOpenIssuesInput{
+		Repo: "acme/looper", Search: "updated:>=2026-07-30T11:55:00Z sort:updated-desc",
+	}); err != nil {
+		t.Fatalf("ListOpenIssues() error = %v", err)
+	}
+}
+
+func TestRepositoryPermissionAllowsWrite(t *testing.T) {
+	t.Parallel()
+	for _, permission := range []string{"write", "maintain", "admin", " ADMIN "} {
+		if !RepositoryPermissionAllowsWrite(permission) {
+			t.Fatalf("RepositoryPermissionAllowsWrite(%q) = false", permission)
+		}
+	}
+	for _, permission := range []string{"", "read", "triage"} {
+		if RepositoryPermissionAllowsWrite(permission) {
+			t.Fatalf("RepositoryPermissionAllowsWrite(%q) = true", permission)
+		}
 	}
 }
 

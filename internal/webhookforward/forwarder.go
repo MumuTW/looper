@@ -13,6 +13,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/fixer"
+	"github.com/nexu-io/looper/internal/gatekeeper"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -29,8 +30,9 @@ const (
 type Lane string
 
 const (
-	LaneReviewer Lane = "reviewer"
-	LaneFixer    Lane = "fixer"
+	LaneReviewer   Lane = "reviewer"
+	LaneFixer      Lane = "fixer"
+	LaneGatekeeper Lane = "gatekeeper"
 )
 
 type DeliveryRequest struct {
@@ -106,6 +108,10 @@ type TargetedFixer interface {
 	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
 }
 
+type TargetedGatekeeper interface {
+	EvaluatePullRequest(context.Context, gatekeeper.EvaluationInput) (gatekeeper.Report, error)
+}
+
 type ConfigSource interface {
 	Snapshot() config.Config
 }
@@ -116,6 +122,7 @@ type Options struct {
 	ConfigSource       ConfigSource
 	Reviewer           TargetedReviewer
 	Fixer              TargetedFixer
+	Gatekeeper         TargetedGatekeeper
 	Logger             bootstrap.Logger
 	Now                func() time.Time
 	QueueCapacity      int
@@ -153,9 +160,10 @@ type workKey struct {
 }
 
 type workMetadata struct {
-	EventType  string
-	Action     string
-	DeliveryID string
+	EventType       string
+	Action          string
+	DeliveryID      string
+	ExpectedHeadSHA string
 }
 
 type workItem struct {
@@ -172,6 +180,7 @@ type routedDelivery struct {
 	branch     string
 	numbers    []int64
 	action     string
+	headSHA    string
 	lanes      map[Lane]struct{}
 }
 
@@ -190,6 +199,9 @@ type pullRequestEnvelope struct {
 	} `json:"repository"`
 	PullRequest struct {
 		Number int64 `json:"number"`
+		Head   struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
 	} `json:"pull_request"`
 }
 
@@ -216,6 +228,7 @@ type checkRunEnvelope struct {
 		FullName string `json:"full_name"`
 	} `json:"repository"`
 	CheckRun struct {
+		HeadSHA      string           `json:"head_sha"`
 		Conclusion   string           `json:"conclusion"`
 		PullRequests []pullRequestRef `json:"pull_requests"`
 		CheckSuite   struct {
@@ -230,6 +243,7 @@ type forwarder struct {
 	configSource       ConfigSource
 	reviewer           TargetedReviewer
 	fixer              TargetedFixer
+	gatekeeper         TargetedGatekeeper
 	logger             bootstrap.Logger
 	now                func() time.Time
 	queueCapacity      int
@@ -289,6 +303,7 @@ func New(options Options) Forwarder {
 		configSource:       options.ConfigSource,
 		reviewer:           options.Reviewer,
 		fixer:              options.Fixer,
+		gatekeeper:         options.Gatekeeper,
 		logger:             options.Logger,
 		now:                now,
 		queueCapacity:      queueCapacity,
@@ -367,7 +382,7 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	// After this section returns accepted/202, worker discovery must still run
 	// even if admission later degrades (no GitHub retry for 202). Fall back to
 	// point-in-time AllowExecute for ungated tests.
-	meta := workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID}
+	meta := workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID, ExpectedHeadSHA: routed.headSHA}
 	var result ForwardResult
 	var enqueueErr error
 	recordAcceptedLocked := func(workItems int) {
@@ -470,6 +485,9 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 			continue
 		}
 		lanes := enabledLanesForProject(cfg, project.ID, routed.lanes)
+		if f.gatekeeper == nil {
+			delete(lanes, LaneGatekeeper)
+		}
 		if len(lanes) == 0 {
 			continue
 		}
@@ -679,6 +697,23 @@ func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem)
 			return err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := item.lanes[LaneGatekeeper]; ok {
+		if f.gatekeeper == nil {
+			return fmt.Errorf("gatekeeper targeted evaluation is not configured")
+		}
+		if key.ObjectType != "pull_request" {
+			return fmt.Errorf("gatekeeper cannot evaluate object type %s", key.ObjectType)
+		}
+		if _, err := f.gatekeeper.EvaluatePullRequest(ctx, gatekeeper.EvaluationInput{
+			ProjectID: key.ProjectID, Repo: key.Repo, PRNumber: key.Number,
+			ExpectedHeadSHA: item.metadata.ExpectedHeadSHA,
+		}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -730,18 +765,23 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		switch strings.TrimSpace(envelope.Action) {
 		case "review_requested":
 			lanes[LaneReviewer] = struct{}{}
+			lanes[LaneGatekeeper] = struct{}{}
 		case "labeled", "unlabeled":
 			lanes[LaneFixer] = struct{}{}
+			lanes[LaneGatekeeper] = struct{}{}
 		case "opened", "reopened", "ready_for_review", "synchronize":
 			lanes[LaneReviewer] = struct{}{}
 			lanes[LaneFixer] = struct{}{}
+			lanes[LaneGatekeeper] = struct{}{}
+		case "converted_to_draft", "closed":
+			lanes[LaneGatekeeper] = struct{}{}
 		default:
 			return routedDelivery{}, false, nil
 		}
 		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
 			return routedDelivery{}, false, errors.New("pull_request webhook missing repository or number")
 		}
-		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: lanes}, true, nil
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), headSHA: strings.TrimSpace(envelope.PullRequest.Head.SHA), lanes: lanes}, true, nil
 	case "issue_comment":
 		var envelope issueCommentEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {
@@ -759,7 +799,16 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
 			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
 		}
-		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), headSHA: strings.TrimSpace(envelope.PullRequest.Head.SHA), lanes: map[Lane]struct{}{LaneFixer: {}, LaneGatekeeper: {}}}, true, nil
+	case "pull_request_review_thread":
+		var envelope pullRequestEnvelope
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return routedDelivery{}, false, fmt.Errorf("decode %s webhook: %w", eventType, err)
+		}
+		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
+			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
+		}
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), headSHA: strings.TrimSpace(envelope.PullRequest.Head.SHA), lanes: map[Lane]struct{}{LaneGatekeeper: {}}}, true, nil
 	case "push":
 		var envelope pushEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {
@@ -781,7 +830,7 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		if err := json.Unmarshal(payload, &envelope); err != nil {
 			return routedDelivery{}, false, fmt.Errorf("decode check_run webhook: %w", err)
 		}
-		if strings.TrimSpace(envelope.Action) != "completed" || !isFailingCheckConclusion(envelope.CheckRun.Conclusion) {
+		if strings.TrimSpace(envelope.Action) != "completed" {
 			return routedDelivery{}, false, nil
 		}
 		numbers := pullRequestNumbers(envelope.CheckRun.PullRequests)
@@ -794,7 +843,11 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		if len(numbers) == 0 {
 			return routedDelivery{}, false, nil
 		}
-		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: numbers, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+		lanes := map[Lane]struct{}{LaneGatekeeper: {}}
+		if isFailingCheckConclusion(envelope.CheckRun.Conclusion) {
+			lanes[LaneFixer] = struct{}{}
+		}
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: numbers, action: strings.TrimSpace(envelope.Action), headSHA: strings.TrimSpace(envelope.CheckRun.HeadSHA), lanes: lanes}, true, nil
 	default:
 		return routedDelivery{}, false, nil
 	}
@@ -833,6 +886,9 @@ func enabledLanesForProject(cfg config.Config, projectID string, lanes map[Lane]
 	}
 	if _, ok := lanes[LaneFixer]; ok && roles.Fixer.AutoDiscovery {
 		result[LaneFixer] = struct{}{}
+	}
+	if _, ok := lanes[LaneGatekeeper]; ok {
+		result[LaneGatekeeper] = struct{}{}
 	}
 	return result
 }

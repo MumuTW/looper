@@ -3,10 +3,27 @@ package runtime
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+const executionLivenessLeaseTTL = 30 * time.Minute
+
+type executionLivenessDisposition string
+
+const (
+	executionLivenessActive            executionLivenessDisposition = "active"
+	executionLivenessNeedsConfirmation executionLivenessDisposition = "needs_confirmation"
+)
+
+type executionLivenessAssessment struct {
+	Disposition    executionLivenessDisposition
+	Classification ContainmentClassification
+	LeaseHeartbeat string
+	LeaseExpiresAt string
+}
 
 // ContainmentClass is the startup-recovery classification of durable execution
 // evidence after a daemon restart (ADR-0015 R8 / #581).
@@ -146,6 +163,45 @@ func (r *Runtime) classifyStartupExecution(ctx context.Context, execution storag
 	}
 	matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
 	return classifyStartupProbeEvidence(pid, matches, running, err), nil
+}
+
+// assessExecutionLiveness combines the durable renewable heartbeat lease with
+// persisted process identity. Neither signal is sufficient alone: a matching
+// live process always blocks overlap, while an invalid identity is stale only
+// after its lease expires. Missing/malformed lease evidence and probe failures
+// require operator confirmation.
+func (r *Runtime) assessExecutionLiveness(ctx context.Context, execution storage.AgentExecutionRecord, now time.Time) (executionLivenessAssessment, error) {
+	classification, err := r.classifyStartupExecution(ctx, execution, nil)
+	if err != nil {
+		return executionLivenessAssessment{}, err
+	}
+	assessment := executionLivenessAssessment{
+		Disposition:    executionLivenessNeedsConfirmation,
+		Classification: classification,
+	}
+	if classification.Class == ContainmentObservedLive {
+		assessment.Disposition = executionLivenessActive
+		return assessment, nil
+	}
+	if classification.Class == ContainmentConfirmedDead {
+		return assessment, nil
+	}
+
+	heartbeat := firstNonEmpty(stringOrEmpty(execution.LastHeartbeatAt), execution.UpdatedAt, execution.StartedAt)
+	heartbeatAt, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(heartbeat))
+	if parseErr != nil {
+		return assessment, nil
+	}
+	expiresAt := heartbeatAt.UTC().Add(executionLivenessLeaseTTL)
+	assessment.LeaseHeartbeat = formatJavaScriptISOString(heartbeatAt.UTC())
+	assessment.LeaseExpiresAt = formatJavaScriptISOString(expiresAt)
+	if now.UTC().Before(expiresAt) {
+		return assessment, nil
+	}
+	// An expired lease schedules observation and operator-visible quarantine,
+	// but it is not process-containment Authority. In particular, leader exit,
+	// PID reuse, or argv drift cannot prove that background descendants drained.
+	return assessment, nil
 }
 
 // classificationAllowsTerminalOrRequeue is true only for confirmed-dead.

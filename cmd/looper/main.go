@@ -39,25 +39,43 @@ import (
 	"github.com/nexu-io/looper/internal/version"
 )
 
-const (
-	requestTimeout          = 30 * time.Second
-	projectDiscoveryTimeout = 10 * time.Minute
-)
+// requestTimeout bounds a single call. Those are one storage transaction and at
+// most one process signal, so a daemon that has not answered in 30s is wedged,
+// not busy.
+//
+// It is a var only so tests can shorten it; nothing reassigns it at runtime.
+var requestTimeout = 30 * time.Second
+
+// bulkStopRequestTimeout bounds how long an interactive client waits for the
+// summary. The daemon deliberately detaches the stop-all sweep from client
+// cancellation, so exceeding this deadline loses only the report and never
+// truncates the operation.
+//
+// It is a var only so tests can shorten it; nothing reassigns it at runtime.
+var bulkStopRequestTimeout = 10 * time.Minute
+
+// projectDiscoveryTimeout bounds only the explicit post-registration discovery
+// request. Registration itself uses requestTimeout because it commits before
+// returning; discovery may scan every open pull request and needs a larger
+// finite budget.
+var projectDiscoveryTimeout = 10 * time.Minute
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
+	parsed, err := splitGlobalFlags(args)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
 		usage(stderr)
 		return 2
 	}
-	if indexOf(args, "--version") >= 0 || args[0] == "version" {
+	if parsed.Verb == "--version" || parsed.Verb == "version" {
 		_, _ = fmt.Fprintln(stdout, version.Value)
 		return 0
 	}
-	if args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+	if parsed.Verb == "-h" || parsed.Verb == "--help" || parsed.Verb == "help" {
 		usage(stdout)
 		return 0
 	}
@@ -68,22 +86,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// `review` owns its own flag set, and the daemon's trusted review proxy
 	// composes that argv. Routing it before splitGlobalFlags is what keeps
 	// --event and --commit-id from being rejected as unknown flags.
-	if verb, ok := leadingVerb(args); ok && verb == "review" {
+	if parsed.Verb == "review" {
 		return runReview(ctx, args, stdin, stdout, stderr)
 	}
 
 	// retry owns --discard-worktree-changes / --confirm and a GET preflight.
 	// Those flags must not go through splitGlobalFlags (which rejects any
 	// non-global dash-argument) and must not collapse to a bodyless POST.
-	if verb, ok := leadingVerb(args); ok && verb == "retry" {
+	if parsed.Verb == "retry" {
 		return runRetry(ctx, args, stdout, stderr)
-	}
-
-	parsed, err := splitGlobalFlags(args)
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
-		usage(stderr)
-		return 2
 	}
 
 	// The onboarding verbs take no flags of their own — only the global ones —
@@ -125,7 +136,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	// stop-all answers HTTP 200 even when some loops only paused or failed;
 	// the old CLI exited nonzero so automation cannot treat "partial stop" as success.
-	if request.Path == "/api/v1/runs/active/stop-all" {
+	if request.Path == stopAllPath {
 		if err := stopAllPartialFailure(body); err != nil {
 			_, _ = fmt.Fprintln(stdout, strings.TrimSpace(body))
 			_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
@@ -170,7 +181,14 @@ func badUsage(format string, args ...any) error {
 type apiRequest struct {
 	Path string
 	Body []byte
+	// LongRunning selects the larger finite request budget used only for a
+	// bulk stop, whose runtime includes one kill budget per active loop.
+	LongRunning bool
 }
+
+// stopAllPath is the daemon's bulk stop route. The CLI branches on it twice —
+// for the deadline and for the partial-failure check — so it is named once.
+const stopAllPath = "/api/v1/runs/active/stop-all"
 
 // respondBody mirrors the daemon's respondLoopRequest. It is restated rather
 // than imported because internal/api is not importable from cmd, and the
@@ -206,36 +224,12 @@ type parsedArgs struct {
 	Global []string
 }
 
-// leadingVerb returns the first positional argument, skipping global flags and
-// the values they consume. It exists so a verb that parses its own flags can be
-// routed before splitGlobalFlags rejects them, and it deliberately mirrors the
-// tolerance of the trusted review proxy's own argv scan, which also allows
-// global flags to precede `review`.
-func leadingVerb(args []string) (string, bool) {
-	for index := 0; index < len(args); index++ {
-		arg := args[index]
-		if arg == "--" {
-			if index+1 < len(args) {
-				return args[index+1], true
-			}
-			return "", false
-		}
-		name, _, hasInline := strings.Cut(arg, "=")
-		if _, global := globalFlags[name]; global {
-			if !hasInline && index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
-				index++
-			}
-			continue
-		}
-		if strings.HasPrefix(arg, "-") && arg != "-" {
-			return "", false
-		}
-		return arg, true
-	}
-	return "", false
-}
-
-// splitGlobalFlags separates global flags from the verb and its operands so
+// splitGlobalFlags is the CLI's single argument-routing authority. It separates
+// global flags from the verb and operands, recognizes top-level help/version,
+// and preserves verb-owned flags for review/retry so their dedicated parsers
+// can validate them. This keeps dispatch and flag parsing from drifting apart.
+//
+// It allows
 // both `looper --config /path stop 12` and `looper stop 12 --config /path`
 // reach the same request. Routing used to run on the raw argv, which made the
 // first form an unknown command and the second an arity error — the flags were
@@ -246,7 +240,6 @@ func leadingVerb(args []string) (string, bool) {
 // because a value this one skips is a value LoadFile still reads.
 func splitGlobalFlags(args []string) (parsedArgs, error) {
 	parsed := parsedArgs{}
-	positional := make([]string, 0, len(args))
 
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
@@ -254,7 +247,12 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 		// Everything after `--` is an operand, which is how an answer or a
 		// selector that begins with a dash gets through.
 		if arg == "--" {
-			positional = append(positional, args[index+1:]...)
+			remaining := args[index+1:]
+			if parsed.Verb == "" && len(remaining) > 0 {
+				parsed.Verb = remaining[0]
+				remaining = remaining[1:]
+			}
+			parsed.Operands = append(parsed.Operands, remaining...)
 			break
 		}
 
@@ -272,18 +270,23 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 			continue
 		}
 
-		if strings.HasPrefix(arg, "-") && arg != "-" {
+		if parsed.Verb == "" && (arg == "--version" || arg == "--help" || arg == "-h") {
+			parsed.Verb = arg
+			continue
+		}
+		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" {
 			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
 		}
-
-		positional = append(positional, arg)
+		if parsed.Verb == "" {
+			parsed.Verb = arg
+		} else {
+			parsed.Operands = append(parsed.Operands, arg)
+		}
 	}
 
-	if len(positional) == 0 {
+	if parsed.Verb == "" {
 		return parsedArgs{}, fmt.Errorf("a command is required")
 	}
-	parsed.Verb = positional[0]
-	parsed.Operands = positional[1:]
 	return parsed, nil
 }
 
@@ -302,8 +305,17 @@ func routeForVerb(verb string, args []string) (apiRequest, error) {
 		// Bulk stop is its own selector on the daemon, not a selector named
 		// "all" with a /stop suffix: that path parses as a single-loop stop
 		// and dies resolving a loop literally called "all".
+		//
+		// It also gets a longer finite deadline. The daemon stops candidates one at a time and
+		// each one may spend up to the runtime's kill budget (20s, see
+		// internal/runtime defaultKillTimeout) draining a containment handle,
+		// so two unresponsive agents already outlast the 30s deadline the other
+		// verbs use. Timing out here does not merely lose the report: the
+		// daemon runs the sweep on the request context, so the CLI's deadline
+		// aborts it partway and no summary says which loops were stopped.
+		// Ctrl-C still cancels — run()'s context is signal-bound.
 		if strings.TrimSpace(args[0]) == "all" && verb == "stop" {
-			return apiRequest{Path: "/api/v1/runs/active/stop-all"}, nil
+			return apiRequest{Path: stopAllPath, LongRunning: true}, nil
 		}
 		segment, err := selectorPathSegment(args[0])
 		if err != nil {
@@ -912,7 +924,11 @@ func dialHost(host string) string {
 // post issues a control verb's request and returns the daemon's raw body, which
 // those verbs echo verbatim rather than reformat.
 func post(ctx context.Context, cfg config.Config, call apiRequest) (string, error) {
-	return doHTTP(ctx, cfg, http.MethodPost, call.Path, call.Body)
+	timeout := requestTimeout
+	if call.LongRunning {
+		timeout = bulkStopRequestTimeout
+	}
+	return doHTTPWithin(ctx, timeout, cfg, http.MethodPost, call.Path, call.Body)
 }
 
 func get(ctx context.Context, cfg config.Config, path string) (string, error) {
@@ -1134,13 +1150,4 @@ The respond answer is a single argument, so quote anything with spaces.
 Every verb except init and version talks to looperd over HTTP and needs it
 running.
 `)
-}
-
-func indexOf(args []string, target string) int {
-	for i, arg := range args {
-		if arg == target {
-			return i
-		}
-	}
-	return -1
 }

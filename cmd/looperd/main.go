@@ -156,7 +156,7 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 			return closeLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
 		StopAll: func(ctx context.Context, reason string) (any, error) {
-			return stopAllLoops(ctx, rt.Services(), reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
+			return stopAllLoopsForRequest(ctx, rt.Services(), reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
 		TakeoverLoop: func(ctx context.Context, loopID, reason string) (looperdapi.TakeoverResult, error) {
 			return takeoverLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
@@ -193,6 +193,14 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		server:          server,
 		shutdownTimeout: shutdownTimeout,
 	}, nil
+}
+
+// stopAllLoopsForRequest preserves request values but deliberately removes the
+// client's cancellation/deadline. stop-all is a daemon-owned safety operation:
+// disconnecting or timing out may lose the summary, but must not leave later
+// candidates running because the HTTP context interrupted a sequential sweep.
+func stopAllLoopsForRequest(ctx context.Context, services looperdruntime.Services, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (stopAllResponse, error) {
+	return stopAllLoops(context.WithoutCancel(ctx), services, reason, now, signal, executionMatchesProcess)
 }
 
 func runtimeConfigMetadata(rt *looperdruntime.Runtime) looperdapi.ConfigMetadata {

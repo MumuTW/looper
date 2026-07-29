@@ -1757,7 +1757,7 @@ func (r *Runner) commentHasWriteAccess(ctx context.Context, repo, cwd, author st
 	if err != nil {
 		return false, err
 	}
-	allowed := permission == "admin" || permission == "maintain" || permission == "write"
+	allowed := githubinfra.RepositoryPermissionAllowsWrite(permission)
 	cache[strings.ToLower(author)] = allowed
 	return allowed, nil
 }

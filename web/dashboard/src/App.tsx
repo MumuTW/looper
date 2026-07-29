@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { Shell } from "@/components/layout/Shell";
-import { exchangeBootstrapCodeIfPresent } from "@/lib/api";
+import { ApiError, exchangeBootstrapCodeIfPresent } from "@/lib/api";
 import { DashboardDataProvider } from "@/lib/DashboardDataContext";
 import { ProjectFilterProvider } from "@/lib/ProjectFilterContext";
 import { ToastProvider } from "@/lib/toast";
@@ -26,6 +26,24 @@ function resolveHostPort(): string {
   return hostname;
 }
 
+/**
+ * True when the daemon has no bootstrap exchange route.
+ *
+ * The route is registered only for `server.authMode: "local-token"`; under
+ * `"none"` the daemon answers 404 ROUTE_NOT_FOUND. There is nothing to recover
+ * in that case — a daemon in `none` mode wants no token, and every request the
+ * dashboard makes will succeed without one — so a stale `?code=` in the URL
+ * must not block the app behind a failure screen whose recovery step (minting a
+ * new code) 404s for exactly the same reason.
+ */
+export function isBootstrapRouteAbsent(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 404 &&
+    err.code === "ROUTE_NOT_FOUND"
+  );
+}
+
 export default function App() {
   const [bootstrapped, setBootstrapped] = useState(false);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
@@ -39,7 +57,7 @@ export default function App() {
       try {
         await exchangeBootstrapCodeIfPresent();
       } catch (err) {
-        if (!cancelled) {
+        if (!cancelled && !isBootstrapRouteAbsent(err)) {
           const message = err instanceof Error ? err.message : String(err);
           setBootstrapError(message);
         }
@@ -77,8 +95,9 @@ export default function App() {
       <div className="mx-auto flex max-w-lg flex-col gap-3 px-3 py-10">
         <h1 className="m-0 text-[16px] font-semibold">Bootstrap failed</h1>
         <p className="m-0 text-[var(--text-muted)]">
-          Could not exchange the one-shot dashboard bootstrap code for a session
-          token. This is not a daemon connectivity failure.
+          The one-shot bootstrap exchange did not complete. The details below
+          may indicate an expired code, an authentication-mode mismatch, a
+          connectivity or Origin/Host rejection, or a daemon error.
         </p>
         <pre className="m-0 overflow-auto rounded border border-[var(--border)] bg-[var(--bg-muted)] p-2 mono text-[12px] text-[var(--danger)]">
           {bootstrapError}
@@ -86,8 +105,13 @@ export default function App() {
         <div className="rounded border border-[var(--border)] bg-[var(--bg-elevated)] p-3 text-[12px]">
           <p className="m-0 mb-1 font-medium">Recovery</p>
           <ol className="m-0 list-decimal pl-4 text-[var(--text-muted)]">
+            <li>Confirm the daemon is reachable and its health endpoint responds</li>
             <li>
-              Mint a fresh one-shot code with your{" "}
+              If the daemon uses{" "}
+              <code className="mono text-[var(--text)]">
+                server.authMode = &quot;local-token&quot;
+              </code>
+              , mint a fresh one-shot code with your{" "}
               <code className="mono text-[var(--text)]">server.localToken</code>
               :{" "}
               <code className="mono text-[var(--text)]">
@@ -98,7 +122,10 @@ export default function App() {
                 /dashboard/?code=…
               </code>
             </li>
-            <li>Ensure the previous code was not already used or expired</li>
+            <li>
+              A code is single-use and short-lived; a reused or expired one
+              fails here
+            </li>
           </ol>
         </div>
       </div>

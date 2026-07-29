@@ -7325,6 +7325,9 @@ func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) te
 		t.Fatalf("MkdirAll(%s) error = %v", homeDir, err)
 	}
 	t.Setenv("HOME", homeDir)
+	// TestMain pins a binary-wide LOOPER_HOME; give each fixture its own so
+	// default-derived paths stay isolated per test.
+	t.Setenv("LOOPER_HOME", filepath.Join(homeDir, ".looper"))
 	cfg, err := config.DefaultConfig(rootDir)
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)

@@ -460,6 +460,16 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	return scanEventLogs(rows)
 }
 
+func (r *EventsRepository) ListByProjectAndEntityType(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE project_id = ? AND entity_type = ? ORDER BY created_at ASC, id ASC`, projectID, entityType)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by project and entity type: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 type ProjectsRepository struct{ q sqliteQuerier }
 
 func (r *ProjectsRepository) Upsert(ctx context.Context, record ProjectRecord) error {

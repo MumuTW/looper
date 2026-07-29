@@ -131,6 +131,7 @@ func TestSplitGlobalFlagsFeedsConfigLoading(t *testing.T) {
 			// No config file, so the flags are the only thing that can move the
 			// address off the built-in default.
 			t.Setenv("HOME", t.TempDir())
+			t.Setenv("LOOPER_HOME", "")
 			parsed, err := splitGlobalFlags(args)
 			if err != nil {
 				t.Fatalf("splitGlobalFlags() error = %v", err)
