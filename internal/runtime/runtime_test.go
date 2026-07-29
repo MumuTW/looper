@@ -2678,7 +2678,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 		ambiguousPID := int64(5453)
 		deadPID := int64(5454)
 
-		rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
+		rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, RunSchedulerTick: func(context.Context, Services) error { return nil }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
 			switch pid {
 			case int(ambiguousPID):
 				return "python unrelated.py", nil

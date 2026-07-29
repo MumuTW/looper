@@ -623,6 +623,15 @@ func runStatus(ctx context.Context, global []string, operands []string, stdout i
 	}
 	_, _ = fmt.Fprintf(stdout, "daemon:   %s (reachable, %s)\n", endpoint, daemonState)
 
+	// /api/v1/status carries ops readiness (review publish + quarantine debt).
+	// healthz stays liveness-only; failure here is non-fatal so onboarding still
+	// reports projects when an older daemon lacks the newer status fields.
+	if status, statusErr := requestJSON[daemonStatusResponse](ctx, cfg, http.MethodGet, "/api/v1/status", nil); statusErr != nil {
+		_, _ = fmt.Fprintf(stdout, "ops:      status unavailable: %v\n", singleLine(statusErr.Error()))
+	} else {
+		writeStatusOpsLines(stdout, status)
+	}
+
 	projects, projectsErr := requestJSON[projectsListResponse](ctx, cfg, http.MethodGet, "/api/v1/projects", nil)
 	if projectsErr != nil {
 		_, _ = fmt.Fprintf(stdout, "projects: unavailable: %v\n", singleLine(projectsErr.Error()))
@@ -837,6 +846,85 @@ func describeProject(project projectResponse) string {
 
 type healthResponse struct {
 	Healthy bool `json:"healthy"`
+}
+
+// daemonStatusResponse is the subset of GET /api/v1/status that `looper status`
+// prints for ops readiness. Unknown fields are ignored.
+type daemonStatusResponse struct {
+	Service statusServiceView `json:"service"`
+	Tools   statusToolsView   `json:"tools"`
+}
+
+type statusServiceView struct {
+	DegradedReasons []string           `json:"degradedReasons"`
+	Recovery        statusRecoveryView `json:"recovery"`
+}
+
+type statusRecoveryView struct {
+	Outstanding statusOutstandingView `json:"outstanding"`
+}
+
+type statusOutstandingView struct {
+	QuarantinedActiveExecutions int `json:"quarantinedActiveExecutions"`
+	QuarantinedRunningRuns      int `json:"quarantinedRunningRuns"`
+}
+
+type statusToolsView struct {
+	LooperPath    string                   `json:"looperPath"`
+	ReviewPublish *statusReviewPublishView `json:"reviewPublish"`
+}
+
+type statusReviewPublishView struct {
+	Known              bool   `json:"known"`
+	Capable            bool   `json:"capable"`
+	Capability         string `json:"capability"`
+	PublishingDisabled bool   `json:"publishingDisabled"`
+	Reason             string `json:"reason"`
+}
+
+func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
+	review := status.Tools.ReviewPublish
+	if review != nil {
+		switch {
+		case !review.Known:
+			reason := strings.TrimSpace(review.Reason)
+			if reason == "" {
+				reason = "capability has not been probed yet"
+			}
+			path := strings.TrimSpace(status.Tools.LooperPath)
+			if path != "" {
+				_, _ = fmt.Fprintf(stdout, "review:   publish readiness unknown (%s; looperPath=%s)\n", singleLine(reason), path)
+			} else {
+				_, _ = fmt.Fprintf(stdout, "review:   publish readiness unknown (%s)\n", singleLine(reason))
+			}
+		case review.PublishingDisabled:
+			reason := strings.TrimSpace(review.Reason)
+			if reason == "" {
+				reason = "capability probe failed"
+			}
+			path := strings.TrimSpace(status.Tools.LooperPath)
+			if path != "" {
+				_, _ = fmt.Fprintf(stdout, "review:   publishing disabled (%s; looperPath=%s)\n", singleLine(reason), path)
+			} else {
+				_, _ = fmt.Fprintf(stdout, "review:   publishing disabled (%s)\n", singleLine(reason))
+			}
+		case review.Capable:
+			token := strings.TrimSpace(review.Capability)
+			if token == "" {
+				token = "ok"
+			}
+			_, _ = fmt.Fprintf(stdout, "review:   publish ready (%s)\n", token)
+		}
+	}
+
+	outstanding := status.Service.Recovery.Outstanding
+	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {
+		_, _ = fmt.Fprintf(stdout, "orphans:  quarantinedActiveExecutions=%d quarantinedRunningRuns=%d\n",
+			outstanding.QuarantinedActiveExecutions, outstanding.QuarantinedRunningRuns)
+	}
+	if len(status.Service.DegradedReasons) > 0 {
+		_, _ = fmt.Fprintf(stdout, "degraded: %s\n", strings.Join(status.Service.DegradedReasons, ", "))
+	}
 }
 
 type projectResponse struct {

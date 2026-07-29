@@ -2924,7 +2924,7 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 	}
 	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
 		ID:          newRuntimeEventID(),
-		EventType:   "looperd.recovery.execution_quarantined",
+		EventType:   recoveryExecutionQuarantinedEventType,
 		ProjectID:   execution.ProjectID,
 		LoopID:      execution.LoopID,
 		RunID:       execution.RunID,
