@@ -6277,7 +6277,7 @@ func TestServerServesStatusEndpoint(t *testing.T) {
 		RecoverySummary: func() any {
 			return map[string]any{"expiredLocksReleased": 1}
 		},
-	}))
+	}), nil)
 	if err := server.Start(); err != nil {
 		t.Fatalf("Server.Start() error = %v", err)
 	}

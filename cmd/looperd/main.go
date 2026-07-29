@@ -166,7 +166,7 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		},
 	})
 	root := looperdapi.NewRootHandler(apiHandler, dashboard.Handler())
-	server := looperdapi.NewServer(deps.Config, root)
+	server := looperdapi.NewServer(deps.Config, root, deps.Logger)
 	if err := server.Start(); err != nil {
 		if deps.Logger != nil {
 			deps.Logger.Warn("looperd recovery aborted because instance did not acquire ownership", map[string]any{"error": err.Error()})
