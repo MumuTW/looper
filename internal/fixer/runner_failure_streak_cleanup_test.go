@@ -138,6 +138,9 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	if err != nil || persistedLoop == nil || persistedLoop.Status != "queued" {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want queued loop", persistedLoop, err)
 	}
+	if persistedLoop.UpdatedAt <= paused.UpdatedAt {
+		t.Fatalf("handoff revision = %q, want after breaker pause %q", persistedLoop.UpdatedAt, paused.UpdatedAt)
+	}
 	loopMeta := parseJSONObject(persistedLoop.MetadataJSON)
 	if _, ok := loopMeta["pendingFixerRediscovery"]; ok {
 		t.Fatalf("pending rediscovery survived threshold handoff: %#v", loopMeta)
