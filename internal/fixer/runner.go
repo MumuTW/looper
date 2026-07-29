@@ -554,22 +554,23 @@ type Options struct {
 	// ContainmentTracker registers validation shell handles with the Execution
 	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
 	// when the runner is not daemon-owned.
-	ContainmentTracker      processcontainment.LiveTracker
-	AllowAutoCommit         bool
-	AllowAutoPush           bool
-	AllowRiskyFixes         bool
-	FixAllPullRequests      bool
-	DiscoveryPolicy         DiscoveryPolicy
-	Disclosure              *config.DisclosureConfig
-	AgentRuntime            string
-	AgentProfileID          string
-	CustomInstructions      *config.Config
-	AgentModel              *string
-	Sleep                   func(time.Duration)
-	RetryBaseDelay          time.Duration
-	RetryMaxAttempts        int64
-	OnAgentExecutionStarted AgentExecutionStartedFunc
-	OnQueueItemEnqueued     func()
+	ContainmentTracker          processcontainment.LiveTracker
+	AllowAutoCommit             bool
+	AllowAutoPush               bool
+	AllowRiskyFixes             bool
+	FixAllPullRequests          bool
+	DiscoveryPolicy             DiscoveryPolicy
+	Disclosure                  *config.DisclosureConfig
+	AgentRuntime                string
+	AgentProfileID              string
+	CustomInstructions          *config.Config
+	AgentModel                  *string
+	Sleep                       func(time.Duration)
+	RetryBaseDelay              time.Duration
+	RetryMaxAttempts            int64
+	MaxConsecutiveFixerFailures int
+	OnAgentExecutionStarted     AgentExecutionStartedFunc
+	OnQueueItemEnqueued         func()
 }
 
 type DiscoveryPolicy struct {
@@ -581,36 +582,37 @@ type DiscoveryPolicy struct {
 }
 
 type Runner struct {
-	db                      *sql.DB
-	repos                   *storage.Repositories
-	github                  GitHubGateway
-	git                     GitGateway
-	agentExecutor           AgentExecutor
-	logger                  bootstrap.Logger
-	now                     func() time.Time
-	agentTimeout            time.Duration
-	agentIdleTimeout        time.Duration
-	claimTTL                time.Duration
-	validationCommands      []string
-	validationCodexCommand  string
-	validationRunner        ValidationRunner
-	containmentTracker      processcontainment.LiveTracker
-	allowAutoCommit         bool
-	allowAutoPush           bool
-	allowRiskyFixes         bool
-	fixAllPullRequests      bool
-	discoveryPolicy         DiscoveryPolicy
-	disclosure              config.DisclosureConfig
-	agentRuntime            string
-	agentProfileID          string
-	customInstructions      config.Config
-	projectRoleConfig       *config.Config
-	agentModel              *string
-	sleep                   func(time.Duration)
-	retryBaseDelay          time.Duration
-	retryMaxAttempts        int64
-	onAgentExecutionStarted AgentExecutionStartedFunc
-	onQueueItemEnqueued     func()
+	db                          *sql.DB
+	repos                       *storage.Repositories
+	github                      GitHubGateway
+	git                         GitGateway
+	agentExecutor               AgentExecutor
+	logger                      bootstrap.Logger
+	now                         func() time.Time
+	agentTimeout                time.Duration
+	agentIdleTimeout            time.Duration
+	claimTTL                    time.Duration
+	validationCommands          []string
+	validationCodexCommand      string
+	validationRunner            ValidationRunner
+	containmentTracker          processcontainment.LiveTracker
+	allowAutoCommit             bool
+	allowAutoPush               bool
+	allowRiskyFixes             bool
+	fixAllPullRequests          bool
+	discoveryPolicy             DiscoveryPolicy
+	disclosure                  config.DisclosureConfig
+	agentRuntime                string
+	agentProfileID              string
+	customInstructions          config.Config
+	projectRoleConfig           *config.Config
+	agentModel                  *string
+	sleep                       func(time.Duration)
+	retryBaseDelay              time.Duration
+	retryMaxAttempts            int64
+	consecutiveFailureThreshold int
+	onAgentExecutionStarted     AgentExecutionStartedFunc
+	onQueueItemEnqueued         func()
 }
 
 type DiscoveryInput struct {
@@ -1008,12 +1010,13 @@ const (
 	zeroProgressPauseReason               = "agent_zero_progress"
 	labelMismatchPauseReason              = "fixer_label_mismatch"
 	failureStreakPauseReason              = "agent_failure_streak"
-	// maxConsecutiveFixerFailures caps how many runs in a row may fail at the
-	// same step against the same fix-items state before the loop is parked. The queue-item
-	// retry layer alone could not stop the incident where a fixer loop retried
-	// 52+ times in 5 hours: every push minted a new queue item (the dedupe key
-	// contains the head SHA), so attempts kept resetting while the agent kept
-	// failing on the same unresolved feedback.
+	// maxConsecutiveFixerFailures is the default for how many runs in a row may
+	// fail at the same step against the same head/fix-items state before the
+	// loop is parked. The queue-item retry layer alone could not stop the
+	// incident where a fixer loop retried 52+ times in 5 hours: every push
+	// minted a new queue item (the dedupe key contains the head SHA), so
+	// attempts kept resetting while the agent kept failing on the same
+	// unresolved feedback.
 	maxConsecutiveFixerFailures = 3
 )
 
@@ -1308,6 +1311,10 @@ func New(options Options) *Runner {
 	if retryMax == 0 {
 		retryMax = defaultRetryMax
 	}
+	consecutiveFailureThreshold := options.MaxConsecutiveFixerFailures
+	if consecutiveFailureThreshold <= 0 {
+		consecutiveFailureThreshold = maxConsecutiveFixerFailures
+	}
 	sleep := options.Sleep
 	if sleep == nil {
 		sleep = time.Sleep
@@ -1324,36 +1331,37 @@ func New(options Options) *Runner {
 		}
 	}
 	return &Runner{
-		db:                      options.DB,
-		repos:                   options.Repos,
-		github:                  options.GitHub,
-		git:                     options.Git,
-		agentExecutor:           options.AgentExecutor,
-		logger:                  options.Logger,
-		now:                     now,
-		agentTimeout:            agentTimeout,
-		agentIdleTimeout:        agentIdleTimeout,
-		claimTTL:                claimTTL,
-		validationCommands:      append([]string(nil), options.ValidationCommands...),
-		validationCodexCommand:  strings.TrimSpace(options.ValidationCodexCommand),
-		validationRunner:        options.ValidationRunner,
-		containmentTracker:      options.ContainmentTracker,
-		allowAutoCommit:         options.AllowAutoCommit,
-		allowAutoPush:           options.AllowAutoPush,
-		allowRiskyFixes:         options.AllowRiskyFixes,
-		fixAllPullRequests:      options.FixAllPullRequests,
-		discoveryPolicy:         policy,
-		disclosure:              disclosureCfg,
-		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
-		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
-		customInstructions:      customInstructionConfig(options.CustomInstructions),
-		projectRoleConfig:       options.CustomInstructions,
-		agentModel:              cloneStringPtr(options.AgentModel),
-		sleep:                   sleep,
-		retryBaseDelay:          retryBaseDelay,
-		retryMaxAttempts:        retryMax,
-		onAgentExecutionStarted: options.OnAgentExecutionStarted,
-		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
+		db:                          options.DB,
+		repos:                       options.Repos,
+		github:                      options.GitHub,
+		git:                         options.Git,
+		agentExecutor:               options.AgentExecutor,
+		logger:                      options.Logger,
+		now:                         now,
+		agentTimeout:                agentTimeout,
+		agentIdleTimeout:            agentIdleTimeout,
+		claimTTL:                    claimTTL,
+		validationCommands:          append([]string(nil), options.ValidationCommands...),
+		validationCodexCommand:      strings.TrimSpace(options.ValidationCodexCommand),
+		validationRunner:            options.ValidationRunner,
+		containmentTracker:          options.ContainmentTracker,
+		allowAutoCommit:             options.AllowAutoCommit,
+		allowAutoPush:               options.AllowAutoPush,
+		allowRiskyFixes:             options.AllowRiskyFixes,
+		fixAllPullRequests:          options.FixAllPullRequests,
+		discoveryPolicy:             policy,
+		disclosure:                  disclosureCfg,
+		agentRuntime:                strings.TrimSpace(options.AgentRuntime),
+		agentProfileID:              strings.TrimSpace(options.AgentProfileID),
+		customInstructions:          customInstructionConfig(options.CustomInstructions),
+		projectRoleConfig:           options.CustomInstructions,
+		agentModel:                  cloneStringPtr(options.AgentModel),
+		sleep:                       sleep,
+		retryBaseDelay:              retryBaseDelay,
+		retryMaxAttempts:            retryMax,
+		consecutiveFailureThreshold: consecutiveFailureThreshold,
+		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
+		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
 	}
 }
 
@@ -1882,7 +1890,8 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	var activeErr *activeRunError
 	var runFailure *claimedRunFailureError
 	var failedQueue *storage.QueueItemRecord
-	breakerTripped := false
+	var breakerLoop *storage.LoopRecord
+	breakerStreak := 0
 	var failErr error
 	if errors.As(err, &activeErr) {
 		failedQueue, failErr = r.requeueQueueItem(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts)
@@ -1892,7 +1901,8 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			return nil, loopErr
 		}
 		if loop != nil {
-			failedQueue, breakerTripped, failErr = r.failQueueItemWithBreaker(ctx, *loop, queueItem, runFailure.runID, runFailure.checkpoint, runFailure.step, failure)
+			breakerLoop = loop
+			failedQueue, breakerStreak, failErr = r.failQueueItemWithBreaker(ctx, *loop, queueItem, runFailure.runID, runFailure.checkpoint, runFailure.step, failure)
 		} else {
 			failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
 		}
@@ -1918,6 +1928,15 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue); err != nil {
 		return nil, err
 	}
+	if breakerStreak > 0 && breakerLoop != nil && runFailure != nil {
+		durableLoop, loopErr := r.repos.Loops.GetByID(ctx, breakerLoop.ID)
+		if loopErr != nil {
+			return nil, loopErr
+		}
+		if durableLoop != nil {
+			r.appendFailureStreakPausedEvent(ctx, *durableLoop, runFailure.runID, runFailure.checkpoint, breakerStreak)
+		}
+	}
 	recoveredRunTerminal := runFailure != nil && failedQueue != nil && failedQueue.Status == "manual_intervention"
 	if queueItem.LoopID != nil && queueItem.Repo != nil && queueItem.PRNumber != nil && (queueResultIsTerminalForCleanup(failedQueue) || recoveredRunTerminal) {
 		loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
@@ -1931,7 +1950,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 					return nil, projectErr
 				}
 				if project != nil {
-					if breakerTripped {
+					if breakerStreak > 0 {
 						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &runFailure.checkpoint)
 						if resumeErr != nil {
 							return nil, resumeErr
@@ -1993,6 +2012,26 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
+	}
+	// The loop record is the execution authority. A queue row can become
+	// visible while a resume handoff is still persisting its metadata and loop
+	// status, so a claimed row must not bypass a durable pause. Requeue it
+	// without spending an attempt; the completed handoff will wake the
+	// scheduler after changing the loop to queued.
+	if loop.Status == "paused" {
+		availableAt := eventlog.FormatJavaScriptISOString(r.now().Add(r.retryBaseDelay).UTC())
+		message := "fixer loop remains paused while resume handoff is incomplete"
+		if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{
+			ID:           queueItem.ID,
+			AvailableAt:  availableAt,
+			Attempts:     queueItem.Attempts,
+			ErrorMessage: &message,
+			ErrorKind:    string(FailureRetryableAfterResume),
+			UpdatedAt:    r.nowISO(),
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "queued"}, nil
 	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
@@ -2075,11 +2114,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 			return ProcessResult{}, err
 		}
-		failedQueue, breakerTripped, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, resumedRun.StartStep, failure)
+		failedQueue, breakerStreak, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, resumedRun.StartStep, failure)
 		if err != nil {
 			return ProcessResult{}, err
 		}
-		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		pausedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 			updated.LastRunAt = stringPtr(r.nowISO())
 			if failedQueue != nil && failedQueue.Status == "queued" {
 				updated.Status = "queued"
@@ -2089,10 +2128,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 				updated.NextRunAt = nil
 			}
-		}); err != nil {
+		})
+		if err != nil {
 			return ProcessResult{}, err
 		}
-		if breakerTripped {
+		if breakerStreak > 0 {
+			r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
 			if _, err := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &latest); err != nil {
 				return ProcessResult{}, err
 			}
@@ -2209,14 +2250,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "failureKind": string(failure.kind), "currentStep": derefString(run.CurrentStep)}})
 			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.message, "failureKind": string(failure.kind)}})
 			r.logError("fixer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "failureKind": string(failure.kind), "summary": failure.message})
-			// Consecutive-failure circuit breaker: once the same step/fix-items
-			// state has failed maxConsecutiveFixerFailures runs in a row, stop
+			// Consecutive-failure circuit breaker: once the same step/head/fix-items
+			// state has failed r.consecutiveFailureThreshold runs in a row, stop
 			// requeueing and park the loop until discovery sees new feedback.
-			failedQueue, breakerTripped, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
+			failedQueue, breakerStreak, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
 			if err != nil {
 				return ProcessResult{}, err
 			}
-			if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			pausedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
 				if failedQueue != nil && failedQueue.Status == "queued" {
 					updated.Status = "queued"
@@ -2226,10 +2267,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 					updated.NextRunAt = nil
 				}
-			}); err != nil {
+			})
+			if err != nil {
 				return ProcessResult{}, err
 			}
-			if breakerTripped {
+			if breakerStreak > 0 {
+				r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
 				if _, err := r.finishFailureStreakBreaker(ctx, *project, *loop, queueItem, &latest); err != nil {
 					return ProcessResult{}, err
 				}
@@ -5246,11 +5289,9 @@ func (r *Runner) resumePausedZeroProgressLoop(ctx context.Context, loop storage.
 }
 
 // resumePausedFailureStreakLoop unparks a loop stopped by the consecutive-
-// failure circuit breaker. Only new feedback — a changed fix-items state
-// (new unresolved threads, different failing checks) — justifies another
-// run; the same state would simply fail again, which is the retry storm the
-// breaker exists to prevent. Unlike the zero-progress breaker a head-SHA
-// change alone does not resume: a push does not fix broken agent behaviour.
+// failure circuit breaker. A new head SHA or a changed fix-items state is new
+// evidence and resets the streak; the same state would simply fail again,
+// which is the retry storm the breaker exists to prevent.
 func (r *Runner) resumePausedFailureStreakLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string) (bool, storage.LoopRecord, error) {
 	if loop.Status != "paused" {
 		return false, loop, nil
@@ -5264,11 +5305,12 @@ func (r *Runner) resumePausedFailureStreakLoop(ctx context.Context, loop storage
 	if !ok {
 		return false, loop, nil
 	}
+	headSHA = strings.TrimSpace(headSHA)
 	currentStateHash := strings.TrimSpace(fixItemsStateHash)
 	// A legacy/manual queue may not carry discovery-time state. Unknown state
 	// is fail-closed: only explicit operator retry may reset it, because treating
 	// the first later discovery as new feedback would reopen the retry storm.
-	if state.FixItemsStateHash == "" || currentStateHash == "" || state.FixItemsStateHash == currentStateHash {
+	if (state.LastHeadSHA == "" || headSHA == "" || state.LastHeadSHA == headSHA) && (state.FixItemsStateHash == "" || currentStateHash == "" || state.FixItemsStateHash == currentStateHash) {
 		return false, loop, nil
 	}
 	// The changed discovery state authorizes a fresh attempt, not continuation
@@ -5606,6 +5648,10 @@ type enqueueInput struct {
 }
 
 func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
+	return r.enqueueWithWake(ctx, input, true)
+}
+
+func (r *Runner) enqueueWithWake(ctx context.Context, input enqueueInput, wake bool) (storage.QueueItemRecord, error) {
 	dedupeKey := buildFixerDedupeKey(input.ProjectID, input.LoopID, input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash)
 	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
 	if err != nil {
@@ -5625,7 +5671,9 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				return storage.QueueItemRecord{}, err
 			}
 			updated = persisted
-			r.wakeSchedulerAfterEnqueue()
+			if wake {
+				r.wakeSchedulerAfterEnqueue()
+			}
 			return updated, nil
 		}
 		return *existing, nil
@@ -5664,7 +5712,9 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				return storage.QueueItemRecord{}, err
 			}
 			updated = persisted
-			r.wakeSchedulerAfterEnqueue()
+			if wake {
+				r.wakeSchedulerAfterEnqueue()
+			}
 			return updated, nil
 		}
 		return *activeForLoop, nil
@@ -5679,7 +5729,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
-	if created {
+	if created && wake {
 		r.wakeSchedulerAfterEnqueue()
 	}
 	return persisted, nil
@@ -5722,7 +5772,7 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 		return false, err
 	}
 	availableAt := r.now()
-	queued, err := r.enqueue(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt})
+	queued, err := r.enqueueWithWake(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt}, false)
 	if err != nil {
 		return false, err
 	}
@@ -5746,6 +5796,7 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 	if err != nil {
 		return false, err
 	}
+	r.wakeSchedulerAfterEnqueue()
 	return true, nil
 }
 
@@ -5754,24 +5805,32 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 	return r.requeueOrFailQueueItem(ctx, queueItem, kind, message, nextAttempts)
 }
 
-func (r *Runner) failQueueItemWithBreaker(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep, failure *loopError) (*storage.QueueItemRecord, bool, error) {
+func (r *Runner) failQueueItemWithBreaker(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep, failure *loopError) (*storage.QueueItemRecord, int, error) {
 	streak, streakLoop, err := r.recordFixerFailureStreak(ctx, loop, queueItem, runID, checkpoint, step)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
-	if streak < maxConsecutiveFixerFailures {
+	if streak < r.consecutiveFailureThreshold {
 		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
-		return failedQueue, false, err
+		return failedQueue, 0, err
 	}
+	r.logError("fixer consecutive-failure circuit breaker tripped", map[string]any{"projectId": loop.ProjectID, "loopId": loop.ID, "runId": runID, "queueItemId": queueItem.ID, "consecutiveCount": streak, "headSha": detailHeadSHA(checkpoint.Detail), "fixItemsStateHash": hashFixItemsState(checkpoint.FixItems), "pauseReason": failureStreakPauseReason})
 	// Persist the loop-side pause intent before terminalizing the queue row. If
 	// either write fails, recovery can still observe an active queue item or the
 	// durable terminal row and reconcile the loop; it cannot be stranded as
 	// running with only an inactive queue item.
 	if _, err := r.mergeLoopMetadata(ctx, streakLoop, map[string]any{"pauseReason": failureStreakPauseReason}); err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
 	failedQueue, err := r.failQueueItemTerminal(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts+1)
-	return failedQueue, true, err
+	return failedQueue, streak, err
+}
+
+func (r *Runner) appendFailureStreakPausedEvent(ctx context.Context, loop storage.LoopRecord, runID string, checkpoint fixerCheckpoint, streak int) {
+	if loop.Status != "paused" {
+		return
+	}
+	r.appendEvent(ctx, eventInput{eventType: "loop.paused", projectID: loop.ProjectID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"pauseReason": failureStreakPauseReason, "consecutiveCount": streak, "headSha": detailHeadSHA(checkpoint.Detail), "fixItemsStateHash": hashFixItemsState(checkpoint.FixItems)}})
 }
 
 func (r *Runner) requeueQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, attempts int64) (*storage.QueueItemRecord, error) {
@@ -6435,11 +6494,10 @@ func (r *Runner) recordZeroProgressSuccess(ctx context.Context, loop storage.Loo
 }
 
 // recordFixerFailureStreak counts consecutive failed runs at the same step
-// against the same fix-items state and persists the streak in loop metadata.
-// Head SHA is diagnostic only: a push changes it and creates a fresh queue
-// item, which is exactly how the retry-storm incident (52+ attempts in 5
-// hours) escaped the queue attempt budget. New feedback or a different
-// failing step starts a fresh streak.
+// against the same head/fix-items state and persists the streak in loop
+// metadata. A push changes the head SHA and is treated as new evidence, so
+// the streak resets when the head SHA, the failing step, or the fix-items
+// state changes.
 func (r *Runner) recordFixerFailureStreak(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep) (int, storage.LoopRecord, error) {
 	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
 		current, err := r.repos.Loops.GetByID(ctx, loop.ID)
@@ -6467,7 +6525,7 @@ func (r *Runner) recordFixerFailureStreak(ctx context.Context, loop storage.Loop
 	if current.LastRunID != "" && previous.LastRunID == current.LastRunID {
 		return previous.ConsecutiveCount, loop, nil
 	}
-	if previous.FixItemsStateHash == current.FixItemsStateHash && previous.Step == current.Step {
+	if previous.FixItemsStateHash == current.FixItemsStateHash && previous.Step == current.Step && previous.LastHeadSHA == current.LastHeadSHA {
 		current.ConsecutiveCount = previous.ConsecutiveCount + 1
 	}
 	updatedLoop, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerFailureStreak": current})

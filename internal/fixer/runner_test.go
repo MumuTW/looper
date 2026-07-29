@@ -88,6 +88,24 @@ func TestNewPreservesInfiniteRetryMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestNewDefaultsMaxConsecutiveFixerFailures(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{})
+	if runner.consecutiveFailureThreshold != maxConsecutiveFixerFailures {
+		t.Fatalf("consecutiveFailureThreshold = %d, want %d", runner.consecutiveFailureThreshold, maxConsecutiveFixerFailures)
+	}
+}
+
+func TestNewPreservesCustomMaxConsecutiveFixerFailures(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{MaxConsecutiveFixerFailures: 7})
+	if runner.consecutiveFailureThreshold != 7 {
+		t.Fatalf("consecutiveFailureThreshold = %d, want 7", runner.consecutiveFailureThreshold)
+	}
+}
+
 func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 	t.Parallel()
 
@@ -6921,6 +6939,67 @@ func TestProcessClaimedItemPausesAfterConsecutiveFailureStreak(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemPausesAfterCustomConsecutiveFailureThreshold(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	view := PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+		viewResponses: []PullRequestDetail{view, view, view, view, view, view, view, view},
+	}
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{
+		{Status: "failed", Summary: "upstream server_error"},
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, RetryMaxAttempts: -1, MaxConsecutiveFixerFailures: 1, Logger: fixture.logger, Now: fixture.now, Sleep: func(time.Duration) {}})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable failed result", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), result.QueueItemID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want terminal manual_intervention", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused", loop)
+	}
+	if got, _ := stringFromAny(parseJSONObject(loop.MetadataJSON)["pauseReason"]); got != failureStreakPauseReason {
+		t.Fatalf("pauseReason = %q, want %q", got, failureStreakPauseReason)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "loop", loop.ID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundPaused := false
+	for _, event := range events {
+		foundPaused = foundPaused || event.EventType == "loop.paused"
+	}
+	if !foundPaused {
+		t.Fatalf("events = %#v, want loop.paused after the loop pause is durable", events)
+	}
+}
+
 func TestProcessClaimedItemClearsFailureStreakOnSuccess(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -6985,6 +7064,36 @@ func TestProcessClaimedItemClearsFailureStreakOnSuccess(t *testing.T) {
 	}
 }
 
+func TestRecordFixerFailureStreakResetsCountWhenHeadChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(83)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_failure_streak_head_reset", Seq: 97, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	baseItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-1"}}
+	checkpoints := []fixerCheckpoint{
+		{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: baseItems},
+		{Detail: &checkpointDetail{HeadSHA: "head-2"}, FixItems: baseItems},
+	}
+	for i, checkpoint := range checkpoints {
+		streak, _, err := runner.recordFixerFailureStreak(context.Background(), loop, storage.QueueItemRecord{}, fmt.Sprintf("run-head-reset-%d", i), checkpoint, stepRepair)
+		if err != nil {
+			t.Fatalf("recordFixerFailureStreak() error = %v", err)
+		}
+		// A new head SHA resets the streak, so each run with a different head is
+		// the first failure for that head.
+		if streak != 1 {
+			t.Fatalf("recordFixerFailureStreak() streak = %d on run %d, want 1", streak, i+1)
+		}
+	}
+}
+
 func TestRecordFixerFailureStreakResetsCountWhenFixItemStateChanges(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -7000,10 +7109,6 @@ func TestRecordFixerFailureStreakResetsCountWhenFixItemStateChanges(t *testing.T
 	baseItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-1"}}
 	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: baseItems}
 	for i := 0; i < 2; i++ {
-		// A push changes the PR head and queue-item dedupe key, but it must not
-		// reset the loop-level streak while the feedback and failing step stay
-		// unchanged.
-		checkpoint.Detail.HeadSHA = fmt.Sprintf("head-%d", i+1)
 		streak, _, err := runner.recordFixerFailureStreak(context.Background(), loop, storage.QueueItemRecord{}, fmt.Sprintf("run-state-reset-%d", i), checkpoint, stepRepair)
 		if err != nil {
 			t.Fatalf("recordFixerFailureStreak() error = %v", err)
@@ -7020,8 +7125,8 @@ func TestRecordFixerFailureStreakResetsCountWhenFixItemStateChanges(t *testing.T
 		t.Fatalf("recordFixerFailureStreak() streak = %d, want 1 after step change", streak)
 	}
 
-	// A genuinely new set of failing items starts a fresh streak; note the
-	// head SHA is unchanged on purpose — only the fix-items state matters.
+	// A genuinely new set of failing items starts a fresh streak; the head SHA
+	// is unchanged so only the fix-items state is being exercised.
 	changedItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-2"}}
 	changedCheckpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: changedItems}
 	streak, _, err = runner.recordFixerFailureStreak(context.Background(), loop, storage.QueueItemRecord{}, "run-state-reset-feedback", changedCheckpoint, stepValidate)
@@ -7048,7 +7153,55 @@ func TestRecordFixerFailureStreakResetsCountWhenFixItemStateChanges(t *testing.T
 	}
 }
 
-func TestEnsureLoopForPullRequestResumesFailureStreakLoopOnlyOnStateChange(t *testing.T) {
+func TestEnsureLoopForPullRequestResumesFailureStreakLoopOnHeadChange(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(84)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	baseItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-1"}}
+	baseStateHash := hashFixItemsState(baseItems)
+	metadata := mustMarshalJSON(map[string]any{
+		"pauseReason": failureStreakPauseReason,
+		"fixerFailureStreak": failureStreakState{
+			LastHeadSHA:       "head-1",
+			FixItemsStateHash: baseStateHash,
+			Step:              string(stepRepair),
+			ConsecutiveCount:  maxConsecutiveFixerFailures,
+			RecordedAt:        fixture.nowISO(),
+		},
+	})
+	loop := storage.LoopRecord{ID: "loop_failure_streak_resume_head", Seq: 98, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	project := storage.ProjectRecord{ID: "project_1"}
+
+	resumed, err := runner.ensureLoopForPullRequest(context.Background(), project, repo, prNumber, "head-2", "fix-hash-1", baseStateHash, baseItems, []string{"t1"})
+	if err != nil {
+		t.Fatalf("ensureLoopForPullRequest(head) error = %v", err)
+	}
+	if resumed.record.Status != "queued" {
+		t.Fatalf("ensureLoopForPullRequest(head) status = %q, want queued", resumed.record.Status)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "queued" {
+		t.Fatalf("loop after head change = %#v, want queued", persisted)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := meta["fixerFailureStreak"]; ok {
+		t.Fatalf("fixerFailureStreak still present after resume: %#v", meta)
+	}
+	if _, ok := meta["pauseReason"]; ok {
+		t.Fatalf("pauseReason still present after resume: %#v", meta)
+	}
+}
+
+func TestEnsureLoopForPullRequestResumesFailureStreakLoopOnStateChange(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"

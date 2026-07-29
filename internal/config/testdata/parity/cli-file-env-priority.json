@@ -93,6 +93,7 @@
         "pollIntervalSeconds": 30,
         "maxConcurrentRuns": 3,
         "retryMaxAttempts": -1,
+        "consecutiveFailureThreshold": 3,
         "retryBaseDelayMs": 5000,
         "slowLaneWarnThresholdMs": 5000,
         "discoveryCacheTtlSeconds": 30
