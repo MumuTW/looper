@@ -19,6 +19,7 @@ func TestBuildFixerPromptUsesForgejoSeedAndFetchContract(t *testing.T) {
 		HeadSHA:     "abc123",
 		BaseRefName: "main",
 		HeadRefName: "feature/fix",
+		Author:      "forge-author",
 		IssueComments: []map[string]any{{
 			"url": "https://code.forgejo.example/acme/looper/pulls/42#issuecomment-202",
 		}},
@@ -26,8 +27,11 @@ func TestBuildFixerPromptUsesForgejoSeedAndFetchContract(t *testing.T) {
 	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", URL: "https://code.forgejo.example/acme/looper/pulls/42/files#diff-1"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"\"url\": \"https://code.forgejo.example/acme/looper/pulls/42\"",
+		"\"pr_author\": \"forge-author\"",
 		"Agent-side Forgejo fetch contract",
 		"GET /api/v1/repos/{owner}/{repo}/pulls/{number}",
+		"user.login",
+		"seeded `pr_author`",
 		"GET /api/v1/repos/{owner}/{repo}/pulls/{number}.diff",
 		"GET /api/v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/comments",
 	} {

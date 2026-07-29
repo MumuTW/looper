@@ -90,7 +90,7 @@ func TestNewPreservesInfiniteRetryMaxAttempts(t *testing.T) {
 func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 	t.Parallel()
 
-	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix", Author: "octocat"}
 	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", ThreadID: "thread-1", Summary: "repair disclosure"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"Minimal PR seed",
@@ -99,9 +99,12 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 		"\"base_ref\": \"main\"",
 		"\"head_ref\": \"feature/fix\"",
 		"\"head_sha\": \"abc123\"",
+		"\"pr_author\": \"octocat\"",
 		"\"task_intent\": \"repair_pull_request_feedback\"",
 		"\"fix_item_ids\"",
-		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels",
+		"gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels,author",
+		"author.login",
+		"seeded `pr_author`",
 		"gh pr diff <pr-url> -R <repo> --name-only",
 		"gh pr diff <pr-url> -R <repo> --patch",
 		"gh pr checks <pr-url> -R <repo>",
@@ -147,7 +150,7 @@ func TestBuildFixerPromptDefinesReviewerAuthorityOrder(t *testing.T) {
 		"including when authorFilter is any or a manual run targets another user's PR",
 		"Treat only reviewer-authored listed comment fix items and reviewer-authored review-thread comments as reviewer suggestions—never the top content-authority tier, even when the reviewer is human.",
 		"Do not classify check or conflict fix items as reviewer suggestions; they are objective branch blockers that still require repair and must not be disregarded as lower-authority feedback.",
-		"Author-authored design clarifications inside review threads count as PR design intent, not reviewer suggestions.",
+		"Author-authored design clarifications inside review threads count as PR design intent, not reviewer suggestions—before applying that distinction, use the PR author login from the seeded `pr_author` or the live fetch (`author.login` / Forgejo `user.login`); comment APIs alone identify only each comment's author and are not enough.",
 		"Do not invent unstated \"stable norms\".",
 		"Do not blindly obey reviewers when they conflict with higher content authority.",
 		"Looper lifecycle, safety, disclosure, and output contracts always outrank these content-authority tiers",
@@ -420,6 +423,53 @@ func TestBuildFixerMinimalPRSeedUsesEnterpriseHost(t *testing.T) {
 	seed := buildFixerMinimalPRSeed("ghe.example.com/acme/looper", 42, &checkpointDetail{}, nil)
 	if !strings.Contains(seed, "\"url\": \"https://ghe.example.com/acme/looper/pull/42\"") {
 		t.Fatalf("seed = %q, want enterprise host PR URL", seed)
+	}
+}
+
+func TestPullRequestCheckpointDetailPreservesPRAuthor(t *testing.T) {
+	t.Parallel()
+
+	detail := PullRequestDetail{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "abc123",
+		HeadRefName: "feature/fix",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Author:      "  octocat  ",
+	}
+	checkpoint := pullRequestCheckpointDetail(detail)
+	if checkpoint == nil || checkpoint.Author != "octocat" {
+		t.Fatalf("checkpoint.Author = %q, want %q", checkpoint.Author, "octocat")
+	}
+	seed := buildFixerMinimalPRSeed("acme/looper", 42, checkpoint, nil)
+	if !strings.Contains(seed, "\"pr_author\": \"octocat\"") {
+		t.Fatalf("seed missing pr_author:\n%s", seed)
+	}
+}
+
+func TestMergeCheckpointDetailPreservesAuthorWhenLiveOmitsIt(t *testing.T) {
+	t.Parallel()
+
+	existing := &checkpointDetail{State: "OPEN", HeadSHA: "old-head", Author: "octocat", Labels: []string{"looper:fix"}}
+	live := PullRequestDetail{State: "OPEN", HeadSHA: "new-head", Labels: []string{"other"}}
+	merged := mergeCheckpointDetailPreservingLabels(existing, live)
+	if merged.Author != "octocat" {
+		t.Fatalf("merged.Author = %q, want preserved %q", merged.Author, "octocat")
+	}
+	if merged.HeadSHA != "new-head" {
+		t.Fatalf("merged.HeadSHA = %q, want live head", merged.HeadSHA)
+	}
+	// Labels still come from existing (preservingLabels contract).
+	if len(merged.Labels) != 1 || merged.Labels[0] != "looper:fix" {
+		t.Fatalf("merged.Labels = %#v, want existing labels preserved", merged.Labels)
+	}
+
+	// Live author wins when present.
+	live.Author = "new-author"
+	merged = mergeCheckpointDetailPreservingLabels(existing, live)
+	if merged.Author != "new-author" {
+		t.Fatalf("merged.Author = %q, want live author", merged.Author)
 	}
 }
 
