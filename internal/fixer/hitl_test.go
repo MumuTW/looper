@@ -109,6 +109,11 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	if !ok || ask.Status != "awaiting" || ask.SessionID != sessionID {
 		t.Fatalf("parked ask = %#v, found=%v", ask, ok)
 	}
+	for _, option := range ask.Options {
+		if option == "Provide different guidance" {
+			t.Fatalf("parked ask includes directly submitted custom-guidance placeholder: %#v", ask.Options)
+		}
+	}
 	persistedQueue, _ := fixture.repos.Queue.GetByID(ctx, queue.ID)
 	persistedRun, _ := fixture.repos.Runs.GetByID(ctx, run1.ID)
 	if persistedQueue.Status != "cancelled" || persistedRun.Status != "interrupted" {
@@ -171,6 +176,20 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	}
 	if len(github.dismissedReviews) != 1 {
 		t.Fatalf("dismissed reviews = %d, want replayed attempt", len(github.dismissedReviews))
+	}
+}
+
+func TestFixerHITLPromptIsLimitedToNonNativeReviewThreads(t *testing.T) {
+	t.Parallel()
+	native := []FixItem{{Type: "comment", ID: "native-1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101}}
+	if instruction := fixerHITLPromptFor(native); instruction != "" {
+		t.Fatalf("native-only HITL instruction = %q, want empty", instruction)
+	}
+	regular := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
+	instruction := fixerHITLPromptFor(regular)
+	if !strings.Contains(instruction, "only to non-native comment fix items") ||
+		!strings.Contains(instruction, "Never use \"needs_human\" in Forgejo repair_results") {
+		t.Fatalf("regular HITL instruction missing source boundary: %q", instruction)
 	}
 }
 

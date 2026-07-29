@@ -120,16 +120,18 @@ function HITLDecisionCard({
     <Card title="Human decision required">
       <p className="mt-0 whitespace-pre-wrap text-[13px]">{ask.question}</p>
       <div className="mb-3 flex flex-wrap gap-2">
-        {ask.options?.map((option) => (
-          <Button
-            key={option}
-            size="sm"
-            disabled={submitting}
-            onClick={() => void submit(option)}
-          >
-            {option}
-          </Button>
-        ))}
+        {ask.options
+          ?.filter((option) => option !== "Provide different guidance")
+          .map((option) => (
+            <Button
+              key={option}
+              size="sm"
+              disabled={submitting}
+              onClick={() => void submit(option)}
+            >
+              {option}
+            </Button>
+          ))}
       </div>
       <form
         className="flex gap-2"

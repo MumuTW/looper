@@ -11,9 +11,19 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-const fixerHITLPromptInstruction = `HUMAN-IN-THE-LOOP: Decide implementation details yourself. Use "needs_human" only when a listed review request creates a genuine conflict with repository rules or the pull request's documented intent, depends on private product intent, or requires a high-stakes sign-off. Do not use it for reversible implementation choices.
+const fixerHITLInstruction = `HUMAN-IN-THE-LOOP: This mechanism applies only to non-native comment fix items represented in review_thread_replies. Decide implementation details yourself. Use "needs_human" only when one of those review requests creates a genuine conflict with repository rules or the pull request's documented intent, depends on private product intent, or requires a high-stakes sign-off. Do not use it for reversible implementation choices. Never use "needs_human" in Forgejo repair_results; follow that contract's fixed, declined, or deferred actions.
 
 When human direction is truly required, set that fix item's review_thread_replies action to "needs_human", put the concrete conflict and decision needed in "explanation", and STOP. Do not push, dismiss reviews, post replies, resolve threads, or otherwise mutate remote state. Looper will pause and resume you after an operator answers through its existing control plane.`
+
+func fixerHITLPromptFor(fixItems []FixItem) string {
+	for _, item := range fixItems {
+		if item.Type == "comment" && item.Source != NativeReviewCommentSource &&
+			strings.TrimSpace(item.ID) != "" && strings.TrimSpace(item.ThreadID) != "" {
+			return fixerHITLInstruction
+		}
+	}
+	return ""
+}
 
 type awaitingHumanError struct {
 	question    string
@@ -47,7 +57,6 @@ func humanDecisionFromReplies(replies []replyExplanationEntry, executionID, vend
 		options: []string{
 			"Keep the repository rules and documented PR intent",
 			"Follow the reviewer request",
-			"Provide different guidance",
 		},
 		executionID: executionID,
 		vendor:      strings.TrimSpace(vendor),

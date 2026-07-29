@@ -2968,7 +2968,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	continuingHITL := nativeResumePrompt != ""
 	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush && !r.hitlEnabled && !continuingHITL, r.disclosure, agentVendor, derefString(agentModel))
 	if r.hitlEnabled {
-		prompt += "\n\n" + fixerHITLPromptInstruction
+		if instruction := fixerHITLPromptFor(checkpoint.FixItems); instruction != "" {
+			prompt += "\n\n" + instruction
+		}
 	}
 	if continuingHITL {
 		prompt += "\n\n" + nativeResumePrompt
