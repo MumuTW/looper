@@ -6030,9 +6030,11 @@ func TestProcessClaimedItemUsesDefaultProjectWorktreeRootWhenProjectMetadataOmit
 	}
 }
 
-func TestRunValidationUsesShellCommandsByDefault(t *testing.T) {
+func TestRunValidationUsesInjectedRunner(t *testing.T) {
 	t.Parallel()
-	runner := New(Options{})
+	runner := New(Options{ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: true, Summary: "Validation passed", Output: "hello\nwarn"}, nil
+	}})
 	result, err := runner.runValidation(context.Background(), ValidationInput{
 		CWD:      t.TempDir(),
 		Commands: []string{"printf 'hello'", "printf 'warn' >&2"},
@@ -6053,7 +6055,9 @@ func TestRunValidationUsesShellCommandsByDefault(t *testing.T) {
 
 func TestRunValidationReturnsCommandFailureOutput(t *testing.T) {
 	t.Parallel()
-	runner := New(Options{})
+	runner := New(Options{ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: false, Summary: "Validation failed: printf 'bad' >&2; exit 9", Output: "bad"}, nil
+	}})
 	result, err := runner.runValidation(context.Background(), ValidationInput{
 		CWD:      t.TempDir(),
 		Commands: []string{"printf 'bad' >&2; exit 9"},

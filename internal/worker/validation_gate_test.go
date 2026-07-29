@@ -14,7 +14,9 @@ import (
 func TestRunValidationRunsConfiguredCommands(t *testing.T) {
 	t.Parallel()
 
-	runner := New(Options{ValidationCommands: []string{"exit 0"}})
+	runner := New(Options{ValidationCommands: []string{"exit 0"}, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+	}})
 	result, err := runner.runValidation(context.Background(), ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
 	if err != nil {
 		t.Fatalf("runValidation() error = %v", err)
@@ -27,7 +29,9 @@ func TestRunValidationRunsConfiguredCommands(t *testing.T) {
 func TestRunValidationBlocksOnNonZeroExit(t *testing.T) {
 	t.Parallel()
 
-	runner := New(Options{ValidationCommands: []string{"exit 0", "exit 3"}})
+	runner := New(Options{ValidationCommands: []string{"exit 0", "exit 3"}, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: false, Summary: "Validation failed: exit 3"}, nil
+	}})
 	result, err := runner.runValidation(context.Background(), ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
 	if err != nil {
 		t.Fatalf("runValidation() error = %v", err)
@@ -63,7 +67,9 @@ func TestRunValidationWithoutCommandsIsANoOpPass(t *testing.T) {
 func TestRunValidationDoesNotInheritDaemonSecrets(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "daemon-secret")
 
-	runner := New(Options{ValidationCommands: []string{`test -z "$OPENAI_API_KEY"`}})
+	runner := New(Options{ValidationCommands: []string{`test -z "$OPENAI_API_KEY"`}, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+	}})
 	result, err := runner.runValidation(context.Background(), ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
 	if err != nil {
 		t.Fatalf("runValidation() error = %v", err)
@@ -76,7 +82,9 @@ func TestRunValidationDoesNotInheritDaemonSecrets(t *testing.T) {
 func TestRunValidationPreservesCancellation(t *testing.T) {
 	t.Parallel()
 
-	runner := New(Options{AgentTimeout: time.Second, ValidationCommands: []string{"sleep 5"}})
+	runner := New(Options{AgentTimeout: time.Second, ValidationCommands: []string{"sleep 5"}, ValidationRunner: func(ctx context.Context, _ ValidationInput) (ValidationResult, error) {
+		return ValidationResult{}, ctx.Err()
+	}})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := runner.runValidation(ctx, ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
@@ -88,7 +96,9 @@ func TestRunValidationPreservesCancellation(t *testing.T) {
 func TestRunValidationBoundsCommandRuntime(t *testing.T) {
 	t.Parallel()
 
-	runner := New(Options{AgentTimeout: 20 * time.Millisecond, ValidationCommands: []string{"sleep 5"}})
+	runner := New(Options{AgentTimeout: 20 * time.Millisecond, ValidationCommands: []string{"sleep 5"}, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: false, Summary: "Validation timed out: sleep 5", Output: "Command timed out"}, nil
+	}})
 	result, err := runner.runValidation(context.Background(), ValidationInput{CWD: t.TempDir(), Commands: runner.validationCommands})
 	if err != nil {
 		t.Fatalf("runValidation() error = %v", err)
