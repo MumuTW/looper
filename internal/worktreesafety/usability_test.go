@@ -49,6 +49,25 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		t.Fatalf("WriteFile usable .git: %v", err)
 	}
 
+	// Linked private gitdir whose HEAD is a regular file but not valid Git HEAD
+	// syntax. Presence-only checks preserve it even though Git rejects it.
+	malformedHeadLinked := t.TempDir()
+	malformedHeadGitdir := filepath.Join(t.TempDir(), "malformed-head-gitdir")
+	malformedHeadCommon := filepath.Join(t.TempDir(), "malformed-head-common")
+	if err := os.MkdirAll(malformedHeadGitdir, 0o755); err != nil {
+		t.Fatalf("MkdirAll malformedHeadGitdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(malformedHeadGitdir, "HEAD"), []byte("not-a-valid-head\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformedHeadGitdir HEAD: %v", err)
+	}
+	writeMinimalGitRepoMetadata(t, malformedHeadCommon)
+	if err := os.WriteFile(filepath.Join(malformedHeadGitdir, "commondir"), []byte(malformedHeadCommon+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformedHeadGitdir commondir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(malformedHeadLinked, ".git"), []byte("gitdir: "+malformedHeadGitdir+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformedHeadLinked .git: %v", err)
+	}
+
 	// Linked gitfile to an existing but empty/corrupt private gitdir (no HEAD).
 	// Real git reports "not a git repository"; probe must treat as unusable.
 	corruptLinked := t.TempDir()
@@ -143,6 +162,13 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 	usableDir := t.TempDir()
 	writeMinimalGitRepoMetadata(t, filepath.Join(usableDir, ".git"))
 
+	// Ordinary checkout with a regular but malformed HEAD must also recreate.
+	malformedHeadDir := t.TempDir()
+	writeMinimalGitRepoMetadata(t, filepath.Join(malformedHeadDir, ".git"))
+	if err := os.WriteFile(filepath.Join(malformedHeadDir, ".git", "HEAD"), []byte("not-a-valid-head\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformedHeadDir HEAD: %v", err)
+	}
+
 	// Ordinary checkout with only HEAD (missing objects/refs) is unusable.
 	headOnlyDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(headOnlyDir, ".git"), 0o755); err != nil {
@@ -182,6 +208,7 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		// Same remote/helper wording must NOT force cleanup when local checkout is valid.
 		{name: "not_a_git_repository_usable_gitfile", path: usable, prepErr: remoteIntegrityText, want: false},
 		{name: "not_a_git_repository_usable_gitdir", path: usableDir, prepErr: remoteIntegrityText, want: false},
+		{name: "not_a_git_repository_linked_gitdir_malformed_head", path: malformedHeadLinked, prepErr: remoteIntegrityText, want: true},
 		{name: "not_a_working_tree_usable", path: usable, prepErr: fmt.Errorf("fatal: %s is not a working tree", usable), want: false},
 		// Existing but empty/corrupt linked gitdir must recreate (not preserve forever).
 		{name: "not_a_git_repository_corrupt_linked_gitdir", path: corruptLinked, prepErr: remoteIntegrityText, want: true},
@@ -193,6 +220,7 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		// Ordinary checkout with only HEAD (no objects/refs) must recreate.
 		{name: "not_a_git_repository_head_only_gitdir", path: headOnlyDir, prepErr: remoteIntegrityText, want: true},
 		{name: "not_a_git_repository_gitdir_head_is_directory", path: directoryHeadDir, prepErr: remoteIntegrityText, want: true},
+		{name: "not_a_git_repository_gitdir_malformed_head", path: malformedHeadDir, prepErr: remoteIntegrityText, want: true},
 		// Malformed gitfile + Git's distinct error must recreate (not retry forever).
 		{name: "invalid_gitfile_format_malformed", path: malformedGitfile, prepErr: invalidGitfileText, want: true},
 		// Usable checkout must not be force-cleaned even if error text mentions gitfile.

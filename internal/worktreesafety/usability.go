@@ -111,11 +111,11 @@ func LocalFixerWorktreeCheckoutUsable(path string) bool {
 	if !filepath.IsAbs(gitdir) {
 		gitdir = filepath.Join(path, gitdir)
 	}
-	// Linked private gitdir must look like a real git dir (HEAD), not merely exist.
-	// An empty/corrupt gitdir still makes `git` report "not a git repository"; if
-	// we only checked existence, prepare would retry forever without recreating.
-	privateHead, err := os.Stat(filepath.Join(gitdir, "HEAD"))
-	if err != nil || !privateHead.Mode().IsRegular() {
+	// Linked private gitdir must have a syntactically valid HEAD, not merely a
+	// regular file. An empty/corrupt HEAD still makes `git` report "not a git
+	// repository"; if we only checked presence, prepare would retry forever
+	// without recreating.
+	if !localGitHEADUsable(gitdir) {
 		return false
 	}
 	// commondir is required for linked worktrees: without it (or when it does not
@@ -133,8 +133,7 @@ func LocalGitRepositoryMetadataUsable(dir string) bool {
 	if dir == "" {
 		return false
 	}
-	head, err := os.Stat(filepath.Join(dir, "HEAD"))
-	if err != nil || !head.Mode().IsRegular() {
+	if !localGitHEADUsable(dir) {
 		return false
 	}
 	objects, err := os.Stat(filepath.Join(dir, "objects"))
@@ -144,6 +143,56 @@ func LocalGitRepositoryMetadataUsable(dir string) bool {
 	refs, err := os.Stat(filepath.Join(dir, "refs"))
 	if err != nil || !refs.IsDir() {
 		return false
+	}
+	return true
+}
+
+// localGitHEADUsable validates the local HEAD encoding without contacting Git
+// or any remote. HEAD is either a symbolic ref with Git's "ref: " prefix or a
+// detached 40/64-hex object ID. A merely non-empty HEAD is not sufficient:
+// values such as "not-a-valid-head" make Git reject the checkout as invalid.
+func localGitHEADUsable(dir string) bool {
+	headPath := filepath.Join(dir, "HEAD")
+	head, err := os.Stat(headPath)
+	if err != nil || !head.Mode().IsRegular() {
+		return false
+	}
+	data, err := os.ReadFile(headPath)
+	if err != nil {
+		return false
+	}
+	value := strings.TrimSpace(string(data))
+	if strings.HasPrefix(value, "ref: ") {
+		return localGitRefNameUsable(strings.TrimSpace(strings.TrimPrefix(value, "ref: ")))
+	}
+	return localGitObjectIDUsable(value)
+}
+
+func localGitRefNameUsable(ref string) bool {
+	if !strings.HasPrefix(ref, "refs/") || strings.HasSuffix(ref, ".") || strings.Contains(ref, "..") || strings.Contains(ref, "//") || strings.Contains(ref, "@{") {
+		return false
+	}
+	for _, segment := range strings.Split(ref, "/") {
+		if segment == "" || strings.HasPrefix(segment, ".") {
+			return false
+		}
+	}
+	for _, runeValue := range ref {
+		if runeValue <= ' ' || runeValue == 0x7f || strings.ContainsRune("~^:?*[\\\\", runeValue) {
+			return false
+		}
+	}
+	return true
+}
+
+func localGitObjectIDUsable(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, runeValue := range value {
+		if !((runeValue >= '0' && runeValue <= '9') || (runeValue >= 'a' && runeValue <= 'f') || (runeValue >= 'A' && runeValue <= 'F')) {
+			return false
+		}
 	}
 	return true
 }
