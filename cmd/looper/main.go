@@ -61,7 +61,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
-	if indexOf(args, "--version") >= 0 || args[0] == "version" {
+	if versionRequested(args) || args[0] == "version" {
 		_, _ = fmt.Fprintln(stdout, version.Value)
 		return 0
 	}
@@ -1100,11 +1100,29 @@ running.
 `)
 }
 
-func indexOf(args []string, target string) int {
-	for i, arg := range args {
-		if arg == target {
-			return i
+// versionRequested reports whether --version was asked for, which is only
+// meaningful before the verb.
+//
+// Scanning the whole command line instead made every operand a version request:
+// `looper respond 12 --version` printed the version and never answered the loop,
+// and so did an answer whose text happens to be "--version". Global flags and
+// the values they consume are skipped so `looper --config c.toml --version`
+// still works; from the first positional (the verb) or `--` onward, the
+// argument belongs to the verb.
+func versionRequested(args []string) bool {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if arg == "--" {
+			return false
 		}
+		name, _, hasInline := strings.Cut(arg, "=")
+		if _, global := globalFlags[name]; global {
+			if !hasInline && index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
+				index++
+			}
+			continue
+		}
+		return arg == "--version"
 	}
-	return -1
+	return false
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/version"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
@@ -318,6 +319,115 @@ func TestRetryReachesTheDaemonRoutes(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "Unknown route") {
 		t.Fatalf("retry hit an unknown route: %s", stderr.String())
+	}
+}
+
+// serveContract exposes the fixture's real handler over HTTP and records what
+// the CLI sent, so a test can assert on the request the daemon actually
+// received rather than on one the test invented.
+func serveContract(t *testing.T, fixture *contractFixture) (configPath string, seen func() map[string]string) {
+	t.Helper()
+
+	var mu sync.Mutex
+	bodies := map[string]string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(payload))
+
+		mu.Lock()
+		bodies[r.Method+" "+r.URL.Path] = string(payload)
+		mu.Unlock()
+
+		recorder := httptest.NewRecorder()
+		fixture.handler.ServeHTTP(recorder, r)
+		for key, values := range recorder.Header() {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(recorder.Code)
+		_, _ = w.Write(recorder.Body.Bytes())
+	}))
+	t.Cleanup(server.Close)
+
+	configPath = writeContractConfig(t, server.URL)
+	t.Setenv("HOME", t.TempDir())
+	return configPath, func() map[string]string {
+		mu.Lock()
+		defer mu.Unlock()
+		out := map[string]string{}
+		for key, value := range bodies {
+			out[key] = value
+		}
+		return out
+	}
+}
+
+// TestVersionFlagDoesNotSwallowOperands pins the half of --version handling a
+// unit test on the parser cannot see: the operand still reaches the daemon.
+//
+// The check used to scan the whole command line, so an answer of "--version"
+// printed the version and the loop was never answered — a silent no-op rather
+// than an error the operator could act on. `--` is how the CLI already
+// documents passing a dash-leading answer, and it is what the old scan ignored.
+func TestVersionFlagDoesNotSwallowOperands(t *testing.T) {
+	fixture := newContractFixture(t)
+	configPath, seen := serveContract(t, fixture)
+
+	stdout := &bytes.Buffer{}
+	run([]string{"--config", configPath, "respond", "12", "--", "--version"}, strings.NewReader(""), stdout, io.Discard)
+
+	body, ok := seen()["POST /api/v1/loops/12/respond"]
+	if !ok {
+		t.Fatalf("respond never reached the daemon; saw %v (stdout %q)", seen(), stdout.String())
+	}
+	var answer respondBody
+	if err := json.Unmarshal([]byte(body), &answer); err != nil {
+		t.Fatalf("decode respond body %q: %v", body, err)
+	}
+	if answer.Answer != "--version" {
+		t.Fatalf("answer = %q, want %q", answer.Answer, "--version")
+	}
+	if strings.Contains(stdout.String(), version.Value) {
+		t.Fatalf("stdout printed the version instead of routing: %q", stdout.String())
+	}
+}
+
+// TestVersionFlagAfterAVerbIsRefused covers the unquoted spelling. It cannot
+// route — --version is not a flag any verb takes — but the failure an operator
+// needs is "unknown flag", not a version string printed while the loop stays
+// unanswered.
+func TestVersionFlagAfterAVerbIsRefused(t *testing.T) {
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	code := run([]string{"respond", "12", "--version"}, strings.NewReader(""), stdout, stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (stdout %q)", code, stdout.String())
+	}
+	if strings.Contains(stdout.String(), version.Value) {
+		t.Fatalf("stdout printed the version for an operand-position flag: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown flag") {
+		t.Fatalf("stderr = %q, want an unknown-flag error", stderr.String())
+	}
+}
+
+// TestVersionFlagStillWorksBeforeTheVerb is the other side of that fix: nothing
+// but a global flag may precede --version, and a global flag must not break it.
+func TestVersionFlagStillWorksBeforeTheVerb(t *testing.T) {
+	for _, args := range [][]string{
+		{"--version"},
+		{"--config", "/nonexistent.toml", "--version"},
+		{"--config=/nonexistent.toml", "--version"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			stdout := &bytes.Buffer{}
+			if code := run(args, strings.NewReader(""), stdout, io.Discard); code != 0 {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			if strings.TrimSpace(stdout.String()) != version.Value {
+				t.Fatalf("stdout = %q, want %q", stdout.String(), version.Value)
+			}
+		})
 	}
 }
 
