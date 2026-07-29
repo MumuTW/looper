@@ -161,7 +161,7 @@ func (s *Service) TransitionStatus(ctx context.Context, loopID string, input Tra
 
 		updated := *loop
 		updated.Status = string(input.Status)
-		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		updated.UpdatedAt = nextLoopUpdatedAt(now, loop.UpdatedAt)
 		if input.NextRunAt != nil {
 			nextRunAt := eventlog.FormatJavaScriptISOString(*input.NextRunAt)
 			updated.NextRunAt = &nextRunAt
@@ -209,7 +209,7 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 		updated := *loop
 		updated.Status = string(domain.LoopStatusPaused)
 		updated.NextRunAt = nil
-		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		updated.UpdatedAt = nextLoopUpdatedAt(now, loop.UpdatedAt)
 		if err := repos.Loops.Upsert(ctx, updated); err != nil {
 			return PauseResult{}, err
 		}
@@ -248,7 +248,7 @@ func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) 
 		updated := *loop
 		updated.Status = string(domain.LoopStatusTerminated)
 		updated.NextRunAt = nil
-		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		updated.UpdatedAt = nextLoopUpdatedAt(now, loop.UpdatedAt)
 		if err := repos.Loops.Upsert(ctx, updated); err != nil {
 			return TerminateResult{}, err
 		}
@@ -274,6 +274,19 @@ func (s *Service) currentTime() time.Time {
 		return time.Now().UTC()
 	}
 	return s.Now().UTC()
+}
+
+// nextLoopUpdatedAt keeps the existing JavaScript-ISO timestamp representation
+// while making it a strictly monotonic loop revision. SQLite callers sort this
+// field lexically, and fixed-width UTC millisecond timestamps preserve that
+// ordering. In particular, a repeated Pause in the same clock millisecond must
+// invalidate a runner's earlier compare-and-swap observation.
+func nextLoopUpdatedAt(now time.Time, previous string) string {
+	candidate := now.UTC().Truncate(time.Millisecond)
+	if parsed, err := time.Parse(time.RFC3339Nano, previous); err == nil && !candidate.After(parsed) {
+		candidate = parsed.UTC().Add(time.Millisecond)
+	}
+	return eventlog.FormatJavaScriptISOString(candidate)
 }
 
 func loopSummaryFromRecord(record storage.LoopRecord) (domain.LoopSummary, error) {
