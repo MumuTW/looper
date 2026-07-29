@@ -81,6 +81,8 @@ describe("bootstrap code exchange", () => {
       await screen.findByRole("heading", { name: "Bootstrap failed" }),
     ).toBeTruthy();
     expect(screen.getByText(/Invalid bootstrap code/)).toBeTruthy();
+		expect(screen.getByText(/may indicate an expired code/)).toBeTruthy();
+		expect(screen.queryByText(/It answered, so/)).toBeNull();
   });
 
   it("stores the session token when the exchange succeeds", async () => {

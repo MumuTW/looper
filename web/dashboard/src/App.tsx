@@ -95,13 +95,9 @@ export default function App() {
       <div className="mx-auto flex max-w-lg flex-col gap-3 px-3 py-10">
         <h1 className="m-0 text-[16px] font-semibold">Bootstrap failed</h1>
         <p className="m-0 text-[var(--text-muted)]">
-          The daemon rejected the one-shot code in this URL. It answered, so
-          this is not a connectivity failure, and it serves the bootstrap route,
-          so it runs with{" "}
-          <code className="mono text-[var(--text)]">
-            server.authMode = &quot;local-token&quot;
-          </code>{" "}
-          and needs a session token before the dashboard can read anything.
+          The one-shot bootstrap exchange did not complete. The details below
+          may indicate an expired code, an authentication-mode mismatch, a
+          connectivity or Origin/Host rejection, or a daemon error.
         </p>
         <pre className="m-0 overflow-auto rounded border border-[var(--border)] bg-[var(--bg-muted)] p-2 mono text-[12px] text-[var(--danger)]">
           {bootstrapError}
@@ -109,8 +105,13 @@ export default function App() {
         <div className="rounded border border-[var(--border)] bg-[var(--bg-elevated)] p-3 text-[12px]">
           <p className="m-0 mb-1 font-medium">Recovery</p>
           <ol className="m-0 list-decimal pl-4 text-[var(--text-muted)]">
+            <li>Confirm the daemon is reachable and its health endpoint responds</li>
             <li>
-              Mint a fresh one-shot code with your{" "}
+              If the daemon uses{" "}
+              <code className="mono text-[var(--text)]">
+                server.authMode = &quot;local-token&quot;
+              </code>
+              , mint a fresh one-shot code with your{" "}
               <code className="mono text-[var(--text)]">server.localToken</code>
               :{" "}
               <code className="mono text-[var(--text)]">
