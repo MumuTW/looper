@@ -95,11 +95,11 @@ func routeForVerb(verb string, args []string) (string, error) {
 			return "/api/v1/runs/active/stop-all", nil
 		}
 		return "/api/v1/runs/active/" + args[0] + "/" + verb, nil
-	case "takeover":
+	case "takeover", "retry", "start", "pause", "handback":
 		if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-			return "", fmt.Errorf("takeover requires exactly one loop id")
+			return "", fmt.Errorf("%s requires exactly one loop id", verb)
 		}
-		return "/api/v1/loops/" + args[0] + "/takeover", nil
+		return "/api/v1/loops/" + args[0] + "/" + verb, nil
 	default:
 		return "", fmt.Errorf("unknown command %q", verb)
 	}
@@ -180,6 +180,10 @@ Usage:
   looper stop <selector>       Stop the active run for a loop ("all" stops every run)
   looper close <selector>      Stop the active run and close the loop
   looper takeover <loop-id>    Take a loop over for manual work
+  looper handback <loop-id>    Hand a taken-over loop back to the daemon
+  looper retry <loop-id>       Requeue a paused or parked loop
+  looper start <loop-id>       Start a loop now
+  looper pause <loop-id>       Pause a loop
   looper version               Print the looper version
 
 Selectors are resolved by the daemon; a loop id or a pull request URL both work.

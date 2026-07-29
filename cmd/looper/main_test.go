@@ -56,6 +56,30 @@ func TestRouteForVerb(t *testing.T) {
 			wantPath: "/api/v1/loops/loop-1/takeover",
 		},
 		{
+			name:     "handback targets the loop",
+			verb:     "handback",
+			args:     []string{"loop-1"},
+			wantPath: "/api/v1/loops/loop-1/handback",
+		},
+		{
+			name:     "retry targets the loop",
+			verb:     "retry",
+			args:     []string{"loop-1"},
+			wantPath: "/api/v1/loops/loop-1/retry",
+		},
+		{
+			name:     "start targets the loop",
+			verb:     "start",
+			args:     []string{"loop-1"},
+			wantPath: "/api/v1/loops/loop-1/start",
+		},
+		{
+			name:     "pause targets the loop",
+			verb:     "pause",
+			args:     []string{"loop-1"},
+			wantPath: "/api/v1/loops/loop-1/pause",
+		},
+		{
 			name:    "stop rejects a missing selector",
 			verb:    "stop",
 			args:    nil,
@@ -66,6 +90,12 @@ func TestRouteForVerb(t *testing.T) {
 			verb:    "close",
 			args:    []string{"a", "b"},
 			wantErr: "close requires exactly one selector",
+		},
+		{
+			name:    "pause names itself in its arity error",
+			verb:    "pause",
+			args:    []string{},
+			wantErr: "pause requires exactly one loop id",
 		},
 		{
 			name:    "takeover rejects a whitespace-only loop id",
