@@ -26,7 +26,7 @@ const (
 	planeMaxWorkItemPages     = 1000
 	// planeUserAgent overrides Go's default net/http User-Agent, which Cloudflare's
 	// WAF in front of Plane blocks outright. Every request MUST set a custom UA.
-	planeUserAgent = "looper-forge/1.0 (+https://github.com/nexu-io/looper)"
+	planeUserAgent = "looper-forge/1.0 (+https://github.com/mumutw/looper)"
 )
 
 // PlaneClient is a task-source provider backed by a Plane project. It reads

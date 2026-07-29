@@ -3117,6 +3117,22 @@ func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueI
 	return failedQueue != nil && failedQueue.Status != "queued" && failedQueue.Status != "cancelled"
 }
 
+// shouldRetryQueueFailure applies the two-tier retry rule from #508.
+//
+// With an infinite bound (scheduler.retryMaxAttempts = -1, the default)
+// nothing else ever stops a retry, so non_retryable is the only brake and is
+// honoured strictly. With a positive bound the cap is already the brake, so
+// the kind is deliberately ignored and even a non_retryable failure gets its
+// attempts: the classifications feeding this are heuristics over agent output,
+// and a wrong one should not park a loop permanently when the bound would have
+// ended it anyway.
+//
+// The asymmetry looks like an oversight and is not. Reintroducing the kind
+// check in the bounded branch breaks TestShouldRetryQueueFailureRespectsMaxAttempts
+// here and in the fixer, reviewer and planner copies. The leading guard is
+// inlined rather than shared with those copies, which name it
+// isQueueRetryEligible; only manual_intervention is excluded, because it has
+// left the automated lane and is waiting on a human.
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
 	if kind != FailureRetryableTransient && kind != FailureRetryableAfterResume && kind != FailureNonRetryable {
 		return false
@@ -4118,10 +4134,6 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 		return maxRetryDelay
 	}
 	return delay
-}
-
-func isRetryableFailure(kind QueueFailureKind) bool {
-	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume
 }
 
 func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {

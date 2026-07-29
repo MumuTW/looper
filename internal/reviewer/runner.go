@@ -7117,12 +7117,31 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func isRetryableFailure(kind QueueFailureKind) bool {
+// isQueueRetryEligible reports whether the queue's retry policy handles this
+// failure kind at all. Only manual_intervention is excluded: it has left the
+// automated lane and is waiting on a human. non_retryable stays eligible on
+// purpose — whether it actually retries is decided by the attempt bound in
+// shouldRetryQueueFailure, not here. The name says "eligible" rather than
+// "retryable" for exactly that reason.
+func isQueueRetryEligible(kind QueueFailureKind) bool {
 	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
 }
 
+// shouldRetryQueueFailure applies the two-tier retry rule from #508.
+//
+// With an infinite bound (scheduler.retryMaxAttempts = -1, the default)
+// nothing else ever stops a retry, so non_retryable is the only brake and is
+// honoured strictly. With a positive bound the cap is already the brake, so
+// the kind is deliberately ignored and even a non_retryable failure gets its
+// attempts: the classifications feeding this are heuristics over agent output,
+// and a wrong one should not park a loop permanently when the bound would have
+// ended it anyway.
+//
+// The asymmetry looks like an oversight and is not. Reintroducing the kind
+// check in the bounded branch breaks TestShouldRetryQueueFailureRespectsMaxAttempts
+// here and in the fixer, planner and worker copies.
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	if !isRetryableFailure(kind) {
+	if !isQueueRetryEligible(kind) {
 		return false
 	}
 	if maxAttempts < 0 {

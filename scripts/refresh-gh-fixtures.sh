@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="${1:-nexu-io/looper}"
+repo="${1:-mumutw/looper}"
 out="internal/e2e/githubcontract/testdata/gh-schema/schema.json"
 
 tmp_dir="$(mktemp -d)"

@@ -122,7 +122,7 @@ Save the resolved absolute path (if any) for Step 4. See [`references/cli.md`](r
 ### Step 3 — Install the `looper` CLI
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/install.sh | sh
 looper --version
 ```
 

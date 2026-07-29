@@ -23,7 +23,7 @@ Different environments may each run their own `loopernet` instance, for example 
 Release workflow publishes the container image to GHCR:
 
 ```bash
-docker pull ghcr.io/nexu-io/loopernet:v0.x.y
+docker pull ghcr.io/mumutw/loopernet:v0.x.y
 ```
 
 Stable releases also publish `latest`.
@@ -85,7 +85,7 @@ docker run -d \
   -e LOOPERNET_ADMIN_TOKEN="replace-me" \
   -e LOOPERNET_MIN_DAEMON_VERSION="0.2.0" \
   -v loopernet-data:/var/lib/loopernet \
-  ghcr.io/nexu-io/loopernet:v0.x.y
+  ghcr.io/mumutw/loopernet:v0.x.y
 ```
 
 ## Docker Compose example
@@ -95,7 +95,7 @@ The repository also includes ready-to-edit deploy assets at [`../deploy/looperne
 ```yaml
 services:
   loopernet:
-    image: ghcr.io/nexu-io/loopernet:v0.x.y
+    image: ghcr.io/mumutw/loopernet:v0.x.y
     restart: unless-stopped
     ports:
       - "8089:8089"

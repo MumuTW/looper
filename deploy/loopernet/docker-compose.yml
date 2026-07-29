@@ -1,6 +1,6 @@
 services:
   loopernet:
-    image: ghcr.io/nexu-io/loopernet:latest
+    image: ghcr.io/mumutw/loopernet:latest
     container_name: loopernet
     restart: unless-stopped
     ports:

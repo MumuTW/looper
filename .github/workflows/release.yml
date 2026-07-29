@@ -40,7 +40,7 @@ jobs:
     timeout-minutes: 20
     env:
       LOOPER_E2E_GITHUB: "1"
-      LOOPER_E2E_SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'nexu-io/looper-sandbox' }}
+      LOOPER_E2E_SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'mumutw/looper-sandbox' }}
 
     steps:
       - name: Check out repository

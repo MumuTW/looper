@@ -1,6 +1,6 @@
 # Looper
 
-[![CI](https://github.com/nexu-io/looper/actions/workflows/ci.yml/badge.svg)](https://github.com/nexu-io/looper/actions/workflows/ci.yml)
+[![CI](https://github.com/mumutw/looper/actions/workflows/ci.yml/badge.svg)](https://github.com/mumutw/looper/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go)](go.mod)
 
@@ -45,7 +45,7 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 If you're an AI coding agent (Claude Code, OpenCode, Codex, Cursor, etc.) helping a user set up Looper, fetch and follow the install + configure tutorial in the bundled skill:
 
 ```
-https://github.com/nexu-io/looper/blob/main/skills/looper/SKILL.md
+https://github.com/mumutw/looper/blob/main/skills/looper/SKILL.md
 ```
 
 It contains a one-shot, step-by-step flow (preflight → install → bootstrap → vendor credentials → verify → first loop) plus a troubleshooting matrix. Confirm destructive steps with the user before running them.
@@ -55,7 +55,7 @@ It contains a one-shot, step-by-step flow (preflight → install → bootstrap �
 Fast path (macOS `darwin-arm64` or Linux `linux-amd64`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/install.sh | sh
 looper bootstrap
 looper project add /path/to/your/local/repo
 ```
@@ -96,7 +96,7 @@ Want to babysit *one* pull request — review it, fix review threads, dismiss un
 
 **The simplest path is one prompt.** Paste this into whatever coding agent you already run (Claude Code, Codex, opencode, Gemini, …):
 
-> Take over this PR until it merges — read https://raw.githubusercontent.com/nexu-io/looper/main/skills/pr-takeover/SKILL.md and follow it.
+> Take over this PR until it merges — read https://raw.githubusercontent.com/mumutw/looper/main/skills/pr-takeover/SKILL.md and follow it.
 
 That points the agent at the [`pr-takeover` skill](skills/pr-takeover/SKILL.md), which decides — confirming with you when unclear — between two modes:
 
@@ -142,7 +142,7 @@ Requirements: `git`, an authenticated `gh`, and one supported agent CLI installe
 For someone who doesn't have Looper yet, a single piped command installs the CLI and hands off to `takeover`. This is what an automation/bot can drop into a PR comment so the author can adopt the PR in one step (run it from inside the repo checkout):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/takeover.sh | sh -s -- acme/repo#42
+curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/takeover.sh | sh -s -- acme/repo#42
 ```
 
 Everything after `--` is forwarded to `looper takeover`, so `--merge` and `--agent-vendor` work there too.
@@ -162,8 +162,8 @@ npx skills add ./skills/pr-takeover
 Or install directly from GitHub:
 
 ```bash
-npx skills add https://github.com/nexu-io/looper/tree/main/skills/looper
-npx skills add https://github.com/nexu-io/looper/tree/main/skills/pr-takeover
+npx skills add https://github.com/mumutw/looper/tree/main/skills/looper
+npx skills add https://github.com/mumutw/looper/tree/main/skills/pr-takeover
 ```
 
 See [`skills/looper/SKILL.md`](skills/looper/SKILL.md) and [`skills/pr-takeover/SKILL.md`](skills/pr-takeover/SKILL.md) for details.

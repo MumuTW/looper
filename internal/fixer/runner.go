@@ -800,6 +800,17 @@ type checkpointRepair struct {
 	ElapsedRuntimeSeconds        int64                   `json:"elapsedRuntimeSeconds,omitempty"`
 	LastProgressAt               string                  `json:"lastProgressAt,omitempty"`
 	ReplyExplanations            []replyExplanationEntry `json:"replyExplanations,omitempty"`
+
+	// GitHubUnreachable records whether the agent's own logs showed it failing
+	// to reach GitHub. It is decided once, when the run ends and the full
+	// stdout/stderr is still in hand, because Summary degrades to a single line
+	// (agent.summarizeLogs) once the completion marker fails to parse — the
+	// exact case this classification exists for. Later readers load a persisted
+	// checkpoint and cannot re-derive it.
+	//
+	// nil means the checkpoint predates the field; those fall back to scanning
+	// the one-line summary, which is what shipped before.
+	GitHubUnreachable *bool `json:"githubUnreachable,omitempty"`
 }
 
 // replyExplanationEntry holds the agent's per-fix-item explanation for the
@@ -965,19 +976,15 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 	if repair.ParseStatus == "parsed" {
 		return nil
 	}
-	// Network/auth/unreachable errors are not transient — retrying won't fix them.
-	// Classify them as NonRetryable to avoid infinite retry loops.
-	summary := strings.ToLower(firstNonEmpty(repair.Summary, ""))
-	for _, fragment := range []string{
-		"network", "unreachable", "could not connect", "api.github.com",
-		"authentication failed", "bad credentials", "token expired",
-		"gh could not connect", "github was unreachable", "github api access failed",
-	} {
-		if strings.Contains(summary, fragment) {
-			return &loopError{
-				message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent could not reach GitHub (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
-				kind:    FailureNonRetryable,
-			}
+	// A run that could not reach GitHub is not worth repeating: with the default
+	// scheduler.retryMaxAttempts of -1, transient is retried forever, and every
+	// attempt spends another agent run on an environment fault no retry can fix.
+	// NonRetryable is the only brake that branch honours (see
+	// shouldRetryQueueFailure).
+	if repairSawUnreachableGitHub(repair) {
+		return &loopError{
+			message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent could not reach GitHub (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
+			kind:    FailureNonRetryable,
 		}
 	}
 	return &loopError{
@@ -986,8 +993,52 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 	}
 }
 
+// repairSawUnreachableGitHub reports whether this run failed because it could
+// not reach GitHub, preferring the decision recorded while the full logs were
+// available over re-deriving it from the truncated summary.
+func repairSawUnreachableGitHub(repair *checkpointRepair) bool {
+	if repair.GitHubUnreachable != nil {
+		return *repair.GitHubUnreachable
+	}
+	return mentionsUnreachableGitHub(repair.Summary)
+}
+
+// unreachableGitHubFragments are matched against a whole agent transcript, so
+// every entry has to be a phrase that only appears when a call actually failed.
+// Bare tokens do not qualify: "network", "unreachable" and "api.github.com" all
+// occur incidentally in the logs of an agent editing code, and misreading one
+// as an outage parks a loop that should have been retried.
+var unreachableGitHubFragments = []string{
+	"could not connect",
+	"could not resolve host",
+	"connection refused",
+	"connection timed out",
+	"network is unreachable",
+	"bad credentials",
+	"authentication failed",
+	"token expired",
+	"github was unreachable",
+	"github api access failed",
+}
+
+func mentionsUnreachableGitHub(text string) bool {
+	lowered := strings.ToLower(text)
+	for _, fragment := range unreachableGitHubFragments {
+		if strings.Contains(lowered, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func checkpointRepairFromAgentResult(executionID, headSHA string, result AgentResult, nowISO string) *checkpointRepair {
-	return &checkpointRepair{AgentExecutionID: executionID, Status: result.Status, Summary: result.Summary, HeadSHA: headSHA, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: nowISO, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
+	// Scan the transcript, not result.Summary: when the completion marker fails
+	// to parse, Summary is only the last non-empty log line, so a connection
+	// failure anywhere earlier in the run would be invisible.
+	unreachable := mentionsUnreachableGitHub(result.Stdout) ||
+		mentionsUnreachableGitHub(result.Stderr) ||
+		mentionsUnreachableGitHub(result.Summary)
+	return &checkpointRepair{AgentExecutionID: executionID, Status: result.Status, Summary: result.Summary, HeadSHA: headSHA, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, CompletedAt: nowISO, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, GitHubUnreachable: &unreachable}
 }
 
 // maxReplyExplanationLength caps each agent-supplied explanation. Replies are
@@ -3005,7 +3056,12 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		message := firstNonEmpty(result.Summary, result.Stderr, "Fixer agent "+result.Status)
 		return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
 	}
-	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
+	// Build the repair record before validating rather than probing with a
+	// two-field copy: validation and the persisted checkpoint then rest on the
+	// same evidence, including the transcript scan that only the live result
+	// carries.
+	repair := checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+	if err := validateCompletedRepairCheckpoint(repair); err != nil {
 		return checkpoint, err
 	}
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
@@ -3016,7 +3072,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// If the agent judged one or more CHANGES_REQUESTED reviews unreasonable it
 	// wrote a dismiss sentinel — dismiss those reviews (best-effort).
 	r.applyReviewDismissals(ctx, input, worktree.Path)
-	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+	checkpoint.Repair = repair
 	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
 	checkpoint.Repair.ReplyExplanations = append(checkpoint.Repair.ReplyExplanations, parseNativeRepairResults(result.Stdout, result.Stderr, checkpoint.FixItems)...)
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
@@ -7735,12 +7791,31 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 	return delay
 }
 
-func isRetryableFailure(kind QueueFailureKind) bool {
+// isQueueRetryEligible reports whether the queue's retry policy handles this
+// failure kind at all. Only manual_intervention is excluded: it has left the
+// automated lane and is waiting on a human. non_retryable stays eligible on
+// purpose — whether it actually retries is decided by the attempt bound in
+// shouldRetryQueueFailure, not here. The name says "eligible" rather than
+// "retryable" for exactly that reason.
+func isQueueRetryEligible(kind QueueFailureKind) bool {
 	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
 }
 
+// shouldRetryQueueFailure applies the two-tier retry rule from #508.
+//
+// With an infinite bound (scheduler.retryMaxAttempts = -1, the default)
+// nothing else ever stops a retry, so non_retryable is the only brake and is
+// honoured strictly. With a positive bound the cap is already the brake, so
+// the kind is deliberately ignored and even a non_retryable failure gets its
+// attempts: the classifications feeding this are heuristics over agent output,
+// and a wrong one should not park a loop permanently when the bound would have
+// ended it anyway.
+//
+// The asymmetry looks like an oversight and is not. Reintroducing the kind
+// check in the bounded branch breaks TestShouldRetryQueueFailureRespectsMaxAttempts
+// here and in the reviewer, planner and worker copies.
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	if !isRetryableFailure(kind) {
+	if !isQueueRetryEligible(kind) {
 		return false
 	}
 	if maxAttempts < 0 {

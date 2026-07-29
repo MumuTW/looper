@@ -26,7 +26,7 @@ Looper uses Go binaries as the default supported implementation.
 The quickest first-time setup is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/install.sh | sh
 looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode
 ```
 
@@ -142,7 +142,7 @@ Current behavior:
 ## Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/uninstall.sh | sh
 ```
 
 The uninstall script removes the CLI binary, the managed daemon binary, and updater state. It asks before deleting config, the SQLite DB, backups, logs, and worktrees.
@@ -152,7 +152,7 @@ The uninstall script removes the CLI binary, the managed daemon binary, and upda
 Clone the repo:
 
 ```bash
-git clone https://github.com/nexu-io/looper.git
+git clone https://github.com/mumutw/looper.git
 cd looper
 ```
 
