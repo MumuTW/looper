@@ -103,7 +103,7 @@ func TestLoadFileConfigPathOverrideWinsSelectionButKeepsOverrides(t *testing.T) 
 	envPath := filepath.Join(cwd, "env.json")
 	optionPath := filepath.Join(cwd, "option.json")
 	files := map[string]string{
-		forcedPath: `{"server":{"host":"forced"}}`,
+		forcedPath: `{"server":{"host":"forced","authMode":"local-token","localToken":"secret"}}`,
 		cliPath:    `{"server":{"host":"cli"}}`,
 		envPath:    `{"server":{"host":"env"}}`,
 		optionPath: `{"server":{"host":"option"}}`,

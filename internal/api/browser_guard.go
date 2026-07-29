@@ -12,10 +12,11 @@ import (
 )
 
 // rewriteHTTPtestDefaultHost is enabled only by TestMain during `go test`.
-// httptest.NewRequest uses the synthetic Host "example.com" for path-only URLs;
-// when this flag is set, that Host is evaluated as the configured server
-// authority so unit tests need not set Host on every request. Production
-// binaries leave this false so a real Host: example.com is not rewritten.
+// httptest.NewRequest uses the synthetic Host "example.com" for path-only URLs
+// and the synthetic RemoteAddr "192.0.2.1:1234"; when this flag is set, those
+// defaults are evaluated as the configured server authority / a loopback
+// client so unit tests need not set Host or RemoteAddr on every request.
+// Production binaries leave this false so real values are never rewritten.
 var rewriteHTTPtestDefaultHost bool
 
 // validateBrowserRequest enforces Host allowlisting and Origin matching for
@@ -95,6 +96,15 @@ func effectiveRequestHost(r *http.Request, cfg config.Config) string {
 		return configuredRequestAuthority(cfg)
 	}
 	return host
+}
+
+// effectiveRemoteAddr mirrors effectiveRequestHost for RemoteAddr: under tests
+// only, httptest's synthetic default client address maps to a loopback client.
+func effectiveRemoteAddr(r *http.Request) string {
+	if rewriteHTTPtestDefaultHost && r.RemoteAddr == "192.0.2.1:1234" {
+		return "127.0.0.1:1234"
+	}
+	return r.RemoteAddr
 }
 
 func configuredRequestAuthority(cfg config.Config) string {

@@ -794,6 +794,20 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 	}
 
 	if cfg.Server.AuthMode != config.AuthModeLocalToken {
+		// Without token authentication, only direct loopback clients may use the
+		// API. The Host header is client-controlled and never proves locality:
+		// on a wildcard bind (server.host=0.0.0.0) a remote client can spoof
+		// "Host: localhost" and pass the browser guard above. Token-verified
+		// non-browser callbacks (e.g. Feishu) authenticate with their own
+		// shared secret and stay reachable from remote addresses.
+		if !isNonBrowserCallbackPath(path) &&
+			(!isLoopbackRemoteAddr(effectiveRemoteAddr(r)) || hasForwardingProxyHeaders(r.Header)) {
+			return apiError{
+				code:    pkgapi.ErrorCodeUnauthorized,
+				status:  http.StatusForbidden,
+				message: "Without token authentication the API is limited to direct loopback clients",
+			}
+		}
 		return nil
 	}
 
