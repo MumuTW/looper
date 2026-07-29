@@ -100,14 +100,14 @@ If no project matches the current directory, or multiple projects match, pass `-
 | `coordinator` | Proactively triages fresh issues and commits a Disposition with durable labels | runs automatically inside `looperd` |
 | `planner` | Generates a spec from an issue and opens a spec PR | Label issue `looper:plan` + assign (or `POST /api/v1/planners`) |
 | `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | Review-request / label discovery (or dashboard / API) |
-| `fixer` | Fixes PR issues based on review comments and tries to resolve threads | `looper fix <repo>#<pr>` |
+| `fixer` | Fixes PR issues based on review comments and tries to resolve threads | Discovery on open PRs with actionable threads (or dashboard / API) |
 | `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | Label `looper:worker-ready` / `looper:spec-ready` (or `POST /api/v1/workers`) |
 
 Forgejo MVP role support:
 
 - Planner and Worker are supported over the Forgejo REST API.
 - Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level Reviewer Summary compatibility protocol.
-- Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and manual/direct `looper fix` runs also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
+- Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and direct/manual fixer loops (dashboard or API, not a `looper fix` verb) also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
 - Coordinator, auto-merge, routed network mode, and webhook modes remain unsupported for Forgejo.
 - A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
@@ -317,19 +317,7 @@ Auto-merge is not engaged for Spec PRs, PRs whose linked Issue has no `## Accept
 
 ## 8. Fixer: repair a PR based on review feedback
 
-The most direct way to use fixer is to start it for a specific PR:
-
-```bash
-looper fix owner/repo#42
-```
-
-If you are already inside the registered repo, you can usually use the PR number by itself:
-
-```bash
-looper fix 42
-```
-
-Use this when you want to force a repair pass on demand before waiting for any automatic fixer trigger.
+There is no `looper fix` CLI. Fixer starts via discovery on open PRs with actionable review threads (authored by the configured user), or via the dashboard / `POST /api/v1/loops` when you need a forced repair pass.
 
 Fixer will:
 
