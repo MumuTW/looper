@@ -72,6 +72,15 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 				"discovery":  map[string]any{"status": "pending"},
 				"warnings":   []string{"Could not detect repository from git remote"},
 			})
+		case r.URL.Path == "/api/v1/projects/repo/discover" && r.Method == http.MethodPost:
+			writeEnvelope(w, http.StatusOK, map[string]any{
+				"id": "repo",
+				"discovery": map[string]any{
+					"status":                 "succeeded",
+					"discoveredWorktrees":    2,
+					"discoveredPullRequests": 1,
+				},
+			})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -747,6 +756,27 @@ func TestProjectAddReportsDiscoveryAsPostCommit(t *testing.T) {
 	}
 }
 
+// TestProjectDiscoverRetriesDiscovery confirms the CLI can ask the daemon to
+// re-run post-commit worktree/PR discovery for an existing project.
+func TestProjectDiscoverRetriesDiscovery(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	configForDaemon(t, daemon.server.URL)
+
+	code, stdout, _ := runCLI(t, "project", "discover", "repo")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "discovery for project repo: succeeded") {
+		t.Fatalf("stdout = %q, want succeeded discovery", stdout)
+	}
+	if !strings.Contains(stdout, "worktrees:  2") {
+		t.Fatalf("stdout = %q, want discovered worktree count", stdout)
+	}
+	if !strings.Contains(stdout, "pullRequests: 1") {
+		t.Fatalf("stdout = %q, want discovered pull request count", stdout)
+	}
+}
+
 func TestProjectRejectsBadSubcommands(t *testing.T) {
 	for _, testCase := range []struct {
 		name string
@@ -757,6 +787,8 @@ func TestProjectRejectsBadSubcommands(t *testing.T) {
 		{name: "add without path", args: []string{"project", "add"}},
 		{name: "add with extra args", args: []string{"project", "add", "a", "b"}},
 		{name: "list with args", args: []string{"project", "list", "x"}},
+		{name: "discover without id", args: []string{"project", "discover"}},
+		{name: "discover with extra args", args: []string{"project", "discover", "a", "b"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			code, _, stderr := runCLI(t, testCase.args...)

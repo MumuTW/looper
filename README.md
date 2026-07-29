@@ -190,6 +190,7 @@ looper init                            # write a starter config; never overwrite
 looper status                          # config, daemon reachability, projects
 looper project add <path>              # register a git repository root
 looper project list
+looper project discover <id>           # retry post-commit worktree/PR discovery
 looper stop <selector>                 # "all" stops every active run
 looper close <selector>
 looper start <selector>

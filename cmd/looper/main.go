@@ -3,7 +3,7 @@
 // This is the minimal surface deliberately kept after the full cobra CLI was
 // removed: the loop control verbs, which are the only ones the daemon has no
 // other client for, plus the few onboarding verbs a first-time operator needs
-// before the dashboard is reachable (init, status, project add/list).
+// before the dashboard is reachable (init, status, project add/list/discover).
 // Everything else the old CLI did (config editing, provider management, network
 // and webhook administration, daemon supervision) is either the dashboard's job
 // or not yet reimplemented.
