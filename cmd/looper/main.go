@@ -61,6 +61,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runReview(ctx, args, stdin, stdout, stderr)
 	}
 
+	// retry owns --discard-worktree-changes / --confirm and a GET preflight.
+	// Those flags must not go through splitGlobalFlags (which rejects any
+	// non-global dash-argument) and must not collapse to a bodyless POST.
+	if verb, ok := leadingVerb(args); ok && verb == "retry" {
+		return runRetry(ctx, args, stdout, stderr)
+	}
+
 	parsed, err := splitGlobalFlags(args)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
@@ -85,6 +92,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
 		return 1
+	}
+	// stop-all answers HTTP 200 even when some loops only paused or failed;
+	// the old CLI exited nonzero so automation cannot treat "partial stop" as success.
+	if request.Path == "/api/v1/runs/active/stop-all" {
+		if err := stopAllPartialFailure(body); err != nil {
+			_, _ = fmt.Fprintln(stdout, strings.TrimSpace(body))
+			_, _ = fmt.Fprintf(stderr, "looper: %v\n", err)
+			return 1
+		}
 	}
 	_, _ = fmt.Fprintln(stdout, strings.TrimSpace(body))
 	return 0
@@ -333,16 +349,30 @@ func dialHost(host string) string {
 }
 
 func post(ctx context.Context, cfg config.Config, call apiRequest) (string, error) {
-	endpoint := daemonBaseURL(cfg) + call.Path
+	return doHTTP(ctx, cfg, http.MethodPost, call.Path, call.Body)
+}
+
+func get(ctx context.Context, cfg config.Config, path string) (string, error) {
+	return doHTTP(ctx, cfg, http.MethodGet, path, nil)
+}
+
+func doHTTP(ctx context.Context, cfg config.Config, method, path string, body []byte) (string, error) {
+	endpoint := daemonBaseURL(cfg) + path
 
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(call.Body))
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 	if err != nil {
 		return "", err
 	}
-	request.Header.Set("Content-Type", "application/json")
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
 	// Only local-token auth mode has a token the daemon will accept. Sending
 	// one whenever server.localToken happens to be set leaks it to whatever is
 	// listening — including a proxy in front of a daemon that never asked for
@@ -365,6 +395,53 @@ func post(ctx context.Context, cfg config.Config, call apiRequest) (string, erro
 		return "", fmt.Errorf("looperd returned %s: %s", response.Status, apiErrorMessage(payload))
 	}
 	return string(payload), nil
+}
+
+// stopAllPartialFailure inspects a successful stop-all envelope. The daemon
+// keeps walking remaining loops and returns 200 with counters; a nonzero
+// failed or pausedOnly count is still an operator-visible failure.
+func stopAllPartialFailure(payload string) error {
+	failed, pausedOnly, err := stopAllResultCounts([]byte(payload))
+	if err != nil {
+		return err
+	}
+	if failed > 0 {
+		return fmt.Errorf("failed to stop %d running task(s)", failed)
+	}
+	if pausedOnly > 0 {
+		return fmt.Errorf("paused %d task(s) without signaling a verified process", pausedOnly)
+	}
+	return nil
+}
+
+func stopAllResultCounts(payload []byte) (failed, pausedOnly int, err error) {
+	// Prefer the success envelope the daemon actually returns (`data.summary`);
+	// fall back to a bare summary object for fixtures that skip the envelope.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return 0, 0, fmt.Errorf("decode stop-all response: %w", err)
+	}
+	type summary struct {
+		Failed     int `json:"failed"`
+		PausedOnly int `json:"pausedOnly"`
+	}
+	if raw, ok := probe["data"]; ok {
+		var data struct {
+			Summary summary `json:"summary"`
+		}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return 0, 0, fmt.Errorf("decode stop-all data: %w", err)
+		}
+		return data.Summary.Failed, data.Summary.PausedOnly, nil
+	}
+	if raw, ok := probe["summary"]; ok {
+		var s summary
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return 0, 0, fmt.Errorf("decode stop-all summary: %w", err)
+		}
+		return s.Failed, s.PausedOnly, nil
+	}
+	return 0, 0, fmt.Errorf("decode stop-all response: missing summary")
 }
 
 // apiErrorMessage pulls the daemon's own message out of an error envelope so
@@ -393,6 +470,8 @@ Usage:
   looper takeover <selector>   Take a loop over for manual work
   looper handback <selector>   Hand a taken-over loop back to the daemon
   looper retry <selector>      Requeue a paused or parked loop
+                               (refuses dirty managed worktrees unless
+                               --discard-worktree-changes --confirm)
   looper start <selector>      Start a loop now
   looper pause <selector>      Pause a loop
   looper respond <selector> "<answer>"
@@ -403,6 +482,10 @@ Global flags, accepted before or after the verb:
   --config <path>              Config file to load
   --host <host>                Daemon host, overriding the config
   --port <port>                Daemon port, overriding the config
+
+Retry flags (after the selector):
+  --discard-worktree-changes   Drop uncommitted worktree edits before retry
+  --confirm                    Required with --discard-worktree-changes
 
 There is one more command, which is not for operators:
   looper review submit <repo>#<number> --event <event> --commit-id <sha>

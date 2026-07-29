@@ -9,7 +9,7 @@
 | `looper close <selector>` | Stop and close the loop |
 | `looper start <selector>` | Start a known loop now |
 | `looper pause <selector>` | Pause a loop |
-| `looper retry <selector>` | Requeue a paused/parked/failed loop |
+| `looper retry <selector>` | Requeue a paused/parked/failed loop. Dirty managed worktrees fail closed unless `--discard-worktree-changes --confirm`. |
 | `looper takeover <selector>` | Park a loop for manual worktree work |
 | `looper handback <selector>` | Return a parked loop to the daemon |
 | `looper respond <selector> "<answer>"` | Answer a human-gated loop and resume it |
