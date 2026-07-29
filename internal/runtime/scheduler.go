@@ -3768,6 +3768,18 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		claimStats.record(claimedCount, availableSlots)
 		appendErr(err)
 	}
+	// Liveness quarantine must be revisited on the scheduler's periodic full
+	// tick, independently of capacity. Tying this to availableSlots == 0 strands
+	// quarantined work forever on otherwise-idle daemons.
+	if input.ReconcileStaleRuns != nil {
+		// Recheck immediately before the mutating reconciliation so shutdown cannot
+		// race past the tick-entry admission check.
+		if err := admissionRefuseWork(input); err != nil {
+			return nil
+		}
+		_, err := input.ReconcileStaleRuns(ctx)
+		appendErr(err)
+	}
 
 	projectsList, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
 	if err != nil {
@@ -4028,23 +4040,6 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 	if err != nil {
 		logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
 		return 0, 0, err
-	}
-	if availableSlots == 0 && input.ReconcileStaleRuns != nil {
-		// Recheck immediately before stale reconcile: availableSlots can race
-		// with BeginShutdown after the count returns, and ReconcileStaleRuns
-		// mutates runs/queue during the HTTP drain window.
-		if err := admissionRefuseWork(input); err != nil {
-			return 0, 0, nil
-		}
-		if _, err := input.ReconcileStaleRuns(ctx); err != nil {
-			logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
-			return 0, 0, err
-		}
-		availableSlots, err = schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
-		if err != nil {
-			logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
-			return 0, 0, err
-		}
 	}
 	claimedItems := make([]storage.QueueItemRecord, 0)
 	if availableSlots > 0 && input.Repos != nil && input.Repos.Queue != nil {

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nexu-io/looper/internal/processidentity"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -171,22 +172,7 @@ func (defaultProcessProbe) IsAlive(pid int) (bool, error) {
 }
 
 func (defaultProcessProbe) StartTime(pid int) (int64, error) {
-	if runtime.GOOS == "linux" {
-		stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-		if err != nil {
-			return 0, err
-		}
-		fields := strings.Fields(string(stat))
-		if len(fields) < 22 {
-			return 0, fmt.Errorf("unexpected /proc stat shape")
-		}
-		start, err := strconv.ParseInt(fields[21], 10, 64)
-		if err != nil {
-			return 0, err
-		}
-		return start, nil
-	}
-	return psProcessStart(pid)
+	return processidentity.StartTime(pid)
 }
 
 func (defaultProcessProbe) Argv(pid int) ([]string, error) {
@@ -217,24 +203,6 @@ func (defaultProcessProbe) ExecutablePath(pid int) (string, error) {
 		return "", err
 	}
 	return argv[0], nil
-}
-
-func psProcessStart(pid int) (int64, error) {
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
-	cmd.Env = append(os.Environ(), "LC_ALL=C", "TZ=UTC")
-	out, err := cmd.Output()
-	if err != nil {
-		return 0, err
-	}
-	value := strings.TrimSpace(string(out))
-	if value == "" {
-		return 0, fmt.Errorf("empty process start")
-	}
-	parsed, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", value, time.UTC)
-	if err != nil {
-		return 0, err
-	}
-	return parsed.UnixNano(), nil
 }
 
 type adoptedForwarderProcess struct {
