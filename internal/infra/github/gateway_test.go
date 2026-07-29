@@ -1801,6 +1801,43 @@ func TestGatewayViewIssueScopesAPIToHostname(t *testing.T) {
 	}
 }
 
+func TestGatewayGetIssueLabelsSkipsCommentFetch(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues/8" {
+			t.Fatalf("unexpected gh args: %q", got)
+		}
+		return shell.Result{Stdout: `{"number":8,"labels":[{"name":"looper:hold"},{"name":"bug"}]}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	labels, err := gateway.GetIssueLabels(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("GetIssueLabels() error = %v", err)
+	}
+	if len(labels) != 2 || labels[0] != "looper:hold" || labels[1] != "bug" {
+		t.Fatalf("GetIssueLabels() = %#v, want [looper:hold bug]", labels)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("gh calls = %#v, want exactly one (no comment pagination)", runner.calls)
+	}
+}
+
+func TestGatewayGetIssueLabelsScopesAPIToHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues/8 --hostname github.example.com" {
+			t.Fatalf("unexpected gh args: %q", got)
+		}
+		return shell.Result{Stdout: `{"number":8,"labels":[]}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if _, err := gateway.GetIssueLabels(context.Background(), ViewIssueInput{Repo: "github.example.com/acme/looper", IssueNumber: 8}); err != nil {
+		t.Fatalf("GetIssueLabels() error = %v", err)
+	}
+}
+
 func TestListIssueBlockedByUsesRepositoryURLForCrossRepoBlockers(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

@@ -4705,11 +4705,13 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	labels := []string(nil)
 	switch target.TargetType {
 	case domain.LoopTargetTypeIssue:
-		detail, err := gh.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
+		// Labels-only: ViewIssue would additionally page through every comment
+		// on the issue, and this preflight reads nothing but the labels.
+		issueLabels, err := gh.GetIssueLabels(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
 		if err != nil {
 			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
 		}
-		labels = detail.Labels
+		labels = issueLabels
 	case domain.LoopTargetTypePullRequest:
 		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
 		if err != nil {
