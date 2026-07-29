@@ -1039,6 +1039,26 @@ func (g *Gateway) GetIssueState(ctx context.Context, input ViewIssueInput) (Issu
 	return IssueState{State: asString(row["state"]), StateReason: firstNonEmpty(asString(row["state_reason"]), asString(row["stateReason"]))}, nil
 }
 
+// GetIssueLabels reads only an issue's label names. ViewIssue answers the same
+// question but also pages through the entire comment thread, so callers that
+// need labels alone pay one gh invocation plus a paginated fetch per issue.
+func (g *Gateway) GetIssueLabels(ctx context.Context, input ViewIssueInput) ([]string, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return extractLabelNames(row["labels"]), nil
+}
+
 func (g *Gateway) ListIssueBlockedBy(ctx context.Context, input ListIssueBlockedByInput) ([]IssueDependency, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/dependencies/blocked_by", repo, input.IssueNumber)}
