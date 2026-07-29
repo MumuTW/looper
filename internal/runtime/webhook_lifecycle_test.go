@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -55,6 +56,9 @@ func TestWebhookForwarderLockPathUsesResolvedRelativeDBDirectory(t *testing.T) {
 }
 
 func TestPSProcessStartForcesCLocale(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux process identity is read from /proc rather than ps")
+	}
 	dir := t.TempDir()
 	psPath := filepath.Join(dir, "ps")
 	if err := os.WriteFile(psPath, []byte("#!/bin/sh\nif [ \"${LC_ALL}\" = \"C\" ] && [ \"${TZ}\" = \"UTC\" ]; then\n  printf 'Mon May 18 12:34:56 2026\\n'\nelse\n  printf 'Lun Mai 18 12:34:56 2026\\n'\nfi\n"), 0o755); err != nil {
