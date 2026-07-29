@@ -117,7 +117,7 @@ looper project add /absolute/path/to/repo
 looper project list
 ```
 
-The path must be a git repository **root** — `looper project add` asks git (`rev-parse --show-toplevel`) and refuses a subdirectory, a directory with a broken or empty `.git`, or a bare repository, naming the real root when it finds one. It also refuses a checkout already registered, and one whose directory name would derive a project id that already exists (`/work/acme/api` after `/work/other/api`), because a path-only add on an existing id rebinds that project rather than creating one. Always pass an absolute path, and confirm it with the user rather than guessing.
+The path must be a git repository **root** — `looper project add` asks the client machine's `git` (`rev-parse --show-toplevel`) and refuses a subdirectory, a directory with a broken or empty `.git`, or a bare repository, naming the real root when it finds one. It also refuses a checkout already registered. The daemon normalizes and checks a path-only request's derived id atomically, so a directory name that would reuse an active project id (`/work/acme/api` after `/work/other/api`) is rejected even when adds race. Always pass an absolute path, and confirm it with the user rather than guessing.
 
 The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` register the same way, and are where the fields the CLI does not expose (explicit id, name, base branch, worktree root, provider) live — use them when you need an explicit id to sidestep a derived-id collision.
 

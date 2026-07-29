@@ -158,12 +158,6 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if err != nil {
 		return AddResult{}, err
 	}
-	if existing != nil && metadataString(parseMetadata(existing.MetadataJSON), "source") == "config" {
-		return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", existing.ID)}
-	}
-	if existing != nil && !existing.Archived && input.IDSource != "derived" {
-		return AddResult{}, ProjectIDCollisionError{ProjectID: input.ID}
-	}
 	projectID := input.ID
 	if existing == nil {
 		projectID = normalizeProjectID(input)
@@ -179,6 +173,15 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 				return AddResult{}, ProjectIDCollisionError{ProjectID: projectID}
 			}
 			existing = normalizedExisting
+		}
+	}
+	if existing != nil && metadataString(parseMetadata(existing.MetadataJSON), "source") == "config" {
+		return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", existing.ID)}
+	}
+	if existing != nil && !existing.Archived {
+		derivedReusesSameCheckout := input.IDSource == "derived" && sameProjectRepoPath(existing.RepoPath, input.RepoPath)
+		if !derivedReusesSameCheckout {
+			return AddResult{}, ProjectIDCollisionError{ProjectID: projectID}
 		}
 	}
 
@@ -644,6 +647,10 @@ func normalizeDerivedProjectID(projectID string) string {
 		return projectID
 	}
 	return "project_" + projectID
+}
+
+func sameProjectRepoPath(left string, right string) bool {
+	return filepath.Clean(strings.TrimSpace(left)) == filepath.Clean(strings.TrimSpace(right))
 }
 
 func deriveProjectIDFromRepoPath(repoPath string) string {

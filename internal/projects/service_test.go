@@ -589,6 +589,79 @@ func TestServiceAddProjectReturnsConflictForExplicitExistingID(t *testing.T) {
 	}
 }
 
+func TestServiceAddProjectSerializesDerivedIDCollisions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		derivedID  string
+		storedID   string
+		pathSuffix string
+	}{
+		{name: "ordinary derived id", derivedID: "api", storedID: "api", pathSuffix: "api"},
+		{name: "normalized legacy prefix", derivedID: "legacy-id-api", storedID: "project_legacy-id-api", pathSuffix: "legacy-id-api"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			coordinator := openCoordinator(t)
+			repos := storage.NewRepositories(coordinator.DB())
+			service := &Service{DB: coordinator.DB(), Repos: repos}
+			inputs := []AddInput{
+				{ID: testCase.derivedID, IDSource: "derived", Name: "First", RepoPath: filepath.Join(t.TempDir(), testCase.pathSuffix), SnapshotMode: SnapshotModeOff},
+				{ID: testCase.derivedID, IDSource: "derived", Name: "Second", RepoPath: filepath.Join(t.TempDir(), testCase.pathSuffix), SnapshotMode: SnapshotModeOff},
+			}
+
+			type outcome struct {
+				result AddResult
+				err    error
+			}
+			start := make(chan struct{})
+			outcomes := make(chan outcome, len(inputs))
+			for _, input := range inputs {
+				input := input
+				go func() {
+					<-start
+					result, err := service.AddProject(context.Background(), input)
+					outcomes <- outcome{result: result, err: err}
+				}()
+			}
+			close(start)
+
+			var succeeded *AddResult
+			var conflict ProjectIDCollisionError
+			for range inputs {
+				got := <-outcomes
+				if got.err == nil {
+					if succeeded != nil {
+						t.Fatal("both colliding derived-id adds succeeded")
+					}
+					succeeded = &got.result
+					continue
+				}
+				if !errors.As(got.err, &conflict) {
+					t.Fatalf("AddProject() error = %T %v, want ProjectIDCollisionError", got.err, got.err)
+				}
+			}
+			if succeeded == nil {
+				t.Fatal("neither derived-id add succeeded")
+			}
+			if conflict.ProjectID != testCase.storedID {
+				t.Fatalf("conflict.ProjectID = %q, want normalized id %q", conflict.ProjectID, testCase.storedID)
+			}
+
+			stored, err := repos.Projects.GetByID(context.Background(), testCase.storedID)
+			if err != nil {
+				t.Fatalf("Projects.GetByID() error = %v", err)
+			}
+			if stored == nil || stored.RepoPath != succeeded.Project.RepoPath {
+				t.Fatalf("stored project = %#v, want successful checkout %q", stored, succeeded.Project.RepoPath)
+			}
+		})
+	}
+}
+
 func TestServiceSyncConfiguredPreservesMetadataLayout(t *testing.T) {
 	t.Parallel()
 

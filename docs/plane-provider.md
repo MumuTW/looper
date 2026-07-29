@@ -24,7 +24,7 @@ Provider capabilities: issues, labels, comments, and assignees are supported; pu
 
 ## Setting it up
 
-There is no generator for a Plane config. `looper bootstrap --provider plane`, and every flag it took, was removed with the old CLI. The project API can register a plain repo path against the running daemon, but a Plane binding lives in the config file's `providers` and `projects` sections, which the project API deliberately refuses to modify.
+There is no generator for a Plane config. `looper bootstrap --provider plane`, and every flag it took, was removed with the old CLI. Define the provider and the complete project together in the config file's `providers` and `projects` sections, then restart `looperd`. Do not pre-register the path through `looper project add`, the dashboard, or the project API: that creates an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup.
 
 Run `looper init` for a starter config, then add the sections below by hand:
 

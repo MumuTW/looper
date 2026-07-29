@@ -169,7 +169,7 @@ Forgejo validation notes:
 
 - `baseUrl` must be an absolute `http(s)` URL.
 - Choose `auth = "token-env"` with `tokenEnv`, or `auth = "tea"` with explicit `teaLogin` matching `baseUrl`. Never rely on tea's default login when multiple identities exist. Do not write token values into config.
-- Forgejo projects require a `provider` and repo. Configure them in the config file's `providers` + `[[projects]]` (or projects table). `looper project add <path>`, the dashboard, and `POST /api/v1/projects` all do path-only registration against a running daemon; a Forgejo binding still has to come from the config file.
+- Forgejo projects require a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add`, the dashboard, or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup.
 - Duplicate `repo` values are rejected case-insensitively, even across providers.
 - Forgejo uses polling only; omit project `webhook.mode` and keep `network.mode` off.
 - The provider profile disables unsupported GitHub-shaped defaults. Explicit opt-ins to Forgejo-unsupported behavior fail fast.

@@ -525,6 +525,20 @@ func TestProjectAddRegistersRepositoryRootWithDaemon(t *testing.T) {
 	}
 }
 
+func TestProjectAddUsesClientPATHInsteadOfConfiguredDaemonGitPath(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	writeConfigFile(t, fmt.Sprintf("[server]\nbaseUrl = %q\n[tools]\ngitPath = %q\n", daemon.server.URL, "/daemon-only/bin/git"))
+	repo := gitRepo(t)
+
+	code, _, stderr := runCLI(t, "project", "add", repo)
+	if code != 0 {
+		t.Fatalf("exit code = %d (stderr %q), want client-local git from PATH", code, stderr)
+	}
+	if got, _ := daemon.createBody["repoPath"].(string); got != repo {
+		t.Fatalf("daemon received repoPath %q, want %q", got, repo)
+	}
+}
+
 func TestProjectAddResolvesRelativePathToAbsolute(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	configForDaemon(t, daemon.server.URL)
@@ -613,34 +627,6 @@ func TestProjectAddSurfacesDaemonConflict(t *testing.T) {
 	}
 }
 
-// TestProjectAddRefusesDerivedProjectIDCollision covers the case the repoPath
-// comparison cannot see. A path-only POST makes the daemon derive the id from
-// the last path segment and treat an existing derived id as an update, so
-// /work/acme/api added after /work/other/api rebinds project "api" to the new
-// checkout and answers 200. Two different checkouts, same basename, and the
-// operator is told the add succeeded.
-func TestProjectAddRefusesDerivedProjectIDCollision(t *testing.T) {
-	daemon := newFakeDaemon(t)
-	first := gitRepoAt(t, filepath.Join(t.TempDir(), "api"))
-	second := gitRepoAt(t, filepath.Join(t.TempDir(), "api"))
-	if first == second {
-		t.Fatalf("fixtures collide: both checkouts resolved to %s", first)
-	}
-	daemon.projects = []map[string]any{{"id": "api", "repoPath": first, "baseBranch": "main"}}
-	configForDaemon(t, daemon.server.URL)
-
-	code, _, stderr := runCLI(t, "project", "add", second)
-	if code != 1 {
-		t.Fatalf("exit code = %d (stderr %q), want 1", code, stderr)
-	}
-	if !strings.Contains(stderr, `project "api"`) || !strings.Contains(stderr, first) {
-		t.Fatalf("stderr = %q, want the project it would have rebound and its current path", stderr)
-	}
-	if daemon.createBody != nil {
-		t.Fatalf("a colliding derived id was still posted: %v", daemon.createBody)
-	}
-}
-
 // TestProjectAddRefusesSubdirectory pins that the root check survived the move
 // from a .git stat to git itself: rev-parse answers from inside a subdirectory,
 // so without the comparison a subdirectory would now register the root instead
@@ -713,10 +699,12 @@ func TestProjectAddCanonicalizesAliasedPath(t *testing.T) {
 	if err := os.Symlink(repo, alias); err != nil {
 		t.Fatalf("create symlink: %v", err)
 	}
-	daemon.projects = []map[string]any{{"id": "alpha", "repoPath": repo, "baseBranch": "main"}}
+	// Older clients stored the spelling the operator supplied, so the catalog
+	// can contain an alias even though new inputs are canonicalized by git.
+	daemon.projects = []map[string]any{{"id": "alpha", "repoPath": alias, "baseBranch": "main"}}
 	configForDaemon(t, daemon.server.URL)
 
-	code, _, stderr := runCLI(t, "project", "add", alias)
+	code, _, stderr := runCLI(t, "project", "add", repo)
 	if code != 1 {
 		t.Fatalf("exit code = %d (stderr %q), want 1", code, stderr)
 	}

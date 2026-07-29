@@ -30,7 +30,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -399,27 +398,54 @@ func loadConfig(args []string) (config.Config, error) {
 	return applyEndpointOverrides(loaded.Config, args), nil
 }
 
-// applyEndpointOverrides makes --host and --port win over a configured
-// server.baseUrl.
-//
-// LoadFile routes those two flags onto Server.Host and Server.Port only, while
-// daemonBaseURL prefers Server.BaseURL whenever it is set. Left alone, that
-// combination sends `looper --host other-box project add /repo` to the daemon
-// named by the config file — a documented override that dials the wrong daemon
-// and mutates the wrong project catalog. Dropping BaseURL is what makes
-// daemonBaseURL fall back to the host and port the operator just typed.
+// applyEndpointOverrides makes --host and --port replace their corresponding
+// components in a configured server.baseUrl.
 //
 // The check reads the already-split global flags rather than the raw command
 // line, so `--host` appearing as an operand (after `--`, or as a respond
 // answer) cannot be mistaken for an endpoint override.
 func applyEndpointOverrides(cfg config.Config, global []string) config.Config {
+	overrideHost := false
+	overridePort := false
 	for _, arg := range global {
 		name, _, _ := strings.Cut(arg, "=")
-		if name == "--host" || name == "--port" {
-			cfg.Server.BaseURL = nil
-			return cfg
+		switch name {
+		case "--host":
+			overrideHost = true
+		case "--port":
+			overridePort = true
 		}
 	}
+	if (!overrideHost && !overridePort) || cfg.Server.BaseURL == nil || strings.TrimSpace(*cfg.Server.BaseURL) == "" {
+		return cfg
+	}
+
+	base, err := url.Parse(strings.TrimSpace(*cfg.Server.BaseURL))
+	if err != nil || base.Hostname() == "" {
+		// Config validation normally makes this unreachable. Falling back to
+		// the bind-style endpoint still honors the flags if an invalid Config
+		// value is supplied directly in a test or embedding.
+		cfg.Server.BaseURL = nil
+		return cfg
+	}
+	host := base.Hostname()
+	port := base.Port()
+	if overrideHost {
+		host = dialHost(cfg.Server.Host)
+	}
+	if overridePort {
+		port = strconv.Itoa(cfg.Server.Port)
+	}
+	if port == "" {
+		base.Host = host
+		if strings.Contains(host, ":") {
+			base.Host = "[" + host + "]"
+		}
+	} else {
+		base.Host = net.JoinHostPort(host, port)
+	}
+	value := base.String()
+	cfg.Server.BaseURL = &value
 	return cfg
 }
 
@@ -648,40 +674,28 @@ func runProjectAdd(ctx context.Context, global []string, repoPath string, stdout
 		return err
 	}
 
-	resolved, err := resolveRepoRoot(ctx, gitExecutable(cfg), repoPath)
+	// Repository validation happens in the CLI process, so it must resolve git
+	// from this process's PATH. tools.gitPath belongs to the daemon environment
+	// and may name a path that does not exist on a remote client.
+	resolved, err := resolveRepoRoot(ctx, "git", repoPath)
 	if err != nil {
 		return err
 	}
 
-	// Authority for both gates below is the daemon and git, not this CLI's own
-	// reading of the filesystem: the catalog compared against is the one
-	// GET /api/v1/projects just returned, and the repository root came from
-	// `git rev-parse` in resolveRepoRoot. They exist because POST
-	// /api/v1/projects cannot refuse either case itself — a path-only add is an
-	// upsert keyed on the derived id, and nothing on that path compares
-	// repoPaths — so without them an "add" silently rebinds a project that
-	// already exists. Neither gate is the final word: the daemon still
-	// validates, and a project registered between this GET and the POST is
-	// caught there rather than here.
+	// Refuse an already-registered checkout with a focused message. The daemon
+	// remains authoritative for IDs and enforces derived-ID collisions under
+	// its mutation lock; this catalog read is only an early duplicate-path
+	// diagnostic.
 	existing, err := requestJSON[projectsListResponse](ctx, cfg, http.MethodGet, "/api/v1/projects", nil)
 	if err != nil {
 		return err
 	}
-	derived := derivedProjectID(resolved)
 	for _, project := range existing.Items {
 		if project.Archived {
 			continue
 		}
 		if sameRepoPath(project.RepoPath, resolved) {
 			return fmt.Errorf("%s is already registered as project %q", resolved, project.ID)
-		}
-		// A path-only POST derives the project id from the last path segment,
-		// and the daemon treats an existing *derived* id as an update rather
-		// than a conflict. So /work/acme/api added after /work/other/api would
-		// repoint project "api" at the new checkout and report it as a
-		// successful add. Refuse here, where both paths are still visible.
-		if project.ID == derived {
-			return fmt.Errorf("project %q already registers %s, and %s derives the same project id; adding it would rebind that project instead of creating one. Register this checkout with an explicit id through the dashboard or POST /api/v1/projects", project.ID, project.RepoPath, resolved)
 		}
 	}
 
@@ -790,42 +804,16 @@ func gitTopLevel(ctx context.Context, gitPath string, dir string) (string, error
 	return toplevel, nil
 }
 
-// gitExecutable prefers the git config.LoadFile detected or the operator
-// configured, so the CLI and the daemon ask the same binary.
-func gitExecutable(cfg config.Config) string {
-	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
-		return strings.TrimSpace(*cfg.Tools.GitPath)
-	}
-	return "git"
-}
-
-// nonProjectIDCharacters mirrors projects.nonProjectIDPattern.
-var nonProjectIDCharacters = regexp.MustCompile(`[^a-z0-9]+`)
-
-// derivedProjectID predicts the id the daemon will derive for a path-only
-// POST /api/v1/projects.
-//
-// It restates projects.deriveProjectIDFromRepoPath, which cmd cannot import.
-// internal/projects stays authoritative — this copy only decides whether to ask
-// at all, never what the id finally is, and the daemon's answer is what gets
-// stored and printed. If the two ever drift, the cost is a collision reported
-// by the daemon instead of here, or a refusal the operator can bypass through
-// the API with an explicit id.
-func derivedProjectID(repoPath string) string {
-	segments := strings.FieldsFunc(repoPath, func(r rune) bool { return r == '/' || r == '\\' })
-	lastSegment := "project"
-	if len(segments) > 0 {
-		lastSegment = segments[len(segments)-1]
-	}
-	normalized := strings.Trim(nonProjectIDCharacters.ReplaceAllString(strings.ToLower(lastSegment), "-"), "-")
-	if normalized == "" {
-		return "project"
-	}
-	return normalized
-}
-
 func sameRepoPath(left string, right string) bool {
-	return filepath.Clean(strings.TrimSpace(left)) == filepath.Clean(strings.TrimSpace(right))
+	return canonicalRepoPath(left) == canonicalRepoPath(right)
+}
+
+func canonicalRepoPath(path string) string {
+	cleaned := filepath.Clean(strings.TrimSpace(path))
+	if evaluated, err := filepath.EvalSymlinks(cleaned); err == nil {
+		return filepath.Clean(evaluated)
+	}
+	return cleaned
 }
 
 func describeProject(project projectResponse) string {
