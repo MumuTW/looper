@@ -353,6 +353,16 @@ type DiscoveryInput struct {
 	Snapshot  *githubinfra.DiscoverySnapshot
 }
 
+// RouteIssueInput is an explicit, report-authorized route into Planner.
+// Unlike discovery, it deliberately does not consult labels or assignees:
+// Authority names the persisted semantic decision that authorized the route.
+type RouteIssueInput struct {
+	ProjectID string
+	Repo      string
+	Issue     IssueSummary
+	Authority string
+}
+
 type DiscoveryResult struct {
 	QueueItems     []storage.QueueItemRecord
 	CreatedLoopIDs []string
@@ -556,30 +566,84 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			continue
 		}
 		fingerprint := buildPlannerDiscoveryFingerprint(input.Repo, r.now(), issue)
-		loopResult, err := r.ensureLoopForIssue(ctx, *project, input.Repo, issue, fingerprint)
+		materialized, err := r.materializeIssue(ctx, *project, input.Repo, issue, login, fingerprint, "")
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		if loopResult.created {
-			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
-		}
-		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "awaiting_human" {
-			result.Skipped++
-			continue
-		}
-		// Anti-thrash: skip enqueue when ensureLoopForIssue left a previously
-		// failed loop in place because its discovery inputs match the last
-		// terminal failure.
-		if loopResult.record.Status == "failed" {
-			result.Skipped++
-			continue
-		}
-		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "title": issue.Title, "body": issue.Body, "url": issue.URL, "assignees": issue.Assignees, "labels": issue.Labels, "currentUserLogin": login, plannerQueuePayloadFPKey: fingerprint}})
-		if err != nil {
-			return DiscoveryResult{}, err
-		}
-		result.QueueItems = append(result.QueueItems, queueItem)
+		result.QueueItems = append(result.QueueItems, materialized.QueueItems...)
+		result.CreatedLoopIDs = append(result.CreatedLoopIDs, materialized.CreatedLoopIDs...)
+		result.Skipped += materialized.Skipped
 	}
+	return result, nil
+}
+
+// RouteIssue projects a persisted routing authority into Planner's durable
+// loop and queue. The loop and queue repositories provide the idempotency
+// boundary, so callers may safely replay the same authority after a partial
+// failure.
+func (r *Runner) RouteIssue(ctx context.Context, input RouteIssueInput) (DiscoveryResult, error) {
+	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil {
+		return DiscoveryResult{}, fmt.Errorf("planner repositories are not configured")
+	}
+	if strings.TrimSpace(input.Authority) == "" {
+		return DiscoveryResult{}, fmt.Errorf("planner route authority is required")
+	}
+	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	if project == nil {
+		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
+	}
+	if project.Archived || domain.IsAutoLaneHeld(domain.LoopTypePlanner, input.Issue.Labels) {
+		return DiscoveryResult{Skipped: 1}, nil
+	}
+	fingerprint := loops.ComputeDiscoveryFingerprint(
+		"planner",
+		"explicit-route",
+		strings.TrimSpace(input.Authority),
+	)
+	return r.materializeIssue(ctx, *project, input.Repo, input.Issue, "", fingerprint, strings.TrimSpace(input.Authority))
+}
+
+func (r *Runner) materializeIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentUserLogin, fingerprint, authority string) (DiscoveryResult, error) {
+	loopResult, err := r.ensureLoopForIssue(ctx, project, repo, issue, fingerprint)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	result := DiscoveryResult{}
+	if loopResult.created {
+		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+	}
+	switch loopResult.record.Status {
+	case "paused", "completed", "awaiting_human", "failed":
+		result.Skipped = 1
+		return result, nil
+	}
+	payload := map[string]any{
+		"issueNumber":            issue.Number,
+		"title":                  issue.Title,
+		"body":                   issue.Body,
+		"url":                    issue.URL,
+		"assignees":              issue.Assignees,
+		"labels":                 issue.Labels,
+		"currentUserLogin":       currentUserLogin,
+		plannerQueuePayloadFPKey: fingerprint,
+	}
+	if authority != "" {
+		payload["routingAuthority"] = authority
+	}
+	queueItem, err := r.enqueue(ctx, enqueueInput{
+		ProjectID:   project.ID,
+		LoopID:      loopResult.record.ID,
+		Repo:        repo,
+		IssueNumber: issue.Number,
+		Payload:     payload,
+	})
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	result.QueueItems = append(result.QueueItems, queueItem)
 	return result, nil
 }
 

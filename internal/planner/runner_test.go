@@ -123,6 +123,39 @@ func TestDiscoverIssuesEnqueuesEligibleWorkAndCreatesLoop(t *testing.T) {
 	}
 }
 
+func TestRouteIssueUsesPersistedAuthorityWithoutLabelOrAssignee(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{},
+		Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+	})
+	input := RouteIssueInput{
+		ProjectID: "project_1", Repo: "acme/looper", Authority: "triage:report-23",
+		Issue: IssueSummary{Number: 23, Title: "Route from triage", Body: "No routing label or assignee."},
+	}
+
+	first, err := runner.RouteIssue(context.Background(), input)
+	if err != nil {
+		t.Fatalf("RouteIssue() error = %v", err)
+	}
+	input.Issue.Title = "Edited after triage"
+	input.Issue.Labels = []string{"later-label"}
+	second, err := runner.RouteIssue(context.Background(), input)
+	if err != nil {
+		t.Fatalf("RouteIssue() replay error = %v", err)
+	}
+	if len(first.CreatedLoopIDs) != 1 || len(first.QueueItems) != 1 {
+		t.Fatalf("first RouteIssue() = %#v, want one loop and queue item", first)
+	}
+	if len(second.CreatedLoopIDs) != 0 || len(second.QueueItems) != 1 || second.QueueItems[0].ID != first.QueueItems[0].ID {
+		t.Fatalf("second RouteIssue() = %#v, want same durable queue item", second)
+	}
+	if plannerQueueDiscoveryFingerprint(first.QueueItems[0].PayloadJSON) != plannerQueueDiscoveryFingerprint(second.QueueItems[0].PayloadJSON) {
+		t.Fatal("persisted report authority changed after mutable issue fields changed")
+	}
+}
+
 func TestDiscoverIssuesSkipsGlobalHoldLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

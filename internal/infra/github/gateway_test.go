@@ -2638,6 +2638,40 @@ func TestListOpenIssuesPassesAllLabelsToGH(t *testing.T) {
 	}
 }
 
+func TestListOpenIssuesPassesSourceSearchToGH(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		want := "--search updated:>=2026-07-30T11:55:00Z sort:updated-desc"
+		if !strings.Contains(args, want) {
+			t.Fatalf("gh args = %q, want %q", args, want)
+		}
+		return shell.Result{Stdout: `[]`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if _, err := gateway.ListOpenIssues(context.Background(), ListOpenIssuesInput{
+		Repo: "acme/looper", Search: "updated:>=2026-07-30T11:55:00Z sort:updated-desc",
+	}); err != nil {
+		t.Fatalf("ListOpenIssues() error = %v", err)
+	}
+}
+
+func TestRepositoryPermissionAllowsWrite(t *testing.T) {
+	t.Parallel()
+	for _, permission := range []string{"write", "maintain", "admin", " ADMIN "} {
+		if !RepositoryPermissionAllowsWrite(permission) {
+			t.Fatalf("RepositoryPermissionAllowsWrite(%q) = false", permission)
+		}
+	}
+	for _, permission := range []string{"", "read", "triage"} {
+		if RepositoryPermissionAllowsWrite(permission) {
+			t.Fatalf("RepositoryPermissionAllowsWrite(%q) = true", permission)
+		}
+	}
+}
+
 func TestGatewayListsReviewRequestedPullRequestsThroughSearch(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

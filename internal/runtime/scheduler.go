@@ -34,6 +34,7 @@ import (
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/triager"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
 	"github.com/nexu-io/looper/internal/worker"
@@ -43,6 +44,10 @@ type plannerScheduler interface {
 	DiscoverIssues(context.Context, planner.DiscoveryInput) (planner.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*planner.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*planner.ProcessResult, error)
+}
+
+type triagerScheduler interface {
+	DiscoverIssues(context.Context, triager.DiscoveryInput) (triager.DiscoveryResult, error)
 }
 
 type coordinatorScheduler interface {
@@ -106,6 +111,7 @@ type defaultSchedulerTickInput struct {
 	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
+	Triager                  triagerScheduler
 	Planner                  plannerScheduler
 	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
@@ -115,6 +121,7 @@ type defaultSchedulerTickInput struct {
 	Snapshotter              snapshotScheduler
 	Config                   *config.Config
 	PlannerDiscoveryEnabled  *bool
+	TriagerEnabled           func(string) bool
 	CoordinatorEnabled       func(string) bool
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
@@ -3236,6 +3243,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		return nil
 	}
 
+	var triagerRunner triagerScheduler
+	var plannerRoleRunner *planner.Runner
 	var plannerRunner plannerScheduler
 	var coordinatorRunner coordinatorScheduler
 	var reviewerRunner reviewerScheduler
@@ -3309,9 +3318,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 
 	// Construct even when live config no longer resolves so sticky snapshot retries remain claimable.
 	resolvedPlanner, plannerConfigured := config.ResolveAgent(cfg, "", config.CodingRolePlanner)
+	var plannerExecutor *agent.ConfiguredExecutor
 	{
 		resolved := resolvedPlanner
-		plannerExecutor := newRoleAgentExecutor(resolved)
+		plannerExecutor = newRoleAgentExecutor(resolved)
 		var agentModel *string
 		if resolved.Model != nil {
 			model := *resolved.Model
@@ -3322,7 +3332,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if !plannerConfigured {
 			plannerAutoDiscovery = false
 		}
-		plannerRunner = planner.New(planner.Options{
+		plannerRoleRunner = planner.New(planner.Options{
 			DB:                 coordinator.DB(),
 			Repos:              repos,
 			GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: plannerStamper, config: &cfg},
@@ -3350,6 +3360,21 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
+		})
+		plannerRunner = plannerRoleRunner
+	}
+	if plannerConfigured && githubGateway != nil {
+		triagerRunner = triager.New(triager.Options{
+			Repos:   repos,
+			GitHub:  githubGateway,
+			Planner: plannerRoleRunner,
+			LLM: triager.NewAgentLLM(
+				plannerExecutor,
+				time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
+				time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
+			),
+			Now:            now,
+			SourceLookback: time.Duration(maxInt(300, 2*cfg.Scheduler.PollIntervalSeconds)) * time.Second,
 		})
 	}
 
@@ -3617,6 +3642,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ReconcileStaleRuns:   reconcileStaleRuns,
 			AsyncRunner:          runner,
 			RequestSchedulerWake: requestWake,
+			Triager:              triagerRunner,
 			Planner:              plannerRunner,
 			Coordinator:          coordinatorRunner,
 			Reviewer:             reviewerRunner,
@@ -3628,7 +3654,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			// Live discovery requires a currently resolvable agent; sticky retries
 			// still claim via always-present runners when vendor was removed
 			// (claimTypeSetsFromInput restricts unconfigured roles to snapshot items).
-			PlannerDiscoveryEnabled:  boolPtr(plannerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
+			PlannerDiscoveryEnabled: boolPtr(plannerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
+			TriagerEnabled: func(projectID string) bool {
+				roles := config.ProjectRoleConfigs(cfg, projectID)
+				return plannerConfigured && roles.Planner.AutoDiscovery && !roles.Coordinator.Enabled
+			},
 			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
 			ReviewerDiscoveryEnabled: boolPtr(reviewerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(fixerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
@@ -3847,7 +3877,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		admissionClosed := false
-		for _, lane := range codingDiscoveryLanes(input) {
+		for _, lane := range discoveryLanes(input) {
 			if !lane.Present {
 				continue
 			}
