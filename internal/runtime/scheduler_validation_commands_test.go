@@ -9,6 +9,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
+	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -100,7 +101,7 @@ func TestBuildDefaultSchedulerHandlersThreadsValidationCommandsIntoWorkerAndFixe
 	}
 }
 
-func TestBuildDefaultSchedulerHandlersWarnsWhenValidationGateIsEmpty(t *testing.T) {
+func TestCatalogSchedulerWarnsOnceWhenValidationGateIsEmpty(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -110,20 +111,33 @@ func TestBuildDefaultSchedulerHandlersWarnsWhenValidationGateIsEmpty(t *testing.
 	vendor := config.AgentVendorCodex
 	cfg.Agent.Vendor = &vendor
 
+	root := t.TempDir()
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repositories := storage.NewRepositories(coordinator.DB())
 	logger := &capturingSchedulerLogger{}
-	handlers := buildValidationCommandHandlers(t, cfg, logger)
-	if handlers.input == nil {
-		t.Fatal("handlers.input = nil")
+	handlers := buildCatalogSchedulerHandlers(projects.NewCatalog(cfg), nil, "", logger, coordinator, repositories, nil, nil, NewActiveExecutionRegistry(), nil, nil, time.Now, nil, nil, nil)
+	if handlers.snapshot == nil {
+		t.Fatal("handlers.snapshot = nil")
 	}
-	input := handlers.input(Services{})
+	_ = handlers.snapshot()
+	_ = handlers.snapshot()
 
-	if got := runnerValidationCommands(t, input.Worker); len(got) != 0 {
-		t.Fatalf("worker validationCommands = %#v, want empty", got)
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
+	count := 0
+	for _, entry := range logger.entries {
+		if entry.message == validationGateDisabledWarning {
+			count++
+		}
 	}
-	if got := runnerValidationCommands(t, input.Fixer); len(got) != 0 {
-		t.Fatalf("fixer validationCommands = %#v, want empty", got)
-	}
-	if !schedulerLoggerContains(logger, validationGateDisabledWarning) {
-		t.Fatal("scheduler did not warn that the validation gate is a silent no-op")
+	if count != 1 {
+		t.Fatalf("validation warning count = %d, want 1 across repeated snapshots", count)
 	}
 }

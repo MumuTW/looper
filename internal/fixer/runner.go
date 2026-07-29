@@ -3013,7 +3013,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
+	// A configured validation gate makes Looper the publishing boundary: the
+	// agent leaves changes local, then the validate and push steps publish only
+	// the content that passed.
+	agentMayPush := fixerAgentMayPush(r.allowAutoPush, r.validationCommands)
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, agentMayPush, r.disclosure, agentVendor, derefString(agentModel))
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -3083,6 +3087,10 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	return checkpoint, nil
 }
 
+func fixerAgentMayPush(allowAutoPush bool, validationCommands []string) bool {
+	return allowAutoPush && len(validationCommands) == 0
+}
+
 func (r *Runner) runReconcileCommitsStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint, err := r.reconcileCommits(ctx, input.Project, input.Checkpoint, buildFixerCommitMessage(input.PRNumber), input.Run)
 	if err != nil {
@@ -3109,8 +3117,11 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 	if err != nil {
 		return checkpoint, err
 	}
+	checkpoint.Validation = &result
 	if !result.Passed {
-		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, "Validation failed"), kind: FailureRetryableAfterResume}
+		failure := classifyFixerValidationFailure(result)
+		checkpoint.ResumePolicy = failure.resumePolicy
+		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
 	}
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
 	if err != nil {
@@ -3132,8 +3143,11 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		if err != nil {
 			return checkpoint, err
 		}
+		checkpoint.Validation = &second
 		if !second.Passed {
-			return checkpoint, &loopError{message: firstNonEmpty(second.Summary, "Validation failed after reconcile"), kind: FailureRetryableAfterResume}
+			failure := classifyFixerValidationFailure(second)
+			checkpoint.ResumePolicy = failure.resumePolicy
+			return checkpoint, &loopError{message: failure.message, kind: failure.kind}
 		}
 		finalInspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
 		if err != nil {
@@ -6511,6 +6525,7 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 			Command: "/bin/sh",
 			Args:    []string{"-c", command},
 			CWD:     input.CWD,
+			Env:     agent.BuildCommandEnvMap(input.CWD, ""),
 			// Supervisor-owned validation: track handle so shutdown retain-storage
 			// sees Kill/Drain failures even when validation collapses them to Passed=false.
 			Tracker: r.containmentTracker,
@@ -6534,6 +6549,30 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	}
 
 	return ValidationResult{Passed: true, Summary: "Validation passed", Output: strings.Join(outputs, "\n")}, nil
+}
+
+type fixerValidationFailure struct {
+	message      string
+	kind         QueueFailureKind
+	resumePolicy string
+}
+
+func classifyFixerValidationFailure(result ValidationResult) fixerValidationFailure {
+	message := firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed")
+	details := strings.ToLower(strings.TrimSpace(strings.Join([]string{result.Summary, result.Output}, "\n")))
+	if containsAnyFixerValidationHint(details, []string{"command not found", "executable file not found", "timed out", "timeout", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
+		return fixerValidationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
+	}
+	return fixerValidationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
+}
+
+func containsAnyFixerValidationHint(message string, hints []string) bool {
+	for _, hint := range hints {
+		if strings.Contains(message, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 type eventInput struct {

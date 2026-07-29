@@ -1075,10 +1075,10 @@ To restore it by default for all project additions:
 
 ```toml
 [defaults]
-validationCommands = ["gofmt -l .", "go vet ./...", "go test ./...", "go build ./..."]
+validationCommands = ["test -z \"$(gofmt -l .)\"", "go vet ./...", "go test ./...", "go build ./..."]
 ```
 
-The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides).
+The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides). Commands come only from daemon configuration, never from the target worktree, so repository changes cannot inject host shell commands into this gate.
 
 The default is empty, which keeps the historical behavior: the validate step passes without running anything and "done" is only the agent's own self-assessment. `looperd` logs a startup warning while the list is empty so the no-op is visible. The field is restart-bound.
 
