@@ -997,6 +997,89 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, reviewer["waiting"], float64(1))
 	assertEqual(t, reviewer["terminated"], float64(1))
 	assertEqual(t, reviewer["stopped"], float64(1))
+
+	tools := data["tools"].(map[string]any)
+	reviewPublish, ok := tools["reviewPublish"].(map[string]any)
+	if !ok {
+		t.Fatalf("tools.reviewPublish missing: %#v", tools)
+	}
+	if _, ok := reviewPublish["publishingDisabled"].(bool); !ok {
+		t.Fatalf("tools.reviewPublish.publishingDisabled missing: %#v", reviewPublish)
+	}
+	recovery := service["recovery"].(map[string]any)
+	outstanding, ok := recovery["outstanding"].(map[string]any)
+	if !ok {
+		t.Fatalf("service.recovery.outstanding missing: %#v", recovery)
+	}
+	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(0))
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
+}
+
+func TestHandlerStatusSurfacesReviewPublishDisabledAndQuarantineDebt(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	incapable := filepath.Join(t.TempDir(), "old-looper")
+	if err := os.WriteFile(incapable, []byte("#!/bin/sh\necho unknown >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(looper) error = %v", err)
+	}
+	cfg.Tools.LooperPath = &incapable
+
+	nowISO := time.Now().UTC().Format(time.RFC3339Nano)
+	repos := rt.Services().Repositories
+	projectID := "project_status_debt"
+	loopID := "loop_status_debt"
+	runID := "run_status_debt"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Debt", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	mi := "manual_intervention"
+	reason := "startup recovery quarantine"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_status_debt", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:project_status_debt:loop_status_debt", Priority: storage.QueuePriorityWorker, Status: "manual_intervention",
+		AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastError: &reason, LastErrorKind: &mi, FinishedAt: &nowISO,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	pid := int64(9090)
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID: "exec_status_debt", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
+		PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(t.TempDir()),
+		HeartbeatCount: 0, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	service := data["service"].(map[string]any)
+	tools := data["tools"].(map[string]any)
+	assertEqual(t, tools["looperPath"], incapable)
+	reviewPublish := tools["reviewPublish"].(map[string]any)
+	assertEqual(t, reviewPublish["publishingDisabled"], true)
+	assertEqual(t, reviewPublish["capable"], false)
+	if reason, _ := reviewPublish["reason"].(string); strings.TrimSpace(reason) == "" {
+		t.Fatalf("reviewPublish.reason empty: %#v", reviewPublish)
+	}
+	outstanding := service["recovery"].(map[string]any)["outstanding"].(map[string]any)
+	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(1))
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
+	reasons, _ := service["degradedReasons"].([]any)
+	joined := fmt.Sprintf("%v", reasons)
+	if !strings.Contains(joined, "review_publish_disabled") || !strings.Contains(joined, "quarantine_orphan_debt") {
+		t.Fatalf("degradedReasons = %#v, want both review and quarantine signals", reasons)
+	}
 }
 
 func TestHandlerStatusIncludesRedactedForgejoProviderHealth(t *testing.T) {

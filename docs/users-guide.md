@@ -14,7 +14,7 @@ Make sure these work first:
 
 ```bash
 command -v looperd
-looper status   # config file, daemon reachability, registered projects
+looper status   # config, daemon liveness, review/orphan ops lines, projects
 gh auth status  # GitHub projects only
 ```
 

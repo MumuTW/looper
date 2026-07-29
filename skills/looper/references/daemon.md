@@ -24,6 +24,10 @@ curl -sS "http://127.0.0.1:17310/api/v1/status"
 curl -sS "http://127.0.0.1:17310/api/v1/version"
 ```
 
+`GET /api/v1/healthz` is **liveness** only (process up + storage/migration check). It can still be HTTP 200 when reviewer publishing is fail-closed or quarantined orphan runs remain.
+
+`GET /api/v1/status` (and the ops lines on `looper status`) is the **readiness / ops** surface: admission state, `tools.looperPath` + review-publish capability, and live `service.recovery.outstanding` quarantine/orphan debt beyond the one-shot startup recovery snapshot.
+
 Dashboard: `http://127.0.0.1:<port>/dashboard/` (mint bootstrap codes via `POST /api/v1/dashboard/bootstrap/code` when `server.authMode=local-token`).
 
 ## Runtime layout

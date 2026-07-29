@@ -65,7 +65,11 @@
             "admissionState": "ready",
             "startedAt": "2026-04-11T12:00:00.000Z",
             "recovery": {
-              "expiredLocksReleased": 1
+              "expiredLocksReleased": 1,
+              "outstanding": {
+                "quarantinedActiveExecutions": 0,
+                "quarantinedRunningRuns": 0
+              }
             },
             "binary": {
               "name": "looperd",
@@ -207,7 +211,12 @@
           "tools": {
             "git": true,
             "gh": true,
-            "osascript": true
+            "osascript": true,
+            "reviewPublish": {
+              "capable": false,
+              "publishingDisabled": true,
+              "reason": "trusted looper path is not configured"
+            }
           }
         },
         "requestId": "fixture-request-id"
