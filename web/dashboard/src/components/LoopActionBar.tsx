@@ -77,12 +77,14 @@ const LABELS: Record<LoopAction, string> = {
 /** True when preflight is missing on older daemons — fall back to plain retry. */
 export function isWorktreeRouteUnavailable(err: unknown): boolean {
   if (!(err instanceof ApiError)) return false;
-  if (err.code === "ROUTE_NOT_FOUND") return true;
-  if (err.status === 404) {
-    const msg = (err.message || "").toLowerCase();
-    return msg.includes("unknown route") || msg.includes("not found");
-  }
-  return false;
+  // Only a daemon too old to serve /worktree may skip the dirty-worktree gate,
+  // and only the typed code says so. Matching the message instead disarmed the
+  // gate on answers from the route itself: /worktree returns 404
+  // PROJECT_NOT_FOUND ("Project not found: …") when the loop's project row is
+  // archived, and the retry that follows carries unreviewed edits into the next
+  // agent run. The status is checked too because the code comes from a response
+  // body anything in front of the daemon can author.
+  return err.status === 404 && err.code === "ROUTE_NOT_FOUND";
 }
 
 /**
