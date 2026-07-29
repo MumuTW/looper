@@ -22,42 +22,34 @@ Concretely, for a `plane` project Looper maps each Plane work-item onto its inte
 
 Provider capabilities: issues, labels, comments, and assignees are supported; pull requests, diffs, and native reviews are **not** (they are delegated to GitHub). Review discovery is by label, review publishing is comment-only, and issue discovery is by polling.
 
-## One-command bootstrap
+## Setting it up
 
-```bash
-looper bootstrap --yes \
-  --provider plane \
-  --project-path /absolute/path/to/open-design \
-  --code-repo acme/open-design \
-  --plane-workspace acme-design \
-  --plane-project 49832a02-3158-4faf-bf2f-d0e39c40c7e6 \
-  --trigger-label looper:plan \
-  --feishu-webhook-env LOOPER_FEISHU_WEBHOOK_URL
-```
+There is no generator for a Plane config. `looper bootstrap --provider plane`, and every flag it took, was removed with the old CLI. The project API can register a plain repo path against the running daemon, but a Plane binding lives in the config file's `providers` and `projects` sections, which the project API deliberately refuses to modify.
 
-Flags:
+Run `looper init` for a starter config, then add the sections below by hand:
 
-- `--provider plane` — select the Plane task source (default is `github`, unchanged).
-- `--project-path` — the local checkout of the GitHub code repo (becomes `repoPath`). Required for plane.
-- `--code-repo owner/repo` — the GitHub repo where PRs are opened. If omitted, Looper detects it from the checkout's `github.com` origin remote.
-- `--plane-workspace` — the Plane workspace slug (required).
-- `--plane-project` — the Plane project UUID (required).
-- `--plane-base-url` — Plane REST API base (optional; defaults to the public Plane API base `https://plane.powerformer.net/api/v1`).
-- `--plane-token-env` — env var holding the Plane API key (optional; defaults to `PLANE_API_KEY`).
-- `--trigger-label` — the issue label that triggers Planner/Worker discovery (optional; defaults to `looper:plan`).
-- `--feishu-webhook-env ENV_NAME` — when set, adds a `notifications.webhook` block (`enabled: true`, `format: "feishu"`, `levels: ["action_required", "failure"]`) pointed at that env var. Works with any provider.
+| Value | Config path | Notes |
+| --- | --- | --- |
+| Plane workspace slug | `providers[].workspace` | required |
+| Plane project UUID | `providers[].projectId` | required |
+| Plane REST API base | `providers[].baseUrl` | e.g. `https://plane.example.com/api/v1` |
+| Env var holding the Plane API key | `providers[].tokenEnv` | conventionally `PLANE_API_KEY`; never store the key itself |
+| GitHub code repo (`owner/repo`) | `projects[].repo` | where PRs are opened |
+| Local checkout of that repo | `projects[].repoPath` | absolute path |
+| Trigger label | `roles.planner.triggers.labels` and `roles.worker.triggers.labels` | conventionally `looper:plan` |
+| Feishu/generic webhook env var | `notifications.webhook.urlEnv` | with `enabled = true`, `format = "feishu"`, `levels = ["action_required", "failure"]` |
 
-`--provider plane` generates a fresh config; if one already exists at the target path, remove it or pass `--config <new-path>`.
+The config file is read at daemon startup, so start (or restart) `looperd` after editing it.
 
 ## Environment variables to export
 
 Both are read from the daemon environment and are never written into the config file:
 
 ```bash
-# The Plane API key (name matches --plane-token-env; default PLANE_API_KEY).
+# The Plane API key (name matches providers[].tokenEnv; conventionally PLANE_API_KEY).
 export PLANE_API_KEY='plane_api_xxx'
 
-# The Feishu (or generic) webhook URL (name matches --feishu-webhook-env).
+# The Feishu (or generic) webhook URL (name matches notifications.webhook.urlEnv).
 export LOOPER_FEISHU_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/xxxx'
 ```
 
@@ -150,7 +142,7 @@ How it works:
 
 ## How discovery maps Plane labels to roles
 
-- Planner and Worker discovery poll the Plane project and keep only work-items that carry **all** of `roles.<role>.triggers.labels` (label UUIDs are resolved to names first). With the bootstrap defaults both roles trigger on a single `--trigger-label` (default `looper:plan`).
+- Planner and Worker discovery poll the Plane project and keep only work-items that carry **all** of `roles.<role>.triggers.labels` (label UUIDs are resolved to names first). Configure both roles with the same single trigger label (conventionally `looper:plan`).
 - Because Plane assignees are UUIDs — not GitHub logins — discovery keys on the label only. The bootstrap sets `requireAssigneeCurrentUser: false`; do not set it to `true` for plane projects or discovery will never match.
 - Coordinator and Fixer discovery lanes are skipped for plane projects (they are GitHub-only). Reviewer runs against the GitHub PRs that Worker opens.
 - Label and comment mutations Looper performs during a run go to Plane: adding a label creates it if missing and merges (never clobbers) the work-item's existing labels; comments are posted as `comment_html`.
@@ -165,10 +157,9 @@ These are documented gaps, not blockers:
 
 ## Verify
 
-1. Export `PLANE_API_KEY` (and the Feishu webhook env if used), then start the daemon: `looper daemon start`.
-2. Confirm the plane project is discovered and claims a labelled work-item — watch for a planner/worker loop and queue item:
+1. Export `PLANE_API_KEY` (and the Feishu webhook env if used) in the daemon's own shell, then start it: `looperd`.
+2. Confirm the config loaded and the plane project is registered:
    ```bash
-   looper ps
-   looper status
+   curl -sS "http://127.0.0.1:17310/api/v1/status"
    ```
-   A work-item carrying the trigger label (e.g. `looper:plan`) should produce a planner loop within one poll interval, and Worker opens the PR on the GitHub `repo`.
+3. Confirm it claims a labelled work-item. The CLI has no loop listing — watch the daemon's own output, the dashboard, or `GET /api/v1/loops`. A work-item carrying the trigger label (e.g. `looper:plan`) should produce a planner loop within one poll interval, and Worker opens the PR on the GitHub `repo`.

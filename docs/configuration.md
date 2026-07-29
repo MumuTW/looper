@@ -30,7 +30,7 @@ Operational notes:
 - `loopernet` centralizes webhook ingress and Node wakeups, but it must not mutate GitHub on its own.
 - Coordinator writes coarse GitHub authority first, then writes the exact target label last.
 - polling remains enabled as fallback and drift recovery when webhook delivery or SSE wakeups are missed.
-- if you use `looper network join` without `--no-enroll-projects`, Looper rejects enrollment when Planner or Fixer auto-discovery is still enabled for those projects; disable those settings first or opt projects into Routed mode manually.
+- when enabling Routed mode / network membership in config, Looper rejects enrollment when Planner or Fixer auto-discovery is still enabled for those projects; disable those settings first or opt projects into Routed mode manually.
 
 The formal contract is documented in ADRs [0007](adr/0007-coordinator-admission-assignment-authority.md) through [0011](adr/0011-coordinator-control-plane-for-routed-projects-v1.md).
 
@@ -151,7 +151,7 @@ Behavior:
 To migrate the legacy default JSON config explicitly, run:
 
 ```bash
-looper config migrate
+# looper config migrate  # removed — edit the config file by hand
 ```
 
 Useful migration flags:
@@ -206,7 +206,7 @@ Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewe
 
 Schema migration is independent from config-file format migration: precedence stays `defaults → config file → environment variables → CLI flags` regardless of whether a file still uses legacy reviewer paths or legacy JSON defaults.
 
-`looper config migrate` is the only product-supported file-writing migration path. Normal CLI and daemon startup never rewrite config files implicitly.
+There is no `looper config migrate` on the stripped CLI. Edit the config file by hand (or use the dashboard for curated hot-safe fields). Normal daemon startup never rewrites config files implicitly.
 
 ## Minimal setup
 
@@ -361,7 +361,7 @@ Looper supports three provider kinds:
 
 - `github` — existing default behavior, backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
 - `forgejo` — REST-backed planner, worker, native reviewer-request/review flows, summary-comment compatibility, and manual/direct native-review-comment fixer runs. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
-- `plane` — a **task-source** provider: issues (work-items) are read from a [Plane](https://plane.so) project, while pull requests, diffs, and reviews stay on the project's GitHub code repo. Use this to let Looper consume Plane work-items directly as its issue source without creating a redundant GitHub issue. See [Plane provider + Feishu HITL setup](plane-provider.md) for the full guide, including the one-command `looper bootstrap --provider plane …` flow.
+- `plane` — a **task-source** provider: issues (work-items) are read from a [Plane](https://plane.so) project, while pull requests, diffs, and reviews stay on the project's GitHub code repo. Use this to let Looper consume Plane work-items directly as its issue source without creating a redundant GitHub issue. See [Plane provider + Feishu HITL setup](plane-provider.md) for the full guide (config-file only; there is no bootstrap CLI).
 
 Forgejo provider example:
 
@@ -371,25 +371,17 @@ Token-env bootstrap (headless / CI):
 
 ```bash
 export FORGEJO_TOKEN=<forgejo-token>
-looper bootstrap --provider forgejo \
-  --project-path /absolute/path/to/example \
-  --forgejo-url https://code.example.com \
-  --auth token-env \
-  --forgejo-token-env FORGEJO_TOKEN
+# # config-file providers block (looper bootstrap removed)  # removed — write providers/projects in the config file
 ```
 
 Tea-backed bootstrap (reuse an existing `tea` login; no second token env):
 
 ```bash
 tea login list
-looper bootstrap --provider forgejo \
-  --project-path /absolute/path/to/example \
-  --forgejo-url https://code.example.com \
-  --auth tea \
-  --tea-login powerformer-code
+# # config-file providers block (looper bootstrap removed)  # removed — write providers/projects in the config file
 ```
 
-Existing installations can manage providers with `looper provider add|list|test|remove`. The commands persist auth strategy and credential *references* (`tokenEnv` name or `teaLogin`) and report when `looperd` must be restarted. Looper never reads tea's config file for tokens and never stores raw tokens.
+Providers are managed in the config file (and imported at daemon startup). There is no `looper provider` CLI. Looper never reads tea's config file for tokens and never stores raw tokens.
 
 ```toml
 [agent]
@@ -429,12 +421,12 @@ Forgejo rules:
 - When `auth` is omitted, a lone `tokenEnv` implies `token-env` and a lone `teaLogin` implies `tea`. Setting both without `auth` is a validation error.
 - Tea-backed API calls use `tea api --login <teaLogin>`; Looper never parses tea credential storage or copies the token into config, logs, argv, event payloads, or environment variables.
 - Actionable tea auth failures surface as `tea_missing`, `tea_login_missing`, `tea_login_host_mismatch`, or `tea_auth_failed` (and never fall through to GitHub).
-- Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, persisted by `looper project add --provider <id>`, or created with `--forgejo-url` plus either `--forgejo-token-env` or `--auth tea --tea-login`. The repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
+- Forgejo projects require a `provider` and repo (`owner/name`) in the config file. The project HTTP API can register a local `repoPath` against a running daemon, but provider bindings themselves are file-managed. Already-started work retains its previous catalog snapshot.
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
 - Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
 - Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses native review-request discovery and native review publication, fixer supports the manual native-comment + summary protocol described below, and coordinator/auto-merge/thread resolution stay disabled.
 - Explicitly re-enabling unsupported Forgejo behavior fails config validation instead of silently downgrading behavior.
-- `looper status` reads the Forgejo version, identity, repository permissions, and OpenAPI document with a bounded timeout and no mutations. Capability output separates Looper's configured support from the server-observed contract; missing or disabled OpenAPI is `unknown`. The probe is fresh for each status request and is not persisted or used as a daemon startup gate.
+- Provider capability probes run inside the daemon and are exposed on status endpoints / the dashboard (there is no `looper status` CLI). Capability output separates Looper's configured support from the server-observed contract; missing or disabled OpenAPI is `unknown`.
 
 Forgejo reviewer discovery defaults to native review requests. Configured reviewer labels remain an optional source; when labels and review requests are both enabled, Forgejo uses their union with deterministic PR-number dedupe. Native clean and blocking outcomes follow `reviewEvents` (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`). Set `roles.reviewer.behavior.publishMode = "summary_comment"` and configure reviewer labels to retain the legacy top-level Reviewer Summary compatibility flow. Native operations require the corresponding endpoint in the Forgejo OpenAPI contract; older instances fail with a provider capability error instead of silently switching modes.
 
@@ -445,7 +437,7 @@ Forgejo reviewer discovery defaults to native review requests. Configured review
 - `providers[].kind = "plane"` requires a non-empty `tokenEnv` (the env var holding the Plane API key), `workspace` (the Plane workspace slug), and `projectId` (the Plane project UUID). `baseUrl` is optional and defaults to the public Plane API base.
 - The project bound to a plane provider requires explicit `provider` and `repo`, where `repo` is the **GitHub code repo** (`owner/name`) where PRs are opened, and `repoPath` is its local checkout.
 - Discovery keys on the trigger label only; because Plane assignees are UUIDs (not GitHub logins), set `roles.*.triggers.requireAssigneeCurrentUser = false`.
-- One command scaffolds all of this: `looper bootstrap --provider plane …` (see [Plane provider + Feishu HITL setup](plane-provider.md)).
+- Scaffold this by editing the config file (see [Plane provider + Feishu HITL setup](plane-provider.md)); there is no bootstrap CLI.
 
 ### Forgejo live sandbox e2e
 
@@ -927,7 +919,7 @@ requireReviewRequest = false
 
 This refactor is a warning-only migration release.
 
-- Looper does **not** add `looper config migrate` in this change set.
+- Looper does **not** ship a `looper config migrate` command on the stripped CLI.
 - Looper does **not** rewrite, rename, convert, or delete user config files during startup.
 - Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path.
 - Accepted legacy config paths, legacy environment variable names, and legacy CLI flags still load during this release, but they emit actionable replacement guidance.
@@ -1055,7 +1047,7 @@ Reviewer behavior matrix:
 One-off reviewer jobs can snapshot the policy into loop metadata so queued work is not affected by later daemon config changes:
 
 ```bash
-looper review owner/repo#123 \
+# looper review  # removed — use discovery / dashboard
   --clean-review-event APPROVE \
   --blocking-review-event REQUEST_CHANGES
 ```
@@ -1063,7 +1055,7 @@ looper review owner/repo#123 \
 To restore the previous synchronous `project add` behavior for one command:
 
 ```bash
-looper project add --snapshot-mode full /absolute/path/to/repo
+# register via POST /api/v1/projects or [[projects]] in config
 ```
 
 To restore it by default for all project additions:

@@ -2,48 +2,50 @@
 
 This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, native reviewer requests/reviews, summary-comment compatibility, and the manual/direct native-review-comment fixer path.
 
+> **CLI strip (read first).** The full `looper` CLI was removed ahead of the role-model rewrite. The **only** operator verbs are:
+>
+> `start` · `pause` · `retry` · `stop` · `close` · `takeover` · `handback` · `respond` · `version`
+>
+> (plus machine-only `review submit`). There is no `bootstrap`, `init`, `status`, `project add`, `daemon *`, `ps`, `logs`, `jump`, `plan`, `review`, `work`, or `webhook`/`provider`/`network` admin. Where this guide still shows an old command, treat it as **intent** and do the equivalent via forge labels, the config file, the dashboard, or the daemon HTTP API. Current install surface: [installation.md](installation.md) and the repository README.
+
 ## 1. Prerequisites
 
 Make sure these work first:
 
 ```bash
-looper status
-looper project list
+command -v looperd
+command -v looper
 gh auth status  # GitHub projects only
+curl -sS "http://127.0.0.1:17310/api/v1/healthz"   # daemon must be running
 ```
 
-If the project is not registered in Looper yet:
+If the project is not registered yet, use the dashboard or:
 
 ```bash
-looper project add /path/to/repo --id myproj --repo owner/repo
+curl -sS -X POST "http://127.0.0.1:17310/api/v1/projects" \
+  -H 'Content-Type: application/json' \
+  -d '{"repoPath":"/absolute/path/to/repo"}'
 ```
 
-If webhook mode reports `degraded`, inspect stale GitHub CLI forwarder hooks first:
-
-```bash
-looper webhook status
-looper webhook cleanup owner/repo
-# if the dry run shows stale GitHub CLI hooks:
-looper webhook cleanup owner/repo --confirm
-```
+Webhook mode is configured in the config file (`webhook.mode` and per-project overrides). Observe health with `GET /api/v1/webhook/status` or the dashboard. Clearing stale GitHub CLI forwarder hooks is a manual `gh api` operation after you confirm the dry-run payload — there is no `looper webhook cleanup`.
 
 Also make sure:
 
-- `looperd` is running
+- `looperd` is running (foreground, or under your own process manager)
 - your local repo can `git fetch` and `git push`
 - GitHub projects: `gh` is authenticated with the target GitHub account
-- Forgejo projects: for `token-env` auth, the configured provider `tokenEnv` is exported in the daemon environment; for `tea` auth, the selected tea login must already be available to the daemon user
-- each coding role you want to run can resolve a vendor: either set global `config.agent.vendor` (for example via `looper bootstrap --agent-vendor opencode`), or supply vendor via `agent.profiles` / `roles.<role>.agent` as described in [Multi-role agent vendor and model](configuration.md#multi-role-agent-vendor-and-model). A single global vendor is the zero-diff default that covers planner, worker, reviewer, and fixer until you add per-role bindings. Coordinator triage always uses the global agent only and is skipped when global vendor is unset.
+- Forgejo projects: put provider auth in the config file (`tokenEnv` or `teaLogin`) and export any required env vars in the daemon environment
+- each coding role you want to run can resolve a vendor: set global `agent.vendor` in the config (for example `vendor = "opencode"`), or supply vendor via `agent.profiles` / `roles.<role>.agent` as described in [Multi-role agent vendor and model](configuration.md#multi-role-agent-vendor-and-model). A single global vendor is the zero-diff default that covers planner, worker, reviewer, and fixer until you add per-role bindings. Coordinator triage always uses the global agent only and is skipped when global vendor is unset.
 
-Forgejo projects can be onboarded with `looper bootstrap --provider forgejo`, managed with `looper provider add|list|test|remove`, or added to a running installation with `looper project add --forgejo-url ...` plus either `--forgejo-token-env` or `--auth tea --tea-login`. Tea-backed providers reuse an explicit `tea` login for the provider host and do not require a second token environment variable. For configured providers, pass the provider id explicitly; `--provider forgejo` selects it only when the origin has one unambiguous match. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
+Forgejo projects are onboarded by editing the config file's `providers` and `projects` sections (or importing `[[projects]]` at daemon startup). There is no `looper bootstrap --provider forgejo` and no `looper provider` CLI. See [configuration](configuration.md#provider-support).
 
-`looper status` probes each configured Forgejo provider with bounded, read-only requests. Human and JSON output distinguish endpoint reachability, token authentication, current identity, server version, per-project read/write access, and configured versus observed capabilities. An unavailable OpenAPI contract is reported as `unknown`, never as supported. Status output omits provider URLs, token environment names, tokens, and raw network errors.
+Provider health is visible on the dashboard and via `GET /api/v1/status`; the stripped CLI has no `looper status` verb.
 
 ### Grok Build (xAI)
 
 For xAI Grok Build, configure `agent.vendor = "grok-build"`; Looper runs the `grok` executable. Authenticate the daemon with `grok login --device-auth` or by providing `XAI_API_KEY` in its environment—never commit an API-key value. Looper defaults to `--always-approve --sandbox off` so Grok can update Git metadata outside a linked worktree; configure `--sandbox` explicitly if a stricter profile works with your repository layout.
 
-Configured Grok arguments take precedence: `--permission-mode` can prompt or fail unattended work, a non-`plain` `--output-format` can break direct completion-marker parsing, and `-p`/`--single` replaces Looper's generated task prompt. Grok Build has no daemon native resume or interactive `looper resume` takeover. Retries start with a fresh checkpoint prompt; Looper never uses ambient `--continue`.
+Configured Grok arguments take precedence: `--permission-mode` can prompt or fail unattended work, a non-`plain` `--output-format` can break direct completion-marker parsing, and `-p`/`--single` replaces Looper's generated task prompt. Grok Build has no daemon native resume or interactive park-for-handwork path beyond the generic `looper takeover <selector>` loop park. Retries start with a fresh checkpoint prompt; Looper never uses ambient `--continue`.
 
 ## 1a. Local-only vs Routed projects
 
@@ -66,10 +68,10 @@ Before enrolling Nodes, deploy exactly one active `loopernet` instance per Netwo
 
 Typical Routed rollout:
 
-1. join each Node to `loopernet` with `looper network join <url> --key ... --name <node>`
+1. join each Node to `loopernet` by configuring network membership in the config file / dashboard (the `looper network join` CLI was removed)
 2. disable unsupported routed auto-discovery (`planner` and `fixer`) before opting projects into `network.mode=routed`
 3. keep Worker and Reviewer identities stable per Node; duplicate GitHub identities are safe only because the exact target label disambiguates which Node may claim
-4. restart `looperd` and confirm `looper network status --verbose` shows membership, identity, and lease state
+4. restart `looperd` and confirm membership, identity, and lease state on the dashboard or `GET /api/v1/network/status`
 
 Operator recovery rules:
 
@@ -96,10 +98,10 @@ If no project matches the current directory, or multiple projects match, pass `-
 | Role | Purpose | Common entrypoint |
 | --- | --- | --- |
 | `coordinator` | Proactively triages fresh issues and commits a Disposition with durable labels | runs automatically inside `looperd` |
-| `planner` | Generates a spec from an issue and opens a spec PR | `looper plan --project <id> --issue <num>` |
-| `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | `looper review <repo>#<pr> [--loop]` or `looper review <pr> [--loop]` from inside the repo |
+| `planner` | Generates a spec from an issue and opens a spec PR | Label issue `looper:plan` + assign (or `POST /api/v1/planners`) |
+| `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | Review-request / label discovery (or dashboard / API) |
 | `fixer` | Fixes PR issues based on review comments and tries to resolve threads | `looper fix <repo>#<pr>` |
-| `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | `looper work --issue <num>` or `looper work --project <id> --issue <num>` |
+| `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | Label `looper:worker-ready` / `looper:spec-ready` (or `POST /api/v1/workers`) |
 
 Forgejo MVP role support:
 
@@ -207,7 +209,7 @@ Autonomous dispatch stops immediately when any veto signal is present:
 ### Start it manually
 
 ```bash
-looper plan --project myproj --issue 123
+# intent: start planner for issue 123 — label looper:plan + assign, or POST /api/v1/planners
 ```
 
 This creates a `planner` loop targeting that issue.
@@ -246,19 +248,19 @@ If planner cannot assign the issue in GitHub, it reports a retryable failure rat
 ### One-time review
 
 ```bash
-looper review owner/repo#42
+# intent: review that PR — discovery via review-request or looper:spec-reviewing
 ```
 
 If you are already inside the registered repo, this usually also works:
 
 ```bash
-looper review 42
+# intent: review PR 42 in the registered repo
 ```
 
 ### Continuous review
 
 ```bash
-looper review owner/repo#42 --loop
+# intent: continuous review — ensure review-request/discovery; use dashboard for loop control
 ```
 
 Use this when new commits are expected to keep landing on the PR.
@@ -268,7 +270,7 @@ Use this when new commits are expected to keep landing on the PR.
 Reviewer mainly watches two kinds of PRs:
 
 - open PRs where the current GitHub user was requested as a reviewer
-- manually-started reviewer loops from this machine, including `looper review owner/repo#42 --loop`
+- manually-started reviewer loops from this machine, including `# intent: continuous review — ensure review-request/discovery; use dashboard for loop control`
 
 For the default review-requested path, Looper asks GitHub for PRs requested from the current user instead of only filtering the first page of open PRs locally.
 
@@ -355,7 +357,7 @@ In practice, `reviewer` and `fixer` often alternate until the spec PR is ready f
 ### Start from an issue
 
 ```bash
-looper work --project myproj --issue 123
+# intent: worker for issue 123 — label looper:worker-ready or looper:spec-ready
 ```
 
 This is the recommended entrypoint.
@@ -363,7 +365,7 @@ This is the recommended entrypoint.
 If you are already inside the target repo, you can usually omit `--project`:
 
 ```bash
-looper work --issue 123
+# intent: worker for issue 123 — label looper:worker-ready or looper:spec-ready
 ```
 
 If that issue already has a related planner loop, worker will try to reuse planner output, including:
@@ -380,7 +382,7 @@ For Forgejo projects, Worker does not claim issues by mutating assignees. The is
 ### Start directly from a spec
 
 ```bash
-looper work --project myproj --title "Implement feature" --spec specs/2026-04-23-123-my-feature.md
+# intent: worker with explicit spec — use dashboard/API; CLI work verb removed
 ```
 
 ### What happens when worker takes over a `spec-ready` PR
@@ -454,54 +456,54 @@ Semantics:
 - there is no issue/PR inheritance.
 - Looper never adds or removes hold labels.
 - removing a hold takes effect on the next normal scan.
-- only explicit manual `looper work/review/fix --force` or API create requests with `force=true` can bypass hold.
+- only API create requests with `force=true` (or equivalent dashboard actions) can bypass hold; the old `looper work/review/fix --force` CLI is gone.
 
 Create-time CLI/API hold validation is best-effort only when the local project repo path or configured `gh` path is unavailable. If those are present but remote `gh` inspection fails, creation fails fast. Automatic discovery and runtime checks still use live remote labels as authority whenever Looper can fetch them.
 
 ## 13. Common GitHub / PR commands
 
-Inspect PRs:
+Inspect PRs with `gh` (the old `looper pr *` verbs are gone):
 
 ```bash
-looper pr list
-looper pr show owner/repo#42
-looper pr status owner/repo#42
+gh pr list
+gh pr view 42
+gh pr checks 42
 ```
 
 Create a reviewer task:
 
 ```bash
-looper review owner/repo#42
-looper review owner/repo#42 --loop
-looper review 42 --loop
+# intent: review that PR — discovery via review-request or looper:spec-reviewing
+# intent: continuous review — ensure review-request/discovery; use dashboard for loop control
+# intent: continuous review of PR 42 in the registered repo
 ```
 
 Start fixer for an existing PR:
 
 ```bash
-looper loop start --type fixer --pr owner/repo#42
+# looper loop start  # removed — fixer discovery + dashboard control
 ```
 
 ## 14. How to inspect current activity
 
 ```bash
-looper ps
-looper describe 12
-looper logs 12 --follow
-looper jump 12
+# looper ps  # removed — use dashboard
+# looper describe  # removed — use dashboard
+# intent: stream logs for loop 12 — open the dashboard loop detail view
+# intent: open worktree for loop 12 — copy path from dashboard dirty-worktree dialog
 looper stop 12
-looper run reconcile-stale
+# looper run reconcile-stale  # removed
 ```
 
-Typical usage:
+Typical usage (stripped CLI + dashboard):
 
-- `looper ps`: see which loops are currently running (includes a truncated failure reason when present)
-- `looper describe <id>`: show why a loop is blocked (manual intervention reason, diagnosis); same as `looper loop inspect`
-- `looper logs <id> --follow`: stream logs live
-- `looper jump <id>`: print the shell command for the loop's worktree; use `eval "$(looper jump 12)"` to actually change directories, or pass `--print-path` to print just the path
-- `looper worktree cleanup`: inspect Looper-managed worktree cleanup candidates without deleting anything; add `--confirm` for one immediate cleanup pass or `--json` for structured output
-- `looper stop <id>`: stop an active loop
-- `looper run reconcile-stale`: interrupt stale running runs, repair blocked queue state, and requeue eligible loops after sleep/wake or other local process loss; `looper daemon restart` is still a reasonable fallback if you want a full daemon restart
+- Dashboard loops list: see which loops are running and truncated failure reasons
+- Dashboard loop detail: diagnosis, logs, and worktree path
+- Dirty-worktree dialog: copy a shell-quoted `cd -- '<path>'` when you need a terminal
+- Worktree cleanup runs on the daemon schedule (`daemon.worktreeCleanup`); no CLI verb
+- `looper stop <selector>`: stop an active loop
+- `looper pause` / `retry` / `takeover` / `handback` / `respond`: remaining control surface
+- After sleep/wake, restart `looperd` if loops look stuck
 
 ## 15. Minimal end-to-end example
 
@@ -513,40 +515,43 @@ Typical usage:
 4. Run:
 
 ```bash
-looper plan --project myproj --issue 123
+# intent: start planner for issue 123 — label looper:plan + assign, or POST /api/v1/planners
 ```
 
 5. Wait for planner to open a spec PR
 6. Run reviewer:
 
 ```bash
-looper review owner/repo#<spec-pr>
+# intent: review the spec PR — discovery via looper:spec-reviewing / review-request
 ```
 
 7. If comments appear, start fixer:
 
 ```bash
-looper loop start --type fixer --pr owner/repo#<spec-pr>
+# looper loop start  # removed — fixer discovery + dashboard control
 ```
 
 8. Once the PR reaches `looper:spec-ready`, start worker:
 
 ```bash
-looper work --issue 123
+# intent: worker for issue 123 — label looper:worker-ready or looper:spec-ready
 ```
 
 ### Option B: manage an existing PR directly
 
 ```bash
-looper review owner/repo#42 --loop
-looper loop start --type fixer --pr owner/repo#42
+# intent: continuous review + fixer on PR 42 —
+# ensure review-request/discovery on a registered project; control loops via dashboard or:
+#   looper stop|pause|retry|takeover <selector>
 ```
 
 This is useful when you already have a PR and only want Looper to handle the review/fix cycle.
 
 ### Option C: take over one PR in a single command
 
-`looper review --loop` + `looper loop start --type fixer` (Option B) requires the repo to already be a registered project, and a plain `looper project add` turns on autonomous discovery for *every* PR in that repo. When you only want Looper on a single PR — for example a contributor adopting their own PR — use `takeover`, which does the whole setup in one step and scopes Looper to just that PR:
+The one-command PR-scoped background takeover (`looper takeover <owner>/<repo>#<pr>` and `scripts/takeover.sh`) was removed with the old CLI. Today: register the repo, let discovery claim the PR via labels/review-requests, and use the surviving control verbs on **existing** loops. For single-PR babysitting without the daemon, use the live [`pr-takeover` skill](../skills/pr-takeover/SKILL.md) with `gh` + `git`.
+
+Historical Option B (`review --loop` + fixer loop start) is also gone as CLI. Prefer discovery + dashboard control. Notes on the old takeover UX (kept for migration context only — commands no longer work):
 
 ```bash
 # from inside the repo checkout
@@ -567,9 +572,9 @@ Agent selection: `takeover` reuses the vendor already in your config; otherwise 
 Manage and stop takeovers:
 
 ```bash
-looper takeover list                 # all active takeovers + live loop status
-looper takeover stop owner/repo#42   # stop this takeover's reviewer + fixer loops
-looper takeover stop --all           # stop every takeover
+# looper takeover list  # removed; use the dashboard loops view
+# looper takeover stop  # removed; use looper stop <selector> on the loops owner/repo#42   # stop this takeover's reviewer + fixer loops
+# looper takeover stop  # removed; use looper stop <selector> on the loops --all           # stop every takeover
 ```
 
 `takeover list` / `stop` are backed by a local index at `~/.looper/takeovers.json`; stopping closes the underlying loops by id (so it works even while they are idle/waiting between commits).
@@ -598,14 +603,14 @@ Example:
 
 ```bash
 export LOOPER_TOKEN=replace-me
-looper status
+curl -sS "http://127.0.0.1:17310/api/v1/status"
 ```
 
 This is separate from GitHub authentication.
 
 ## 18. Webhook delivery status
 
-When webhook mode is enabled, `looper webhook status --json` reports the active delivery mode.
+When webhook mode is enabled, `curl -sS "http://127.0.0.1:17310/api/v1/webhook/status"` reports the active delivery mode.
 
 In `gh-forward` mode it reports each local `gh webhook forward` subprocess.
 
@@ -628,10 +633,10 @@ Then set `webhook.publicBaseUrl` to the stable HTTPS URL for that tunnel and res
 Useful tunnel commands:
 
 ```bash
-looper webhook status --verbose
-looper webhook rotate owner/repo
-looper webhook list-orphans
-looper webhook delete owner/repo --confirm
+curl -sS "http://127.0.0.1:17310/api/v1/webhook/status"
+# looper webhook rotate owner/repo  # removed with the old CLI
+# looper webhook list-orphans  # removed with the old CLI
+# looper webhook delete owner/repo --confirm  # removed with the old CLI
 ```
 
 - `latched=true` on a tunnel hook means GitHub disabled it repeatedly and Looper stopped re-enabling it; polling fallback continues.
