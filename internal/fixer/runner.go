@@ -2891,10 +2891,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		if err := validateCompletedRepairCheckpoint(checkpoint.Repair); err != nil {
 			return checkpoint, err
 		}
-		if r.hitlEnabled {
-			if err := r.markHumanAnswerConsumed(ctx, &input.Loop); err != nil {
-				return checkpoint, err
-			}
+		if err := r.markHumanAnswerConsumed(ctx, &input.Loop); err != nil {
+			return checkpoint, err
+		}
+		if hasDeliveredHITLAnswer(input.Loop.MetadataJSON) && checkpoint.Worktree != nil {
+			r.applyReviewDismissals(ctx, input, checkpoint.Worktree.Path)
 		}
 		return checkpoint, nil
 	}
@@ -2963,15 +2964,14 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush && !r.hitlEnabled, r.disclosure, agentVendor, derefString(agentModel))
-	nativeResumePrompt := ""
-	nativeSessionID := ""
+	nativeResumePrompt, nativeSessionID := r.pendingHumanAnswer(ctx, &input.Loop, agentVendor)
+	continuingHITL := nativeResumePrompt != ""
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush && !r.hitlEnabled && !continuingHITL, r.disclosure, agentVendor, derefString(agentModel))
 	if r.hitlEnabled {
 		prompt += "\n\n" + fixerHITLPromptInstruction
-		nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop, agentVendor)
-		if nativeResumePrompt != "" {
-			prompt += "\n\n" + nativeResumePrompt
-		}
+	}
+	if continuingHITL {
+		prompt += "\n\n" + nativeResumePrompt
 	}
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
@@ -3045,7 +3045,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	if r.hitlEnabled {
+	if continuingHITL {
 		if err := r.markHumanAnswerConsumed(ctx, &input.Loop); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}

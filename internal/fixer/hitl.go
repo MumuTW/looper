@@ -127,6 +127,14 @@ func shouldResumeAnsweredHITLRepair(metadataJSON *string, runStatus string, fail
 	return ok && ask.Status == "answered" && strings.TrimSpace(ask.Answer) != ""
 }
 
+func hasDeliveredHITLAnswer(metadataJSON *string) bool {
+	ask, ok := loops.ReadHITLAsk(metadataJSON)
+	if !ok || strings.TrimSpace(ask.Answer) == "" {
+		return false
+	}
+	return ask.Status == "answered" || ask.Status == "consumed"
+}
+
 func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord) (loops.HITLAsk, bool) {
 	metadata := loop.MetadataJSON
 	if r.repos != nil && r.repos.Loops != nil {

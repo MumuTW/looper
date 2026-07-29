@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,9 +75,12 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 		{Status: "completed", Summary: "applied decision", ParseStatus: "parsed", Stdout: fixed},
 	}}
 	git := &fakeGitGateway{}
+	github := &fakeGitHubGateway{
+		reviews: []ReviewSummary{{ID: 10, State: "CHANGES_REQUESTED", Author: "reviewer-x"}},
+	}
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos,
-		GitHub: &fakeGitHubGateway{}, Git: git,
+		GitHub: github, Git: git,
 		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
 		AgentRuntime: "codex", AllowAutoPush: true, HITLEnabled: true,
 	})
@@ -122,6 +126,9 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(ctx, *persistedLoop); err != nil {
 		t.Fatalf("Loops.Upsert(answer) error = %v", err)
 	}
+	// Disabling HITL stops new asks, but must not revoke an already accepted
+	// operator answer or re-enable agent-side remote mutation during its resume.
+	runner.hitlEnabled = false
 	resume, err := runner.createRunContext(ctx, *persistedLoop)
 	if err != nil {
 		t.Fatalf("createRunContext(resume) error = %v", err)
@@ -137,7 +144,9 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	if err != nil || resumed.Repair == nil {
 		t.Fatalf("resumed runRepairStep() = (%#v, %v)", resumed.Repair, err)
 	}
-	if agent.starts[1].NativeSessionID != sessionID || !strings.Contains(agent.starts[1].NativeResumePrompt, "Keep the documented PR intent") {
+	if agent.starts[1].NativeSessionID != sessionID ||
+		!strings.Contains(agent.starts[1].NativeResumePrompt, "Keep the documented PR intent") ||
+		!strings.Contains(agent.starts[1].Prompt, "Do not push") {
 		t.Fatalf("resume agent input = %#v", agent.starts[1])
 	}
 	finishedLoop, _ := fixture.repos.Loops.GetByID(ctx, loopID)
@@ -147,6 +156,21 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	}
 	if len(git.prepareCalls) != 0 {
 		t.Fatalf("PrepareWorktree calls = %d, want no reset-capable prepare on HITL resume", len(git.prepareCalls))
+	}
+
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".looper"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.looper) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".looper", "dismiss.json"), []byte(`{"dismissals":[{"reviewer":"reviewer-x","reason":"conflicts with the approved direction"}]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(dismiss.json) error = %v", err)
+	}
+	step.Loop = *finishedLoop
+	step.Checkpoint = resumed
+	if _, err := runner.runRepairStep(ctx, step); err != nil {
+		t.Fatalf("runRepairStep(durable repair retry) error = %v", err)
+	}
+	if len(github.dismissedReviews) != 1 {
+		t.Fatalf("dismissed reviews = %d, want replayed attempt", len(github.dismissedReviews))
 	}
 }
 
