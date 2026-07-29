@@ -296,6 +296,28 @@ describe("LoopActionBar retry dirty UX", () => {
     });
   });
 
+  // The route exists and answered: the project row is archived or gone. Its
+  // message contains "not found", so a substring match reads it as a missing
+  // route, skips the gate, and requeues the loop with unreviewed local edits.
+  it("holds the gate when /worktree answers 404 PROJECT_NOT_FOUND", async () => {
+    fetchLoopWorktree.mockRejectedValue(
+      new ApiError("Project not found: acme", {
+        status: 404,
+        code: "PROJECT_NOT_FOUND",
+      }),
+    );
+    renderBar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText("Project not found: acme").length,
+      ).toBeGreaterThan(0);
+    });
+    expect(retryLoop).not.toHaveBeenCalled();
+  });
+
   it("surfaces non-404 preflight failures without retrying", async () => {
     fetchLoopWorktree.mockRejectedValue(
       new ApiError("git status failed", {
