@@ -980,16 +980,26 @@ const (
 
 func (e *loopError) Error() string { return e.message }
 
-func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
+func validateCompletedRepairCheckpoint(repair *checkpointRepair, worktree *checkpointWorktree) error {
 	if repair == nil {
 		return nil
 	}
 	if repair.ParseStatus == "parsed" {
 		return nil
 	}
+	message := fmt.Sprintf(
+		"Fixer agent completed without a valid structured result (parse status: %s); automatic retry paused for manual recovery",
+		firstNonEmpty(repair.ParseStatus, "missing"),
+	)
+	if worktree != nil && worktree.Path != "" && worktree.CleanedAt == "" {
+		message += "; worktree preserved at " + worktree.Path
+	}
+	if summary := strings.TrimSpace(repair.Summary); summary != "" {
+		message += ". Agent summary: " + summary
+	}
 	return &loopError{
-		message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent completed without valid structured result (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
-		kind:    FailureRetryableTransient,
+		message: message,
+		kind:    FailureManualIntervention,
 	}
 }
 
@@ -3061,7 +3071,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, nil
 	}
 	if checkpoint.Repair != nil {
-		if err := validateCompletedRepairCheckpoint(checkpoint.Repair); err != nil {
+		if err := validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree); err != nil {
 			return checkpoint, err
 		}
 		return checkpoint, nil
@@ -3187,7 +3197,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// same evidence, including the transcript scan that only the live result
 	// carries.
 	repair := checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
-	if err := validateCompletedRepairCheckpoint(repair); err != nil {
+	if err := validateCompletedRepairCheckpoint(repair, checkpoint.Worktree); err != nil {
+		checkpoint.Repair = repair
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		return checkpoint, err
 	}
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
@@ -6932,7 +6944,7 @@ func previousFixerStep(step FixerStep) FixerStep {
 func validateFixerResumeCheckpoint(startStep FixerStep, checkpoint fixerCheckpoint) error {
 	switch startStep {
 	case stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck:
-		return validateCompletedRepairCheckpoint(checkpoint.Repair)
+		return validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree)
 	default:
 		return nil
 	}
@@ -7730,8 +7742,6 @@ func shouldResumeFromPrepare(status string, failedStep FixerStep, checkpoint fix
 	switch failedStep {
 	case stepRepair, stepReconcileCommits, stepValidate, stepPush:
 		return true
-	case stepResolveComments, stepRecheck:
-		return validateCompletedRepairCheckpoint(checkpoint.Repair) != nil
 	default:
 		return false
 	}
