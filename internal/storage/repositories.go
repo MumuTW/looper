@@ -461,11 +461,12 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	return scanEventLogs(rows)
 }
 
-// ListEntityIDsByType returns the supplied entity IDs that have an event of
-// eventType. It is deliberately a set because callers only need durable
-// evidence, not every historical occurrence of that evidence.
-func (r *EventsRepository) ListEntityIDsByType(ctx context.Context, eventType, entityType string, entityIDs []string) (map[string]struct{}, error) {
-	matched := make(map[string]struct{})
+// ListFirstEventTimestampsByType returns, for each supplied entity ID that has
+// an event of eventType, the created_at of its earliest such event. Callers
+// need both the durable evidence and when it was first written, so one pass
+// yields both rather than letting a second query disagree with the first.
+func (r *EventsRepository) ListFirstEventTimestampsByType(ctx context.Context, eventType, entityType string, entityIDs []string) (map[string]string, error) {
+	matched := make(map[string]string)
 	if len(entityIDs) == 0 {
 		return matched, nil
 	}
@@ -476,21 +477,23 @@ func (r *EventsRepository) ListEntityIDsByType(ctx context.Context, eventType, e
 			args = append(args, entityID)
 		}
 		rows, err := r.q.QueryContext(ctx, `
-			SELECT DISTINCT entity_id
+			SELECT entity_id, MIN(created_at)
 			FROM event_logs
 			WHERE event_type = ? AND entity_type = ?
 			AND entity_id IN (`+sqlPlaceholders(len(chunk))+`)
+			GROUP BY entity_id
 		`, args...)
 		if err != nil {
 			return nil, fmt.Errorf("list entity ids by event type: %w", err)
 		}
 		for rows.Next() {
 			var entityID string
-			if err := rows.Scan(&entityID); err != nil {
+			var firstAt sql.NullString
+			if err := rows.Scan(&entityID, &firstAt); err != nil {
 				_ = rows.Close()
 				return nil, fmt.Errorf("scan entity id by event type: %w", err)
 			}
-			matched[entityID] = struct{}{}
+			matched[entityID] = firstAt.String
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
