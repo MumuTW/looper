@@ -13,7 +13,6 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/fixer"
-	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/gatekeeper"
 	projectcatalog "github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
@@ -480,12 +479,6 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 		repo := repoFromProjectMetadata(project.MetadataJSON)
 		if !strings.EqualFold(repo, routed.repo) {
 			continue
-		}
-		projectView, configured := view.Project(project.ID)
-		if configured {
-			if capabilities, ok := forge.StaticCapabilities(projectView.ProviderKind); ok && !capabilities.GitHubPullRequests {
-				continue
-			}
 		}
 		rolePolicy := view.RolePolicy(project.ID)
 		lanes := enabledLanesForProject(rolePolicy, routed.lanes)

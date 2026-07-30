@@ -20,7 +20,6 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
@@ -892,10 +891,10 @@ func (r *Runtime) start(ctx context.Context) error {
 
 	repositories := storage.NewRepositories(coordinator.DB())
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
-	var githubGateway *githubinfra.Gateway
-	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
-		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
-	}
+	// Every project is GitHub, so the gateway is always needed. GHPath may be
+	// empty here; startup validation is what reports a missing gh, not a nil
+	// gateway.
+	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	projectService := &projects.Service{
 		DB:             coordinator.DB(),
 		Repos:          repositories,
@@ -971,13 +970,6 @@ func (r *Runtime) start(ctx context.Context) error {
 		return err
 	}
 	r.config = r.projectCatalog.Snapshot()
-	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
-		if githubGateway == nil {
-			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
-		}
-	} else {
-		githubGateway = nil
-	}
 	// Fail loud, not silent: without a credential the daemon's own gh children
 	// fall back to anonymous requests that GitHub rate-limits per IP, which
 	// surfaces later as unexplained transient forge failures.
@@ -1240,16 +1232,6 @@ func defaultSchedulerAgentsConfigured(cfg config.Config) bool {
 // scheduler-enabled so import does not fall back to full synchronous capture.
 func asyncSnapshotQueueEnabled(customSchedulerTick bool, cfg config.Config) bool {
 	return customSchedulerTick || defaultSchedulerAgentsConfigured(cfg)
-}
-
-func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
-	providers := forge.NewResolver(cfg)
-	for _, project := range cfg.Projects {
-		if providers.ForProject(project.ID).Capabilities().GitHubPullRequests {
-			return true
-		}
-	}
-	return len(cfg.Projects) == 0
 }
 
 func runtimeProjectBinding(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
