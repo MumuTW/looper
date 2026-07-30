@@ -669,6 +669,16 @@ func (r *Runtime) WithAllowClaim(fn func()) error {
 	return r.admission.WithAllowWork(fn)
 }
 
+// BeginDrain closes new-work admission without canceling existing producers or
+// active agent processes. Controlled cutover uses this before it waits for the
+// active-work observer; shutdown remains responsible for cancellation.
+func (r *Runtime) BeginDrain(reason string) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.BeginDrain(reason)
+}
+
 // MarkDegraded sticks admission until process restart and cancels work-producing
 // contexts (scheduler, recovery, cleanup) so new discovery/claims/cleanup that
 // already passed AllowClaim cannot complete after the transition. Unlike
@@ -1627,7 +1637,7 @@ func (r *Runtime) admissionRefusesDeferredRequeue() bool {
 		return true
 	}
 	switch r.admission.State() {
-	case AdmissionStopping, AdmissionDegraded:
+	case AdmissionDraining, AdmissionStopping, AdmissionDegraded:
 		return true
 	default:
 		return false

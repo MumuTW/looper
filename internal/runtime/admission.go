@@ -46,6 +46,9 @@ type AdmissionState string
 const (
 	AdmissionStarting AdmissionState = "starting"
 	AdmissionReady    AdmissionState = "ready"
+	// AdmissionDraining refuses new mutations and claims while already-running
+	// work is allowed to finish. Unlike stopping, it does not cancel producers.
+	AdmissionDraining AdmissionState = "draining"
 	AdmissionStopping AdmissionState = "stopping"
 	AdmissionDegraded AdmissionState = "degraded"
 )
@@ -54,6 +57,7 @@ const (
 // because admission is not ready.
 var (
 	ErrAdmissionNotReady    = errors.New("daemon admission is not ready")
+	ErrAdmissionDraining    = errors.New("daemon admission is draining")
 	ErrAdmissionStopping    = errors.New("daemon admission is stopping")
 	ErrAdmissionDegraded    = errors.New("daemon admission is degraded")
 	ErrAdmissionIllegalMove = errors.New("illegal admission state transition")
@@ -105,6 +109,8 @@ func legalAdmissionTransition(from, to AdmissionState) bool {
 	case AdmissionStarting:
 		return to == AdmissionReady || to == AdmissionStopping || to == AdmissionDegraded
 	case AdmissionReady:
+		return to == AdmissionDraining || to == AdmissionStopping || to == AdmissionDegraded
+	case AdmissionDraining:
 		return to == AdmissionStopping || to == AdmissionDegraded
 	case AdmissionDegraded:
 		// Sticky until process restart: only stopping is legal (no ready reopen).
@@ -114,6 +120,32 @@ func legalAdmissionTransition(from, to AdmissionState) bool {
 	default:
 		return false
 	}
+}
+
+// BeginDrain closes admission for a controlled cutover without canceling
+// existing work. It is intentionally one-way: resuming a partially drained
+// daemon would need to recreate producer contexts and re-establish ownership,
+// so recovery is an explicit restart rather than a hidden reopen.
+func (a *Admission) BeginDrain(reason string) error {
+	if a == nil {
+		return ErrAdmissionStopping
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state == AdmissionDraining {
+		if reason != "" {
+			a.reason = reason
+		}
+		return nil
+	}
+	if !legalAdmissionTransition(a.state, AdmissionDraining) {
+		return fmt.Errorf("%w: %s → %s", ErrAdmissionIllegalMove, a.state, AdmissionDraining)
+	}
+	a.state = AdmissionDraining
+	if reason != "" {
+		a.reason = reason
+	}
+	return nil
 }
 
 // Transition applies a legal state change. Illegal moves return
@@ -274,6 +306,8 @@ func (a *Admission) allowWorkLocked() error {
 		return nil
 	case AdmissionStopping:
 		return ErrAdmissionStopping
+	case AdmissionDraining:
+		return ErrAdmissionDraining
 	case AdmissionDegraded:
 		return ErrAdmissionDegraded
 	default:
