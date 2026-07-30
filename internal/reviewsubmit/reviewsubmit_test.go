@@ -585,6 +585,24 @@ func TestValidateReviewerReviewSubmitHoldDoesNotCreateMissingDatabase(t *testing
 	}
 }
 
+func TestValidateReviewerReviewSubmitHoldAcceptsExistingFileURI(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "looper.sqlite")
+	db, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := db.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := validateReviewerReviewSubmitHold(context.Background(), config.Config{Storage: config.StorageConfig{DBPath: "file:" + dbPath}}, "acme/looper", 42, true, "run_manual", []string{labels.HoldReviewer}); err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("validateReviewerReviewSubmitHold(file URI) error = %v, want normal held rejection after URI-aware stat", err)
+	}
+}
+
 func TestValidateLatestReviewerReviewSubmitHoldRefreshesLabels(t *testing.T) {
 	t.Parallel()
 

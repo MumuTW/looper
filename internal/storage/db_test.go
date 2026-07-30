@@ -92,6 +92,16 @@ func TestDatabaseLockUsesCanonicalPerDatabasePath(t *testing.T) {
 	}
 }
 
+func TestSQLiteFilesystemPathParsesFileURI(t *testing.T) {
+	path, isFile, err := SQLiteFilesystemPath("file:/var/lib/looper/looper.sqlite?cache=shared")
+	if err != nil {
+		t.Fatalf("SQLiteFilesystemPath(file URI) error = %v", err)
+	}
+	if !isFile || path != "/var/lib/looper/looper.sqlite" {
+		t.Fatalf("SQLiteFilesystemPath(file URI) = (%q, %t), want (/var/lib/looper/looper.sqlite, true)", path, isFile)
+	}
+}
+
 func TestOpenSQLiteDBWithCompatibilityCheckHoldsMigrationFenceUntilClose(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "looper.sqlite")
 	db, err := OpenSQLiteDBWithCompatibilityCheck(context.Background(), dbPath)

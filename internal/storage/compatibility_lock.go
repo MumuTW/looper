@@ -69,22 +69,9 @@ func databaseLockPath(dbPath string) (string, bool, error) {
 }
 
 func canonicalDatabasePath(dbPath string) (string, bool, error) {
-	dbPath = strings.TrimSpace(dbPath)
-	if dbPath == "" || dbPath == ":memory:" {
-		return "", false, nil
-	}
-	if strings.HasPrefix(dbPath, "file:") {
-		parsed, err := url.Parse(dbPath)
-		if err != nil {
-			return "", false, fmt.Errorf("parse SQLite file URI: %w", err)
-		}
-		if strings.EqualFold(parsed.Query().Get("mode"), "memory") {
-			return "", false, nil
-		}
-		if parsed.Path == "" {
-			return "", false, fmt.Errorf("SQLite file URI has no filesystem path")
-		}
-		dbPath = parsed.Path
+	dbPath, isFile, err := SQLiteFilesystemPath(dbPath)
+	if err != nil || !isFile {
+		return "", isFile, err
 	}
 	absPath, err := filepath.Abs(dbPath)
 	if err != nil {
@@ -103,4 +90,28 @@ func canonicalDatabasePath(dbPath string) (string, bool, error) {
 		absPath = filepath.Join(parent, filepath.Base(absPath))
 	}
 	return absPath, true, nil
+}
+
+// SQLiteFilesystemPath returns the underlying filesystem path for an on-disk
+// SQLite configuration value. It recognizes the file: URI form accepted by
+// sqliteDSN, while memory databases have no path to stat or lock.
+func SQLiteFilesystemPath(dbPath string) (string, bool, error) {
+	dbPath = strings.TrimSpace(dbPath)
+	if dbPath == "" || dbPath == ":memory:" {
+		return "", false, nil
+	}
+	if strings.HasPrefix(dbPath, "file:") {
+		parsed, err := url.Parse(dbPath)
+		if err != nil {
+			return "", false, fmt.Errorf("parse SQLite file URI: %w", err)
+		}
+		if strings.EqualFold(parsed.Query().Get("mode"), "memory") {
+			return "", false, nil
+		}
+		if parsed.Path == "" {
+			return "", false, fmt.Errorf("SQLite file URI has no filesystem path")
+		}
+		dbPath = parsed.Path
+	}
+	return dbPath, true, nil
 }

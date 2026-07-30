@@ -496,11 +496,17 @@ func validateReviewerReviewSubmitHold(ctx context.Context, cfg config.Config, re
 		if dbPath == "" {
 			return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
 		}
-		if _, err := os.Stat(dbPath); err != nil {
-			if os.IsNotExist(err) {
-				return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
+		filePath, isFile, err := storage.SQLiteFilesystemPath(dbPath)
+		if err != nil {
+			return fmt.Errorf("validate held manual reviewer run database path: %w", err)
+		}
+		if isFile {
+			if _, err := os.Stat(filePath); err != nil {
+				if os.IsNotExist(err) {
+					return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
+				}
+				return fmt.Errorf("validate held manual reviewer run: stat storage database: %w", err)
 			}
-			return fmt.Errorf("validate held manual reviewer run: stat storage database: %w", err)
 		}
 		db, err := storage.OpenSQLiteDBWithCompatibilityCheck(ctx, dbPath)
 		if err != nil {
