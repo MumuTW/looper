@@ -110,6 +110,33 @@ type ActiveExecutionRegistry struct {
 	killTimeout time.Duration
 }
 
+// DrainSnapshot is the complete in-memory Supervisor-owned work set relevant
+// to a graceful drain. Durable run rows are intentionally absent: a terminal
+// write can race a still-live containment handle, while this registry owns the
+// handle and the pre-bind/claim windows that must finish before cutover.
+type DrainSnapshot struct {
+	LiveExecutions    int `json:"liveExecutions"`
+	PendingSpawns     int `json:"pendingSpawns"`
+	BoundOperations   int `json:"boundOperations"`
+	PendingOperations int `json:"pendingOperations"`
+}
+
+func (s DrainSnapshot) Drained() bool {
+	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0
+}
+
+// DrainSnapshot returns one mutex-consistent view of all work that graceful
+// drain waits for. Individual count accessors are insufficient because one
+// lease can move between pending and bound while callers sample them.
+func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
+	if r == nil {
+		return DrainSnapshot{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return DrainSnapshot{LiveExecutions: len(r.executions), PendingSpawns: len(r.pending), BoundOperations: len(r.boundOps), PendingOperations: len(r.pendingOps)}
+}
+
 const defaultKillTimeout = 20 * time.Second
 
 func NewActiveExecutionRegistry() *ActiveExecutionRegistry {

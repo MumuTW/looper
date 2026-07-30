@@ -679,6 +679,38 @@ func (r *Runtime) BeginDrain(reason string) error {
 	return r.admission.BeginDrain(reason)
 }
 
+// DrainSnapshot reports the Supervisor-owned work still in flight after
+// BeginDrain. It is the authority a controlled cutover waits on; durable run
+// status is deliberately not substituted for live containment ownership.
+func (r *Runtime) DrainSnapshot() DrainSnapshot {
+	if r == nil || r.activeExecutions == nil {
+		return DrainSnapshot{}
+	}
+	return r.activeExecutions.DrainSnapshot()
+}
+
+// WaitForDrain waits for the graceful-drain work set to become empty. Context
+// expiry is the caller's explicit deadline decision; this method never kills
+// a process or changes admission as a timeout side effect.
+func (r *Runtime) WaitForDrain(ctx context.Context, interval time.Duration) (DrainSnapshot, error) {
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		snapshot := r.DrainSnapshot()
+		if snapshot.Drained() {
+			return snapshot, nil
+		}
+		select {
+		case <-ctx.Done():
+			return snapshot, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // MarkDegraded sticks admission until process restart and cancels work-producing
 // contexts (scheduler, recovery, cleanup) so new discovery/claims/cleanup that
 // already passed AllowClaim cannot complete after the transition. Unlike
