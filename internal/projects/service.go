@@ -575,10 +575,10 @@ func (s *Service) List(ctx context.Context) ([]storage.ProjectRecord, error) {
 	return active, nil
 }
 
-// ResumeRunningDiscoveries reschedules work whose persisted pending or running
+// ResumeIncompleteDiscoveries reschedules work whose persisted pending or running
 // state outlived its process. The runtime calls this once after startup has
 // materialized the project catalog and installed its discovery lifecycle.
-func (s *Service) ResumeRunningDiscoveries(ctx context.Context) error {
+func (s *Service) ResumeIncompleteDiscoveries(ctx context.Context) error {
 	if s == nil || s.Repos == nil || s.Repos.Projects == nil {
 		return fmt.Errorf("projects repository is not configured")
 	}

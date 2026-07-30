@@ -1046,12 +1046,6 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = fmt.Errorf("runtime repositories are not configured")
 			return
 		}
-		if projectService != nil {
-			if err := projectService.ResumeRunningDiscoveries(ctx); err != nil {
-				r.startupReadyErr = err
-				return
-			}
-		}
 		if err := r.validateCoordinatorDependencyGates(ctx, repositories, githubGateway); err != nil {
 			r.startupReadyErr = err
 			return
@@ -1100,6 +1094,16 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		if err := r.admission.MarkReady("complete startup"); err != nil {
 			r.startupReadyErr = err
 			return
+		}
+		// Persisted discovery is runtime-owned work. Launch it only after
+		// dependency validation, recovery, ownership, producer assembly, and
+		// admission readiness have all succeeded.
+		if projectService != nil {
+			if err := projectService.ResumeIncompleteDiscoveries(ctx); err != nil {
+				_ = r.MarkDegraded("resume incomplete project discovery: " + err.Error())
+				r.startupReadyErr = err
+				return
+			}
 		}
 		// Deferred reviewer recovery requeues failed loops without the scheduler
 		// claim path; start it only after admission is ready, and only while
