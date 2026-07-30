@@ -6608,6 +6608,7 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 	if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: project.ID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: compactStrings([]string{derefString(project.BaseBranch)})}); err != nil {
 		r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleanup_failed", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "message": err.Error()}})
 		r.logError("fixer worktree cleanup failed", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "message": err.Error()})
+		r.recordCleanupSecondaryIssue(ctx, runID, checkpoint, err)
 		return
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
@@ -6617,6 +6618,43 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 		})
 	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleaned", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch}})
+}
+
+// recordCleanupSecondaryIssue records a refused removal on the run's outcome.
+//
+// A refused removal is a secondary issue by construction: the run has already
+// completed and been written, and its primary result stands. Recording it makes the
+// problem visible where an operator reads the run, instead of only in the event log.
+//
+// This is the refused case specifically -- CleanupWorktree returned an error -- not
+// the unverified case where the process died mid-removal. The timestamp pair carries
+// that distinction; see cleanupFixerWorktreeIfTerminal.
+func (r *Runner) recordCleanupSecondaryIssue(ctx context.Context, runID string, checkpoint *fixerCheckpoint, cause error) {
+	if checkpoint == nil || cause == nil {
+		return
+	}
+	retryable := true
+	issue := FixerOutcomeFailure{
+		Step:      string(stepRecheck),
+		Message:   "worktree cleanup refused: " + cause.Error(),
+		Kind:      FailureRetryableTransient,
+		Retryable: &retryable,
+	}
+	// Keep the in-memory checkpoint consistent so the returned ProcessResult and any
+	// later write in this run agree with what was stored.
+	if checkpoint.Outcome == nil {
+		checkpoint.Outcome = &FixerRunOutcome{}
+	}
+	checkpoint.Outcome.SecondaryIssues = append(checkpoint.Outcome.SecondaryIssues, issue)
+
+	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
+		return
+	}
+	if err := r.repos.Runs.AppendCheckpointSecondaryIssue(ctx, runID, mustMarshalJSON(issue), r.nowISO()); err != nil {
+		r.logError("fixer cleanup secondary issue persist failed", map[string]any{
+			"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": err.Error(),
+		})
+	}
 }
 
 // derefRunRecordID returns the run's ID, or "" when no durable run exists.

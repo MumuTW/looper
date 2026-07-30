@@ -11,6 +11,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/e2e/harness"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 type fakeGHState struct {
@@ -220,6 +221,130 @@ func TestFakeGHFixtureRejectsUnsupportedJSONField(t *testing.T) {
 	}
 }
 
+// TestFakeGHFixtureRejectsUnsupportedLabelListField guards the label-list JSON
+// contract: fake-gh must validate requested fields against the schema
+// allowlist, like the other JSON-producing list commands, so a caller that
+// requests an unsupported field is rejected instead of silently returning
+// complete label objects.
+func TestFakeGHFixtureRejectsUnsupportedLabelListField(t *testing.T) {
+	t.Parallel()
+	bins := harness.MustBinaries(t)
+	fakeGH := harness.NewFakeGH(t, bins, loadFixtureSchema(t))
+	cmd := exec.Command(fakeGH.Path, "label", "list", "--repo", "acme/looper", "--json", "name,id")
+	cmd.Env = append(os.Environ(), flattenEnv(fakeGH.EnvMap())...)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected unsupported label-list field failure")
+	}
+	if !strings.Contains(string(output), `unknown JSON field: "id"`) {
+		t.Fatalf("output = %s, want unsupported-field error", string(output))
+	}
+}
+
+// TestInvariantApplyingLabelsNeverRewritesAnExistingLabel is the contract-level
+// coverage for the read-before-write label path. It seeds a hand-worded
+// existing label through the supported harness API (harness.GHState), runs the
+// real gateway against fake-gh, and confirms: no --force is passed, the
+// existing label is not recreated, the missing label is created, and the
+// stored wording survives the create round trip. This exercises the stateful
+// fake-gh label model end-to-end rather than asserting on argv strings alone.
+func TestInvariantApplyingLabelsNeverRewritesAnExistingLabel(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	fakeGH := harness.NewFakeGH(t, bins, loadFixtureSchema(t))
+	fakeGH.WriteState(t, harness.GHState{
+		RepositoryLabels: map[string][]harness.GHLabel{
+			"acme/looper": {
+				{Name: labels.HoldGlobal, Color: "b60205", Description: "Human veto, hand-worded"},
+			},
+		},
+	})
+	root := t.TempDir()
+	for key, value := range fakeGH.EnvMap() {
+		t.Setenv(key, value)
+	}
+	t.Setenv("HOME", root)
+	gateway := githubinfra.New(githubinfra.Options{GHPath: fakeGH.Path, CWD: root})
+
+	if err := gateway.AddIssueLabels(context.Background(), githubinfra.IssueLabelsInput{
+		Repo:        "acme/looper",
+		IssueNumber: 7,
+		Labels:      []string{labels.HoldGlobal, labels.DefaultPlanTrigger},
+	}); err != nil {
+		t.Fatalf("AddIssueLabels() error = %v", err)
+	}
+
+	invocations := readInvocationsForContract(t, fakeGH.InvocationLog)
+	assertInvocationHasJSONFields(t, invocations, "label", "list", []string{"name", "color", "description"})
+	log := invocationLogString(invocations)
+	if strings.Contains(log, "--force") {
+		t.Errorf("gh was called with --force, which rewrites existing labels:\n%s", log)
+	}
+	if strings.Contains(log, "label create "+labels.HoldGlobal+" ") {
+		t.Errorf("existing label %s was recreated:\n%s", labels.HoldGlobal, log)
+	}
+	if !strings.Contains(log, "label create "+labels.DefaultPlanTrigger+" ") {
+		t.Errorf("missing label %s was not created:\n%s", labels.DefaultPlanTrigger, log)
+	}
+	assertInvocationContains(t, invocations, []string{"api", "repos/acme/looper/issues/7/labels", "--method", "POST"})
+
+	// The stored wording must survive the create round trip: looper:hold keeps
+	// its hand-worded description, and looper:plan is now present.
+	state := readFakeGHStateFile(t, fakeGH.StatePath)
+	labelsForRepo := state.RepositoryLabels["acme/looper"]
+	hold := findGHLabel(t, labelsForRepo, labels.HoldGlobal)
+	if hold.Description != "Human veto, hand-worded" {
+		t.Errorf("looper:hold description = %q, want hand-worded wording preserved", hold.Description)
+	}
+	if findGHLabel(t, labelsForRepo, labels.DefaultPlanTrigger) == nil {
+		t.Errorf("looper:plan missing from fake-gh state after AddIssueLabels: %#v", labelsForRepo)
+	}
+}
+
+// TestFakeGHLabelCreateModelsBothDuplicateOutcomes pins fake-gh's fidelity to
+// real `gh label create`: a duplicate without --force is rejected with "already
+// exists" (the error the gateway tolerates when it loses a list/create race),
+// and --force updates the existing label's color and description in place
+// rather than failing. Modeling both outcomes is what lets the harness expose a
+// reintroduced --force instead of masking it.
+func TestFakeGHLabelCreateModelsBothDuplicateOutcomes(t *testing.T) {
+	t.Parallel()
+	bins := harness.MustBinaries(t)
+	fakeGH := harness.NewFakeGH(t, bins, loadFixtureSchema(t))
+	fakeGH.WriteState(t, harness.GHState{
+		RepositoryLabels: map[string][]harness.GHLabel{
+			"acme/looper": {
+				{Name: labels.DefaultPlanTrigger, Color: "5319e7", Description: "Picked up automatically by planner"},
+			},
+		},
+	})
+
+	duplicate := exec.Command(fakeGH.Path, "label", "create", labels.DefaultPlanTrigger, "--repo", "acme/looper", "--color", "5319e7", "--description", "rewritten wording")
+	duplicate.Env = append(os.Environ(), flattenEnv(fakeGH.EnvMap())...)
+	output, err := duplicate.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected duplicate label create to fail without --force")
+	}
+	if !strings.Contains(string(output), "already exists") {
+		t.Fatalf("output = %s, want already-exists error", string(output))
+	}
+	state := readFakeGHStateFile(t, fakeGH.StatePath)
+	plan := findGHLabel(t, state.RepositoryLabels["acme/looper"], labels.DefaultPlanTrigger)
+	if plan.Description != "Picked up automatically by planner" {
+		t.Errorf("looper:hold description changed without --force = %q, want original preserved", plan.Description)
+	}
+
+	forced := exec.Command(fakeGH.Path, "label", "create", labels.DefaultPlanTrigger, "--repo", "acme/looper", "--color", "000000", "--description", "rewritten wording", "--force")
+	forced.Env = append(os.Environ(), flattenEnv(fakeGH.EnvMap())...)
+	if output, err := forced.CombinedOutput(); err != nil {
+		t.Fatalf("label create --force on existing label failed: %v\n%s", err, string(output))
+	}
+	state = readFakeGHStateFile(t, fakeGH.StatePath)
+	plan = findGHLabel(t, state.RepositoryLabels["acme/looper"], labels.DefaultPlanTrigger)
+	if plan.Description != "rewritten wording" || plan.Color != "000000" {
+		t.Errorf("looper:plan after --force = %+v, want rewritten wording and color 000000", plan)
+	}
+}
+
 func TestRealGHReadOnlySmoke(t *testing.T) {
 	if os.Getenv("LOOPER_E2E_REAL_GH") == "" {
 		t.Skip("set LOOPER_E2E_REAL_GH=1 to run real-gh smoke")
@@ -371,4 +496,36 @@ func containsOrdered(haystack []string, needle []string) bool {
 		}
 	}
 	return true
+}
+
+func invocationLogString(invocations []map[string]any) string {
+	var lines []string
+	for _, invocation := range invocations {
+		lines = append(lines, strings.Join(argvStrings(invocation), " "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func readFakeGHStateFile(tb testing.TB, path string) harness.GHState {
+	tb.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		tb.Fatalf("read fake-gh state: %v", err)
+	}
+	var state harness.GHState
+	if err := json.Unmarshal(payload, &state); err != nil {
+		tb.Fatalf("decode fake-gh state: %v", err)
+	}
+	return state
+}
+
+func findGHLabel(tb testing.TB, labels []harness.GHLabel, name string) *harness.GHLabel {
+	tb.Helper()
+	for index := range labels {
+		if strings.EqualFold(labels[index].Name, name) {
+			return &labels[index]
+		}
+	}
+	tb.Fatalf("label %q not found in %#v", name, labels)
+	return nil
 }

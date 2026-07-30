@@ -93,6 +93,18 @@ type GHState struct {
 	GraphQL          map[string]any           `json:"graphql,omitempty"`
 	CurrentUserLogin string                   `json:"currentUserLogin,omitempty"`
 	PullRequests     map[string]GHPullRequest `json:"pullRequests,omitempty"`
+	// RepositoryLabels seeds the per-repo label set the fake-gh binary models,
+	// keyed by repo slug. A contract test populates this to exercise the
+	// gateway's read-before-write label path against a hand-worded existing
+	// label, rather than asserting on argv strings in a unit test.
+	RepositoryLabels map[string][]GHLabel `json:"repositoryLabels,omitempty"`
+}
+
+// GHLabel is the public harness mirror of fake-gh's label state.
+type GHLabel struct {
+	Name        string `json:"name"`
+	Color       string `json:"color,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 func NewFakeGH(tb testing.TB, bins BuiltBinaries, schema GHSchema) FakeGH {

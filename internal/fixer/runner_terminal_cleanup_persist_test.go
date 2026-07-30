@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/loops"
@@ -255,5 +256,94 @@ func TestTerminalCleanupSurvivesLaterRetryPolicyWrite(t *testing.T) {
 	}
 	if final.Worktree == nil || final.Worktree.CleanedAt == "" {
 		t.Fatalf("stored worktree = %#v, want the earlier cleanup preserved under the later policy write", final.Worktree)
+	}
+}
+
+// TestTerminalCleanupRecordsRefusedRemovalAsSecondaryIssue covers the durable half of
+// a refused removal. The run has already completed and been written, so this is a
+// secondary issue by construction -- it must not disturb the primary result, and it
+// has to be visible where an operator reads the run rather than only in the event log.
+func TestTerminalCleanupRecordsRefusedRemovalAsSecondaryIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{cleanupErr: errors.New("worktree is dirty")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_issue", filepath.Join(t.TempDir(), "wt-50"))
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, "run_cleanup_issue", &checkpoint)
+
+	// In memory, for the returned ProcessResult.
+	if checkpoint.Outcome == nil || len(checkpoint.Outcome.SecondaryIssues) != 1 {
+		t.Fatalf("in-memory Outcome = %#v, want one secondary issue", checkpoint.Outcome)
+	}
+	if !strings.Contains(checkpoint.Outcome.SecondaryIssues[0].Message, "worktree is dirty") {
+		t.Fatalf("issue = %#v, want the refusal cause carried", checkpoint.Outcome.SecondaryIssues[0])
+	}
+
+	// And durably.
+	run, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_issue")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
+	}
+	stored := parseCheckpoint(run.CheckpointJSON)
+	if stored.Outcome == nil || len(stored.Outcome.SecondaryIssues) != 1 {
+		t.Fatalf("stored Outcome = %#v, want the issue persisted", stored.Outcome)
+	}
+	if stored.Outcome.SecondaryIssues[0].Retryable == nil || !*stored.Outcome.SecondaryIssues[0].Retryable {
+		t.Fatalf("stored issue = %#v, want retryable", stored.Outcome.SecondaryIssues[0])
+	}
+	// The cleanup timestamps still read as unverified, and nothing claimed a primary
+	// failure on a run whose own result stands.
+	if _, cleaned := storedCleanupTimestamps(t, fixture, "run_cleanup_issue"); cleaned != "" {
+		t.Fatalf("stored CleanedAt = %q, want empty after a refused removal", cleaned)
+	}
+	if stored.Outcome.PrimaryFailure != nil {
+		t.Fatalf("stored PrimaryFailure = %#v, want none: cleanup must not become the run's primary result", stored.Outcome.PrimaryFailure)
+	}
+}
+
+// TestTerminalCleanupAppendsToExistingSecondaryIssues pins that the durable write
+// appends rather than replaces, since the run may already carry issues recorded by
+// the failure path.
+func TestTerminalCleanupAppendsToExistingSecondaryIssues(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{cleanupErr: errors.New("worktree is dirty")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_append", filepath.Join(t.TempDir(), "wt-51"))
+
+	// A pre-existing outcome, as the failure path would have stored.
+	existing := checkpoint
+	existing.Outcome = &FixerRunOutcome{
+		PrimaryFailure:  &FixerOutcomeFailure{Step: string(stepRepair), Message: "agent timed out"},
+		SecondaryIssues: []FixerOutcomeFailure{{Step: string(stepPush), Message: "remote moved"}},
+	}
+	stored, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_append")
+	if err != nil || stored == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", stored, err)
+	}
+	encoded := mustMarshalJSON(existing)
+	updated := *stored
+	updated.CheckpointJSON = &encoded
+	if err := fixture.repos.Runs.Upsert(context.Background(), updated); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, "run_cleanup_append", &checkpoint)
+
+	after, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_append")
+	if err != nil || after == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", after, err)
+	}
+	final := parseCheckpoint(after.CheckpointJSON)
+	if final.Outcome == nil || len(final.Outcome.SecondaryIssues) != 2 {
+		t.Fatalf("stored SecondaryIssues = %#v, want the cleanup issue appended to the existing one", final.Outcome)
+	}
+	if final.Outcome.PrimaryFailure == nil || final.Outcome.PrimaryFailure.Message != "agent timed out" {
+		t.Fatalf("stored PrimaryFailure = %#v, want the causal failure untouched", final.Outcome.PrimaryFailure)
 	}
 }

@@ -125,3 +125,43 @@ describe("LoopDetail durable progress row", () => {
     expect(screen.queryByText("Kept (partial)")).toBeNull();
   });
 });
+
+describe("LoopDetail secondary issues row", () => {
+  it("lists issues around the run's own result, separately from the cause", async () => {
+    renderLoopDetail(
+      loopFixture({
+        outcome: {
+          primaryFailure: { step: "repair", message: "agent timed out" },
+          secondaryIssues: [
+            { step: "recheck", message: "worktree cleanup refused: dirty" },
+          ],
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Also")).toBeTruthy();
+    });
+    expect(
+      screen.getByText("recheck — worktree cleanup refused: dirty"),
+    ).toBeTruthy();
+    // The causal failure stays in its own row rather than being folded in.
+    expect(
+      screen.getByText("repair — agent timed out (+1 later issue)"),
+    ).toBeTruthy();
+  });
+
+  it("shows a dash when nothing else happened", async () => {
+    renderLoopDetail(
+      loopFixture({
+        outcome: { primaryFailure: { step: "repair", message: "agent timed out" } },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Also")).toBeTruthy();
+    });
+    const row = screen.getByText("Also").closest("div");
+    expect(row?.textContent).toContain("—");
+  });
+});
