@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/labels"
@@ -26,6 +27,24 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
 )
+
+func TestDetectProjectRepoRejectsUnsupportedRemoteHost(t *testing.T) {
+	t.Parallel()
+
+	gitPath := filepath.Join(t.TempDir(), "git")
+	if err := os.WriteFile(gitPath, []byte("#!/bin/sh\nprintf '%s\\n' 'https://code.example.test/core/looper.git'\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	_, err := detectProjectRepo(context.Background(), gitinfra.New(gitinfra.Options{GitPath: gitPath}), projects.OperationView{}, t.TempDir())
+	var unsupported projects.UnsupportedRemoteHostError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("detectProjectRepo() error = %v, want UnsupportedRemoteHostError", err)
+	}
+	if unsupported.Host != "code.example.test" {
+		t.Fatalf("unsupported host = %q, want code.example.test", unsupported.Host)
+	}
+}
 
 func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	t.Parallel()

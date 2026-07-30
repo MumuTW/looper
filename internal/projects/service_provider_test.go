@@ -2,7 +2,6 @@ package projects
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -137,42 +136,37 @@ func TestServiceAddProjectRejectsDetectedRepoFromMismatchedProvider(t *testing.T
 	}
 }
 
-// A checkout whose origin is not github.com used to register with no repository
-// and no warning: the scheduler skipped it on every tick, so registration looked
-// successful while nothing ever ran. Both halves of that gap are now reported.
-func TestServiceAddProjectWarnsWhenNoRepositoryCouldBeDetermined(t *testing.T) {
+func TestServiceAddProjectRejectsUnsupportedRemoteHost(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
-	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
+	published := false
 	service := &Service{
-		DB:     coordinator.DB(),
-		Repos:  repos,
-		Config: cfg,
-		Now:    func() time.Time { return now },
+		Repos: repos,
+		Now:   time.Now,
 		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
-			return DetectedRepo{}, fmt.Errorf(`origin host "code.example.com" is not github.com; looper drives GitHub only, so the repository cannot be detected — pass the repository explicitly as owner/name`)
+			return DetectedRepo{}, UnsupportedRemoteHostError{Host: "code.example.test"}
 		},
-		PublishProjects: func([]config.ProjectRefConfig) {},
+		PublishProjects: func([]config.ProjectRefConfig) { published = true },
 	}
 
-	added, err := service.AddProject(context.Background(), AddInput{
-		ID: "demo", Name: "Demo", RepoPath: "/tmp/demo",
+	_, err := service.AddProject(context.Background(), AddInput{
+		ID: "project", Name: "Project", RepoPath: "/tmp/project",
 	})
-	if err != nil {
-		t.Fatalf("AddProject() error = %v, want registration to succeed with warnings", err)
+	if err == nil {
+		t.Fatal("AddProject() error = nil, want unsupported remote host rejection")
 	}
-
-	joined := strings.Join(added.Warnings, "\n")
-	if !strings.Contains(joined, "is not github.com") {
-		t.Fatalf("warnings = %#v, want the unrecognized origin host reported", added.Warnings)
+	for _, want := range []string{"code.example.test", "--repo owner/name", "[[projects]]"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("AddProject() error = %q, want %q", err, want)
+		}
 	}
-	if !strings.Contains(joined, "no automation will run") {
-		t.Fatalf("warnings = %#v, want the inert-project consequence reported", added.Warnings)
+	stored, getErr := repos.Projects.GetByID(context.Background(), "project")
+	if getErr != nil {
+		t.Fatalf("GetByID() error = %v", getErr)
+	}
+	if stored != nil || published {
+		t.Fatalf("stored = %#v, published = %v; want rejection before persistence", stored, published)
 	}
 }

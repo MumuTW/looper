@@ -31,6 +31,17 @@ type DetectedRepo struct {
 	Provider string
 }
 
+// UnsupportedRemoteHostError distinguishes a remote that was parsed but
+// cannot be routed to the GitHub provider from an ordinary git-detection
+// failure, which remains a registration warning.
+type UnsupportedRemoteHostError struct {
+	Host string
+}
+
+func (e UnsupportedRemoteHostError) Error() string {
+	return fmt.Sprintf("origin host %q is not supported by the GitHub provider; pass --repo owner/name explicitly, and configure provider-bound projects under [[projects]]", e.Host)
+}
+
 type DetectRepoFunc func(context.Context, string) (DetectedRepo, error)
 
 type ListWorktreesFunc func(context.Context, string) ([]WorktreeListEntry, error)
@@ -340,6 +351,10 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 	if (repo == nil || provider == nil) && s.DetectRepo != nil {
 		detected, detectErr := s.DetectRepo(ctx, input.RepoPath)
 		if detectErr != nil {
+			var unsupportedHost UnsupportedRemoteHostError
+			if errors.As(detectErr, &unsupportedHost) {
+				return AddResult{}, nil, ProjectValidationError{Message: unsupportedHost.Error()}
+			}
 			warnings = append(warnings, fmt.Sprintf("Could not detect repository from git remote: %s", detectErr.Error()))
 		} else {
 			if repo == nil && strings.TrimSpace(detected.Repo) != "" {
