@@ -1040,6 +1040,39 @@ func TestRunnerAutonomousDispatchPreemptionIsPerTick(t *testing.T) {
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1, 2})
 }
 
+// TestReconfigurePreservesRuntimeStateThrottle verifies that reconfigure
+// carries the previous runner's RuntimeState into the replacement, so the
+// per-project throttle timestamp survives a config-snapshot rebuild. This
+// mirrors the production rebuild path in internal/runtime/scheduler.go, which
+// shares one coordinatorState across snapshots via Options.State. A fresh
+// RuntimeState on rebuild would reset lastTickByProject and let the second
+// tick at the same now() run despite the poll interval.
+func TestReconfigurePreservesRuntimeStateThrottle(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "1h"
+	})
+
+	res, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() first tick error = %v", err)
+	}
+	if res.Skipped {
+		t.Fatalf("first tick skipped, want ticked")
+	}
+
+	fixture.reconfigure(func(cfg *config.Config) { cfg.Roles.Coordinator.PollInterval = "1h" })
+
+	res, err = fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() second tick error = %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("second tick after reconfigure not throttled, want skipped (RuntimeState not preserved)")
+	}
+}
+
 func TestRunnerAutonomousDispatchPreemptionCountsWorkerDispatchesFromDispatchType(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
@@ -1256,13 +1289,16 @@ func newCoordinatorFixture(t *testing.T, configure ...func(*config.Config)) coor
 
 // reconfigure rebuilds the fixture's Runner from a fresh config value produced
 // by configure, going back through New(Options{...}) rather than mutating the
-// existing Runner's config in place. The underlying storage, GitHub stub, and
-// network stub are reused so state accumulated by earlier ticks carries over.
+// existing Runner's config in place. The underlying storage, GitHub stub,
+// network stub, and RuntimeState are reused so state accumulated by earlier
+// ticks (throttle timestamps, watch locks) carries over — mirroring the
+// production config-snapshot rebuild path in internal/runtime/scheduler.go,
+// which shares one coordinatorState across rebuilds via Options.State.
 func (f *coordinatorFixture) reconfigure(configure func(*config.Config)) {
 	cfg := *f.cfg
 	configure(&cfg)
 	f.cfg = &cfg
-	f.runner = New(Options{Repos: storage.NewRepositories(f.coord.DB()), GitHub: f.github, Config: f.cfg, Now: func() time.Time { return f.now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}, Network: f.network})
+	f.runner = New(Options{Repos: storage.NewRepositories(f.coord.DB()), GitHub: f.github, Config: f.cfg, Now: func() time.Time { return f.now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}, Network: f.network, State: f.runner.state})
 }
 
 func timePtr(value time.Time) *time.Time { return &value }
