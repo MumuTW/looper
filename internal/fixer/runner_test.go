@@ -6587,6 +6587,7 @@ type fakeGitGateway struct {
 	mergeBaseResult MergeBaseResult
 	mergeBaseErr    error
 	cleanupCalls    []CleanupWorktreeInput
+	cleanupErr      error
 }
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
@@ -6686,7 +6687,7 @@ func (f *fakeGitGateway) IsAncestor(_ context.Context, _ string, ancestor, desce
 
 func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktreeInput) error {
 	f.cleanupCalls = append(f.cleanupCalls, input)
-	return nil
+	return f.cleanupErr
 }
 
 type fakeAgentExecutor struct {
