@@ -928,6 +928,20 @@ func latestRunOrder(alias string) string {
 	return alias + ".started_at DESC, " + alias + ".created_at DESC, " + alias + ".seq DESC"
 }
 
+// SortRunsLatestFirst is the Go-side mirror of latestRunOrder for callers that
+// pick a latest run from already-loaded records; keep both in sync.
+func SortRunsLatestFirst(runs []RunRecord) {
+	sort.SliceStable(runs, func(i, j int) bool {
+		if runs[i].StartedAt != runs[j].StartedAt {
+			return runs[i].StartedAt > runs[j].StartedAt
+		}
+		if runs[i].CreatedAt != runs[j].CreatedAt {
+			return runs[i].CreatedAt > runs[j].CreatedAt
+		}
+		return runs[i].Seq > runs[j].Seq
+	})
+}
+
 func (r *RunsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*RunRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE loop_id = ? ORDER BY `+latestRunOrder("runs")+` LIMIT 1`, loopID)
 	record, err := scanRun(row)
@@ -955,12 +969,17 @@ func (r *RunsRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []stri
 		rows, err := r.q.QueryContext(ctx, `
 			SELECT r.*
 			FROM runs r
-			WHERE r.loop_id IN (`+sqlPlaceholders(len(chunk))+`)
-			AND r.id = (
-				SELECT latest.id FROM runs latest
-				WHERE latest.loop_id = r.loop_id
-				ORDER BY `+latestRunOrder("latest")+`
-				LIMIT 1
+			WHERE r.id IN (
+				SELECT (
+					SELECT latest.id FROM runs latest
+					WHERE latest.loop_id = candidates.loop_id
+					ORDER BY `+latestRunOrder("latest")+`
+					LIMIT 1
+				)
+				FROM (
+					SELECT DISTINCT loop_id FROM runs
+					WHERE loop_id IN (`+sqlPlaceholders(len(chunk))+`)
+				) AS candidates
 			)
 			ORDER BY `+latestRunOrder("r")+`
 		`, args...)
@@ -977,15 +996,7 @@ func (r *RunsRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []stri
 		}
 		items = append(items, chunkItems...)
 	}
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].StartedAt != items[j].StartedAt {
-			return items[i].StartedAt > items[j].StartedAt
-		}
-		if items[i].CreatedAt != items[j].CreatedAt {
-			return items[i].CreatedAt > items[j].CreatedAt
-		}
-		return items[i].Seq > items[j].Seq
-	})
+	SortRunsLatestFirst(items)
 	return items, nil
 }
 
@@ -1001,13 +1012,15 @@ func (r *RunsRepository) ListLatestByLoopStatusesAndResumePolicy(ctx context.Con
 	rows, err := r.q.QueryContext(ctx, `
 		SELECT r.*
 		FROM runs r
-		JOIN loops l ON l.id = r.loop_id
-		WHERE l.status IN (`+sqlPlaceholders(len(statuses))+`)
-		AND r.id = (
-			SELECT latest.id FROM runs latest
-			WHERE latest.loop_id = r.loop_id
-			ORDER BY `+latestRunOrder("latest")+`
-			LIMIT 1
+		WHERE r.id IN (
+			SELECT (
+				SELECT latest.id FROM runs latest
+				WHERE latest.loop_id = l.id
+				ORDER BY `+latestRunOrder("latest")+`
+				LIMIT 1
+			)
+			FROM loops l
+			WHERE l.status IN (`+sqlPlaceholders(len(statuses))+`)
 		)
 		AND json_valid(r.checkpoint_json)
 		AND json_extract(r.checkpoint_json, '$.resumePolicy') = ?

@@ -8262,3 +8262,59 @@ type requestArtifactRoute struct {
 		Body any `json:"body"`
 	} `json:"request"`
 }
+
+func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testing.T) {
+	fixture := newTestFixture(t)
+	ctx := context.Background()
+	repos := fixture.runtime.Services().Repositories
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{
+		ID:         "prs_tied_runs",
+		ProjectID:  "project_1",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "abc123",
+		CapturedAt: nowISO,
+		CreatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_pr_42", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// Three attempts inside one millisecond; IDs descend lexically so an
+	// ID-based tie-break would report the first insert instead of the newest.
+	for _, run := range []storage.RunRecord{
+		{ID: "z_attempt_1", LoopID: "loop_pr_42", Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "m_attempt_2", LoopID: "loop_pr_42", Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "a_attempt_3", LoopID: "loop_pr_42", Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Runs.Upsert(ctx, run); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		}
+	}
+	// Touching an older attempt later must not make it the latest run.
+	laterISO := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+	if err := repos.Runs.Upsert(ctx, storage.RunRecord{ID: "z_attempt_1", LoopID: "loop_pr_42", Status: "interrupted", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: laterISO}); err != nil {
+		t.Fatalf("Runs.Upsert(z_attempt_1 update) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Flooper/42/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	loopStatus := data["loopStatus"].(map[string]any)
+	assertEqual(t, loopStatus["latestRunStatus"], "running")
+}

@@ -2498,15 +2498,7 @@ func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot s
 		}
 		runs = append(runs, loopRuns...)
 	}
-	sort.SliceStable(runs, func(i, j int) bool {
-		if runs[i].StartedAt != runs[j].StartedAt {
-			return runs[i].StartedAt > runs[j].StartedAt
-		}
-		if runs[i].UpdatedAt != runs[j].UpdatedAt {
-			return runs[i].UpdatedAt > runs[j].UpdatedAt
-		}
-		return runs[i].ID > runs[j].ID
-	})
+	storage.SortRunsLatestFirst(runs)
 
 	var latestRunStatus *string
 	if len(runs) > 0 {
