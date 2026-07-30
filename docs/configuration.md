@@ -360,6 +360,48 @@ For fresh unattended runs, Looper supplies `--always-approve` and `--sandbox off
 
 Grok Build support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt, and Looper never uses Grok Build's ambient `--continue`.
 
+## Devin CLI (experimental fresh-run)
+
+Use `devin-experimental` as the `agent.vendor` identifier. The persisted name
+makes its weaker lifecycle contract machine-visible. Looper invokes the locally
+authenticated `devin` executable in non-interactive print mode:
+
+```toml
+[agent]
+vendor = "devin-experimental"
+model = "glm-5-2"
+```
+
+Authenticate and inspect the models currently available to the daemon account
+before starting Looper:
+
+```bash
+devin auth login
+devin auth status
+devin models list --format json
+```
+
+Model availability and pricing are time-sensitive. Pin the exact model UID
+reported by `devin models list`; do not rely on a family alias when cost matters.
+As of 2026-07-30, the tested account reports `glm-5-2`, `swe-1-7`, and
+`swe-1-7-medium` as free. For example, `swe` currently resolves to the paid
+`swe-1-7-lightning` variant rather than either free SWE-1.7 variant. Treat this
+as time-sensitive evidence, not a permanent pricing guarantee.
+
+Fresh unattended runs default to `--permission-mode dangerous`,
+`--respect-workspace-trust false`, and `--print`. Operators can override the
+permission and workspace-trust flags through `agent.params.args`. Dangerous
+mode lets the agent execute without prompts and is not a filesystem or network
+security boundary. Validation-gated runs that request Looper's strict
+tool-network restriction therefore fail closed for Devin, as they do for every
+non-Codex vendor.
+
+This first integration is fresh-run only. Although Devin CLI exposes resume and
+ACP, Looper does not yet capture Devin's ATIF session identity or implement a
+shared ACP transport. Daemon native resume and interactive takeover remain
+disabled; retries continue from Looper's durable checkpoint in the same
+worktree with a fresh Devin session.
+
 ## Provider support
 
 Looper supports three provider kinds:

@@ -1,6 +1,6 @@
 ---
 name: looper
-description: Use when installing, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, cursor-cli, or Grok Build; when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing daemon reachability, git, gh, LOOPER_TOKEN, writable path, or startup issues.
+description: Use when installing, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, cursor-cli, Grok Build, or Devin; when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing daemon reachability, git, gh, LOOPER_TOKEN, writable path, or startup issues.
 ---
 
 # Looper
@@ -59,6 +59,7 @@ Install missing tools only with the user's OK. Authenticate `gh` if needed.
 | `opencode` | `command -v opencode` |
 | `cursor-cli` | `command -v cursor-agent` or `command -v agent` |
 | `grok-build` | `command -v grok` |
+| `devin-experimental` | `command -v devin` |
 
 If none are installed, stop and ask which the user wants.
 
@@ -85,6 +86,7 @@ port = 17310
 
 [agent]
 vendor = "claude-code"   # or codex / opencode / cursor-cli / grok-build
+# devin-experimental is available for Devin fresh-run tasks.
 
 [defaults]
 baseBranch = "main"

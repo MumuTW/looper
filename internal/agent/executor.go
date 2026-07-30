@@ -430,12 +430,8 @@ func (e *ConfiguredExecutor) markNativeResumeFailed(ctx context.Context, executi
 }
 
 func nativeResumeSupported(vendor config.AgentVendor) bool {
-	switch vendor {
-	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI:
-		return true
-	default:
-		return false
-	}
+	adapter, ok := runtimeAdapterFor(vendor)
+	return ok && adapter.resolveNativeResumeArgs != nil
 }
 
 func isRecoverableNativeResumeSource(status string, resumeStatus *string) bool {
@@ -2003,12 +1999,8 @@ func ResolveSpawnWithNativeResume(cfg ExecutorConfig, workingDirectory string, p
 // (`claude --resume <id>`) both keep the id and thread the conversation.
 // opencode/cursor stay disabled until the same 3-turn check passes for them.
 func InteractiveTakeoverSupported(vendor config.AgentVendor) bool {
-	switch vendor {
-	case config.AgentVendorCodex, config.AgentVendorClaudeCode:
-		return true
-	default:
-		return false
-	}
+	adapter, ok := runtimeAdapterFor(vendor)
+	return ok && adapter.resolveInteractiveResume != nil
 }
 
 // InteractiveResumeCommandLine renders the shell command a human runs to take
@@ -2024,15 +2016,11 @@ func InteractiveResumeCommandLine(cfg ExecutorConfig, workingDirectory, sessionI
 		return "", false
 	}
 	command := resolveCommand(cfg)
-	var resume string
-	switch cfg.Vendor {
-	case config.AgentVendorCodex:
-		resume = command + " resume " + shellSingleQuote(sessionID)
-	case config.AgentVendorClaudeCode:
-		resume = command + " --resume " + shellSingleQuote(sessionID)
-	default:
+	adapter, ok := runtimeAdapterFor(cfg.Vendor)
+	if !ok || adapter.resolveInteractiveResume == nil {
 		return "", false
 	}
+	resume := adapter.resolveInteractiveResume(command, sessionID)
 	if workingDirectory != "" {
 		return "cd " + shellSingleQuote(workingDirectory) + " && " + resume, true
 	}
@@ -2056,34 +2044,18 @@ func resolveCommand(cfg ExecutorConfig) string {
 	if override, ok := cfg.Params["command"].(string); ok && strings.TrimSpace(override) != "" {
 		return override
 	}
-	switch cfg.Vendor {
-	case config.AgentVendorClaudeCode:
-		return "claude"
-	case config.AgentVendorCursorCLI:
-		return "agent"
-	case config.AgentVendorGrokBuild:
-		return "grok"
-	default:
-		return string(cfg.Vendor)
+	if adapter, ok := runtimeAdapterFor(cfg.Vendor); ok && adapter.command != "" {
+		return adapter.command
 	}
+	return string(cfg.Vendor)
 }
 
 func resolveArgs(cfg ExecutorConfig, workingDirectory string, prompt string) []string {
 	resolvedArgs := stringArgs(cfg.Params["args"])
-	switch cfg.Vendor {
-	case config.AgentVendorClaudeCode:
-		return resolveClaudeArgs(cfg, resolvedArgs, prompt)
-	case config.AgentVendorCodex:
-		return resolveCodexArgs(cfg, resolvedArgs, prompt)
-	case config.AgentVendorOpenCode:
-		return resolveOpenCodeArgs(cfg, resolvedArgs, workingDirectory, prompt)
-	case config.AgentVendorCursorCLI:
-		return resolveCursorArgs(cfg, resolvedArgs, prompt)
-	case config.AgentVendorGrokBuild:
-		return resolveGrokArgs(cfg, resolvedArgs, workingDirectory, prompt)
-	default:
-		return append([]string{}, resolvedArgs...)
+	if adapter, ok := runtimeAdapterFor(cfg.Vendor); ok && adapter.resolveStartArgs != nil {
+		return adapter.resolveStartArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	}
+	return append([]string{}, resolvedArgs...)
 }
 
 func resolveClaudeArgs(cfg ExecutorConfig, args []string, prompt string) []string {
@@ -2289,61 +2261,25 @@ func resolveGrokArgs(cfg ExecutorConfig, args []string, workingDirectory string,
 	return resolved
 }
 
-func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args []string, sessionID string, prompt string) []string {
-	switch cfg.Vendor {
-	case config.AgentVendorClaudeCode:
-		resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
-		if !hasAnyFlag(resolved, []string{"--continue", "--resume"}) {
-			resolved = append(resolved, "--resume", sessionID)
-		}
-		if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
-			resolved = append(resolved, "--print", prompt)
-		}
-		if !hasAnyFlag(resolved, []string{"--dangerously-skip-permissions"}) {
-			resolved = append(resolved, "--dangerously-skip-permissions")
-		}
-		return resolved
-	case config.AgentVendorCodex:
-		resolved := removeFirstArg(args, "exec")
-		resolved = removeFirstArg(resolved, "resume")
-		withModel := prependModelFlag(append([]string{"exec"}, resolved...), cfg.Model, "--model", []string{"--model", "-m"})
-		// A resumed session is sandboxed exactly like a fresh one, so it
-		// needs the same networking grant; without it, resume would fail in
-		// the one way the fresh path was just fixed for.
-		withModel = appendCodexSandboxDefaults(withModel)
-		base := append(withModel, "resume")
-		base = append(base, sessionID)
-		if containsArg(withModel, "-") {
-			return base
-		}
-		return append(base, prompt)
-	case config.AgentVendorOpenCode:
-		resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model", "-m"})
-		if !containsArg(resolved, "run") {
-			resolved = append([]string{"run"}, resolved...)
-		}
-		if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--dir"}) {
-			resolved = appendDirFlag(resolved, workingDirectory)
-		}
-		if !hasAnyFlag(resolved, []string{"--session", "--continue"}) {
-			resolved = append(resolved, "--session", sessionID)
-		}
-		if !hasAnyFlag(resolved, []string{"-p", "--prompt", "-f", "--file"}) {
-			resolved = append(resolved, prompt)
-		}
-		return resolved
-	case config.AgentVendorCursorCLI:
-		resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
-		if !hasAnyFlag(resolved, []string{"--continue", "--resume"}) {
-			resolved = append(resolved, "--resume", sessionID)
-		}
-		if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
-			resolved = append(resolved, "--print", prompt)
-		}
-		return resolved
-	default:
-		return append([]string{}, args...)
+func resolveDevinArgs(cfg ExecutorConfig, args []string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+	if !hasAnyFlag(resolved, []string{"--permission-mode"}) {
+		resolved = append(resolved, "--permission-mode", "dangerous")
 	}
+	if !hasAnyFlag(resolved, []string{"--respect-workspace-trust"}) {
+		resolved = append(resolved, "--respect-workspace-trust", "false")
+	}
+	if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
+		resolved = append(resolved, "--print")
+	}
+	return append(resolved, prompt)
+}
+
+func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args []string, sessionID string, prompt string) []string {
+	if adapter, ok := runtimeAdapterFor(cfg.Vendor); ok && adapter.resolveNativeResumeArgs != nil {
+		return adapter.resolveNativeResumeArgs(cfg, args, workingDirectory, sessionID, prompt)
+	}
+	return append([]string{}, args...)
 }
 
 func buildCommandEnv(workingDirectory string, prompt string, envSources ...map[string]string) []string {

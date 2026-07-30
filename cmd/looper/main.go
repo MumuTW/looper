@@ -472,7 +472,8 @@ port = 17310
 
 [agent]
 # The coding agent looperd drives. One of:
-#   claude-code, codex, opencode, cursor-cli, grok-build
+#   claude-code, codex, opencode, cursor-cli, grok-build, devin-experimental
+# devin-experimental is fresh-run only.
 vendor = "claude-code"
 # model = "opus"
 
