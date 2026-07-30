@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/eventlog"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/eventlog"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // MergeOutcomeEventType records what Gatekeeper did with an eligible pull
