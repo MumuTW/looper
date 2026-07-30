@@ -23,6 +23,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
@@ -4122,7 +4123,7 @@ func TestHandlerCreateManualLoopsRejectHeldTargetsWithoutForce(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), project); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 	h := NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), Now: func() time.Time { return fixture.now.Add(time.Minute) }})
 	for _, tc := range []struct{ name, path, body string }{
 		{name: "planner", path: "/api/v1/planners", body: `{"projectId":"project_1","issueNumber":77}`},
@@ -4157,7 +4158,7 @@ func TestHandlerPlannerCreateForceBypassesHold(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"project_1","issueNumber":77,"force":true}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
@@ -4178,7 +4179,7 @@ func TestHandlerWorkerCreateRejectsHeldRequestedIssueEvenWhenPlannerPRExists(t *
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelWorker}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldWorker}))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
@@ -4202,7 +4203,7 @@ func TestHandlerCreateManualLoopForceBypassesHoldButStillConflicts(t *testing.T)
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_existing_conflict", Seq: 100, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"), Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -4228,7 +4229,7 @@ func TestHandlerCreateReviewerLoopForcePersistsManualMetadata(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42,"force":true}`)))
 	req.Header.Set("content-type", "application/json")

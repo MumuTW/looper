@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/coordinator/depgraph"
-	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 const (
@@ -313,13 +313,13 @@ func hasLabel(labels []string, want string) bool {
 	return false
 }
 
-func autonomousDispatchHeld(labels []string, legacyHoldLabel string) bool {
+func autonomousDispatchHeld(issueLabels []string, legacyHoldLabel string) bool {
 	// Coordinator autonomous dispatch is only blocked by the official global hold.
 	// Lane-specific official holds apply later in each lane's own discovery gate.
-	if hasLabel(labels, domain.HoldLabelGlobal) {
+	if hasLabel(issueLabels, labels.HoldGlobal) {
 		return true
 	}
-	return hasLabel(labels, strings.TrimSpace(legacyHoldLabel))
+	return hasLabel(issueLabels, strings.TrimSpace(legacyHoldLabel))
 }
 
 func dependencyFailureBody(blockers []depgraph.Blocker) string {

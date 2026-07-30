@@ -17,9 +17,8 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -3735,15 +3734,15 @@ func extractIssueRepository(value any) IssueRepository {
 
 func resolveLabelColor(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
-	case "looper:plan":
+	case labels.DefaultPlanTrigger:
 		return "5319e7"
-	case specpr.ReviewingLabel:
+	case labels.SpecReviewing:
 		return "1d76db"
-	case specpr.ReadyLabel:
+	case labels.SpecReady:
 		return "0e8a16"
-	case specpr.NeedsHumanLabel:
+	case labels.NeedsHuman:
 		return "d93f0b"
-	case domain.HoldLabelGlobal, domain.HoldLabelWorker, domain.HoldLabelFixer, domain.HoldLabelReviewer:
+	case labels.HoldGlobal, labels.HoldWorker, labels.HoldFixer, labels.HoldReviewer:
 		return "b60205"
 	default:
 		return "5319e7"
@@ -3752,21 +3751,21 @@ func resolveLabelColor(label string) string {
 
 func resolveLabelDescription(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
-	case "looper:plan":
+	case labels.DefaultPlanTrigger:
 		return "Picked up automatically by planner"
-	case specpr.ReviewingLabel:
+	case labels.SpecReviewing:
 		return "Spec PR is under review"
-	case specpr.ReadyLabel:
+	case labels.SpecReady:
 		return "Spec PR is ready for implementation"
-	case specpr.NeedsHumanLabel:
+	case labels.NeedsHuman:
 		return "Looper requires manual intervention"
-	case domain.HoldLabelGlobal:
+	case labels.HoldGlobal:
 		return "Block all automatic Looper activity for this issue or PR"
-	case domain.HoldLabelWorker:
+	case labels.HoldWorker:
 		return "Block automatic worker activity for this issue or PR"
-	case domain.HoldLabelFixer:
+	case labels.HoldFixer:
 		return "Block automatic fixer activity for this issue or PR"
-	case domain.HoldLabelReviewer:
+	case labels.HoldReviewer:
 		return "Block automatic reviewer activity for this issue or PR"
 	default:
 		return "Managed by looper"
@@ -3775,14 +3774,14 @@ func resolveLabelDescription(label string) string {
 
 func StandardLooperLabels() []LabelDefinition {
 	return []LabelDefinition{
-		{Name: "looper:plan", Color: resolveLabelColor("looper:plan"), Description: resolveLabelDescription("looper:plan")},
-		{Name: specpr.ReviewingLabel, Color: resolveLabelColor(specpr.ReviewingLabel), Description: resolveLabelDescription(specpr.ReviewingLabel)},
-		{Name: specpr.ReadyLabel, Color: resolveLabelColor(specpr.ReadyLabel), Description: resolveLabelDescription(specpr.ReadyLabel)},
-		{Name: specpr.NeedsHumanLabel, Color: resolveLabelColor(specpr.NeedsHumanLabel), Description: resolveLabelDescription(specpr.NeedsHumanLabel)},
-		{Name: domain.HoldLabelGlobal, Color: resolveLabelColor(domain.HoldLabelGlobal), Description: resolveLabelDescription(domain.HoldLabelGlobal)},
-		{Name: domain.HoldLabelWorker, Color: resolveLabelColor(domain.HoldLabelWorker), Description: resolveLabelDescription(domain.HoldLabelWorker)},
-		{Name: domain.HoldLabelFixer, Color: resolveLabelColor(domain.HoldLabelFixer), Description: resolveLabelDescription(domain.HoldLabelFixer)},
-		{Name: domain.HoldLabelReviewer, Color: resolveLabelColor(domain.HoldLabelReviewer), Description: resolveLabelDescription(domain.HoldLabelReviewer)},
+		{Name: labels.DefaultPlanTrigger, Color: resolveLabelColor(labels.DefaultPlanTrigger), Description: resolveLabelDescription(labels.DefaultPlanTrigger)},
+		{Name: labels.SpecReviewing, Color: resolveLabelColor(labels.SpecReviewing), Description: resolveLabelDescription(labels.SpecReviewing)},
+		{Name: labels.SpecReady, Color: resolveLabelColor(labels.SpecReady), Description: resolveLabelDescription(labels.SpecReady)},
+		{Name: labels.NeedsHuman, Color: resolveLabelColor(labels.NeedsHuman), Description: resolveLabelDescription(labels.NeedsHuman)},
+		{Name: labels.HoldGlobal, Color: resolveLabelColor(labels.HoldGlobal), Description: resolveLabelDescription(labels.HoldGlobal)},
+		{Name: labels.HoldWorker, Color: resolveLabelColor(labels.HoldWorker), Description: resolveLabelDescription(labels.HoldWorker)},
+		{Name: labels.HoldFixer, Color: resolveLabelColor(labels.HoldFixer), Description: resolveLabelDescription(labels.HoldFixer)},
+		{Name: labels.HoldReviewer, Color: resolveLabelColor(labels.HoldReviewer), Description: resolveLabelDescription(labels.HoldReviewer)},
 	}
 }
 

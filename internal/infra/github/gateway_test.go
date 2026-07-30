@@ -11,8 +11,8 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
-	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 func TestInvalidJSONErrorIncludesParserDetailsAndPayloadSample(t *testing.T) {
@@ -2434,7 +2434,7 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 	}
 	got := ""
 	for _, label := range result.Labels {
-		if label.Name == domain.HoldLabelWorker {
+		if label.Name == labels.HoldWorker {
 			got = label.Error
 		}
 	}

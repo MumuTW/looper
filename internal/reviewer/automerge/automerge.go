@@ -1,9 +1,8 @@
 package automerge
 
 import (
-	"strings"
-
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 type RefusalReason string
@@ -50,7 +49,7 @@ func Decide(pr PRSnapshot, autoMergeConfig config.ReviewerAutoMergeConfig, prote
 	if !autoMergeConfig.Enabled {
 		return RefuseWithReason(RefusalReasonDisabled)
 	}
-	if !hasLooperLabel(pr.Labels) || !pr.HasTrackedIssueLink {
+	if !labels.AnyLooperOwned(pr.Labels) || !pr.HasTrackedIssueLink {
 		return RefuseWithReason(RefusalReasonScope)
 	}
 	if autoMergeConfig.RequireBranchProtection && (!protection.Exists || !protection.HasRequiredChecks) {
@@ -63,15 +62,6 @@ func Decide(pr PRSnapshot, autoMergeConfig config.ReviewerAutoMergeConfig, prote
 		return RefuseWithReason(RefusalReasonAutoMergeDisabled)
 	}
 	return OptInWithStrategy(autoMergeConfig.Strategy)
-}
-
-func hasLooperLabel(labels []string) bool {
-	for _, label := range labels {
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(label)), "looper:") {
-			return true
-		}
-	}
-	return false
 }
 
 func StrategyAllowed(strategy config.ReviewerAutoMergeStrategy, settings RepoSettingsSnapshot) bool {
