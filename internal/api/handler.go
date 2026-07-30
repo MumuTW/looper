@@ -4076,8 +4076,8 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	}
 
 	var body createLoopRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return loopResponse{}, *aerr
 	}
 
 	projectID := strings.TrimSpace(derefString(body.ProjectID))
@@ -4269,8 +4269,8 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 
 	body := createWorkerRequest{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return workerCreateResponse{}, *aerr
 	}
 
 	prompt := normalizeOptionalString(body.Prompt)
@@ -4919,8 +4919,8 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 	}
 
 	body := createPlannerRequest{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return plannerCreateResponse{}, *aerr
 	}
 
 	projectID := strings.TrimSpace(derefString(body.ProjectID))
@@ -5629,18 +5629,22 @@ func retryRequestRequestsDiscard(r *http.Request) (bool, error) {
 	if r == nil || r.Body == nil {
 		return false, nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	raw, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxJSONMutationBodyBytes))
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(strings.NewReader(string(raw)))
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return false, apiError{code: pkgapi.ErrorCodeRequestTooLarge, status: http.StatusRequestEntityTooLarge, message: fmt.Sprintf("Request body exceeds %d bytes", maxJSONMutationBodyBytes)}
+		}
 		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
 	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
 		return false, nil
 	}
 	var body retryLoopRequest
-	if err := json.Unmarshal(raw, &body); err != nil {
-		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+	if aerr := decodeStrictJSONValue(raw, &body); aerr != nil {
+		return false, *aerr
 	}
 	return body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges, nil
 }
@@ -5656,12 +5660,8 @@ type respondLoopRequest struct {
 // agent session with the answer. This is the testable core of the HITL bridge.
 func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID string) (loopResponse, error) {
 	var body respondLoopRequest
-	if r.Body != nil {
-		defer r.Body.Close()
-		decoder := json.NewDecoder(r.Body)
-		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid respond request: %v", err)}
-		}
+	if aerr := decodeJSONMutationBody(r, &body, false); aerr != nil {
+		return loopResponse{}, *aerr
 	}
 	return h.deliverHumanAnswer(ctx, loopID, body.Answer)
 }
@@ -5935,12 +5935,8 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 // path preserves human interactive edits in the worktree for the resumed session.
 func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string, fromHandback bool) (retryLoopResponse, error) {
 	var body retryLoopRequest
-	if r.Body != nil {
-		defer r.Body.Close()
-		decoder := json.NewDecoder(r.Body)
-		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
-		}
+	if aerr := decodeJSONMutationBody(r, &body, false); aerr != nil {
+		return retryLoopResponse{}, *aerr
 	}
 	mode := strings.TrimSpace(body.Mode)
 	if mode == "" {
@@ -7349,8 +7345,8 @@ type createProjectRequest struct {
 
 func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectService) (createProjectResponse, error) {
 	body := createProjectRequest{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return createProjectResponse{}, *aerr
 	}
 
 	repoPath := strings.TrimSpace(derefString(body.RepoPath))
