@@ -132,7 +132,11 @@ type Options struct {
 	// pump chose to fire (ticker/trigger cadence regressions pass through),
 	// and it bypasses the default claim's own internal admission gating,
 	// which only the default implementation exercises.
-	RunSchedulerClaim  RunSchedulerTickFunc
+	RunSchedulerClaim RunSchedulerTickFunc
+	// WebhookForwarder overrides the webhook forwarder wired during startup.
+	// Like RunSchedulerTick, an injected forwarder owns its own dependencies;
+	// nil uses the default catalog-scheduler forwarder.
+	WebhookForwarder   WebhookForwarder
 	ReadProcessCommand ReadProcessCommandFunc
 	ReadProcessStart   ReadProcessStartFunc
 	ReadProcessBootID  ReadProcessBootIDFunc
@@ -181,6 +185,7 @@ type Runtime struct {
 	defaultSchedulerClaim  RunSchedulerTickFunc
 	customSchedulerTick    bool
 	customSchedulerClaim   bool
+	customWebhookForwarder bool
 	readProcessCommand     ReadProcessCommandFunc
 	readProcessStart       ReadProcessStartFunc
 	readProcessBootID      ReadProcessBootIDFunc
@@ -270,6 +275,7 @@ func New(options Options) *Runtime {
 	runSchedulerTick := options.RunSchedulerTick
 	customSchedulerTick := runSchedulerTick != nil
 	customSchedulerClaim := options.RunSchedulerClaim != nil
+	customWebhookForwarder := options.WebhookForwarder != nil
 
 	readProcessCommand := options.ReadProcessCommand
 	if readProcessCommand == nil {
@@ -322,6 +328,8 @@ func New(options Options) *Runtime {
 		customSchedulerTick:         customSchedulerTick,
 		defaultSchedulerClaim:       options.RunSchedulerClaim,
 		customSchedulerClaim:        customSchedulerClaim,
+		webhookForwarder:            options.WebhookForwarder,
+		customWebhookForwarder:      customWebhookForwarder,
 		readProcessCommand:          readProcessCommand,
 		readProcessStart:            readProcessStart,
 		readProcessBootID:           readProcessBootID,
@@ -390,9 +398,31 @@ func Start(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.R
 func (r *Runtime) Start(ctx context.Context) error {
 	r.startOnce.Do(func() {
 		r.startErr = r.start(ctx)
+		if r.startErr != nil {
+			// Ownership of an injected forwarder transferred at construction;
+			// a caller whose Start failed must not be required to Stop the
+			// runtime just to release it.
+			r.closeInjectedWebhookForwarder()
+		}
 	})
 
 	return r.startErr
+}
+
+// closeInjectedWebhookForwarder releases a construction-injected forwarder
+// exactly once: the field is cleared under the lock so a later Stop cannot
+// double-close it.
+func (r *Runtime) closeInjectedWebhookForwarder() {
+	if !r.customWebhookForwarder {
+		return
+	}
+	r.mu.Lock()
+	forwarder := r.webhookForwarder
+	r.webhookForwarder = nil
+	r.mu.Unlock()
+	if forwarder != nil {
+		forwarder.Close()
+	}
 }
 
 func (r *Runtime) Stop(reason string) {
@@ -1031,13 +1061,19 @@ func (r *Runtime) start(ctx context.Context) error {
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
 		if !r.customSchedulerTick {
 			r.defaultSchedulerTick = handlers.tick
-			r.webhookForwarder = handlers.webhook
+			if !r.customWebhookForwarder {
+				r.webhookForwarder = handlers.webhook
+			} else if handlers.webhook != nil {
+				// An injected forwarder replaces the default; close the one
+				// the handler bundle constructed so its workers do not leak.
+				handlers.webhook.Close()
+			}
 			r.notificationGateways = handlers.notificationGateways
 			schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
 		} else if handlers.webhook != nil {
-			// The bundle was built only for its claim; close the eagerly
-			// constructed webhook forwarder it also carries so its workers
-			// do not leak.
+			// The bundle was built only for its claim (or not at all for an
+			// injected one); close the eagerly constructed webhook forwarder
+			// it carries so its workers do not leak.
 			handlers.webhook.Close()
 		}
 		if !r.customSchedulerClaim {
