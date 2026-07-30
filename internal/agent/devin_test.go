@@ -186,6 +186,18 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
+	// Any abort before the explicit Kill below — a readiness timeout, a failed
+	// assertion — would otherwise leave the child alive for the full 60s
+	// execution timeout. Containment puts it in its own process group, so it
+	// outlives the test binary and orphans into later tests or a persistent
+	// runner. Safe on the happy path too: Kill is non-blocking and Wait
+	// re-posts its outcome, so a second pair of calls observes the same result.
+	t.Cleanup(func() {
+		_ = run.Kill("test cleanup")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = run.Wait(ctx)
+	})
 
 	// Spawning a shell can take well over 2s on a loaded CI runner, so this is
 	// generous — but it stays far below the 60s execution timeout so there is
