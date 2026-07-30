@@ -65,6 +65,7 @@ func TestRunRecoveryPipelineRecoversOtherLoopsWhenOneIsHumanHeld(t *testing.T) {
 	seedRun("loop_ordinary")
 
 	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt.services.Coordinator = coordinator
 	if _, err := rt.runRecoveryPipeline(ctx, repositories, nil, now); err != nil {
 		t.Fatalf("runRecoveryPipeline() error = %v; one held loop must not abort startup recovery", err)
 	}
@@ -125,17 +126,16 @@ func TestRecoveryUpsertLoopReportsAHeldLoopAsNotApplied(t *testing.T) {
 	}
 }
 
-// Stale-run reconciliation's requeue is not one write, it is a loop write
-// followed by a multi-statement queue repair. recoveryUpsertLoop only guards the
-// first: a takeover that commits *after* the loop write cancels the loop's queue
-// item, and the repair then publishes a replacement one for a loop the human now
-// owns. The claim predicate keeps that item dormant, so nothing runs — but it is
-// durable state contradicting the hold, and it is the exact blocker
-// assertLoopRetryPreconditions rejects on, so leaving it there puts a landmine
-// under the operator's release path. Unlike the cleanup races deferred to #210,
-// both halves here are durable writes on the same rows, so the window closes
-// rather than narrows.
-func TestStaleRunRepairAbandonsRequeueWhenTakeoverCommitsMidRepair(t *testing.T) {
+// Stale-run reconciliation's requeue is not one write, it is a loop write plus a
+// multi-statement queue repair — and it now commits as one transaction, with the
+// human-hold guard inside the loop write deciding the whole thing. A pass that
+// loaded the loop before `looper takeover` committed therefore loses the race at
+// the write instead of publishing queue work it has to take back out: refusal
+// covers the queue repair as well, because the queue repair is in the same
+// transaction that was refused. An active queue item against a held loop is
+// exactly what assertLoopRetryPreconditions rejects, so anything left behind here
+// is a landmine under the operator's release path.
+func TestStaleRunRepairRefusesTheWholeRepairOfAHeldLoop(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -158,6 +158,7 @@ func TestStaleRunRepairAbandonsRequeueWhenTakeoverCommitsMidRepair(t *testing.T)
 	if err := repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
+	// The snapshot recovery is holding: the loop as it looked before takeover.
 	loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := repositories.Loops.Upsert(ctx, loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -175,40 +176,24 @@ func TestStaleRunRepairAbandonsRequeueWhenTakeoverCommitsMidRepair(t *testing.T)
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
-	// The takeover transaction, committed in the window the fix closes: the hold
-	// lands and the loop's queue item is cancelled, exactly as looperd's
-	// Loops.Hold does.
-	takeoverOnce := false
-	rt.staleRepairAfterLoopWriteHook = func(id string) {
-		if takeoverOnce || id != loopID {
-			return
-		}
-		takeoverOnce = true
-		held, err := repositories.Loops.GetByID(ctx, loopID)
-		if err != nil || held == nil {
-			t.Errorf("Loops.GetByID(%s) = (%#v, %v)", loopID, held, err)
-			return
-		}
-		held.Status = "human_takeover"
-		held.NextRunAt = nil
-		held.UpdatedAt = nowISO
-		if err := repositories.Loops.UpsertChangingHumanHold(ctx, *held); err != nil {
-			t.Errorf("UpsertChangingHumanHold() error = %v", err)
-			return
-		}
-		reason := "Taken over by a human via looper takeover"
-		if _, err := repositories.Queue.CancelByLoop(ctx, loopID, nowISO, &reason); err != nil {
-			t.Errorf("Queue.CancelByLoop() error = %v", err)
-		}
+	// The takeover, exactly as looperd's takeover commits it: the hold lands and
+	// the loop's queue item is cancelled.
+	held := loop
+	held.Status = "human_takeover"
+	held.UpdatedAt = nowISO
+	if err := repositories.Loops.UpsertChangingHumanHold(ctx, held); err != nil {
+		t.Fatalf("UpsertChangingHumanHold() error = %v", err)
+	}
+	takeoverReason := "Taken over by a human via looper takeover"
+	if _, err := repositories.Queue.CancelByLoop(ctx, loopID, nowISO, &takeoverReason); err != nil {
+		t.Fatalf("Queue.CancelByLoop() error = %v", err)
 	}
 
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt.services.Coordinator = coordinator
 	summary, err := rt.repairStaleRunQueueState(ctx, repositories, loop, latestRun, false, nowISO)
 	if err != nil {
 		t.Fatalf("repairStaleRunQueueState() error = %v", err)
-	}
-	if !takeoverOnce {
-		t.Fatal("the takeover hook never fired; the test did not reach the requeue path it claims to cover")
 	}
 	if summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
 		t.Fatalf("summary = %#v, want no requeue reported: the human owns the loop", summary)
@@ -221,9 +206,11 @@ func TestStaleRunRepairAbandonsRequeueWhenTakeoverCommitsMidRepair(t *testing.T)
 	if persisted.Status != "human_takeover" {
 		t.Fatalf("loop status = %q, want human_takeover preserved", persisted.Status)
 	}
-	// The assertion that matters for the operator: nothing active is left behind.
-	// An active queue item here is precisely what assertLoopRetryPreconditions
-	// refuses, so this is the state /handback would have had to clean up.
+	if persisted.NextRunAt != nil {
+		t.Fatalf("loop.NextRunAt = %#v, want nil: recovery must not re-arm a loop a human owns", persisted.NextRunAt)
+	}
+	// The assertion that matters for the operator: the refused loop write took the
+	// queue repair down with it, so nothing active is left behind.
 	active, err := repositories.Queue.FindActiveByLoopID(ctx, loopID)
 	if err != nil {
 		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)

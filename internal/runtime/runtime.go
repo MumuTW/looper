@@ -221,13 +221,6 @@ type Runtime struct {
 	// from still holds the image it is running (#154).
 	daemonBinary *daemonBinaryWatcher
 
-	// staleRepairAfterLoopWriteHook is test-only: invoked immediately after
-	// stale-run reconciliation's requeue write to the loop lands and before the
-	// queue repair that follows, so a test can commit a takeover inside the exact
-	// window abandonRequeueIfTakenOver closes. Mirrors the API handler's
-	// discardBeforeGitHook, which exists for the same reason.
-	staleRepairAfterLoopWriteHook func(loopID string)
-
 	// shutdownDrainErr is set by BeginShutdown when producer/handle drain fails.
 	// Stop retains SQLite when non-nil (ADR-0015 / #577).
 	shutdownDrainErr error
@@ -2000,7 +1993,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				return RecoverySummary{}, err
 			}
 			if recoveredQueueItems == 0 {
-				if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.Config().Scheduler.RetryMaxAttempts)); err != nil {
+				if err := r.ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO); err != nil {
 					return RecoverySummary{}, err
 				}
 			}
@@ -2721,23 +2714,15 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 					requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 				}
 				requeuedLoop.UpdatedAt = nowISO
-				applied, err := recoveryUpsertLoop(ctx, repositories, requeuedLoop)
+				repair, err := r.requeueStaleRunLoop(ctx, storage.StaleRunRequeueInput{Loop: requeuedLoop, NowISO: nowISO})
 				if err != nil {
 					return staleRunQueueRepairSummary{}, err
 				}
-				if !applied {
+				if !repair.Applied {
 					return summary, nil
 				}
-				if _, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO); err != nil {
-					return staleRunQueueRepairSummary{}, err
-				}
-				if abandoned, err := abandonRequeueIfTakenOver(ctx, repositories, loop.ID, nowISO); err != nil {
-					return staleRunQueueRepairSummary{}, err
-				} else if abandoned {
-					return staleRunQueueRepairSummary{}, nil
-				}
 				summary.LoopsRequeued = 1
-				summary.QueueItemsRequeued = 1
+				summary.QueueItemsRequeued = repair.QueueItemsRequeued
 				return summary, nil
 			}
 		}
@@ -2750,61 +2735,25 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 			requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 		}
 		requeuedLoop.UpdatedAt = nowISO
-		applied, err := recoveryUpsertLoop(ctx, repositories, requeuedLoop)
+		seed, err := r.recoveryQueueItemSeed(requeuedLoop, nowISO)
 		if err != nil {
 			return staleRunQueueRepairSummary{}, err
 		}
-		if !applied {
+		repair, err := r.requeueStaleRunLoop(ctx, storage.StaleRunRequeueInput{
+			Loop:             requeuedLoop,
+			NowISO:           nowISO,
+			Seed:             seed,
+			CancelDuplicates: true,
+		})
+		if err != nil {
+			return staleRunQueueRepairSummary{}, err
+		}
+		if !repair.Applied {
 			return summary, nil
 		}
-		if r.staleRepairAfterLoopWriteHook != nil {
-			r.staleRepairAfterLoopWriteHook(loop.ID)
-		}
-		activeQueue, err := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
-		if err != nil {
-			return staleRunQueueRepairSummary{}, err
-		}
-		keepQueueID := ""
-		if activeQueue != nil {
-			keepQueueID = activeQueue.ID
-		}
-		requeuedCount, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO)
-		if err != nil {
-			return staleRunQueueRepairSummary{}, err
-		}
-		createdQueue := int64(0)
-		if requeuedCount == 0 {
-			if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.Config().Scheduler.RetryMaxAttempts)); err != nil {
-				return staleRunQueueRepairSummary{}, err
-			}
-			activeQueue, err = repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
-			if err != nil {
-				return staleRunQueueRepairSummary{}, err
-			}
-			if activeQueue != nil {
-				keepQueueID = activeQueue.ID
-				createdQueue = 1
-			}
-		}
-		if keepQueueID != "" {
-			duplicateReason := "Cancelled duplicate active queue items during stale-run reconciliation"
-			cancelledDuplicates, err := repositories.Queue.CancelActiveByLoopExcept(ctx, loop.ID, keepQueueID, nowISO, &duplicateReason)
-			if err != nil {
-				return staleRunQueueRepairSummary{}, err
-			}
-			summary.QueueItemsCancelled += cancelledDuplicates
-		}
-		// The queue repair above is several statements past the loop write, and a
-		// takeover that commits inside that span cancels the item this pass then
-		// replaces. Re-read before reporting a requeue, and take the replacement
-		// back out.
-		if abandoned, err := abandonRequeueIfTakenOver(ctx, repositories, loop.ID, nowISO); err != nil {
-			return staleRunQueueRepairSummary{}, err
-		} else if abandoned {
-			return staleRunQueueRepairSummary{}, nil
-		}
+		summary.QueueItemsCancelled += repair.QueueItemsCancelled
 		summary.LoopsRequeued = 1
-		summary.QueueItemsRequeued = requeuedCount + createdQueue
+		summary.QueueItemsRequeued = repair.QueueItemsRequeued
 		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
 			ID:         newRuntimeEventID(),
 			EventType:  "looperd.recovery.loop_requeued",
@@ -2814,7 +2763,7 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 			PayloadJSON: mustMarshalJSON(map[string]any{
 				"previousStatus":      loop.Status,
 				"nextRunAt":           nowISO,
-				"recoveredQueueItems": requeuedCount + createdQueue,
+				"recoveredQueueItems": repair.QueueItemsRequeued,
 			}),
 			CreatedAt: nowISO,
 		}); err != nil {
@@ -3241,87 +3190,37 @@ func recoveryUpsertLoop(ctx context.Context, repositories *storage.Repositories,
 	return true, nil
 }
 
-// abandonRequeueIfTakenOver is the closing half of recoveryUpsertLoop's guard.
-//
-// recoveryUpsertLoop refuses a requeue whose loop was *already* held. It cannot
-// see a takeover that commits in the window after that write succeeds, and the
-// queue repair that follows is several statements long: the takeover cancels the
-// loop's queue item, then reconciliation finds none active and publishes a
-// replacement one for a loop the human now owns. The claim predicate leaves that
-// item dormant, so nothing runs — but it is durable state that contradicts the
-// hold, and the reconciliation summary reports work it never really scheduled.
-//
-// Unlike the cleanup paths (#210), this is closable rather than merely narrowed:
-// both the observation and the repair are durable writes against the same rows,
-// so re-reading the loop and cancelling what this pass just published leaves no
-// residue — there is no filesystem mutation racing in between.
-//
-// Reports whether the requeue was abandoned.
-func abandonRequeueIfTakenOver(ctx context.Context, repositories *storage.Repositories, loopID, nowISO string) (bool, error) {
-	current, err := repositories.Loops.GetByID(ctx, loopID)
-	if err != nil {
-		return false, err
+// requeueStaleRunLoop commits stale-run reconciliation's loop requeue and the
+// queue repair that belongs with it as one transaction, so the human-hold guard
+// inside the loop write decides the whole repair.
+func (r *Runtime) requeueStaleRunLoop(ctx context.Context, input storage.StaleRunRequeueInput) (storage.StaleRunRequeueResult, error) {
+	r.mu.RLock()
+	coordinator := r.services.Coordinator
+	r.mu.RUnlock()
+	if coordinator == nil {
+		return storage.StaleRunRequeueResult{}, fmt.Errorf("recover stale run requeue: sqlite coordinator is not configured")
 	}
-	if current == nil || !domain.LoopIsHumanHeld(current.Status) {
-		return false, nil
-	}
-	reason := "Cancelled stale-run reconciliation requeue: the loop was taken over by a human mid-repair"
-	if _, err := repositories.Queue.CancelByLoop(ctx, loopID, nowISO, &reason); err != nil {
-		return false, err
-	}
-	return true, nil
+	return storage.RequeueStaleRunLoop(ctx, coordinator.DB(), input)
 }
 
-func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string, maxAttempts int64) error {
-	activeQueue, err := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
-	if err != nil {
-		return err
-	}
-	if activeQueue != nil {
-		return nil
-	}
-
-	latestQueue, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
-	if err != nil {
-		return err
-	}
-	if latestQueue != nil {
-		if latestQueue.Status == "queued" || latestQueue.Status == "running" {
-			return nil
-		}
-		if latestQueue.DedupeKey != "" {
-			activeByDedupe, err := repositories.Queue.FindActiveByDedupe(ctx, latestQueue.DedupeKey)
-			if err != nil {
-				return err
-			}
-			if activeByDedupe != nil {
-				return nil
-			}
-		}
-
-		replacement := *latestQueue
-		replacement.ID = newRuntimeEventID()
-		replacement.Status = "queued"
-		replacement.AvailableAt = nowISO
-		replacement.Attempts = 0
-		replacement.ClaimedBy = nil
-		replacement.ClaimedAt = nil
-		replacement.StartedAt = nil
-		replacement.FinishedAt = nil
-		replacement.LastError = nil
-		replacement.LastErrorKind = nil
-		replacement.CreatedAt = nowISO
-		replacement.UpdatedAt = nowISO
-		_, _, err := repositories.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement)
-		return err
-	}
-
-	queueRecord, ok, err := buildRecoveryQueueItem(loop, nowISO, maxAttempts)
+// recoveryQueueItemSeed names the queue item recovery would publish for a loop
+// that has nothing claimable left.
+func (r *Runtime) recoveryQueueItemSeed(loop storage.LoopRecord, nowISO string) (storage.RecoveryQueueItemSeed, error) {
+	seed := storage.RecoveryQueueItemSeed{DerivedID: newRuntimeEventID()}
+	queueRecord, ok, err := buildRecoveryQueueItem(loop, nowISO, int64(r.Config().Scheduler.RetryMaxAttempts))
 	if err != nil || !ok {
+		return seed, err
+	}
+	seed.Fallback = &queueRecord
+	return seed, nil
+}
+
+func (r *Runtime) ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string) error {
+	seed, err := r.recoveryQueueItemSeed(loop, nowISO)
+	if err != nil {
 		return err
 	}
-	_, _, err = repositories.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord)
-	return err
+	return storage.EnsureActiveQueueItem(ctx, repositories, loop.ID, seed, nowISO)
 }
 
 func shouldInterruptStaleRunningRun(run storage.RunRecord, latestRun *storage.RunRecord, hasActiveAgent bool, hasUncertainAgent bool) bool {
