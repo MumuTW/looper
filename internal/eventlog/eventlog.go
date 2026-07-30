@@ -34,6 +34,17 @@ func FormatJavaScriptISOString(value time.Time) string {
 	return fmt.Sprintf("%s.%03dZ", value.Format("2006-01-02T15:04:05"), value.Nanosecond()/int(time.Millisecond))
 }
 
+// NextJavaScriptISOString returns a JavaScript-ISO timestamp strictly after
+// previous. Loop writes use UpdatedAt as their durable revision, so a fixed or
+// backward-moving clock must not reuse or regress that value.
+func NextJavaScriptISOString(now time.Time, previous string) string {
+	candidate := now.UTC().Truncate(time.Millisecond)
+	if parsed, err := time.Parse(time.RFC3339Nano, previous); err == nil && !candidate.After(parsed) {
+		candidate = parsed.UTC().Add(time.Millisecond)
+	}
+	return FormatJavaScriptISOString(candidate)
+}
+
 func NewEventID(prefix string) string {
 	if prefix == "" {
 		prefix = "event"

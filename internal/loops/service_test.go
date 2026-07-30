@@ -51,6 +51,43 @@ func TestServiceCreateAndPauseResumeLoop(t *testing.T) {
 	}
 }
 
+func TestServiceRepeatedPauseAdvancesLoopRevisionAtFixedClock(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	seedProject(t, repos, now)
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	loop, err := service.Create(ctx, CreateInput{
+		ProjectID: "project_1",
+		Type:      domain.LoopTypeReviewer,
+		Target:    domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 43},
+		Status:    domain.LoopStatusQueued,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	reason := "operator pause"
+	first, err := service.Pause(ctx, loop.ID, &reason)
+	if err != nil {
+		t.Fatalf("first Pause() error = %v", err)
+	}
+	second, err := service.Pause(ctx, loop.ID, &reason)
+	if err != nil {
+		t.Fatalf("second Pause() error = %v", err)
+	}
+	if first.Loop.UpdatedAt >= second.Loop.UpdatedAt {
+		t.Fatalf("pause revisions = %q then %q, want strictly increasing lexical JavaScript timestamps", first.Loop.UpdatedAt, second.Loop.UpdatedAt)
+	}
+	firstTime, firstErr := time.Parse(time.RFC3339Nano, first.Loop.UpdatedAt)
+	secondTime, secondErr := time.Parse(time.RFC3339Nano, second.Loop.UpdatedAt)
+	if firstErr != nil || secondErr != nil || !secondTime.After(firstTime) {
+		t.Fatalf("pause revisions parse as (%v, %v), want increasing timestamps", firstErr, secondErr)
+	}
+}
+
 func TestServiceCreateRejectsConflictingActiveLoop(t *testing.T) {
 	t.Parallel()
 

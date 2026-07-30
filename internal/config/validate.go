@@ -96,6 +96,10 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "scheduler.retryMaxAttempts", Message: "must be -1 or a positive integer"})
 	}
 
+	if config.Scheduler.ConsecutiveFailureThreshold < 1 {
+		issues = append(issues, ValidationIssue{Path: "scheduler.consecutiveFailureThreshold", Message: "must be a positive integer"})
+	}
+
 	if config.Scheduler.RetryBaseDelayMS < 1 {
 		issues = append(issues, ValidationIssue{Path: "scheduler.retryBaseDelayMs", Message: "must be a positive integer"})
 	}
