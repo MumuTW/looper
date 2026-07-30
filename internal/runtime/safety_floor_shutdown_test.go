@@ -205,10 +205,12 @@ func TestSafetyFloorMarkDegradedDoesNotCancelWebhookExecute(t *testing.T) {
 	backupDir := filepath.Join(workingDir, "backups")
 	cfg.Storage.BackupDir = &backupDir
 
+	var cancelCalls atomic.Int64
 	rt := New(Options{
-		Config:        cfg,
-		Logger:        &testLogger{},
-		DeferRecovery: true,
+		Config:           cfg,
+		Logger:           &testLogger{},
+		DeferRecovery:    true,
+		WebhookForwarder: &countingCancelForwarder{onCancel: func() { cancelCalls.Add(1) }},
 	})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -217,12 +219,6 @@ func TestSafetyFloorMarkDegradedDoesNotCancelWebhookExecute(t *testing.T) {
 	if err := rt.CompleteStartup(context.Background()); err != nil {
 		t.Fatalf("CompleteStartup() error = %v", err)
 	}
-
-	var cancelCalls atomic.Int64
-	forwarder := &countingCancelForwarder{onCancel: func() { cancelCalls.Add(1) }}
-	rt.mu.Lock()
-	rt.webhookForwarder = forwarder
-	rt.mu.Unlock()
 
 	if err := rt.MarkDegraded("test hard persist failure"); err != nil {
 		t.Fatalf("MarkDegraded() error = %v", err)
@@ -249,10 +245,12 @@ func TestSafetyFloorRuntimeStopCancelsWebhookExecute(t *testing.T) {
 	backupDir := filepath.Join(workingDir, "backups")
 	cfg.Storage.BackupDir = &backupDir
 
+	var cancelCalls atomic.Int64
 	rt := New(Options{
-		Config:        cfg,
-		Logger:        &testLogger{},
-		DeferRecovery: true,
+		Config:           cfg,
+		Logger:           &testLogger{},
+		DeferRecovery:    true,
+		WebhookForwarder: &countingCancelForwarder{onCancel: func() { cancelCalls.Add(1) }},
 	})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -260,12 +258,6 @@ func TestSafetyFloorRuntimeStopCancelsWebhookExecute(t *testing.T) {
 	if err := rt.CompleteStartup(context.Background()); err != nil {
 		t.Fatalf("CompleteStartup() error = %v", err)
 	}
-
-	var cancelCalls atomic.Int64
-	forwarder := &countingCancelForwarder{onCancel: func() { cancelCalls.Add(1) }}
-	rt.mu.Lock()
-	rt.webhookForwarder = forwarder
-	rt.mu.Unlock()
 
 	rt.Stop("test direct stop")
 	if cancelCalls.Load() < 1 {
