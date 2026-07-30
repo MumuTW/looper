@@ -1727,7 +1727,7 @@ func TestGatewayUsesQualifiedHostnameForRepoScopedAPICommands(t *testing.T) {
 				return gateway.RemovePullRequestReaction(context.Background(), PullRequestReactionInput{Repo: repo, PRNumber: 42, Content: "eyes"})
 			},
 			want: []string{
-				"api user --jq .login",
+				"api user --jq .login --hostname code.example.test",
 				"api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname code.example.test",
 				"api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json --hostname code.example.test",
 			},
@@ -1771,10 +1771,10 @@ func TestGatewayUsesQualifiedHostnameForRepoScopedAPICommands(t *testing.T) {
 			runner := &fakeGHRunner{t: t}
 			runner.respond = func(options shell.Options) (shell.Result, error) {
 				switch strings.Join(options.Args, " ") {
-				case "api user --jq .login":
-					return shell.Result{Stdout: "reviewer\n"}, nil
+				case "api user --jq .login --hostname code.example.test":
+					return shell.Result{Stdout: "ghes-reviewer\n"}, nil
 				case "api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname code.example.test":
-					return shell.Result{Stdout: `[{"id":7,"content":"eyes","user":{"login":"reviewer"}}]`}, nil
+					return shell.Result{Stdout: `[{"id":7,"content":"eyes","user":{"login":"ghes-reviewer"}}]`}, nil
 				case "label list --repo code.example.test/acme/looper --limit 1000 --json name,color,description":
 					return shell.Result{Stdout: `[{"name":"ready","color":"ededed","description":""}]`}, nil
 				case "api repos/acme/looper/compare/base...head --hostname code.example.test":

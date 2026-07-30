@@ -194,10 +194,6 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 		}
 	}
 	for repo := range repoSet {
-		if strings.Count(repo, "/") != 1 {
-			states = append(states, WebhookTunnelState{Repo: repo, LastError: "tunnel mode does not support host-qualified repo names"})
-			continue
-		}
 		record, ok, err := store.Get(ctx, repo)
 		if err != nil {
 			states = append(states, WebhookTunnelState{Repo: repo, LastError: fmt.Sprintf("load tunnel hook record: %v", err)})
@@ -440,7 +436,12 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "webhook forwarder unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
+	forwardPayload, err := webhookTunnelForwardPayload(body, repo)
+	if err != nil {
+		http.Error(w, "invalid webhook payload", http.StatusBadRequest)
+		return
+	}
+	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: forwardPayload})
 	if err != nil {
 		// Post-gate admission refusal (race after allowTunnelForward) is temporary
 		// unavailability; do not treat as an invalid delivery (400).
@@ -543,6 +544,9 @@ func configuredWebhookReposForMode(cfg config.Config, mode config.WebhookMode) [
 			continue
 		}
 		repo := strings.TrimSpace(project.Repo)
+		if mode == config.WebhookModeTunnel {
+			repo = webhookTunnelRepoForProject(cfg, project, repo)
+		}
 		if repo == "" {
 			continue
 		}
@@ -554,6 +558,25 @@ func configuredWebhookReposForMode(cfg config.Config, mode config.WebhookMode) [
 	}
 	sort.Strings(repos)
 	return repos
+}
+
+// webhookTunnelRepoForProject derives the key used by the tunnel from the
+// project's provider binding. The binding's base URL, not punctuation in a
+// repository name or incoming request, identifies an Enterprise host.
+func webhookTunnelRepoForProject(cfg config.Config, project config.ProjectRefConfig, repo string) string {
+	identity, ok := config.ProjectRepositoryIdentity(cfg, project)
+	if !ok || identity.Kind != config.ProviderKindGitHub {
+		return repo
+	}
+	parsed, err := url.Parse(identity.BaseURL)
+	if err != nil {
+		return repo
+	}
+	hostname := strings.TrimSpace(parsed.Hostname())
+	if hostname == "" || strings.EqualFold(hostname, "github.com") || strings.EqualFold(hostname, "www.github.com") || strings.EqualFold(hostname, "api.github.com") {
+		return repo
+	}
+	return hostname + "/" + repo
 }
 
 func webhookModeForProject(cfg config.Config, projectID string) config.WebhookMode {
@@ -621,7 +644,11 @@ func webhookTunnelListenerURL(cfg config.Config) string {
 }
 
 func webhookTunnelManagedURL(cfg config.Config, repo string) string {
-	return strings.TrimRight(strings.TrimSpace(cfg.Webhook.PublicBaseURL), "/") + "/webhook/" + strings.Trim(strings.TrimSpace(repo), "/")
+	path := strings.Trim(strings.TrimSpace(repo), "/")
+	if hostname, repoPath := splitTunnelRepoHostname(path); hostname != "" {
+		path = "host/" + hostname + "/" + repoPath
+	}
+	return strings.TrimRight(strings.TrimSpace(cfg.Webhook.PublicBaseURL), "/") + "/webhook/" + path
 }
 
 func webhookTunnelRequestPath(cfg config.Config, requestPath string) (string, bool) {
@@ -656,14 +683,13 @@ func repoFromWebhookTunnelPath(path string) (string, bool) {
 			return "", false
 		}
 		return parts[1] + "/" + parts[2], true
-	case 4:
-		// The three-segment route has always rejected a trailing path segment.
-		// A GHES hostname is distinguishable from that legacy shape because a
-		// configured HTTP(S) hostname contains a domain separator.
-		if parts[1] == "" || !strings.Contains(parts[1], ".") || parts[2] == "" || parts[3] == "" {
+	case 5:
+		// Host-qualified routes use an explicit marker, so internal GHES hosts
+		// such as "github" do not rely on a dot-based heuristic.
+		if parts[1] != "host" || parts[2] == "" || parts[3] == "" || parts[4] == "" {
 			return "", false
 		}
-		return parts[1] + "/" + parts[2] + "/" + parts[3], true
+		return parts[2] + "/" + parts[3] + "/" + parts[4], true
 	default:
 		return "", false
 	}
@@ -678,6 +704,34 @@ func webhookTunnelPayloadRepo(repo string) string {
 		return parts[1] + "/" + parts[2]
 	}
 	return strings.Join(parts, "/")
+}
+
+// webhookTunnelForwardPayload preserves the provider-qualified key used by
+// project metadata. GitHub delivers repository.full_name as owner/name even
+// for Enterprise hooks, so the authenticated tunnel route supplies the host.
+func webhookTunnelForwardPayload(payload []byte, repo string) ([]byte, error) {
+	if hostname, _ := splitTunnelRepoHostname(repo); hostname == "" {
+		return payload, nil
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return nil, err
+	}
+	repositoryRaw, ok := envelope["repository"]
+	if !ok {
+		return nil, errors.New("webhook payload missing repository")
+	}
+	var repository map[string]any
+	if err := json.Unmarshal(repositoryRaw, &repository); err != nil {
+		return nil, err
+	}
+	repository["full_name"] = repo
+	encodedRepository, err := json.Marshal(repository)
+	if err != nil {
+		return nil, err
+	}
+	envelope["repository"] = encodedRepository
+	return json.Marshal(envelope)
 }
 
 func githubPayloadRepo(payload []byte) string {
@@ -800,12 +854,9 @@ func splitRepoPath(repo string) string {
 }
 
 func splitTunnelRepoHostname(repo string) (string, string) {
-	repo = strings.TrimSpace(repo)
-	if strings.Count(repo, "/") >= 2 {
-		parts := strings.SplitN(repo, "/", 2)
-		if strings.Contains(parts[0], ".") {
-			return parts[0], parts[1]
-		}
+	parts := strings.Split(strings.Trim(strings.TrimSpace(repo), "/"), "/")
+	if len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] != "" {
+		return parts[0], parts[1] + "/" + parts[2]
 	}
-	return "", repo
+	return "", strings.TrimSpace(repo)
 }

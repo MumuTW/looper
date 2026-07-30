@@ -4082,7 +4082,7 @@ func TestValidateRejectsSameRepoAcrossGitHubProviders(t *testing.T) {
 	}
 }
 
-func TestProviderBaseURLRejectsNonGitHubHosts(t *testing.T) {
+func TestProviderBaseURLAcceptsGitHubEnterpriseHosts(t *testing.T) {
 	t.Parallel()
 
 	for _, baseURL := range []string{"https://code.example.com", "https://ghe.corp.internal", "http://github.example.com"} {
@@ -4096,12 +4096,9 @@ func TestProviderBaseURLRejectsNonGitHubHosts(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Normalize() error = %v", err)
 			}
-			err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
-			var validationErr *ConfigValidationError
-			if !errors.As(err, &validationErr) {
-				t.Fatalf("ValidateWithOptions() error = %v, want *ConfigValidationError", err)
+			if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+				t.Fatalf("ValidateWithOptions() error = %v, want GitHub Enterprise host accepted", err)
 			}
-			assertValidationIssue(t, validationErr, "providers[0].baseUrl", "must be a github.com URL or omitted; GitHub Enterprise Server is not supported")
 		})
 	}
 }
