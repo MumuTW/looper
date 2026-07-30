@@ -3,6 +3,9 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -837,6 +840,57 @@ func (r *ActiveExecutionRegistry) LoopStopActive(loopID string) bool {
 // not reach confirmed-dead. Callers must retain storage and fail loud (#577).
 var errShutdownDrainTimeout = errors.New("shutdown: containment drain timed out or failed")
 
+type shutdownWaitTarget struct {
+	description string
+	done        <-chan struct{}
+}
+
+func waitForShutdownTargets(deadline time.Time, targets []shutdownWaitTarget) error {
+	for _, target := range targets {
+		if target.done == nil {
+			continue
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return unfinishedShutdownTargets(targets)
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-target.done:
+			timer.Stop()
+		case <-timer.C:
+			return unfinishedShutdownTargets(targets)
+		}
+	}
+	return nil
+}
+
+func unfinishedShutdownTargets(targets []shutdownWaitTarget) error {
+	unfinished := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.done == nil {
+			continue
+		}
+		select {
+		case <-target.done:
+		default:
+			unfinished = append(unfinished, target.description)
+		}
+	}
+	if len(unfinished) == 0 {
+		return nil
+	}
+	sort.Strings(unfinished)
+	return fmt.Errorf("%w: unfinished ownership: %s", errShutdownDrainTimeout, strings.Join(unfinished, ", "))
+}
+
+func spawnOwnershipDescription(kind string, lease *spawnLease) string {
+	if lease == nil {
+		return kind + "(unknown)"
+	}
+	return fmt.Sprintf("%s(loop=%s run=%s execution=%s)", kind, lease.meta.LoopID, lease.meta.RunID, lease.meta.ExecutionID)
+}
+
 // Track implements processcontainment.LiveTracker for Supervisor-owned non-agent
 // handles (validation/shell, trusted review). release is idempotent.
 func (r *ActiveExecutionRegistry) Track(handle *processcontainment.Handle) (release func()) {
@@ -902,6 +956,11 @@ func (r *ActiveExecutionRegistry) NonAgentDrainErr() error {
 // finalize (ADR-0015 R6 / #579). Does not force-release operation leases on
 // timeout — that would create unowned durable running claims.
 //
+// One deadline is captured before admission closes. Agent handle drains,
+// pending spawn/rebind/operation windows, non-agent handles, and bound
+// operation finalizers all consume that same process-wide shutdown budget.
+// Timeout diagnostics retain the ownership identities that did not finish.
+//
 // Returns a non-nil error when any handle Kill fails or a spawn/rebind wait
 // times out. ADR-0015 / #577: drain failure must not be reported as graceful
 // success; Runtime.Stop retains SQLite when this returns an error.
@@ -909,27 +968,27 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	if r == nil {
 		return nil
 	}
+	deadline := time.Now().Add(r.killBudget())
 	r.mu.Lock()
 	r.admissionClosed = true
 	if reason != "" {
 		r.shutdownReason = reason
 	}
 	toCancel := make([]*spawnLease, 0, len(r.pending)+len(r.active))
-	spawnWait := make([]<-chan struct{}, 0)
-	rebindWait := make([]<-chan struct{}, 0)
+	waitTargets := make([]shutdownWaitTarget, 0)
 	for _, lease := range r.pending {
 		toCancel = append(toCancel, lease)
 		if lease.spawnDone != nil {
-			spawnWait = append(spawnWait, lease.spawnDone)
+			waitTargets = append(waitTargets, shutdownWaitTarget{description: spawnOwnershipDescription("pending-spawn", lease), done: lease.spawnDone})
 		}
 		if lease.rebinding && lease.rebindDone != nil {
-			rebindWait = append(rebindWait, lease.rebindDone)
+			waitTargets = append(waitTargets, shutdownWaitTarget{description: spawnOwnershipDescription("rebind", lease), done: lease.rebindDone})
 		}
 	}
 	for _, lease := range r.active {
 		toCancel = append(toCancel, lease)
 		if lease.rebinding && lease.rebindDone != nil {
-			rebindWait = append(rebindWait, lease.rebindDone)
+			waitTargets = append(waitTargets, shutdownWaitTarget{description: spawnOwnershipDescription("rebind", lease), done: lease.rebindDone})
 		}
 	}
 	entries := make([]*ownedExecution, 0, len(r.executions))
@@ -940,7 +999,7 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	if reason == "" {
 		cause = agent.ErrSpawnAdmissionClosed
 	}
-	opWait := r.cancelPendingOperationsLocked(cause)
+	waitTargets = append(waitTargets, r.cancelPendingOperationsLocked(cause)...)
 	r.cancelBoundOperationsLocked(cause, "")
 	r.mu.Unlock()
 
@@ -949,24 +1008,12 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	}
 	var drainErr error
 	for _, entry := range entries {
-		if err := r.killOwned(entry, reason); err != nil {
+		if err := r.killOwnedUntil(entry, reason, deadline); err != nil {
 			drainErr = errors.Join(drainErr, err)
 		}
 	}
-	budget := r.killBudget()
-	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait)+len(opWait))
-	waitChans = append(waitChans, spawnWait...)
-	waitChans = append(waitChans, rebindWait...)
-	waitChans = append(waitChans, opWait...)
-	for _, done := range waitChans {
-		if done == nil {
-			continue
-		}
-		select {
-		case <-done:
-		case <-time.After(budget):
-			drainErr = errors.Join(drainErr, errShutdownDrainTimeout)
-		}
+	if err := waitForShutdownTargets(deadline, waitTargets); err != nil {
+		drainErr = errors.Join(drainErr, err)
 	}
 	// Join refuse-path killUnowned failures published on waited leases.
 	for _, lease := range toCancel {
@@ -974,7 +1021,7 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 			drainErr = errors.Join(drainErr, err)
 		}
 	}
-	if len(waitChans) > 0 {
+	if len(waitTargets) > 0 {
 		r.mu.Lock()
 		second := make([]*ownedExecution, 0, len(r.executions))
 		for _, entry := range r.executions {
@@ -984,7 +1031,7 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 		}
 		r.mu.Unlock()
 		for _, entry := range second {
-			if err := r.killOwned(entry, reason); err != nil {
+			if err := r.killOwnedUntil(entry, reason, deadline); err != nil {
 				drainErr = errors.Join(drainErr, err)
 			}
 		}
@@ -993,14 +1040,14 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	// Non-agent Supervisor-owned handles: prefer owner cancel path (shell.Run /
 	// trusted-review Kill) so we do not race concurrent Kill. Wait for release,
 	// then force-kill stragglers and join reported drain failures.
-	if err := r.drainNonAgentHandles(budget); err != nil {
+	if err := r.drainNonAgentHandles(deadline); err != nil {
 		drainErr = errors.Join(drainErr, err)
 	}
 
 	// Finalizers: bound operation leases release only after durable queue
 	// finalize. Wait (do not force-release) so shutdown does not close storage
 	// under an unowned running claim while ownership is still live.
-	if err := r.waitBoundOperations(budget); err != nil {
+	if err := r.waitBoundOperations(deadline); err != nil {
 		drainErr = errors.Join(drainErr, err)
 	}
 
@@ -1011,56 +1058,49 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 }
 
 // drainNonAgentHandles waits for tracked non-agent handles to release (owner
-// confirmed-drain path), force-kills any that outlive the budget, and joins
+// confirmed-drain path), force-kills any that outlive the shared deadline, and joins
 // ReportDrainFailure results.
-func (r *ActiveExecutionRegistry) drainNonAgentHandles(budget time.Duration) error {
+func (r *ActiveExecutionRegistry) drainNonAgentHandles(deadline time.Time) error {
 	if r == nil {
 		return nil
 	}
 	type pendingNonAgent struct {
+		id     uint64
 		handle *processcontainment.Handle
 		done   <-chan struct{}
 	}
 	r.mu.Lock()
 	pending := make([]pendingNonAgent, 0, len(r.nonAgentHandles))
-	for _, entry := range r.nonAgentHandles {
+	for id, entry := range r.nonAgentHandles {
 		if entry == nil || entry.handle == nil {
 			continue
 		}
-		pending = append(pending, pendingNonAgent{handle: entry.handle, done: entry.done})
+		pending = append(pending, pendingNonAgent{id: id, handle: entry.handle, done: entry.done})
 	}
 	r.mu.Unlock()
 
-	deadline := time.NewTimer(budget)
-	defer deadline.Stop()
-	timedOut := false
+	waitTargets := make([]shutdownWaitTarget, 0, len(pending))
 	for _, p := range pending {
-		if timedOut {
-			break
-		}
-		select {
-		case <-p.done:
-		case <-deadline.C:
-			timedOut = true
-		}
+		waitTargets = append(waitTargets, shutdownWaitTarget{description: fmt.Sprintf("non-agent-handle(id=%d)", p.id), done: p.done})
 	}
 
 	var drainErr error
-	if timedOut {
-		drainErr = errors.Join(drainErr, errShutdownDrainTimeout)
+	if err := waitForShutdownTargets(deadline, waitTargets); err != nil {
+		drainErr = errors.Join(drainErr, err)
 		r.mu.Lock()
-		stragglers := make([]*processcontainment.Handle, 0, len(r.nonAgentHandles))
-		for _, entry := range r.nonAgentHandles {
+		stragglers := make([]pendingNonAgent, 0, len(r.nonAgentHandles))
+		for id, entry := range r.nonAgentHandles {
 			if entry != nil && entry.handle != nil {
-				stragglers = append(stragglers, entry.handle)
+				stragglers = append(stragglers, pendingNonAgent{id: id, handle: entry.handle, done: entry.done})
 			}
 		}
 		r.mu.Unlock()
-		for _, handle := range stragglers {
-			ctx, cancel := context.WithTimeout(context.Background(), r.killBudget())
-			if err := handle.Kill(ctx); err != nil {
-				drainErr = errors.Join(drainErr, err)
-				r.ReportDrainFailure(err)
+		for _, straggler := range stragglers {
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			if err := straggler.handle.Kill(ctx); err != nil {
+				wrapped := fmt.Errorf("non-agent-handle(id=%d): %w", straggler.id, err)
+				drainErr = errors.Join(drainErr, wrapped)
+				r.ReportDrainFailure(wrapped)
 			}
 			cancel()
 		}
@@ -1211,6 +1251,10 @@ func (r *ActiveExecutionRegistry) PendingCount() int {
 }
 
 func (r *ActiveExecutionRegistry) killOwned(entry *ownedExecution, reason string) error {
+	return r.killOwnedUntil(entry, reason, time.Now().Add(r.killBudget()))
+}
+
+func (r *ActiveExecutionRegistry) killOwnedUntil(entry *ownedExecution, reason string, deadline time.Time) error {
 	if entry == nil {
 		return nil
 	}
@@ -1218,15 +1262,22 @@ func (r *ActiveExecutionRegistry) killOwned(entry *ownedExecution, reason string
 	if entry.softKill != nil {
 		softErr = entry.softKill(reason)
 	}
+	description := fmt.Sprintf("agent-execution(loop=%s run=%s execution=%s)", entry.loopID, entry.runID, entry.executionID)
 	if entry.handle != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), r.killBudget())
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
 		if err := entry.handle.Kill(ctx); err != nil {
-			return errors.Join(softErr, err)
+			return fmt.Errorf("%s: %w", description, errors.Join(softErr, err))
 		}
-		return softErr
+		if softErr != nil {
+			return fmt.Errorf("%s: %w", description, softErr)
+		}
+		return nil
 	}
-	return softErr
+	if softErr != nil {
+		return fmt.Errorf("%s: %w", description, softErr)
+	}
+	return nil
 }
 
 func (r *ActiveExecutionRegistry) killBudget() time.Duration {

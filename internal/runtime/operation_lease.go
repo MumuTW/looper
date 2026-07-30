@@ -3,6 +3,9 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -327,12 +330,12 @@ func (r *ActiveExecutionRegistry) PendingOperationCount() int {
 }
 
 // cancelPendingOperationsLocked cancels pending (unbound) operation leases.
-// Caller must hold r.mu. Returns wait channels for pendingDone.
-func (r *ActiveExecutionRegistry) cancelPendingOperationsLocked(cause error) []<-chan struct{} {
+// Caller must hold r.mu. Returns identified wait targets for pendingDone.
+func (r *ActiveExecutionRegistry) cancelPendingOperationsLocked(cause error) []shutdownWaitTarget {
 	if r == nil {
 		return nil
 	}
-	wait := make([]<-chan struct{}, 0, len(r.pendingOps))
+	wait := make([]shutdownWaitTarget, 0, len(r.pendingOps))
 	for _, lease := range r.pendingOps {
 		if lease == nil {
 			continue
@@ -341,7 +344,10 @@ func (r *ActiveExecutionRegistry) cancelPendingOperationsLocked(cause error) []<
 			lease.cancel(cause)
 		}
 		if lease.pendingDone != nil {
-			wait = append(wait, lease.pendingDone)
+			wait = append(wait, shutdownWaitTarget{
+				description: fmt.Sprintf("pending-operation(lease=%d claimedBy=%s)", lease.id, lease.meta.ClaimedBy),
+				done:        lease.pendingDone,
+			})
 		}
 	}
 	return wait
@@ -369,30 +375,12 @@ func (r *ActiveExecutionRegistry) cancelBoundOperationsLocked(cause error, loopI
 	}
 }
 
-// waitPendingOperations waits for pending operation bind/release windows.
-func (r *ActiveExecutionRegistry) waitPendingOperations(wait []<-chan struct{}, budget time.Duration) error {
-	var waitErr error
-	for _, done := range wait {
-		if done == nil {
-			continue
-		}
-		select {
-		case <-done:
-		case <-time.After(budget):
-			waitErr = errors.Join(waitErr, errShutdownDrainTimeout)
-		}
-	}
-	return waitErr
-}
-
 // waitBoundOperations waits for bound operation leases to Release after durable
 // finalize (shutdown finalizer drain). Does not force-release on timeout.
-func (r *ActiveExecutionRegistry) waitBoundOperations(budget time.Duration) error {
+func (r *ActiveExecutionRegistry) waitBoundOperations(deadline time.Time) error {
 	if r == nil {
 		return nil
 	}
-	deadline := time.NewTimer(budget)
-	defer deadline.Stop()
 	for {
 		r.mu.Lock()
 		remaining := len(r.boundOps)
@@ -400,10 +388,35 @@ func (r *ActiveExecutionRegistry) waitBoundOperations(budget time.Duration) erro
 		if remaining == 0 {
 			return nil
 		}
+		budget := time.Until(deadline)
+		if budget <= 0 {
+			return r.unfinishedBoundOperationsError()
+		}
+		timer := time.NewTimer(min(5*time.Millisecond, budget))
 		select {
-		case <-deadline.C:
-			return errShutdownDrainTimeout
-		case <-time.After(5 * time.Millisecond):
+		case <-timer.C:
 		}
 	}
+}
+
+func (r *ActiveExecutionRegistry) unfinishedBoundOperationsError() error {
+	if r == nil {
+		return errShutdownDrainTimeout
+	}
+	r.mu.Lock()
+	descriptions := make([]string, 0, len(r.boundOps))
+	for _, lease := range r.boundOps {
+		if lease == nil {
+			continue
+		}
+		lease.mu.Lock()
+		descriptions = append(descriptions, fmt.Sprintf("bound-operation(lease=%d queueItem=%s loop=%s)", lease.id, lease.queueItemID, lease.loopID))
+		lease.mu.Unlock()
+	}
+	r.mu.Unlock()
+	if len(descriptions) == 0 {
+		return errShutdownDrainTimeout
+	}
+	sort.Strings(descriptions)
+	return fmt.Errorf("%w: unfinished ownership: %s", errShutdownDrainTimeout, strings.Join(descriptions, ", "))
 }
