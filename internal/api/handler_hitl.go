@@ -84,37 +84,11 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (struct{}, error) {
-		repos := storage.NewRepositories(tx)
-		loop, err := repos.Loops.GetByID(ctx, loopID)
-		if err != nil {
-			return struct{}{}, err
-		}
-		if loop == nil {
-			return struct{}{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
-		}
-		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
-			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
-			if werr != nil {
-				// Without the resume marker the next worker run cannot attach
-				// to the human-driven session; leave the loop parked instead of
-				// pretending the handback succeeded.
-				return struct{}{}, fmt.Errorf("persist takeover resume marker: %w", werr)
-			}
-			loop.MetadataJSON = &meta
-			loop.UpdatedAt = nowISO
-			if err := repos.Loops.UpsertChangingHumanHold(ctx, *loop); err != nil {
-				return struct{}{}, err
-			}
-		}
-		reason := "Cleared for takeover handback"
-		if _, err := repos.Queue.CancelByLoop(ctx, loopID, nowISO, &reason); err != nil {
-			return struct{}{}, err
-		}
-		return struct{}{}, nil
+	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (loops.HandbackPreparationResult, error) {
+		return loops.PrepareHandback(ctx, storage.NewRepositories(tx), loops.HandbackPreparationInput{LoopID: loopID, NowISO: nowISO})
 	})
 	if err != nil {
-		return nil, err
+		return nil, mapLoopReactivationError(err, loopID)
 	}
 	// Handback reuses retry re-arm; fromHandback also rejects discard if body is
 	// re-read after a client races another field in (defense in depth).
