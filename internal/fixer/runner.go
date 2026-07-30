@@ -1130,6 +1130,12 @@ func (checkpoint fixerCheckpoint) outcomeEvidenceInCurrentRun(observedAt string)
 // DeriveRunOutcome projects both current and pre-outcome fixer checkpoints into
 // the API presentation contract without rewriting durable run history.
 func DeriveRunOutcome(run storage.RunRecord) *FixerRunOutcome {
+	// A run that is still executing has no terminal result yet; deriving an
+	// empty outcome would label it "Completed" in the dashboard while it is
+	// actively running. Suppress until the run reaches a terminal status.
+	if run.Status == "running" {
+		return nil
+	}
 	if run.CheckpointJSON == nil || strings.TrimSpace(*run.CheckpointJSON) == "" {
 		return nil
 	}
@@ -5309,7 +5315,22 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		initialCheckpoint.Worktree = resumedCheckpoint.Worktree
 	}
 	initialCheckpoint.Pause = nil
+	// Preserve follow-up thread handoffs across retries so a transient
+	// recheck failure does not lose the no-fix-gate exclusion for threads
+	// already scheduled for rediscovery: a retry resumes directly at recheck
+	// (resolve-comments is not replayed), so FollowUpThreadIDs are never
+	// recomputed and the run would otherwise block on the very threads it
+	// already handed off, pausing the loop before rediscovery can enqueue.
+	// Per-run durable progress is reset by the run-start timestamp filter in
+	// refreshOutcomeProgress, not by clearing Outcome here.
+	var preservedFollowUpThreadIDs []string
+	if initialCheckpoint.Outcome != nil {
+		preservedFollowUpThreadIDs = initialCheckpoint.Outcome.FollowUpThreadIDs
+	}
 	initialCheckpoint.Outcome = nil
+	if len(preservedFollowUpThreadIDs) > 0 {
+		initialCheckpoint.Outcome = &FixerRunOutcome{FollowUpThreadIDs: preservedFollowUpThreadIDs}
+	}
 	initialCheckpoint.RunStartedAt = ""
 	initialCheckpoint.RunStartedRunID = ""
 	nowISO := r.nowISO()

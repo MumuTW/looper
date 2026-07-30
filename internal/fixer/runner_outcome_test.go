@@ -352,3 +352,103 @@ func TestNewFollowupFixItemsDetectsNewFailingCheckAndConflict(t *testing.T) {
 		t.Fatalf("hasNewFollowupFixItems() = true, want false for matching snapshots")
 	}
 }
+
+func TestCreateRunContextPreservesFollowUpThreadIDsForRecheckRetry(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	target := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_recheck_retry_followup", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	oldAt := "2026-04-11T11:59:00.000Z"
+	// A no-commit repair run handed off a newly observed thread (t2) as
+	// follow-up work, then failed at recheck with a transient error. The
+	// retry resumes directly at recheck, so resolve-comments never recomputes
+	// FollowUpThreadIDs; they must survive the retry's Outcome reset.
+	predecessor := fixerCheckpoint{
+		ResumePolicy:     loops.ResumePolicyAdvanceFromCheckpoint,
+		FixItems:         []FixItem{{ID: "c1", Type: "comment", ThreadID: "t1"}},
+		FixItemsHash:     hashFixItems([]FixItem{{ID: "c1", Type: "comment", ThreadID: "t1"}}),
+		Worktree:         &checkpointWorktree{Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/fix-42", PreparedAt: oldAt},
+		Repair:           &checkpointRepair{CompletedAt: oldAt, ParseStatus: "parsed"},
+		ReconcileCommits: &checkpointReconcileCommits{WorkingTreeClean: true, CompletedAt: oldAt},
+		Push:             &checkpointPush{Pushed: false, SkippedReason: "No new commits to push", PushedAt: oldAt},
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{FixItemID: "c1", ThreadID: "t1", Status: "deferred", UpdatedAt: oldAt}}},
+		Outcome:          &FixerRunOutcome{FollowUpThreadIDs: []string{"t2"}},
+	}
+	checkpointJSON := mustMarshalJSON(predecessor)
+	failedStep := string(stepRecheck)
+	lastCompleted := string(stepResolveComments)
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_recheck_failed", LoopID: loop.ID, Status: "failed", CurrentStep: &failedStep, LastCompletedStep: &lastCompleted, CheckpointJSON: &checkpointJSON, StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	resumed, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.StartStep != stepRecheck {
+		t.Fatalf("StartStep = %q, want recheck retry", resumed.StartStep)
+	}
+	if resumed.Checkpoint.Outcome == nil || !sameStringSlices(resumed.Checkpoint.Outcome.FollowUpThreadIDs, []string{"t2"}) {
+		t.Fatalf("retry Outcome = %#v, want preserved follow-up thread t2", resumed.Checkpoint.Outcome)
+	}
+	// Inherited durable progress must still be reset for the retry.
+	resumed.Checkpoint.recordFailure(stepRecheck, &loopError{message: "retry failed before progress", kind: FailureRetryableTransient})
+	resumed.Checkpoint.refreshOutcomeProgress()
+	if resumed.Checkpoint.Outcome.PartialSuccess || resumed.Checkpoint.Outcome.Progress != (FixerDurableProgress{}) {
+		t.Fatalf("retry Outcome = %#v, want inherited progress excluded", resumed.Checkpoint.Outcome)
+	}
+	if !sameStringSlices(resumed.Checkpoint.Outcome.FollowUpThreadIDs, []string{"t2"}) {
+		t.Fatalf("retry Outcome = %#v, want follow-up thread preserved after failure recording", resumed.Checkpoint.Outcome)
+	}
+
+	// The preserved handoff must keep recheck from blocking on the new thread
+	// and pausing the loop before rediscovery can enqueue.
+	liveDetail := PullRequestDetail{
+		Number:      prNumber,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		Comments:    []map[string]any{{"id": "c2", "threadId": "t2", "body": "newly failing thread"}},
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{liveDetail}}
+	recheckRunner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	recheckCheckpoint := resumed.Checkpoint
+	recheckCheckpoint.RunStartedAt = fixture.nowISO()
+	rechecked, err := recheckRunner.runRecheckStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: recheckCheckpoint})
+	if err != nil || rechecked.ResumePolicy != loops.ResumePolicyAdvanceFromCheckpoint {
+		t.Fatalf("runRecheckStep() = (%#v, %v), want follow-up thread excluded from no-fix gate", rechecked, err)
+	}
+}
+
+func TestDeriveRunOutcomeSuppressesRunningRun(t *testing.T) {
+	t.Parallel()
+
+	// A run that is still executing has no terminal result. Deriving an empty
+	// outcome would label it "Completed" in the dashboard while it is active.
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		FixItems:         []FixItem{{ID: "c1", Type: "comment", ThreadID: "t1"}},
+		ReconcileCommits: &checkpointReconcileCommits{NewCommitSHAs: []string{"commit-1"}},
+		Push:             &checkpointPush{Pushed: true},
+	})
+	step := string(stepRepair)
+	run := storage.RunRecord{Status: "running", CurrentStep: &step, CheckpointJSON: &checkpointJSON}
+
+	if outcome := DeriveRunOutcome(run); outcome != nil {
+		t.Fatalf("DeriveRunOutcome(running) = %#v, want nil until the run terminates", outcome)
+	}
+
+	// A terminal run with the same checkpoint still derives its outcome.
+	terminal := run
+	terminal.Status = "success"
+	if outcome := DeriveRunOutcome(terminal); outcome == nil || !outcome.Progress.Pushed {
+		t.Fatalf("DeriveRunOutcome(success) = %#v, want derived durable progress", outcome)
+	}
+}
