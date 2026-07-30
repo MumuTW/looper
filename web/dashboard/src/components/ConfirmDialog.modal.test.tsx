@@ -119,4 +119,70 @@ describe("ConfirmDialog keyboard modal contract", () => {
     expect(trigger.isConnected).toBe(false);
     expect(document.activeElement).not.toBe(trigger);
   });
+
+  it("exempts toast containers with aria-live from background inert state", () => {
+    const toast = document.createElement("div");
+    toast.setAttribute("data-toast-container", "true");
+    toast.setAttribute("aria-live", "polite");
+    document.body.appendChild(toast);
+
+    try {
+      render(<DialogHarness />);
+      openDialog();
+      expect(toast.hasAttribute("inert")).toBe(false);
+      expect(toast.hasAttribute("aria-hidden")).toBe(false);
+    } finally {
+      toast.remove();
+    }
+  });
+
+  it("contains body siblings dynamically appended after modal opens", async () => {
+    render(<DialogHarness />);
+    openDialog();
+
+    const sibling = document.createElement("div");
+    sibling.id = "dynamic-sibling";
+    document.body.appendChild(sibling);
+
+    await vi.waitFor(() => {
+      expect(sibling.hasAttribute("inert")).toBe(true);
+      expect(sibling.getAttribute("aria-hidden")).toBe("true");
+    });
+
+    sibling.remove();
+  });
+
+  it("retains focus within panel when action becomes busy", () => {
+    const { rerender } = render(
+      <ConfirmDialog
+        open={true}
+        title="Busy Test"
+        busy={false}
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      >
+        Body
+      </ConfirmDialog>,
+    );
+
+    const confirm = screen.getByRole("button", { name: "Confirm" });
+    confirm.focus();
+    expect(document.activeElement).toBe(confirm);
+
+    rerender(
+      <ConfirmDialog
+        open={true}
+        title="Busy Test"
+        busy={true}
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      >
+        Body
+      </ConfirmDialog>,
+    );
+
+    expect(confirm.disabled).toBe(true);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
 });

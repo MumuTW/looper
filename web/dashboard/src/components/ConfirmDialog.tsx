@@ -36,32 +36,85 @@ function focusableElements(panel: HTMLElement): HTMLElement[] {
   );
 }
 
-type BackgroundState = {
-  element: Element;
-  inert: string | null;
-  ariaHidden: string | null;
-};
+const activeModalsStack: HTMLElement[] = [];
+const originalBodyChildStates = new Map<
+  Element,
+  { inert: string | null; ariaHidden: string | null }
+>();
+let bodyObserver: MutationObserver | null = null;
+
+function updateBackgroundInertState() {
+  if (typeof document === "undefined") return;
+
+  const topModal = activeModalsStack[activeModalsStack.length - 1];
+
+  for (const child of Array.from(document.body.children)) {
+    if (
+      child.hasAttribute("data-toast-container") ||
+      child.getAttribute("aria-live") ||
+      child.querySelector("[aria-live]")
+    ) {
+      child.removeAttribute("inert");
+      child.removeAttribute("aria-hidden");
+      continue;
+    }
+
+    if (activeModalsStack.includes(child as HTMLElement)) {
+      if (child === topModal) {
+        child.removeAttribute("inert");
+        child.removeAttribute("aria-hidden");
+      } else {
+        child.setAttribute("inert", "");
+        child.setAttribute("aria-hidden", "true");
+      }
+      continue;
+    }
+
+    if (!originalBodyChildStates.has(child)) {
+      originalBodyChildStates.set(child, {
+        inert: child.getAttribute("inert"),
+        ariaHidden: child.getAttribute("aria-hidden"),
+      });
+    }
+
+    child.setAttribute("inert", "");
+    child.setAttribute("aria-hidden", "true");
+  }
+}
 
 function hideBackground(modalRoot: HTMLElement): () => void {
-  const states: BackgroundState[] = Array.from(document.body.children)
-    .filter((element) => element !== modalRoot)
-    .map((element) => ({
-      element,
-      inert: element.getAttribute("inert"),
-      ariaHidden: element.getAttribute("aria-hidden"),
-    }));
+  activeModalsStack.push(modalRoot);
+  updateBackgroundInertState();
 
-  for (const { element } of states) {
-    element.setAttribute("inert", "");
-    element.setAttribute("aria-hidden", "true");
+  if (!bodyObserver && typeof document !== "undefined") {
+    bodyObserver = new MutationObserver(() => {
+      updateBackgroundInertState();
+    });
+    bodyObserver.observe(document.body, { childList: true });
   }
 
   return () => {
-    for (const { element, inert, ariaHidden } of states) {
-      if (inert === null) element.removeAttribute("inert");
-      else element.setAttribute("inert", inert);
-      if (ariaHidden === null) element.removeAttribute("aria-hidden");
-      else element.setAttribute("aria-hidden", ariaHidden);
+    const idx = activeModalsStack.indexOf(modalRoot);
+    if (idx !== -1) {
+      activeModalsStack.splice(idx, 1);
+    }
+
+    if (activeModalsStack.length > 0) {
+      updateBackgroundInertState();
+    } else {
+      if (bodyObserver) {
+        bodyObserver.disconnect();
+        bodyObserver = null;
+      }
+      for (const [child, state] of originalBodyChildStates.entries()) {
+        if (child.isConnected) {
+          if (state.inert === null) child.removeAttribute("inert");
+          else child.setAttribute("inert", state.inert);
+          if (state.ariaHidden === null) child.removeAttribute("aria-hidden");
+          else child.setAttribute("aria-hidden", state.ariaHidden);
+        }
+      }
+      originalBodyChildStates.clear();
     }
   };
 }
@@ -116,9 +169,23 @@ export function ConfirmDialog({
       restoreBackground();
       const initiatingElement = initiatingElementRef.current;
       initiatingElementRef.current = null;
-      if (initiatingElement?.isConnected) initiatingElement.focus();
+      if (activeModalsStack.length === 0 && initiatingElement?.isConnected) {
+        initiatingElement.focus();
+      }
     };
   }, [open]);
+
+  useEffect(() => {
+    if (!open || !busy || !panelRef.current) return;
+    const active = document.activeElement;
+    if (
+      !active ||
+      !panelRef.current.contains(active) ||
+      (active as HTMLButtonElement).disabled
+    ) {
+      panelRef.current.focus();
+    }
+  }, [open, busy]);
 
   useEffect(() => {
     if (!open) return;
