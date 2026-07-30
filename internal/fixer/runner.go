@@ -158,6 +158,10 @@ type PullRequestSummary struct {
 	BaseRefName string
 	HeadSHA     string
 	Author      string
+	// UpdatedAt is the forge's last-modified timestamp. Discovery uses it to tell
+	// whether a pull request could have gained review work since it was last
+	// examined; a provider that cannot supply it simply never skips.
+	UpdatedAt string
 }
 
 type PullRequestDetail struct {
@@ -601,6 +605,14 @@ type DiscoveryResult struct {
 	QueueItems     []storage.QueueItemRecord
 	CreatedLoopIDs []string
 	Skipped        int
+	// Examined counts pull requests that passed the cheap local eligibility checks
+	// and therefore cost a ViewPullRequest round trip. It is the per-PR forge work
+	// this lane actually performs, as distinct from Skipped, which is work avoided
+	// for free before any call.
+	Examined int
+	// SkippedClean counts pull requests whose previous examination found nothing to
+	// fix and whose observable state has not changed since.
+	SkippedClean int
 }
 
 type ProcessResult struct {
@@ -1609,6 +1621,14 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if !policy.AutoDiscovery && len(openPRs) == 0 {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
+	// Examining a pull request costs a ViewPullRequest round trip to answer "is there
+	// anything to fix". Most answers are "no" and cannot have changed: a new review
+	// comment or review moves UpdatedAt, a push moves HeadSHA, a hold moves Labels.
+	// Reuse the previous clean answer when none of those moved.
+	cleanExaminations, err := latestCleanExaminations(ctx, r.repos, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	result := DiscoveryResult{}
 	for _, item := range recoveredQueueItems {
 		appendDiscoveryQueueItem(&result.QueueItems, item)
@@ -1624,6 +1644,13 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
+		fingerprint := examinationFingerprint(pr)
+		previousClean, hasClean := cleanExaminations[cleanExaminationEntityID(input.Repo, pr.Number)]
+		if skipCleanExamination(previousClean, hasClean, fingerprint, r.now()) {
+			result.SkippedClean++
+			continue
+		}
+		result.Examined++
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
 		if err != nil {
 			return DiscoveryResult{}, err
@@ -1632,8 +1659,16 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
+		enqueuedBefore := len(result.QueueItems)
 		if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
 			return DiscoveryResult{}, err
+		}
+		// Only a clean examination is recorded, so the skip above can never suppress
+		// discovery that found work — at worst it delays re-confirming "nothing to do".
+		if len(result.QueueItems) == enqueuedBefore {
+			if err := r.recordCleanExamination(ctx, input.ProjectID, input.Repo, pr.Number, fingerprint); err != nil {
+				return DiscoveryResult{}, err
+			}
 		}
 	}
 	return result, nil

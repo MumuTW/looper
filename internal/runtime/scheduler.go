@@ -1141,7 +1141,7 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 	}
 	result := make([]fixer.PullRequestSummary, 0, len(pullRequests))
 	for _, pr := range pullRequests {
-		result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: pr.Labels, BaseRefName: pr.BaseRefName, HeadSHA: pr.HeadSHA, Author: pr.Author})
+		result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: pr.Labels, BaseRefName: pr.BaseRefName, HeadSHA: pr.HeadSHA, Author: pr.Author, UpdatedAt: pr.UpdatedAt})
 	}
 	return result, nil
 }
