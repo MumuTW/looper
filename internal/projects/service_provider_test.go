@@ -176,3 +176,47 @@ func TestServiceAddProjectWarnsWhenNoRepositoryCouldBeDetermined(t *testing.T) {
 		t.Fatalf("warnings = %#v, want the inert-project consequence reported", added.Warnings)
 	}
 }
+
+// The inert-project warning must never route an operator through RemoveProject.
+// That call terminates every loop and cancels every queue item for the project,
+// and "terminated" has no outbound transition, so following the advice would
+// destroy the automation state the operator is trying to restore.
+func TestInertProjectWarningNeverAdvisesTheDestructivePath(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	service := &Service{
+		DB: coordinator.DB(), Repos: repos, Config: cfg,
+		Now:             func() time.Time { return now },
+		PublishProjects: func([]config.ProjectRefConfig) {},
+	}
+
+	added, err := service.AddProject(context.Background(), AddInput{
+		ID: "demo", Name: "Demo", RepoPath: t.TempDir(), IDSource: "derived",
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+
+	joined := strings.Join(added.Warnings, "\n")
+	if !strings.Contains(joined, "no automation will run") {
+		t.Fatalf("warnings = %#v, want the inert-project consequence reported", added.Warnings)
+	}
+	for _, destructive := range []string{"DELETE", "delete", "remove", "Remove"} {
+		if strings.Contains(joined, destructive) {
+			t.Fatalf("warning names %q, but removal terminates every loop for the project: %q", destructive, joined)
+		}
+	}
+	// The reset that re-registration does cause must be disclosed, not glossed.
+	for _, disclosed := range []string{"name", "baseBranch", "snapshotMode", "defaults"} {
+		if !strings.Contains(joined, disclosed) {
+			t.Fatalf("warning omits %q; the fields re-registration resets must be named: %q", disclosed, joined)
+		}
+	}
+}
