@@ -2,11 +2,11 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"testing"
 )
 
-func TestPollFeishuHITLInboxOnce(t *testing.T) {
-	// feishu_threads: root om_root_1 -> loop-a (this looper); om_other -> "" (another looper).
+func TestPollFeishuHITLInboxOnceAllSucceed(t *testing.T) {
 	rootToLoop := map[string]string{"om_root_1": "loop-a"}
 	seqToLoop := map[int64]string{71: "loop-seq71"}
 	var answers, messages []string
@@ -23,30 +23,62 @@ func TestPollFeishuHITLInboxOnce(t *testing.T) {
 		},
 	}
 	events := []feishuInboxEvent{
-		{ID: 10, Kind: "message", RootID: "om_root_1", Text: "用 A,改 resize handle"}, // typed -> enqueue
-		{ID: 11, Kind: "message", RootID: "om_other", Text: "not ours"},             // another looper -> skip
-		{ID: 12, Kind: "message", RootID: "om_root_1", Text: "   "},                 // empty -> skip
-		mustCardAction(15, "71", "redis"),                                           // button -> deliver by seq
+		{ID: 10, Kind: "message", RootID: "om_root_1", Text: "用 A"},
+		{ID: 11, Kind: "message", RootID: "om_other", Text: "not ours"},
+		{ID: 12, Kind: "message", RootID: "om_root_1", Text: "   "},
+		makeCardAction(15, "71", "redis"),
 	}
-	n, maxID := pollFeishuHITLInboxOnce(context.Background(), events, deps)
+	n, newCursor := pollFeishuHITLInboxOnce(context.Background(), events, deps, 0)
 	if n != 2 {
 		t.Fatalf("handled = %d, want 2", n)
 	}
-	if maxID != 15 {
-		t.Fatalf("maxID = %d, want 15", maxID)
+	if newCursor != 15 {
+		t.Fatalf("newCursor = %d, want 15", newCursor)
 	}
-	// A typed reply is queued (conversational), a button click is a decision.
-	if len(messages) != 1 || messages[0] != "loop-a=用 A,改 resize handle" {
-		t.Fatalf("enqueued messages = %v, want the typed reply", messages)
+	if len(messages) != 1 || messages[0] != "loop-a=用 A" {
+		t.Fatalf("enqueued messages = %v", messages)
 	}
 	if len(answers) != 1 || answers[0] != "loop-seq71=redis" {
-		t.Fatalf("delivered answers = %v, want the button click", answers)
+		t.Fatalf("delivered answers = %v", answers)
 	}
 }
 
-func mustCardAction(id int64, seq, answer string) feishuInboxEvent {
-	e := feishuInboxEvent{ID: id, Kind: "card_action"}
-	e.Value.LoopSeq = seq
-	e.Value.Answer = answer
-	return e
+func TestPollFeishuHITLInboxCursorBlocksOnFailedDelivery(t *testing.T) {
+	deps := feishuHITLPollDeps{
+		loopBySeq: func(_ contextType, seq int64) string { return "loop-seq" },
+	}
+	events := []feishuInboxEvent{
+		makeCardAction(9, "1", "ok"),
+		makeCardAction(10, "1", "ok"),
+		makeCardAction(11, "1", "ok"),
+		makeCardAction(12, "1", "ok"),
+	}
+
+	var callCount int
+	deps.deliverAnswer = func(_ contextType, loopID, answer string) error {
+		callCount++
+		if callCount == 2 {
+			return fmt.Errorf("temporary failure")
+		}
+		return nil
+	}
+
+	n, newCursor := pollFeishuHITLInboxOnce(context.Background(), events, deps, 0)
+	if n != 3 {
+		t.Fatalf("handled = %d, want 3", n)
+	}
+	if newCursor != 9 {
+		t.Fatalf("newCursor = %d, want 9 (blocked on failed event 10)", newCursor)
+	}
+}
+
+func makeCardAction(id int64, seq, answer string) feishuInboxEvent {
+	return feishuInboxEvent{
+		ID:   id,
+		Kind: "card_action",
+		Value: struct {
+			LoopSeq string `json:"loopSeq"`
+			Answer  string `json:"answer"`
+		}{LoopSeq: seq, Answer: answer},
+	}
 }
