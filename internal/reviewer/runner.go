@@ -34,6 +34,7 @@ import (
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/nexu-io/looper/internal/reviewer/publish"
 	"github.com/nexu-io/looper/internal/reviewer/workflow"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
@@ -3478,12 +3479,6 @@ type criteriaPublishResult struct {
 	recordOnly  bool
 }
 
-const (
-	criteriaFailCommentMarker     = "<!-- looper:reviewer:criteria-fail -->"
-	autoMergeRefusedCommentMarker = "<!-- looper:reviewer:automerge-refused -->"
-	criteriaVerificationHeading   = "### Acceptance criteria verification"
-)
-
 func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint, detail PullRequestDetail) (*criteriaPublishResult, error) {
 	if resolvePullRequestPhase(detail.Labels) == "spec" {
 		return nil, nil
@@ -3524,7 +3519,7 @@ func (r *Runner) publishCleanReviewWithoutCriteria(ctx context.Context, input st
 		}
 		return &criteriaPublishResult{reviewEvent: ReviewEventComment, recordOnly: true}, nil
 	}
-	body := stampReviewBody(r.disclosure, buildCleanApprovalBody(cleanReviewAuthorLogin(checkpoint, detail), criteriaVerificationHeading, nil, "No explicit acceptance criteria were stated on the linked issue, so this review follows the standard clean-review path."), "reviewer")
+	body := stampReviewBody(r.disclosure, publish.CleanApprovalBody(cleanReviewAuthorLogin(checkpoint, detail), publish.CriteriaVerificationHeading, nil, "No explicit acceptance criteria were stated on the linked issue, so this review follows the standard clean-review path."), "reviewer")
 	marker, err := r.submitOrReuseReview(ctx, input, detail, pending, ReviewEventApprove, "clean", body)
 	if err != nil {
 		return nil, err
@@ -3536,7 +3531,7 @@ func (r *Runner) publishCleanReviewWithoutCriteria(ctx context.Context, input st
 }
 
 func (r *Runner) publishCriteriaApprovedReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint, detail PullRequestDetail, autoMergeCfg config.ReviewerAutoMergeConfig, issueRef linkedIssueReference, verification criteria.VerificationResult) (*criteriaPublishResult, error) {
-	body := stampReviewBody(r.disclosure, buildCleanApprovalBody(cleanReviewAuthorLogin(checkpoint, detail), criteriaVerificationHeading, verification.Criteria, "I verified each stated acceptance criterion against the current PR diff before approving."), "reviewer")
+	body := stampReviewBody(r.disclosure, publish.CleanApprovalBody(cleanReviewAuthorLogin(checkpoint, detail), publish.CriteriaVerificationHeading, verification.Criteria, "I verified each stated acceptance criterion against the current PR diff before approving."), "reviewer")
 	marker, err := r.submitOrReuseReview(ctx, input, detail, pending, ReviewEventApprove, "clean", body)
 	if err != nil {
 		return nil, err
@@ -3560,14 +3555,14 @@ func (r *Runner) publishCriteriaApprovedReview(ctx context.Context, input stepIn
 		}
 		return &criteriaPublishResult{reviewEvent: marker.Event, marker: marker}, nil
 	}
-	if err := r.postStampedPRCommentIfMissing(ctx, input, detail, autoMergeRefusedCommentMarker, fmt.Sprintf("Auto-merge opt-in was refused for this PR: %s.", decision.Reason)); err != nil {
+	if err := r.postStampedPRCommentIfMissing(ctx, input, detail, publish.AutoMergeRefusedMarker, fmt.Sprintf("Auto-merge opt-in was refused for this PR: %s.", decision.Reason)); err != nil {
 		return nil, err
 	}
 	return &criteriaPublishResult{reviewEvent: marker.Event, marker: marker}, nil
 }
 
 func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInput, detail PullRequestDetail, pending pendingReviewCheckpoint, issueRef linkedIssueReference, issue githubinfra.IssueDetail, verification criteria.VerificationResult) (*criteriaPublishResult, error) {
-	body := stampReviewBody(r.disclosure, buildCriteriaFailureBody(verification.Criteria), "reviewer")
+	body := stampReviewBody(r.disclosure, publish.CriteriaFailureBody(verification.Criteria), "reviewer")
 	marker, err := r.submitOrReuseReview(ctx, input, detail, pending, ReviewEventComment, "non_blocking", body)
 	if err != nil {
 		return nil, err
@@ -3821,64 +3816,6 @@ func parseInt64(raw string) (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 }
 
-func buildCleanApprovalBody(authorLogin string, heading string, results []criteria.CriterionResult, intro string) string {
-	parts := []string{fmt.Sprintf("%s Thanks for the update — I reviewed the current PR head and it's ready to move forward.", cleanReviewAuthorMention(authorLogin))}
-	if strings.TrimSpace(intro) != "" {
-		parts = append(parts, intro)
-	}
-	if heading != "" {
-		parts = append(parts, heading, formatCriteriaResults(results, true))
-	}
-	parts = append(parts, "Happy to see this tightened up — nice work.")
-	return strings.Join(parts, "\n\n")
-}
-
-func buildCriteriaFailureBody(results []criteria.CriterionResult) string {
-	return strings.Join([]string{"Acceptance criteria could not be fully verified for this PR head.", criteriaVerificationHeading, formatCriteriaResults(results, false), criteriaFailCommentMarker}, "\n\n")
-}
-
-func formatCriteriaResults(results []criteria.CriterionResult, includeOnlyPass bool) string {
-	if len(results) == 0 {
-		if includeOnlyPass {
-			return "- No explicit acceptance criteria were available to verify."
-		}
-		return "- No acceptance criteria results were recorded."
-	}
-	lines := make([]string, 0, len(results))
-	for _, result := range results {
-		if includeOnlyPass && result.Verdict != criteria.VerdictPass {
-			continue
-		}
-		line := fmt.Sprintf("- **%s** — %s", result.Criterion, strings.ToUpper(string(result.Verdict)))
-		if pointers := formatEvidencePointers(result.Evidence); pointers != "" {
-			line += " (" + pointers + ")"
-		}
-		if justification := strings.TrimSpace(result.Justification); justification != "" {
-			line += ": " + justification
-		}
-		lines = append(lines, line)
-	}
-	if len(lines) == 0 && includeOnlyPass {
-		return "- No passing acceptance criteria were recorded."
-	}
-	return strings.Join(lines, "\n")
-}
-
-func formatEvidencePointers(evidence []criteria.Evidence) string {
-	parts := make([]string, 0, len(evidence))
-	for _, entry := range evidence {
-		if entry.FilePath == "" || entry.StartLine < 1 {
-			continue
-		}
-		if entry.EndLine > entry.StartLine {
-			parts = append(parts, fmt.Sprintf("%s:%d-%d", entry.FilePath, entry.StartLine, entry.EndLine))
-			continue
-		}
-		parts = append(parts, fmt.Sprintf("%s:%d", entry.FilePath, entry.StartLine))
-	}
-	return strings.Join(parts, ", ")
-}
-
 func criteriaFailureLabels(labels []string) []string {
 	toRemove := []string{}
 	for _, label := range labels {
@@ -3966,7 +3903,7 @@ func reviewHumanVisibleBody(body string) string {
 
 func validateCleanApprovedReviewMarkerBody(marker ReviewMarkerResult, authorLogin string) error {
 	visible := reviewHumanVisibleBody(marker.Body)
-	mention := cleanReviewAuthorMention(authorLogin)
+	mention := publish.AuthorMention(authorLogin)
 	if mention == "" {
 		return fmt.Errorf("clean APPROVE review body requires the PR author login for @mention validation")
 	}
@@ -3991,14 +3928,6 @@ func cleanReviewAuthorLogin(checkpoint reviewerCheckpoint, detail PullRequestDet
 		return checkpoint.Snapshot.Author
 	}
 	return ""
-}
-
-func cleanReviewAuthorMention(login string) string {
-	login = strings.TrimSpace(strings.TrimPrefix(login, "@"))
-	if login == "" {
-		return ""
-	}
-	return "@" + login
 }
 
 func (r *Runner) specReviewingLabel(projectID string) string {
@@ -6146,7 +6075,7 @@ func customInstructionConfig(value *config.Config) config.Config {
 }
 
 func cleanReviewAuthorTarget(checkpoint reviewerCheckpoint) string {
-	mention := cleanReviewAuthorMention(cleanReviewAuthorLogin(checkpoint, PullRequestDetail{}))
+	mention := publish.AuthorMention(cleanReviewAuthorLogin(checkpoint, PullRequestDetail{}))
 	if mention == "" {
 		return "@<PR-author-login>"
 	}

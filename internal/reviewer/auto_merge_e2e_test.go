@@ -15,6 +15,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/nexu-io/looper/internal/reviewer/publish"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -145,7 +146,7 @@ func TestReviewerAutoMergeWaitsForMergeBeforeUnblockingDependentDispatchWithFake
 	if strings.Contains(string(logBytes), `"argv":["api","repos/acme/looper/issues/2/labels","--method","POST","-f","labels[]=looper:plan"]`) {
 		t.Fatalf("dependent issue dispatched before auto-merge completed:\n%s", string(logBytes))
 	}
-	if !strings.Contains(string(logBytes), criteriaVerificationHeading) {
+	if !strings.Contains(string(logBytes), publish.CriteriaVerificationHeading) {
 		t.Fatalf("invocation log missing criteria verification heading:\n%s", string(logBytes))
 	}
 
