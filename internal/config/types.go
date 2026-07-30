@@ -627,6 +627,26 @@ type RoleConfigs struct {
 	Fixer       FixerRoleConfig       `json:"fixer"`
 	Worker      WorkerRoleConfig      `json:"worker"`
 	Coordinator CoordinatorRoleConfig `json:"coordinator"`
+	Deployer    DeployerRoleConfig    `json:"deployer"`
+}
+
+// DeployerRoleConfig configures the agent-free Role that runs a project's
+// deploy command after its base branch moves. Looper does not interpret the
+// command, decide what a successful deploy means beyond its exit status, or
+// attempt to roll one back.
+type DeployerRoleConfig struct {
+	Enabled bool `json:"enabled"`
+	// Command is run with /bin/sh -c from the project's repository root. It is
+	// arbitrary local execution by design — the same trust the daemon already
+	// extends to the agent CLIs it runs — and only a merge into the project's
+	// base branch triggers it.
+	Command string `json:"command,omitempty"`
+	// TimeoutSeconds bounds one deploy. Empty defaults to 900.
+	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`
+	// Environment is added to the deploy command's environment on top of the
+	// daemon's own. Values, not names: a deploy usually needs a token the daemon
+	// itself has no use for.
+	Environment map[string]string `json:"environment,omitempty"`
 }
 
 type ProjectRefConfig struct {
@@ -1181,6 +1201,13 @@ type PartialCoordinatorRoleConfig struct {
 	MergeWatch   *PartialCoordinatorMergeWatchConfig   `json:"mergeWatch,omitempty"`
 }
 
+type PartialDeployerRoleConfig struct {
+	Enabled        *bool              `json:"enabled,omitempty"`
+	Command        *string            `json:"command,omitempty"`
+	TimeoutSeconds *int               `json:"timeoutSeconds,omitempty"`
+	Environment    *map[string]string `json:"environment,omitempty"`
+}
+
 type PartialRoleConfigs struct {
 	// Coding holds TOML-authored coding-role overlays
 	// (`[roles.coding.<shipped-role>]`). It is global-only:
@@ -1193,6 +1220,7 @@ type PartialRoleConfigs struct {
 	Fixer       *PartialFixerRoleConfig            `json:"fixer,omitempty"`
 	Worker      *PartialWorkerRoleConfig           `json:"worker,omitempty"`
 	Coordinator *PartialCoordinatorRoleConfig      `json:"coordinator,omitempty"`
+	Deployer    *PartialDeployerRoleConfig         `json:"deployer,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }

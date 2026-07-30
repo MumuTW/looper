@@ -132,6 +132,9 @@ type defaultSchedulerTickInput struct {
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
+	// OnDeployFinished, when set, reports a completed deploy so the human who
+	// asked for the change learns it shipped.
+	OnDeployFinished func(context.Context, DeployNotification)
 }
 
 type defaultSchedulerHandlers struct {
@@ -2213,6 +2216,25 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			WorkerDiscoveryEnabled:   boolPtr(workerConfigured && view.AnyProjectRoleAutoDiscovery("worker")),
 			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
+			OnDeployFinished: func(ctx context.Context, notification DeployNotification) {
+				level := "info"
+				if !notification.Outcome.Succeeded {
+					level = "action_required"
+				}
+				notificationGateway.Notify(ctx, notify.SystemNotificationPayload{
+					ID:         fmt.Sprintf("deploy-%d", notification.Outcome.DeploymentID),
+					ProjectID:  notification.ProjectID,
+					Level:      level,
+					Title:      notification.Title(),
+					Subtitle:   notification.Subtitle(),
+					Body:       notification.Body(),
+					EntityType: "deployment",
+					EntityID:   notification.Outcome.SHA,
+					// One notification per deployment: a retried status write must not
+					// produce a second ping for the same deploy.
+					DedupeKey: fmt.Sprintf("deploy:%s:%s", notification.Repo, notification.Outcome.SHA),
+				})
+			},
 		}
 	}
 
@@ -2450,6 +2472,13 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			break
 		}
 		runGitHubHITLPoll(ctx, input, project)
+
+		// Deploy last for this project: a merge that just landed should be picked
+		// up by the same tick that observed it, but never ahead of discovery.
+		if err := admissionRefuseWork(input); err != nil {
+			break
+		}
+		runDeployLane(ctx, input, project, repo)
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and

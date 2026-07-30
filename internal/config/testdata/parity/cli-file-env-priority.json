@@ -251,6 +251,9 @@
             "assignTo": ""
           }
         },
+        "deployer": {
+          "enabled": false
+        },
         "planner": {
           "autoDiscovery": true,
           "triggers": {
