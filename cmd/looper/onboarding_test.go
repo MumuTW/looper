@@ -983,12 +983,14 @@ func TestProjectRejectsBadSubcommands(t *testing.T) {
 		args []string
 	}{
 		{name: "missing subcommand", args: []string{"project"}},
-		{name: "unknown subcommand", args: []string{"project", "remove", "x"}},
+		{name: "unknown subcommand", args: []string{"project", "delete", "x"}},
 		{name: "add without path", args: []string{"project", "add"}},
 		{name: "add with extra args", args: []string{"project", "add", "a", "b"}},
 		{name: "list with args", args: []string{"project", "list", "x"}},
 		{name: "discover without id", args: []string{"project", "discover"}},
 		{name: "discover with extra args", args: []string{"project", "discover", "a", "b"}},
+		{name: "remove without id", args: []string{"project", "remove"}},
+		{name: "remove with extra args", args: []string{"project", "remove", "a", "b"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			code, _, stderr := runCLI(t, testCase.args...)
