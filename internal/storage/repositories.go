@@ -629,11 +629,6 @@ func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeH
 	if !changeHumanHold {
 		guard = ` WHERE (loops.status = ?) = (excluded.status = ?)`
 		args = append(args, string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusHumanTakeover))
-		if record.Status == string(domain.LoopStatusHumanTakeover) {
-			insertSource = `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM loops WHERE id = ?)`
-			args = append(args[:15], record.ID)
-			args = append(args, string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusHumanTakeover))
-		}
 	}
 	result, err := r.q.ExecContext(ctx, `
 		INSERT INTO loops (id, seq, project_id, type, target_type, target_id, repo, pr_number, status, config_json, metadata_json, last_run_at, next_run_at, created_at, updated_at)
