@@ -76,6 +76,16 @@ func TestContextADRReferencesResolve(t *testing.T) {
 			t.Errorf("ADR number %s is used by two files: %s and %s", number, existing, entry.Name())
 		}
 		present[number] = entry.Name()
+
+		// The filename prefix is the authority for the number only when the
+		// document agrees. A file named 0018-new-decision.md whose heading
+		// declares "# ADR-0017" leaves two documents visibly numbered 0017
+		// while the duplicate check above stays green, and a CONTEXT.md
+		// citation resolves to a filename whose body claims a different
+		// number. When a heading carries an ADR number, it must match.
+		if heading, ok := adrHeadingNumber(filepath.Join(repoRoot, "docs", "adr", entry.Name())); ok && heading != number {
+			t.Errorf("ADR file %s is numbered %s in its filename but %s in its heading", entry.Name(), number, heading)
+		}
 	}
 
 	for _, match := range adrReference.FindAllStringSubmatch(contextDoc(t), -1) {
@@ -88,6 +98,27 @@ func TestContextADRReferencesResolve(t *testing.T) {
 			t.Errorf("CONTEXT.md cites %s, but docs/adr has no such ADR", match[0])
 		}
 	}
+}
+
+// adrHeadingNumber reads an ADR document's first Markdown heading and reports
+// the ADR number it declares, if any. Headings such as "# Coordinator is
+// stateless" carry no number and are reported as not present; "# ADR-0012: ..."
+// and "# ADR 0005: ..." report "0012" and "0005".
+func adrHeadingNumber(path string) (string, bool) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	headingRe := regexp.MustCompile(`ADR[- ](\d{4})`)
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, "#") {
+			if m := headingRe.FindStringSubmatch(line); m != nil {
+				return m[1], true
+			}
+			return "", false
+		}
+	}
+	return "", false
 }
 
 // A glossary entry that points at a repository path is only as good as the
