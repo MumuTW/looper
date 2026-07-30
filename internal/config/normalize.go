@@ -52,6 +52,15 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	config.Roles.Coding = codingRoles
 	config.Roles.codingModelCanonical = codingModelCanonical
 
+	// Store server.baseUrl in its canonical form so every consumer reads the
+	// same validated representation. Invalid values are kept verbatim for
+	// Validate to report.
+	if config.Server.BaseURL != nil {
+		if canonical, err := CanonicalizeServerBaseURL(*config.Server.BaseURL); err == nil {
+			config.Server.BaseURL = &canonical
+		}
+	}
+
 	return config, nil
 }
 

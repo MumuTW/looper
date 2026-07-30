@@ -344,6 +344,11 @@ func validateServerConfig(server ServerConfig, issues *[]ValidationIssue) {
 	if server.AuthMode == AuthModeLocalToken && isNilOrEmptyString(server.LocalToken) {
 		*issues = append(*issues, ValidationIssue{Path: "server.localToken", Message: "is required when authMode is local-token"})
 	}
+	if server.BaseURL != nil && strings.TrimSpace(*server.BaseURL) != "" {
+		if _, err := CanonicalizeServerBaseURL(*server.BaseURL); err != nil {
+			*issues = append(*issues, ValidationIssue{Path: "server.baseUrl", Message: err.Error()})
+		}
+	}
 }
 
 func validateStorageConfig(storage StorageConfig, issues *[]ValidationIssue) {
@@ -543,6 +548,63 @@ func isValidNetworkMode(mode NetworkMode) bool {
 
 func isValidProviderKind(kind ProviderKind) bool {
 	return kind == ProviderKindGitHub || kind == ProviderKindForgejo || kind == ProviderKindPlane
+}
+
+// CanonicalizeServerBaseURL validates value as the daemon's advertised base
+// URL and returns its canonical form: lowercase http(s) scheme and host, a
+// required host, no userinfo, query, or fragment, and an absolute path with
+// no trailing slash and no empty, ".", or ".." segments. Every consumer of
+// server.baseUrl (CLI dialing, browser Host/Origin allowlisting, webhook
+// endpoint display) reads the canonical form the load pipeline stores, so
+// path concatenation and origin comparison cannot diverge.
+func CanonicalizeServerBaseURL(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", errors.New("must be an absolute http(s) URL")
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return "", errors.New("must be a parseable absolute http(s) URL")
+	}
+
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("must use the http or https scheme")
+	}
+	if parsed.Host == "" || parsed.Hostname() == "" {
+		return "", errors.New("must include a host")
+	}
+	if parsed.User != nil {
+		return "", errors.New("must not include userinfo credentials")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery {
+		return "", errors.New("must not include a query string")
+	}
+	if parsed.Fragment != "" {
+		return "", errors.New("must not include a fragment")
+	}
+
+	path := parsed.EscapedPath()
+	if path == "/" {
+		path = ""
+	}
+	if path != "" {
+		if !strings.HasPrefix(path, "/") {
+			return "", errors.New("must use an absolute path")
+		}
+		path = strings.TrimSuffix(path, "/")
+		for _, segment := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+			switch segment {
+			case "":
+				return "", errors.New("must not contain empty path segments")
+			case ".", "..":
+				return "", errors.New("must not contain . or .. path segments")
+			}
+		}
+	}
+
+	return scheme + "://" + strings.ToLower(parsed.Host) + path, nil
 }
 
 func isAbsoluteHTTPURL(value string) bool {
