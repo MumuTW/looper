@@ -1147,6 +1147,9 @@ func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "looper", Type: "reviewer", TargetType: "pull_request", Status: "idle", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
+	if err := repos.Worktrees.Upsert(ctx, storage.WorktreeRecord{ID: "worktree_1", ProjectID: "looper", RepoPath: "/tmp/looper", WorktreePath: "/tmp/looper-worktree", Branch: "feature/old", Status: "active", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Worktrees.Upsert() error = %v", err)
+	}
 
 	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(time.Minute) }}
 
@@ -1175,6 +1178,13 @@ func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 	}
 	if loop == nil || loop.ProjectID != "looper" {
 		t.Fatalf("loop = %#v, want preserved loop history", loop)
+	}
+	worktrees, err := repos.Worktrees.ListByProject(ctx, "looper")
+	if err != nil {
+		t.Fatalf("Worktrees.ListByProject() error = %v", err)
+	}
+	if len(worktrees) != 0 {
+		t.Fatalf("Worktrees.ListByProject() = %#v, want retired identities after project archive", worktrees)
 	}
 }
 

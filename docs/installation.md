@@ -117,7 +117,7 @@ Registration completes as soon as the project is validated, committed, and publi
 
 Do not use `looper project add` for a project that needs an explicit provider binding; the CLI and API schemas cannot express one, so those belong in `[[projects]]` in the config file. Registering one through the API first and adding it to the config afterwards makes `looperd` fail to start while the API record remains active.
 
-To recover that mixed-ownership state without editing SQLite, temporarily remove the conflicting `[[projects]]` entry, restart `looperd`, send `DELETE /api/v1/projects/<id>`, and stop the daemon. Restore the complete config entry and restart once more. DELETE archives the API-owned record; config import is allowed to claim only that explicitly archived ID. The old project's loops are terminated as part of removal, so confirm the target ID before sending DELETE.
+To recover that mixed-ownership state without editing SQLite, temporarily remove the conflicting `[[projects]]` entry, restart `looperd`, send `DELETE /api/v1/projects/<id>`, and stop the daemon. Restore the complete config entry and restart once more. DELETE archives the API-owned record; config import is allowed to claim only that explicitly archived ID. The old project's loops are terminated and its worktree registrations are retired without touching the physical checkouts, so confirm the target ID before sending DELETE.
 
 Projects registered through the API take effect immediately. Projects listed under `[[projects]]` in the config file are imported at daemon startup instead.
 

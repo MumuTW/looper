@@ -3216,6 +3216,22 @@ func (r *WorktreesRepository) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// DeleteByProject removes worktree identities for a project that Looper no
+// longer manages. The physical checkouts are deliberately left untouched: a
+// project handoff must not discard potentially dirty work, but its replacement
+// must not inherit those records under the reused project ID.
+func (r *WorktreesRepository) DeleteByProject(ctx context.Context, projectID string) (int64, error) {
+	result, err := r.q.ExecContext(ctx, `DELETE FROM worktrees WHERE project_id = ?`, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("delete worktrees by project: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read delete worktrees by project rows affected: %w", err)
+	}
+	return affected, nil
+}
+
 func (r *WorktreesRepository) GetByID(ctx context.Context, id string) (*WorktreeRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM worktrees WHERE id = ?`, id)
 	record, err := scanWorktree(row)

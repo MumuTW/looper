@@ -359,11 +359,11 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		detected, detectErr := s.DetectRepo(ctx, input.RepoPath)
 		if detectErr != nil {
 			warnings = append(warnings, fmt.Sprintf("Could not detect repository from git remote: %s", detectErr.Error()))
-		} else {
-			if repo == nil && strings.TrimSpace(detected.Repo) != "" {
-				if detectedProvider := strings.TrimSpace(detected.Provider); detectedProvider != "" {
-					return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin matches provider %q; provider bindings are config-file authority, so define the project under [[projects]] instead of project add", detectedProvider)}
-				}
+		} else if repo == nil {
+			if detectedProvider := strings.TrimSpace(detected.Provider); detectedProvider != "" {
+				return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin %q requires a provider binding; provider bindings are config-file authority, so define the project under [[projects]] instead of project add", detectedProvider)}
+			}
+			if strings.TrimSpace(detected.Repo) != "" {
 				value := strings.TrimSpace(detected.Repo)
 				repo = &value
 			}
@@ -806,6 +806,9 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 			if _, cancelErr := repos.Queue.CancelByProject(ctx, project.ID, nowISO, &cancelReason); cancelErr != nil {
 				return false, cancelErr
 			}
+			if _, retireErr := repos.Worktrees.DeleteByProject(ctx, project.ID); retireErr != nil {
+				return false, retireErr
+			}
 			return true, nil
 		})
 		if transactionErr != nil || !archived {
@@ -908,11 +911,15 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 		existingByID[existingProjects[index].ID] = &existingProjects[index]
 	}
 	desiredRecords := make([]storage.ProjectRecord, 0, len(cfg.Projects))
+	reclaimingArchivedAPIProjectIDs := make(map[string]struct{})
 	for _, project := range cfg.Projects {
 		desiredIDs[project.ID] = struct{}{}
 		if existing := existingByID[project.ID]; existing != nil {
-			if source, _ := parseMetadata(existing.MetadataJSON)["source"].(string); source == "api" && !existing.Archived {
-				return ProjectValidationError{Message: fmt.Sprintf("configured project %s conflicts with an API-managed project that is still active; temporarily remove this project from [[projects]], restart looperd, send DELETE /api/v1/projects/%s to archive the API record, stop looperd, restore the config entry, and restart so config can claim the archived id", project.ID, url.PathEscape(project.ID))}
+			if source, _ := parseMetadata(existing.MetadataJSON)["source"].(string); source == "api" {
+				if !existing.Archived {
+					return ProjectValidationError{Message: fmt.Sprintf("configured project %s conflicts with an API-managed project that is still active; temporarily remove this project from [[projects]], restart looperd, send DELETE /api/v1/projects/%s to archive the API record, stop looperd, restore the config entry, and restart so config can claim the archived id", project.ID, url.PathEscape(project.ID))}
+				}
+				reclaimingArchivedAPIProjectIDs[project.ID] = struct{}{}
 			}
 		}
 	}
@@ -957,6 +964,11 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	}
 
 	applyImport := func(repos *storage.Repositories) error {
+		for projectID := range reclaimingArchivedAPIProjectIDs {
+			if _, err := repos.Worktrees.DeleteByProject(ctx, projectID); err != nil {
+				return err
+			}
+		}
 		for _, record := range desiredRecords {
 			if err := repos.Projects.Upsert(ctx, record); err != nil {
 				return err
@@ -1120,22 +1132,24 @@ func parseMetadata(metadataJSON *string) map[string]any {
 func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.ProjectRefConfig, repo *string) (string, error) {
 	extras := map[string]json.RawMessage{}
 	repoRaw := json.RawMessage("null")
+	reclaimingArchivedAPIProject := existing != nil && existing.Archived && metadataString(parseMetadata(existing.MetadataJSON), "source") == "api"
 
 	if existing != nil {
 		existingMetadata := parseMetadata(existing.MetadataJSON)
 		for key, value := range existingMetadata {
 			switch key {
-			case "repo":
+			case "repo", "worktreeRoot", "source":
 				continue
-			case "worktreeRoot", "source":
-				continue
-			default:
-				encoded, err := json.Marshal(value)
-				if err != nil {
-					return "", err
+			case registrationDiscoveryMetadataKey:
+				if reclaimingArchivedAPIProject {
+					continue
 				}
-				extras[key] = encoded
 			}
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return "", err
+			}
+			extras[key] = encoded
 		}
 	}
 	if repo != nil && strings.TrimSpace(*repo) != "" {

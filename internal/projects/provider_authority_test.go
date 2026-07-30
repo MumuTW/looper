@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestServiceSyncConfiguredAllowsConfigToClaimArchivedAPIProject(t *testing.T) {
@@ -19,9 +19,12 @@ func TestServiceSyncConfiguredAllowsConfigToClaimArchivedAPIProject(t *testing.T
 	now := time.Date(2026, time.July, 31, 4, 0, 0, 0, time.UTC)
 	createdAt := now.Add(-time.Hour).Format(time.RFC3339Nano)
 	baseBranch := "main"
-	metadata := `{"repo":"acme/old","source":"api"}`
+	metadata := `{"registrationDiscovery":{"status":"succeeded","discoveredWorktrees":1,"warnings":["old discovery"]},"repo":"acme/old","source":"api"}`
 	existing := storage.ProjectRecord{ID: "shared", Name: "Old API project", RepoPath: "/tmp/old", BaseBranch: &baseBranch, Archived: true, MetadataJSON: &metadata, CreatedAt: createdAt, UpdatedAt: createdAt}
 	if err := repos.Projects.Upsert(context.Background(), existing); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Worktrees.Upsert(context.Background(), storage.WorktreeRecord{ID: "old-worktree", ProjectID: "shared", RepoPath: "/tmp/old", WorktreePath: "/tmp/old-worktree", Branch: "feature/old", Status: "active", CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -47,6 +50,16 @@ func TestServiceSyncConfiguredAllowsConfigToClaimArchivedAPIProject(t *testing.T
 	}
 	if provider := metadataString(parseMetadata(stored.MetadataJSON), "provider"); provider != "acme" {
 		t.Fatalf("stored provider = %q, want config-owned acme binding", provider)
+	}
+	if discovery := DiscoveryStateFromRecord(*stored); discovery.Status != "" {
+		t.Fatalf("DiscoveryStateFromRecord() = %#v, want no API discovery state on config replacement", discovery)
+	}
+	worktrees, err := repos.Worktrees.ListByProject(context.Background(), "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(worktrees) != 0 {
+		t.Fatalf("ListByProject(shared) = %#v, want API worktree identities retired before ID reuse", worktrees)
 	}
 }
 

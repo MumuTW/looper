@@ -198,13 +198,13 @@ Looper's frozen canonical top-level config roots are:
 
 - Removing a config-managed project from `[[projects]]` archives its SQLite record on the next startup.
 - Config import never removes API-managed projects.
-- Reusing an active API-managed project ID in `[[projects]]` fails startup instead of transferring ownership implicitly. An archived API record is the explicit handoff authority: config import may claim that ID and replace it with an active config-managed record.
+- Reusing an active API-managed project ID in `[[projects]]` fails startup instead of transferring ownership implicitly. An archived API record is the explicit handoff authority: config import may claim that ID and replace it with an active config-managed record after retiring the old worktree registrations; it does not alter physical checkouts.
 - CLI/API add and remove operations publish one atomic Catalog replacement after the database commit; already-started work keeps its captured snapshot, while new work observes the new Catalog.
 - A project referencing a missing Provider fails validation; it never falls back to GitHub.
 
 See [ADR-0012](adr/0012-sqlite-project-authority.md) for the Authority and lifecycle decision.
 
-To move an existing API-managed project into `[[projects]]`, first remove its new config entry so the daemon can start, then verify the exact target project ID and send `DELETE /api/v1/projects/<id>` while the daemon is running. Stop the daemon, restore the complete `[[projects]]` entry (including any `provider` and `repo`), and restart. The DELETE archives the API record and terminates its old loops; that archived bit is the durable, explicit ownership handoff that permits config import to claim the same ID. Do not delete SQLite rows directly.
+To move an existing API-managed project into `[[projects]]`, first remove its new config entry so the daemon can start, then verify the exact target project ID and send `DELETE /api/v1/projects/<id>` while the daemon is running. Stop the daemon, restore the complete `[[projects]]` entry (including any `provider` and `repo`), and restart. The DELETE archives the API record, terminates its old loops, and retires its worktree registrations without touching their physical checkouts; that archived bit is the durable, explicit ownership handoff that permits config import to claim the same ID. Do not delete SQLite rows directly.
 
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
 

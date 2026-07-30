@@ -167,7 +167,7 @@ Inspect loops in the dashboard or via `GET /api/v1/loops`. Worktree path for a d
 | PR URL rejected as selector | Expected — use loop seq or loop id only |
 | Reviewer can't publish | Daemon must spawn the trusted `looper review submit` wrapper; never run it by hand without the proxy |
 | Daemon fails on startup | Config validation, missing `git`/`gh`, or unwritable `~/.looper` |
-| `configured project X conflicts with an active API-managed project` | Temporarily remove X from `[[projects]]`, restart, verify the exact target project ID, send `DELETE /api/v1/projects/X`, stop, restore the complete config entry, and restart. DELETE archives the API record; config import can then claim that ID. This terminates the old project's loops |
+| `configured project X conflicts with an active API-managed project` | Temporarily remove X from `[[projects]]`, restart, verify the exact target project ID, send `DELETE /api/v1/projects/X`, stop, restore the complete config entry, and restart. DELETE archives the API record; config import can then claim that ID. This terminates the old project's loops and retires its worktree registrations without touching physical checkouts |
 | Want daemon across reboot | User's `launchd`/`systemd`/`tmux` — not a Looper feature |
 
 ## Anti-patterns
