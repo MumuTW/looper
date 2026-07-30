@@ -703,7 +703,7 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 			if args != "api repos/acme/looper/commits/abc123/check-runs?filter=latest&per_page=100 -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
 			}
-			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success","started_at":"2026-07-31T12:00:00Z","completed_at":"2026-07-31T12:01:00Z","app":{"id":15368},"check_suite":{"id":7654}}]}`}, nil
+			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"id":99,"name":"unit","status":"completed","conclusion":"success","started_at":"2026-07-31T12:00:00Z","completed_at":"2026-07-31T12:01:00Z","app":{"id":15368},"check_suite":{"id":7654}}]}`}, nil
 		case 2:
 			if args != "api repos/acme/looper/commits/abc123/status -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
@@ -723,7 +723,7 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 	if len(runs.CheckRuns) != 1 || runs.CheckRuns[0].Name != "unit" {
 		t.Fatalf("CheckRuns = %#v, want decoded check run", runs.CheckRuns)
 	}
-	if runs.CheckRuns[0].AppID != 15368 || runs.CheckRuns[0].CheckSuiteID != 7654 {
+	if runs.CheckRuns[0].ID != 99 || runs.CheckRuns[0].AppID != 15368 || runs.CheckRuns[0].CheckSuiteID != 7654 {
 		t.Fatalf("CheckRuns[0] = %#v, want app and check-suite identities", runs.CheckRuns[0])
 	}
 	if runs.CheckRuns[0].StartedAt != "2026-07-31T12:00:00Z" || runs.CheckRuns[0].CompletedAt != "2026-07-31T12:01:00Z" {
@@ -731,6 +731,40 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 	}
 	if len(runs.Statuses) != 2 || runs.Statuses[0].Context != "legacy-ci" || runs.Statuses[1].Context != "lint" {
 		t.Fatalf("Statuses = %#v, want deduped status contexts in API order", runs.Statuses)
+	}
+}
+
+func TestListAttributionPathsUsesPaginatedGitHubEvidence(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		switch got := strings.Join(options.Args, " "); call {
+		case 1:
+			if want := "api --paginate --slurp repos/acme/looper/check-runs/99/annotations?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
+				t.Fatalf("annotation args = %q, want %q", got, want)
+			}
+			return shell.Result{Stdout: `[[{"path":"internal/runtime/a.go"},{"path":"internal/runtime/a.go"}]]`}, nil
+		case 2:
+			if want := "api --paginate --slurp repos/acme/looper/pulls/42/files?per_page=100 -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
+				t.Fatalf("files args = %q, want %q", got, want)
+			}
+			return shell.Result{Stdout: `[[{"filename":"z.go"},{"filename":"a.go"},{"filename":"a.go"}]]`}, nil
+		default:
+			t.Fatalf("unexpected extra call %q", got)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	annotations, err := gateway.ListCheckRunAnnotations(context.Background(), CheckRunAnnotationsInput{Repo: "ghes.example/acme/looper", CheckRunID: 99})
+	if err != nil || len(annotations) != 2 || annotations[0].Path != "internal/runtime/a.go" {
+		t.Fatalf("ListCheckRunAnnotations() = %#v, %v", annotations, err)
+	}
+	files, err := gateway.ListPullRequestFiles(context.Background(), ViewPullRequestInput{Repo: "ghes.example/acme/looper", PRNumber: 42})
+	if err != nil || len(files) != 2 || files[0] != "a.go" || files[1] != "z.go" {
+		t.Fatalf("ListPullRequestFiles() = %#v, %v", files, err)
 	}
 }
 

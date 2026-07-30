@@ -52,6 +52,7 @@ func mergeOutcomes(t *testing.T, repos *storage.Repositories) []MergeOutcome {
 func TestAutoMergesAnEligiblePullRequest(t *testing.T) {
 	t.Parallel()
 	fixture := newGatekeeperFixture(t)
+	fixture.github.files = []string{"internal/runtime/auditor.go"}
 	runner := autoRunner(t, fixture)
 
 	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
@@ -72,8 +73,23 @@ func TestAutoMergesAnEligiblePullRequest(t *testing.T) {
 		t.Fatalf("merge head = %q", fixture.github.merges[0].HeadSHA)
 	}
 	outcomes := mergeOutcomes(t, fixture.repos)
-	if len(outcomes) != 1 || !outcomes[0].Merged {
+	if len(outcomes) != 1 || !outcomes[0].Merged || len(outcomes[0].TouchedFiles) != 1 || outcomes[0].TouchedFiles[0] != "internal/runtime/auditor.go" {
 		t.Fatalf("outcomes = %+v", outcomes)
+	}
+}
+
+func TestAutoRecordsSuccessfulMergeWhenFileEvidenceIsUnavailable(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.filesErr = errors.New("pull request files unavailable")
+	runner := autoRunner(t, fixture)
+
+	if _, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"}); err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v, want merged outcome retained", err)
+	}
+	outcomes := mergeOutcomes(t, fixture.repos)
+	if len(outcomes) != 1 || !outcomes[0].Merged || len(outcomes[0].TouchedFiles) != 0 {
+		t.Fatalf("outcomes = %#v, want merged outcome without optional file evidence", outcomes)
 	}
 }
 

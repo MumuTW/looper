@@ -25,7 +25,11 @@ type MergeOutcome struct {
 	// HeadSHA is the commit the decision was made about and, on success, the
 	// commit that was merged.
 	HeadSHA string `json:"headSha"`
-	Merged  bool   `json:"merged"`
+	// TouchedFiles is GitHub's authoritative pull-request file list captured
+	// after a successful merge. Auditor may use it as attribution evidence; it
+	// is not merge authority and therefore a read failure never undoes a merge.
+	TouchedFiles []string `json:"touchedFiles,omitempty"`
+	Merged       bool     `json:"merged"`
 	// Reason explains a refusal. Empty on success.
 	Reason string `json:"reason,omitempty"`
 	// ConfirmingReasons are the gates that blocked the confirming evaluation, when
@@ -104,6 +108,14 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 	}
 
 	outcome.Merged = true
+	files, filesErr := r.github.ListPullRequestFiles(ctx, githubinfra.ViewPullRequestInput{Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID)})
+	if filesErr != nil {
+		if r.logWarn != nil {
+			r.logWarn("gatekeeper: could not capture merged pull request files", map[string]any{"repo": report.Repo, "pr": report.PRNumber, "error": filesErr.Error()})
+		}
+	} else {
+		outcome.TouchedFiles = files
+	}
 	return r.persistMergeOutcome(ctx, outcome)
 }
 

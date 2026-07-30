@@ -33,7 +33,7 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 		if err != nil {
 			return nil, fmt.Errorf("parse merge outcome event %s timestamp: %w", event.ID, err)
 		}
-		candidates = append(candidates, MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergedAt: mergedAt.UTC()})
+		candidates = append(candidates, MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergedAt: mergedAt.UTC(), TouchedFiles: append([]string(nil), outcome.TouchedFiles...)})
 	}
 	return candidates, nil
 }

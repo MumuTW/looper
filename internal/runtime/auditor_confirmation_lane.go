@@ -209,7 +209,7 @@ func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepo
 			projectCandidates = append(projectCandidates, candidate)
 		}
 	}
-	attribution := auditor.Attribute(auditor.FailureEvidence{ObservedAt: observedAt}, projectCandidates)
+	attribution := auditor.Attribute(auditor.FailureEvidence{ObservedAt: observedAt, FailingPaths: observation.FailingPaths}, projectCandidates)
 	return auditor.Decide(confirmation, attribution), nil
 }
 
