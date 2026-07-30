@@ -51,3 +51,29 @@ export function formatDurableProgress(
 
   return parts.length > 0 ? parts.join(" · ") : null;
 }
+
+/**
+ * Lists the issues that happened around a run's own result -- a refused worktree
+ * cleanup, a failure raised while parking. Returns null when there are none.
+ *
+ * These are deliberately kept separate from the primary failure: they did not cause
+ * the run's result, and folding them in would make the causal failure harder to find,
+ * which is the problem the outcome exists to fix.
+ */
+export function formatSecondaryIssues(
+  outcome: FixerRunOutcome | null | undefined,
+): string[] | null {
+  const issues = outcome?.secondaryIssues;
+  if (!issues || issues.length === 0) return null;
+
+  const lines = issues
+    .map((issue) => {
+      const step = issue.step?.trim();
+      const message = issue.message?.trim();
+      if (!step && !message) return null;
+      return step && message ? `${step} — ${message}` : (step ?? message ?? "");
+    })
+    .filter((line): line is string => line !== null);
+
+  return lines.length > 0 ? lines : null;
+}
