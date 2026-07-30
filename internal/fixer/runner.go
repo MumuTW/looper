@@ -6955,8 +6955,14 @@ func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRe
 // cleanupFixerWorktreeIfTerminal removes the run's worktree once the run has
 // reached a terminal state, and records the attempt durably.
 //
-// The cleanup timestamps it sets are the only record of what happened: a run with
-// CleanupAttemptedAt but no CleanedAt is one whose cleanup failed. Callers reach
+// The cleanup timestamps it sets are the only record of what happened. Read them as
+// three states: neither set means cleanup never ran; both set means the worktree was
+// removed; CleanupAttemptedAt without CleanedAt means the outcome is *unverified* --
+// removal was started and not confirmed. It deliberately does not mean "failed": the
+// attempt is written before the filesystem mutation, so a daemon exit mid-removal
+// lands in the same state as a refused removal, and the worktree may be absent,
+// partially removed, or intact. Only inspecting the path can tell them apart, so
+// nothing here infers failure from the pair. Callers reach
 // this after completeRun has already written the run, so a full-row Upsert of the
 // in-memory record could revert a concurrent transition (discovery persisting
 // restart_from_discover while cleanup runs, say). The narrow timestamp merge

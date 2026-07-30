@@ -117,7 +117,7 @@ func TestTerminalCleanupPersistsAttemptBeforeWorktreeMutation(t *testing.T) {
 	}
 }
 
-func TestTerminalCleanupPersistsFailureAsAttemptWithoutCleaned(t *testing.T) {
+func TestTerminalCleanupRecordsRefusedRemovalAsUnverified(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	git := &fakeGitGateway{cleanupErr: errors.New("worktree is dirty")}
@@ -130,10 +130,10 @@ func TestTerminalCleanupPersistsFailureAsAttemptWithoutCleaned(t *testing.T) {
 
 	attempted, cleaned := storedCleanupTimestamps(t, fixture, "run_cleanup_failed")
 	if attempted == "" {
-		t.Fatal("stored CleanupAttemptedAt is empty, want the failed attempt recorded durably")
+		t.Fatal("stored CleanupAttemptedAt is empty, want the unconfirmed attempt recorded durably")
 	}
 	if cleaned != "" {
-		t.Fatalf("stored CleanedAt = %q, want empty so the failure stays distinguishable", cleaned)
+		t.Fatalf("stored CleanedAt = %q, want empty so the outcome reads as unverified", cleaned)
 	}
 }
 
