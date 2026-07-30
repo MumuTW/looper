@@ -7707,10 +7707,17 @@ func (h *Handler) buildLabelsInitResponse(r *http.Request) (any, error) {
 	}
 	result, err := provisioner(r.Context(), githubinfra.InitializeLabelsInput{Repo: repo, DryRun: body.DryRun})
 	if err != nil {
+		// InitializeLabels deliberately completes the remaining mutations after
+		// an individual create fails. Its populated result is the authority for
+		// what actually happened, so return it for the CLI to print and turn into
+		// a non-zero exit rather than replacing it with a summary-only 500.
+		if result.Summary.Failed > 0 {
+			return result, nil
+		}
 		// A malformed slug is a client error; everything else (gh unavailable,
-		// label list/create failure, partial mutation failure) is reported as a
-		// server error. InitializeLabels is idempotent, so a re-run after a
-		// partial failure provisions only the labels that did not land.
+		// label-list failure) is reported as a server error. InitializeLabels is
+		// idempotent, so a re-run after a partial failure provisions only the
+		// labels that did not land.
 		if strings.HasPrefix(err.Error(), "invalid GitHub repo:") {
 			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
 		}

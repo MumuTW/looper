@@ -32,12 +32,16 @@ import (
 // are served; anything else fails the test, so a verb that starts talking to a
 // different endpoint cannot pass silently.
 type fakeDaemon struct {
-	server       *httptest.Server
-	healthy      bool
-	projects     []map[string]any
-	createBody   map[string]any
-	createStatus int
-	createError  string
+	server           *httptest.Server
+	healthy          bool
+	projects         []map[string]any
+	createBody       map[string]any
+	createStatus     int
+	createError      string
+	labelsInitBody   map[string]any
+	labelsInitResult map[string]any
+	labelsInitStatus int
+	labelsInitError  string
 	// createDelay stands in for the worktree and pull request discovery the
 	// daemon runs after it has already committed the project.
 	createDelay time.Duration
@@ -122,6 +126,30 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 					"discoveredPullRequests": 1,
 				},
 			})
+		case r.URL.Path == "/api/v1/labels/init" && r.Method == http.MethodPost:
+			body := map[string]any{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode labels init body: %v", err)
+			}
+			daemon.labelsInitBody = body
+			if daemon.labelsInitStatus != 0 {
+				w.WriteHeader(daemon.labelsInitStatus)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"ok":    false,
+					"error": map[string]any{"code": "VALIDATION_FAILED", "message": daemon.labelsInitError},
+				})
+				return
+			}
+			result := daemon.labelsInitResult
+			if result == nil {
+				result = map[string]any{
+					"repo":    body["repo"],
+					"dryRun":  body["dryRun"],
+					"labels":  []map[string]any{{"name": "looper:worker-ready", "status": "created"}},
+					"summary": map[string]any{"created": 1, "skipped": 0, "failed": 0},
+				}
+			}
+			writeEnvelope(w, http.StatusOK, result)
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -991,6 +1019,65 @@ func TestProjectRejectsBadSubcommands(t *testing.T) {
 				t.Fatalf("stderr = %q, want usage text", stderr)
 			}
 		})
+	}
+}
+
+func TestLabelsInitSupportsDocumentedForms(t *testing.T) {
+	t.Run("explicit repo and dry run", func(t *testing.T) {
+		daemon := newFakeDaemon(t)
+		configForDaemon(t, daemon.server.URL)
+
+		code, stdout, stderr := runCLI(t, "labels", "init", "--repo", "acme/looper", "--dry-run")
+		if code != 0 {
+			t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
+		}
+		if got := daemon.labelsInitBody["repo"]; got != "acme/looper" {
+			t.Fatalf("labels init repo = %v, want acme/looper", got)
+		}
+		if got := daemon.labelsInitBody["dryRun"]; got != true {
+			t.Fatalf("labels init dryRun = %v, want true", got)
+		}
+		if !strings.Contains(stdout, "provisioned labels for acme/looper (dry run)") {
+			t.Fatalf("stdout = %q, want dry-run summary", stdout)
+		}
+	})
+
+	t.Run("current repository", func(t *testing.T) {
+		daemon := newFakeDaemon(t)
+		configForDaemon(t, daemon.server.URL)
+		previous := detectCurrentGitHubRepository
+		detectCurrentGitHubRepository = func(context.Context, string) (string, error) { return "acme/current", nil }
+		t.Cleanup(func() { detectCurrentGitHubRepository = previous })
+
+		code, _, stderr := runCLI(t, "labels", "init")
+		if code != 0 {
+			t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
+		}
+		if got := daemon.labelsInitBody["repo"]; got != "acme/current" {
+			t.Fatalf("labels init repo = %v, want acme/current", got)
+		}
+	})
+}
+
+func TestLabelsInitRejectsUndocumentedPositionalRepo(t *testing.T) {
+	code, _, stderr := runCLI(t, "labels", "init", "acme/looper")
+	if code != 2 || !strings.Contains(stderr, "unknown labels init option") {
+		t.Fatalf("labels init positional result = code %d, stderr %q; want usage rejection", code, stderr)
+	}
+}
+
+func TestInitQualifiesLabelProvisioningAsGitHubOnly(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	var stdout bytes.Buffer
+	if err := runInit([]string{"--config", configPath}, nil, &stdout); err != nil {
+		t.Fatalf("runInit() error = %v", err)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "for a GitHub project, also run `looper labels init`") {
+		t.Fatalf("init output = %q, want GitHub-only labels instruction", got)
+	}
+	if strings.Contains(got, "`looper labels init <owner/name>`") {
+		t.Fatalf("init output = %q, must not prescribe the obsolete unconditional command", got)
 	}
 }
 

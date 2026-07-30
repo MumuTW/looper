@@ -7768,6 +7768,42 @@ func TestHandlerLabelsInitProvisionsStandardLabels(t *testing.T) {
 	}
 }
 
+func TestHandlerLabelsInitPreservesPartialProvisioningResult(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		LabelProvisioner: func(context.Context, githubinfra.InitializeLabelsInput) (githubinfra.LabelInitResult, error) {
+			return githubinfra.LabelInitResult{
+				Repo: "acme/looper",
+				Labels: []githubinfra.LabelInitItem{
+					{Name: "looper:plan", Status: "created"},
+					{Name: "looper:worker-ready", Status: "failed", Error: "permission denied"},
+				},
+				Summary: githubinfra.LabelInitSummary{Created: 1, Failed: 1},
+			}, fmt.Errorf("create label looper:worker-ready: permission denied")
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/labels/init", strings.NewReader(`{"repo":"acme/looper"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with the partial result (body %s)", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data, _ := body["data"].(map[string]any)
+	summary, _ := data["summary"].(map[string]any)
+	if summary["created"] != float64(1) || summary["failed"] != float64(1) {
+		t.Fatalf("summary = %#v, want created=1 failed=1", summary)
+	}
+	labels, _ := data["labels"].([]any)
+	if len(labels) != 2 {
+		t.Fatalf("labels = %#v, want every per-label outcome", labels)
+	}
+}
+
 func TestHandlerLabelsInitRejectsEmptyRepo(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{

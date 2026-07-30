@@ -60,6 +60,24 @@ var bulkStopRequestTimeout = 10 * time.Minute
 // finite budget.
 var projectDiscoveryTimeout = 10 * time.Minute
 
+// labelsInitRequestTimeout is deliberately longer than a normal API request:
+// one provisioning run lists labels and may then create every standard label.
+// The daemon keeps the detailed outcome so a client timeout must not turn a
+// completed subset into an unreportable failure.
+var labelsInitRequestTimeout = 15 * time.Minute
+
+var detectCurrentGitHubRepository = func(ctx context.Context, ghPath string) (string, error) {
+	output, err := exec.CommandContext(ctx, ghPath, "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner").Output()
+	if err != nil {
+		return "", fmt.Errorf("detect current GitHub repository: %w", err)
+	}
+	repo := strings.TrimSpace(string(output))
+	if repo == "" {
+		return "", errors.New("detect current GitHub repository: gh returned no repository")
+	}
+	return repo, nil
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
@@ -97,8 +115,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runRetry(ctx, args, stdout, stderr)
 	}
 
-	// The onboarding verbs take no flags of their own — only the global ones —
-	// so they are routed after splitGlobalFlags like the control verbs, and
+	// The onboarding verbs are routed after splitGlobalFlags like the control
+	// verbs. `labels` additionally owns --repo and --dry-run, while the others
+	// take only global flags. This keeps `looper --config /p status` and
 	// unlike `review`. That is what keeps `looper --config /p status` and
 	// `looper status --config /p` the same invocation, keeps an unknown flag
 	// refused rather than read as an operand, and hands config.LoadFile only
@@ -276,7 +295,7 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 			parsed.Verb = arg
 			continue
 		}
-		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" {
+		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "labels" {
 			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
 		}
 		if parsed.Verb == "" {
@@ -528,7 +547,7 @@ func runInit(global []string, operands []string, stdout io.Writer) error {
 	}
 
 	_, _ = fmt.Fprintf(stdout, "wrote starter config to %s\n", path)
-	_, _ = fmt.Fprintf(stdout, "next: edit it, start looperd, then run `looper project add <repo>`, `looper labels init <owner/name>`, and `looper status`\n")
+	_, _ = fmt.Fprintf(stdout, "next: edit it, start looperd, then run `looper project add <repo>` and `looper status`; for a GitHub project, also run `looper labels init`\n")
 	return nil
 }
 
@@ -799,25 +818,72 @@ func runLabels(ctx context.Context, global []string, operands []string, stdout i
 	}
 	switch operands[0] {
 	case "init":
-		if len(operands) != 2 || strings.TrimSpace(operands[1]) == "" {
-			return badUsage("labels init requires exactly one repository (owner/name)")
+		options, err := parseLabelsInitOptions(operands[1:])
+		if err != nil {
+			return err
 		}
-		return runLabelsInit(ctx, global, operands[1], stdout)
+		return runLabelsInit(ctx, global, options, stdout)
 	default:
 		return badUsage("unknown labels subcommand %q", operands[0])
 	}
 }
 
-func runLabelsInit(ctx context.Context, global []string, repo string, stdout io.Writer) error {
+type labelsInitOptions struct {
+	repo   string
+	dryRun bool
+}
+
+type labelsInitRequest struct {
+	Repo   string `json:"repo"`
+	DryRun bool   `json:"dryRun"`
+}
+
+func parseLabelsInitOptions(args []string) (labelsInitOptions, error) {
+	options := labelsInitOptions{}
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		switch {
+		case arg == "--dry-run":
+			options.dryRun = true
+		case arg == "--repo":
+			if index+1 >= len(args) || strings.TrimSpace(args[index+1]) == "" || strings.HasPrefix(args[index+1], "-") {
+				return labelsInitOptions{}, badUsage("labels init --repo requires owner/name")
+			}
+			options.repo = strings.TrimSpace(args[index+1])
+			index++
+		case strings.HasPrefix(arg, "--repo="):
+			options.repo = strings.TrimSpace(strings.TrimPrefix(arg, "--repo="))
+			if options.repo == "" {
+				return labelsInitOptions{}, badUsage("labels init --repo requires owner/name")
+			}
+		default:
+			return labelsInitOptions{}, badUsage("unknown labels init option %q", arg)
+		}
+	}
+	return options, nil
+}
+
+func runLabelsInit(ctx context.Context, global []string, options labelsInitOptions, stdout io.Writer) error {
 	cfg, err := loadConfig(global)
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(map[string]string{"repo": strings.TrimSpace(repo)})
+	repo := strings.TrimSpace(options.repo)
+	if repo == "" {
+		ghPath := "gh"
+		if cfg.Tools.GHPath != nil && strings.TrimSpace(*cfg.Tools.GHPath) != "" {
+			ghPath = strings.TrimSpace(*cfg.Tools.GHPath)
+		}
+		repo, err = detectCurrentGitHubRepository(ctx, ghPath)
+		if err != nil {
+			return err
+		}
+	}
+	body, err := json.Marshal(labelsInitRequest{Repo: repo, DryRun: options.dryRun})
 	if err != nil {
 		return err
 	}
-	result, err := requestJSON[labelsInitResponse](ctx, cfg, http.MethodPost, "/api/v1/labels/init", body)
+	result, err := requestJSONWithin[labelsInitResponse](ctx, labelsInitRequestTimeout, cfg, http.MethodPost, "/api/v1/labels/init", body)
 	if err != nil {
 		return err
 	}
@@ -829,8 +895,8 @@ func printLabelsInitResult(result labelsInitResponse, stdout io.Writer) error {
 	if result.DryRun {
 		dryRunPrefix = " (dry run)"
 	}
-	_, _ = fmt.Fprintf(stdout, "provisioned labels for %s%s: created=%d updated=%d skipped=%d failed=%d\n",
-		result.Repo, dryRunPrefix, result.Summary.Created, result.Summary.Updated, result.Summary.Skipped, result.Summary.Failed)
+	_, _ = fmt.Fprintf(stdout, "provisioned labels for %s%s: created=%d skipped=%d failed=%d\n",
+		result.Repo, dryRunPrefix, result.Summary.Created, result.Summary.Skipped, result.Summary.Failed)
 	for _, label := range result.Labels {
 		line := fmt.Sprintf("  %s: %s", label.Status, label.Name)
 		if label.Error != "" {
@@ -1135,7 +1201,6 @@ type labelsInitItem struct {
 
 type labelsInitSummary struct {
 	Created int `json:"created"`
-	Updated int `json:"updated"`
 	Skipped int `json:"skipped"`
 	Failed  int `json:"failed"`
 }
@@ -1361,8 +1426,8 @@ Usage:
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
   looper project discover <id> Retry post-commit worktree/PR discovery for a project
-  looper labels init <owner/name>
-                               Provision looper's standard GitHub labels on a repo
+	looper labels init [--repo owner/name] [--dry-run]
+	                               Provision standard labels for a GitHub repository
   looper stop <selector>       Stop the active run for a loop ("all" stops every run)
   looper close <selector>      Stop the active run and close the loop
   looper takeover <selector>   Take a loop over for manual work
