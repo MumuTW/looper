@@ -583,219 +583,23 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			continue
 		}
 
+		handled, nextIndex, err := parseOperationalCLIArg(
+			args,
+			index,
+			&parsed,
+			&canonicalInstructionsEnabledOverrideSet,
+			&canonicalPackageAutoUpgradeOverrideSet,
+			takeValue,
+		)
+		if err != nil {
+			return parsedCLIArgs{}, err
+		}
+		if handled {
+			index = nextIndex
+			continue
+		}
+
 		switch {
-		case matchesFlag(arg, "--config"):
-			value, nextIndex, err := takeValue(index, "--config")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsed.configPath = value
-			parsed.hasConfigPath = true
-			index = nextIndex
-		case matchesFlag(arg, "--no-custom-instructions"):
-			disable := true
-			if _, value, ok := strings.Cut(arg, "="); ok {
-				parsedValue, err := parseBoolean(value)
-				if err != nil {
-					return parsedCLIArgs{}, fmt.Errorf("invalid value for --no-custom-instructions: %q is not a boolean", value)
-				}
-				disable = *parsedValue
-			} else if index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
-				if parsedValue, err := parseBoolean(args[index+1]); err == nil {
-					disable = *parsedValue
-					index++
-				}
-			}
-			if !canonicalInstructionsEnabledOverrideSet {
-				ensureInstructionsConfig(&parsed.overrides).Enabled = boolPtr(!disable)
-			}
-		case matchesFlag(arg, "--instructions-enabled"):
-			value, nextIndex, err := takeValue(index, "--instructions-enabled")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --instructions-enabled: %q is not a boolean", value)
-			}
-			ensureInstructionsConfig(&parsed.overrides).Enabled = parsedValue
-			canonicalInstructionsEnabledOverrideSet = true
-			index = nextIndex
-		case matchesFlag(arg, "--no-auto-upgrade"):
-			disable := true
-			if _, value, ok := strings.Cut(arg, "="); ok {
-				parsedValue, err := parseBoolean(value)
-				if err != nil {
-					return parsedCLIArgs{}, fmt.Errorf("invalid value for --no-auto-upgrade: %q is not a boolean", value)
-				}
-				disable = *parsedValue
-			} else if index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
-				if parsedValue, err := parseBoolean(args[index+1]); err == nil {
-					disable = *parsedValue
-					index++
-				}
-			}
-			if !canonicalPackageAutoUpgradeOverrideSet {
-				ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = boolPtr(!disable)
-			}
-		case matchesFlag(arg, "--package-auto-upgrade-enabled"):
-			value, nextIndex, err := takeValue(index, "--package-auto-upgrade-enabled")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --package-auto-upgrade-enabled: %q is not a boolean", value)
-			}
-			ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = parsedValue
-			canonicalPackageAutoUpgradeOverrideSet = true
-			index = nextIndex
-		case matchesFlag(arg, "--host"):
-			value, nextIndex, err := takeValue(index, "--host")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			ensureServerConfig(&parsed.overrides).Host = stringPtr(value)
-			index = nextIndex
-		case matchesFlag(arg, "--port"):
-			value, nextIndex, err := takeValue(index, "--port")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseInteger(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --port: %q is not an integer", value)
-			}
-			ensureServerConfig(&parsed.overrides).Port = parsedValue
-			index = nextIndex
-		case matchesFlag(arg, "--db-path"):
-			value, nextIndex, err := takeValue(index, "--db-path")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			ensureStorageConfig(&parsed.overrides).DBPath = stringPtr(value)
-			index = nextIndex
-		case matchesFlag(arg, "--log-dir"):
-			value, nextIndex, err := takeValue(index, "--log-dir")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			ensureDaemonConfig(&parsed.overrides).LogDir = stringPtr(value)
-			index = nextIndex
-		case matchesFlag(arg, "--daemon-mode"):
-			value, nextIndex, err := takeValue(index, "--daemon-mode")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			daemonMode := DaemonMode(value)
-			ensureDaemonConfig(&parsed.overrides).Mode = &daemonMode
-			index = nextIndex
-		case matchesFlag(arg, "--daemon-restart-policy"):
-			value, nextIndex, err := takeValue(index, "--daemon-restart-policy")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			policy := DaemonRestartPolicy(value)
-			ensureDaemonConfig(&parsed.overrides).RestartPolicy = &policy
-			index = nextIndex
-		case matchesFlag(arg, "--daemon-restart-throttle-seconds"):
-			value, nextIndex, err := takeValue(index, "--daemon-restart-throttle-seconds")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseInteger(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --daemon-restart-throttle-seconds: %q is not an integer", value)
-			}
-			ensureDaemonConfig(&parsed.overrides).RestartThrottleSeconds = parsedValue
-			index = nextIndex
-		case matchesFlag(arg, "--git-path"):
-			value, nextIndex, err := takeValue(index, "--git-path")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			ensureToolPathsConfig(&parsed.overrides).GitPath = stringPtr(value)
-			index = nextIndex
-		case matchesFlag(arg, "--gh-path"):
-			value, nextIndex, err := takeValue(index, "--gh-path")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			ensureToolPathsConfig(&parsed.overrides).GHPath = stringPtr(value)
-			index = nextIndex
-		case matchesFlag(arg, "--looper-path"):
-			value, nextIndex, err := takeValue(index, "--looper-path")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			ensureToolPathsConfig(&parsed.overrides).LooperPath = stringPtr(value)
-			index = nextIndex
-		case matchesFlag(arg, "--planner-agent-timeout-seconds"):
-			value, nextIndex, err := takeValue(index, "--planner-agent-timeout-seconds")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseInteger(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --planner-agent-timeout-seconds: %q is not an integer", value)
-			}
-			ensureAgentTimeoutConfig(&parsed.overrides).PlannerSeconds = parsedValue
-			index = nextIndex
-		case matchesFlag(arg, "--worker-agent-timeout-seconds"):
-			value, nextIndex, err := takeValue(index, "--worker-agent-timeout-seconds")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseInteger(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --worker-agent-timeout-seconds: %q is not an integer", value)
-			}
-			ensureAgentTimeoutConfig(&parsed.overrides).WorkerSeconds = parsedValue
-			index = nextIndex
-		case matchesFlag(arg, "--reviewer-agent-timeout-seconds"):
-			value, nextIndex, err := takeValue(index, "--reviewer-agent-timeout-seconds")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseInteger(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-agent-timeout-seconds: %q is not an integer", value)
-			}
-			ensureAgentTimeoutConfig(&parsed.overrides).ReviewerSeconds = parsedValue
-			index = nextIndex
-		case matchesFlag(arg, "--fixer-agent-timeout-seconds"):
-			value, nextIndex, err := takeValue(index, "--fixer-agent-timeout-seconds")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseInteger(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --fixer-agent-timeout-seconds: %q is not an integer", value)
-			}
-			ensureAgentTimeoutConfig(&parsed.overrides).FixerSeconds = parsedValue
-			index = nextIndex
-		case matchesFlag(arg, "--allow-auto-commit"):
-			value, nextIndex, err := takeValue(index, "--allow-auto-commit")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --allow-auto-commit: %q is not a boolean", value)
-			}
-			ensureDefaultsConfig(&parsed.overrides).AllowAutoCommit = parsedValue
-			index = nextIndex
-		case matchesFlag(arg, "--allow-auto-push"):
-			value, nextIndex, err := takeValue(index, "--allow-auto-push")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --allow-auto-push: %q is not a boolean", value)
-			}
-			ensureDefaultsConfig(&parsed.overrides).AllowAutoPush = parsedValue
-			index = nextIndex
 		case matchesAnyFlag(arg, "--roles-reviewer-behavior-review-events-clean", "--reviewer-clean-review-event"):
 			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-review-events-clean")
 			if err != nil {
@@ -977,6 +781,243 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	}
 
 	return parsed, nil
+}
+
+type cliValueTaker func(index int, flag string) (string, int, error)
+
+// parseOperationalCLIArg owns daemon/runtime flags whose values map directly
+// into one configuration section. Compatibility-heavy reviewer and fixer
+// flags remain in parseCLIArgs, where their cross-flag precedence is visible.
+func parseOperationalCLIArg(
+	args []string,
+	index int,
+	parsed *parsedCLIArgs,
+	canonicalInstructionsEnabledOverrideSet *bool,
+	canonicalPackageAutoUpgradeOverrideSet *bool,
+	takeValue cliValueTaker,
+) (bool, int, error) {
+	arg := args[index]
+
+	switch {
+	case matchesFlag(arg, "--config"):
+		value, nextIndex, err := takeValue(index, "--config")
+		if err != nil {
+			return true, index, err
+		}
+		parsed.configPath = value
+		parsed.hasConfigPath = true
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--no-custom-instructions"):
+		disable := true
+		nextIndex := index
+		if _, value, ok := strings.Cut(arg, "="); ok {
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return true, index, fmt.Errorf("invalid value for --no-custom-instructions: %q is not a boolean", value)
+			}
+			disable = *parsedValue
+		} else if index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
+			if parsedValue, err := parseBoolean(args[index+1]); err == nil {
+				disable = *parsedValue
+				nextIndex++
+			}
+		}
+		if !*canonicalInstructionsEnabledOverrideSet {
+			ensureInstructionsConfig(&parsed.overrides).Enabled = boolPtr(!disable)
+		}
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--instructions-enabled"):
+		value, nextIndex, err := takeValue(index, "--instructions-enabled")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --instructions-enabled: %q is not a boolean", value)
+		}
+		ensureInstructionsConfig(&parsed.overrides).Enabled = parsedValue
+		*canonicalInstructionsEnabledOverrideSet = true
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--no-auto-upgrade"):
+		disable := true
+		nextIndex := index
+		if _, value, ok := strings.Cut(arg, "="); ok {
+			parsedValue, err := parseBoolean(value)
+			if err != nil {
+				return true, index, fmt.Errorf("invalid value for --no-auto-upgrade: %q is not a boolean", value)
+			}
+			disable = *parsedValue
+		} else if index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
+			if parsedValue, err := parseBoolean(args[index+1]); err == nil {
+				disable = *parsedValue
+				nextIndex++
+			}
+		}
+		if !*canonicalPackageAutoUpgradeOverrideSet {
+			ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = boolPtr(!disable)
+		}
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--package-auto-upgrade-enabled"):
+		value, nextIndex, err := takeValue(index, "--package-auto-upgrade-enabled")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --package-auto-upgrade-enabled: %q is not a boolean", value)
+		}
+		ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = parsedValue
+		*canonicalPackageAutoUpgradeOverrideSet = true
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--host"):
+		value, nextIndex, err := takeValue(index, "--host")
+		if err != nil {
+			return true, index, err
+		}
+		ensureServerConfig(&parsed.overrides).Host = stringPtr(value)
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--port"):
+		value, nextIndex, err := takeValue(index, "--port")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseInteger(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --port: %q is not an integer", value)
+		}
+		ensureServerConfig(&parsed.overrides).Port = parsedValue
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--db-path"):
+		value, nextIndex, err := takeValue(index, "--db-path")
+		if err != nil {
+			return true, index, err
+		}
+		ensureStorageConfig(&parsed.overrides).DBPath = stringPtr(value)
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--log-dir"):
+		value, nextIndex, err := takeValue(index, "--log-dir")
+		if err != nil {
+			return true, index, err
+		}
+		ensureDaemonConfig(&parsed.overrides).LogDir = stringPtr(value)
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--daemon-mode"):
+		value, nextIndex, err := takeValue(index, "--daemon-mode")
+		if err != nil {
+			return true, index, err
+		}
+		daemonMode := DaemonMode(value)
+		ensureDaemonConfig(&parsed.overrides).Mode = &daemonMode
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--daemon-restart-policy"):
+		value, nextIndex, err := takeValue(index, "--daemon-restart-policy")
+		if err != nil {
+			return true, index, err
+		}
+		policy := DaemonRestartPolicy(value)
+		ensureDaemonConfig(&parsed.overrides).RestartPolicy = &policy
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--daemon-restart-throttle-seconds"):
+		value, nextIndex, err := takeValue(index, "--daemon-restart-throttle-seconds")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseInteger(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --daemon-restart-throttle-seconds: %q is not an integer", value)
+		}
+		ensureDaemonConfig(&parsed.overrides).RestartThrottleSeconds = parsedValue
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--git-path"):
+		value, nextIndex, err := takeValue(index, "--git-path")
+		if err != nil {
+			return true, index, err
+		}
+		ensureToolPathsConfig(&parsed.overrides).GitPath = stringPtr(value)
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--gh-path"):
+		value, nextIndex, err := takeValue(index, "--gh-path")
+		if err != nil {
+			return true, index, err
+		}
+		ensureToolPathsConfig(&parsed.overrides).GHPath = stringPtr(value)
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--looper-path"):
+		value, nextIndex, err := takeValue(index, "--looper-path")
+		if err != nil {
+			return true, index, err
+		}
+		ensureToolPathsConfig(&parsed.overrides).LooperPath = stringPtr(value)
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--planner-agent-timeout-seconds"):
+		value, nextIndex, err := takeValue(index, "--planner-agent-timeout-seconds")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseInteger(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --planner-agent-timeout-seconds: %q is not an integer", value)
+		}
+		ensureAgentTimeoutConfig(&parsed.overrides).PlannerSeconds = parsedValue
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--worker-agent-timeout-seconds"):
+		value, nextIndex, err := takeValue(index, "--worker-agent-timeout-seconds")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseInteger(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --worker-agent-timeout-seconds: %q is not an integer", value)
+		}
+		ensureAgentTimeoutConfig(&parsed.overrides).WorkerSeconds = parsedValue
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--reviewer-agent-timeout-seconds"):
+		value, nextIndex, err := takeValue(index, "--reviewer-agent-timeout-seconds")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseInteger(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --reviewer-agent-timeout-seconds: %q is not an integer", value)
+		}
+		ensureAgentTimeoutConfig(&parsed.overrides).ReviewerSeconds = parsedValue
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--fixer-agent-timeout-seconds"):
+		value, nextIndex, err := takeValue(index, "--fixer-agent-timeout-seconds")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseInteger(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --fixer-agent-timeout-seconds: %q is not an integer", value)
+		}
+		ensureAgentTimeoutConfig(&parsed.overrides).FixerSeconds = parsedValue
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--allow-auto-commit"):
+		value, nextIndex, err := takeValue(index, "--allow-auto-commit")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --allow-auto-commit: %q is not a boolean", value)
+		}
+		ensureDefaultsConfig(&parsed.overrides).AllowAutoCommit = parsedValue
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--allow-auto-push"):
+		value, nextIndex, err := takeValue(index, "--allow-auto-push")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --allow-auto-push: %q is not a boolean", value)
+		}
+		ensureDefaultsConfig(&parsed.overrides).AllowAutoPush = parsedValue
+		return true, nextIndex, nil
+	default:
+		return false, index, nil
+	}
 }
 
 func collectDeprecatedCLIWarnings(args []string) []string {
