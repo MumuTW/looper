@@ -1,0 +1,67 @@
+{
+  "families": [
+    {
+      "family_label": "GLM-5.2",
+      "family_uid": "glm-5.2",
+      "slug": "glm-5.2",
+      "aliases": [],
+      "variants": [
+        {
+          "model_uid": "glm-5-2",
+          "label": "GLM-5.2 High",
+          "max_context_tokens": 200000,
+          "max_output_tokens": 128000,
+          "cost_tier": "Free",
+          "is_new": false,
+          "is_beta": false
+        }
+      ]
+    },
+    {
+      "family_label": "SWE-1.7",
+      "family_uid": "swe-1.7",
+      "slug": "swe-1.7",
+      "aliases": [],
+      "variants": [
+        {
+          "model_uid": "swe-1-7",
+          "label": "SWE-1.7 Max",
+          "max_context_tokens": 262000,
+          "max_output_tokens": 128000,
+          "cost_tier": "Free",
+          "is_new": false,
+          "is_beta": true
+        },
+        {
+          "model_uid": "swe-1-7-medium",
+          "label": "SWE-1.7 Medium",
+          "max_context_tokens": 262000,
+          "max_output_tokens": 128000,
+          "cost_tier": "Free",
+          "is_new": false,
+          "is_beta": true
+        }
+      ]
+    },
+    {
+      "family_label": "SWE-1.7 Lightning",
+      "family_uid": "swe-1.7-lightning",
+      "slug": "swe-1.7-lightning",
+      "aliases": [
+        "swe"
+      ],
+      "variants": [
+        {
+          "model_uid": "swe-1-7-lightning",
+          "label": "SWE-1.7 Lightning",
+          "max_context_tokens": 202752,
+          "max_output_tokens": 96000,
+          "cost_tier": "Med cost",
+          "cost_summary": "$2.5 / MTok In · $12.5 / MTok Out",
+          "is_new": false,
+          "is_beta": true
+        }
+      ]
+    }
+  ]
+}

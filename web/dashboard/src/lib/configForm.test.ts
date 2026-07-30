@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ApiError, type ConfigData } from "./api";
 import {
   AGENT_VENDOR_OPTIONS,
+  agentVendorOptionLabel,
   buildConfigPatch,
   CONFIG_GROUPS,
   configFieldErrors,
@@ -205,6 +206,13 @@ describe("config form contract", () => {
       "roles.reviewer.agent.vendor",
     ]);
     expect(JSON.stringify(result.body)).not.toMatch(/params/i);
+  });
+
+  it("labels Devin as experimental in operator-facing selectors", () => {
+    expect(agentVendorOptionLabel("devin-experimental")).toBe(
+      "devin-experimental (fresh-run only)",
+    );
+    expect(agentVendorOptionLabel("codex")).toBe("codex");
   });
 
   it("builds a dirty-only typed patch and validates integer controls", () => {

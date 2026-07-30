@@ -1,0 +1,33 @@
+{
+  "schema_version": "ATIF-v1.7",
+  "session_id": "sanitized-session",
+  "agent": {
+    "name": "devin",
+    "version": "3000.3.22",
+    "model_name": "GLM-5.2",
+    "tool_definitions": [],
+    "extra": {
+      "backend": "Windsurf",
+      "permission_mode": "Normal"
+    }
+  },
+  "steps": [
+    {
+      "step_id": 1,
+      "source": "user",
+      "message": "Reply with exactly: LOOPER_DEVIN_OK. Do not use tools."
+    },
+    {
+      "step_id": 2,
+      "source": "agent",
+      "message": "LOOPER_DEVIN_OK",
+      "tool_calls": []
+    }
+  ],
+  "final_metrics": {
+    "total_prompt_tokens": 14783,
+    "total_completion_tokens": 7,
+    "total_cached_tokens": 4416,
+    "total_steps": 8
+  }
+}

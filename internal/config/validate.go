@@ -940,16 +940,20 @@ func isNilOrEmptyString(value *string) bool {
 }
 
 func isValidAgentVendor(vendor AgentVendor) bool {
-	switch vendor {
-	case AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild:
-		return true
-	default:
-		return false
+	for _, supported := range supportedAgentVendors {
+		if vendor == supported {
+			return true
+		}
 	}
+	return false
 }
 
 func agentVendorValidationMessage() string {
-	return fmt.Sprintf("must be one of: %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild)
+	values := make([]string, 0, len(supportedAgentVendors))
+	for _, vendor := range supportedAgentVendors {
+		values = append(values, string(vendor))
+	}
+	return "must be one of: " + strings.Join(values, ", ")
 }
 
 func validateAgentProfiles(profiles map[string]AgentBindingConfig, issues *[]ValidationIssue) {

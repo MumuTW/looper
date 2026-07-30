@@ -3,12 +3,30 @@ package config
 type AgentVendor string
 
 const (
-	AgentVendorClaudeCode AgentVendor = "claude-code"
-	AgentVendorCodex      AgentVendor = "codex"
-	AgentVendorOpenCode   AgentVendor = "opencode"
-	AgentVendorCursorCLI  AgentVendor = "cursor-cli"
-	AgentVendorGrokBuild  AgentVendor = "grok-build"
+	AgentVendorClaudeCode        AgentVendor = "claude-code"
+	AgentVendorCodex             AgentVendor = "codex"
+	AgentVendorOpenCode          AgentVendor = "opencode"
+	AgentVendorCursorCLI         AgentVendor = "cursor-cli"
+	AgentVendorGrokBuild         AgentVendor = "grok-build"
+	AgentVendorDevinExperimental AgentVendor = "devin-experimental"
 )
+
+var supportedAgentVendors = []AgentVendor{
+	AgentVendorClaudeCode,
+	AgentVendorCodex,
+	AgentVendorOpenCode,
+	AgentVendorCursorCLI,
+	AgentVendorGrokBuild,
+	AgentVendorDevinExperimental,
+}
+
+// ConfigurableAgentVendors returns the vendor identities accepted by
+// validation. Callers receive a copy so this package remains the roster
+// authority. Configurable does not imply every lifecycle capability is
+// supported; experimental identities say so in their persisted value.
+func ConfigurableAgentVendors() []AgentVendor {
+	return append([]AgentVendor(nil), supportedAgentVendors...)
+}
 
 type LogLevel string
 

@@ -38,7 +38,14 @@ export const AGENT_VENDOR_OPTIONS = [
   "opencode",
   "cursor-cli",
   "grok-build",
+  "devin-experimental",
 ] as const;
+
+export function agentVendorOptionLabel(vendor: string): string {
+  return vendor === "devin-experimental"
+    ? "devin-experimental (fresh-run only)"
+    : vendor;
+}
 
 const agentProfileLeafPath = /^agent\.profiles\.[A-Za-z0-9_-]+\.(vendor|model)$/;
 const roleAgentLeafPath =

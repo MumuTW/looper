@@ -20,6 +20,7 @@ import {
 } from "@/lib/api";
 import {
   AGENT_VENDOR_OPTIONS,
+  agentVendorOptionLabel,
   agentProfilePath,
   buildConfigPatch,
   CODING_ROLES,
@@ -291,7 +292,9 @@ function ConfigControl({
         ) : null}
         {options.map((option) => (
           <option key={option} value={option}>
-            {option}
+            {path === "agent.vendor" || path.endsWith(".agent.vendor")
+              ? agentVendorOptionLabel(option)
+              : option}
           </option>
         ))}
       </select>
@@ -561,7 +564,7 @@ function AgentProfiles({
                         ) : null}
                         {AGENT_VENDOR_OPTIONS.map((option) => (
                           <option key={option} value={option}>
-                            {option}
+                            {agentVendorOptionLabel(option)}
                           </option>
                         ))}
                       </select>
@@ -690,7 +693,7 @@ function AgentProfiles({
           <option value="">Vendor (optional)</option>
           {AGENT_VENDOR_OPTIONS.map((option) => (
             <option key={option} value={option}>
-              {option}
+              {agentVendorOptionLabel(option)}
             </option>
           ))}
         </select>

@@ -61,7 +61,8 @@ host = "127.0.0.1"
 port = 17310
 
 [agent]
-# One of: claude-code, codex, opencode, cursor-cli, grok-build
+# One of: claude-code, codex, opencode, cursor-cli, grok-build, devin-experimental
+# devin-experimental is fresh-run only.
 vendor = "claude-code"
 
 [defaults]
