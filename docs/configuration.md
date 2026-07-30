@@ -204,7 +204,7 @@ Looper's frozen canonical top-level config roots are:
 
 See [ADR-0012](adr/0012-sqlite-project-authority.md) for the Authority and lifecycle decision.
 
-To move an existing API-managed project into `[[projects]]`, first remove its new config entry so the daemon can start, then send `DELETE /api/v1/projects/<id>` while the daemon is running. Stop the daemon, restore the complete `[[projects]]` entry (including any `provider` and `repo`), and restart. The DELETE archives the API record and terminates its old loops; that archived bit is the durable, explicit ownership handoff that permits config import to claim the same ID. Do not delete SQLite rows directly.
+To move an existing API-managed project into `[[projects]]`, first remove its new config entry so the daemon can start, then verify the exact target project ID and send `DELETE /api/v1/projects/<id>` while the daemon is running. Stop the daemon, restore the complete `[[projects]]` entry (including any `provider` and `repo`), and restart. The DELETE archives the API record and terminates its old loops; that archived bit is the durable, explicit ownership handoff that permits config import to claim the same ID. Do not delete SQLite rows directly.
 
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
 

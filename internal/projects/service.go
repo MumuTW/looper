@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -225,6 +226,7 @@ type AddInput struct {
 	IDSource     string
 	WorktreeRoot *string
 	Repo         *string
+	Validation   *config.ProjectValidationConfig
 	SnapshotMode SnapshotMode
 }
 
@@ -400,6 +402,14 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		metadata["repo"] = *repo
 	}
 	delete(metadata, "provider")
+	if input.Validation != nil {
+		metadata["validation"] = config.ProjectValidationConfig{
+			Commands: append([]string(nil), input.Validation.Commands...),
+			OptOut:   input.Validation.OptOut,
+		}
+	} else if existing == nil {
+		delete(metadata, "validation")
+	}
 	delete(metadata, "roles")
 	if input.WorktreeRoot != nil {
 		metadata["worktreeRoot"] = *input.WorktreeRoot
@@ -902,7 +912,7 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 		desiredIDs[project.ID] = struct{}{}
 		if existing := existingByID[project.ID]; existing != nil {
 			if source, _ := parseMetadata(existing.MetadataJSON)["source"].(string); source == "api" && !existing.Archived {
-				return ProjectValidationError{Message: fmt.Sprintf("configured project %s conflicts with an API-managed project that is still active; temporarily remove this project from [[projects]], restart looperd, send DELETE /api/v1/projects/%s to archive the API record, stop looperd, restore the config entry, and restart so config can claim the archived id", project.ID, project.ID)}
+				return ProjectValidationError{Message: fmt.Sprintf("configured project %s conflicts with an API-managed project that is still active; temporarily remove this project from [[projects]], restart looperd, send DELETE /api/v1/projects/%s to archive the API record, stop looperd, restore the config entry, and restart so config can claim the archived id", project.ID, url.PathEscape(project.ID))}
 			}
 		}
 	}

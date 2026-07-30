@@ -2411,6 +2411,25 @@ func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsCreateRoutePassesValidationPolicyToService(t *testing.T) {
+	fixture := newTestFixture(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","validation":{"commands":["go test ./..."]}}`)))
+	var got projects.AddInput
+
+	_, err := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).buildCreateProjectResponse(req, fakeProjectService{
+		addProject: func(_ context.Context, input projects.AddInput) (projects.AddResult, error) {
+			got = input
+			return projects.AddResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildCreateProjectResponse() error = %v", err)
+	}
+	if got.Validation == nil || !reflect.DeepEqual(got.Validation.Commands, []string{"go test ./..."}) || got.Validation.OptOut {
+		t.Fatalf("Validation = %#v, want commands passed through", got.Validation)
+	}
+}
+
 func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)

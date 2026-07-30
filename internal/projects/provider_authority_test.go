@@ -79,3 +79,28 @@ func TestServiceSyncConfiguredActiveAPICollisionNamesSafeHandoff(t *testing.T) {
 		}
 	}
 }
+
+func TestServiceSyncConfiguredActiveAPICollisionEscapesProjectIDInRecoveryURL(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 4, 0, 0, 0, time.UTC)
+	baseBranch := "main"
+	projectID := "shared?old #1"
+	metadata := `{"repo":"acme/api","source":"api"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "API", RepoPath: "/tmp/api", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: now.Format(time.RFC3339Nano), UpdatedAt: now.Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Projects = []config.ProjectRefConfig{{ID: projectID, Name: "Configured", RepoPath: "/tmp/config"}}
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+
+	err = service.SyncConfigured(context.Background(), cfg, now)
+	if err == nil || !strings.Contains(err.Error(), "DELETE /api/v1/projects/shared%3Fold%20%231") {
+		t.Fatalf("SyncConfigured() error = %v, want escaped recovery URL", err)
+	}
+}
