@@ -121,6 +121,10 @@ type Context struct {
 	// Optional: when nil, dispatch keeps the local-only occupancy check from
 	// #319 and does not call the forge.
 	LookupIssueOccupancy func(ctx context.Context, repo string, issueNumber int64, cwd string) (IssueOccupancy, error)
+	// RefreshTargetLabels reads the live labels used by manual-loop hold
+	// preflight. Production leaves it nil and uses the configured GitHub gateway;
+	// embeddings and tests can inject the same freshness authority explicitly.
+	RefreshTargetLabels func(ctx context.Context, target domain.LoopTarget, cwd string) ([]string, error)
 }
 
 // PullRequestTarget is the minimum a caller needs to decide whether a pull
@@ -155,6 +159,10 @@ type Handler struct {
 	// before the requeue transaction so tests can inject a TX-time conflict
 	// after the sticky stop gate was already cleared.
 	retryAfterClearStopGateHook func(loopID string)
+	// workerReuseAfterClearStopGateHook is test-only: invoked after an
+	// issue-worker reuse clears its sticky stop gate and before its
+	// transaction rechecks issue-claim admission.
+	workerReuseAfterClearStopGateHook func(loopID string)
 	// loopLogsFollowObserve is test-only instrumentation for enforcing the
 	// stream's query/read budgets without coupling tests to SQLite internals.
 	loopLogsFollowObserve func(loopLogsFollowObservation)
@@ -4201,6 +4209,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
+	if domain.LoopType(loopType) == domain.LoopTypeWorker && target.TargetType == domain.LoopTargetTypeIssue {
+		metadataJSON, err = issueWorkerMetadataJSON(metadataJSON, target, derefBool(body.Force))
+		if err != nil {
+			return loopResponse{}, err
+		}
+	}
 	if domain.LoopType(loopType) == domain.LoopTypePlanner {
 		metadataJSON, err = manualPlannerMetadataJSON(metadataJSON, target.IssueNumber)
 		if err != nil {
@@ -4251,11 +4265,19 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return storage.LoopRecord{}, err
 		}
 
+		candidateStatus := domain.LoopStatus(status)
+		if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatus == domain.LoopStatusRunning {
+			candidateStatus = domain.LoopStatusQueued
+		}
+		candidate := storage.LoopRecord{ProjectID: projectID, Type: loopType, TargetType: targetType, TargetID: loopTargetIDCompat(target), Repo: repoFromTargetCompat(target), PRNumber: prNumberFromTargetCompat(target), Status: string(candidateStatus), MetadataJSON: metadataJSON}
+		if err := assertIssueClaimAdmission(r.Context(), transactionRepos, candidate, derefBool(body.Force)); err != nil {
+			return storage.LoopRecord{}, err
+		}
+
 		existing, err := transactionRepos.Loops.List(r.Context())
 		if err != nil {
 			return storage.LoopRecord{}, err
 		}
-		candidateStatus := domain.LoopStatus(status)
 		if err := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopType(loopType), target, candidateStatus); err != nil {
 			return storage.LoopRecord{}, err
 		}
@@ -4280,17 +4302,14 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
-		if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatus == domain.LoopStatusRunning {
-			record.Status = string(domain.LoopStatusQueued)
-			candidateStatus = domain.LoopStatusQueued
-		}
+		record.Status = string(candidateStatus)
 		if candidateStatus == domain.LoopStatusRunning {
 			record.NextRunAt = &nowISO
 		} else if candidateStatus == domain.LoopStatusQueued {
 			record.NextRunAt = &nowISO
 		}
 
-		if err := transactionRepos.Loops.Upsert(r.Context(), record); err != nil {
+		if err := upsertLoopAfterIssueClaimAdmission(r.Context(), transactionRepos.Loops, record, derefBool(body.Force)); err != nil {
 			return storage.LoopRecord{}, err
 		}
 
@@ -4332,6 +4351,40 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	}
 
 	return serializeLoop(record), nil
+}
+
+func assertIssueClaimAdmission(ctx context.Context, repos *storage.Repositories, candidate storage.LoopRecord, force bool) error {
+	err := repos.Loops.AssertIssueClaimAdmission(ctx, candidate, force)
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
+	return err
+}
+
+func upsertLoopAfterIssueClaimAdmission(ctx context.Context, loops *storage.LoopsRepository, record storage.LoopRecord, force bool) error {
+	var err error
+	if force {
+		err = loops.UpsertForcingIssueClaimAdmission(ctx, record)
+	} else {
+		err = loops.Upsert(ctx, record)
+	}
+	return mapIssueClaimAdmissionError(err)
+}
+
+func issueCollisionError(issueNumber int64, loopID, loopType string) apiError {
+	return apiError{
+		code:    pkgapi.ErrorCodeLoopConflict,
+		status:  http.StatusConflict,
+		message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", issueNumber, loopType, loopID),
+		details: map[string]any{"occupiedBy": map[string]any{"loopId": loopID, "loopType": loopType}},
+	}
+}
+
+func mapIssueClaimAdmissionError(err error) error {
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
+	return err
 }
 
 func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateResponse, error) {
@@ -4401,7 +4454,6 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if issueNumber != nil {
 		requestedIssueTarget = &domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
 	}
-
 	effectivePRNumber := (*int64)(nil)
 	if prNumber != nil {
 		resolved, resolveErr := h.requirePullRequestTarget(r.Context(), requirePullRequestTargetInput{ProjectID: projectID, Repo: *repo, PRNumber: *prNumber})
@@ -4472,21 +4524,23 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 
 	workerPayload := struct {
-		Title       string  `json:"title"`
-		Prompt      *string `json:"prompt"`
-		SpecPath    *string `json:"specPath"`
-		Repo        string  `json:"repo"`
-		BaseBranch  string  `json:"baseBranch"`
-		IssueNumber *int64  `json:"issueNumber,omitempty"`
-		PRNumber    *int64  `json:"prNumber,omitempty"`
+		Title              string  `json:"title"`
+		Prompt             *string `json:"prompt"`
+		SpecPath           *string `json:"specPath"`
+		Repo               string  `json:"repo"`
+		BaseBranch         string  `json:"baseBranch"`
+		IssueNumber        *int64  `json:"issueNumber,omitempty"`
+		PRNumber           *int64  `json:"prNumber,omitempty"`
+		IssueClaimOverride bool    `json:"issueClaimOverride,omitempty"`
 	}{
-		Title:       title,
-		Prompt:      prompt,
-		SpecPath:    effectiveSpecPath,
-		Repo:        *repo,
-		BaseBranch:  *baseBranch,
-		IssueNumber: issueNumber,
-		PRNumber:    effectivePRNumber,
+		Title:              title,
+		Prompt:             prompt,
+		SpecPath:           effectiveSpecPath,
+		Repo:               *repo,
+		BaseBranch:         *baseBranch,
+		IssueNumber:        issueNumber,
+		PRNumber:           effectivePRNumber,
+		IssueClaimOverride: issueNumber != nil && derefBool(body.Force),
 	}
 	payloadJSONBytes, err := json.Marshal(struct {
 		Worker any `json:"worker"`
@@ -4502,6 +4556,42 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 	metadataJSON := string(payloadJSONBytes)
 	reusedWorkerLoop := false
+	issueClaimCandidate := func(reusedLoopID string) storage.LoopRecord {
+		return storage.LoopRecord{
+			ID:           reusedLoopID,
+			ProjectID:    projectID,
+			Type:         string(domain.LoopTypeWorker),
+			TargetType:   targetType,
+			TargetID:     &targetID,
+			Repo:         repo,
+			PRNumber:     effectivePRNumber,
+			Status:       string(domain.LoopStatusQueued),
+			MetadataJSON: &metadataJSON,
+		}
+	}
+
+	// Keep the eager 409 before publication, but model a reusable worker as its
+	// existing lifecycle. A planner may retarget a new worker to a PR, while an
+	// earlier issue worker is still the one that this request will resume.
+	// Admission skips only that loop ID; independent source-issue lifecycles
+	// remain conflicts. The transaction below is the authoritative recheck.
+	if requestedIssueTarget != nil && !derefBool(body.Force) {
+		existing, listErr := services.Repositories.Loops.List(r.Context())
+		if listErr != nil {
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: listErr.Error()}
+		}
+		reusedLoopID := ""
+		if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
+			return workerCreateResponse{}, reuseErr
+		} else if ok {
+			reusedLoopID = existingLoop.ID
+		}
+		if preflightErr := storage.WithTransaction(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) error {
+			return assertIssueClaimAdmission(r.Context(), storage.NewRepositories(tx), issueClaimCandidate(reusedLoopID), false)
+		}); preflightErr != nil {
+			return workerCreateResponse{}, preflightErr
+		}
+	}
 
 	// Issue-worker reuse enqueues the existing loop (same as start requeue).
 	// Take the shared per-loop retry lock before the TX so discard+retry cannot
@@ -4544,6 +4634,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			}
 		}
 	}
+	if reuseStopGateLoopID != "" && h.workerReuseAfterClearStopGateHook != nil {
+		h.workerReuseAfterClearStopGateHook(reuseStopGateLoopID)
+	}
 	restoreReuseStopGate := func() error {
 		if reuseGateWasActive && reuseStopGateLoopID != "" && services.ActiveExecutions != nil {
 			return services.ActiveExecutions.RestoreLoopStop(reuseStopGateLoopID)
@@ -4553,35 +4646,53 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
-
 		existing, listErr := repos.Loops.List(r.Context())
 		if listErr != nil {
 			return storage.LoopRecord{}, listErr
 		}
+		var reusableLoop *storage.LoopRecord
 		if issueNumber != nil {
-			if existingLoop, existingTarget, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
+			if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
 				return storage.LoopRecord{}, reuseErr
 			} else if ok {
-				reusedWorkerLoop = true
-				// Ensure gate is open even when the pre-TX scan missed this loop;
-				// still before commit so the queue item is not yet claimable.
-				if services.ActiveExecutions != nil {
-					if reuseStopGateLoopID == "" {
-						reuseStopGateLoopID = existingLoop.ID
-					}
-					// Clear+report under one lock: looper stop may establish the gate
-					// after the pre-TX clear saw it inactive. Without this return
-					// value, TX abort restore would skip (flag still false).
-					if services.ActiveExecutions.ClearLoopStop(existingLoop.ID) {
-						reuseGateWasActive = true
-					}
-				}
-				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
-				if resumeErr != nil {
-					return storage.LoopRecord{}, resumeErr
-				}
-				return resumed, nil
+				loop := existingLoop
+				reusableLoop = &loop
 			}
+		}
+		if requestedIssueTarget != nil {
+			reusedLoopID := ""
+			if reusableLoop != nil {
+				reusedLoopID = reusableLoop.ID
+			}
+			if admissionErr := assertIssueClaimAdmission(r.Context(), repos, issueClaimCandidate(reusedLoopID), derefBool(body.Force)); admissionErr != nil {
+				return storage.LoopRecord{}, admissionErr
+			}
+		}
+		if reusableLoop != nil {
+			reusedWorkerLoop = true
+			existingLoop := *reusableLoop
+			existingTarget, targetErr := loopTargetFromRecordCompat(existingLoop)
+			if targetErr != nil {
+				return storage.LoopRecord{}, targetErr
+			}
+			// Ensure gate is open even when the pre-TX scan missed this loop;
+			// still before commit so the queue item is not yet claimable.
+			if services.ActiveExecutions != nil {
+				if reuseStopGateLoopID == "" {
+					reuseStopGateLoopID = existingLoop.ID
+				}
+				// Clear+report under one lock: looper stop may establish the gate
+				// after the pre-TX clear saw it inactive. Without this return
+				// value, TX abort restore would skip (flag still false).
+				if services.ActiveExecutions.ClearLoopStop(existingLoop.ID) {
+					reuseGateWasActive = true
+				}
+			}
+			resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
+			if resumeErr != nil {
+				return storage.LoopRecord{}, resumeErr
+			}
+			return resumed, nil
 		}
 		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued); uniqueErr != nil {
 			return storage.LoopRecord{}, uniqueErr
@@ -4607,7 +4718,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
-		if upsertErr := repos.Loops.Upsert(r.Context(), record); upsertErr != nil {
+		if upsertErr := upsertLoopAfterIssueClaimAdmission(r.Context(), repos.Loops, record, derefBool(body.Force)); upsertErr != nil {
 			return storage.LoopRecord{}, upsertErr
 		}
 
@@ -4658,6 +4769,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			}
 			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: errors.Join(err, restoreErr).Error()}
 		}
+		err = mapIssueClaimAdmissionError(err)
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return workerCreateResponse{}, typed
@@ -4705,6 +4817,22 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if err != nil {
 		return err
 	}
+	if target.TargetType != domain.LoopTargetTypeIssue && target.TargetType != domain.LoopTargetTypePullRequest {
+		return nil
+	}
+	// An injected refresher is already the caller's explicit freshness authority;
+	// unlike the default GitHub gateway, it does not require a local checkout or
+	// a configured gh binary.
+	if h.context.RefreshTargetLabels != nil {
+		labels, refreshErr := h.refreshTargetLabels(ctx, target, project.RepoPath, "")
+		if refreshErr != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
+		}
+		if domain.IsAutoLaneHeld(loopType, labels) {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+		}
+		return nil
+	}
 	// Hold preflight is best-effort at create time: when we cannot reliably talk to
 	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
 	// skip validation rather than blocking manual creation for unrelated local setup.
@@ -4718,30 +4846,30 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if ghPath == "" {
 		return nil
 	}
-	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, Env: config.DaemonGitHubCredentialEnv(h.context.Config), GHRun: shell.Run})
-	labels := []string(nil)
-	switch target.TargetType {
-	case domain.LoopTargetTypeIssue:
-		// Labels-only: ViewIssue would additionally page through every comment
-		// on the issue, and this preflight reads nothing but the labels.
-		issueLabels, err := gh.GetIssueLabels(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
-		}
-		labels = issueLabels
-	case domain.LoopTargetTypePullRequest:
-		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
-		}
-		labels = detail.Labels
-	default:
-		return nil
+	labels, refreshErr := h.refreshTargetLabels(ctx, target, project.RepoPath, ghPath)
+	if refreshErr != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
 	}
 	if !domain.IsAutoLaneHeld(loopType, labels) {
 		return nil
 	}
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+}
+
+func (h *Handler) refreshTargetLabels(ctx context.Context, target domain.LoopTarget, cwd, ghPath string) ([]string, error) {
+	if h.context.RefreshTargetLabels != nil {
+		return h.context.RefreshTargetLabels(ctx, target, cwd)
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: cwd, Env: config.DaemonGitHubCredentialEnv(h.context.Config), GHRun: shell.Run})
+	switch target.TargetType {
+	case domain.LoopTargetTypeIssue:
+		return gh.GetIssueLabels(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: cwd})
+	case domain.LoopTargetTypePullRequest:
+		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: cwd})
+		return detail.Labels, err
+	default:
+		return nil, nil
+	}
 }
 
 // refuseOccupiedIssueTarget asks the forge whether the issue is still open and
@@ -4923,10 +5051,8 @@ func forcedManualWorkerQueuePayloadJSONCompat(payloadJSON *string) *string {
 	if len(payload) == 0 {
 		return payloadJSON
 	}
-	if payload["autoDiscovered"] != true {
-		return payloadJSON
-	}
 	delete(payload, "autoDiscovered")
+	payload["issueClaimOverride"] = true
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return payloadJSON
@@ -4968,11 +5094,12 @@ func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
 	if len(metadata) == 0 {
 		return metadataJSON
 	}
-	worker, _ := metadata["worker"].(map[string]any)
-	if worker["autoDiscovered"] != true {
+	worker, ok := metadata["worker"].(map[string]any)
+	if !ok {
 		return metadataJSON
 	}
 	delete(worker, "autoDiscovered")
+	worker["issueClaimOverride"] = true
 	metadata["worker"] = worker
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
@@ -4982,16 +5109,44 @@ func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
 	return &text
 }
 
+// issueWorkerMetadataJSON records the source identity used after a worker
+// retargets to a pull request. Only force=true may create the durable override:
+// callers control generic metadata, so an incoming override is not authority.
+func issueWorkerMetadataJSON(metadataJSON *string, target domain.LoopTarget, force bool) (*string, error) {
+	metadata := parseJSONObject(metadataJSON)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	worker, _ := metadata["worker"].(map[string]any)
+	if worker == nil {
+		worker = map[string]any{}
+	}
+	delete(worker, "issueClaimOverride")
+	if force {
+		worker["issueClaimOverride"] = true
+	}
+	worker["repo"] = target.Repo
+	worker["issueNumber"] = target.IssueNumber
+	metadata["worker"] = worker
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	text := string(encoded)
+	return &text, nil
+}
+
 func forcedManualWorkerCheckpointJSONCompat(checkpointJSON *string) *string {
 	checkpoint := parseJSONObject(checkpointJSON)
 	if len(checkpoint) == 0 {
 		return checkpointJSON
 	}
-	work, _ := checkpoint["work"].(map[string]any)
-	if work["autoDiscovered"] != true {
+	work, ok := checkpoint["work"].(map[string]any)
+	if !ok {
 		return checkpointJSON
 	}
 	delete(work, "autoDiscovered")
+	work["issueClaimOverride"] = true
 	checkpoint["work"] = work
 	encoded, err := json.Marshal(checkpoint)
 	if err != nil {
@@ -5630,6 +5785,7 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		return updated, nil
 	})
 	if err != nil {
+		err = mapIssueClaimAdmissionError(err)
 		if restoreErr := restoreStopGate(); restoreErr != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
@@ -6347,6 +6503,7 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		return retryResult{loop: updated, queueItemID: &persisted.ID}, nil
 	})
 	if err != nil {
+		err = mapIssueClaimAdmissionError(err)
 		if restoreErr := restoreStopGate(); restoreErr != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
@@ -7268,6 +7425,9 @@ func parseIssueNumber(targetID string) (int64, error) {
 }
 
 func mapLoopCreateError(err error) error {
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
 	message := err.Error()
 	switch {
 	case strings.Contains(message, "project not found:"):

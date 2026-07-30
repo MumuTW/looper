@@ -139,6 +139,64 @@ func TestHandlerWorkersCreateReuseRestoresStopGateOnTXFailure(t *testing.T) {
 	}
 }
 
+// A collision that arrives after issue-worker reuse has opened its stop gate
+// must restore that gate when the transaction rejects the dispatch. This spans
+// the API claim admission path and the runtime spawn-admission lifecycle.
+func TestHandlerWorkersCreateReuseRestoresStopGateOnIssueClaimCollision(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_worker_reuse_claim_collision"
+	loopID := "loop_worker_reuse_claim_collision"
+	repo := "acme/looper"
+	targetID := "issue:acme/looper:97"
+	workerMeta := `{"worker":{"title":"Stopped issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":97}}`
+	baseBranch := "main"
+	projectMeta := `{"repo":"acme/looper"}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: &baseBranch, MetadataJSON: &projectMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 3130, ProjectID: projectID, Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "paused", MetadataJSON: &workerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(worker) error = %v", err)
+	}
+	if _, err := services.ActiveExecutions.BeginLoopStop(loopID, "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop() error = %v", err)
+	}
+
+	h.workerReuseAfterClearStopGateHook = func(id string) {
+		if id != loopID {
+			return
+		}
+		if services.ActiveExecutions.LoopStopActive(loopID) {
+			t.Error("LoopStopActive = true in after-clear hook, want false")
+		}
+		prTarget := "pr:acme/looper:197"
+		prNumber := int64(197)
+		claimMeta := `{"worker":{"repo":"acme/looper","issueNumber":97}}`
+		// The regular publication path now atomically rejects this competing
+		// source-issue claim. Use the explicit override to model a claim that
+		// was already admitted elsewhere while reuse had its stop gate open.
+		if err := services.Repositories.Loops.UpsertForcingIssueClaimAdmission(context.Background(), storage.LoopRecord{ID: "loop_fixer_claim_collision", Seq: 3131, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &claimMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Errorf("Loops.UpsertForcingIssueClaimAdmission(fixer collision) error = %v", err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", strings.NewReader(`{"projectId":"project_worker_reuse_claim_collision","repo":"acme/looper","issueNumber":97,"baseBranch":"main"}`))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("worker reuse status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !services.ActiveExecutions.LoopStopActive(loopID) {
+		t.Fatal("LoopStopActive = false after collision, want sticky gate restored")
+	}
+	if _, err := services.ActiveExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: loopID, RunID: "run_reuse_collision", ExecutionID: "exec_reuse_collision"}); !errors.Is(err, agent.ErrSpawnLoopStopping) {
+		t.Fatalf("AdmitSpawn after collision error = %v, want ErrSpawnLoopStopping", err)
+	}
+}
+
 // TestHandlerWorkersCreateReuseSharesRetryLockWithDiscard ensures POST /workers
 // issue-worker reuse takes the same per-loop mutex as discard+retry, so reuse
 // cannot enqueue between discard preflight and git reset (wiping the worktree
