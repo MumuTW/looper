@@ -154,6 +154,15 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 			want: []ReasonCode{ReasonHold},
 		},
 		{
+			// A Gate report that omitted this would record the PR as eligible
+			// while a human veto is in force.
+			name: "global hold despite case and padding",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.detail.Labels = []string{" Looper:Hold "}
+			},
+			want: []ReasonCode{ReasonHold},
+		},
+		{
 			name: "provider mergeability is ambiguous",
 			mutate: func(f *gatekeeperFixture) {
 				f.github.mergeable.Mergeable = nil

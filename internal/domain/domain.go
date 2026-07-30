@@ -143,35 +143,34 @@ func AssertKnownLoopType(loopType LoopType) error {
 	return fmt.Errorf("loop.type must be one of: %s, %s, %s, %s", LoopTypePlanner, LoopTypeReviewer, LoopTypeWorker, LoopTypeFixer)
 }
 
+// IsAutoLaneHeld reports whether a hold blocks automatic work on the item.
+//
+// A hold is a human veto, so matching is normalized rather than exact: a forge
+// label written "Looper:Hold" must stop the lane exactly as "looper:hold"
+// does. Normalizing cannot introduce a false hold, because forge label names
+// are unique case-insensitively — at most one spelling can exist in a
+// repository — so the only behavior it can change is a miss becoming a hit,
+// which is the safe direction for a veto.
 func IsAutoLaneHeld(loopType LoopType, itemLabels []string) bool {
-	if hasExactLabel(itemLabels, labels.HoldGlobal) {
+	if labels.Has(itemLabels, labels.HoldGlobal) {
 		return true
 	}
 	switch loopType {
 	case LoopTypePlanner:
 		return false
 	case LoopTypeWorker:
-		return hasExactLabel(itemLabels, labels.HoldWorker)
+		return labels.Has(itemLabels, labels.HoldWorker)
 	case LoopTypeFixer:
-		return hasExactLabel(itemLabels, labels.HoldFixer)
+		return labels.Has(itemLabels, labels.HoldFixer)
 	case LoopTypeReviewer:
-		return hasExactLabel(itemLabels, labels.HoldReviewer)
+		return labels.Has(itemLabels, labels.HoldReviewer)
 	default:
 		return false
 	}
 }
 
-func IsAutomaticLoopHeld(loopType LoopType, manual bool, labels []string) bool {
-	return !manual && IsAutoLaneHeld(loopType, labels)
-}
-
-func hasExactLabel(labels []string, want string) bool {
-	for _, label := range labels {
-		if label == want {
-			return true
-		}
-	}
-	return false
+func IsAutomaticLoopHeld(loopType LoopType, manual bool, itemLabels []string) bool {
+	return !manual && IsAutoLaneHeld(loopType, itemLabels)
 }
 
 func AssertKnownLoopStatus(status LoopStatus) error {

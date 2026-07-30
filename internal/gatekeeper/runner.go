@@ -233,11 +233,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if detail.IsDraft {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonPullRequestDraft})
 	}
-	for _, label := range detail.Labels {
-		if strings.TrimSpace(label) == labels.HoldGlobal {
-			report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldGlobal)
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldGlobal})
-		}
+	// Normalized, like the other hold gates: a Gate report that omits a hold
+	// spelled "Looper:Hold" would record the Pull Request as eligible while a
+	// human veto is in force.
+	if labels.Has(detail.Labels, labels.HoldGlobal) {
+		report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldGlobal)
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldGlobal})
 	}
 	report.Evidence.ProjectPolicyPermitsTarget = r.policyPermitsTarget(input.ProjectID, input.Repo, report.Evidence.BaseRefName)
 	if !report.Evidence.ProjectPolicyPermitsTarget {
