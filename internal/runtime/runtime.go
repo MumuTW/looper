@@ -124,7 +124,14 @@ type Options struct {
 	SyncConfiguredProjects      SyncConfiguredProjectsFunc
 	RunSchedulerTick            RunSchedulerTickFunc
 	// RunSchedulerClaim overrides the claim pass the scheduler pump drives,
-	// independently of RunSchedulerTick; nil uses the default catalog claim.
+	// independently of RunSchedulerTick in both directions: either can be
+	// injected while the other keeps its default catalog implementation.
+	//
+	// Blind spots, stated for reviewers of tests built on this seam: an
+	// injected claim observes that the pump invoked a pass, not when the
+	// pump chose to fire (ticker/trigger cadence regressions pass through),
+	// and it bypasses the default claim's own internal admission gating,
+	// which only the default implementation exercises.
 	RunSchedulerClaim  RunSchedulerTickFunc
 	ReadProcessCommand ReadProcessCommandFunc
 	ReadProcessStart   ReadProcessStartFunc
@@ -1027,6 +1034,11 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.webhookForwarder = handlers.webhook
 			r.notificationGateways = handlers.notificationGateways
 			schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
+		} else if handlers.webhook != nil {
+			// The bundle was built only for its claim; close the eagerly
+			// constructed webhook forwarder it also carries so its workers
+			// do not leak.
+			handlers.webhook.Close()
 		}
 		if !r.customSchedulerClaim {
 			r.defaultSchedulerClaim = handlers.claim
