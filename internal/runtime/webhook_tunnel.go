@@ -52,7 +52,10 @@ type webhookTunnelGitHubClient interface {
 	DeleteHook(ctx context.Context, repo string, id int64) error
 }
 
-type ghWebhookTunnelClient struct{ ghPath string }
+type ghWebhookTunnelClient struct {
+	ghPath string
+	env    map[string]string
+}
 
 func (c ghWebhookTunnelClient) GetHook(ctx context.Context, repo string, id int64) (webhookTunnelGitHubHook, bool, error) {
 	result, err := c.run(ctx, repo, []string{"api", fmt.Sprintf("repos/%s/hooks/%d", splitRepoPath(repo), id)})
@@ -132,10 +135,17 @@ func (c ghWebhookTunnelClient) run(ctx context.Context, repo string, args []stri
 	if strings.TrimSpace(c.ghPath) == "" {
 		return nil, errors.New("gh is not configured or could not be resolved")
 	}
+	if len(c.env) == 0 {
+		return nil, errors.New("daemon has no configured GitHub credential")
+	}
 	if host, _ := splitTunnelRepoHostname(repo); host != "" {
 		args = append(args, "--hostname", host)
 	}
 	cmd := exec.CommandContext(ctx, c.ghPath, args...)
+	cmd.Env = os.Environ()
+	for key, value := range c.env {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -506,7 +516,7 @@ func (w *webhookRuntime) tunnelGitHubClient() webhookTunnelGitHubClient {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.tunnelClient == nil {
-		w.tunnelClient = ghWebhookTunnelClient{ghPath: w.ghPath}
+		w.tunnelClient = ghWebhookTunnelClient{ghPath: w.ghPath, env: config.DaemonGitHubCredentialEnv(w.cfg)}
 	}
 	return w.tunnelClient
 }
