@@ -163,18 +163,12 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		if providerKind == config.ProviderKindForgejo {
 			config.ApplyForgejoProjectProfile(&project)
 		}
-		if providerKind == config.ProviderKindForgejo || providerKind == config.ProviderKindPlane {
+		if providerKind == config.ProviderKindForgejo {
 			effectiveConfig := global
 			effectiveConfig.Projects = append(append([]config.ProjectRefConfig(nil), projects...), project)
 			roles := config.ProjectRoleConfigs(effectiveConfig, project.ID)
 			prefix := fmt.Sprintf("projects[%q]", project.ID)
-			var err error
-			if providerKind == config.ProviderKindForgejo {
-				err = config.ValidateForgejoRoleCapabilities(roles, prefix)
-			} else {
-				err = config.ValidatePlaneRoleCapabilities(roles, prefix)
-			}
-			if err != nil {
+			if err := config.ValidateForgejoRoleCapabilities(roles, prefix); err != nil {
 				return nil, err
 			}
 		}

@@ -385,6 +385,9 @@ func decodeConfigFile(path string, raw []byte) (PartialConfig, error) {
 }
 
 func decodeJSONConfigFile(raw []byte) (PartialConfig, error) {
+	if err := rejectRemovedProviderKind(raw); err != nil {
+		return PartialConfig{}, err
+	}
 	var partialConfig PartialConfig
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	if err := decodeTopLevelConfigSections(decoder, &partialConfig); err != nil {
@@ -394,6 +397,38 @@ func decodeJSONConfigFile(raw []byte) (PartialConfig, error) {
 		return PartialConfig{}, fmt.Errorf("trailing JSON value")
 	}
 	return partialConfig, nil
+}
+
+// rejectRemovedProviderKind scans the normalized JSON config for a provider
+// whose kind was removed (currently "plane") and returns the explicit
+// unsupported-provider validation error before strict nested decoding rejects
+// legacy schema fields (workspace, projectId, planeAssigneeId) as unknown.
+// This keeps the decode schema clean — the removed fields stay deleted rather
+// than being retained as a silent compatibility shim — while still giving a
+// legacy config a single, actionable error instead of a misleading
+// unknown-field decode failure that surfaces one field at a time.
+func rejectRemovedProviderKind(raw []byte) error {
+	var probe struct {
+		Providers []struct {
+			Kind *ProviderKind `json:"kind"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		// Lenient: let strict decoding surface real structural errors.
+		return nil
+	}
+	for index, provider := range probe.Providers {
+		if provider.Kind == nil {
+			continue
+		}
+		if reason, removed := removedProviderKinds[*provider.Kind]; removed {
+			return &ConfigValidationError{Issues: []ValidationIssue{{
+				Path:    fmt.Sprintf("providers[%d].kind", index),
+				Message: fmt.Sprintf("provider kind %q is no longer supported: %s", *provider.Kind, reason),
+			}}}
+		}
+	}
+	return nil
 }
 
 func decodeStructuredConfigFile(raw []byte, unmarshal func(any) error) (PartialConfig, error) {

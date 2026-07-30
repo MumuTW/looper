@@ -485,24 +485,6 @@ func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, 
 	return forge.NewResolver(*cfg).ForgejoForLocation("", cwd)
 }
 
-// planeClientForRepo returns a Plane task-source client for a project whose
-// provider kind is "plane" and whose code repo (project.Repo, a GitHub repo)
-// matches repo. The second return is false when repo is not a plane project, in
-// which case callers fall through to the GitHub/forgejo path.
-func planeClientForRepo(cfg *config.Config, repo string) (*forge.PlaneClient, bool, error) {
-	if cfg == nil {
-		return nil, false, nil
-	}
-	return forge.NewResolver(*cfg).PlaneForLocation(repo, "")
-}
-
-func planeClientForCWD(cfg *config.Config, cwd string) (*forge.PlaneClient, bool, error) {
-	if cfg == nil {
-		return nil, false, nil
-	}
-	return forge.NewResolver(*cfg).PlaneForLocation("", cwd)
-}
-
 func forgeIdentityLogins(identities []forge.Identity) []string {
 	if identities == nil {
 		return nil
@@ -602,13 +584,6 @@ func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...s
 	return forgejoClientForLocation(a.config, repo, cwd)
 }
 
-// plane returns a Plane task-source client when repo belongs to a plane-kind
-// project. Issue-side reads/mutations for such projects are served by Plane;
-// pull-request operations are left to the GitHub path (repo is the code repo).
-func (a plannerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
-	return planeClientForLocation(a.config, repo, cwd)
-}
-
 func forgejoClientForLocation(cfg *config.Config, repo string, cwd []string) (*forge.ForgejoClient, bool, error) {
 	if cfg == nil {
 		return nil, false, nil
@@ -620,32 +595,7 @@ func forgejoClientForLocation(cfg *config.Config, repo string, cwd []string) (*f
 	return forge.NewResolver(*cfg).ForgejoForLocation(repo, location)
 }
 
-func planeClientForLocation(cfg *config.Config, repo string, cwd []string) (*forge.PlaneClient, bool, error) {
-	if cfg == nil {
-		return nil, false, nil
-	}
-	location := ""
-	if len(cwd) > 0 {
-		location = cwd[0]
-	}
-	return forge.NewResolver(*cfg).PlaneForLocation(repo, location)
-}
-
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return nil, err
-		}
-		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
-		if err != nil {
-			return nil, err
-		}
-		result := make([]planner.IssueSummary, 0, len(issues))
-		for _, issue := range issues {
-			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
-		}
-		return result, nil
-	}
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
@@ -675,16 +625,6 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 }
 
 func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewIssueInput) (planner.IssueDetail, error) {
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return planner.IssueDetail{}, err
-		}
-		issue, err := client.ViewIssue(ctx, input.IssueNumber)
-		if err != nil {
-			return planner.IssueDetail{}, err
-		}
-		return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
-	}
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return planner.IssueDetail{}, err
@@ -706,13 +646,6 @@ func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewI
 }
 
 func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := planeClientForCWD(a.config, cwd); ok || err != nil {
-		if err != nil {
-			return "", err
-		}
-		identity, err := client.CurrentUser(ctx)
-		return identity.Login, err
-	}
 	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
 		if err != nil {
 			return "", err
@@ -727,12 +660,6 @@ func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd strin
 }
 
 func (a plannerGitHubAdapter) AddIssueAssignees(ctx context.Context, input planner.IssueAssigneesInput) error {
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
-	}
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
@@ -1671,8 +1598,8 @@ func reviewerAllowsTrustedReviewProxy(cfg *config.Config, projectID string, meta
 }
 
 // reviewerProjectNeedsTrustedProxy reports whether the selected project
-// publishes native reviews (not summary_comment). This includes GitHub, Plane's
-// GitHub code side, and native Forgejo projects.
+// publishes native reviews (not summary_comment). This includes GitHub and
+// native Forgejo projects.
 func reviewerProjectNeedsTrustedProxy(cfg *config.Config, projectID string) bool {
 	if cfg == nil {
 		return false
@@ -2297,7 +2224,7 @@ func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult
 	if err != nil {
 		return fixer.AgentResult{}, err
 	}
-	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, CompletionPayload: result.CompletionPayload, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
 }
 
 type workerGitHubAdapter struct {
@@ -2308,13 +2235,6 @@ type workerGitHubAdapter struct {
 
 func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
 	return forgejoClientForLocation(a.config, repo, cwd)
-}
-
-// plane returns a Plane task-source client when repo belongs to a plane-kind
-// project. The worker reads issues and posts issue-side comments/labels through
-// Plane; pull-request creation stays on the GitHub code repo.
-func (a workerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
-	return planeClientForLocation(a.config, repo, cwd)
 }
 
 func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input worker.ListOpenPullRequestsInput) ([]worker.PullRequestSummary, error) {
@@ -2347,20 +2267,6 @@ func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input wor
 }
 
 func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.ListOpenIssuesInput) ([]worker.IssueSummary, error) {
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return nil, err
-		}
-		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
-		if err != nil {
-			return nil, err
-		}
-		result := make([]worker.IssueSummary, 0, len(issues))
-		for _, issue := range issues {
-			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
-		}
-		return result, nil
-	}
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
@@ -2390,13 +2296,6 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 }
 
 func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := planeClientForCWD(a.config, cwd); ok || err != nil {
-		if err != nil {
-			return "", err
-		}
-		identity, err := client.CurrentUser(ctx)
-		return identity.Login, err
-	}
 	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
 		if err != nil {
 			return "", err
@@ -2411,12 +2310,6 @@ func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string
 }
 
 func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker.IssueAssigneesInput) error {
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
-	}
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
@@ -2451,16 +2344,6 @@ func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.V
 }
 
 func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIssueInput) (worker.IssueDetail, error) {
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return worker.IssueDetail{}, err
-		}
-		issue, err := client.ViewIssue(ctx, input.IssueNumber)
-		if err != nil {
-			return worker.IssueDetail{}, err
-		}
-		return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
-	}
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.IssueDetail{}, err
@@ -2483,18 +2366,6 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 
 func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
 	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
-	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return worker.IssueCommentResult{}, err
-		}
-		comment, err := client.CreateIssueComment(ctx, forge.CreateCommentInput{IssueNumber: input.IssueNumber, Body: body})
-		if err != nil {
-			return worker.IssueCommentResult{}, err
-		}
-		// Plane comment ids are UUIDs and do not fit looper's int64 comment id, so
-		// ID stays 0; the URL points at the work-item web page.
-		return worker.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
-	}
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.IssueCommentResult{}, err
@@ -2517,17 +2388,6 @@ func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worke
 
 func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worker.UpdateIssueCommentInput) error {
 	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
-	if _, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
-		if err != nil {
-			return err
-		}
-		// Plane comment ids are UUIDs, which do not round-trip through looper's
-		// int64 comment id, so in-place updates are not supported. This is a
-		// no-op: the worker's CreateIssueComment path (which returns id 0) posts a
-		// fresh progress comment on each status transition instead.
-		// TODO(plane): track the Plane comment UUID to enable true updates.
-		return nil
-	}
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
@@ -3487,7 +3347,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {
 	if configuredPath := strings.TrimSpace(derefString(cfg.Tools.GHPath)); configuredPath != "" {
-		githubGateway = githubinfra.New(githubinfra.Options{GHPath: configuredPath, CWD: cwd})
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: configuredPath, CWD: cwd, Env: config.DaemonGitHubCredentialEnv(cfg)})
 	}
 	if githubGateway == nil {
 		return false

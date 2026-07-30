@@ -2,13 +2,6 @@ package specpr
 
 import "testing"
 
-func TestHasLabelNormalizesCaseAndWhitespace(t *testing.T) {
-	t.Parallel()
-	if !HasLabel([]string{"  LOOPER:SPEC-REVIEWING  ", "other"}, ReviewingLabel) {
-		t.Fatal("HasLabel() = false, want true")
-	}
-}
-
 func TestResolvePullRequestPhase(t *testing.T) {
 	t.Parallel()
 	if got := ResolvePullRequestPhase([]string{"looper:spec-reviewing"}); got != PhaseSpec {

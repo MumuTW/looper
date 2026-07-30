@@ -61,23 +61,6 @@ func TestResolverSelectsGitHubAndForgejoWithSharedContract(t *testing.T) {
 	}
 }
 
-func TestResolverMakesPlaneTaskSourceExplicit(t *testing.T) {
-	t.Parallel()
-	cfg := config.Config{
-		Providers: []config.ProviderConfig{{ID: "plane", Kind: config.ProviderKindPlane}},
-		Projects:  []config.ProjectRefConfig{{ID: "plane", Provider: "plane", Repo: "acme/code", RepoPath: t.TempDir()}},
-	}
-
-	selection := NewResolver(cfg).ForProject("plane")
-	capabilities := selection.Capabilities()
-	if !selection.UsesExternalTaskSource() || selection.TaskSourceName() != "Plane" {
-		t.Fatalf("Plane selection = %#v, want explicit external task source", selection)
-	}
-	if capabilities.PullRequests || capabilities.NativeReviews || !capabilities.GitHubPullRequests || capabilities.GitHubIssues {
-		t.Fatalf("Plane capabilities = %#v, want task source without native PRs and GitHub code PR delegation", capabilities)
-	}
-}
-
 func TestResolverCWDSelectionIsAuthoritative(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

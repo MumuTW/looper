@@ -45,10 +45,11 @@ function fixture(): ConfigData {
     },
     roles: {
       planner: {
-        triggers: { planeAssigneeId: "planner-member" },
+        triggers: { requireAssigneeCurrentUser: true },
       },
+      coordinator: { enabled: false },
       worker: {
-        triggers: { planeAssigneeId: "worker-member" },
+        triggers: { requireAssigneeCurrentUser: false },
         agent: { profile: "fast", vendor: "claude-code", model: "haiku" },
       },
       reviewer: {
@@ -105,12 +106,17 @@ function fixture(): ConfigData {
           editable: true,
           applyMode: "hot",
         },
-        "roles.planner.triggers.planeAssigneeId": {
+        "roles.planner.triggers.requireAssigneeCurrentUser": {
+          source: "config-file",
+          editable: true,
+          applyMode: "hot",
+        },
+        "roles.coordinator.enabled": {
           source: "config-file",
           editable: false,
           applyMode: "restart",
         },
-        "roles.worker.triggers.planeAssigneeId": {
+        "roles.worker.triggers.requireAssigneeCurrentUser": {
           source: "config-file",
           editable: true,
           applyMode: "hot",
@@ -146,11 +152,17 @@ describe("config form contract", () => {
       "tools.looperPath",
       "tools.osascriptPath",
     ]);
+    // roles.coordinator.enabled is genuinely restart-bound (absent from
+    // hotEditablePaths), so the roles group must filter it out; the hot-safe
+    // planner/worker trigger controls must stay visible.
     expect(configFieldPaths(data, roles)).not.toContain(
-      "roles.planner.triggers.planeAssigneeId",
+      "roles.coordinator.enabled",
     );
     expect(configFieldPaths(data, roles)).toContain(
-      "roles.worker.triggers.planeAssigneeId",
+      "roles.planner.triggers.requireAssigneeCurrentUser",
+    );
+    expect(configFieldPaths(data, roles)).toContain(
+      "roles.worker.triggers.requireAssigneeCurrentUser",
     );
     // Profiles are curated (add/remove UI), not free-form leaf fields.
     expect(configFieldPaths(data, agent)).not.toContain(
@@ -508,10 +520,10 @@ describe("config form contract", () => {
     };
     data.roles = {
       planner: {
-        triggers: { planeAssigneeId: "planner-member" },
+        triggers: { requireAssigneeCurrentUser: true },
       },
       worker: {
-        triggers: { planeAssigneeId: "worker-member" },
+        triggers: { requireAssigneeCurrentUser: false },
         agent: {
           profile: "fast",
           vendor: "claude-code",
@@ -579,7 +591,7 @@ describe("config form contract", () => {
       fast: { vendor: "codex", model: "gpt-5" },
     };
     data.roles.worker = {
-      triggers: { planeAssigneeId: "worker-member" },
+      triggers: { requireAssigneeCurrentUser: false },
       agent: { profile: "fast" },
     };
     const profileSameAsGlobal = buildConfigPatch(
@@ -600,7 +612,7 @@ describe("config form contract", () => {
       bare: { vendor: "codex" },
     };
     data.roles.worker = {
-      triggers: { planeAssigneeId: "worker-member" },
+      triggers: { requireAssigneeCurrentUser: false },
       agent: { profile: "bare" },
     };
     const modelLessProfile = buildConfigPatch(
@@ -620,7 +632,7 @@ describe("config form contract", () => {
       fast: { vendor: "codex", model: "gpt-5-mini" },
     };
     data.roles.worker = {
-      triggers: { planeAssigneeId: "worker-member" },
+      triggers: { requireAssigneeCurrentUser: false },
       agent: { model: "gpt-5" },
     };
     data.roles.reviewer = {
@@ -649,7 +661,7 @@ describe("config form contract", () => {
       shared: { model: "gpt-5-mini" },
     };
     data.roles.worker = {
-      triggers: { planeAssigneeId: "worker-member" },
+      triggers: { requireAssigneeCurrentUser: false },
       agent: { profile: "shared" },
     };
     const globalWithProfileModel = buildConfigPatch(
@@ -667,7 +679,7 @@ describe("config form contract", () => {
     // Global vendor switch leaves role/profile models alone when the role
     // overrides vendor (resolved vendor does not inherit global).
     data.roles.worker = {
-      triggers: { planeAssigneeId: "worker-member" },
+      triggers: { requireAssigneeCurrentUser: false },
       agent: { vendor: "codex", model: "gpt-5" },
     };
     const globalWithRoleVendor = buildConfigPatch(

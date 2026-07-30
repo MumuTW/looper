@@ -64,7 +64,6 @@ var hotEditablePaths = map[string]struct{}{
 	"roles.worker.triggers.labels":                                         {},
 	"roles.worker.triggers.labelMode":                                      {},
 	"roles.worker.triggers.requireAssigneeCurrentUser":                     {},
-	"roles.worker.triggers.planeAssigneeId":                                {},
 	"roles.worker.instructions":                                            {},
 	"roles.fixer.autoDiscovery":                                            {},
 	"roles.fixer.triggers.includeDrafts":                                   {},

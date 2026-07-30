@@ -12,8 +12,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -229,7 +228,7 @@ func TestRouteIssueCreatesNewLoopForNewReopenedAuthority(t *testing.T) {
 func TestDiscoverIssuesSkipsGlobalHoldLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan", domain.HoldLabelGlobal}}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan", labels.HoldGlobal}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
 
 	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -257,7 +256,7 @@ func TestProcessClaimedItemSkipsHeldPlannerIssue(t *testing.T) {
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_planner_hold", ProjectID: &projectID, LoopID: &loopID, Type: "planner", TargetType: "issue", TargetID: loopTarget, Repo: &repo, DedupeKey: "planner:hold", Priority: storage.QueuePriorityPlanner, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issueNumber, Labels: []string{domain.HoldLabelGlobal}}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issueNumber, Labels: []string{labels.HoldGlobal}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_planner_hold", ProjectID: &projectID, LoopID: &loopID, Type: "planner", TargetType: "issue", TargetID: loopTarget, Repo: &repo, Status: "running"})
@@ -283,7 +282,7 @@ func TestProcessClaimedItemSkipsHeldPlannerIssue(t *testing.T) {
 func TestRunPublishStepSkipsWhenHoldAddedBeforePush(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Labels: []string{domain.HoldLabelGlobal}}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Labels: []string{labels.HoldGlobal}}}
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
 	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Checkpoint: plannerCheckpoint{Issue: &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this"}, Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "planner/42", BaseBranch: "main"}, WriteSpec: &checkpointWriteSpec{Status: "completed"}}})
@@ -305,7 +304,7 @@ func TestRunPublishStepRechecksHoldAfterCreatingPullRequest(t *testing.T) {
 		issueDetails: []IssueDetail{
 			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
 			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
-			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan", domain.HoldLabelGlobal}},
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan", labels.HoldGlobal}},
 		},
 		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
 	}
@@ -361,7 +360,7 @@ func TestRunPublishStepRechecksPullRequestHoldAfterCreatingPullRequest(t *testin
 			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
 			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
 		},
-		prDetail:       PullRequestDetail{Number: 101, Labels: []string{domain.HoldLabelGlobal}},
+		prDetail:       PullRequestDetail{Number: 101, Labels: []string{labels.HoldGlobal}},
 		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
 	}
 	git := &fakeGitGateway{}
@@ -410,7 +409,7 @@ func TestRunPublishStepChecksLifecycleAdoptedPullRequestHoldBeforeDisclosure(t *
 	branch := "planner/42"
 	github := &fakeGitHubGateway{
 		issueDetail: IssueDetail{Number: 42, Labels: []string{"looper:plan"}},
-		prDetail:    PullRequestDetail{Number: 202, URL: "https://example/pr/202", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Labels: []string{domain.HoldLabelGlobal}, Body: "## Summary\n\nExisting spec PR"},
+		prDetail:    PullRequestDetail{Number: 202, URL: "https://example/pr/202", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Labels: []string{labels.HoldGlobal}, Body: "## Summary\n\nExisting spec PR"},
 	}
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
@@ -468,7 +467,7 @@ func TestRunPublishStepChecksBranchAdoptedPullRequestHoldBeforeDisclosure(t *tes
 	github := &fakeGitHubGateway{
 		issueDetail:      IssueDetail{Number: 42, Labels: []string{"looper:plan"}},
 		openPullRequests: []PullRequestSummary{{Number: 203, URL: "https://example/pr/203", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}},
-		prDetail:         PullRequestDetail{Number: 203, URL: "https://example/pr/203", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Labels: []string{domain.HoldLabelGlobal}, Body: "## Summary\n\nExisting spec PR"},
+		prDetail:         PullRequestDetail{Number: 203, URL: "https://example/pr/203", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Labels: []string{labels.HoldGlobal}, Body: "## Summary\n\nExisting spec PR"},
 	}
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
@@ -784,7 +783,7 @@ func TestRunWriteSpecStepRechecksPlannerHoldBeforeStartingAgent(t *testing.T) {
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issue.IssueNumber, Labels: []string{domain.HoldLabelGlobal}}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issue.IssueNumber, Labels: []string{labels.HoldGlobal}}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
@@ -827,7 +826,7 @@ func TestRunWriteSpecStepRechecksPlannerHoldAfterAgentCompletion(t *testing.T) {
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	github := &fakeGitHubGateway{issueDetails: []IssueDetail{{Number: 42}, {Number: 42, Labels: []string{domain.HoldLabelGlobal}}}}
+	github := &fakeGitHubGateway{issueDetails: []IssueDetail{{Number: 42}, {Number: 42, Labels: []string{labels.HoldGlobal}}}}
 	git := &fakeGitGateway{inspectResult: InspectHeadResult{HasUncommittedChanges: true}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now})
 
@@ -987,7 +986,7 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	if len(agent.starts) != 1 || len(git.pushCalls) != 1 || len(github.createPRCalls) != 1 {
 		t.Fatalf("agent starts=%d push=%d createPR=%d, want 1/1/1", len(agent.starts), len(git.pushCalls), len(github.createPRCalls))
 	}
-	if len(github.addLabelCalls) != 1 || len(github.addLabelCalls[0].Labels) != 1 || github.addLabelCalls[0].Labels[0] != specpr.ReviewingLabel {
+	if len(github.addLabelCalls) != 1 || len(github.addLabelCalls[0].Labels) != 1 || github.addLabelCalls[0].Labels[0] != labels.SpecReviewing {
 		t.Fatalf("addLabelCalls = %#v, want spec-reviewing label", github.addLabelCalls)
 	}
 	if got := github.createPRCalls[0].Body; !strings.Contains(got, "\nSpec: ") {
@@ -1018,7 +1017,7 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 func TestPlannerAdoptionHoldSummaryRechecksIssueBeforeAdoptedPullRequest(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Labels: []string{domain.HoldLabelGlobal}}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Labels: []string{labels.HoldGlobal}}}
 	runner := New(Options{GitHub: github, Logger: fixture.logger, Now: fixture.now})
 	checkpoint := plannerCheckpoint{Issue: &checkpointIssue{Repo: "acme/looper", IssueNumber: 42}}
 

@@ -13,6 +13,7 @@ import (
 	"github.com/nexu-io/looper/internal/coordinator/mergewatch"
 	"github.com/nexu-io/looper/internal/disclosure"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 var mergeWatchPRURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -150,7 +151,7 @@ func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue l
 		if err != nil {
 			continue
 		}
-		if detail.AutoMerge == nil || !strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)) || !hasLooperLabel(detail.Labels) || !prLinksIssue(repo, issue.detail.Number, detail.Body) {
+		if detail.AutoMerge == nil || !strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)) || !labels.AnyLooperOwned(detail.Labels) || !prLinksIssue(repo, issue.detail.Number, detail.Body) {
 			continue
 		}
 		eligible = append(eligible, prNumber)
@@ -231,7 +232,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		Open:                   open,
 		AutoMergeEnabled:       detail.AutoMerge != nil,
 		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),
-		HasLooperLabel:         hasLooperLabel(detail.Labels),
+		HasLooperLabel:         labels.AnyLooperOwned(detail.Labels),
 		Mergeable:              detail.Mergeable,
 		MergeableState:         mergeableState,
 		RequiredChecks:         checks,
@@ -247,7 +248,7 @@ func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail 
 		Open:                   strings.EqualFold(detail.State, "open"),
 		AutoMergeEnabled:       detail.AutoMerge != nil,
 		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),
-		HasLooperLabel:         hasLooperLabel(detail.Labels),
+		HasLooperLabel:         labels.AnyLooperOwned(detail.Labels),
 		Mergeable:              detail.Mergeable,
 		MergeableState:         strings.ToLower(strings.TrimSpace(detail.MergeableState)),
 	}
@@ -434,15 +435,6 @@ func (r *Runner) deleteMergeWatchComment(ctx context.Context, repo, cwd string, 
 		return nil
 	}
 	return r.github.DeleteIssueComment(ctx, githubinfra.DeleteIssueCommentInput{Repo: repo, CommentID: existing.ID, CWD: cwd})
-}
-
-func hasLooperLabel(labels []string) bool {
-	for _, label := range labels {
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(label)), "looper:") {
-			return true
-		}
-	}
-	return false
 }
 
 func isTransientMergeWatchError(err error) bool {

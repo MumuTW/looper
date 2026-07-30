@@ -231,6 +231,7 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 	}
 	return githubinfra.New(githubinfra.Options{
 		GHPath:                 *cfg.Tools.GHPath,
+		Env:                    config.DaemonGitHubCredentialEnv(cfg),
 		GitPath:                gitPath,
 		CWD:                    cwd,
 		GHRun:                  shell.Run,
@@ -1071,22 +1072,12 @@ func currentRunningReviewerRun(ctx context.Context, repos *storage.Repositories,
 		if runs[i].Status != string(domain.RunStatusRunning) {
 			continue
 		}
-		if current == nil || reviewerRunNewer(runs[i], *current) {
+		if current == nil || storage.RunNewer(runs[i], *current) {
 			run := runs[i]
 			current = &run
 		}
 	}
 	return current, nil
-}
-
-func reviewerRunNewer(candidate, current storage.RunRecord) bool {
-	if candidate.StartedAt != current.StartedAt {
-		return candidate.StartedAt > current.StartedAt
-	}
-	if candidate.CreatedAt != current.CreatedAt {
-		return candidate.CreatedAt > current.CreatedAt
-	}
-	return candidate.ID > current.ID
 }
 
 func parseReviewSubmitJSONObject(value *string) map[string]any {

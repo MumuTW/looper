@@ -38,6 +38,94 @@ func TestReviewerSummaryRenderParseAndUniqueComment(t *testing.T) {
 	}
 }
 
+// Review Item IDs are carried by the named ReviewItemID type, but they travel
+// between looperd versions as summary-comment JSON. This pins the wire bytes so
+// the type stays a compile-time-only distinction: an ID must marshal as a plain
+// JSON string, and a summary written before the type existed must still parse.
+func TestReviewItemIDWireFormatIsPlainString(t *testing.T) {
+	t.Parallel()
+
+	body, err := RenderReviewerSummary(NewReviewerSummary(3, []ReviewItem{
+		{ReviewItemID: "R-001", Status: ReviewItemStatusOpen, Title: "Open", Body: "Fix it.", LastSeenRoundID: 3},
+		{ReviewItemID: "R-002", Status: ReviewItemStatusSuperseded, Title: "Old", Body: "Old wording.", Supersedes: []ReviewItemID{"R-001"}, SupersededBy: "R-001", LastSeenRoundID: 2},
+	}))
+	if err != nil {
+		t.Fatalf("RenderReviewerSummary() error = %v", err)
+	}
+	for _, want := range []string{`"review_item_id":"R-001"`, `"supersedes":["R-001"]`, `"superseded_by":"R-001"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("RenderReviewerSummary() = %q, want it to contain %s", body, want)
+		}
+	}
+
+	// Byte-for-byte payload emitted by the pre-ReviewItemID implementation.
+	legacy := `<!-- looper:forgejo-reviewer-summary {"kind":"looper.forgejo.reviewer_summary","schema_version":1,"review_round_id":3,"items":[{"review_item_id":"R-001","status":"open","title":"Open","body":"Fix it.","last_seen_round_id":3},{"review_item_id":"R-002","status":"superseded","title":"Old","body":"Old wording.","supersedes":["R-001"],"superseded_by":"R-001","last_seen_round_id":2}]} -->`
+	parsed, err := ParseReviewerSummary(legacy)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary(legacy) error = %v", err)
+	}
+	if parsed.Items[1].SupersededBy != "R-001" || len(parsed.Items[1].Supersedes) != 1 || parsed.Items[1].Supersedes[0] != "R-001" {
+		t.Fatalf("ParseReviewerSummary(legacy) = %#v", parsed.Items[1])
+	}
+
+	fixer, err := RenderFixerSummary(NewFixerSummary(1, 3, []FixerResult{{ReviewItemID: "R-001", Result: FixerItemResultFixed, Explanation: "Done."}}))
+	if err != nil {
+		t.Fatalf("RenderFixerSummary() error = %v", err)
+	}
+	if !strings.Contains(fixer, `"review_item_id":"R-001"`) {
+		t.Fatalf("RenderFixerSummary() = %q, want a plain-string review_item_id", fixer)
+	}
+}
+
+// A summary comment can carry a padded ID — a human editing the marker, or an
+// older writer. Validation compares normalized IDs, so such a summary parses
+// clean; if parsing then handed the raw ID onward, the reviewer's rebuild would
+// index by " R-001 ", miss a finding claiming "R-001", and report the item as
+// unknown. Parsing normalizes so no consumer has to remember to.
+func TestParseNormalizesReviewItemIDs(t *testing.T) {
+	t.Parallel()
+
+	padded := `<!-- looper:forgejo-reviewer-summary {"kind":"looper.forgejo.reviewer_summary","schema_version":1,"review_round_id":3,"items":[{"review_item_id":" R-001 ","status":"open","title":"Open","body":"Fix it.","last_seen_round_id":3},{"review_item_id":"R-002","status":"superseded","title":"Old","body":"Old wording.","supersedes":["  R-001"],"superseded_by":" R-001\t","last_seen_round_id":2}]} -->`
+	parsed, err := ParseReviewerSummary(padded)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary() error = %v", err)
+	}
+	if parsed.Items[0].ReviewItemID != "R-001" {
+		t.Errorf("item 0 ReviewItemID = %q, want %q", parsed.Items[0].ReviewItemID, "R-001")
+	}
+	if parsed.Items[1].SupersededBy != "R-001" {
+		t.Errorf("item 1 SupersededBy = %q, want %q", parsed.Items[1].SupersededBy, "R-001")
+	}
+	if len(parsed.Items[1].Supersedes) != 1 || parsed.Items[1].Supersedes[0] != "R-001" {
+		t.Errorf("item 1 Supersedes = %q, want [R-001]", parsed.Items[1].Supersedes)
+	}
+
+	paddedFixer := `<!-- looper:forgejo-fixer-summary {"kind":"looper.forgejo.fixer_summary","schema_version":1,"fix_round_id":1,"consumed_review_round_id":3,"results":[{"review_item_id":" R-001 ","result":"fixed","explanation":"Done."}]} -->`
+	fixer, err := ParseFixerSummary(paddedFixer)
+	if err != nil {
+		t.Fatalf("ParseFixerSummary() error = %v", err)
+	}
+	if fixer.Results[0].ReviewItemID != "R-001" {
+		t.Errorf("fixer result ReviewItemID = %q, want %q", fixer.Results[0].ReviewItemID, "R-001")
+	}
+}
+
+// Normalized/IsZero are the single normalization point for IDs arriving from
+// agent JSON and from summary comments parsed off the forge.
+func TestReviewItemIDNormalization(t *testing.T) {
+	t.Parallel()
+
+	if got := ReviewItemID("  R-001\n").Normalized(); got != "R-001" {
+		t.Fatalf("Normalized() = %q, want %q", got, "R-001")
+	}
+	if !ReviewItemID(" \t ").IsZero() {
+		t.Fatal("IsZero() = false for a whitespace-only ID, want true")
+	}
+	if ReviewItemID("R-001").IsZero() {
+		t.Fatal("IsZero() = true for an assigned ID, want false")
+	}
+}
+
 func TestReviewerSummaryValidationFailures(t *testing.T) {
 	t.Parallel()
 

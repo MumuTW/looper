@@ -900,7 +900,7 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	if result.Status != "completed" {
 		t.Fatalf("result.Status = %q, want completed", result.Status)
 	}
-	if result.ParseStatus != "parsed" || result.CompletionSignal != CompletionMarkerPrefix || result.Summary != "done" {
+	if result.ParseStatus != "parsed" || result.CompletionSignal != CompletionMarkerPrefix || result.CompletionPayload == "" || result.Summary != "done" {
 		t.Fatalf("result = %#v, want parsed completion marker result", result)
 	}
 	if len(result.Artifacts) != 1 || result.Artifacts[0] != "spec.md" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "main.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {
@@ -1041,6 +1041,27 @@ func TestParseCompletionIgnoresTemplatePlaceholder(t *testing.T) {
 	parsed := parseCompletion(CompletionMarkerPrefix+`{"summary":"<one-sentence summary>"}`+"\nreal work\n", "")
 	if parsed.ParseStatus != "missing" || parsed.Summary != "" {
 		t.Fatalf("parseCompletion() = %#v, want template placeholder ignored", parsed)
+	}
+}
+
+// TestParseCompletionIgnoresFixerTemplatePlaceholders guards the fixer-specific
+// completion templates: an agent that echoes either offered example and exits
+// without emitting a real result must not authorize downstream actions. The
+// core detector keys on the "<one-sentence summary>" placeholder alone, so the
+// outcome/failure_kind keys alongside it do not slip past as a real completion.
+func TestParseCompletionIgnoresFixerTemplatePlaceholders(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		`{"outcome":"completed","summary":"<one-sentence summary>"}`,
+		`{"outcome":"blocked","failure_kind":"manual_intervention","summary":"<one-sentence summary>"}`,
+	}
+	for _, payload := range cases {
+		stdout := CompletionMarkerPrefix + payload + "\nreal work\n"
+		parsed := parseCompletion(stdout, "")
+		if parsed.ParseStatus != "missing" || parsed.Summary != "" || parsed.CompletionPayload != "" {
+			t.Fatalf("parseCompletion(%s) = %#v, want echoed fixer template ignored", payload, parsed)
+		}
 	}
 }
 

@@ -558,7 +558,14 @@ func webhookForwardEndpoint(cfg config.Config) (*string, []string) {
 		if !isManagerLoopbackHost(base.Hostname()) {
 			return nil, []string{fmt.Sprintf("server.baseUrl host %q is not loopback", base.Hostname())}
 		}
-		resolved := base.ResolveReference(&url.URL{Path: webhookForwardPath})
+		// The canonical base URL carries no path prefix: CanonicalizeServerBaseURL
+		// rejects path-prefixed advertised URLs because the dashboard requests
+		// API routes and assets by absolute path. Resolve the forward route as
+		// the absolute /webhook/forward path rather than appending beneath a
+		// prefix that can no longer reach this consumer.
+		resolved := *base
+		resolved.Path = webhookForwardPath
+		resolved.RawPath = ""
 		endpoint := resolved.String()
 		return &endpoint, nil
 	}

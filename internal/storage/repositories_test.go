@@ -658,6 +658,94 @@ func TestRunsGetLatestByLoopIDBreaksStartedAtTiesByCreatedAt(t *testing.T) {
 	}
 }
 
+func TestRunsLatestRunSelectionBreaksIdenticalTimestampsByInsertionOrder(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{
+		ID:        "project_run_seq",
+		Name:      "Looper",
+		RepoPath:  "/tmp/looper",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{
+		ID:         "loop_run_seq",
+		Seq:        1,
+		ProjectID:  "project_run_seq",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		Status:     "failed",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// Fast retries within one millisecond: identical started_at AND created_at.
+	// IDs descend lexically so the old id-based tie-break would pick the wrong
+	// (first-inserted) attempt.
+	startedAt := "2026-04-11T12:00:01.000Z"
+	checkpoint := `{"resumePolicy":"on_failure"}`
+	for _, runID := range []string{"z_attempt_1", "m_attempt_2", "a_attempt_3"} {
+		if err := repos.Runs.Upsert(ctx, RunRecord{
+			ID:             runID,
+			LoopID:         "loop_run_seq",
+			Status:         "failed",
+			CheckpointJSON: &checkpoint,
+			StartedAt:      startedAt,
+			CreatedAt:      startedAt,
+			UpdatedAt:      startedAt,
+		}); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", runID, err)
+		}
+	}
+
+	// Re-upserting an older attempt must not reassign its insertion sequence.
+	if err := repos.Runs.Upsert(ctx, RunRecord{
+		ID:        "z_attempt_1",
+		LoopID:    "loop_run_seq",
+		Status:    "interrupted",
+		StartedAt: startedAt,
+		CreatedAt: startedAt,
+		UpdatedAt: "2026-04-11T12:00:02.000Z",
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(z_attempt_1 update) error = %v", err)
+	}
+
+	for attempt := 0; attempt < 5; attempt++ {
+		latestRun, err := repos.Runs.GetLatestByLoopID(ctx, "loop_run_seq")
+		if err != nil {
+			t.Fatalf("Runs.GetLatestByLoopID() error = %v", err)
+		}
+		if latestRun == nil || latestRun.ID != "a_attempt_3" {
+			t.Fatalf("Runs.GetLatestByLoopID() attempt %d = %#v, want a_attempt_3", attempt, latestRun)
+		}
+
+		batch, err := repos.Runs.ListLatestByLoopIDs(ctx, []string{"loop_run_seq"})
+		if err != nil {
+			t.Fatalf("Runs.ListLatestByLoopIDs() error = %v", err)
+		}
+		if len(batch) != 1 || batch[0].ID != "a_attempt_3" {
+			t.Fatalf("Runs.ListLatestByLoopIDs() attempt %d = %#v, want [a_attempt_3]", attempt, batch)
+		}
+
+		byPolicy, err := repos.Runs.ListLatestByLoopStatusesAndResumePolicy(ctx, []string{"failed"}, "on_failure")
+		if err != nil {
+			t.Fatalf("Runs.ListLatestByLoopStatusesAndResumePolicy() error = %v", err)
+		}
+		if len(byPolicy) != 1 || byPolicy[0].ID != "a_attempt_3" {
+			t.Fatalf("Runs.ListLatestByLoopStatusesAndResumePolicy() attempt %d = %#v, want [a_attempt_3]", attempt, byPolicy)
+		}
+	}
+}
+
 func TestLoopsAllocateSeqSeedsFromMaxWhenCounterMissing(t *testing.T) {
 	t.Parallel()
 
@@ -2467,4 +2555,149 @@ func openMigratedCoordinatorForRepositories(t *testing.T) *SQLiteCoordinator {
 	}
 
 	return coordinator
+}
+
+func TestRunNewerBreaksTimestampTiesBySeq(t *testing.T) {
+	t.Parallel()
+
+	older := RunRecord{ID: "z_first", StartedAt: "2026-04-11T12:00:01.000Z", CreatedAt: "2026-04-11T12:00:01.000Z", Seq: 1}
+	newer := RunRecord{ID: "a_second", StartedAt: "2026-04-11T12:00:01.000Z", CreatedAt: "2026-04-11T12:00:01.000Z", Seq: 2}
+	if !RunNewer(newer, older) {
+		t.Fatal("RunNewer(newer, older) = false, want true for higher seq on tied timestamps")
+	}
+	if RunNewer(older, newer) {
+		t.Fatal("RunNewer(older, newer) = true, want false for lower seq on tied timestamps")
+	}
+
+	laterStart := RunRecord{ID: "b", StartedAt: "2026-04-11T12:00:02.000Z", CreatedAt: "2026-04-11T12:00:02.000Z", Seq: 1}
+	if !RunNewer(laterStart, newer) {
+		t.Fatal("RunNewer(laterStart, newer) = false, want true: timestamps outrank seq")
+	}
+}
+
+func TestQueueStickySnapshotClaimInspectsNewestTiedRun(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_sticky", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_sticky_eligible", Seq: 1, ProjectID: "project_sticky", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_sticky_eligible) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_sticky_ineligible", Seq: 2, ProjectID: "project_sticky", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_sticky_ineligible) error = %v", err)
+	}
+
+	// Same-millisecond attempts: only the newest insert decides eligibility.
+	// Eligible loop: newest insert failed with a snapshot; older tied insert
+	// completed without one. Ineligible loop: the mirror image.
+	snapshot := `{"vendor":"claude"}`
+	tieAt := "2026-04-11T11:59:00.000Z"
+	for _, run := range []RunRecord{
+		{ID: "z_done", LoopID: "loop_sticky_eligible", Status: "completed", StartedAt: tieAt, CreatedAt: tieAt, UpdatedAt: tieAt},
+		{ID: "a_retry", LoopID: "loop_sticky_eligible", Status: "failed", AgentSnapshotJSON: &snapshot, StartedAt: tieAt, CreatedAt: tieAt, UpdatedAt: tieAt},
+		{ID: "z_retry", LoopID: "loop_sticky_ineligible", Status: "failed", AgentSnapshotJSON: &snapshot, StartedAt: tieAt, CreatedAt: tieAt, UpdatedAt: tieAt},
+		{ID: "a_done", LoopID: "loop_sticky_ineligible", Status: "completed", StartedAt: tieAt, CreatedAt: tieAt, UpdatedAt: tieAt},
+	} {
+		if err := repos.Runs.Upsert(ctx, run); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		}
+	}
+
+	loopEligible := "loop_sticky_eligible"
+	loopIneligible := "loop_sticky_ineligible"
+	for _, item := range []QueueItemRecord{
+		{ID: "qi_eligible", LoopID: &loopEligible, Type: "worker", TargetType: "project", TargetID: "project_sticky", DedupeKey: "d_sticky_eligible", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_ineligible", LoopID: &loopIneligible, Type: "worker", TargetType: "project", TargetID: "project_sticky", DedupeKey: "d_sticky_ineligible", Priority: 2, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	claimed, err := repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, now, "worker-a", nil, []string{"worker"})
+	if err != nil {
+		t.Fatalf("ClaimNextNonLongTermRetryAmongTypeSets() error = %v", err)
+	}
+	if claimed == nil || claimed.ID != "qi_eligible" {
+		t.Fatalf("ClaimNextNonLongTermRetryAmongTypeSets() = %#v, want qi_eligible", claimed)
+	}
+
+	second, err := repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, now, "worker-a", nil, []string{"worker"})
+	if err != nil {
+		t.Fatalf("second ClaimNextNonLongTermRetryAmongTypeSets() error = %v", err)
+	}
+	if second != nil {
+		t.Fatalf("second ClaimNextNonLongTermRetryAmongTypeSets() = %#v, want nil: newest tied run is completed", second)
+	}
+}
+
+func TestRunsTouchHeartbeatOnlyMovesForward(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_touch_hb", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_touch_hb", Seq: 1, ProjectID: "project_touch_hb", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpoint := `{"resumePolicy":"always"}`
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_touch_hb", LoopID: "loop_touch_hb", Status: "running", CheckpointJSON: &checkpoint, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	// NULL heartbeat: first touch sets it.
+	t2 := "2026-04-11T12:00:02.000Z"
+	if err := repos.Runs.TouchHeartbeat(ctx, "run_touch_hb", t2); err != nil {
+		t.Fatalf("TouchHeartbeat(t2) error = %v", err)
+	}
+	run, err := repos.Runs.GetByID(ctx, "run_touch_hb")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.LastHeartbeatAt == nil || *run.LastHeartbeatAt != t2 {
+		t.Fatalf("LastHeartbeatAt = %v, want %q", run.LastHeartbeatAt, t2)
+	}
+
+	// A stale writer cannot move liveness evidence backward.
+	t1 := "2026-04-11T12:00:01.000Z"
+	if err := repos.Runs.TouchHeartbeat(ctx, "run_touch_hb", t1); err != nil {
+		t.Fatalf("TouchHeartbeat(t1) error = %v", err)
+	}
+	run, err = repos.Runs.GetByID(ctx, "run_touch_hb")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.LastHeartbeatAt == nil || *run.LastHeartbeatAt != t2 {
+		t.Fatalf("LastHeartbeatAt after stale touch = %v, want %q retained", run.LastHeartbeatAt, t2)
+	}
+	if run.UpdatedAt != t2 {
+		t.Fatalf("UpdatedAt after stale touch = %q, want %q retained", run.UpdatedAt, t2)
+	}
+
+	// Forward touch advances, and no other column is disturbed.
+	t3 := "2026-04-11T12:00:03.000Z"
+	if err := repos.Runs.TouchHeartbeat(ctx, "run_touch_hb", t3); err != nil {
+		t.Fatalf("TouchHeartbeat(t3) error = %v", err)
+	}
+	run, err = repos.Runs.GetByID(ctx, "run_touch_hb")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.LastHeartbeatAt == nil || *run.LastHeartbeatAt != t3 {
+		t.Fatalf("LastHeartbeatAt = %v, want %q", run.LastHeartbeatAt, t3)
+	}
+	if run.Status != "running" || run.CheckpointJSON == nil || *run.CheckpointJSON != checkpoint || run.StartedAt != now {
+		t.Fatalf("TouchHeartbeat disturbed other columns: %#v", run)
+	}
 }

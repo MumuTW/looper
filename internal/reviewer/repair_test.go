@@ -6,7 +6,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -177,7 +177,7 @@ func TestRepairKeepsReadyLabelSkipWhileLabelPresent(t *testing.T) {
 		currentLogin:   "octocat",
 		reviewRequests: []string{"octocat"},
 		viewHeadSHA:    "abc123",
-		labels:         []string{specpr.ReadyLabel},
+		labels:         []string{labels.SpecReady},
 	})
 
 	result, err := repairer.Repair(context.Background(), RepairInput{Repo: "acme/looper", PRNumber: 42})
@@ -332,7 +332,7 @@ func readyLabelFilterSkipMetadata() string {
 			"kind":          "ready_label",
 			"reason":        "PR has ready label",
 			"headSha":       "abc123",
-			"requiredLabel": specpr.ReadyLabel,
+			"requiredLabel": labels.SpecReady,
 			"recordedAt":    "2026-05-17T06:00:00.000Z",
 		},
 	})

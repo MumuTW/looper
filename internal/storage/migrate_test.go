@@ -931,3 +931,86 @@ func containsAll(s string, parts []string) bool {
 	}
 	return true
 }
+
+func TestMigration0020BackfillsRunSeqByInsertionOrderWithinTies(t *testing.T) {
+	t.Parallel()
+
+	if len(EmbeddedMigrations) < 20 || EmbeddedMigrations[19].ID != "0020_run_seq" {
+		t.Fatalf("EmbeddedMigrations[19] = %#v, want 0020_run_seq", EmbeddedMigrations[19])
+	}
+
+	ctx := context.Background()
+	db := openTestSQLiteDB(t)
+	seedRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:19]})
+	if _, err := seedRunner.RunPending(ctx); err != nil {
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+
+	repos := NewRepositories(db)
+	now := "2026-04-17T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_migration_0020", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_migration_0020", Seq: 1, ProjectID: "project_migration_0020", Type: "fixer", TargetType: "pull_request", Status: "completed", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// Seed runs with pre-0020 DDL via raw SQL: RunsRepository targets the latest
+	// schema. The two tied rows share identical timestamps and are distinguished
+	// only by insertion order.
+	oldAt := "2026-04-17T10:00:00.000Z"
+	tieAt := "2026-04-17T11:00:00.000Z"
+	for _, run := range []struct{ id, startedAt, createdAt string }{
+		{id: "run_oldest", startedAt: oldAt, createdAt: oldAt},
+		{id: "z_tie_first", startedAt: tieAt, createdAt: tieAt},
+		{id: "a_tie_second", startedAt: tieAt, createdAt: tieAt},
+	} {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO runs (id, loop_id, status, started_at, created_at, updated_at)
+			VALUES (?, 'loop_migration_0020', 'completed', ?, ?, ?)
+		`, run.id, run.startedAt, run.createdAt, run.createdAt); err != nil {
+			t.Fatalf("insert run %s error = %v", run.id, err)
+		}
+	}
+
+	migrationRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:20]})
+	result, err := migrationRunner.RunPending(ctx)
+	if err != nil {
+		t.Fatalf("RunPending() applying 0020 error = %v", err)
+	}
+	if !reflect.DeepEqual(result.AppliedIDs, []string{"0020_run_seq"}) {
+		t.Fatalf("RunPending().AppliedIDs = %v, want [0020_run_seq]", result.AppliedIDs)
+	}
+
+	wantSeqs := map[string]int64{"run_oldest": 1, "z_tie_first": 2, "a_tie_second": 3}
+	for runID, wantSeq := range wantSeqs {
+		var gotSeq int64
+		if err := db.QueryRowContext(ctx, `SELECT seq FROM runs WHERE id = ?`, runID).Scan(&gotSeq); err != nil {
+			t.Fatalf("read seq for %s error = %v", runID, err)
+		}
+		if gotSeq != wantSeq {
+			t.Fatalf("backfilled seq for %s = %d, want %d", runID, gotSeq, wantSeq)
+		}
+	}
+
+	latestRun, err := repos.Runs.GetLatestByLoopID(ctx, "loop_migration_0020")
+	if err != nil {
+		t.Fatalf("Runs.GetLatestByLoopID() error = %v", err)
+	}
+	if latestRun == nil || latestRun.ID != "a_tie_second" {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, want a_tie_second", latestRun)
+	}
+
+	// New inserts continue the sequence above the backfilled maximum.
+	newAt := "2026-04-17T13:00:00.000Z"
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_post_migration", LoopID: "loop_migration_0020", Status: "running", StartedAt: newAt, CreatedAt: newAt, UpdatedAt: newAt}); err != nil {
+		t.Fatalf("Runs.Upsert(run_post_migration) error = %v", err)
+	}
+	var postSeq int64
+	if err := db.QueryRowContext(ctx, `SELECT seq FROM runs WHERE id = 'run_post_migration'`).Scan(&postSeq); err != nil {
+		t.Fatalf("read seq for run_post_migration error = %v", err)
+	}
+	if postSeq != 4 {
+		t.Fatalf("seq for run_post_migration = %d, want 4", postSeq)
+	}
+}

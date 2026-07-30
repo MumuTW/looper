@@ -99,7 +99,7 @@ With the daemon up, register a local git repository root either:
 
 Registration completes as soon as the project is validated, committed, and published. Worktree and pull request discovery then runs as post-commit work in the daemon — even on a repository with many open pull requests `looper project add` returns immediately, reporting discovery as pending. Discovery status is stored on the project record; if it fails, retry it with `looper project discover <id>` (or `POST /api/v1/projects/{id}/discover`) without re-registering the project.
 
-Do not use `looper project add` for Forgejo or Plane projects. Those need a provider binding the CLI cannot express, so they belong in `[[projects]]` in the config file. Registering one through the API first and adding it to the config afterwards makes `looperd` fail to start, because a configured project cannot take over an id an API-managed record already holds.
+Do not use `looper project add` for Forgejo projects. Those need a provider binding the CLI cannot express, so they belong in `[[projects]]` in the config file. Registering one through the API first and adding it to the config afterwards makes `looperd` fail to start, because a configured project cannot take over an id an API-managed record already holds.
 
 Projects registered through the API take effect immediately. Projects listed under `[[projects]]` in the config file are imported at daemon startup instead.
 
@@ -140,7 +140,9 @@ Manual: replace the binaries. Download the newer `looper-<target>.tar.gz` and `l
 curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/uninstall.sh | sh
 ```
 
-The uninstall script removes the CLI binary, any daemon binary under `~/.looper/bin/`, and updater state. It asks before deleting config, the SQLite DB, backups, logs, and worktrees. A `looperd` you installed elsewhere on your `PATH` has to be removed by hand.
+The uninstall script removes the installer-owned CLI binary, any daemon binary under `$LOOPER_HOME/bin/` (default `~/.looper/bin/`), updater state, and the exact PATH stanza added by the installer to `.zprofile`, `.bash_profile`, or `.profile`. Unrelated profile content is preserved.
+
+Before removing user data, it lists every existing path in scope and asks for approval. That optional scope is `config.toml`, `config.json`, `config.yaml`, `config.yml`, `looper.sqlite` plus its `-wal`/`-shm` sidecars, `backups/`, `logs/`, and `worktrees/` under `$LOOPER_HOME`. Declining leaves all of those paths untouched. For an explicitly authorized non-interactive uninstall, set `LOOPER_UNINSTALL_YES=1`; other values do not grant deletion authority. A `looperd` installed elsewhere on `PATH` still has to be removed by hand.
 
 ## From source
 
