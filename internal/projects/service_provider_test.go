@@ -220,3 +220,49 @@ func TestInertProjectWarningNeverAdvisesTheDestructivePath(t *testing.T) {
 		}
 	}
 }
+
+// Explicit IDs must have the same non-destructive repair route as derived
+// IDs. The API labels a supplied id as explicit, so accepting only derived
+// IDs would make the warning's re-registration advice impossible to follow.
+func TestServiceAddProjectRepairsExplicitIDAtSameCheckout(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	repoPath := t.TempDir()
+	service := &Service{
+		DB:              coordinator.DB(),
+		Repos:           repos,
+		Config:          cfg,
+		Now:             time.Now,
+		PublishProjects: func([]config.ProjectRefConfig) {},
+	}
+
+	initial, err := service.AddProject(context.Background(), AddInput{
+		ID: "demo", IDSource: "explicit", Name: "Demo", RepoPath: repoPath,
+	})
+	if err != nil {
+		t.Fatalf("initial AddProject() error = %v", err)
+	}
+	if !strings.Contains(strings.Join(initial.Warnings, "\n"), "no automation will run") {
+		t.Fatalf("initial warnings = %#v, want inert-project warning", initial.Warnings)
+	}
+
+	repo := "owner/demo"
+	repaired, err := service.AddProject(context.Background(), AddInput{
+		ID: "demo", IDSource: "explicit", Name: "Demo", RepoPath: repoPath, Repo: &repo,
+	})
+	if err != nil {
+		t.Fatalf("repair AddProject() error = %v", err)
+	}
+	if repaired.Project.CreatedAt != initial.Project.CreatedAt {
+		t.Fatalf("repaired CreatedAt = %q, want existing project creation time %q", repaired.Project.CreatedAt, initial.Project.CreatedAt)
+	}
+	if repaired.Repo == nil || *repaired.Repo != repo {
+		t.Fatalf("repaired repo = %#v, want %q", repaired.Repo, repo)
+	}
+}

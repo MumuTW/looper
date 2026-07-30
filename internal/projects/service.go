@@ -321,8 +321,11 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", existing.ID)}
 	}
 	if existing != nil && !existing.Archived {
-		derivedReusesSameCheckout := input.IDSource == "derived" && sameProjectRepoPath(existing.RepoPath, input.RepoPath)
-		if !derivedReusesSameCheckout {
+		// Re-registration is the only non-destructive repair path for an API
+		// project with missing repository metadata. The stable authority is the
+		// existing project ID and its checkout, not whether the caller supplied
+		// that ID or the API derived it from the path.
+		if !sameProjectRepoPath(existing.RepoPath, input.RepoPath) {
 			return AddResult{}, nil, ProjectIDCollisionError{ProjectID: projectID}
 		}
 	}
