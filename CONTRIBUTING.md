@@ -43,6 +43,19 @@ go build ./...
 go test ./...
 ```
 
+`go build` and `go run` are the fast Go-only development paths. From a clean
+checkout they intentionally embed the small diagnostic fallback page because Go
+does not invoke the Node toolchain. Build a runnable/distributable daemon with
+the production dashboard through the repository's build authority:
+
+```bash
+scripts/build-looperd.sh                         # writes dist/looperd
+scripts/build-looperd.sh --output /tmp/looperd  # explicit destination
+```
+
+That command installs the locked dashboard dependencies, builds the SPA, then
+compiles `looperd`. Release CI and `scripts/update-daemon.sh` use the same path.
+
 Common dev loop from the repo root:
 
 ```bash
@@ -56,7 +69,7 @@ Default runtime artifacts land in `~/.looper/` (`looper.sqlite`, `backups/`, `lo
 
 ## Local pre-flight (so CI never surprises you)
 
-CI's `verify` job runs, in order: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → production-only `staticcheck` → `go test ./...` → `go build`. A separate `race` job runs the race detector over the focused package set in `scripts/race-packages.txt`. Two helpers keep you ahead of both:
+CI's `verify` job runs, in order: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → production-only `staticcheck` → `go test ./...` → `go build` → a release-style `looperd` binary check that loads the embedded SPA, its JavaScript bundle, and the dashboard's shared local APIs. A separate `race` job runs the race detector over the focused package set in `scripts/race-packages.txt`. Two helpers keep you ahead of both:
 
 ```bash
 scripts/verify.sh --install-hooks   # one-time per clone: git commits now auto-gofmt
@@ -128,7 +141,7 @@ For GitHub live sandbox tests, prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`; `LOOPER_
 
 1. Fork the repo (or branch directly if you have write access).
 2. Make your changes on a feature branch.
-3. Ensure `scripts/verify.sh` is clean (dashboard build + `gofmt -l .` → `go vet ./...` → production-only `staticcheck` → `go test ./...` → `go test -race` → `go build ./...`) — these are exactly what CI's `verify` and `race` jobs run.
+3. Ensure `scripts/verify.sh` is clean (dashboard build + `gofmt -l .` → `go vet ./...` → production-only `staticcheck` → `go test ./...` → `go test -race` → Go builds + embedded-dashboard binary contract) — these are exactly what CI's `verify` and `race` jobs run.
 4. Open a PR against `main` with:
    - A semantic title (same rules as commits)
    - A short description of the change and motivation

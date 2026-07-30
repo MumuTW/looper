@@ -49,7 +49,7 @@ mv looperd-darwin-arm64 ~/.local/bin/looperd
 chmod 0755 ~/.local/bin/looperd
 ```
 
-Release binaries are unsigned. If macOS Gatekeeper blocks the first launch, allow the binary manually in System Settings. From a source checkout, `go build -o ~/.local/bin/looperd ./cmd/looperd` works instead.
+Release binaries are unsigned. If macOS Gatekeeper blocks the first launch, allow the binary manually in System Settings. From a source checkout, use `scripts/build-looperd.sh --output ~/.local/bin/looperd`; it builds and embeds the production dashboard before compiling the daemon.
 
 ### 3. Write a config
 
@@ -154,13 +154,19 @@ git clone https://github.com/mumutw/looper.git
 cd looper
 ```
 
-Then build or run the Go binaries:
+Then build the CLI and a distributable daemon:
 
 ```bash
 go build -o looper ./cmd/looper
-go build -o looperd ./cmd/looperd
-go run ./cmd/looperd
+scripts/build-looperd.sh --output looperd
+./looperd
 ```
+
+Plain `go build ./cmd/looperd` and `go run ./cmd/looperd` remain supported for
+Go-only development, but a clean checkout has no generated SPA assets, so those
+commands serve the diagnostic fallback page. `scripts/build-looperd.sh` is the
+supported source/release build when the local dashboard must be usable; it uses
+the pinned Node/pnpm dependencies before compiling the Go binary.
 
 In another shell, run the CLI from source:
 

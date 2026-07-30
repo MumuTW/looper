@@ -77,7 +77,7 @@ if [ "$promote" -eq 0 ]; then
     LOOPER_BUILD_GIT_SHA="$sha" \
     LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     LOOPER_BUILD_VERSION="0.0.0-dev+g$short" \
-    sh -c 'go build -ldflags "$(go run ./tools/go-build-flags)" -o "$0" ./cmd/looperd' "$tmp/looperd.new"
+    ./scripts/build-looperd.sh --output "$tmp/looperd.new"
   )
 
   built="$("$tmp/looperd.new" --version)"
