@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -184,6 +185,7 @@ type PullRequestCheckRuns struct {
 }
 
 type PullRequestCheckRun struct {
+	ID           int64
 	Name         string
 	Status       string
 	Conclusion   string
@@ -196,6 +198,10 @@ type PullRequestCheckRun struct {
 type PullRequestStatus struct {
 	Context string
 	State   string
+}
+
+type CheckRunAnnotation struct {
+	Path string
 }
 
 type CommentInfo struct {
@@ -455,6 +461,12 @@ type PullRequestCheckRunsInput struct {
 	Repo string
 	Ref  string
 	CWD  string
+}
+
+type CheckRunAnnotationsInput struct {
+	Repo       string
+	CheckRunID int64
+	CWD        string
 }
 
 // RerequestCheckSuiteInput identifies one GitHub check suite to rerun. The
@@ -1805,7 +1817,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 	checkRuns := toObjectSlice(row["check_runs"])
 	out := PullRequestCheckRuns{TotalCount: int(asInt64(row["total_count"])), CheckRuns: make([]PullRequestCheckRun, 0, len(checkRuns))}
 	for _, checkRun := range checkRuns {
-		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id"), StartedAt: asString(checkRun["started_at"]), CompletedAt: asString(checkRun["completed_at"])})
+		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{ID: asInt64(checkRun["id"]), Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id"), StartedAt: asString(checkRun["started_at"]), CompletedAt: asString(checkRun["completed_at"])})
 	}
 	statuses := toObjectSlice(statusRow["statuses"])
 	out.Statuses = make([]PullRequestStatus, 0, len(statuses))
@@ -1823,6 +1835,66 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 		out.Statuses = append(out.Statuses, PullRequestStatus{Context: contextName, State: asString(status["state"])})
 	}
 	return out, nil
+}
+
+func (g *Gateway) ListCheckRunAnnotations(ctx context.Context, input CheckRunAnnotationsInput) ([]CheckRunAnnotation, error) {
+	if input.CheckRunID <= 0 {
+		return nil, fmt.Errorf("list check run annotations: positive check run ID is required")
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/check-runs/%d/annotations?per_page=100", repo, input.CheckRunID), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	annotations := make([]CheckRunAnnotation, 0, len(rows))
+	for _, row := range rows {
+		if path := strings.TrimSpace(asString(row["path"])); path != "" {
+			annotations = append(annotations, CheckRunAnnotation{Path: path})
+		}
+	}
+	return annotations, nil
+}
+
+func (g *Gateway) ListPullRequestFiles(ctx context.Context, input ViewPullRequestInput) ([]string, error) {
+	if input.PRNumber <= 0 {
+		return nil, fmt.Errorf("list pull request files: positive pull request number is required")
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/files?per_page=100", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(rows))
+	files := make([]string, 0, len(rows))
+	for _, row := range rows {
+		filename := strings.TrimSpace(asString(row["filename"]))
+		if filename == "" {
+			continue
+		}
+		if _, exists := seen[filename]; exists {
+			continue
+		}
+		seen[filename] = struct{}{}
+		files = append(files, filename)
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // RerequestCheckSuite asks GitHub to rerun one check suite. It deliberately

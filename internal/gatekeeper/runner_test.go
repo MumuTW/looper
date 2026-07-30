@@ -339,6 +339,8 @@ type fakeGatekeeperGitHub struct {
 	deletedIDs   []int64
 	merges       []githubinfra.EnableAutoMergeInput
 	mergeErr     error
+	files        []string
+	filesErr     error
 	// beforeView, when set, runs before each pull-request read, so a test can
 	// change forge state between the primary and confirming evaluations.
 	beforeView    func(*fakeGatekeeperGitHub)
@@ -428,6 +430,10 @@ func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.Li
 }
 func (f *fakeGatekeeperGitHub) GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error) {
 	return f.finalHeadSHA, f.finalBaseSHA, nil
+}
+
+func (f *fakeGatekeeperGitHub) ListPullRequestFiles(context.Context, githubinfra.ViewPullRequestInput) ([]string, error) {
+	return f.files, f.filesErr
 }
 
 func reasonCodes(reasons []Reason) []ReasonCode {
