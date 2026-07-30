@@ -100,22 +100,22 @@ func TestTerminalCleanupPersistsFailureAsAttemptWithoutCleaned(t *testing.T) {
 	}
 }
 
-// TestTerminalCleanupPreservesConcurrentCheckpointRewrite is the assertion that
+// TestTerminalCleanupPreservesConcurrentRunState is the assertion that
 // matters most here, and the one the first version of this file missed. Replacing
 // checkpoint_json wholesale leaves the scalar columns intact while still erasing a
 // concurrent checkpoint transition — an operator retry rewriting resumePolicy to
 // restart_from_discover between completion and cleanup — so the requeued run would
 // resume the invalid downstream checkpoint it was retried to escape.
-func TestTerminalCleanupPreservesConcurrentCheckpointRewrite(t *testing.T) {
+func TestTerminalCleanupPreservesConcurrentRunState(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
 	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_policy_race", filepath.Join(t.TempDir(), "wt-46"))
 
-	// Something else rewrites the stored checkpoint after the in-memory copy was
-	// captured — as an operator retry does via
-	// MarkInvalidCompletionRunRestartFromDiscover, which sets exactly this policy.
+	// Something else advances the run after the in-memory copy was captured: an
+	// operator retry rewrites resumePolicy — MarkInvalidCompletionRunRestartFromDiscover
+	// sets exactly this policy — and the run moves on to a new status and step.
 	stored, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_policy_race")
 	if err != nil || stored == nil {
 		t.Fatalf("Runs.GetByID() = (%#v, %v)", stored, err)
@@ -125,6 +125,8 @@ func TestTerminalCleanupPreservesConcurrentCheckpointRewrite(t *testing.T) {
 	rewritten := mustMarshalJSON(concurrent)
 	updated := *stored
 	updated.CheckpointJSON = &rewritten
+	updated.Status = "interrupted"
+	updated.CurrentStep = stringPtr(string(stepDiscoverPR))
 	if err := fixture.repos.Runs.Upsert(context.Background(), updated); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -148,45 +150,12 @@ func TestTerminalCleanupPreservesConcurrentCheckpointRewrite(t *testing.T) {
 	if final.Worktree.Path == "" || final.Worktree.Branch == "" {
 		t.Fatalf("stored worktree = %#v, want path and branch preserved by the field-level merge", final.Worktree)
 	}
-}
-
-// TestTerminalCleanupDoesNotRevertConcurrentRunTransition covers the scalar columns:
-// cleanup must not push the stale in-memory status and step back over newer values.
-func TestTerminalCleanupDoesNotRevertConcurrentRunTransition(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	git := &fakeGitGateway{}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
-	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_race", filepath.Join(t.TempDir(), "wt-44"))
-
-	// Something else advances the run after the in-memory checkpoint was captured.
-	stored, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_race")
-	if err != nil || stored == nil {
-		t.Fatalf("Runs.GetByID() = (%#v, %v)", stored, err)
-	}
-	updated := *stored
-	updated.Status = "interrupted"
-	updated.CurrentStep = stringPtr(string(stepDiscoverPR))
-	if err := fixture.repos.Runs.Upsert(context.Background(), updated); err != nil {
-		t.Fatalf("Runs.Upsert() error = %v", err)
-	}
-
-	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "run_cleanup_race", &checkpoint)
-
-	after, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_race")
-	if err != nil || after == nil {
-		t.Fatalf("Runs.GetByID() = (%#v, %v)", after, err)
-	}
+	// Scalar columns too: the stale in-memory record must not be pushed back.
 	if after.Status != "interrupted" {
 		t.Fatalf("run Status = %q, want interrupted preserved across cleanup", after.Status)
 	}
 	if got := derefString(after.CurrentStep); got != string(stepDiscoverPR) {
 		t.Fatalf("run CurrentStep = %q, want %q preserved across cleanup", got, stepDiscoverPR)
-	}
-	if _, cleaned := storedCleanupTimestamps(t, fixture, "run_cleanup_race"); cleaned == "" {
-		t.Fatal("stored CleanedAt is empty, want cleanup still recorded alongside the newer transition")
 	}
 }
 
