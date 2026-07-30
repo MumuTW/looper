@@ -995,11 +995,13 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair, worktree *check
 		// Path != "" and an empty CleanedAt only prove Looper did not record
 		// cleanup; they do not prove the worktree still exists on disk (external
 		// deletion, daemon restart with an old checkpoint, or an agent removing
-		// its working directory can all leave a stale path). Verify the local
-		// path before claiming preservation, and otherwise describe the recorded
-		// path so the operator is not told recovery evidence was preserved at a
-		// nonexistent location.
-		if _, statErr := os.Stat(worktree.Path); statErr == nil {
+		// its working directory can all leave a stale path). os.Stat succeeds for
+		// an empty directory or an unrelated file recreated at the recorded path,
+		// so claim preservation only when the path is still a usable fixer git
+		// checkout (the same local checkout-usability probe prepare uses); otherwise
+		// describe the recorded path so the operator is not told recovery evidence
+		// was preserved at a nonexistent or unrelated location.
+		if localFixerWorktreeCheckoutUsable(worktree.Path) {
 			message += "; worktree preserved at " + worktree.Path
 		} else {
 			message += "; recorded worktree path " + worktree.Path
@@ -2158,7 +2160,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := validateFixerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
 		failure := r.classifyFailure(err)
 		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-		latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
+		// createRunContext sets a resumed checkpoint's policy to
+		// advance_from_checkpoint, so NormalizeResumePolicy would preserve that
+		// nonempty advance policy and leave the failed run ineligible for
+		// MarkManualInterventionRunRestartFromDiscover. A manual-intervention
+		// resume-validation failure (missing/invalid repair result on a legacy or
+		// interrupted downstream checkpoint) must durably park the checkpoint so
+		// operator retry can escape via restart_from_discover instead of resuming
+		// the same downstream step and re-parking forever.
+		if failure.kind == FailureManualIntervention {
+			latest.ResumePolicy = loops.ResumePolicyManualIntervention
+		} else {
+			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
+		}
 		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 			return ProcessResult{}, err
 		}
@@ -5448,17 +5462,21 @@ func restartLatestRunFromDiscover(ctx context.Context, repos *storage.Repositori
 	return repos.Runs.Upsert(ctx, updated)
 }
 
-// MarkManualInterventionRunRestartFromDiscover rewrites the latest failed fixer
-// run's checkpoint to restart_from_discover when it is parked for manual
-// intervention. Operator retry is the explicit authority that escapes a parked
-// manual-intervention checkpoint (for example a missing or invalid repair
-// completion result recorded at resolve-comments or recheck): without this,
-// createRunContext resumes at the same downstream step and
+// MarkManualInterventionRunRestartFromDiscover rewrites the latest failed or
+// interrupted fixer run's checkpoint to restart_from_discover when it is parked
+// for manual intervention. Operator retry is the explicit authority that escapes
+// a parked manual-intervention checkpoint (for example a missing or invalid
+// repair completion result recorded at resolve-comments or recheck): without
+// this, createRunContext resumes at the same downstream step and
 // validateFixerResumeCheckpoint parks it again, so even a retry after manually
 // recovering or discarding the worktree can never reach repair or discovery.
-// Runs that are not failed or are not parked for manual recovery are left
-// untouched so createRunContext's natural resume logic still applies. The
-// boolean reports whether a checkpoint was rewritten.
+// Interrupted runs are included because the retry API exposes them as retryable
+// and createRunContext resumes interrupted predecessors at the same downstream
+// step; only the manual-intervention resume policy is rewritten, so distinct
+// handback/human-takeover resume policies are left untouched. Runs that are not
+// failed/interrupted or are not parked for manual recovery are left untouched so
+// createRunContext's natural resume logic still applies. The boolean reports
+// whether a checkpoint was rewritten.
 func MarkManualInterventionRunRestartFromDiscover(ctx context.Context, repos *storage.Repositories, loopID, updatedAt string) (bool, error) {
 	if repos == nil || repos.Runs == nil {
 		return false, nil
@@ -5467,7 +5485,7 @@ func MarkManualInterventionRunRestartFromDiscover(ctx context.Context, repos *st
 	if err != nil {
 		return false, err
 	}
-	if latestRun == nil || latestRun.Status != "failed" {
+	if latestRun == nil || (latestRun.Status != "failed" && latestRun.Status != "interrupted") {
 		return false, nil
 	}
 	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)

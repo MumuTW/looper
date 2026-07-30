@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -91,6 +92,10 @@ func TestResumeCheckpointFailureBypassesBreaker(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, RetryMaxAttempts: -1, Logger: fixture.logger, Now: fixture.now})
+	// Advance the clock so the replacement run createRunContext creates is
+	// unambiguously the latest run (GetLatestByLoopID orders by started_at DESC);
+	// the predecessor run was seeded at the fixture's base time.
+	fixture.advance(time.Minute)
 
 	result, err := runner.ProcessClaimedItem(context.Background(), queue)
 	if err != nil || result.Status != "failed" {
@@ -113,6 +118,30 @@ func TestResumeCheckpointFailureBypassesBreaker(t *testing.T) {
 	}
 	if persisted.Status != "paused" {
 		t.Fatalf("loop.Status = %q, want paused for manual intervention", persisted.Status)
+	}
+	// The resume-validation manual-intervention failure must durably park the
+	// checkpoint as manual_intervention so operator retry can escape via
+	// MarkManualInterventionRunRestartFromDiscover. createRunContext sets the
+	// resumed checkpoint policy to advance_from_checkpoint; preserving that
+	// nonempty advance policy would leave the failed run ineligible for the
+	// retry escape and re-park on every retry.
+	parkedRun, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil || parkedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", parkedRun, err)
+	}
+	if got := parseCheckpoint(parkedRun.CheckpointJSON).ResumePolicy; got != loops.ResumePolicyManualIntervention {
+		t.Fatalf("parked checkpoint ResumePolicy = %q, want manual_intervention", got)
+	}
+	rewrote, err := MarkManualInterventionRunRestartFromDiscover(context.Background(), fixture.repos, loop.ID, fixture.nowISO())
+	if err != nil || !rewrote {
+		t.Fatalf("MarkManualInterventionRunRestartFromDiscover() = (%v, %v), want escape rewrite after durable manual park", rewrote, err)
+	}
+	escaped, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil || escaped == nil {
+		t.Fatalf("Runs.GetByID() escaped = (%#v, %v)", escaped, err)
+	}
+	if got := parseCheckpoint(escaped.CheckpointJSON).ResumePolicy; got != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("escaped checkpoint ResumePolicy = %q, want restart_from_discover after operator retry", got)
 	}
 }
 

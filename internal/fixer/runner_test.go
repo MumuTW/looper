@@ -5142,6 +5142,22 @@ func TestCreateRunContextInterruptsResumedRunWithStaleStartMarker(t *testing.T) 
 	}
 }
 
+// writeUsableFixerWorktreeCheckout creates the local git metadata (ordinary .git
+// with HEAD + objects/ + refs/) that localFixerWorktreeCheckoutUsable accepts as
+// a usable fixer checkout, so worktree-preservation messages can be asserted.
+func writeUsableFixerWorktreeCheckout(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(path, ".git", "objects"), 0o755); err != nil {
+		t.Fatalf("MkdirAll .git/objects: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(path, ".git", "refs"), 0o755); err != nil {
+		t.Fatalf("MkdirAll .git/refs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile .git/HEAD: %v", err)
+	}
+}
+
 func TestProcessClaimedItemParksCompletedRepairWhenStructuredResultMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -5150,6 +5166,7 @@ func TestProcessClaimedItemParksCompletedRepairWhenStructuredResultMissing(t *te
 	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
 		t.Fatalf("MkdirAll worktree: %v", err)
 	}
+	writeUsableFixerWorktreeCheckout(t, worktreePath)
 	projectMetadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	baseBranch := "main"
 	if err := fixture.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(t.TempDir(), "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
@@ -5249,6 +5266,7 @@ func TestProcessClaimedItemBypassesBreakerForManualInterventionCompletionFailure
 	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
 		t.Fatalf("MkdirAll worktree: %v", err)
 	}
+	writeUsableFixerWorktreeCheckout(t, worktreePath)
 	projectMetadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	baseBranch := "main"
 	if err := fixture.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(t.TempDir(), "repo"), BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
@@ -5314,25 +5332,42 @@ func TestProcessClaimedItemBypassesBreakerForManualInterventionCompletionFailure
 
 func TestValidateCompletedRepairCheckpointDescribesRecordedPathForStaleWorktree(t *testing.T) {
 	t.Parallel()
-	existingPath := filepath.Join(t.TempDir(), "wt-existing")
-	if err := os.MkdirAll(existingPath, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
+	// A real usable fixer git checkout (ordinary .git with HEAD + objects/ + refs/)
+	// is the only path that should claim preservation.
+	preservedPath := filepath.Join(t.TempDir(), "wt-preserved")
+	if err := os.MkdirAll(filepath.Join(preservedPath, ".git", "objects"), 0o755); err != nil {
+		t.Fatalf("MkdirAll .git/objects: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(preservedPath, ".git", "refs"), 0o755); err != nil {
+		t.Fatalf("MkdirAll .git/refs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(preservedPath, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile .git/HEAD: %v", err)
+	}
+	// An empty directory at the recorded path must NOT claim preservation: os.Stat
+	// succeeds for it, but no fixer checkout exists there. A stale path that has
+	// vanished is the other non-preservation case.
+	emptyDirPath := filepath.Join(t.TempDir(), "wt-empty")
+	if err := os.MkdirAll(emptyDirPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll empty dir: %v", err)
 	}
 	stalePath := filepath.Join(t.TempDir(), "wt-stale")
 
 	repair := &checkpointRepair{ParseStatus: "", Summary: "upstream server_error"}
 
-	preservedErr := validateCompletedRepairCheckpoint(repair, &checkpointWorktree{Path: existingPath})
-	if !contains(preservedErr.Error(), "worktree preserved at "+existingPath) {
-		t.Fatalf("preserved error = %q, want worktree preserved at %s", preservedErr.Error(), existingPath)
+	preservedErr := validateCompletedRepairCheckpoint(repair, &checkpointWorktree{Path: preservedPath})
+	if !contains(preservedErr.Error(), "worktree preserved at "+preservedPath) {
+		t.Fatalf("preserved error = %q, want worktree preserved at %s", preservedErr.Error(), preservedPath)
 	}
 
-	recordedErr := validateCompletedRepairCheckpoint(repair, &checkpointWorktree{Path: stalePath})
-	if !contains(recordedErr.Error(), "recorded worktree path "+stalePath) {
-		t.Fatalf("recorded error = %q, want recorded worktree path %s (not preserved)", recordedErr.Error(), stalePath)
-	}
-	if contains(recordedErr.Error(), "worktree preserved") {
-		t.Fatalf("recorded error = %q, must not claim preservation for stale path", recordedErr.Error())
+	for _, stale := range []string{stalePath, emptyDirPath} {
+		recordedErr := validateCompletedRepairCheckpoint(repair, &checkpointWorktree{Path: stale})
+		if !contains(recordedErr.Error(), "recorded worktree path "+stale) {
+			t.Fatalf("recorded error = %q, want recorded worktree path %s (not preserved)", recordedErr.Error(), stale)
+		}
+		if contains(recordedErr.Error(), "worktree preserved") {
+			t.Fatalf("recorded error = %q, must not claim preservation for non-checkout path %s", recordedErr.Error(), stale)
+		}
 	}
 }
 
@@ -5457,6 +5492,168 @@ func TestOperatorRetryEscapesManualInterventionCheckpoint(t *testing.T) {
 	}
 	if got := parseCheckpoint(untouched.CheckpointJSON).ResumePolicy; got != loops.ResumePolicyAdvanceFromCheckpoint {
 		t.Fatalf("ResumePolicy = %q, want advance_from_checkpoint preserved", got)
+	}
+}
+
+// TestOperatorRetryRewritesInterruptedManualInterventionCheckpoint covers the
+// interrupted predecessor case: the retry API exposes interrupted manual runs as
+// retryable, and createRunContext resumes an interrupted predecessor at the same
+// downstream step where validateFixerResumeCheckpoint re-parks. Operator retry
+// must rewrite an interrupted manual-intervention checkpoint to
+// restart_from_discover just like a failed one, while a non-manual interrupted
+// run is left untouched.
+func TestOperatorRetryRewritesInterruptedManualInterventionCheckpoint(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(45)
+	loopTarget := "pr:acme/looper:45"
+	nowISO := fixture.nowISO()
+	loopID := "loop_retry_escape_interrupted"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 3, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber,
+		Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		ResumePolicy: loops.ResumePolicyManualIntervention,
+		Worktree:     &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-45"), Branch: "feature/fix-45", PreparedAt: nowISO},
+		Repair:       &checkpointRepair{Summary: "interrupted before resolve", ParseStatus: "", CompletedAt: nowISO},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_interrupted_manual", LoopID: loopID, Status: "interrupted",
+		CurrentStep: stringPtr(string(stepReconcileCommits)), LastCompletedStep: stringPtr(string(stepRepair)),
+		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	rewrote, err := MarkManualInterventionRunRestartFromDiscover(context.Background(), fixture.repos, loopID, nowISO)
+	if err != nil || !rewrote {
+		t.Fatalf("MarkManualInterventionRunRestartFromDiscover() = (%v, %v), want rewrote interrupted manual-intervention checkpoint", rewrote, err)
+	}
+	persisted, err := fixture.repos.Runs.GetByID(context.Background(), "run_interrupted_manual")
+	if err != nil || persisted == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", persisted, err)
+	}
+	if got := parseCheckpoint(persisted.CheckpointJSON).ResumePolicy; got != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("ResumePolicy = %q, want restart_from_discover after operator retry of interrupted run", got)
+	}
+	if !loops.ShouldRestartFromDiscover("interrupted", parseCheckpoint(persisted.CheckpointJSON).ResumePolicy) {
+		t.Fatalf("ShouldRestartFromDiscover(interrupted) = false, want true for restart_from_discover policy")
+	}
+
+	// An interrupted run that is not parked for manual intervention is left
+	// untouched so createRunContext's natural resume logic still applies.
+	otherLoopID := "loop_retry_escape_interrupted_other"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: otherLoopID, Seq: 4, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber,
+		Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() other error = %v", err)
+	}
+	otherJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: loops.ResumePolicyAdvanceFromCheckpoint, Repair: &checkpointRepair{ParseStatus: "parsed", Summary: "ok"}})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_interrupted_advance", LoopID: otherLoopID, Status: "interrupted",
+		CurrentStep: stringPtr(string(stepValidate)), LastCompletedStep: stringPtr(string(stepPush)),
+		CheckpointJSON: &otherJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() other error = %v", err)
+	}
+	noop, err := MarkManualInterventionRunRestartFromDiscover(context.Background(), fixture.repos, otherLoopID, nowISO)
+	if err != nil || noop {
+		t.Fatalf("MarkManualInterventionRunRestartFromDiscover() = (%v, %v), want no rewrite for non-manual interrupted run", noop, err)
+	}
+	untouched, err := fixture.repos.Runs.GetByID(context.Background(), "run_interrupted_advance")
+	if err != nil || untouched == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", untouched, err)
+	}
+	if got := parseCheckpoint(untouched.CheckpointJSON).ResumePolicy; got != loops.ResumePolicyAdvanceFromCheckpoint {
+		t.Fatalf("ResumePolicy = %q, want advance_from_checkpoint preserved for non-manual interrupted run", got)
+	}
+}
+
+// TestOperatorRetryEscapeReachesDiscoverAfterReplacementClaim covers the full
+// park -> retry -> replacement claim -> discover start contract. A fixer run
+// parked for manual intervention at a downstream step cannot escape on a plain
+// resumed claim because createRunContext resumes at the downstream step and
+// validateFixerResumeCheckpoint re-parks. After operator retry rewrites the
+// checkpoint to restart_from_discover, the replacement claim's createRunContext
+// must start at discover (not resume the downstream step), so retry can reach
+// repair/discovery again.
+func TestOperatorRetryEscapeReachesDiscoverAfterReplacementClaim(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(46)
+	loopTarget := "pr:acme/looper:46"
+	nowISO := fixture.nowISO()
+	loopID := "loop_retry_escape_lifecycle"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 5, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber,
+		Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		ResumePolicy: loops.ResumePolicyManualIntervention,
+		Worktree:     &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-46"), Branch: "feature/fix-46", PreparedAt: nowISO},
+		Repair:       &checkpointRepair{Summary: "missing result at resolve", ParseStatus: "", CompletedAt: nowISO},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_parked_lifecycle", LoopID: loopID, Status: "failed",
+		CurrentStep: stringPtr(string(stepResolveComments)), LastCompletedStep: stringPtr(string(stepPush)),
+		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, RetryMaxAttempts: -1, Logger: fixture.logger, Now: fixture.now})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	// Pre-retry: the parked checkpoint's manual-intervention policy means a plain
+	// resumed claim would resume at the downstream step (resolve-comments) where
+	// validateFixerResumeCheckpoint re-parks on the invalid repair, so retry can
+	// never reach repair/discovery.
+	parkedCheckpoint := parseCheckpoint(&checkpointJSON)
+	if loops.ShouldRestartFromDiscover("failed", parkedCheckpoint.ResumePolicy) {
+		t.Fatalf("pre-retry ShouldRestartFromDiscover = true, want false for manual_intervention policy")
+	}
+	if err := validateFixerResumeCheckpoint(nextFixerStep(stepPush), parkedCheckpoint); err == nil {
+		t.Fatalf("pre-retry validateFixerResumeCheckpoint(resolve_comments) = nil, want re-park on invalid repair")
+	}
+
+	// Operator retry rewrites the checkpoint to restart_from_discover (the same
+	// transition the HTTP /retry handler performs).
+	rewrote, err := MarkManualInterventionRunRestartFromDiscover(context.Background(), fixture.repos, loopID, fixture.nowISO())
+	if err != nil || !rewrote {
+		t.Fatalf("MarkManualInterventionRunRestartFromDiscover() = (%v, %v), want rewrote checkpoint", rewrote, err)
+	}
+
+	// Post-retry: the replacement claim's createRunContext starts at discover and
+	// does not resume the parked downstream step.
+	postCtx, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("post-retry createRunContext() error = %v", err)
+	}
+	if postCtx.StartStep != stepDiscoverPR {
+		t.Fatalf("post-retry createRunContext StartStep = %s, want discover after operator retry", postCtx.StartStep)
+	}
+	if postCtx.Resumed {
+		t.Fatalf("post-retry createRunContext Resumed = true, want fresh discover start not downstream resume")
+	}
+	persisted, err := fixture.repos.Runs.GetByID(context.Background(), postCtx.Run.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", persisted, err)
+	}
+	if got := derefString(persisted.CurrentStep); got != string(stepDiscoverPR) {
+		t.Fatalf("persisted run CurrentStep = %s, want discover after replacement claim", got)
 	}
 }
 
