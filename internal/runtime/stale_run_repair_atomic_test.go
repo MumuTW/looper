@@ -136,3 +136,65 @@ func TestRepairStaleRunQueueStateReportsActualManualInterventionRequeueCount(t *
 		}
 	}
 }
+
+// TestRepairStaleRunQueueStateReusesQueueHistoryBeforeFallback keeps legacy
+// loops recoverable: queue history can still supply all target details even
+// after old loop rows no longer have enough metadata to build a fresh item.
+func TestRepairStaleRunQueueStateReusesQueueHistoryBeforeFallback(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name        string
+		queueStatus string
+	}{
+		{name: "active", queueStatus: "queued"},
+		{name: "terminal", queueStatus: "failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			nowISO := "2026-07-31T09:00:00.000Z"
+			oldISO := "2026-07-31T07:00:00.000Z"
+			loopID := "loop_stale_repair_legacy_" + test.name
+			rt, repos := newStaleRepairFixture(t, loopID, "running", nowISO)
+			ctx := context.Background()
+			projectID := "project_stale_repair"
+			repo := "acme/looper"
+			prNumber := int64(42)
+			targetID := "pr:acme/looper:42"
+			queue := storage.QueueItemRecord{
+				ID: "queue_stale_repair_legacy_" + test.name, ProjectID: &projectID, LoopID: &loopID,
+				Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber,
+				DedupeKey: "reviewer:project_stale_repair:" + loopID + ":acme/looper:42", Priority: storage.QueuePriorityReviewer,
+				Status: test.queueStatus, AvailableAt: oldISO, MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO,
+			}
+			if test.queueStatus == "failed" {
+				queue.FinishedAt = &oldISO
+			}
+			if err := repos.Queue.Upsert(ctx, queue); err != nil {
+				t.Fatalf("Queue.Upsert() error = %v", err)
+			}
+
+			// This is a legacy row: its queue history knows the PR, but the loop
+			// itself no longer does. Eager fallback construction rejects it.
+			legacyLoop := storage.LoopRecord{
+				ID: loopID, Seq: 4201, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request",
+				Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO,
+			}
+			latestRun := &storage.RunRecord{ID: "run_stale_repair_legacy_" + test.name, LoopID: loopID, Status: "interrupted", StartedAt: oldISO, EndedAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+
+			summary, err := rt.repairStaleRunQueueState(ctx, repos, legacyLoop, latestRun, false, nowISO)
+			if err != nil {
+				t.Fatalf("repairStaleRunQueueState() error = %v", err)
+			}
+			if summary.LoopsRequeued != 1 {
+				t.Fatalf("summary = %#v, want the legacy loop requeued", summary)
+			}
+			active, err := repos.Queue.FindActiveByLoopID(ctx, loopID)
+			if err != nil || active == nil {
+				t.Fatalf("Queue.FindActiveByLoopID() = (%#v, %v)", active, err)
+			}
+			if active.Repo == nil || *active.Repo != repo || active.PRNumber == nil || *active.PRNumber != prNumber || active.TargetID != targetID {
+				t.Fatalf("active queue = %#v, want the historical PR target", active)
+			}
+		})
+	}
+}

@@ -8,13 +8,14 @@ import (
 
 // RecoveryQueueItemSeed supplies the identity recovery needs to publish a queue
 // item for a loop that has none: DerivedID names a replacement derived from the
-// loop's latest terminal item, and Fallback is the item to publish when there is
-// no prior item to derive from. Both are built by the caller because ID minting
-// and queue-item construction are runtime concerns; a zero seed publishes
+// loop's latest terminal item, and Fallback builds the item to publish when
+// there is no prior item to derive from. Queue history is authoritative, so
+// Fallback is invoked only after the transaction has found none. ID minting and
+// queue-item construction remain runtime concerns; a zero seed publishes
 // nothing.
 type RecoveryQueueItemSeed struct {
 	DerivedID string
-	Fallback  *QueueItemRecord
+	Fallback  func() (QueueItemRecord, bool, error)
 }
 
 // StaleRunRequeueInput is the complete durable outcome of stale-run
@@ -166,6 +167,10 @@ func EnsureActiveQueueItem(ctx context.Context, repositories *Repositories, loop
 	if seed.Fallback == nil {
 		return nil
 	}
-	_, _, err = repositories.Queue.UpsertActiveByDedupeOrGetExisting(ctx, *seed.Fallback)
+	fallback, ok, err := seed.Fallback()
+	if err != nil || !ok {
+		return err
+	}
+	_, _, err = repositories.Queue.UpsertActiveByDedupeOrGetExisting(ctx, fallback)
 	return err
 }

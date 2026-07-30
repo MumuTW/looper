@@ -2685,14 +2685,10 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 			requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 		}
 		requeuedLoop.UpdatedAt = nowISO
-		seed, err := r.recoveryQueueItemSeed(requeuedLoop, nowISO)
-		if err != nil {
-			return staleRunQueueRepairSummary{}, err
-		}
 		repair, err := r.requeueStaleRunLoop(ctx, storage.StaleRunRequeueInput{
 			Loop:             requeuedLoop,
 			NowISO:           nowISO,
-			Seed:             seed,
+			Seed:             r.recoveryQueueItemSeed(requeuedLoop, nowISO),
 			CancelDuplicates: true,
 		})
 		if err != nil {
@@ -3092,23 +3088,21 @@ func (r *Runtime) requeueStaleRunLoop(ctx context.Context, input storage.StaleRu
 }
 
 // recoveryQueueItemSeed names the queue item recovery would publish for a loop
-// that has nothing claimable left.
-func (r *Runtime) recoveryQueueItemSeed(loop storage.LoopRecord, nowISO string) (storage.RecoveryQueueItemSeed, error) {
-	seed := storage.RecoveryQueueItemSeed{DerivedID: newRuntimeEventID()}
-	queueRecord, ok, err := buildRecoveryQueueItem(loop, nowISO, int64(r.Config().Scheduler.RetryMaxAttempts))
-	if err != nil || !ok {
-		return seed, err
+// that has nothing claimable left. The fallback stays deferred because a legacy
+// loop can lack the fields needed to build it while its queue history is still
+// complete enough to restore.
+func (r *Runtime) recoveryQueueItemSeed(loop storage.LoopRecord, nowISO string) storage.RecoveryQueueItemSeed {
+	maxAttempts := int64(r.Config().Scheduler.RetryMaxAttempts)
+	return storage.RecoveryQueueItemSeed{
+		DerivedID: newRuntimeEventID(),
+		Fallback: func() (storage.QueueItemRecord, bool, error) {
+			return buildRecoveryQueueItem(loop, nowISO, maxAttempts)
+		},
 	}
-	seed.Fallback = &queueRecord
-	return seed, nil
 }
 
 func (r *Runtime) ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string) error {
-	seed, err := r.recoveryQueueItemSeed(loop, nowISO)
-	if err != nil {
-		return err
-	}
-	return storage.EnsureActiveQueueItem(ctx, repositories, loop.ID, seed, nowISO)
+	return storage.EnsureActiveQueueItem(ctx, repositories, loop.ID, r.recoveryQueueItemSeed(loop, nowISO), nowISO)
 }
 
 func interruptRecoveryRun(ctx context.Context, repositories *storage.Repositories, run storage.RunRecord, loop storage.LoopRecord, nowISO string, message string) error {
