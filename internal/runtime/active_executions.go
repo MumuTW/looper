@@ -57,24 +57,18 @@ type ActiveExecutionRegistry struct {
 	pending    map[uint64]*spawnLease
 	// active holds leases after BindHandle succeeds until Release. Stop must
 	// cancel these so native-resume fallback cannot re-spawn after drain.
-	active        map[uint64]*spawnLease
-	stoppingLoops map[string]int
-	// stopGates carries the per-loop stop generation. Each BeginLoopStop
-	// release closure captures the gate pointer plus its epoch at capture
-	// time; ClearLoopStop bumps the epoch so closures captured before the
-	// clear become no-ops. Without this, a temporary release (e.g.
-	// stopCandidateExecution) that outlived ClearLoopStop could still
-	// decrement a later RestoreLoopStop sticky ref and reopen AdmitSpawn for
-	// pre-stop runners.
-	//
-	// An entry is reclaimed whenever no stop gate is active: every closure
-	// that still matches its gate holds a stoppingLoops ref, so at that
-	// boundary all un-run closures are stale, and pointer identity keeps them
-	// no-ops after a fresh gate (a new generation) is created for the loop.
-	// This also retires closures that are abandoned on purpose — haltLoop's
-	// durable pause never calls its release — the moment ClearLoopStop
-	// reactivates the loop.
-	stopGates map[string]*loopStopGate
+	active map[uint64]*spawnLease
+	// stoppingLoops maps loopID to the current stop generation: a refcount of
+	// active holds whose pointer identity is what BeginLoopStop release
+	// closures compare against. ClearLoopStop deletes the entry, retiring the
+	// generation, so closures captured before the clear — including ones
+	// abandoned on purpose, like haltLoop's durable pause — become permanent
+	// no-ops. Without the generation check, a temporary release (e.g.
+	// stopCandidateExecution) that outlived ClearLoopStop could decrement a
+	// later RestoreLoopStop sticky ref and reopen AdmitSpawn for pre-stop
+	// runners. Entries exist only while a stop is active, so terminal-loop
+	// churn retains exactly the sticky entries admission correctness requires.
+	stoppingLoops map[string]*loopStopGate
 	// stopDrained records execution keys confirmed-drained by BeginLoopStop
 	// (or Kill) while a loop stop gate is active. haltLoop looks up Kill by
 	// durable id after BeginLoopStop; concurrent releaseLease can delete the
@@ -125,8 +119,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 		executions:       make(map[string]*ownedExecution),
 		pending:          make(map[uint64]*spawnLease),
 		active:           make(map[uint64]*spawnLease),
-		stoppingLoops:    make(map[string]int),
-		stopGates:        make(map[string]*loopStopGate),
+		stoppingLoops:    make(map[string]*loopStopGate),
 		stopDrained:      make(map[string]struct{}),
 		pendingOps:       make(map[uint64]*operationLease),
 		boundOps:         make(map[uint64]*operationLease),
@@ -240,7 +233,7 @@ func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agen
 		return l.killUnowned(handle, agent.ErrSpawnAdmissionClosed)
 	}
 	closing := r.admissionClosed
-	stopping := r.stoppingLoops[l.meta.LoopID] > 0 && l.meta.LoopID != ""
+	stopping := r.stoppingLoops[l.meta.LoopID] != nil && l.meta.LoopID != ""
 	reason := r.shutdownReason
 	if reason == "" {
 		if stopping {
@@ -304,7 +297,7 @@ func (l *spawnLease) BeginRebind() error {
 		return errors.New("agent spawn: rebind already in progress")
 	}
 	closing := r.admissionClosed
-	stopping := l.meta.LoopID != "" && r.stoppingLoops[l.meta.LoopID] > 0
+	stopping := l.meta.LoopID != "" && r.stoppingLoops[l.meta.LoopID] != nil
 	if closing {
 		return agent.ErrSpawnAdmissionClosed
 	}
@@ -371,7 +364,7 @@ func (l *spawnLease) RebindHandle(handle *processcontainment.Handle, softKill ag
 		return err
 	}
 	closing := r.admissionClosed
-	stopping := r.stoppingLoops[l.meta.LoopID] > 0 && l.meta.LoopID != ""
+	stopping := r.stoppingLoops[l.meta.LoopID] != nil && l.meta.LoopID != ""
 	if closing || stopping {
 		r.mu.Unlock()
 		l.cancel(agent.ErrSpawnStoppedDuringBind)
@@ -503,7 +496,7 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	r.mu.Lock()
 	allow := r.allowSpawn
 	closed := r.admissionClosed
-	stopping := meta.LoopID != "" && r.stoppingLoops[meta.LoopID] > 0
+	stopping := meta.LoopID != "" && r.stoppingLoops[meta.LoopID] != nil
 	r.mu.Unlock()
 
 	if allow != nil {
@@ -524,7 +517,7 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 		r.mu.Unlock()
 		return nil, agent.ErrSpawnAdmissionClosed
 	}
-	if meta.LoopID != "" && r.stoppingLoops[meta.LoopID] > 0 {
+	if meta.LoopID != "" && r.stoppingLoops[meta.LoopID] != nil {
 		r.mu.Unlock()
 		return nil, agent.ErrSpawnLoopStopping
 	}
@@ -717,18 +710,12 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 		return func() {}, nil
 	}
 	r.mu.Lock()
-	r.stoppingLoops[loopID]++
-	// Capture the gate pointer and its epoch so a later ClearLoopStop can
-	// invalidate this release without tracking each closure: an epoch bump
-	// invalidates closures of the live generation, and reclamation replaces
-	// the gate object entirely so closures of dead generations fail the
-	// pointer-identity check no matter what a fresh gate's epoch is.
-	gate := r.stopGates[loopID]
-	if gate == nil {
-		gate = &loopStopGate{}
-		r.stopGates[loopID] = gate
-	}
-	epoch := gate.epoch
+	// Capture the generation so a later ClearLoopStop can invalidate this
+	// release without tracking each closure: clearing drops the generation
+	// from the map, and a closure whose captured gate is no longer the live
+	// entry owns nothing — no matter how many generations came and went in
+	// between.
+	gate := r.incLoopStopLocked(loopID)
 	targets := r.collectLoopStopTargetsLocked(loopID)
 	r.mu.Unlock()
 	drainErr := r.cancelAndDrainLoop(loopID, reason, targets)
@@ -737,38 +724,39 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 		once.Do(func() {
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			// A different (or missing) gate means this closure belongs to a
-			// reclaimed generation; a bumped epoch means ClearLoopStop already
-			// took this ref. Either way it owns nothing now.
-			if r.stopGates[loopID] != gate || gate.epoch != epoch {
+			// A different (or missing) live gate means ClearLoopStop retired
+			// this closure's generation; its ref died with that generation.
+			if r.stoppingLoops[loopID] != gate {
 				return
 			}
-			if r.stoppingLoops[loopID] <= 1 {
+			if gate.refs <= 1 {
 				delete(r.stoppingLoops, loopID)
 				r.clearStopDrainedForLoopLocked(loopID)
 			} else {
-				r.stoppingLoops[loopID]--
+				gate.refs--
 			}
-			r.maybeReclaimStopGateLocked(loopID)
 		})
 	}, drainErr
 }
 
-// loopStopGate is one stop generation for a loop; see stopGates.
+// loopStopGate is one stop generation for a loop: the refcount of active
+// holds plus, via its pointer identity, the generation that release closures
+// compare against. It lives as the stoppingLoops map value, so a loop whose
+// gate is sticky forever (terminal close) costs exactly the one entry that
+// admission correctness already requires. Non-zero-sized by construction —
+// zero-sized allocations could share an address and break identity.
 type loopStopGate struct {
-	epoch uint64
+	refs int
 }
 
-// maybeReclaimStopGateLocked drops the loop's stop gate once no stop is
-// active. Every closure still matching its captured gate and epoch holds a
-// stoppingLoops ref, so at this boundary all un-run closures — including ones
-// abandoned by design, like haltLoop's durable pause — are stale, and the
-// pointer-identity check keeps them no-ops forever.
-func (r *ActiveExecutionRegistry) maybeReclaimStopGateLocked(loopID string) {
-	if _, active := r.stoppingLoops[loopID]; active {
-		return
+func (r *ActiveExecutionRegistry) incLoopStopLocked(loopID string) *loopStopGate {
+	gate := r.stoppingLoops[loopID]
+	if gate == nil {
+		gate = &loopStopGate{}
+		r.stoppingLoops[loopID] = gate
 	}
-	delete(r.stopGates, loopID)
+	gate.refs++
+	return gate
 }
 
 // ClearLoopStop reopens spawn admission for a loop after intentional re-activation
@@ -790,16 +778,12 @@ func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) (wasActive bool) 
 		return false
 	}
 	r.mu.Lock()
-	wasActive = r.stoppingLoops[loopID] > 0
+	wasActive = r.stoppingLoops[loopID] != nil
+	// Deleting the entry retires the generation: a BeginLoopStop that captured
+	// before this clear cannot leave a live release that still matches, because
+	// its gate pointer is no longer the live entry.
 	delete(r.stoppingLoops, loopID)
-	// Bump so a BeginLoopStop that captured before this clear cannot leave a
-	// live release that still matches; the following reclaim then retires the
-	// generation, and pointer identity keeps its closures no-ops.
-	if gate, ok := r.stopGates[loopID]; ok {
-		gate.epoch++
-	}
 	r.clearStopDrainedForLoopLocked(loopID)
-	r.maybeReclaimStopGateLocked(loopID)
 	r.mu.Unlock()
 	return wasActive
 }
@@ -826,7 +810,7 @@ func (r *ActiveExecutionRegistry) RestoreLoopStop(loopID string) error {
 	// Sticky restore always owns a reference. Temporary BeginLoopStop (for
 	// example stopCandidateExecution's kill window) may already hold a count;
 	// incrementing ensures its deferred release cannot clear the restored gate.
-	r.stoppingLoops[loopID]++
+	r.incLoopStopLocked(loopID)
 	targets := r.collectLoopStopTargetsLocked(loopID)
 	r.mu.Unlock()
 	// Gate is closed first; cancel+drain prevents orphan processes from the
@@ -841,7 +825,7 @@ func (r *ActiveExecutionRegistry) LoopStopActive(loopID string) bool {
 		return false
 	}
 	r.mu.Lock()
-	active := r.stoppingLoops[loopID] > 0
+	active := r.stoppingLoops[loopID] != nil
 	r.mu.Unlock()
 	return active
 }
@@ -1096,12 +1080,12 @@ func (r *ActiveExecutionRegistry) Register(loopID, runID, executionID string, ex
 	}
 	key := activeExecutionKey(loopID, runID, executionID)
 	r.mu.Lock()
-	if r.admissionClosed || (loopID != "" && r.stoppingLoops[loopID] > 0) {
+	if r.admissionClosed || (loopID != "" && r.stoppingLoops[loopID] != nil) {
 		reason := r.shutdownReason
 		if reason == "" {
 			reason = "execution admission is closed"
 		}
-		if loopID != "" && r.stoppingLoops[loopID] > 0 {
+		if loopID != "" && r.stoppingLoops[loopID] != nil {
 			reason = "loop is stopping"
 		}
 		r.mu.Unlock()

@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-func (r *ActiveExecutionRegistry) stopStateSizes() (gates, stopping int) {
+func (r *ActiveExecutionRegistry) stopStateSize() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.stopGates), len(r.stoppingLoops)
+	return len(r.stoppingLoops)
 }
 
 func TestStopStateReclaimedAfterTerminalLoopChurn(t *testing.T) {
@@ -32,9 +32,8 @@ func TestStopStateReclaimedAfterTerminalLoopChurn(t *testing.T) {
 		release()
 	}
 
-	gates, stopping := registry.stopStateSizes()
-	if gates != 0 || stopping != 0 {
-		t.Fatalf("stop state after churn = gates:%d stopping:%d, want all 0", gates, stopping)
+	if size := registry.stopStateSize(); size != 0 {
+		t.Fatalf("stop state after churn = %d entries, want 0", size)
 	}
 }
 
@@ -69,9 +68,30 @@ func TestStaleReleaseCannotClearRestoredGateAcrossReclaim(t *testing.T) {
 	if wasActive := registry.ClearLoopStop(loopID); !wasActive {
 		t.Fatal("final ClearLoopStop() = false, want active gate")
 	}
-	gates, stopping := registry.stopStateSizes()
-	if gates != 0 || stopping != 0 {
-		t.Fatalf("stop state after final clear = gates:%d stopping:%d, want all 0", gates, stopping)
+	if size := registry.stopStateSize(); size != 0 {
+		t.Fatalf("stop state after final clear = %d entries, want 0", size)
+	}
+}
+
+func TestTerminalStickyStopRetainsExactlyOneEntry(t *testing.T) {
+	t.Parallel()
+
+	registry := NewActiveExecutionRegistry()
+	// A successful terminal close abandons its release and never reactivates:
+	// the sticky gate entry is required forever, but it must be the only
+	// per-loop stop state retained.
+	for i := 0; i < 500; i++ {
+		loopID := fmt.Sprintf("loop_terminal_%d", i)
+		if _, err := registry.BeginLoopStop(loopID, "terminal close"); err != nil {
+			t.Fatalf("BeginLoopStop(%s) error = %v", loopID, err)
+		}
+		if !registry.LoopStopActive(loopID) {
+			t.Fatalf("LoopStopActive(%s) = false, want sticky gate closed", loopID)
+		}
+	}
+
+	if size := registry.stopStateSize(); size != 500 {
+		t.Fatalf("stop state after 500 terminal closes = %d entries, want exactly 500 sticky gates", size)
 	}
 }
 
@@ -96,9 +116,8 @@ func TestAbandonedStickyStopReleaseIsRetiredByClear(t *testing.T) {
 	if wasActive := registry.ClearLoopStop(loopID); !wasActive {
 		t.Fatal("ClearLoopStop() = false, want active gate")
 	}
-	gates, stopping := registry.stopStateSizes()
-	if gates != 0 || stopping != 0 {
-		t.Fatalf("stop state after reactivation = gates:%d stopping:%d, want all 0", gates, stopping)
+	if size := registry.stopStateSize(); size != 0 {
+		t.Fatalf("stop state after reactivation = %d entries, want 0", size)
 	}
 
 	// If the abandoned closure does run later (defensive), it must be a no-op
@@ -112,8 +131,7 @@ func TestAbandonedStickyStopReleaseIsRetiredByClear(t *testing.T) {
 		t.Fatal("LoopStopActive() = false: abandoned stale release cleared a fresh generation's gate")
 	}
 	again()
-	gates, stopping = registry.stopStateSizes()
-	if gates != 0 || stopping != 0 {
-		t.Fatalf("stop state after fresh release = gates:%d stopping:%d, want all 0", gates, stopping)
+	if size := registry.stopStateSize(); size != 0 {
+		t.Fatalf("stop state after fresh release = %d entries, want 0", size)
 	}
 }
