@@ -50,6 +50,19 @@ function sumLoopCounts(loops: StatusData["loops"]): Record<string, number> {
   return totals;
 }
 
+function admissionColor(state: string): string {
+  switch (state) {
+    case "ready":
+      return "var(--ok)";
+    case "degraded":
+      return "var(--warning)";
+    case "stopping":
+      return "var(--danger)";
+    default:
+      return "var(--text-muted)";
+  }
+}
+
 function FullPageError({ message }: { message: string }) {
   return (
     <div className="mx-auto flex max-w-lg flex-col gap-3 py-10">
@@ -343,23 +356,7 @@ export function OverviewPage({
 
   const healthData = health.data;
   const loopTotals = sumLoopCounts(status?.loops);
-  // Never default missing healthy to true / green.
-  const serviceHealthy =
-    status?.service?.healthy === true
-      ? true
-      : status?.service?.healthy === false
-        ? false
-        : sharedHealthy === true
-          ? true
-          : sharedHealthy === false
-            ? false
-            : undefined;
-  const schedulerHealthy =
-    status?.scheduler?.healthy === true
-      ? true
-      : status?.scheduler?.healthy === false
-        ? false
-        : undefined;
+  const admissionState = status?.service?.admissionState;
   const storageHealthy = (() => {
     if (healthData?.storage?.ok === false || status?.storage?.healthy === false) {
       return false;
@@ -389,18 +386,14 @@ export function OverviewPage({
         <Card title="Service">
           <dl className="m-0">
             <Kv
-              label="Healthy"
+              label="Admission"
               value={
-                serviceHealthy === undefined ? (
-                  "—"
-                ) : (
-                  <span
-                    style={{
-                      color: serviceHealthy ? "var(--ok)" : "var(--danger)",
-                    }}
-                  >
-                    {serviceHealthy ? "yes" : "no"}
+                admissionState ? (
+                  <span style={{ color: admissionColor(admissionState) }}>
+                    {admissionState}
                   </span>
+                ) : (
+                  "—"
                 )
               }
             />
@@ -438,18 +431,14 @@ export function OverviewPage({
                 </div>
               ) : null}
               <Kv
-                label="Healthy"
+                label="Status"
                 value={
-                  schedulerHealthy === undefined ? (
-                    "—"
-                  ) : (
-                    <span
-                      style={{
-                        color: schedulerHealthy ? "var(--ok)" : "var(--danger)",
-                      }}
-                    >
-                      {schedulerHealthy ? "yes" : "no"}
+                  admissionState ? (
+                    <span style={{ color: admissionColor(admissionState) }}>
+                      {admissionState}
                     </span>
+                  ) : (
+                    "—"
                   )
                 }
               />

@@ -23,6 +23,10 @@ import (
 )
 
 const (
+	// EnrollmentEventType is the Triage enrollment: Triager's durable record
+	// that a specific new/reopened source event entered the workflow before
+	// any LLM call. It provides retry identity across agent outages and
+	// source-lookback expiry; it does not authorize Planner.
 	EnrollmentEventType = "triage.enrolled"
 	// ReportEventType is the Triage Report: Triager's durable structured
 	// record of classification, scope, risk, confidence, missing information,
@@ -32,8 +36,12 @@ const (
 	// replace it.
 	ReportEventType       = "triage.report"
 	ConfirmationEventType = "triage.confirmed"
-	ProjectionEventType   = "triage.routed"
-	RetirementEventType   = "triage.retired"
+	// ProjectionEventType is the Triage routing acknowledgement: the
+	// projection of an accepted Triage Report into Planner's durable loop and
+	// queue without consulting Planner's label/assignee discovery filters —
+	// distinct from Coordinator Dispatch, which stays label-mediated.
+	ProjectionEventType = "triage.routed"
+	RetirementEventType = "triage.retired"
 
 	ActionRoutePlanner Action = "route_planner"
 	ActionAwaitHuman   Action = "await_human_confirmation"
