@@ -47,9 +47,10 @@ $ ./replay_acp.py --cwd "$(mktemp -d)" --agent-type summarizer \
 # ---------------------------------------------------------------------------
 # Follow-up: the capture above is bare JSON, not a <tool_call> block, so on its
 # own it shows only that Devin can put text on the message channel — not that
-# Hermes would accept it. Settled by feeding both forms through the shim's real
-# parser (agent/copilot_acp_client.py::_extract_tool_calls_from_text, Hermes
-# v2026.7.20), which needs no Devin account to reproduce:
+# Hermes would accept it. `test_hermes_devin_helpers.py` executes both the
+# captured bare representation and its exact <tool_call> wrapper through the
+# parser AST from the checked-in v2026.7.20 stock source; it needs no Devin
+# account or Hermes installation to reproduce:
 #
 #   captured bare JSON: 1 call(s) -> name='memory'
 #     args='{"action": "add", "content": "LOOPER-TEST-42"}' residual_text=''

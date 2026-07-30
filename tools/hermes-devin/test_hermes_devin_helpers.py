@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import importlib.util
+import ast
+import hashlib
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 
@@ -27,9 +32,60 @@ REPLAY_ACP = load_module(
     "replay_acp_for_test",
     REPO_ROOT / "docs" / "research" / "testdata" / "hermes-devin-acp" / "replay_acp.py",
 )
+STOCK_ACP_CLIENT = Path(__file__).with_name("testdata") / "copilot_acp_client.v2026.7.20.py"
 
 
 class HermesDevinHelperTests(unittest.TestCase):
+    def test_pinned_patch_applies_to_the_checked_in_stock_fixture_and_reverts(self):
+        stock = STOCK_ACP_CLIENT.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(stock).hexdigest(),
+            "eb5b4bf7bf2c4ff7deb0f2928a2fb4ada0e8584996603b88541e90d3c5e8f178",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            install = Path(temp) / "hermes-agent"
+            target = install / "agent" / "copilot_acp_client.py"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(stock)
+            script = REPO_ROOT / "tools" / "hermes-devin" / "apply-hermes-patch.sh"
+            env = {**os.environ, "HERMES_INSTALL_DIR": str(install)}
+            applied = subprocess.run([str(script)], env=env, text=True, capture_output=True, check=False)
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            self.assertEqual(
+                hashlib.sha256(target.read_bytes()).hexdigest(),
+                "e4dc6dfeb79e25a66543af2487265c468e93515d04a6725d134428d562ce7950",
+            )
+            reverted = subprocess.run([str(script), "--revert"], env=env, text=True, capture_output=True, check=False)
+            self.assertEqual(reverted.returncode, 0, reverted.stderr)
+            self.assertEqual(target.read_bytes(), stock)
+
+    def test_tagged_and_captured_bare_tool_calls_use_the_pinned_hermes_parser(self):
+        """Execute the parser AST from the exact stock source without its app deps."""
+        source = STOCK_ACP_CLIENT.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        namespace = {"json": json, "re": re}
+        wanted_assignments = {"_TOOL_CALL_BLOCK_RE", "_TOOL_CALL_JSON_RE"}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in wanted_assignments for target in node.targets
+            ):
+                exec(compile(ast.Module(body=[node], type_ignores=[]), str(STOCK_ACP_CLIENT), "exec"), namespace)
+        namespace["_build_openai_tool_call"] = lambda **kwargs: SimpleNamespace(
+            id=kwargs["call_id"], function=SimpleNamespace(name=kwargs["name"], arguments=kwargs["arguments"])
+        )
+        parser = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_extract_tool_calls_from_text")
+        exec(compile(ast.Module(body=[parser], type_ignores=[]), str(STOCK_ACP_CLIENT), "exec"), namespace)
+        captured = (
+            '{"id": "call_1", "type": "function", "function": '
+            '{"name": "memory", "arguments": "{\\"action\\": \\"add\\", \\"content\\": \\"LOOPER-TEST-42\\"}"}}'
+        )
+        for payload in (captured, f"<tool_call>{captured}</tool_call>"):
+            calls, residual = namespace["_extract_tool_calls_from_text"](payload)
+            self.assertEqual(residual, "")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0].function.name, "memory")
+            self.assertEqual(calls[0].function.arguments, '{"action": "add", "content": "LOOPER-TEST-42"}')
+
     def test_explicit_falsy_or_unknown_target_is_rejected_before_preflight(self):
         for target in ("", False, 0, None, [], {}, "users", "User"):
             text, is_error = MEMORY_MCP.call_tool("hermes_memory_read", {"target": target})
@@ -73,6 +129,33 @@ class HermesDevinHelperTests(unittest.TestCase):
         self.assertIn("must be sourced from Bash", result.stderr)
         self.assertIn("--print", result.stderr)
         self.assertNotIn("Bad substitution", result.stderr)
+
+    def test_sourcing_exports_only_hermes_home_without_clobbering_caller_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profile = root / "hermes-root" / "profiles" / "looper"
+            profile.mkdir(parents=True)
+            command = (
+                'FORCE=caller-force PROFILE_CREATED=caller-created REPO_ROOT=caller-root; '
+                'set -- unrelated-arg; . "$PROFILE_SCRIPT"; status=$?; '
+                'test "$status" -eq 0; test "$FORCE" = caller-force; '
+                'test "$PROFILE_CREATED" = caller-created; test "$REPO_ROOT" = caller-root; '
+                'test "$HERMES_HOME" = "$HERMES_ROOT/profiles/looper"; '
+                '! declare -F write_profile_file >/dev/null; '
+                '! declare -F __looper_select_hermes_profile >/dev/null'
+            )
+            result = subprocess.run(
+                ["bash", "-c", command],
+                env={
+                    **os.environ,
+                    "HERMES_ROOT": str(root / "hermes-root"),
+                    "PROFILE_SCRIPT": str(REPO_ROOT / "scripts" / "hermes-profile.sh"),
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_fresh_bootstrap_replaces_seed_defaults_and_preserves_empty_allowlist(self):
         with tempfile.TemporaryDirectory() as temp:
