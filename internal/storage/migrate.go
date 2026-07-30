@@ -138,6 +138,13 @@ func (r *MigrationRunner) RunPending(ctx context.Context, options ...RunPendingO
 		return MigrationRunResult{}, err
 	}
 
+	if unknown := unknownAppliedMigrationIDs(applied, r.migrations); len(unknown) > 0 {
+		return MigrationRunResult{}, fmt.Errorf(
+			"database has applied migrations unknown to this binary: %s; the database was likely created or migrated by a newer looper version (downgrade or mixed-version deployment) — run a looper binary that includes these migrations or restore a backup matching this version",
+			strings.Join(unknown, ", "),
+		)
+	}
+
 	appliedIDs := make(map[string]struct{}, len(applied))
 	skipped := make([]string, len(applied))
 	for i, migration := range applied {
@@ -189,6 +196,26 @@ func (r *MigrationRunner) Backup(ctx context.Context) (string, error) {
 	defer conn.Close()
 
 	return r.backupOnConn(ctx, conn)
+}
+
+// unknownAppliedMigrationIDs returns applied IDs absent from the binary's
+// manifest, in the sorted order produced by readAppliedMigrations. Unknown IDs
+// mean the binary cannot prove it understands the schema, so migration must
+// refuse to proceed rather than treat the database as fully migrated.
+func unknownAppliedMigrationIDs(applied []AppliedMigration, migrations []EmbeddedMigration) []string {
+	known := make(map[string]struct{}, len(migrations))
+	for _, migration := range migrations {
+		known[migration.ID] = struct{}{}
+	}
+
+	unknown := make([]string, 0)
+	for _, migration := range applied {
+		if _, ok := known[migration.ID]; !ok {
+			unknown = append(unknown, migration.ID)
+		}
+	}
+
+	return unknown
 }
 
 func describeMigrations(migrations []EmbeddedMigration) []MigrationDescriptor {
