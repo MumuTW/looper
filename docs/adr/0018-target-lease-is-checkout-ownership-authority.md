@@ -214,13 +214,13 @@ disagree.
 
 ## Consequences
 
-**What this costs.** A new table and its migration — the first persisted state
-this program has added — plus a backfill that can refuse to start the daemon. A
-lease acquisition on paths that are currently free. An acquire/release discipline
-that a future caller can forget, which is a real hazard: a forgotten release is a
-wedged target, so release must be structural (defer, or a helper owning both
-halves) rather than a convention. Uncertain agent ownership now wedges a target
-until an operator acts, where today it silently proceeds.
+**What this costs.** A new authority-bearing table and migration, plus a
+backfill that can refuse to start the daemon. A lease acquisition on paths that
+are currently free. An acquire/release discipline that a future caller can
+forget, which is a real hazard: a forgotten release is a wedged target, so
+release must be structural (defer, or a helper owning both halves) rather than a
+convention. Uncertain agent ownership now wedges a target until an operator acts,
+where today it silently proceeds.
 
 **What it buys.** The guarantee stops being tiered. `docs/DESIGN-human-takeover.md`
 currently has to split its promises into absolute, best-effort, and not-covered,
@@ -236,6 +236,22 @@ a containment problem, and ADR-0015 already owns live execution ownership.
 **Migration.** The `human_takeover` status remains readable and remains what the
 dashboard, `looper status`, and the API report, so no operator-facing contract
 breaks. What changes is that no code branches on it for enforcement.
+
+### Required implementation proof
+
+The implementation must add contract/invariant integration coverage for:
+
+- a leader that exits while a descendant remains alive: recovery quarantines and
+  retains the lease, and no competing checkout mutation starts;
+- two legacy targets whose different repositories map to the same detached-path
+  candidate: they contend for one lease;
+- close/terminate during human takeover: the terminal transition and release
+  commit together, so a later actor is not wedged;
+- upgrade backfill: every unambiguous held loop receives a lease, while a
+  duplicate or unkeyable holder aborts the entire migration and leaves no
+  partially migrated authority; and
+- injected failures in takeover and handback: neither path can expose a
+  lease/status/queue split-brain state.
 
 ## Alternatives considered
 
