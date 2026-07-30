@@ -53,7 +53,7 @@ func TestServiceAddProjectAllowsExplicitGitHubRepoOnDetectedForgejoOrigin(t *tes
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	tokenEnv := "LOOPER_FORGEJO_TOKEN"
-	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
 	service := &Service{
 		DB:     coordinator.DB(),
 		Repos:  repos,
@@ -103,8 +103,8 @@ func TestServiceAddProjectRejectsDetectedRepoFromMismatchedProvider(t *testing.T
 			}
 			tokenEnv := "LOOPER_FORGEJO_TOKEN"
 			cfg.Providers = []config.ProviderConfig{
-				{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
-				{ID: "forgejo-other", Kind: config.ProviderKindForgejo, BaseURL: "https://other.example.com", TokenEnv: &tokenEnv},
+				{ID: "forgejo-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
+				{ID: "forgejo-other", Kind: config.ProviderKindGitHub, BaseURL: "https://other.example.com", TokenEnv: &tokenEnv},
 			}
 			published := false
 			service := &Service{
@@ -133,92 +133,5 @@ func TestServiceAddProjectRejectsDetectedRepoFromMismatchedProvider(t *testing.T
 				t.Fatalf("stored = %#v, published = %v; want rejection before persistence", stored, published)
 			}
 		})
-	}
-}
-
-func TestServiceAddProjectRejectsDuplicateActiveRepoBeforeUpsert(t *testing.T) {
-	t.Parallel()
-
-	coordinator := openCoordinator(t)
-	repos := storage.NewRepositories(coordinator.DB())
-	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
-	nowISO := now.UTC().Format(time.RFC3339Nano)
-	metadata := `{"repo":"nexu-io/looper","source":"config"}`
-	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID: "github", Name: "GitHub", RepoPath: "/tmp/github", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	tokenEnv := "LOOPER_FORGEJO_TOKEN"
-	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
-	published := false
-	service := &Service{
-		Repos:  repos,
-		Config: cfg,
-		Now:    func() time.Time { return now },
-		PublishProjects: func([]config.ProjectRefConfig) {
-			published = true
-		},
-	}
-	repo := "NEXU-IO/LOOPER"
-	provider := "forgejo-main"
-	added, err := service.AddProject(context.Background(), AddInput{
-		ID: "forgejo", Name: "Forgejo", RepoPath: "/tmp/forgejo", Repo: &repo, Provider: &provider,
-	})
-	if err != nil {
-		t.Fatalf("AddProject() error = %v, want cross-provider duplicate repo accepted", err)
-	}
-	stored, getErr := repos.Projects.GetByID(context.Background(), "forgejo")
-	if getErr != nil {
-		t.Fatalf("Projects.GetByID() error = %v", getErr)
-	}
-	if stored == nil || added.Project.ID != "forgejo" || !published {
-		t.Fatalf("stored = %#v, added = %#v, published = %v; want persisted provider-qualified project", stored, added, published)
-	}
-}
-
-func TestServiceAddProjectClearsForgejoRolesWhenProviderIsRemoved(t *testing.T) {
-	t.Parallel()
-
-	coordinator := openCoordinator(t)
-	repos := storage.NewRepositories(coordinator.DB())
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	tokenEnv := "LOOPER_FORGEJO_TOKEN"
-	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
-	catalog := NewCatalog(cfg)
-	service := &Service{DB: coordinator.DB(), Repos: repos, Config: cfg, ConfigSource: catalog, Now: time.Now, PublishProjects: catalog.Publish}
-	repo := "core/odcrew"
-	provider := "forgejo-main"
-	input := AddInput{ID: "odcrew", IDSource: "derived", Name: "ODCrew", RepoPath: "/tmp/odcrew", Repo: &repo, Provider: &provider}
-	if _, err := service.AddProject(context.Background(), input); err != nil {
-		t.Fatalf("AddProject(Forgejo) error = %v", err)
-	}
-
-	input.Provider = nil
-	if _, err := service.AddProject(context.Background(), input); err != nil {
-		t.Fatalf("AddProject(GitHub) error = %v", err)
-	}
-	stored, err := repos.Projects.GetByID(context.Background(), "odcrew")
-	if err != nil {
-		t.Fatalf("GetByID() error = %v", err)
-	}
-	metadata := parseMetadata(stored.MetadataJSON)
-	if _, ok := metadata["roles"]; ok {
-		t.Fatalf("stored metadata = %v, want provider-owned roles removed", metadata)
-	}
-	snapshot := catalog.Snapshot()
-	if len(snapshot.Projects) != 1 || snapshot.Projects[0].Provider != "" {
-		t.Fatalf("catalog projects = %#v, want GitHub-default binding", snapshot.Projects)
-	}
-	if !config.ProjectRoleConfigs(snapshot, "odcrew").Reviewer.Discovery.Triggers.RequireReviewRequest {
-		t.Fatal("GitHub reviewer requireReviewRequest = false, want global GitHub default")
 	}
 }

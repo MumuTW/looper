@@ -135,52 +135,36 @@ repoPath = "/absolute/path/to/repo"
 
 ## Provider config
 
-Provider kinds:
+GitHub is the only supported provider kind.
 
-- `github` — legacy default, backed by `gh`. Projects without `provider` keep GitHub autodetection/metadata behavior.
-- `forgejo` — REST-backed MVP. Forgejo-only configs do not require `gh` when `git` and the provider auth are valid (`token-env` or `tea`).
+- `github` — backed by `gh`. Projects without `provider` keep GitHub autodetection/metadata behavior. Set `baseUrl` to point a project at GitHub Enterprise Server.
 
-Minimal Forgejo project (token-env):
+Minimal project bound to an explicit provider:
 
 ```toml
 [agent]
 vendor = "opencode"
 
 [[providers]]
-id = "forgejo-main"
-kind = "forgejo"
+id = "ghes-main"
+kind = "github"
 baseUrl = "https://code.example.com"
-auth = "token-env"
-tokenEnv = "LOOPER_FORGEJO_TOKEN"
-
-# Or reuse an explicit tea login (no tokenEnv):
-# auth = "tea"
-# teaLogin = "powerformer-code"
+tokenEnv = "LOOPER_GITHUB_TOKEN"
 
 [[projects]]
 id = "example"
 name = "Example"
 repoPath = "/absolute/path/to/example"
-provider = "forgejo-main"
+provider = "ghes-main"
 repo = "acme/example"
 ```
 
-Forgejo validation notes:
+Provider validation notes:
 
-- `baseUrl` must be an absolute `http(s)` URL.
-- Choose `auth = "token-env"` with `tokenEnv`, or `auth = "tea"` with explicit `teaLogin` matching `baseUrl`. Never rely on tea's default login when multiple identities exist. Do not write token values into config.
-- Forgejo projects require a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add`, the dashboard, or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup.
+- `providers[].kind` must be `github`. `forgejo` and `plane` were removed and are rejected with an explicit unsupported-provider error; they are never reinterpreted as a supported provider.
+- `baseUrl`, when set, must be an absolute `http(s)` URL.
+- A project bound to a provider requires a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add`, the dashboard, or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup.
 - Duplicate `repo` values are rejected case-insensitively, even across providers.
-- Forgejo uses polling only; omit project `webhook.mode` and keep `network.mode` off.
-- The provider profile disables unsupported GitHub-shaped defaults. Explicit opt-ins to Forgejo-unsupported behavior fail fast.
-
-Forgejo MVP role limits:
-
-- planner and worker are supported
-- worker only processes issues already assigned to the current Forgejo user; it does not self-assign
-- reviewer discovers by labels and publishes a top-level Reviewer Summary PR comment; default normal-review label is `looper:review`, while spec PRs use `looper:spec-reviewing`
-- fixer consumes open items from the Reviewer Summary and publishes a top-level Fixer Summary PR comment; it does not resolve native review threads
-- coordinator, auto-merge, native reviews, review requests, thread resolution, routed network mode, and webhooks are unsupported for Forgejo
 
 ## Role model guidance
 
@@ -334,10 +318,10 @@ ghPath = "/opt/homebrew/bin/gh"
 osascriptPath = "/usr/bin/osascript"
 
 [[providers]]
-id = "forgejo-main"
-kind = "forgejo"
+id = "ghes-main"
+kind = "github"
 baseUrl = "https://code.example.com"
-tokenEnv = "LOOPER_FORGEJO_TOKEN"
+tokenEnv = "LOOPER_GITHUB_TOKEN"
 
 [defaults]
 baseBranch = "main"
@@ -391,11 +375,11 @@ name = "Looper"
 repoPath = "/absolute/path/to/looper"
 
 [[projects]]
-id = "forgejo-example"
-name = "Forgejo Example"
-repoPath = "/absolute/path/to/forgejo-example"
-provider = "forgejo-main"
-repo = "acme/forgejo-example"
+id = "ghes-example"
+name = "GHES Example"
+repoPath = "/absolute/path/to/ghes-example"
+provider = "ghes-main"
+repo = "acme/ghes-example"
 
 [projects.roles.reviewer.discovery.triggers]
 labels = ["needs-review"]
@@ -516,8 +500,7 @@ looperd \
 - `projects[].id` must be valid and unique
 - storage, log, working-directory, and worktree paths must be writable
 - required tool paths must resolve
-- `gh` must resolve for GitHub projects; Forgejo-only configs do not require `gh`
-- Forgejo providers require `baseUrl` and either `tokenEnv` (`token-env` auth) or `teaLogin` (`tea` auth); token-env needs the named env var at runtime, tea needs a matching login for the daemon user
+- `gh` must resolve for GitHub projects
 - `notifications.osascript.enabled=true` requires `tools.osascriptPath` to resolve
 
 ## Safety notes

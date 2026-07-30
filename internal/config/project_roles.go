@@ -155,7 +155,7 @@ func stripRoleAgentBindings(partial PartialRoleConfigs) PartialRoleConfigs {
 }
 
 // ProjectProviderKind resolves the task-source provider kind for a project by
-// id (github / forgejo). Unknown ids fall back to the GitHub default.
+// id. Unknown ids fall back to the GitHub default.
 func ProjectProviderKind(cfg Config, projectID string) ProviderKind {
 	project := findConfiguredProject(cfg.Projects, projectID)
 	if project == nil {

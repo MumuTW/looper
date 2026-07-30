@@ -44,19 +44,19 @@ func TestForgeCredentialReadinessResolvesConfiguredToken(t *testing.T) {
 	}
 }
 
-func TestForgeCredentialReadinessIgnoresNonGitHubConfigs(t *testing.T) {
+// A fresh install has no projects yet, so it must not be reported as missing a
+// credential it does not need. The companion case — a project bound to a
+// non-GitHub provider — is gone with the last non-GitHub provider kind.
+func TestForgeCredentialReadinessIgnoresProjectlessConfigs(t *testing.T) {
 	for _, key := range config.GitHubTokenEnvKeys {
 		t.Setenv(key, "")
 	}
-	cfg := config.Config{
-		Providers: []config.ProviderConfig{{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test"}},
-		Projects:  []config.ProjectRefConfig{{ID: "forgejo", Provider: "forgejo", Repo: "acme/forgejo", RepoPath: "/tmp/forgejo"}},
-	}
 
-	if readiness := ForgeCredentialReadinessFor(cfg); readiness.GitHubProjects || readiness.Degraded() {
-		t.Fatalf("ForgeCredentialReadinessFor() = %#v, want no GitHub credential requirement", readiness)
+	readiness := ForgeCredentialReadinessFor(config.Config{})
+	if readiness.GitHubProjects {
+		t.Fatal("GitHubProjects = true for a project-less config, want false")
 	}
-	if readiness := ForgeCredentialReadinessFor(config.Config{}); readiness.Degraded() {
+	if readiness.Degraded() {
 		t.Fatal("Degraded() = true for a project-less config, want false")
 	}
 }

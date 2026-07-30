@@ -1,7 +1,6 @@
 package forge
 
 import (
-	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -69,8 +68,6 @@ func cloneProviderConfig(provider config.ProviderConfig) config.ProviderConfig {
 	cloned := provider
 	cloned.GHPath = cloneStringPointer(provider.GHPath)
 	cloned.TokenEnv = cloneStringPointer(provider.TokenEnv)
-	cloned.TeaLogin = cloneStringPointer(provider.TeaLogin)
-	cloned.TeaPath = cloneStringPointer(provider.TeaPath)
 	return cloned
 }
 
@@ -213,55 +210,6 @@ func (selection Selection) Capabilities() Capabilities {
 	return capabilities
 }
 
-// UsesNativePullRequestAPI is true when role-facing pull-request operations
-// must use the Forgejo adapter instead of the GitHub code-repository gateway.
-func (selection Selection) UsesNativePullRequestAPI() bool {
-	return selection.kind == ProviderKindForgejo
-}
+func (selection Selection) PullRequestProviderName() string { return "GitHub" }
 
-func (selection Selection) PullRequestProviderName() string {
-	if selection.UsesNativePullRequestAPI() {
-		return "Forgejo"
-	}
-	return "GitHub"
-}
-
-func (selection Selection) TaskSourceName() string {
-	switch selection.kind {
-	case ProviderKindForgejo:
-		return "Forgejo"
-	default:
-		return "GitHub"
-	}
-}
-
-func (selection Selection) ForgejoClient() (*ForgejoClient, bool, error) {
-	if !selection.UsesNativePullRequestAPI() {
-		return nil, false, nil
-	}
-	if strings.TrimSpace(selection.project.repo) == "" {
-		return nil, true, fmt.Errorf("forgejo project %s is missing repo", strings.TrimSpace(selection.project.id))
-	}
-	client, err := NewForgejoClientFromConfig(selection.provider, strings.TrimSpace(selection.project.repo))
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
-}
-
-// ProbeNativeReviewCommentResolution keeps the provider configuration and the
-// Forgejo-specific capability probe inside the selection seam.
-func (selection Selection) ProbeNativeReviewCommentResolution(ctx context.Context) (ProbeState, error) {
-	if !selection.UsesNativePullRequestAPI() {
-		return ProbeStateSupported, nil
-	}
-	return ProbeForgejoReviewCommentResolution(ctx, selection.provider, selection.project.repo)
-}
-
-func (resolver Resolver) ForgejoForLocation(repo, cwd string) (*ForgejoClient, bool, error) {
-	selection, matched, err := resolver.ForLocation(repo, cwd)
-	if err != nil || !matched {
-		return nil, false, err
-	}
-	return selection.ForgejoClient()
-}
+func (selection Selection) TaskSourceName() string { return "GitHub" }

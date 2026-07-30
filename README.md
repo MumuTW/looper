@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go)](go.mod)
 
-**An autonomous AI dev team for your GitHub and Forgejo repos — plan, review, fix, and ship PRs, on a loop.**
+**An autonomous AI dev team for your GitHub repos — plan, review, fix, and ship PRs, on a loop.**
 
 > *"LLMs are exceptionally good at looping until they meet specific goals... Don't tell it what to do, give it success criteria and watch it go."*
 > — Andrej Karpathy
@@ -15,7 +15,7 @@ Looper turns that idea into a local AI dev team. Register the repos you want it 
 
 Looper ships two binaries:
 
-- `looperd` — the background daemon that polls GitHub or Forgejo, runs loops, and manages worktrees
+- `looperd` — the background daemon that polls GitHub, runs loops, and manages worktrees
 - `looper` — a thin CLI for onboarding (`init`, `status`, `project add|list|discover`) and loop control (`stop`, `close`, `start`, `pause`, `retry`, `takeover`, `handback`, `respond`) against a running `looperd`
 
 ## Four loops, four success criteria
@@ -32,7 +32,7 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 ## Features
 
 - 🚢 **Start from an issue, not a prompt.** On GitHub, the internal Triager turns a clear, low-risk new or reopened issue directly into Planner work; risky or underspecified reports wait with an auditable local triage report. Label-and-assign discovery remains available as an explicit manual route. Once a spec reaches `looper:spec-ready`, implementation begins.
-- 🐙 **Durable workflow state stays inspectable.** Issues, PRs, reviews, and assignees remain the shared forge workflow; local `triage.report` events are the semantic authority for internal GitHub intake, so routing labels are optional projections rather than hidden prerequisites. GitHub is fully supported; Forgejo supports planner, worker, native reviewer requests/reviews, and summary-comment compatibility flows.
+- 🐙 **Durable workflow state stays inspectable.** Issues, PRs, reviews, and assignees remain the shared forge workflow; local `triage.report` events are the semantic authority for internal GitHub intake, so routing labels are optional projections rather than hidden prerequisites.
 - 🛰️ **Many repos, one daemon.** Register your projects once — Looper watches them together and runs loops across repos in parallel.
 - 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents work across issues and repos without stepping on each other.
 - 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`, `grok-build`, plus `devin-experimental` for fresh runs) so you're not locked into one model or CLI.
@@ -84,7 +84,7 @@ looper status                                          # config, daemon, project
 
 `looper project add` posts to the running daemon, so the project is live immediately. The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` do the same thing, and are where the options the CLI does not expose (explicit id, base branch, provider) live.
 
-Once the daemon is healthy and forge credentials are configured (`gh auth status` for GitHub, or a configured Forgejo token environment variable), loops start from the forge itself: label an issue and assign it, and `looperd`'s discovery picks it up. The CLI controls loops the daemon already owns:
+Once the daemon is healthy and GitHub credentials are configured (`gh auth status`), loops start from the forge itself: label an issue and assign it, and `looperd`'s discovery picks it up. The CLI controls loops the daemon already owns:
 
 ```bash
 looper stop 12
@@ -161,7 +161,7 @@ issue (looper:plan, assigned)
 
 Each role runs in its own worktree, coordinated by `looperd` and gated by labels. The planner opens the spec PR, the reviewer and fixer loop on it until it's clean, and `looper:spec-ready` is the signal that hands work to the worker — which implements on the same PR rather than opening a new one.
 
-Looper is poll-driven by default: keep `looperd` running and forge credentials available for the loop to fire. GitHub projects still use `gh`; Forgejo projects use the configured REST provider and do not require `gh` in Forgejo-only installs. Everything runs locally — no hosted control plane required.
+Looper is poll-driven by default: keep `looperd` running and forge credentials available for the loop to fire. Projects use `gh`. Everything runs locally — no hosted control plane required.
 
 ## Networked operation
 
@@ -215,7 +215,6 @@ There is one more command that is not for operators: `looper review submit`, whi
 - Supported formats: `.toml`, `.yaml`, `.yml`, `.json`
 - Config source selection precedence: `--config` → `LOOPER_CONFIG` → default-path discovery
 - State directory: `~/.looper`, overridable with `LOOPER_HOME` (takes precedence over `HOME`). It moves the whole set of default-derived paths together — config discovery, database, logs, and worktree roots — so a second instance never writes into the first one's state
-- Provider support: legacy GitHub projects keep working through `gh`; Forgejo projects require an explicit provider, `baseUrl`, `repo`, and either `tokenEnv` (`auth=token-env`) or `teaLogin` (`auth=tea`)
 - All role-specific config lives under `roles.<role>`; canonical reviewer behavior lives under `roles.reviewer.behavior.*`
 - Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path
 - `agent.vendor` is required to run loops (no default)
@@ -238,19 +237,9 @@ go test ./...
 Provider e2e checks:
 
 ```bash
-go test ./internal/e2e/forgejocontract -count=1
-go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1
+go test ./internal/e2e -run 'Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1
 ```
 
-Forgejo live sandbox e2e is local/manual only and skipped unless explicitly enabled. Use a dedicated existing sandbox repo; tests create and clean run-scoped issues, branches, PRs, labels, and comments:
-
-```bash
-LOOPER_E2E_FORGEJO=1 \
-LOOPER_E2E_FORGEJO_BASE_URL=https://code.example.com \
-LOOPER_E2E_FORGEJO_SANDBOX_REPO=owner/repo \
-LOOPER_E2E_FORGEJO_TOKEN=$TOKEN \
-go test ./internal/e2e -run '^TestForgejoSandbox' -count=1
-```
 
 GitHub live sandbox tests prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`; legacy `LOOPER_E2E_SANDBOX_REPO` remains accepted only as a compatibility alias, and conflicting values fail fast.
 
@@ -263,4 +252,4 @@ Build artifacts go to `dist/` and are gitignored — don't edit generated files.
 - Daemon-managed worktrees live under `~/.looper/worktrees/`, grouped by repo and project
 - Worktree cleanup runs inside the daemon on the `daemon.worktreeCleanup` schedule; the CLI no longer has a `worktree cleanup` verb
 - When `notifications.osascript.enabled=true`, `osascript` must resolve on startup
-- Automation is poll-driven by default — keep `looperd` running and provider credentials available; GitHub projects require `gh`, while Forgejo-only installs do not
+- Automation is poll-driven by default — keep `looperd` running and GitHub credentials available; projects require `gh`

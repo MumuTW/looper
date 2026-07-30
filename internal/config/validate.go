@@ -74,8 +74,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if !isValidReviewerScope(config.Roles.Reviewer.Behavior.Scope) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.scope", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerScopeFullPR, ReviewerScopeChangedFiles, ReviewerScopeChangedRanges)})
 	}
-	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview && config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSummaryComment {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s or %s", ReviewerPublishModeSingleReview, ReviewerPublishModeSummaryComment)})
+	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
 	}
 	if !isValidReviewerThreadResolutionMode(config.Roles.Reviewer.Behavior.ThreadResolution.Mode) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", ReviewerThreadResolutionModeReportOnly, ReviewerThreadResolutionModeCommentOnly, ReviewerThreadResolutionModeSuggestResolution, ReviewerThreadResolutionModeResolveObjective)})
@@ -130,39 +130,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if reason, removed := removedProviderKinds[provider.Kind]; removed {
 			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("provider kind %q is no longer supported: %s", provider.Kind, reason)})
 		} else if !isValidProviderKind(provider.Kind) {
-			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be one of: %s, %s", ProviderKindGitHub, ProviderKindForgejo)})
-		}
-		if provider.Kind == ProviderKindForgejo {
-			if !isAbsoluteHTTPURL(provider.BaseURL) {
-				issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL for forgejo providers"})
-			}
-			auth := EffectiveProviderAuth(provider)
-			switch auth {
-			case ProviderAuthTea:
-				if isNilOrEmptyString(provider.TeaLogin) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "is required when auth is tea"})
-				}
-				if !isNilOrEmptyString(provider.TokenEnv) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "must be omitted when auth is tea"})
-				}
-			case ProviderAuthTokenEnv:
-				if isNilOrEmptyString(provider.TokenEnv) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "is required when auth is token-env"})
-				}
-				if !isNilOrEmptyString(provider.TeaLogin) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "must be omitted when auth is token-env"})
-				}
-			case "":
-				if provider.Auth != "" {
-					issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
-				} else if !isNilOrEmptyString(provider.TokenEnv) && !isNilOrEmptyString(provider.TeaLogin) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: "must be set explicitly when both tokenEnv and teaLogin are present"})
-				} else {
-					issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be %s (with tokenEnv) or %s (with teaLogin)", ProviderAuthTokenEnv, ProviderAuthTea)})
-				}
-			default:
-				issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
-			}
+			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be: %s", ProviderKindGitHub)})
 		}
 	}
 
@@ -170,13 +138,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	projectRepos := make(map[string]int, len(config.Projects))
 	for index, project := range config.Projects {
 		prefix := fmt.Sprintf("projects[%d]", index)
-		providerKind := ProviderKindGitHub
 		if strings.TrimSpace(project.Provider) != "" {
-			kind, exists := providerIDs[project.Provider]
-			if !exists {
+			if _, exists := providerIDs[project.Provider]; !exists {
 				issues = append(issues, ValidationIssue{Path: prefix + ".provider", Message: fmt.Sprintf("references unknown provider id: %s", project.Provider)})
-			} else {
-				providerKind = kind
 			}
 		}
 
@@ -199,14 +163,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if project.RepoPath == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: "must be a non-empty path"})
 		}
-		if providerKind == ProviderKindForgejo {
-			if strings.TrimSpace(project.Provider) == "" {
-				issues = append(issues, ValidationIssue{Path: prefix + ".provider", Message: "is required for forgejo projects"})
-			}
-			if strings.TrimSpace(project.Repo) == "" {
-				issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: "is required for forgejo projects"})
-			}
-		}
 		if strings.TrimSpace(project.Repo) != "" {
 			identity, resolved := ProjectRepositoryIdentity(config, project)
 			if previousIndex, exists := projectRepos[identity.Key()]; resolved && exists {
@@ -217,12 +173,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
 			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
-		}
-		if providerKind == ProviderKindForgejo && project.Webhook.Mode != "" {
-			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: "must be omitted for forgejo projects; forgejo MVP uses polling only"})
-		}
-		if providerKind == ProviderKindForgejo && normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
-			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: "must be off for forgejo projects; routed network mode is not supported"})
 		}
 		if !isValidWebhookModeOrEmpty(project.Webhook.Mode) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
@@ -249,11 +199,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
-		}
-		if providerKind == ProviderKindForgejo {
-			validateForgejoRoleCapabilities(effectiveProjectRoles, prefix, &issues)
-		} else if effectiveProjectRoles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
-			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: "summary_comment is supported only for forgejo projects"})
 		}
 		if normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
 			validateRoutedProjectPrerequisites(config, effectiveProjectRoles, prefix, &issues)
@@ -542,7 +487,7 @@ func isValidNetworkMode(mode NetworkMode) bool {
 }
 
 func isValidProviderKind(kind ProviderKind) bool {
-	return kind == ProviderKindGitHub || kind == ProviderKindForgejo
+	return kind == ProviderKindGitHub
 }
 
 // CanonicalizeServerBaseURL validates value as the daemon's advertised base
@@ -690,30 +635,6 @@ func isAbsoluteHTTPURL(value string) bool {
 		return false
 	}
 	return (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
-}
-
-func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
-	if roles.Reviewer.AutoMerge.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.autoMerge.enabled", Message: "must be false for forgejo projects"})
-	}
-	if roles.Reviewer.Behavior.ThreadResolution.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.threadResolution.enabled", Message: "must be false for forgejo projects"})
-	}
-	if roles.Coordinator.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.coordinator.enabled", Message: "must be false for forgejo projects"})
-	}
-}
-
-// ValidateForgejoRoleCapabilities rejects role settings that require GitHub-only
-// APIs. Callers should apply the Forgejo project profile before validating so
-// omitted project settings receive provider-compatible defaults.
-func ValidateForgejoRoleCapabilities(roles RoleConfigs, prefix string) error {
-	issues := make([]ValidationIssue, 0)
-	validateForgejoRoleCapabilities(roles, prefix, &issues)
-	if len(issues) == 0 {
-		return nil
-	}
-	return &ConfigValidationError{Issues: issues}
 }
 
 func normalizeNetworkMode(mode NetworkMode) NetworkMode {

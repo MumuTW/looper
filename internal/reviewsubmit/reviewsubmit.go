@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -20,7 +18,6 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/outboundguard"
-	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -60,168 +57,7 @@ type reviewSubmitGateway interface {
 	SubmitReview(context.Context, githubinfra.SubmitReviewInput) error
 }
 
-type forgejoReviewSubmitGateway struct {
-	client               *forge.ForgejoClient
-	stamper              disclosure.Stamper
-	requireReviewRequest bool
-	labels               []string
-	labelMode            config.LabelMode
-}
-
-func (gateway forgejoReviewSubmitGateway) validateReviewRequest(ctx context.Context, prNumber int64, labels []string, bypass bool) error {
-	// bypass must be proven from trusted run/loop metadata by the caller
-	// (manual reviewer loop, or enabled follow-up on a new head). The argv
-	// --reviewer-manual flag alone is never sufficient to skip the
-	// requested-reviewer / label publish gate.
-	if bypass || !gateway.requireReviewRequest || forgeReviewSubmitLabelsMatch(labels, gateway.labels, gateway.labelMode) {
-		return nil
-	}
-	identity, err := gateway.client.CurrentUser(ctx)
-	if err != nil {
-		return err
-	}
-	requested, err := gateway.client.ListPullRequestReviewers(ctx, prNumber)
-	if err != nil {
-		return err
-	}
-	for _, reviewer := range requested {
-		if sameGitHubLogin(reviewer.Login, identity.Login) {
-			return nil
-		}
-	}
-	return errors.New("review request removed before publish")
-}
-
-func forgeReviewSubmitLabelsMatch(actual, required []string, mode config.LabelMode) bool {
-	if len(required) == 0 {
-		return false
-	}
-	set := map[string]struct{}{}
-	for _, label := range actual {
-		set[strings.ToLower(strings.TrimSpace(label))] = struct{}{}
-	}
-	matches := 0
-	for _, label := range required {
-		if _, ok := set[strings.ToLower(strings.TrimSpace(label))]; ok {
-			matches++
-		}
-	}
-	if mode == config.LabelModeAny {
-		return matches > 0
-	}
-	return matches == len(required)
-}
-
-func (gateway forgejoReviewSubmitGateway) ViewPullRequest(ctx context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
-	pr, err := gateway.client.ViewPullRequest(ctx, input.PRNumber)
-	if err != nil {
-		return githubinfra.PullRequestDetail{}, err
-	}
-	return githubinfra.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeReviewSubmitLabelNames(pr.Labels), HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login}, nil
-}
-
-func (gateway forgejoReviewSubmitGateway) GetCurrentUserLogin(ctx context.Context, _ string) (string, error) {
-	identity, err := gateway.client.CurrentUser(ctx)
-	return identity.Login, err
-}
-
-func (gateway forgejoReviewSubmitGateway) GetPullRequestDiff(ctx context.Context, input githubinfra.GetPullRequestDiffInput) (string, error) {
-	diff, err := gateway.client.PullRequestDiff(ctx, input.PRNumber)
-	if err != nil {
-		// Forgejo client caps response bodies at 1 MiB with a generic
-		// "response exceeds" error. Map that to ErrDiffTooLarge so top-level
-		// reviews without inline comments can use the existing no-anchor path.
-		if strings.Contains(err.Error(), "response exceeds") {
-			return "", githubinfra.ErrDiffTooLarge
-		}
-		return "", err
-	}
-	return diff, nil
-}
-
-func (gateway forgejoReviewSubmitGateway) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
-	if matches := reviewSubmitMarkerRE.FindStringSubmatch(input.Body); len(matches) == 2 {
-		expected := parseReviewSubmitMarkerFields(matches[1])
-		reviews, err := gateway.client.ListPullRequestReviews(ctx, input.PRNumber)
-		if err != nil {
-			return err
-		}
-		identity, err := gateway.client.CurrentUser(ctx)
-		if err != nil {
-			return err
-		}
-		for _, review := range reviews {
-			candidateMatch := reviewSubmitMarkerRE.FindStringSubmatch(review.Body)
-			if len(candidateMatch) != 2 {
-				continue
-			}
-			candidate := parseReviewSubmitMarkerFields(candidateMatch[1])
-			// Only reuse a marker published by the current authenticated account.
-			// Another identity may share id/head/outcome after token rotation or
-			// multi-instance reuse; later marker verification filters by login.
-			if candidate["id"] == expected["id"] && candidate["head"] == expected["head"] && candidate["outcome"] == expected["outcome"] && forgeReviewSubmitStateMatchesEvent(review.State, input.Event) && sameGitHubLogin(review.User.Login, identity.Login) {
-				return nil
-			}
-		}
-	}
-	// Match the GitHub gateway contract: retarget/downgrade invalid anchors using the
-	// live diff index so a bad path/line does not fail the whole native review submit.
-	input.Body, input.Comments = githubinfra.NormalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
-	comments := make([]forge.PullRequestReviewCommentInput, 0, len(input.Comments))
-	for _, comment := range input.Comments {
-		comments = append(comments, forge.PullRequestReviewCommentInput{Body: gateway.stamper.ReviewComment(comment.Body, "reviewer"), Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
-	}
-	body := gateway.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
-	_, err := gateway.client.CreatePullRequestReview(ctx, forge.CreatePullRequestReviewInput{Number: input.PRNumber, Body: body, Event: input.Event, CommitID: input.CommitID, Comments: comments})
-	return err
-}
-
-func forgeReviewSubmitStateMatchesEvent(state, event string) bool {
-	state = strings.ToUpper(strings.TrimSpace(state))
-	switch strings.ToUpper(strings.TrimSpace(event)) {
-	case "APPROVE":
-		return state == "APPROVED"
-	case "REQUEST_CHANGES":
-		return state == "CHANGES_REQUESTED" || state == "REQUEST_CHANGES"
-	case "COMMENT":
-		return state == "COMMENTED" || state == "COMMENT"
-	default:
-		return false
-	}
-}
-
-func forgeReviewSubmitLabelNames(labels []forge.Label) []string {
-	result := make([]string, 0, len(labels))
-	for _, label := range labels {
-		result = append(result, label.Name)
-	}
-	return result
-}
-
 func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnostic func(string, map[string]any)) (reviewSubmitGateway, error) {
-	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
-	if err != nil {
-		return nil, err
-	}
-	if matched != nil {
-		// Include storage-materialized projects so ProjectRoleConfigs sees
-		// project-specific roles instead of falling back to global defaults.
-		roleCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
-		selection, err := forge.NewResolver(roleCfg).ForProjectRef(*matched)
-		if err != nil {
-			return nil, err
-		}
-		if client, native, err := selection.ForgejoClient(); native || err != nil {
-			if err != nil {
-				return nil, err
-			}
-			reviewer, ok := config.ProjectCodingRoleConfig(roleCfg, matched.ID, config.CodingRoleReviewer)
-			if !ok {
-				return nil, fmt.Errorf("reviewer coding role is not configured")
-			}
-			return forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(cfg), requireReviewRequest: reviewer.Discovery.RequireReviewRequest, labels: append([]string(nil), reviewer.Discovery.Labels...), labelMode: reviewer.Discovery.LabelMode}, nil
-		}
-	}
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" {
 		return nil, fmt.Errorf("GitHub CLI (gh) not found; install gh or set --gh-path <path>")
 	}
@@ -238,137 +74,6 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 		GitRun:                 shell.Run,
 		ReviewSubmitDiagnostic: diagnostic,
 	}), nil
-}
-
-// reviewSubmitProjectForRepo selects the configured project for a review-submit
-// repository. When provider-qualified projects share the same owner/repo,
-// prefer the project whose registered checkout or worktree contains cwd before
-// treating the repository as ambiguous.
-//
-// File-config and SQLite catalog projects are combined before matching so a
-// single file-config same-repo hit cannot hide an API-managed project that CWD
-// would otherwise select unambiguously.
-func reviewSubmitProjectForRepo(cfg config.Config, repo, cwd string) (*config.ProjectRefConfig, error) {
-	candidates := append([]config.ProjectRefConfig(nil), cfg.Projects...)
-	seen := make(map[string]struct{}, len(candidates))
-	for _, project := range candidates {
-		if id := strings.TrimSpace(project.ID); id != "" {
-			seen[id] = struct{}{}
-		}
-	}
-	dbProjects, err := loadReviewSubmitProjectsFromStorage(cfg)
-	if err != nil {
-		return nil, err
-	}
-	for _, project := range dbProjects {
-		id := strings.TrimSpace(project.ID)
-		if id == "" {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		candidates = append(candidates, project)
-	}
-	return reviewSubmitMatchProject(candidates, repo, cwd)
-}
-
-// reviewSubmitConfigWithMatchedProject returns a config snapshot that includes
-// the matched project so ProjectRoleConfigs can resolve storage-materialized
-// role overrides when the project is absent from file config.
-func reviewSubmitConfigWithMatchedProject(cfg config.Config, matched *config.ProjectRefConfig) config.Config {
-	if matched == nil {
-		return cfg
-	}
-	matchedID := strings.TrimSpace(matched.ID)
-	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.ID) == matchedID {
-			return cfg
-		}
-	}
-	cfg.Projects = append(append([]config.ProjectRefConfig(nil), cfg.Projects...), *matched)
-	return cfg
-}
-
-func reviewSubmitMatchProject(projectList []config.ProjectRefConfig, repo, cwd string) (*config.ProjectRefConfig, error) {
-	repo = strings.TrimSpace(repo)
-	var matches []*config.ProjectRefConfig
-	for index := range projectList {
-		project := &projectList[index]
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		matches = append(matches, project)
-	}
-	switch len(matches) {
-	case 0:
-		return nil, nil
-	case 1:
-		return matches[0], nil
-	}
-	var cwdMatches []*config.ProjectRefConfig
-	for _, project := range matches {
-		if reviewSubmitCWDBelongsToProject(*project, cwd) {
-			cwdMatches = append(cwdMatches, project)
-		}
-	}
-	if len(cwdMatches) == 1 {
-		return cwdMatches[0], nil
-	}
-	return nil, fmt.Errorf("review submit repository %s matches multiple configured projects", repo)
-}
-
-func loadReviewSubmitProjectsFromStorage(cfg config.Config) ([]config.ProjectRefConfig, error) {
-	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
-	if dbPath == "" {
-		return nil, nil
-	}
-	if _, err := os.Stat(dbPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("stat project database for review submit: %w", err)
-	}
-	db, err := storage.OpenSQLiteDB(context.Background(), dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open project database for review submit: %w", err)
-	}
-	defer func() { _ = db.Close() }()
-	records, err := storage.NewRepositories(db).Projects.List(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("list projects for review submit: %w", err)
-	}
-	materialized, err := projects.MaterializeCatalog(cfg, records)
-	if err != nil {
-		return nil, fmt.Errorf("materialize project catalog for review submit: %w", err)
-	}
-	return materialized, nil
-}
-
-func reviewSubmitCWDBelongsToProject(project config.ProjectRefConfig, cwd string) bool {
-	cwd = filepath.Clean(strings.TrimSpace(cwd))
-	if cwd == "." || cwd == "" {
-		return false
-	}
-	repoPath := filepath.Clean(strings.TrimSpace(project.RepoPath))
-	if repoPath != "." && cwd == repoPath {
-		return true
-	}
-	worktreeRoot := ""
-	if project.WorktreeRoot != nil {
-		worktreeRoot = strings.TrimSpace(*project.WorktreeRoot)
-	}
-	if worktreeRoot == "" {
-		resolved, err := config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
-		if err != nil {
-			return false
-		}
-		worktreeRoot = resolved
-	}
-	worktreeRoot = filepath.Clean(worktreeRoot)
-	relative, err := filepath.Rel(worktreeRoot, cwd)
-	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 // Options is one `looper review submit` invocation.
@@ -484,13 +189,6 @@ func Run(ctx context.Context, opts Options) error {
 	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return err
 	}
-	// Review-request publish bypass for Forgejo is derived from trusted
-	// run/loop metadata (manual loop, or enabled follow-up on a new head),
-	// never from the agent-controlled argv --reviewer-manual flag alone.
-	requestBypass, err := trustedReviewRequestSubmitBypass(ctx, opts, loaded.Config, repo, prNumber, commitID)
-	if err != nil {
-		return err
-	}
 	if err := validateReviewerReviewSubmitHold(ctx, loaded.Config, repo, prNumber, opts.ReviewerManual, opts.ReviewerRunID, detail.Labels); err != nil {
 		return err
 	}
@@ -516,11 +214,7 @@ func Run(ctx context.Context, opts Options) error {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
 			// Body-only oversized/truncated fallback still must fail closed on base/head
 			// drift: hold-only refresh is not enough when commit_id was captured earlier.
-			freshLabels, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd)
-			if err != nil {
-				return err
-			}
-			if err := validateForgejoReviewSubmitRequest(ctx, gateway, prNumber, freshLabels, requestBypass); err != nil {
+			if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd); err != nil {
 				return err
 			}
 			return submitReviewWithoutAnchorValidation(ctx, stdout, stderr, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
@@ -541,27 +235,13 @@ func Run(ctx context.Context, opts Options) error {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
 	// Fail closed on base/head drift between anchor resolution and mutation.
-	freshLabels, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd)
-	if err != nil {
-		return err
-	}
-	if err := validateForgejoReviewSubmitRequest(ctx, gateway, prNumber, freshLabels, requestBypass); err != nil {
+	if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd); err != nil {
 		return err
 	}
 	if err := gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
 		return wrapReviewSubmitError(stderr, repo, prNumber, submissionEvent, commitID, payload, "submit validated PR review", err)
 	}
 	return writeJSON(stdout, map[string]any{"submitted": true})
-}
-
-func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmitGateway, prNumber int64, labels []string, bypass bool) error {
-	validator, ok := gateway.(interface {
-		validateReviewRequest(context.Context, int64, []string, bool) error
-	})
-	if !ok {
-		return nil
-	}
-	return validator.validateReviewRequest(ctx, prNumber, labels, bypass)
 }
 
 // trustedReviewRequestSubmitBypass reports whether Forgejo review-request /
@@ -575,48 +255,12 @@ func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmi
 //     / reviewerFollowUpHasNewHead in the reviewer runner). Automatic follow-up
 //     runs do not pass --reviewer-run-id, so that path resolves the current
 //     running reviewer loop for the PR when the flag is absent.
-func trustedReviewRequestSubmitBypass(ctx context.Context, opts Options, cfg config.Config, repo string, prNumber int64, headSHA string) (bool, error) {
-	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
-	if dbPath == "" {
-		return false, nil
-	}
-	// Match loadReviewSubmitProjectsFromStorage: only probe an already-
-	// materialized daemon DB. OpenSQLiteDB creates missing files without
-	// migrations, which would turn an optional authority lookup into
-	// "no such table" failures for review-submit callers that only set
-	// storage.dbPath (CLI harnesses, one-shot agent config).
-	if _, err := os.Stat(dbPath); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("validate trusted review request bypass: %w", err)
-	}
-	db, err := storage.OpenSQLiteDB(ctx, dbPath)
-	if err != nil {
-		return false, fmt.Errorf("validate trusted review request bypass: %w", err)
-	}
-	defer func() { _ = db.Close() }()
-	repos := storage.NewRepositories(db)
-	runID := strings.TrimSpace(opts.ReviewerRunID)
-	if runID != "" {
-		manual, err := trustedManualReviewerRun(ctx, repos, repo, prNumber, runID)
-		if err != nil {
-			return false, err
-		}
-		if manual {
-			return true, nil
-		}
-		return trustedFollowUpNewHeadReviewerRun(ctx, repos, repo, prNumber, runID, headSHA)
-	}
-	return trustedCurrentFollowUpNewHeadReviewerBypass(ctx, repos, repo, prNumber, headSHA)
-}
-
+//
 // resolveReviewSubmitAnchors establishes complete base/head anchor authority.
 // For actionable inline comments it prefers path-targeted local diffs (GitHub
 // gateway) and never treats a truncated remote capture as authoritative.
 // Body-only reviews may still proceed when only GitHub oversized / local
-// capture limits block a full remote diff. Forgejo uses the remote PR diff as
-// complete authority.
+// capture limits block a full remote diff.
 func resolveReviewSubmitAnchors(ctx context.Context, gateway reviewSubmitGateway, repo string, prNumber int64, cwd string, detail githubinfra.PullRequestDetail, comments []reviewSubmitComment) (*diffanchor.Index, error) {
 	if len(comments) == 0 {
 		diff, err := gateway.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
@@ -648,7 +292,7 @@ func resolveReviewSubmitAnchors(ctx context.Context, gateway reviewSubmitGateway
 		return anchors, nil
 	}
 
-	// Forgejo and other gateways: remote PR diff is the complete authority.
+	// Non-GitHub-gateway callers: the remote PR diff is the complete authority.
 	diff, err := gateway.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return nil, err
@@ -883,14 +527,14 @@ func validateLatestReviewerReviewSubmitHold(ctx context.Context, gh reviewSubmit
 	if err := validateReviewerReviewSubmitHold(ctx, cfg, repo, prNumber, manual, runID, detail.Labels); err != nil {
 		return nil, err
 	}
-	// Return the refreshed labels so Forgejo publish authority does not reuse
-	// the first PR snapshot (which can still list a trigger label removed mid-run).
+	// Return the refreshed labels so publish authority does not reuse the first
+	// PR snapshot (which can still list a trigger label removed mid-run).
 	return detail.Labels, nil
 }
 
 // validateLatestReviewerReviewSubmitPublication re-reads the PR before mutation
 // and fails closed on head/base drift plus hold labels. Refreshed labels are
-// returned so Forgejo publish authority uses the latest snapshot.
+// returned so publish authority uses the latest snapshot.
 func validateLatestReviewerReviewSubmitPublication(ctx context.Context, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string) ([]string, error) {
 	detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {

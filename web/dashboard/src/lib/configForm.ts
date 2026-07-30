@@ -235,10 +235,7 @@ const SELECT_OPTIONS: Record<string, string[]> = {
     "changed_files",
     "changed_ranges",
   ],
-  "roles.reviewer.behavior.publishMode": [
-    "single_review",
-    "summary_comment",
-  ],
+  "roles.reviewer.behavior.publishMode": ["single_review"],
   "roles.reviewer.behavior.reviewEvents.clean": ["COMMENT", "APPROVE"],
   "roles.reviewer.behavior.reviewEvents.blocking": [
     "COMMENT",

@@ -131,7 +131,7 @@ func TestRestartRequiredChangesReturnsConcreteSortedPaths(t *testing.T) {
 	newConfig.Roles.Planner.Triggers.Labels = []string{"hot-label"}
 	newConfig.Defaults.BaseBranch = "develop"
 	newConfig.Roles.Coordinator.Enabled = !newConfig.Roles.Coordinator.Enabled
-	newConfig.Providers = append(newConfig.Providers, ProviderConfig{ID: "forgejo", Kind: ProviderKindForgejo})
+	newConfig.Providers = append(newConfig.Providers, ProviderConfig{ID: "ghes", Kind: ProviderKindGitHub, BaseURL: "https://ghe.example.test"})
 	newConfig.Projects = append(newConfig.Projects, ProjectRefConfig{ID: "import"})
 
 	want := []string{

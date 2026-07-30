@@ -27,7 +27,6 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/fixer"
-	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
@@ -953,18 +952,17 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 }
 
 type statusResponse struct {
-	Service         statusService                 `json:"service"`
-	Storage         statusStorage                 `json:"storage"`
-	Scheduler       statusScheduler               `json:"scheduler"`
-	Agent           statusAgent                   `json:"agent"`
-	WorktreeCleanup any                           `json:"worktreeCleanup"`
-	Webhook         statusWebhook                 `json:"webhook"`
-	Loops           statusLoops                   `json:"loops"`
-	Network         any                           `json:"network,omitempty"`
-	Safety          statusSafety                  `json:"safety"`
-	Notifications   statusNotifications           `json:"notifications"`
-	Tools           statusTools                   `json:"tools"`
-	Providers       []forge.ForgejoProviderHealth `json:"providers"`
+	Service         statusService       `json:"service"`
+	Storage         statusStorage       `json:"storage"`
+	Scheduler       statusScheduler     `json:"scheduler"`
+	Agent           statusAgent         `json:"agent"`
+	WorktreeCleanup any                 `json:"worktreeCleanup"`
+	Webhook         statusWebhook       `json:"webhook"`
+	Loops           statusLoops         `json:"loops"`
+	Network         any                 `json:"network,omitempty"`
+	Safety          statusSafety        `json:"safety"`
+	Notifications   statusNotifications `json:"notifications"`
+	Tools           statusTools         `json:"tools"`
 }
 
 type statusService struct {
@@ -1480,25 +1478,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			LooperPath:    reviewPublish.LooperPath,
 			ReviewPublish: reviewPublish,
 		},
-		Providers: h.buildProviderHealth(ctx),
 	}, nil
-}
-
-func (h *Handler) buildProviderHealth(ctx context.Context) []forge.ForgejoProviderHealth {
-	providers := make([]forge.ForgejoProviderHealth, 0)
-	for _, provider := range h.context.Config.Providers {
-		if provider.Kind != config.ProviderKindForgejo {
-			continue
-		}
-		projects := make([]forge.ForgejoProbeProject, 0)
-		for _, project := range h.context.Config.Projects {
-			if project.Provider == provider.ID {
-				projects = append(projects, forge.ForgejoProbeProject{ID: project.ID, Repo: project.Repo})
-			}
-		}
-		providers = append(providers, forge.ProbeForgejoProvider(ctx, provider, projects))
-	}
-	return providers
 }
 
 func (h *Handler) buildWorktreeCleanupStatusResponse() any {
@@ -1876,7 +1856,7 @@ type projectResponse struct {
 	RepoPath   string `json:"repoPath"`
 	BaseBranch string `json:"baseBranch"`
 	Archived   bool   `json:"archived"`
-	// Provider is the resolved provider kind for display (github, forgejo).
+	// Provider is the resolved provider kind for display.
 	Provider     string  `json:"provider"`
 	Repo         *string `json:"repo"`
 	WorktreeRoot *string `json:"worktreeRoot"`
