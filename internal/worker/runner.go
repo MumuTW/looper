@@ -33,6 +33,7 @@ import (
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/reproduction"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/validation"
 	"github.com/nexu-io/looper/internal/worktreesafety"
@@ -1743,6 +1744,11 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
 		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, agentVendor, derefString(agentModel))
+		// The reproduction's identity is explicit Worker input: it must not be
+		// re-derived from the diff, and the completion gate will re-check it.
+		if manifest, present, manifestErr := reproduction.ReadManifest(worktree.Path); manifestErr == nil && present {
+			prompt += reproduction.PromptBlock(manifest)
+		}
 		if err != nil {
 			return checkpoint, err
 		}
@@ -2009,6 +2015,10 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 	if inspect.HasUncommittedChanges {
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		return checkpoint, &loopError{message: "Validation left uncommitted changes after reconcile", kind: FailureManualIntervention}
+	}
+	if err := r.enforceReproductionGate(ctx, input, work, worktree.Path); err != nil {
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, err
 	}
 	result.HeadSHA = inspect.HeadSHA
 	checkpoint.Validation = &result

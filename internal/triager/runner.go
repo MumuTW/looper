@@ -153,6 +153,18 @@ type PlannerRouter interface {
 	RouteIssue(context.Context, planner.RouteIssueInput) (planner.DiscoveryResult, error)
 }
 
+// ReproductionGate lets a Role scheduled between Triager and Planner withhold
+// routing until a bug has a durable reproduction.
+//
+// It is an interface rather than a direct dependency so Triager keeps knowing
+// nothing about reproduction: a nil gate means today's path exactly, which is
+// what every non-bug classification and every project with the Reproducer
+// disabled gets.
+type ReproductionGate interface {
+	// PlannerAllowed reports whether this accepted report may reach Planner now.
+	PlannerAllowed(ctx context.Context, report Report) (bool, error)
+}
+
 type Options struct {
 	Repos          *storage.Repositories
 	GitHub         GitHubGateway
@@ -161,16 +173,19 @@ type Options struct {
 	Now            func() time.Time
 	SourceLookback time.Duration
 	DecisionLimit  int
+	// ReproductionGate is optional. Nil keeps the pre-Reproducer routing path.
+	ReproductionGate ReproductionGate
 }
 
 type Runner struct {
-	repos          *storage.Repositories
-	github         GitHubGateway
-	llm            LLM
-	planner        PlannerRouter
-	now            func() time.Time
-	sourceLookback time.Duration
-	decisionLimit  int
+	repos            *storage.Repositories
+	github           GitHubGateway
+	llm              LLM
+	planner          PlannerRouter
+	now              func() time.Time
+	sourceLookback   time.Duration
+	decisionLimit    int
+	reproductionGate ReproductionGate
 }
 
 type DiscoveryInput struct {
@@ -186,6 +201,7 @@ type DiscoveryResult struct {
 	ReportsPersisted     int
 	Routed               int
 	AwaitingConfirmation int
+	AwaitingReproduction int
 	Confirmed            int
 	Skipped              int
 	Retired              int
@@ -208,6 +224,7 @@ func New(options Options) *Runner {
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, llm: options.LLM,
 		planner: options.Planner, now: now, sourceLookback: sourceLookback, decisionLimit: decisionLimit,
+		reproductionGate: options.ReproductionGate,
 	}
 }
 
@@ -473,6 +490,19 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 	}
 	if action != ActionRoutePlanner {
 		return fmt.Errorf("triage report %s has unknown policy action %q", report.IdempotencyKey, action)
+	}
+	// A bug must be reproduced before planning is paid for. The gate holds the
+	// enrollment open rather than retiring it, so the projection replays
+	// unchanged on the tick after the reproduction lands.
+	if r.reproductionGate != nil {
+		allowed, err := r.reproductionGate.PlannerAllowed(ctx, *report)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			result.AwaitingReproduction++
+			return nil
+		}
 	}
 	route, err := r.planner.RouteIssue(ctx, planner.RouteIssueInput{
 		ProjectID: enrollment.ProjectID, Repo: repo, Authority: report.IdempotencyKey,

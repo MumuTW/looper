@@ -703,9 +703,22 @@ type Config struct {
 	Defaults      DefaultsConfig     `json:"defaults"`
 	Instructions  InstructionsConfig `json:"instructions"`
 	HITL          HITLConfig         `json:"hitl"`
+	Reproducer    ReproducerConfig   `json:"reproducer"`
 	Roles         RoleConfigs        `json:"roles"`
 	Providers     []ProviderConfig   `json:"providers,omitempty"`
 	Projects      []ProjectRefConfig `json:"projects"`
+}
+
+// ReproducerConfig gates the Reproducer Role: when Enabled, a bug-classified
+// Triage Report must produce a durable Reproduction Record before Planner is
+// reached, and Worker's and Fixer's completion gate additionally requires the
+// recorded reproduction command to pass.
+//
+// Disabled is the default, matching hitl.enabled and the Planner escalation
+// policy. Enabling it changes what "done" means for every bug in a project,
+// which is an opt-in decision rather than a behaviour change on upgrade.
+type ReproducerConfig struct {
+	Enabled bool `json:"enabled"`
 }
 
 // HITLConfig gates the mid-run human-in-the-loop feature: when Enabled, agents
@@ -984,6 +997,10 @@ type PartialInstructionsConfig struct {
 	MaxBytes *int  `json:"maxBytes,omitempty"`
 }
 
+type PartialReproducerConfig struct {
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
 type PartialHITLConfig struct {
 	Enabled         *bool                    `json:"enabled,omitempty"`
 	AnswerTransport *string                  `json:"answerTransport,omitempty"`
@@ -1187,6 +1204,7 @@ type PartialConfig struct {
 	LegacyReviewer *PartialReviewerConfig     `json:"reviewer,omitempty"`
 	Instructions   *PartialInstructionsConfig `json:"instructions,omitempty"`
 	HITL           *PartialHITLConfig         `json:"hitl,omitempty"`
+	Reproducer     *PartialReproducerConfig   `json:"reproducer,omitempty"`
 	Roles          *PartialRoleConfigs        `json:"roles,omitempty"`
 	Providers      *[]PartialProviderConfig   `json:"providers,omitempty"`
 	Projects       *[]PartialProjectRefConfig `json:"projects,omitempty"`

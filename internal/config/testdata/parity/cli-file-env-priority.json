@@ -364,6 +364,9 @@
       },
       "hitl": {
         "enabled": false
+      },
+      "reproducer": {
+        "enabled": false
       }
     },
     "metadata": {

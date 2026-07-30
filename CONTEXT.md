@@ -31,6 +31,16 @@ accepted low-risk reports directly into Planner work. It has no configurable
 trigger labels and does not replace Fixer's review-feedback source.
 _Avoid_: coordinator (a separate label/network control-plane role).
 
+**Reproducer**:
+An internal Role that runs between Triager and Planner for bug-classified
+Issues. It authors a failing reproduction in its own worktree and agent session,
+proves the reproduction command fails on the current base before accepting it,
+commits it to the branch Planner will adopt, and persists a Reproduction Record.
+When it cannot make the bug fail it produces a `cannot reproduce` record and
+parks the Issue for a human instead of reaching Planner. It is bug-only and
+default-disabled.
+_Avoid_: reproducer agent, test writer, verifier.
+
 **Worker**:
 A reactive Role that implements a Spec or an Issue, producing a Pull Request.
 _Avoid_: implementer, builder, coder.
@@ -110,6 +120,40 @@ The **Dispatch** precondition that all **Blockers** be `state==closed AND state_
 **Ready set**:
 The subset of tracked Issues whose **Dependency gate** is currently released — the Issues that may be **Dispatched** this tick, subject to the existing PRD #334 conditions.
 
+**Reproduction Record**:
+Reproducer's durable structured record containing the reproduction command, the
+reproduction test file paths with their content hashes, the reproduction commit
+SHA, the base SHA the command was observed failing on, the observed failure, and
+the idempotency key. It is stored as a `reproduction.recorded` event and is the
+Authority for "this bug is reproduced". A copy travels with the branch as the
+committed **Reproduction manifest**; the record, not the copy, is what the
+completion gate is checked against.
+_Avoid_: failing test, red test, repro.
+
+**Reproduction manifest**:
+The `.looper/reproduction.json` file committed in the reproduction commit. It
+carries the Reproduction Record with the branch so Planner, Worker, and Fixer
+receive the reproduction's identity as explicit input rather than re-deriving it
+from the diff.
+_Avoid_: sentinel, ask file.
+
+**Reproduction gate**:
+The completion precondition, additional to repository validation, that the
+recorded reproduction command passes and every recorded reproduction file still
+hashes to its recorded content. Worker and Fixer both enforce it. A hash
+mismatch or a missing file fails the run with a distinct, non-generic reason
+rather than as an ordinary validation failure.
+_Avoid_: validation gate, suite gate.
+
+**Cannot reproduce**:
+Reproducer's decision that the reported bug could not be made to fail, recorded
+as a `reproduction.unreproducible` event with what was attempted, what was
+observed instead, and what information is missing. It is a decision, not a
+failure: it increments no attempts, trips no retry, and parks the Planner loop
+in `awaiting_human` with a HITL ask. A human answer either waives the
+reproduction (`reproduction.waived`) or leaves the Issue stopped.
+_Avoid_: reproduction failure, crash.
+
 **Acceptance criterion**:
 A checkbox item under an Issue's `## Acceptance criteria` section. Reviewer's auto-merge gate verifies each criterion has a satisfying-evidence pointer in the diff before submitting APPROVE.
 
@@ -129,6 +173,10 @@ The durable `pull_request.merge_gate.evaluated` event written by Merge Gatekeepe
 
 **Authority**:
 For any side-effecting action, the named, durable, structured signal that justifies the action. Per `AGENTS.md`: "What is the authority for this action, and why is it not the agent's own structured output?" Coordinator's authority for Dispatch is the durable `dispatch/*` label on the Issue, which is the agent's structured output committed to GitHub.
+Reproducer's authority for "this bug is reproduced" is the persisted
+Reproduction Record — command, commit SHA, file hashes — written before Planner
+is reached and verified by actually running the command, not the agent's claim
+that it wrote a test.
 Triager's authority for Triage routing is the persisted Triage Report; the
 policy outcome is stored before Planner projection and replayed after partial
 failures. When policy requires a human, the report plus its persisted
@@ -202,6 +250,9 @@ _Avoid_: local sandbox, mock sandbox.
 
 - A **Triager** performs **Triage** on a new or reopened GitHub **Issue**, producing a persisted **Triage Report**
 - An accepted low-risk **Triage Report** authorizes **Triage routing** directly to **Planner**
+- A bug-classified **Triage Report** authorizes **Reproducer**, and **Triage routing** to **Planner** is withheld until a **Reproduction Record** or a `reproduction.waived` record exists
+- A **Reproducer** produces either a **Reproduction Record** plus a reproduction commit on the branch **Planner** will adopt, or a **Cannot reproduce** decision that parks the Planner loop for a human
+- **Planner**, **Worker**, and **Fixer** read the **Reproduction manifest** from their worktree as explicit input; **Worker** and **Fixer** additionally enforce the **Reproduction gate** on top of unchanged repository validation
 - A **Coordinator** performs label-mediated **Triage** on a fresh **Issue**, producing a **Disposition** plus classification labels
 - A **Coordinator** performs **Dispatch** on a Triaged Issue, producing a **Trigger label** that a **Planner** or **Worker** observes
 - A **Coordinator** may perform **PR review assignment**, producing a GitHub review request that **Reviewer** observes

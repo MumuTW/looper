@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/reproduction"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
@@ -1072,6 +1073,12 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
 		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
+		// A reproduction committed on this branch by Reproducer is explicit
+		// Planner input: plan the fix against a demonstrated failure rather than
+		// against the Issue's prose.
+		if manifest, present, manifestErr := reproduction.ReadManifest(worktree.Path); manifestErr == nil && present {
+			prompt += reproduction.PromptBlock(manifest)
+		}
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value

@@ -153,6 +153,9 @@
       "hitl": {
         "enabled": false
       },
+      "reproducer": {
+        "enabled": false
+      },
       "roles": {
         "coordinator": {
           "enabled": false,

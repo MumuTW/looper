@@ -3445,12 +3445,20 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
 			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: FailureManualIntervention}
 		}
+		if gateErr := r.enforceReproductionGate(ctx, input, worktree.Path); gateErr != nil {
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			return checkpoint, gateErr
+		}
 		second.HeadSHA = finalInspect.HeadSHA
 		second.Summary = firstNonEmpty(second.Summary, "Validation passed after extra reconcile")
 		r.refreshReconcileMetadata(&checkpoint, worktree, finalInspect)
 		checkpoint.Validation = &second
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
+	}
+	if gateErr := r.enforceReproductionGate(ctx, input, worktree.Path); gateErr != nil {
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, gateErr
 	}
 	r.refreshReconcileMetadata(&checkpoint, worktree, inspect)
 	result.HeadSHA = inspect.HeadSHA

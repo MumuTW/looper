@@ -32,6 +32,7 @@ import (
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/projects"
+	"github.com/nexu-io/looper/internal/reproducer"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/triager"
@@ -44,6 +45,10 @@ type plannerScheduler interface {
 	DiscoverIssues(context.Context, planner.DiscoveryInput) (planner.DiscoveryResult, error)
 	ProcessNext(context.Context, string) (*planner.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*planner.ProcessResult, error)
+}
+
+type reproducerScheduler interface {
+	DiscoverIssues(context.Context, reproducer.DiscoveryInput) (reproducer.DiscoveryResult, error)
 }
 
 type triagerScheduler interface {
@@ -112,6 +117,7 @@ type defaultSchedulerTickInput struct {
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
 	Triager                  triagerScheduler
+	Reproducer               reproducerScheduler
 	Planner                  plannerScheduler
 	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
@@ -122,6 +128,7 @@ type defaultSchedulerTickInput struct {
 	Config                   *config.Config
 	PlannerDiscoveryEnabled  *bool
 	TriagerEnabled           func(string) bool
+	ReproducerEnabled        func(string) bool
 	CoordinatorEnabled       func(string) bool
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
@@ -2877,6 +2884,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	}
 
 	var triagerRunner triagerScheduler
+	var reproducerRunner reproducerScheduler
 	var plannerRoleRunner *planner.Runner
 	var plannerRunner plannerScheduler
 	var coordinatorRunner coordinatorScheduler
@@ -3001,11 +3009,18 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 		plannerRunner = plannerRoleRunner
 	}
+	// The Reproducer gate is built even when the Role is disabled-by-absence so
+	// the wiring has one shape; a nil gate is Triager's pre-Reproducer path.
+	var reproductionGate triager.ReproductionGate
+	if cfg.Reproducer.Enabled {
+		reproductionGate = reproducer.NewGate(repos)
+	}
 	if plannerConfigured && githubGateway != nil {
 		triagerRunner = triager.New(triager.Options{
-			Repos:   repos,
-			GitHub:  githubGateway,
-			Planner: plannerRoleRunner,
+			Repos:            repos,
+			GitHub:           githubGateway,
+			Planner:          plannerRoleRunner,
+			ReproductionGate: reproductionGate,
 			LLM: triager.NewAgentLLM(
 				plannerExecutor,
 				time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
@@ -3132,6 +3147,21 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			return strings.TrimSpace(command)
 		}
 		return "codex"
+	}
+	if cfg.Reproducer.Enabled && plannerConfigured && githubGateway != nil {
+		reproducerRunner = reproducer.New(reproducer.Options{
+			Repos:                  repos,
+			GitHub:                 githubGateway,
+			Git:                    plannerGitAdapter{gateway: gitGateway, stamper: roleStamper(resolvedPlanner)},
+			AgentExecutor:          plannerAgentExecutorAdapter{executor: plannerExecutor},
+			Planner:                plannerRoleRunner,
+			Now:                    now,
+			AgentTimeout:           time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
+			CommandTimeout:         time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
+			ValidationCodexCommand: validationCodexCommand(resolvedPlanner),
+			ContainmentTracker:     activeExecutions,
+		})
 	}
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
@@ -3282,6 +3312,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AsyncRunner:          runner,
 			RequestSchedulerWake: requestWake,
 			Triager:              triagerRunner,
+			Reproducer:           reproducerRunner,
 			Planner:              plannerRunner,
 			Coordinator:          coordinatorRunner,
 			Reviewer:             reviewerRunner,
@@ -3297,6 +3328,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			TriagerEnabled: func(projectID string) bool {
 				policy := view.RolePolicy(projectID)
 				return plannerConfigured && policy.RoleAutoDiscovery(config.CodingRolePlanner) && !policy.Roles.Coordinator.Enabled
+			},
+			ReproducerEnabled: func(projectID string) bool {
+				policy := view.RolePolicy(projectID)
+				return cfg.Reproducer.Enabled && plannerConfigured && policy.RoleAutoDiscovery(config.CodingRolePlanner) && !policy.Roles.Coordinator.Enabled
 			},
 			CoordinatorEnabled:       func(projectID string) bool { return view.RolePolicy(projectID).Roles.Coordinator.Enabled },
 			ReviewerDiscoveryEnabled: boolPtr(reviewerConfigured && view.AnyProjectRoleAutoDiscovery("reviewer")),

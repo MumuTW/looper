@@ -80,6 +80,7 @@ type CodingRoleConfig struct {
 // internal lanes, not coding-role registry entries.
 const (
 	PriorityTriager     = 5
+	PriorityReproducer  = 7
 	PriorityPlanner     = 10
 	PriorityCoordinator = 20
 	PriorityReviewer    = 30

@@ -11,6 +11,7 @@ import (
 	"github.com/nexu-io/looper/internal/gatekeeper"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/planner"
+	"github.com/nexu-io/looper/internal/reproducer"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/triager"
@@ -160,6 +161,26 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 	}
 }
 
+// reproducerLane sits between triager and planner. The ordering is the design:
+// running after Planner would mean the planning cost is already paid before
+// anyone knows whether the bug can be made to fail at all.
+func reproducerLane(input defaultSchedulerTickInput) discoveryLane {
+	decisionBudget := reproducer.DefaultDecisionLimit
+	return discoveryLane{
+		Name:     "reproducer",
+		Priority: config.PriorityReproducer,
+		Present:  input.Reproducer != nil,
+		Enabled: func(projectID string) bool {
+			return input.ReproducerEnabled != nil && input.ReproducerEnabled(projectID)
+		},
+		Supported: supportsGitHubIssueDiscovery,
+		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
+			result, err := input.Reproducer.DiscoverIssues(ctx, reproducer.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: &decisionBudget})
+			return result.QueueItems, err
+		},
+	}
+}
+
 // discoveryLanes builds the ordered lane list for one tick from registered
 // coding and internal roles.
 //
@@ -181,7 +202,7 @@ func discoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
 	roles := config.EffectiveCodingRoles(roleConfigs)
 	names := config.CodingRoleNames(roleConfigs)
 
-	lanes := make([]discoveryLane, 0, len(names)+2)
+	lanes := make([]discoveryLane, 0, len(names)+3)
 	for _, name := range names {
 		role := roles[name]
 		lane, ok := discoverers[name]
@@ -194,7 +215,7 @@ func discoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
 		lanes = append(lanes, lane)
 	}
 
-	lanes = append(lanes, triagerLane(input), coordinatorLane(input))
+	lanes = append(lanes, triagerLane(input), reproducerLane(input), coordinatorLane(input))
 	sort.SliceStable(lanes, func(i, j int) bool { return lanes[i].Priority < lanes[j].Priority })
 	return lanes
 }

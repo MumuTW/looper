@@ -394,6 +394,9 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeInstructionsConfig(&config.Instructions, *partial.Instructions)
 	}
 
+	if partial.Reproducer != nil && partial.Reproducer.Enabled != nil {
+		config.Reproducer.Enabled = *partial.Reproducer.Enabled
+	}
 	if partial.HITL != nil {
 		if partial.HITL.Enabled != nil {
 			config.HITL.Enabled = *partial.HITL.Enabled
