@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
@@ -91,14 +93,15 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
-	Repos             *storage.Repositories
-	GitHubGateway     *githubinfra.Gateway
-	Logger            bootstrap.Logger
-	Now               func() time.Time
-	MaxConcurrentRuns int
-	ClaimMu           *sync.Mutex
-	ClaimBoundary     *sync.RWMutex
-	RefreshForClaim   func() defaultSchedulerTickInput
+	Repos              *storage.Repositories
+	StorageCoordinator *storage.SQLiteCoordinator
+	GitHubGateway      *githubinfra.Gateway
+	Logger             bootstrap.Logger
+	Now                func() time.Time
+	MaxConcurrentRuns  int
+	ClaimMu            *sync.Mutex
+	ClaimBoundary      *sync.RWMutex
+	RefreshForClaim    func() defaultSchedulerTickInput
 	// AllowClaim, when set, is the admission projection for all work-producing
 	// scheduler activity: the full default tick (discovery, HITL, claims,
 	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
@@ -2182,6 +2185,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		}
 		return defaultSchedulerTickInput{
 			Repos:                services.Repositories,
+			StorageCoordinator:   services.Coordinator,
 			GitHubGateway:        githubGateway,
 			Logger:               logger,
 			Now:                  now,
@@ -2708,9 +2712,31 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 // ownedQueueClaim is one durable running claim held under a Supervisor
 // operation lease until durable finalize (#579).
 type ownedQueueClaim struct {
-	item   storage.QueueItemRecord
-	lease  OperationLease
-	permit OperationPermit
+	item             storage.QueueItemRecord
+	lease            OperationLease
+	permit           OperationPermit
+	targetLeaseKey   string
+	targetLeaseToken string
+}
+
+// releaseTargetLease runs only after the queue claim has durably left running.
+// A failed CAS release retains checkout authority; callers must not pretend a
+// later actor may mutate the path while the original token's outcome is unknown.
+func releaseTargetLease(ctx context.Context, input defaultSchedulerTickInput, claim ownedQueueClaim) error {
+	if claim.targetLeaseKey == "" {
+		return nil
+	}
+	if input.Repos == nil || input.Repos.TargetLeases == nil {
+		return errors.New("target lease repository is not configured")
+	}
+	released, err := input.Repos.TargetLeases.Release(ctx, claim.targetLeaseKey, claim.targetLeaseToken)
+	if err != nil {
+		return err
+	}
+	if !released {
+		return fmt.Errorf("target lease %s changed before queue claim %s finalized", claim.targetLeaseKey, claim.item.ID)
+	}
+	return nil
 }
 
 // testAfterClaimHook, when set by tests, rewrites ClaimNext* results so the
@@ -2746,6 +2772,41 @@ func claimTypeSetsFromInput(input defaultSchedulerTickInput) (unrestricted, stic
 		unrestricted = append(unrestricted, "snapshot")
 	}
 	return unrestricted, stickySnapshotOnly
+}
+
+// claimNextWithTargetLease is the production claim boundary for worktree-owning
+// roles. The queue transition and target lease live in one SQLite transaction;
+// tests that construct only repositories retain the legacy direct-claim path.
+func claimNextWithTargetLease(ctx context.Context, input defaultSchedulerTickInput, nowISO, claimedBy string, longTerm bool, unrestrictedTypes, stickySnapshotTypes []string) (*storage.QueueItemRecord, string, string, error) {
+	if input.StorageCoordinator == nil {
+		if longTerm {
+			item, err := input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+			return item, "", "", err
+		}
+		item, err := input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+		return item, "", "", err
+	}
+	ownerToken, err := loops.NewTargetLeaseOwnerToken()
+	if err != nil {
+		return nil, "", "", err
+	}
+	type result struct {
+		item *storage.QueueItemRecord
+		key  string
+	}
+	claimed, err := storage.WithTransactionValue(ctx, input.StorageCoordinator.DB(), nil, func(tx *sql.Tx) (result, error) {
+		repos := storage.NewRepositories(tx)
+		if longTerm {
+			item, key, claimErr := repos.Queue.ClaimNextLongTermRetryAmongTypeSetsWithTargetLease(ctx, nowISO, claimedBy, ownerToken, unrestrictedTypes, stickySnapshotTypes)
+			return result{item: item, key: key}, claimErr
+		}
+		item, key, claimErr := repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease(ctx, nowISO, claimedBy, ownerToken, unrestrictedTypes, stickySnapshotTypes)
+		return result{item: item, key: key}, claimErr
+	})
+	if err != nil {
+		return nil, "", "", err
+	}
+	return claimed.item, claimed.key, ownerToken, nil
 }
 
 func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) ([]storage.QueueItemRecord, error) {
@@ -2789,7 +2850,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		claimEmpty
 		claimStop
 	)
-	claimOne := func(claimFn func(context.Context, string, string) (*storage.QueueItemRecord, error)) (result int, claimErr error) {
+	claimOne := func(longTerm bool) (result int, claimErr error) {
 		if err := ctx.Err(); err != nil {
 			return claimStop, nil
 		}
@@ -2805,7 +2866,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				return claimStop, nil
 			}
 		}
-		item, err := claimFn(ctx, nowISO, "scheduler")
+		item, targetLeaseKey, targetLeaseToken, err := claimNextWithTargetLease(ctx, input, nowISO, "scheduler", longTerm, unrestrictedTypes, stickySnapshotTypes)
 		if testAfterClaimHook != nil {
 			item, err = testAfterClaimHook(item, err)
 		}
@@ -2879,10 +2940,10 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				lease.Release()
 				return claimContinue, nil
 			}
-			owned = append(owned, ownedQueueClaim{item: *item, lease: lease, permit: permit})
+			owned = append(owned, ownedQueueClaim{item: *item, lease: lease, permit: permit, targetLeaseKey: targetLeaseKey, targetLeaseToken: targetLeaseToken})
 		} else {
 			// Tests without OperationOwner: claim without lease ownership.
-			owned = append(owned, ownedQueueClaim{item: *item})
+			owned = append(owned, ownedQueueClaim{item: *item, targetLeaseKey: targetLeaseKey, targetLeaseToken: targetLeaseToken})
 		}
 		queueItems = append(queueItems, *item)
 		return claimContinue, nil
@@ -2890,9 +2951,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 
 	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
-		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
-		})
+		result, err := claimOne(false)
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
 		}
@@ -2905,9 +2964,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		}
 	}
 	for !stopClaiming && len(queueItems) < availableSlots {
-		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
-		})
+		result, err := claimOne(true)
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
 		}
@@ -3139,6 +3196,8 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 					}
 					// Retain ownership on finalize failure.
 				}
+			} else if releaseErr := releaseTargetLease(ctx, input, claim); releaseErr != nil {
+				errList = append(errList, releaseErr)
 			} else if lease != nil {
 				lease.Release()
 			}
@@ -3170,6 +3229,8 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 				if input.OperationOwner != nil {
 					input.OperationOwner.ReportHardPersistFailure(finErr)
 				}
+			} else if releaseErr := releaseTargetLease(ctx, input, claim); releaseErr != nil {
+				errList = append(errList, releaseErr)
 			} else if lease != nil {
 				lease.Release()
 			}
@@ -3187,6 +3248,10 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 						input.OperationOwner.ReportHardPersistFailure(finErr)
 					}
 					// Retain ownership when finalize fails.
+					continue
+				}
+				if releaseErr := releaseTargetLease(ctx, input, claim); releaseErr != nil {
+					errList = append(errList, releaseErr)
 					continue
 				}
 				lease.Release()
@@ -3215,6 +3280,12 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 							})
 						}
 						// Retain ownership — do not Release.
+						return
+					}
+					if releaseErr := releaseTargetLease(ctx, input, claim); releaseErr != nil {
+						if input.Logger != nil {
+							input.Logger.Warn("scheduler target lease release failed", map[string]any{"queueItemId": item.ID, "error": releaseErr.Error()})
+						}
 						return
 					}
 					lease.Release()
@@ -3251,6 +3322,12 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 						})
 					}
 					// Retain ownership — do not Release.
+					return
+				}
+				if releaseErr := releaseTargetLease(ctx, input, claim); releaseErr != nil {
+					if input.Logger != nil {
+						input.Logger.Warn("scheduler target lease release failed", map[string]any{"queueItemId": item.ID, "error": releaseErr.Error()})
+					}
 					return
 				}
 				lease.Release()

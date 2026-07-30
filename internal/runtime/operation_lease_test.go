@@ -157,10 +157,17 @@ func TestClaimOwnershipSpanAndFinalizeBeforeRelease(t *testing.T) {
 
 	reg := NewActiveExecutionRegistry()
 	var sawOwnedDuringProcess atomic.Bool
+	var sawTargetLeaseDuringProcess atomic.Bool
 	worker := &ownershipProbeWorker{
 		onProcess: func(item storage.QueueItemRecord) {
 			if reg.OwnsQueueClaim(item.ID) {
 				sawOwnedDuringProcess.Store(true)
+			}
+			lease, leaseErr := repos.TargetLeases.Get(context.Background(), projectID+"|worker:"+loopID)
+			if leaseErr != nil {
+				t.Errorf("TargetLeases.Get during process: %v", leaseErr)
+			} else if lease != nil && lease.OwnerKind == "automation" && lease.OwnerID == item.ID {
+				sawTargetLeaseDuringProcess.Store(true)
 			}
 			if err := repos.Queue.Complete(context.Background(), item.ID, nowISO); err != nil {
 				t.Errorf("Complete during process: %v", err)
@@ -169,11 +176,12 @@ func TestClaimOwnershipSpanAndFinalizeBeforeRelease(t *testing.T) {
 	}
 
 	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 1, defaultSchedulerTickInput{
-		Repos:          repos,
-		Now:            func() time.Time { return now },
-		OperationOwner: reg,
-		AsyncRunner:    immediateSchedulerRunner{},
-		Worker:         worker,
+		Repos:              repos,
+		StorageCoordinator: coordinator,
+		Now:                func() time.Time { return now },
+		OperationOwner:     reg,
+		AsyncRunner:        immediateSchedulerRunner{},
+		Worker:             worker,
 	})
 	if err != nil {
 		t.Fatalf("claimAndRunScheduledQueueItems: %v", err)
@@ -184,6 +192,9 @@ func TestClaimOwnershipSpanAndFinalizeBeforeRelease(t *testing.T) {
 	if !sawOwnedDuringProcess.Load() {
 		t.Fatal("while daemon-live running claim must be owned by operation lease during processor")
 	}
+	if !sawTargetLeaseDuringProcess.Load() {
+		t.Fatal("while daemon-live running claim must hold its durable target lease")
+	}
 	if reg.BoundOperationCount() != 0 {
 		t.Fatalf("bound ops = %d, want 0 after durable finalize + Release", reg.BoundOperationCount())
 	}
@@ -193,6 +204,10 @@ func TestClaimOwnershipSpanAndFinalizeBeforeRelease(t *testing.T) {
 	}
 	if got == nil || got.Status != "completed" {
 		t.Fatalf("queue status = %#v, want completed", got)
+	}
+	targetLease, err := repos.TargetLeases.Get(context.Background(), projectID+"|worker:"+loopID)
+	if err != nil || targetLease != nil {
+		t.Fatalf("target lease after durable finalize = (%#v, %v), want absent", targetLease, err)
 	}
 }
 

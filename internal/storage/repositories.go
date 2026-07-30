@@ -2275,6 +2275,35 @@ func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSets(ctx context.Contex
 	`, extraArgs)
 }
 
+// ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease atomically selects a
+// queue item, acquires its checkout lease when the role has one, and marks the
+// item running. Call it with a transaction-backed repository: selecting and
+// leasing are one durable commit, so a scheduler never obtains a running claim
+// before it has checkout authority.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease(ctx context.Context, nowISO, claimedBy, ownerToken string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, string, error) {
+	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+	if typePred == "" {
+		return nil, "", nil
+	}
+	return r.claimNextMatchingWithTargetLease(ctx, nowISO, claimedBy, ownerToken, `
+		AND NOT (`+longTermRetryPredicateParam+`)
+		`+typePred+`
+	`, append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...))
+}
+
+// ClaimNextLongTermRetryAmongTypeSetsWithTargetLease is the long-term retry
+// counterpart of ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease.
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsWithTargetLease(ctx context.Context, nowISO, claimedBy, ownerToken string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, string, error) {
+	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+	if typePred == "" {
+		return nil, "", nil
+	}
+	return r.claimNextMatchingWithTargetLease(ctx, nowISO, claimedBy, ownerToken, `
+		AND (`+longTermRetryPredicateParam+`)
+		`+typePred+`
+	`, append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...))
+}
+
 func queueTypeInClause(types []string) (placeholders string, args []any) {
 	parts := make([]string, 0, len(types))
 	args = make([]any, 0, len(types))
@@ -2355,6 +2384,80 @@ func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimed
 	}
 
 	return &record, nil
+}
+
+func (r *QueueRepository) claimNextMatchingWithTargetLease(ctx context.Context, nowISO, claimedBy, ownerToken, extraPredicate string, extraArgs []any) (*QueueItemRecord, string, error) {
+	claimCtx, cancel, err := claimCtxForDurableClaim(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	defer cancel()
+	if strings.TrimSpace(ownerToken) == "" {
+		return nil, "", fmt.Errorf("claim next queue item with target lease: owner token is empty")
+	}
+
+	// A held target is not an error and must not starve lower-priority work. The
+	// caller runs this against an IMMEDIATE transaction, so each selected item
+	// and its lease acquisition stay invisible until the final claim commits.
+	excludedIDs := make([]string, 0, 8)
+	for {
+		excludePredicate := ""
+		excludeArgs := make([]any, 0, len(excludedIDs))
+		if len(excludedIDs) > 0 {
+			excludePredicate = "\nAND qi.id NOT IN (" + sqlPlaceholders(len(excludedIDs)) + ")"
+			for _, id := range excludedIDs {
+				excludeArgs = append(excludeArgs, id)
+			}
+		}
+		row := r.q.QueryRowContext(claimCtx, `
+			`+scheduledQueueBaseQuery+extraPredicate+excludePredicate+scheduledQueueOrderBy+`
+			LIMIT 1
+		`, append([]any{nowISO}, append(extraArgs, excludeArgs...)...)...)
+		candidate, scanErr := scanQueueItem(row)
+		if scanErr != nil {
+			if errors.Is(scanErr, sql.ErrNoRows) {
+				return nil, "", nil
+			}
+			return nil, "", fmt.Errorf("select next queue item for target lease: %w", scanErr)
+		}
+
+		leaseKey := ""
+		if candidate.Type != "snapshot" {
+			leaseKey = TargetLeaseKeyFromQueue(candidate)
+		}
+		if leaseKey != "" {
+			acquired, acquireErr := (&TargetLeasesRepository{q: r.q}).Acquire(claimCtx, TargetLeaseRecord{
+				TargetKey: leaseKey, OwnerToken: ownerToken, OwnerKind: "automation", OwnerID: candidate.ID, Purpose: "claim", AcquiredAt: nowISO, UpdatedAt: nowISO,
+			})
+			if acquireErr != nil {
+				return nil, "", acquireErr
+			}
+			if !acquired {
+				excludedIDs = append(excludedIDs, candidate.ID)
+				continue
+			}
+		}
+
+		claimedRow := r.q.QueryRowContext(claimCtx, `
+			UPDATE queue_items
+			SET status = 'running', claimed_by = ?, claimed_at = ?,
+				started_at = COALESCE(started_at, ?), updated_at = ?
+			WHERE id = ? AND status = 'queued'
+			RETURNING *
+		`, claimedBy, nowISO, nowISO, nowISO, candidate.ID)
+		claimed, claimErr := scanQueueItem(claimedRow)
+		if claimErr == nil {
+			return &claimed, leaseKey, nil
+		}
+		if leaseKey != "" {
+			_, _ = (&TargetLeasesRepository{q: r.q}).Release(claimCtx, leaseKey, ownerToken)
+		}
+		if errors.Is(claimErr, sql.ErrNoRows) {
+			excludedIDs = append(excludedIDs, candidate.ID)
+			continue
+		}
+		return nil, "", fmt.Errorf("claim next queue item with target lease: %w", claimErr)
+	}
 }
 
 func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy, queueType string) (*QueueItemRecord, error) {

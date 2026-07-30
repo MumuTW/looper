@@ -133,23 +133,7 @@ func LoopTargetGuardKeyFromRecord(loop storage.LoopRecord) string {
 // used by the process-local guard. A project-scoped worker has its own branch
 // and checkout, so its lease is unique to that loop rather than omitted.
 func TargetLeaseKeyFromRecord(loop storage.LoopRecord) string {
-	if loop.Type == string(domain.LoopTypeWorker) && loop.TargetType == string(domain.LoopTargetTypeProject) {
-		projectID := strings.TrimSpace(loop.ProjectID)
-		loopID := strings.TrimSpace(loop.ID)
-		if projectID == "" || loopID == "" {
-			return ""
-		}
-		return fmt.Sprintf("%s|worker:%s", projectID, loopID)
-	}
-	projectID := strings.TrimSpace(loop.ProjectID)
-	targetKey := strings.TrimSpace(TargetKeyFromLoopRecord(loop))
-	if projectID == "" || targetKey == "" {
-		return ""
-	}
-	// Unlike the in-process guard, an issue checkout belongs to its target, not
-	// the role that happened to create it. This keeps every role that reaches
-	// the same issue checkout on one durable lease.
-	return fmt.Sprintf("%s|%s", projectID, targetKey)
+	return storage.TargetLeaseKeyFromLoop(loop)
 }
 
 // PullRequestTargetGuardKey builds the shared PR worktree target mutex key from
