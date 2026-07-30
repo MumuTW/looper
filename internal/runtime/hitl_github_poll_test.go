@@ -232,6 +232,7 @@ func TestPollGitHubHITLAnswersOncePermissionLookupFailureFailsClosed(t *testing.
 }
 
 func TestRunGitHubHITLPollUsesHostScopedRepositoryPermissionAndIsReplaySafe(t *testing.T) {
+	resetGitHubHITLRejectedAuthorCacheForTest()
 	now := time.Date(2026, time.July, 30, 6, 0, 0, 0, time.UTC)
 	nowISO := now.Format("2006-01-02T15:04:05.000Z")
 	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{
@@ -300,5 +301,190 @@ func TestRunGitHubHITLPollUsesHostScopedRepositoryPermissionAndIsReplaySafe(t *t
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok || ask.Status != "answered" || ask.Answer != "publish it" {
 		t.Fatalf("ask after authorized answer = %#v, %v", ask, ok)
+	}
+}
+
+// TestPollGitHubHITLAnswersOnceDeduplicatesPermissionChecksByAuthor verifies the
+// per-pass author dedup: one untrusted contributor who posts many comments before
+// a maintainer answers triggers a single permission request, not one per comment.
+func TestPollGitHubHITLAnswersOnceDeduplicatesPermissionChecksByAuthor(t *testing.T) {
+	var checked []string
+	deps := githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return []githubAnswerComment{
+				{ID: 500, Author: "looper", Body: "<!-- looper:hitl:ask --> ask"},
+				{ID: 501, Author: "spammer", Body: "do x"},
+				{ID: 502, Author: "spammer", Body: "do y"},
+				{ID: 503, Author: "spammer", Body: "do z"},
+				{ID: 504, Author: "maintainer", Body: "approved"},
+			}, nil
+		},
+		deliverAnswer: func(_ contextType, _, _ string) error { return nil },
+		authorizeAuthor: func(_ contextType, _, author, _ string) (bool, error) {
+			checked = append(checked, author)
+			return author == "maintainer", nil
+		},
+		projectCWD: func(string) string { return "/tmp/repo" },
+	}
+
+	got := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{{
+		ID: "loop-a", Repo: "acme/x", Transport: "github", AskStatus: "awaiting", PRNumber: 42, AskCommentID: 500,
+	}}, deps)
+
+	if got != 1 {
+		t.Fatalf("delivered = %d, want 1 (maintainer answer delivered)", got)
+	}
+	if want := []string{"spammer", "maintainer"}; strings.Join(checked, ",") != strings.Join(want, ",") {
+		t.Fatalf("checked authors = %v, want %v (spammer deduplicated to one check)", checked, want)
+	}
+}
+
+// TestPollGitHubHITLAnswersOnceCachesRejectedAuthorAcrossPasses verifies the
+// cross-pass negative cache: a commenter confirmed unauthorized is not re-checked
+// on the next scheduler pass while the loop is still awaiting.
+func TestPollGitHubHITLAnswersOnceCachesRejectedAuthorAcrossPasses(t *testing.T) {
+	var checks int
+	deps := githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return []githubAnswerComment{
+				{ID: 500, Author: "looper", Body: "<!-- looper:hitl:ask --> ask"},
+				{ID: 501, Author: "external", Body: "publish it"},
+			}, nil
+		},
+		deliverAnswer: func(_ contextType, _, _ string) error { return nil },
+		authorizeAuthor: func(_ contextType, _, _, _ string) (bool, error) {
+			checks++
+			return false, nil
+		},
+		projectCWD:          func(string) string { return "/tmp/repo" },
+		rejectedAuthorCache: newGitHubHITLRejectedAuthorCache(time.Minute),
+		now:                 func() time.Time { return time.UnixMilli(0) },
+	}
+	loop := []githubHITLAwaitingLoop{{ID: "loop-a", Repo: "acme/x", Transport: "github", AskStatus: "awaiting", PRNumber: 42, AskCommentID: 500}}
+
+	if got := pollGitHubHITLAnswersOnce(context.Background(), loop, deps); got != 0 {
+		t.Fatalf("pass 1 delivered = %d, want 0 (unauthorized)", got)
+	}
+	if checks != 1 {
+		t.Fatalf("pass 1 checks = %d, want 1", checks)
+	}
+	if got := pollGitHubHITLAnswersOnce(context.Background(), loop, deps); got != 0 {
+		t.Fatalf("pass 2 delivered = %d, want 0 (still unauthorized)", got)
+	}
+	if checks != 1 {
+		t.Fatalf("pass 2 checks = %d, want 1 (cached rejection skipped re-check)", checks)
+	}
+}
+
+// TestPollGitHubHITLAnswersOnceRechecksRejectedAuthorAfterTTL verifies the cache
+// is eventually consistent: once the TTL expires a previously-rejected author is
+// re-checked, so a newly-granted collaborator's answer is honored.
+func TestPollGitHubHITLAnswersOnceRechecksRejectedAuthorAfterTTL(t *testing.T) {
+	var checks int
+	var allowed bool
+	now := time.UnixMilli(0)
+	deps := githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return []githubAnswerComment{
+				{ID: 500, Author: "looper", Body: "<!-- looper:hitl:ask --> ask"},
+				{ID: 501, Author: "external", Body: "publish it"},
+			}, nil
+		},
+		deliverAnswer: func(_ contextType, _, _ string) error { return nil },
+		authorizeAuthor: func(_ contextType, _, _, _ string) (bool, error) {
+			checks++
+			return allowed, nil
+		},
+		projectCWD:          func(string) string { return "/tmp/repo" },
+		rejectedAuthorCache: newGitHubHITLRejectedAuthorCache(time.Minute),
+		now:                 func() time.Time { return now },
+	}
+	loop := []githubHITLAwaitingLoop{{ID: "loop-a", Repo: "acme/x", Transport: "github", AskStatus: "awaiting", PRNumber: 42, AskCommentID: 500}}
+
+	pollGitHubHITLAnswersOnce(context.Background(), loop, deps)
+	if checks != 1 {
+		t.Fatalf("pass 1 checks = %d, want 1", checks)
+	}
+	now = now.Add(2 * time.Minute) // past TTL
+	allowed = true                 // collaborator was granted write access
+	got := pollGitHubHITLAnswersOnce(context.Background(), loop, deps)
+	if checks != 2 {
+		t.Fatalf("pass 2 checks = %d, want 2 (re-checked after TTL expiry)", checks)
+	}
+	if got != 1 {
+		t.Fatalf("pass 2 delivered = %d, want 1 (newly authorized answer honored)", got)
+	}
+}
+
+// TestRunGitHubHITLPollCachesRejectedAuthorAcrossPasses is the contract-level
+// counterpart: with the process-wide cache wired through runGitHubHITLPoll, a
+// commenter confirmed unauthorized on pass 1 is not re-checked on pass 2 while
+// the loop remains awaiting_human.
+func TestRunGitHubHITLPollCachesRejectedAuthorAcrossPasses(t *testing.T) {
+	resetGitHubHITLRejectedAuthorCacheForTest()
+	now := time.Date(2026, time.July, 30, 6, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project-hitl-reject-cache"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "HITL reject cache", RepoPath: "/tmp/repo", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	meta, err := loops.WriteHITLAsk(nil, loops.HITLAsk{
+		Question: "Publish?", Status: "awaiting", Transport: "github", PRNumber: 42, AskCommentID: 500,
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	repo := "acme/x"
+	prNumber := int64(42)
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "loop-hitl-reject-cache", Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "pull_request", TargetID: &repo,
+		Repo: &repo, PRNumber: &prNumber, Status: "awaiting_human", MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	var commentCalls, permissionCalls int
+	gateway := githubinfra.New(githubinfra.Options{GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.Contains(args, "issues/42/comments"):
+			commentCalls++
+			return shell.Result{Stdout: `[[{"id":501,"body":"publish it","user":{"login":"external"}}]]`}, nil
+		case strings.Contains(args, "collaborators/external/permission"):
+			permissionCalls++
+			return shell.Result{Stdout: `{"permission":"read"}`}, nil
+		default:
+			return shell.Result{Stdout: `{}`}, nil
+		}
+	}})
+	cfg := config.Config{HITL: config.HITLConfig{Enabled: true, AnswerTransport: "github"}}
+	input := defaultSchedulerTickInput{Repos: repos, GitHubGateway: gateway, Config: &cfg, Now: func() time.Time { return now }}
+	project := storage.ProjectRecord{ID: projectID, RepoPath: "/tmp/repo"}
+
+	runGitHubHITLPoll(context.Background(), input, project)
+	runGitHubHITLPoll(context.Background(), input, project)
+
+	if commentCalls != 2 {
+		t.Fatalf("comment calls = %d, want 2 (one per pass)", commentCalls)
+	}
+	if permissionCalls != 1 {
+		t.Fatalf("permission calls = %d, want 1 (rejected author cached across passes)", permissionCalls)
+	}
+	loop, err := repos.Loops.GetByID(context.Background(), "loop-hitl-reject-cache")
+	if err != nil || loop == nil || loop.Status != "awaiting_human" {
+		t.Fatalf("loop after rejected answer = %#v, %v, want awaiting_human (fail closed)", loop, err)
 	}
 }

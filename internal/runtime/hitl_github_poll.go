@@ -4,6 +4,8 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -77,6 +79,82 @@ func githubHITLAnswerCandidates(comments []githubAnswerComment, askCommentID int
 	return candidates
 }
 
+// githubHITLRejectedAuthorTTL bounds how long a rejected commenter's negative
+// permission result is trusted before the poll lane re-checks. Repository
+// collaborator access changes are eventually consistent with this window: a
+// newly-granted writer's answer is honored no later than one TTL after the
+// grant, while the daemon's authenticated API quota is not drained by re-issuing
+// a permission request for the same unauthorized author on every scheduler tick.
+const githubHITLRejectedAuthorTTL = 10 * time.Minute
+
+// githubHITLRejectedAuthorCache memoizes authors confirmed unauthorized for a
+// host-qualified repository so the answer-poll lane does not re-issue a GitHub
+// permission request for the same rejected commenter on every scheduler pass.
+// Only negative, error-free results are cached: authorization successes deliver
+// an answer and leave awaiting state (no re-poll), and lookup errors stay
+// fail-closed so transient API/auth failures are not silently swallowed.
+type githubHITLRejectedAuthorCache struct {
+	mu   sync.Mutex
+	ttl  time.Duration
+	seen map[string]time.Time // "repo|author" -> last confirmed-unauthorized at
+}
+
+func newGitHubHITLRejectedAuthorCache(ttl time.Duration) *githubHITLRejectedAuthorCache {
+	return &githubHITLRejectedAuthorCache{ttl: ttl, seen: make(map[string]time.Time)}
+}
+
+// rejected reports whether author was confirmed unauthorized for repo within the
+// TTL window. A nil cache or non-positive TTL disables cross-pass caching.
+func (c *githubHITLRejectedAuthorCache) rejected(repo, authorKey string, now time.Time) bool {
+	if c == nil || c.ttl <= 0 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	at, ok := c.seen[repo+"|"+authorKey]
+	if !ok {
+		return false
+	}
+	return now.Sub(at) < c.ttl
+}
+
+// record marks author as confirmed unauthorized for repo at now, opportunistically
+// evicting expired entries so the cache cannot grow without bound across a
+// long-lived daemon. A nil cache is a no-op.
+func (c *githubHITLRejectedAuthorCache) record(repo, authorKey string, now time.Time) {
+	if c == nil || c.ttl <= 0 {
+		return
+	}
+	key := repo + "|" + authorKey
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seen[key] = now
+	for k, at := range c.seen {
+		if now.Sub(at) >= c.ttl {
+			delete(c.seen, k)
+		}
+	}
+}
+
+// githubHITLRejectedAuthors is the process-wide negative-permission cache shared
+// across scheduler ticks, mirroring the process-wide requeue/target guards.
+var githubHITLRejectedAuthors = newGitHubHITLRejectedAuthorCache(githubHITLRejectedAuthorTTL)
+
+// resetGitHubHITLRejectedAuthorCacheForTest clears the process-wide negative
+// cache so tests that exercise runGitHubHITLPoll start from a known state.
+func resetGitHubHITLRejectedAuthorCacheForTest() {
+	githubHITLRejectedAuthors.mu.Lock()
+	githubHITLRejectedAuthors.seen = make(map[string]time.Time)
+	githubHITLRejectedAuthors.mu.Unlock()
+}
+
+func githubHITLPollNow(now func() time.Time) time.Time {
+	if now != nil {
+		return now()
+	}
+	return time.Now()
+}
+
 // githubHITLPollDeps are the injected dependencies of the answer-poll lane, kept
 // as functions so the lane is testable and decoupled from the scheduler wiring.
 type githubHITLPollDeps struct {
@@ -94,7 +172,14 @@ type githubHITLPollDeps struct {
 	// authorizeAuthor checks the repository's current permission when no
 	// explicit answer author allowlist is configured.
 	authorizeAuthor func(ctx contextType, repo, author, cwd string) (bool, error)
-	logWarn         func(msg string, fields map[string]any)
+	// rejectedAuthorCache memoizes unauthorized authors across poll passes so a
+	// rejected commenter is not re-checked on every tick. Nil disables cross-pass
+	// caching (unit tests that assert exact per-pass check counts).
+	rejectedAuthorCache *githubHITLRejectedAuthorCache
+	// now returns the current time for the rejected-author cache TTL. Nil falls
+	// back to time.Now (production); injected in tests for deterministic TTL.
+	now     func() time.Time
+	logWarn func(msg string, fields map[string]any)
 }
 
 // githubHITLAwaitingLoop is the minimal loop shape the lane needs.
@@ -138,9 +223,24 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 		}
 		answer := detectGitHubHITLAnswer(comments, loop.AskCommentID, deps.answerAuthors)
 		if answer == "" && len(githubHITLAnswerAuthorAllowlist(deps.answerAuthors)) == 0 {
+			now := githubHITLPollNow(deps.now)
+			// One permission request per author per pass: a single untrusted
+			// contributor who posts many comments before a maintainer answers must
+			// not multiply the daemon's authenticated API calls.
+			checked := make(map[string]bool, len(comments))
 			for _, candidate := range githubHITLAnswerCandidates(comments, loop.AskCommentID) {
 				if deps.authorizeAuthor == nil {
 					break
+				}
+				authorKey := strings.ToLower(strings.TrimSpace(candidate.Author))
+				if checked[authorKey] {
+					continue
+				}
+				checked[authorKey] = true
+				// Skip commenters already confirmed unauthorized within the TTL so a
+				// rejected author is not re-checked on every scheduler pass.
+				if deps.rejectedAuthorCache != nil && deps.rejectedAuthorCache.rejected(repo, authorKey, now) {
+					continue
 				}
 				allowed, err := deps.authorizeAuthor(ctx, repo, candidate.Author, cwd)
 				if err != nil {
@@ -154,6 +254,9 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 				if allowed {
 					answer = candidate.Body
 					break
+				}
+				if deps.rejectedAuthorCache != nil {
+					deps.rejectedAuthorCache.record(repo, authorKey, now)
 				}
 			}
 		}
@@ -347,6 +450,8 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			}
 			return githubinfra.RepositoryPermissionAllowsWrite(permission), nil
 		},
+		rejectedAuthorCache: githubHITLRejectedAuthors,
+		now:                 input.Now,
 	}
 	if input.Logger != nil {
 		deps.logWarn = func(msg string, fields map[string]any) { input.Logger.Warn(msg, fields) }
