@@ -2,6 +2,7 @@ package triager
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -90,5 +91,71 @@ func TestDiscoverIssuesAcceptsNewConfirmationInReportTimestampSecond(t *testing.
 	}
 	if second.Confirmed != 1 || second.Routed != 1 {
 		t.Fatalf("second DiscoverIssues() = %#v", second)
+	}
+}
+
+func TestDiscoverIssuesDoesNotUsePlanPostedDuringDecisionToConfirmLaterReport(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.llm.responses = []string{`{"classification":"feature","scope":"in_scope","risk":"high","confidence":0.98,"missingInformation":[],"recommendedNextRole":"planner","rationale":"Touches credentials."}`}
+	fixture.github.permission = "write"
+	fixture.llm.onComplete = func() {
+		fixture.github.detail.Comments = []githubinfra.CommentInfo{{
+			ID: 77, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339Nano),
+		}}
+		fixture.github.onTimeline = func() {
+			fixture.github.detail.Comments = append(fixture.github.detail.Comments, githubinfra.CommentInfo{
+				ID: 78, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339Nano),
+			})
+		}
+	}
+	runner := fixture.runner()
+
+	first, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverIssues() error = %v", err)
+	}
+	if first.AwaitingConfirmation != 1 || first.Confirmed != 0 || first.Routed != 0 {
+		t.Fatalf("first DiscoverIssues() = %#v, want the mid-decision /plan excluded", first)
+	}
+	report := fixture.singleReport(t)
+	if report.ConfirmationAfterCommentID != 78 {
+		t.Fatalf("ConfirmationAfterCommentID = %d, want post-revalidation cutoff 78", report.ConfirmationAfterCommentID)
+	}
+
+	fixture.github.listEmpty = true
+	fixture.now = fixture.now.Add(time.Minute)
+	fixture.github.detail.Comments = append(fixture.github.detail.Comments, githubinfra.CommentInfo{
+		ID: 79, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339Nano),
+	})
+	second, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverIssues() error = %v", err)
+	}
+	if second.Confirmed != 1 || second.Routed != 1 || len(fixture.planner.inputs) != 1 {
+		t.Fatalf("second DiscoverIssues() = %#v planner=%d, want later /plan routed once", second, len(fixture.planner.inputs))
+	}
+	events, err := fixture.repos.Events.List(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	var confirmed Confirmation
+	for _, event := range events {
+		if event.EventType == ConfirmationEventType {
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &confirmed); err != nil {
+				t.Fatalf("decode confirmation: %v", err)
+			}
+		}
+	}
+	if confirmed.CommentID != 79 {
+		t.Fatalf("confirmation comment = %d, want only post-report comment 79", confirmed.CommentID)
+	}
+
+	third, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("third DiscoverIssues() error = %v", err)
+	}
+	if third.Confirmed != 0 || third.Routed != 0 || fixture.llm.calls != 1 || len(fixture.planner.inputs) != 1 {
+		t.Fatalf("third replay = %#v llm/planner=%d/%d, want idempotent no-op", third, fixture.llm.calls, len(fixture.planner.inputs))
 	}
 }

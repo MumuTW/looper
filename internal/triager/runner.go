@@ -441,13 +441,27 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		if !matches {
 			return r.retireSource(ctx, state, "source_superseded", result)
 		}
-		detail = refreshed
+		// Source revalidation performs another GitHub read (timeline). Refresh the
+		// issue once more after it so the comment cutoff is the last remote
+		// snapshot before report persistence, not a pre-revalidation snapshot.
+		reportBoundary, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: enrollment.IssueNumber, CWD: project.RepoPath})
+		if err != nil {
+			return err
+		}
+		if !eligibleTarget(reportBoundary) {
+			return r.retireSource(ctx, state, "source_no_longer_eligible", result)
+		}
+		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, reportBoundary.Labels) {
+			result.Skipped++
+			return nil
+		}
+		detail = reportBoundary
 		detailSource = refreshedSource
 		created := r.now().UTC().Format(time.RFC3339Nano)
 		value := Report{
 			Version: 1, IdempotencyKey: enrollment.IdempotencyKey, ProjectID: enrollment.ProjectID, Repo: enrollment.Repo,
 			IssueNumber: enrollment.IssueNumber, Source: detailSource, Decision: decision,
-			Policy: validateDecision(decision), ConfirmationAfterCommentID: enrollment.CommentID, CreatedAt: created,
+			Policy: validateDecision(decision), ConfirmationAfterCommentID: latestCommentID(detail.Comments), CreatedAt: created,
 		}
 		if err := r.persistReport(ctx, value); err != nil {
 			return err
