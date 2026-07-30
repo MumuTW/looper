@@ -40,14 +40,22 @@ func ListUnreviewed(ctx context.Context, repos *storage.Repositories, state stri
 	if repos == nil || repos.Events == nil {
 		return nil, fmt.Errorf("gatekeeper event repository is not configured")
 	}
-	records, err := repos.Events.ListByEntityTypeAndEventTypes(ctx, "pull_request", []string{GateReportEventType})
+	// The latest report per pull request is selected in SQLite rather than by
+	// reading every report and keeping the last. Evaluations append indefinitely,
+	// so the history grows with the lifetime of the daemon while the answer grows
+	// only with the number of pull requests; decoding the history to throw almost
+	// all of it away would put this endpoint on the wrong curve.
+	//
+	// The grouping is per (project, entity), which is also what makes the answer
+	// correct: `owner/repo#12` identifies a pull request only within a project,
+	// and two projects can carry the same slug and number against different
+	// provider base URLs.
+	records, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "", "pull_request", []string{GateReportEventType})
 	if err != nil {
 		return nil, fmt.Errorf("list gate reports: %w", err)
 	}
-	// Records arrive oldest first, so a later report for the same pull request
-	// overwrites an earlier one and the map ends up holding the latest verdict on
-	// each — which is the only one that describes how the pull request stands now.
-	latest := make(map[string]Report, len(records))
+	wanted := strings.ToUpper(strings.TrimSpace(state))
+	items := make([]UnreviewedPullRequest, 0)
 	for _, record := range records {
 		if record.EntityID == nil {
 			continue
@@ -56,11 +64,6 @@ func ListUnreviewed(ctx context.Context, repos *storage.Repositories, state stri
 		if err := json.Unmarshal([]byte(record.PayloadJSON), &report); err != nil {
 			continue
 		}
-		latest[*record.EntityID] = report
-	}
-	wanted := strings.ToUpper(strings.TrimSpace(state))
-	items := make([]UnreviewedPullRequest, 0)
-	for _, report := range latest {
 		provenance := report.Evidence.ReviewProvenance
 		if provenance.Status != ReviewProvenanceAbsent && provenance.Status != ReviewProvenanceRefused {
 			continue
@@ -78,11 +81,16 @@ func ListUnreviewed(ctx context.Context, repos *storage.Repositories, state stri
 			ReviewProvenance: provenance,
 		})
 	}
+	// Project first, because repo slug and number alone do not identify a pull
+	// request across projects and two rows can otherwise compare equal.
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].Repo != items[j].Repo {
 			return items[i].Repo < items[j].Repo
 		}
-		return items[i].PRNumber < items[j].PRNumber
+		if items[i].PRNumber != items[j].PRNumber {
+			return items[i].PRNumber < items[j].PRNumber
+		}
+		return items[i].ProjectID < items[j].ProjectID
 	})
 	return items, nil
 }

@@ -617,6 +617,59 @@ func (r *EventsRepository) ListByEntityTypeAndEventTypes(ctx context.Context, en
 	return scanEventLogs(rows)
 }
 
+// ListLatestByEntityTypeAndEventTypes returns one record per entity: the most
+// recent matching event for each distinct (project, entity) pair.
+//
+// Callers that only want the current state of each entity must not pay for its
+// whole history. An entity is re-evaluated repeatedly, so its lifecycle grows
+// with the lifetime of the daemon while the projection derived from it grows
+// only with the number of entities; selecting the latest row in SQLite keeps
+// the cost on the second curve, and nothing is decoded that is then discarded.
+//
+// The partition is (project_id, entity_id), not entity_id alone. An entity ID
+// like `owner/repo#12` is unique only within one project: two projects can
+// point at the same slug on different provider base URLs, and partitioning on
+// the ID alone would silently drop one of them.
+//
+// projectID scopes the query to a single project; empty means every project.
+func (r *EventsRepository) ListLatestByEntityTypeAndEventTypes(ctx context.Context, projectID, entityType string, eventTypes []string) ([]EventLogRecord, error) {
+	if len(eventTypes) == 0 {
+		return []EventLogRecord{}, nil
+	}
+	args := make([]any, 0, len(eventTypes)+2)
+	args = append(args, entityType)
+	for _, eventType := range eventTypes {
+		args = append(args, eventType)
+	}
+	projectFilter := ""
+	if strings.TrimSpace(projectID) != "" {
+		projectFilter = " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT * FROM event_logs WHERE id IN (
+			SELECT id FROM (
+				-- rowid breaks the tie, not id: event ids are random hex, so two
+				-- events written in the same millisecond would otherwise pick a
+				-- winner at random. rowid is insertion order, which is what
+				-- "latest" means when the clock cannot separate them.
+				SELECT id, ROW_NUMBER() OVER (
+					PARTITION BY project_id, entity_id ORDER BY created_at DESC, rowid DESC
+				) AS row_rank
+				FROM event_logs
+				WHERE entity_type = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`)`+projectFilter+`
+			) WHERE row_rank = 1
+		)
+		ORDER BY created_at ASC, rowid ASC
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list latest event logs by entity type and event types: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 // ListFirstEventTimestampsByType returns, for each supplied entity ID that has
 // an event of eventType, the created_at of its earliest such event. Callers
 // need both the durable evidence and when it was first written, so one pass

@@ -70,23 +70,65 @@ type ReviewProvenance struct {
 // refusalDetector recognises a reviewer stating, in the pull request discussion,
 // that it is not reviewing this pull request.
 //
-// This is a list of one rather than a single string test because "Review limit
+// A detector is a marker *and* the account that posts it. The marker alone is
+// body text, and body text is not authority: anyone quoting the notice — or
+// typing it — would otherwise be recorded as having refused to review a change
+// they never had any part in. This is the same identity rule the owned verdict
+// comment already uses, where marker plus author is the comment's identity.
+//
+// This is a list of one rather than a single test because "Review limit
 // reached" is what CodeRabbit posts today. It is the current signal from one
 // reviewer, not the definition of refusal, and the recorded Detector says which
 // signal matched so a later addition does not retroactively reinterpret rows
 // already written.
 type refusalDetector struct {
-	ID     string
-	Marker string
+	ID string
+	// Account is the reviewer's login as GitHub spells it, with no `[bot]`
+	// suffix: the CodeRabbit account is `coderabbitai`, and REST decorates it to
+	// `coderabbitai[bot]` while gh's GraphQL projections do not. Matching strips
+	// the suffix rather than testing for it, because the suffix is a property of
+	// which API answered, not of the account.
+	Account string
+	Marker  string
 }
 
 var refusalDetectors = []refusalDetector{
-	{ID: "coderabbit_review_limit", Marker: "Review limit reached"},
+	{ID: "coderabbit_review_limit", Account: "coderabbitai", Marker: "Review limit reached"},
 }
 
-func detectRefusal(body string) (string, bool) {
+// RefusalCommentMarkers are the body markers a refusal can carry. They are
+// exported so the comment read can be projected down to matching comments before
+// it crosses the shell capture boundary — the detector still decides, and it
+// decides on the author as well as the body.
+func RefusalCommentMarkers() []string {
+	markers := make([]string, 0, len(refusalDetectors))
 	for _, detector := range refusalDetectors {
-		if strings.Contains(body, detector.Marker) {
+		markers = append(markers, detector.Marker)
+	}
+	return markers
+}
+
+// accountLogin normalises a login for comparison against a detector's account:
+// case-insensitive, and without the `[bot]` suffix REST appends to app accounts.
+func accountLogin(login string) string {
+	login = strings.ToLower(strings.TrimSpace(login))
+	return strings.TrimSuffix(login, "[bot]")
+}
+
+// detectRefusal reports which detector matched a comment, requiring the marker,
+// the account, and GitHub's own classification of that account as a bot.
+//
+// The bot classification is what makes the account check mean anything: a login
+// is a string a human can also hold, especially on an enterprise install, and
+// the account type is the forge's own answer rather than an inference from the
+// name.
+func detectRefusal(comment githubinfra.CommentInfo) (string, bool) {
+	login := accountLogin(comment.Author)
+	for _, detector := range refusalDetectors {
+		if login != detector.Account || !comment.IsBot {
+			continue
+		}
+		if strings.Contains(comment.Body, detector.Marker) {
 			return detector.ID, true
 		}
 	}
@@ -105,13 +147,17 @@ func isCompletedReviewState(state string) bool {
 	}
 }
 
-// reviewProvenanceFrom builds the observation from the forge's own records: the
-// reviews GitHub stores against the pull request, and the discussion comments
-// that carry a refusal.
+// reviewsObservedFrom records the submitted reviews and, from them alone, the
+// status they settle.
+//
+// Completed reviews are the whole of the `reviewed` answer: comments only ever
+// distinguish `refused` from `absent`, and only when nothing was reviewed. So
+// this is decidable without them, which is what lets a comment read that fails
+// leave a known `reviewed` standing instead of collapsing it to `unknown`.
 //
 // Order is the forge's order, which is chronological and stable, so the record
 // reads as the sequence of what happened rather than a re-sorted summary of it.
-func reviewProvenanceFrom(reviews []githubinfra.ReviewSummary, comments []githubinfra.CommentInfo) ReviewProvenance {
+func reviewsObservedFrom(reviews []githubinfra.ReviewSummary) ReviewProvenance {
 	provenance := ReviewProvenance{
 		Reviewers: make([]ReviewerObservation, 0, len(reviews)),
 		Refusals:  make([]ReviewRefusal, 0),
@@ -125,8 +171,21 @@ func reviewProvenanceFrom(reviews []githubinfra.ReviewSummary, comments []github
 		provenance.CompletedReviews++
 		provenance.Reviewers = append(provenance.Reviewers, ReviewerObservation{Login: login, IsBot: review.IsBot, State: state})
 	}
+	if provenance.CompletedReviews > 0 {
+		provenance.Status = ReviewProvenanceReviewed
+	} else {
+		provenance.Status = ReviewProvenanceAbsent
+	}
+	return provenance
+}
+
+// withRefusalsFrom adds the refusals the discussion carries. It can only move
+// `absent` to `refused`: a pull request somebody reviewed stays reviewed, and
+// the refusal is still recorded alongside because "a bot declined and a human
+// reviewed anyway" is the thing the operator wants to be able to read.
+func withRefusalsFrom(provenance ReviewProvenance, comments []githubinfra.CommentInfo) ReviewProvenance {
 	for _, comment := range comments {
-		detector, ok := detectRefusal(comment.Body)
+		detector, ok := detectRefusal(comment)
 		if !ok {
 			continue
 		}
@@ -134,13 +193,8 @@ func reviewProvenanceFrom(reviews []githubinfra.ReviewSummary, comments []github
 			Login: strings.TrimSpace(comment.Author), Detector: detector, CommentID: comment.ID,
 		})
 	}
-	switch {
-	case provenance.CompletedReviews > 0:
-		provenance.Status = ReviewProvenanceReviewed
-	case len(provenance.Refusals) > 0:
+	if provenance.Status == ReviewProvenanceAbsent && len(provenance.Refusals) > 0 {
 		provenance.Status = ReviewProvenanceRefused
-	default:
-		provenance.Status = ReviewProvenanceAbsent
 	}
 	return provenance
 }

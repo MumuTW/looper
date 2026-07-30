@@ -381,6 +381,26 @@ func (f *fakeGatekeeperGitHub) ListPullRequestReviews(context.Context, githubinf
 	return f.reviews, f.reviewsErr
 }
 
+// ListIssueCommentsContaining mirrors the gateway's projection: only comments
+// carrying one of the markers cross the boundary, so no test can accidentally
+// rely on the detector seeing the whole conversation.
+func (f *fakeGatekeeperGitHub) ListIssueCommentsContaining(_ context.Context, _ githubinfra.ViewIssueInput, markers []string) ([]githubinfra.CommentInfo, error) {
+	f.perPullRequestCalls++
+	if f.commentsErr != nil {
+		return nil, f.commentsErr
+	}
+	matched := make([]githubinfra.CommentInfo, 0)
+	for _, comment := range f.comments {
+		for _, marker := range markers {
+			if strings.Contains(comment.Body, marker) {
+				matched = append(matched, comment)
+				break
+			}
+		}
+	}
+	return matched, nil
+}
+
 func (f *fakeGatekeeperGitHub) CreateIssueComment(_ context.Context, input githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {
 	if f.commentErr != nil {
 		return githubinfra.IssueCommentResult{}, f.commentErr

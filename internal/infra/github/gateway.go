@@ -208,8 +208,17 @@ type PullRequestStatus struct {
 }
 
 type CommentInfo struct {
-	ID                int64
-	Author            string
+	ID     int64
+	Author string
+	// IsBot is GitHub's own classification of the comment author's account,
+	// taken from the account `type` the API returns. It is read here rather than
+	// derived from the login for the same reason as ReviewSummary.IsBot: the
+	// login cannot answer it, because gh's GraphQL projections spell the
+	// CodeRabbit account `coderabbitai`, with no `[bot]` suffix.
+	//
+	// A caller that needs it must use a reader that projects the account type; a
+	// projection that omits it leaves this false.
+	IsBot             bool
 	AuthorAssociation string
 	Body              string
 	CreatedAt         string
@@ -1275,6 +1284,48 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 func (g *Gateway) listPullRequestAutomationComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
 	filter := `.[] | select((.body // "") | (contains("looper:fixer-round") or contains("looper:conflict-notice") or contains("looper:reviewer:automerge-refused"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--jq", filter}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONObjects(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return extractCommentInfos(rows), nil
+}
+
+// ListIssueCommentsContaining returns only the comments whose body contains one
+// of the supplied markers, projected to the fields a marker-driven detector
+// needs: id, body, and the author's login and account type.
+//
+// Reading the whole conversation to find one notice is what makes a large
+// discussion fail: the unprojected reader hands every body to a bounded shell
+// capture, so a busy pull request returns a truncation error and the caller
+// records nothing at all. gh applies this filter to each page before anything
+// crosses that boundary, so the size of the discussion cannot erase the answer.
+//
+// The account type is projected deliberately. A marker is body text, and body
+// text is not authority: the detector has to be able to tell the account that
+// posts the notice from a human quoting it.
+func (g *Gateway) ListIssueCommentsContaining(ctx context.Context, input ViewIssueInput, markers []string) ([]CommentInfo, error) {
+	if len(markers) == 0 {
+		return []CommentInfo{}, nil
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	tests := make([]string, 0, len(markers))
+	for _, marker := range markers {
+		encoded, err := json.Marshal(marker)
+		if err != nil {
+			return nil, fmt.Errorf("encode comment marker: %w", err)
+		}
+		tests = append(tests, fmt.Sprintf("contains(%s)", encoded))
+	}
+	filter := fmt.Sprintf(`.[] | select((.body // "") | (%s)) | {id,body,user:{login:.user.login,type:.user.type}}`, strings.Join(tests, " or "))
 	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--jq", filter}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
@@ -4357,9 +4408,11 @@ func extractCommentInfos(value any) []CommentInfo {
 	}
 	out := make([]CommentInfo, 0, len(items))
 	for _, row := range items {
+		author := firstNonNil(row["author"], row["user"])
 		out = append(out, CommentInfo{
 			ID:                asInt64(firstNonNil(row["id"], row["databaseId"])),
-			Author:            extractAuthor(firstNonNil(row["author"], row["user"])),
+			Author:            extractAuthor(author),
+			IsBot:             extractAuthorIsBot(author),
 			AuthorAssociation: firstNonEmpty(asString(row["authorAssociation"]), asString(row["author_association"])),
 			Body:              asString(row["body"]),
 			CreatedAt:         firstNonEmpty(asString(row["createdAt"]), asString(row["created_at"])),
