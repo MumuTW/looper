@@ -1349,6 +1349,8 @@ Usage:
   looper upgrade backup       Create a daemon-owned rollback backup bundle
   looper upgrade drain --deadline <duration>
                                Close admission and wait for existing work
+  looper upgrade verify --bundle <directory>
+                               Verify a rollback backup bundle before cutover
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load

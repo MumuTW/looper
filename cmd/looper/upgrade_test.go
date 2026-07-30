@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/upgradebackup"
 	"github.com/MumuTW/looper/internal/version"
 )
 
@@ -150,6 +151,39 @@ func TestUpgradeDrainReturnsSnapshotWhenDeadlineExpires(t *testing.T) {
 	if result.Drained || !result.DeadlineExceeded || result.Snapshot.LiveExecutions != 1 {
 		t.Fatalf("result = %#v", result)
 	}
+}
+
+func TestUpgradeVerifyChecksLocalRollbackBundle(t *testing.T) {
+	root := t.TempDir()
+	config := writeUpgradeBundleFile(t, root, "config.toml", "[server]\n")
+	cli := writeUpgradeBundleFile(t, root, "looper-bin", "cli")
+	daemon := writeUpgradeBundleFile(t, root, "looperd-bin", "daemon")
+	bundle, err := upgradebackup.Create(context.Background(), upgradebackup.Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Snapshot: func(context.Context) (string, error) {
+		return writeUpgradeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"verify", "--bundle", bundle.Directory}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var result upgradebackup.Verification
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Valid || result.Directory != bundle.Directory {
+		t.Fatalf("verification = %#v", result)
+	}
+}
+
+func writeUpgradeBundleFile(t *testing.T, directory, name, contents string) string {
+	t.Helper()
+	path := filepath.Join(directory, name)
+	if err := os.WriteFile(path, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func upgradeTestDaemon(t *testing.T, identity version.Info) *httptest.Server {

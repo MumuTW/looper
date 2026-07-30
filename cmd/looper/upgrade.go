@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MumuTW/looper/internal/upgradebackup"
 	"github.com/MumuTW/looper/internal/version"
 )
 
@@ -62,7 +63,7 @@ type upgradeDaemonVersion struct {
 
 func runUpgrade(ctx context.Context, global, operands []string, stdout interface{ Write([]byte) (int, error) }) error {
 	if len(operands) == 0 {
-		return badUsage("upgrade requires backup, drain, or preflight")
+		return badUsage("upgrade requires backup, drain, preflight, or verify")
 	}
 	if operands[0] == "backup" {
 		if len(operands) != 1 {
@@ -85,8 +86,19 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		}
 		return runUpgradeDrain(ctx, global, deadline, stdout)
 	}
+	if operands[0] == "verify" {
+		bundle, err := parseUpgradeVerifyArgs(operands[1:])
+		if err != nil {
+			return err
+		}
+		result, err := upgradebackup.Verify(bundle)
+		if err != nil {
+			return err
+		}
+		return writeVersionJSON(stdout, result)
+	}
 	if operands[0] != "preflight" {
-		return badUsage("upgrade requires backup, drain, or preflight")
+		return badUsage("upgrade requires backup, drain, preflight, or verify")
 	}
 	targetLooper, targetLooperd, jsonOutput, err := parseUpgradePreflightArgs(operands[1:])
 	if err != nil {
@@ -237,6 +249,13 @@ func parseUpgradeDrainArgs(args []string) (time.Duration, error) {
 		return 0, badUsage("upgrade drain requires a positive Go duration for --deadline")
 	}
 	return deadline, nil
+}
+
+func parseUpgradeVerifyArgs(args []string) (string, error) {
+	if len(args) != 2 || args[0] != "--bundle" || strings.TrimSpace(args[1]) == "" {
+		return "", badUsage("upgrade verify requires --bundle <directory>")
+	}
+	return args[1], nil
 }
 
 func targetBuildIdentity(ctx context.Context, binary string, args ...string) (version.Info, error) {

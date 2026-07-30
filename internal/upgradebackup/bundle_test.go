@@ -60,6 +60,35 @@ func TestCreateRemovesPartialBundleOnCopyFailure(t *testing.T) {
 	}
 }
 
+func TestVerifyAcceptsCreatedBundleAndRejectsChangedLayoutOrContent(t *testing.T) {
+	root := t.TempDir()
+	config := writeBundleFile(t, root, "config.toml", "[server]\n")
+	cli := writeBundleFile(t, root, "looper-bin", "cli")
+	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	result, err := Create(context.Background(), Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Now: func() time.Time { return time.Date(2026, 7, 31, 1, 2, 3, 0, time.UTC) }, Snapshot: func(context.Context) (string, error) {
+		return writeBundleFile(t, root, "snapshot.sqlite", "sqlite-consistent"), nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := Verify(result.Directory)
+	if err != nil || !verified.Valid || len(verified.Manifest.Files) != len(result.Manifest.Files) {
+		t.Fatalf("Verify() = (%#v, %v)", verified, err)
+	}
+	if err := os.WriteFile(filepath.Join(result.Directory, "looper"), []byte("changed"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(result.Directory); err == nil {
+		t.Fatal("Verify() error = nil after changed binary")
+	}
+	if err := os.WriteFile(filepath.Join(result.Directory, "extra"), []byte("extra"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(result.Directory); err == nil {
+		t.Fatal("Verify() error = nil after unexpected entry")
+	}
+}
+
 func writeBundleFile(t *testing.T, dir, name, contents string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)

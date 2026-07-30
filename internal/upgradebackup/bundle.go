@@ -41,6 +41,12 @@ type Result struct {
 	Manifest  Manifest `json:"manifest"`
 }
 
+type Verification struct {
+	Directory string   `json:"directory"`
+	Manifest  Manifest `json:"manifest"`
+	Valid     bool     `json:"valid"`
+}
+
 // Create invokes the supplied daemon-owned snapshot operation once, then moves
 // that consistent snapshot into a new bundle and copies the exact operator
 // config/CLI/daemon files beside it. A manifest is written last, so its
@@ -114,17 +120,119 @@ func copyAndRecord(source, destination string, files map[string]File, name strin
 	return record(destination, files, name)
 }
 func record(path string, files map[string]File, name string) error {
+	file, err := describeFile(path, name)
+	if err != nil {
+		return err
+	}
+	files[name] = file
+	return nil
+}
+
+func describeFile(path, name string) (File, error) {
 	contents, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read %s for checksum: %w", name, err)
+		return File{}, fmt.Errorf("read %s for checksum: %w", name, err)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", name, err)
+		return File{}, fmt.Errorf("stat %s: %w", name, err)
 	}
 	sum := sha256.Sum256(contents)
-	files[name] = File{SHA256: hex.EncodeToString(sum[:]), Size: info.Size()}
+	return File{SHA256: hex.EncodeToString(sum[:]), Size: info.Size()}, nil
+}
+
+// Verify confirms that a bundle still has the exact small layout Create
+// produces and that each named file matches its manifest entry. This is an
+// accidental-corruption and wrong-bundle check, not a signature: anyone able
+// to replace both a file and manifest.json can make a different self-consistent
+// bundle.
+func Verify(directory string) (Verification, error) {
+	if strings.TrimSpace(directory) == "" {
+		return Verification{}, fmt.Errorf("backup bundle directory is required")
+	}
+	manifestPath := filepath.Join(directory, "manifest.json")
+	manifestInfo, err := os.Lstat(manifestPath)
+	if err != nil {
+		return Verification{}, fmt.Errorf("stat backup manifest: %w", err)
+	}
+	if !manifestInfo.Mode().IsRegular() {
+		return Verification{}, fmt.Errorf("backup manifest must be a regular file")
+	}
+	encoded, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return Verification{}, fmt.Errorf("read backup manifest: %w", err)
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(encoded, &manifest); err != nil {
+		return Verification{}, fmt.Errorf("decode backup manifest: %w", err)
+	}
+	if err := validateManifest(manifest); err != nil {
+		return Verification{}, err
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return Verification{}, fmt.Errorf("read backup bundle: %w", err)
+	}
+	expected := map[string]bool{"manifest.json": true}
+	for name, want := range manifest.Files {
+		expected[name] = true
+		path := filepath.Join(directory, name)
+		info, err := os.Lstat(path)
+		if err != nil {
+			return Verification{}, fmt.Errorf("stat bundle file %s: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return Verification{}, fmt.Errorf("bundle file %s must be a regular file", name)
+		}
+		got, err := describeFile(path, name)
+		if err != nil {
+			return Verification{}, err
+		}
+		if got != want {
+			return Verification{}, fmt.Errorf("bundle file %s does not match manifest", name)
+		}
+	}
+	for _, entry := range entries {
+		if !expected[entry.Name()] {
+			return Verification{}, fmt.Errorf("unexpected bundle entry %s", entry.Name())
+		}
+	}
+	return Verification{Directory: directory, Manifest: manifest, Valid: true}, nil
+}
+
+func validateManifest(manifest Manifest) error {
+	if manifest.Version != ManifestVersion {
+		return fmt.Errorf("unsupported backup manifest version %d", manifest.Version)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, manifest.CreatedAt); err != nil {
+		return fmt.Errorf("invalid backup manifest createdAt: %w", err)
+	}
+	if len(manifest.Files) != 4 {
+		return fmt.Errorf("backup manifest must name exactly four files")
+	}
+	configFiles := 0
+	for name, file := range manifest.Files {
+		if filepath.Base(name) != name || name == "manifest.json" || strings.TrimSpace(name) == "" {
+			return fmt.Errorf("invalid backup manifest file name %q", name)
+		}
+		if len(file.SHA256) != sha256.Size*2 || strings.ToLower(file.SHA256) != file.SHA256 {
+			return fmt.Errorf("invalid backup manifest checksum for %s", name)
+		}
+		if _, err := hex.DecodeString(file.SHA256); err != nil || file.Size < 0 {
+			return fmt.Errorf("invalid backup manifest file metadata for %s", name)
+		}
+		if name == "config" || strings.HasPrefix(name, "config.") {
+			configFiles++
+		}
+	}
+	if !manifest.Files["database.sqlite"].valid() || !manifest.Files["looper"].valid() || !manifest.Files["looperd"].valid() || configFiles != 1 {
+		return fmt.Errorf("backup manifest must name database.sqlite, looper, looperd, and one config file")
+	}
 	return nil
+}
+
+func (file File) valid() bool {
+	return file.Size >= 0 && len(file.SHA256) == sha256.Size*2 && strings.ToLower(file.SHA256) == file.SHA256
 }
 func SortedFileNames(manifest Manifest) []string {
 	names := make([]string, 0, len(manifest.Files))
