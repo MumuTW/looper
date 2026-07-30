@@ -35,32 +35,28 @@ import (
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/nexu-io/looper/internal/reviewer/workflow"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
-const (
-	stepDiscover         ReviewerStep = "discover"
-	stepFilter           ReviewerStep = "filter"
-	stepClaim            ReviewerStep = "claim"
-	stepSnapshot         ReviewerStep = "snapshot"
-	stepWorktree         ReviewerStep = "worktree"
-	stepThreadResolution ReviewerStep = "thread_resolution"
-	stepReview           ReviewerStep = "review"
-	stepPublish          ReviewerStep = "publish"
-)
+// ReviewerStep and the stepXxx constants are a compatibility surface over
+// the workflow package, which now owns the step-ordering table. ReviewerStep
+// is part of this package's exported surface, so it stays as a type alias
+// rather than a distinct type.
+type ReviewerStep = workflow.Step
 
-var reviewerStepSequence = []ReviewerStep{
-	stepDiscover,
-	stepFilter,
-	stepClaim,
-	stepSnapshot,
-	stepWorktree,
-	stepThreadResolution,
-	stepReview,
-	stepPublish,
-}
+const (
+	stepDiscover         = workflow.StepDiscover
+	stepFilter           = workflow.StepFilter
+	stepClaim            = workflow.StepClaim
+	stepSnapshot         = workflow.StepSnapshot
+	stepWorktree         = workflow.StepWorktree
+	stepThreadResolution = workflow.StepThreadResolution
+	stepReview           = workflow.StepReview
+	stepPublish          = workflow.StepPublish
+)
 
 var reviewMarkerCommentPattern = regexp.MustCompile(`(?is)<!--\s*looper:review\b.*?-->`)
 var reviewHumanHTMLCommentPattern = regexp.MustCompile(`(?s)<!--.*?-->`)
@@ -81,8 +77,6 @@ const (
 // should not have to know which half they are looking at, so both say the same
 // thing and this constant is what keeps that true.
 const TrustedWrapperUnavailableMessage = "trusted looper review submit wrapper unavailable"
-
-type ReviewerStep string
 
 type ReviewEvent string
 
@@ -1681,7 +1675,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(startStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(startStep)}})
 	r.logInfo("reviewer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(startStep), "resumed": resumedRun.Resumed})
-	for _, step := range stepsFrom(startStep) {
+	for _, step := range workflow.From(startStep) {
 		stepStartedAt := r.now()
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
@@ -1697,26 +1691,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
 			failure := r.classifyFailureForProjectAndBoundary(project.ID, err, reviewerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-			if checkpoint.ResumePolicy == "rerun_review" || hasPendingReviewMarkerMiss(checkpoint) {
+			if workflow.PreferInMemoryCheckpoint(checkpoint.ResumePolicy, hasPendingReviewMarkerMiss(checkpoint)) {
 				latest = checkpoint
 			}
-			if checkpoint.ResumePolicy == "restart_from_discover" {
+			if workflow.CarryRestartFromDiscover(checkpoint.ResumePolicy) {
 				latest.ResumePolicy = checkpoint.ResumePolicy
 			}
-			resumePolicy := latest.ResumePolicy
-			switch failure.kind {
-			case FailureRetryableAfterResume:
-				if resumePolicy != loops.ResumePolicyRestartFromDiscover && resumePolicy != "rerun_review" {
-					resumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-				}
-			case FailureManualIntervention:
-				resumePolicy = loops.ResumePolicyManualIntervention
-			default:
-				if resumePolicy == "" {
-					resumePolicy = loops.ResumePolicyReplayStep
-				}
-			}
-			latest.ResumePolicy = resumePolicy
+			latest.ResumePolicy = workflow.NextResumePolicyOnFailure(string(failure.kind), latest.ResumePolicy)
 			runStatus := "failed"
 			stepEventType := "loop.step.failed"
 			runEventType := "run.failed"
@@ -1956,7 +1937,7 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 	}
 	checkpoint := input.Checkpoint
 	checkpoint.Detail = checkpointDetailFromDetail(detail)
-	checkpoint.ResumePolicy = "replay_step"
+	checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
 	return checkpoint, nil
 }
 
@@ -2262,7 +2243,7 @@ func (r *Runner) runSnapshotStep(ctx context.Context, input stepInput) (reviewer
 	}
 	checkpoint := input.Checkpoint
 	checkpoint.Snapshot = &checkpointSnapshot{ID: snapshot.ID, HeadSHA: snapshot.HeadSHA, CapturedAt: snapshot.CapturedAt, Title: derefString(snapshot.Title), Body: derefString(snapshot.Body), Author: derefString(snapshot.Author), ChecksSummary: derefString(snapshot.ChecksSummary), UnresolvedThreadCount: snapshot.UnresolvedThreadCount, PayloadJSON: derefString(snapshot.PayloadJSON)}
-	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 	return checkpoint, nil
 }
 
@@ -2309,7 +2290,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	if checkpoint.Worktree != nil {
 		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 			checkpoint.Worktree = nil
-			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		} else if reviewerWorktreePrepared(checkpoint) {
 			// Reusing a prepared path skips CreateWorktree/RestoreWorktree.
 			// reviewerWorktreePrepared already rejects paths with a fixer marker;
@@ -2382,7 +2363,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	}
 	checkpoint.Worktree.HeadSHA = prepared.HeadSHA
 	checkpoint.Worktree.PreparedAt = r.nowISO()
-	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 	return checkpoint, nil
 }
 
@@ -2522,14 +2503,14 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, strings.TrimSpace(decision.Decision), strings.TrimSpace(decision.Evidence), thread.ID, action, skippedReason)
 	}
 	checkpoint.ThreadResolution = result
-	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 	return checkpoint, nil
 }
 
 func markThreadResolutionRediscoveryOnRefreshError(checkpoint reviewerCheckpoint, err error) reviewerCheckpoint {
 	var typed *loopError
 	if errors.As(err, &typed) && typed.kind == FailureRetryableAfterResume && strings.Contains(typed.message, "PR changed during thread reconciliation") {
-		checkpoint.ResumePolicy = "restart_from_discover"
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 	}
 	return checkpoint
 }
@@ -2887,7 +2868,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 			checkpoint.Worktree = nil
-			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		}
 	}
 	if !reviewerWorktreePrepared(checkpoint) {
@@ -2972,7 +2953,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			r.markAgentExecutionNativeResumePendingForHeadChange(ctx, executionID, input, headChange)
 		}
 		checkpoint.PendingReview = nil
-		checkpoint.ResumePolicy = "restart_from_discover"
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: headChange.Reason, kind: FailureRetryableAfterResume, interrupted: true}
 	}
 	if err != nil {
@@ -2991,7 +2972,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
-			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 			return checkpoint, nil
 		}
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
@@ -3014,7 +2995,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
-			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 			return checkpoint, nil
 		}
 		if reason, ok := rediscoverySignalFromAgentResult(result, requireReviewRequest); ok {
@@ -3028,7 +3009,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(reviewCompletionOutcome(result)), MarkerVerificationMisses: 1}
-		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
@@ -3042,12 +3023,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 				return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
 			}
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload), CleanNoop: completion.Outcome == "clean"}
-			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 			return checkpoint, nil
 		}
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
-			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 			return checkpoint, nil
 		}
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
@@ -3058,13 +3039,13 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 				}
 				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", ContentFingerprint: reviewMarkerFingerprint(found), CleanNoop: true}
-				checkpoint.ResumePolicy = "advance_from_checkpoint"
+				checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 				return checkpoint, nil
 			}
 			return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
-		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
 	if commentOnlyCompletion {
@@ -3077,11 +3058,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload)}
-		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
 	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(reviewCompletionOutcome(result))}
-	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 	return checkpoint, nil
 }
 
@@ -3241,7 +3222,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		markerResult = found
 	} else {
 		checkpoint.PendingReview = nil
-		checkpoint.ResumePolicy = "rerun_review"
+		checkpoint.ResumePolicy = workflow.ResumePolicyRerunReview
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
@@ -3285,11 +3266,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if pending.MarkerVerificationMisses == 0 {
 			pending.MarkerVerificationMisses = 1
 			checkpoint.PendingReview = pending.clone()
-			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 			return checkpoint, &loopError{message: message + "; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = nil
-		checkpoint.ResumePolicy = "rerun_review"
+		checkpoint.ResumePolicy = workflow.ResumePolicyRerunReview
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
 	reviewPolicy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
@@ -4624,58 +4605,44 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	checkpoint := parseCheckpoint(nil)
 	lastCompleted := ReviewerStep("")
 	failedStep := ReviewerStep("")
+	latestStatus := ""
+	failureSummary := ""
 	if latestRun != nil {
 		checkpoint = parseCheckpoint(latestRun.CheckpointJSON)
 		lastCompleted = asReviewerStep(derefString(latestRun.LastCompletedStep))
 		failedStep = asReviewerStep(derefString(latestRun.CurrentStep))
+		latestStatus = latestRun.Status
+		failureSummary = firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
 	}
-	restartFromDiscover := false
-	rerunReview := false
-	if latestRun != nil {
-		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
-		restartFromDiscover = checkpoint.ResumePolicy == "restart_from_discover" || shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary)
-		rerunReview = checkpoint.ResumePolicy == "rerun_review"
-	}
-	startStep := stepDiscover
-	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") {
-		if restartFromDiscover {
-			startStep = stepDiscover
-		} else if rerunReview && !isManualReviewerLoop(loop) {
-			startStep = stepDiscover
-		} else if rerunReview {
-			startStep = stepReview
-		} else if lastCompleted != "" {
-			if next := nextReviewerStep(lastCompleted); next != "" {
-				startStep = next
-			}
-		}
-	}
-	if startStep != stepDiscover && !isManualReviewerLoop(loop) && needsReviewerEligibilityRediscovery(checkpoint, startStep) {
-		startStep = stepDiscover
-		restartFromDiscover = true
-	}
-	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepDiscover
-	// stickySnapshot: any continuation of a failed/interrupted predecessor, including first-step retries.
-	stickySnapshot := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted")
-	initialCheckpoint := reviewerCheckpoint{ResumePolicy: "replay_step"}
-	if resumed {
+	plan := workflow.PlanResume(workflow.ResumeInput{
+		HasLatestRun:           latestRun != nil,
+		LatestStatus:           latestStatus,
+		LastCompletedStep:      lastCompleted,
+		FailedStep:             failedStep,
+		CheckpointResumePolicy: checkpoint.ResumePolicy,
+		FailureSummary:         failureSummary,
+		ManualLoop:             isManualReviewerLoop(loop),
+		NeedsEligibilityRediscovery: func(startStep workflow.Step) bool {
+			return needsReviewerEligibilityRediscovery(checkpoint, startStep)
+		},
+	})
+	startStep := plan.StartStep
+	resumed := plan.Resumed
+	initialCheckpoint := reviewerCheckpoint{ResumePolicy: plan.InitialResumePolicy}
+	if plan.CarryCheckpoint {
 		initialCheckpoint = checkpoint
-		if restartFromDiscover {
-			initialCheckpoint = reviewerCheckpoint{ResumePolicy: "replay_step"}
-		} else {
-			initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
-			if startStep == stepReview && initialCheckpoint.Worktree != nil {
-				initialCheckpoint.Worktree.PreparedAt = ""
-			}
-			// Fixer-owner invalidation for resume-past-worktree is deferred until
-			// ProcessClaimedItem successfully reacquires the PR lock. Clearing
-			// here would revoke an active fixer's marker even when lock
-			// reacquisition fails and this reviewer never claims the checkout.
+		initialCheckpoint.ResumePolicy = plan.InitialResumePolicy
+		if plan.ClearWorktreePreparedAt && initialCheckpoint.Worktree != nil {
+			initialCheckpoint.Worktree.PreparedAt = ""
 		}
+		// Fixer-owner invalidation for resume-past-worktree is deferred until
+		// ProcessClaimedItem successfully reacquires the PR lock. Clearing
+		// here would revoke an active fixer's marker even when lock
+		// reacquisition fails and this reviewer never claims the checkout.
 	}
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), CheckpointJSON: stringPtr(mustMarshalJSON(initialCheckpoint)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
-	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot)
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, plan.StickySnapshot)
 	if err != nil {
 		return resumedRunContext{}, err
 	}
@@ -4683,7 +4650,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		return resumedRunContext{}, fmt.Errorf("agent snapshot required for vendor %q but was not produced", r.agentRuntime)
 	}
 	run.AgentSnapshotJSON = snapshotJSON
-	if resumed && !restartFromDiscover && lastCompleted != "" {
+	if plan.CarryLastCompletedStep {
 		run.LastCompletedStep = stringPtr(string(lastCompleted))
 	}
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
@@ -4709,7 +4676,7 @@ func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, 
 func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord, step ReviewerStep, checkpoint reviewerCheckpoint) (storage.RunRecord, error) {
 	updated := run
 	nowISO := r.nowISO()
-	next := nextReviewerStep(step)
+	next := workflow.Next(step)
 	if next != "" {
 		updated.CurrentStep = stringPtr(string(next))
 	} else {
@@ -4972,7 +4939,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		}
 		return hasApprovedReviewByAuthorForHead(reviews, currentLogin, headSHA), nil
 	}
-	if queueKind == string(FailureRetryableAfterResume) && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == "rerun_review") {
+	if queueKind == string(FailureRetryableAfterResume) && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == workflow.ResumePolicyRerunReview) {
 		approved, err := approvedByCurrentUser()
 		if err != nil {
 			return false, "", "", err
@@ -5656,16 +5623,6 @@ func (r *Runner) logError(message string, context map[string]any) {
 	}
 }
 
-func shouldRestartFromDiscover(status string, failedStep ReviewerStep, failureSummary string) bool {
-	if status != "failed" && status != "interrupted" {
-		return false
-	}
-	if failedStep != stepPublish && failedStep != stepReview && failedStep != stepThreadResolution {
-		return false
-	}
-	return strings.Contains(failureSummary, "PR head changed before publish") || strings.Contains(failureSummary, "PR head changed while reviewer was running") || strings.Contains(failureSummary, "review request removed before publish") || strings.Contains(failureSummary, "PR changed during thread reconciliation")
-}
-
 func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (string, bool) {
 	if checkpoint.Snapshot == nil {
 		return "", false
@@ -5841,28 +5798,8 @@ func extractRediscoverySignal(line, signal string) string {
 	return strings.TrimSpace(line[index:])
 }
 
-func stepsFrom(start ReviewerStep) []ReviewerStep {
-	startIndex := 0
-	for i, step := range reviewerStepSequence {
-		if step == start {
-			startIndex = i
-			break
-		}
-	}
-	return reviewerStepSequence[startIndex:]
-}
-
-func nextReviewerStep(step ReviewerStep) ReviewerStep {
-	for i, candidate := range reviewerStepSequence {
-		if candidate == step && i+1 < len(reviewerStepSequence) {
-			return reviewerStepSequence[i+1]
-		}
-	}
-	return ""
-}
-
 func asReviewerStep(value string) ReviewerStep {
-	for _, candidate := range reviewerStepSequence {
+	for _, candidate := range workflow.Sequence() {
 		if string(candidate) == value {
 			return candidate
 		}
