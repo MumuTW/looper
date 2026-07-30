@@ -47,6 +47,7 @@ function fixture(): ConfigData {
       planner: {
         triggers: { requireAssigneeCurrentUser: true },
       },
+      coordinator: { enabled: false },
       worker: {
         triggers: { requireAssigneeCurrentUser: false },
         agent: { profile: "fast", vendor: "claude-code", model: "haiku" },
@@ -107,6 +108,11 @@ function fixture(): ConfigData {
         },
         "roles.planner.triggers.requireAssigneeCurrentUser": {
           source: "config-file",
+          editable: true,
+          applyMode: "hot",
+        },
+        "roles.coordinator.enabled": {
+          source: "config-file",
           editable: false,
           applyMode: "restart",
         },
@@ -146,7 +152,13 @@ describe("config form contract", () => {
       "tools.looperPath",
       "tools.osascriptPath",
     ]);
+    // roles.coordinator.enabled is genuinely restart-bound (absent from
+    // hotEditablePaths), so the roles group must filter it out; the hot-safe
+    // planner/worker trigger controls must stay visible.
     expect(configFieldPaths(data, roles)).not.toContain(
+      "roles.coordinator.enabled",
+    );
+    expect(configFieldPaths(data, roles)).toContain(
       "roles.planner.triggers.requireAssigneeCurrentUser",
     );
     expect(configFieldPaths(data, roles)).toContain(
