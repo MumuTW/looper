@@ -206,6 +206,13 @@ func TestGatewayDetachedPRWorktreeReusesRecordAcrossBranches(t *testing.T) {
 	if err != nil || len(items) != 1 {
 		t.Fatalf("Worktrees.ListByProject() = %#v, %v; want one row", items, err)
 	}
+	if err := gateway.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: second.WorktreePath, Branch: "reviewer/pr-42-head"}); err != nil {
+		t.Fatalf("CleanupWorktree() error = %v", err)
+	}
+	cleaned, err := fixture.repos.Worktrees.GetByPath(ctx, second.WorktreePath)
+	if err != nil || cleaned == nil || cleaned.Status != "cleaned" {
+		t.Fatalf("Worktrees.GetByPath() after CleanupWorktree() = %#v, %v; want cleaned record", cleaned, err)
+	}
 }
 
 func TestGatewayWorktreeCleanIgnoresIgnoredFiles(t *testing.T) {

@@ -548,12 +548,15 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	if g.repos == nil {
 		return fmt.Errorf("refusing to remove worktree %q branch %q: looper provenance repository is unavailable", input.WorktreePath, input.Branch)
 	}
-	existing, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+	existing, err := g.repos.Worktrees.GetByPath(ctx, input.WorktreePath)
 	if err != nil {
-		return fmt.Errorf("provenance check (get worktree by branch): %w", err)
+		return fmt.Errorf("provenance check (get worktree by path): %w", err)
 	}
 	if existing == nil {
-		return fmt.Errorf("refusing to remove worktree %q branch %q: no looper worktree record found for this project — worktree was not created by looper", input.WorktreePath, input.Branch)
+		return fmt.Errorf("refusing to remove worktree %q branch %q: no looper worktree record found for this path — worktree was not created by looper", input.WorktreePath, input.Branch)
+	}
+	if existing.ProjectID != input.ProjectID {
+		return fmt.Errorf("refusing to remove worktree %q branch %q: looper record belongs to project %q, not %q", input.WorktreePath, input.Branch, existing.ProjectID, input.ProjectID)
 	}
 	if existing.Status != "active" {
 		return fmt.Errorf("refusing to remove worktree %q branch %q: looper worktree record is %q, not active", input.WorktreePath, input.Branch, existing.Status)
