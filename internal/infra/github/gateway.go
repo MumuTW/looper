@@ -1410,7 +1410,29 @@ func (g *Gateway) GetRepositoryPermission(ctx context.Context, input RepositoryP
 	if err != nil {
 		return "", err
 	}
-	return strings.ToLower(strings.TrimSpace(asString(row["permission"]))), nil
+	permission := strings.ToLower(strings.TrimSpace(asString(row["permission"])))
+	// A 200 with no recognized permission value (e.g. "{}") is a semantically
+	// malformed response, not a denial: GitHub's collaborator-permission endpoint
+	// always returns one of admin/maintain/write/triage/read. Surfacing it as an
+	// error keeps callers fail-closed with a diagnostic instead of silently
+	// treating a legitimate maintainer's answer as unauthorized.
+	if !isKnownRepositoryPermission(permission) {
+		return "", fmt.Errorf("github: malformed collaborator permission response for %s/%s: %q", repo, input.User, permission)
+	}
+	return permission, nil
+}
+
+// isKnownRepositoryPermission reports whether permission is one of the values
+// GitHub's collaborator-permission endpoint returns. The empty string reaches
+// here only for a malformed 200 response: a 404 (genuine non-collaborator) is
+// mapped to "" and returned without error above.
+func isKnownRepositoryPermission(permission string) bool {
+	switch permission {
+	case "admin", "maintain", "write", "triage", "read":
+		return true
+	default:
+		return false
+	}
 }
 
 // RepositoryPermissionAllowsWrite is the shared authority predicate for
