@@ -45,6 +45,12 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		return 0
 	}
 
+	if len(args) > 0 && args[0] == "service" {
+		// Handled before bootstrap: this manages the daemon's lifecycle rather than
+		// starting one, so it must not fall through into starting a runtime.
+		return runServiceCommand(context.Background(), args[1:], stdout, stderr, defaultServiceDeps())
+	}
+
 	if hasHelpArg(args) || (len(args) > 0 && args[0] == "help") {
 		writeUsage(stdout)
 		return 0
@@ -1271,8 +1277,12 @@ func writeUsage(w io.Writer) {
 
 Usage:
 	looperd [flags]
+	looperd service <install|uninstall|status|print>
 	looperd help
 
 Daemon and HTTP API server for Looper.
+
+Run "looperd service help" for supervised-service management (launchd on macOS,
+systemd user units on Linux).
 `)
 }

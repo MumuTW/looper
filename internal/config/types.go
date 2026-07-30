@@ -49,6 +49,7 @@ type DaemonMode string
 const (
 	DaemonModeForeground DaemonMode = "foreground"
 	DaemonModeLaunchd    DaemonMode = "launchd"
+	DaemonModeSystemd    DaemonMode = "systemd"
 )
 
 type DaemonRestartPolicy string

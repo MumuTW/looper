@@ -727,6 +727,48 @@ allowedUserIds = [123456789]
 defaultProjectId = "looper"
 ```
 
+## Supervised service (`daemon.mode`)
+
+`looperd` runs in the foreground by default and nothing restarts it. `daemon.mode`
+selects a platform supervisor instead:
+
+| Value | Meaning |
+| --- | --- |
+| `foreground` (default) | No service. `looperd service install` refuses. |
+| `launchd` | macOS LaunchAgent, installed under `~/Library/LaunchAgents/`. |
+| `systemd` | Linux systemd **user** unit, installed under `~/.config/systemd/user/`. |
+
+Setting the mode does not install anything on its own — it records the intent, and
+`looperd service install` refuses unless the mode matches the platform, so the
+config file stays the authority for how the daemon is meant to run.
+
+The generated unit is built from configuration you already have:
+
+| Field | Effect on the unit |
+| --- | --- |
+| `daemon.restartPolicy` | `never` → no restart; `on-failure` → restart only on a non-zero exit (launchd `KeepAlive.SuccessfulExit=false`, systemd `Restart=on-failure`); `always` → restart unconditionally |
+| `daemon.restartThrottleSeconds` | launchd `ThrottleInterval` / systemd `RestartSec` |
+| `daemon.logDir` | `looperd.out.log` and `looperd.err.log` land here; the directory is created at install |
+| `daemon.workingDirectory` | The service's working directory |
+| `daemon.environment` | Environment variables passed to the supervised process |
+| `daemon.plistPath` | Overrides where the unit file is written |
+
+Because `daemon.environment` is how tokens reach the daemon, the unit is written
+`0600`.
+
+```bash
+looperd service print       # show the unit without writing anything
+looperd service install     # write it and load it
+looperd service status      # is the unit installed?
+looperd service uninstall   # unload and remove it
+```
+
+**A per-user service is not always-on.** A LaunchAgent runs only while the user is
+logged in; a systemd user unit does the same unless you run
+`loginctl enable-linger $USER`. For a machine that must keep working with nobody
+signed in, enable automatic login too — otherwise a reboot leaves the daemon
+stopped until someone logs in.
+
 ## Project override rules
 
 Project entries stay in `projects[]`, but any override-bearing config must mirror the same local shape it uses globally.

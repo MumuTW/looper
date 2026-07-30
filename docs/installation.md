@@ -85,7 +85,17 @@ Every field and validation rule lives in [configuration.md](configuration.md). `
 looperd
 ```
 
-Keep it running — every `looper` control verb talks to it. Nothing restarts it after a crash, logout, or reboot; if you want supervision, wrap it in `launchd`, `systemd`, `tmux`, or whatever your machine already uses. `looperd --config <path>` selects a non-default config.
+Keep it running — every `looper` control verb talks to it. In the foreground nothing restarts it after a crash or a reboot. `looperd --config <path>` selects a non-default config.
+
+To have the machine supervise it instead, set `daemon.mode` in your config and install the service:
+
+```bash
+looperd service install
+```
+
+That writes a launchd agent (macOS) or a systemd user unit (Linux) built from your `daemon.*` configuration, and loads it. `looperd service print` shows the exact unit first, without writing anything; `status` reports whether it is installed, and `uninstall` reverses it.
+
+**A per-user service is not the same as always-on.** A LaunchAgent runs only while the user is logged in, and a systemd user unit does the same unless lingering is enabled (`loginctl enable-linger $USER`). For a machine that must keep working with nobody logged in, enable automatic login as well — otherwise a reboot leaves the daemon stopped until someone signs in.
 
 ### 5. Register projects
 

@@ -458,7 +458,7 @@ func validateHITLConfig(hitl HITLConfig, issues *[]ValidationIssue) {
 
 func validateDaemonConfig(daemon DaemonConfig, issues *[]ValidationIssue) {
 	if !isValidDaemonMode(daemon.Mode) {
-		*issues = append(*issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
+		*issues = append(*issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s", DaemonModeForeground, DaemonModeLaunchd, DaemonModeSystemd)})
 	}
 	validateEnvironmentNames(daemon.Environment, "daemon.environment", issues)
 	if !isValidDaemonRestartPolicy(daemon.RestartPolicy) {
@@ -1202,7 +1202,7 @@ func isValidAuthMode(mode AuthMode) bool {
 
 func isValidDaemonMode(mode DaemonMode) bool {
 	switch mode {
-	case DaemonModeForeground, DaemonModeLaunchd:
+	case DaemonModeForeground, DaemonModeLaunchd, DaemonModeSystemd:
 		return true
 	default:
 		return false
