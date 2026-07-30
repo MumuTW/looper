@@ -1904,6 +1904,11 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
+	for _, existing := range existingLoops {
+		if existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID && existing.Status == "human_takeover" {
+			return loopUpsertResult{}, fmt.Errorf("cannot create planner loop: issue #%d has an active human_takeover loop (%s)", issue.Number, existing.ID)
+		}
+	}
 	matching := make([]storage.LoopRecord, 0)
 	for _, existing := range existingLoops {
 		if existing.Type == "planner" && existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID {

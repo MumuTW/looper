@@ -3635,6 +3635,9 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 			if prLinked {
 				return loopUpsertResult{record: existing, skipEnqueue: true}, nil
 			}
+			if existing.Status == "human_takeover" {
+				return loopUpsertResult{}, fmt.Errorf("cannot create worker loop: issue #%d has an active human_takeover loop (%s)", issue.Number, existing.ID)
+			}
 			updated := existing
 			updated.Repo = &repo
 			suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
@@ -3659,6 +3662,11 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 				return loopUpsertResult{}, err
 			}
 			return loopUpsertResult{record: published}, nil
+		}
+	}
+	for _, existing := range existingLoops {
+		if existing.ProjectID == project.ID && derefString(existing.Repo) == repo && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID && existing.Status == "human_takeover" {
+			return loopUpsertResult{}, fmt.Errorf("cannot create worker loop: issue #%d has an active human_takeover loop (%s)", issue.Number, existing.ID)
 		}
 	}
 	metadataJSON := mustMarshalJSON(workerMeta)
