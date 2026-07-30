@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ func TestAutonomousGraceElapsedAppliesTrigger(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
-	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" || action.AssignTo != "octocat" {
+	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != labels.DefaultPlanTrigger || action.AssignTo != "octocat" {
 		t.Fatalf("action = %#v, want autonomous planner dispatch", action)
 	}
 }
@@ -31,7 +32,7 @@ func TestAutonomousGraceElapsedAppliesTriggerWithSatisfiedBlockedByGraph(t *test
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
 	graph := dependencyGraph("acme/looper", 1, depgraph.IssueRef{Repo: "acme/looper", Number: 9}, depgraph.IssueState{State: "closed", StateReason: "completed"})
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, graph)
-	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" || action.AssignTo != "octocat" {
+	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != labels.DefaultPlanTrigger || action.AssignTo != "octocat" {
 		t.Fatalf("action = %#v, want autonomous planner dispatch with satisfied graph", action)
 	}
 }
@@ -40,9 +41,9 @@ func TestAutonomousGraceElapsedAppliesAllPlannerTriggersWhenConfigured(t *testin
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
 	cfg := autonomousConfig()
-	cfg.PlannerTriggerLabels = []string{"looper:plan", "team:planner"}
+	cfg.PlannerTriggerLabels = []string{labels.DefaultPlanTrigger, "team:planner"}
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, TriagedAt: now.Add(-31 * time.Minute)}, cfg, now, nil)
-	if len(action.TriggerLabels) != 2 || action.TriggerLabels[0] != "looper:plan" || action.TriggerLabels[1] != "team:planner" {
+	if len(action.TriggerLabels) != 2 || action.TriggerLabels[0] != labels.DefaultPlanTrigger || action.TriggerLabels[1] != "team:planner" {
 		t.Fatalf("action = %#v, want all planner triggers", action)
 	}
 }
@@ -59,7 +60,7 @@ func TestAutonomousDispatchRemovedDoesNothing(t *testing.T) {
 func TestAutonomousHoldLabelVetoesDispatch(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "looper:hold"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, labels.HoldGlobal}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
 	if !action.NoOp {
 		t.Fatalf("action = %#v, want no-op", action)
 	}
@@ -68,7 +69,7 @@ func TestAutonomousHoldLabelVetoesDispatch(t *testing.T) {
 func TestAutonomousHoldLabelVetoesDispatchDespiteCase(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "Looper:Hold"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, strings.Replace(labels.HoldGlobal, "looper", "Looper", 1)}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
 	if !action.NoOp {
 		t.Fatalf("action = %#v, want no-op for a differently-cased hold", action)
 	}
@@ -113,7 +114,7 @@ func TestAutonomousLaneSpecificOfficialHoldDoesNotVetoDispatch(t *testing.T) {
 	cfg := autonomousConfig()
 	cfg.HoldLabel = "legacy:hold"
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, labels.HoldWorker}, TriagedAt: now.Add(-31 * time.Minute)}, cfg, now, nil)
-	if action.NoOp || len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" {
+	if action.NoOp || len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != labels.DefaultPlanTrigger {
 		t.Fatalf("action = %#v, want dispatch despite lane-specific hold", action)
 	}
 }
@@ -121,7 +122,7 @@ func TestAutonomousLaneSpecificOfficialHoldDoesNotVetoDispatch(t *testing.T) {
 func TestAutonomousTriggerAlreadyPresentVetoesDispatch(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
-	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "looper:plan"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, labels.DefaultPlanTrigger}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
 	if !action.NoOp {
 		t.Fatalf("action = %#v, want no-op", action)
 	}
@@ -151,11 +152,11 @@ func autonomousConfig() Config {
 	return Config{
 		Mode:                 ModeAutonomous,
 		TriagedLabel:         "triaged",
-		HoldLabel:            "looper:hold",
+		HoldLabel:            labels.HoldGlobal,
 		AutonomousDelay:      30 * time.Minute,
 		AssignTo:             "octocat",
-		PlannerTriggerLabels: []string{"looper:plan"},
-		WorkerTriggerLabels:  []string{"looper:worker-ready"},
+		PlannerTriggerLabels: []string{labels.DefaultPlanTrigger},
+		WorkerTriggerLabels:  []string{labels.DefaultWorkerReadyTrigger},
 	}
 }
 

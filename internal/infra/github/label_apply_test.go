@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -25,7 +26,7 @@ func TestApplyingLabelsNeverRewritesAnExistingLabel(t *testing.T) {
 		switch {
 		case args == "label list --repo acme/looper --limit 1000 --json name,color,description":
 			// looper:hold exists with wording that differs from labels.Standard.
-			return shell.Result{Stdout: `[{"name":"looper:hold","color":"b60205","description":"Human veto, hand-worded"}]`}, nil
+			return shell.Result{Stdout: fmt.Sprintf(`[{"name":%q,"color":"b60205","description":"Human veto, hand-worded"}]`, labels.HoldGlobal)}, nil
 		case strings.HasPrefix(args, "label create looper:plan "):
 			return shell.Result{Stdout: "{}"}, nil
 		case strings.HasPrefix(args, "api repos/acme/looper/issues/7/labels"):

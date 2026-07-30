@@ -1833,15 +1833,15 @@ func TestGatewayGetIssueLabelsSkipsCommentFetch(t *testing.T) {
 		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues/8" {
 			t.Fatalf("unexpected gh args: %q", got)
 		}
-		return shell.Result{Stdout: `{"number":8,"labels":[{"name":"looper:hold"},{"name":"bug"}]}`}, nil
+		return shell.Result{Stdout: fmt.Sprintf(`{"number":8,"labels":[{"name":%q},{"name":"bug"}]}`, labels.HoldGlobal)}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	labels, err := gateway.GetIssueLabels(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 8})
+	gotLabels, err := gateway.GetIssueLabels(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 8})
 	if err != nil {
 		t.Fatalf("GetIssueLabels() error = %v", err)
 	}
-	if len(labels) != 2 || labels[0] != "looper:hold" || labels[1] != "bug" {
-		t.Fatalf("GetIssueLabels() = %#v, want [looper:hold bug]", labels)
+	if len(gotLabels) != 2 || gotLabels[0] != labels.HoldGlobal || gotLabels[1] != "bug" {
+		t.Fatalf("GetIssueLabels() = %#v, want [looper:hold bug]", gotLabels)
 	}
 	if len(runner.calls) != 1 {
 		t.Fatalf("gh calls = %#v, want exactly one (no comment pagination)", runner.calls)
@@ -2146,7 +2146,7 @@ func TestGatewayIgnoresMissingLabelDeleteErrors(t *testing.T) {
 		return shell.Result{Stdout: "{}"}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	if err := gateway.RemovePullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{"looper:spec-ready"}}); err != nil {
+	if err := gateway.RemovePullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{labels.SpecReady}}); err != nil {
 		t.Fatalf("RemovePullRequestLabels() error = %v, want nil", err)
 	}
 }
@@ -2286,7 +2286,7 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 		args := strings.Join(options.Args, " ")
 		switch args {
 		case "label list --repo acme/looper --limit 1000 --json name,color,description":
-			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"},{"name":"looper:spec-reviewing","color":"000000","description":"Old description"}]`}, nil
+			return shell.Result{Stdout: fmt.Sprintf(`[{"name":%q,"color":"5319e7","description":"Picked up automatically by planner"},{"name":%q,"color":"000000","description":"Old description"}]`, labels.DefaultPlanTrigger, labels.SpecReviewing)}, nil
 		case "label create looper:worker-ready --repo acme/looper --color 0e8a16 --description Ready for Looper worker implementation":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:awaiting-human --repo acme/looper --color fbca04 --description Waiting on a human response before Looper continues":
@@ -2410,7 +2410,7 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 		args := strings.Join(options.Args, " ")
 		switch args {
 		case "label list --repo acme/looper --limit 1000 --json name,color,description":
-			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+			return shell.Result{Stdout: fmt.Sprintf(`[{"name":%q,"color":"5319e7","description":"Picked up automatically by planner"}]`, labels.DefaultPlanTrigger)}, nil
 		case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:worker-ready --repo acme/looper --color 0e8a16 --description Ready for Looper worker implementation":

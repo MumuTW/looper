@@ -1,9 +1,13 @@
 package labelaudit
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/network/protocol"
 )
 
 const repoRoot = "../.."
@@ -51,12 +55,12 @@ func TestScanCatchesEveryKnownBypass(t *testing.T) {
 		use    string
 		reason string
 	}{
-		{value: "looper:plan", use: "labels.DefaultPlanTrigger", reason: "a bare literal"},
-		{value: "LOOPER:Worker-Ready", use: "labels.DefaultWorkerReadyTrigger", reason: "a case variant of the same label"},
-		{value: "looper:hold", use: "labels.HoldGlobal", reason: "assembled through an aliased import"},
-		{value: "looper:target:blue", reason: "assembled through a dot-imported owner constant"},
-		{value: "looper:target:red", reason: "a concrete member of the target family"},
-		{value: "looper:spec-ready", use: "labels.SpecReady", reason: "assembled through a function-local constant"},
+		{value: labels.DefaultPlanTrigger, use: "labels.DefaultPlanTrigger", reason: "a bare literal"},
+		{value: fmt.Sprintf("%s%s", strings.ToUpper(labels.Prefix), strings.Replace(strings.TrimPrefix(labels.DefaultWorkerReadyTrigger, labels.Prefix), "worker-ready", "Worker-Ready", 1)), use: "labels.DefaultWorkerReadyTrigger", reason: "a case variant of the same label"},
+		{value: labels.HoldGlobal, use: "labels.HoldGlobal", reason: "assembled through an aliased import"},
+		{value: protocol.TargetLabelForNode("blue"), reason: "assembled through a dot-imported owner constant"},
+		{value: protocol.TargetLabelForNode("red"), reason: "a concrete member of the target family"},
+		{value: labels.SpecReady, use: "labels.SpecReady", reason: "assembled through a function-local constant"},
 	} {
 		violation, ok := found[want.value]
 		if !ok {
@@ -70,6 +74,17 @@ func TestScanCatchesEveryKnownBypass(t *testing.T) {
 			t.Errorf("%q should be told to construct the label, got %q", want.value, violation.Message)
 		}
 	}
+}
+
+func TestScanIncludesTestFiles(t *testing.T) {
+	t.Parallel()
+
+	for _, violation := range scanFixture(t, "testonly") {
+		if violation.Value == labels.DefaultPlanTrigger && violation.Use == "labels.DefaultPlanTrigger" {
+			return
+		}
+	}
+	t.Fatalf("a protected label literal in a test file was not reported")
 }
 
 // False positives cost more than the rule is worth: a check that fires on

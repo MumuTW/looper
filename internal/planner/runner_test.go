@@ -84,7 +84,7 @@ func TestNewPreservesInfiniteRetryMaxAttempts(t *testing.T) {
 func TestDiscoverIssuesEnqueuesEligibleWorkAndCreatesLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}, {Number: 43, Title: "Skip", Assignees: []string{"someone"}, Labels: []string{"looper:plan"}}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}, {Number: 43, Title: "Skip", Assignees: []string{"someone"}, Labels: []string{labels.DefaultPlanTrigger}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
 
 	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -209,7 +209,7 @@ func TestRouteIssueCreatesNewLoopForNewReopenedAuthority(t *testing.T) {
 func TestDiscoverIssuesSkipsGlobalHoldLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan", labels.HoldGlobal}}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger, labels.HoldGlobal}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
 
 	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -283,9 +283,9 @@ func TestRunPublishStepRechecksHoldAfterCreatingPullRequest(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{
 		issueDetails: []IssueDetail{
-			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
-			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
-			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan", labels.HoldGlobal}},
+			{Number: 42, Title: "Plan this", Labels: []string{labels.DefaultPlanTrigger}},
+			{Number: 42, Title: "Plan this", Labels: []string{labels.DefaultPlanTrigger}},
+			{Number: 42, Title: "Plan this", Labels: []string{labels.DefaultPlanTrigger, labels.HoldGlobal}},
 		},
 		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
 	}
@@ -337,9 +337,9 @@ func TestRunPublishStepRechecksPullRequestHoldAfterCreatingPullRequest(t *testin
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{
 		issueDetails: []IssueDetail{
-			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
-			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
-			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
+			{Number: 42, Title: "Plan this", Labels: []string{labels.DefaultPlanTrigger}},
+			{Number: 42, Title: "Plan this", Labels: []string{labels.DefaultPlanTrigger}},
+			{Number: 42, Title: "Plan this", Labels: []string{labels.DefaultPlanTrigger}},
 		},
 		prDetail:       PullRequestDetail{Number: 101, Labels: []string{labels.HoldGlobal}},
 		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
@@ -389,7 +389,7 @@ func TestRunPublishStepChecksLifecycleAdoptedPullRequestHoldBeforeDisclosure(t *
 	repoPath := t.TempDir()
 	branch := "planner/42"
 	github := &fakeGitHubGateway{
-		issueDetail: IssueDetail{Number: 42, Labels: []string{"looper:plan"}},
+		issueDetail: IssueDetail{Number: 42, Labels: []string{labels.DefaultPlanTrigger}},
 		prDetail:    PullRequestDetail{Number: 202, URL: "https://example/pr/202", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Labels: []string{labels.HoldGlobal}, Body: "## Summary\n\nExisting spec PR"},
 	}
 	git := &fakeGitGateway{}
@@ -446,7 +446,7 @@ func TestRunPublishStepChecksBranchAdoptedPullRequestHoldBeforeDisclosure(t *tes
 	repoPath := t.TempDir()
 	branch := "planner/42"
 	github := &fakeGitHubGateway{
-		issueDetail:      IssueDetail{Number: 42, Labels: []string{"looper:plan"}},
+		issueDetail:      IssueDetail{Number: 42, Labels: []string{labels.DefaultPlanTrigger}},
 		openPullRequests: []PullRequestSummary{{Number: 203, URL: "https://example/pr/203", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}},
 		prDetail:         PullRequestDetail{Number: 203, URL: "https://example/pr/203", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Labels: []string{labels.HoldGlobal}, Body: "## Summary\n\nExisting spec PR"},
 	}
@@ -504,7 +504,7 @@ func TestDiscoverIssuesEnqueuesAcrossProjectsForSameIssue(t *testing.T) {
 	if err := fixture.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "Looper Duplicate", RepoPath: filepath.Join(t.TempDir(), "repo-2"), BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
 	}
-	issue := IssueSummary{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
+	issue := IssueSummary{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}
 	project1Loop, err := fixture.repos.Loops.GetByID(context.Background(), "missing")
 	if err != nil || project1Loop != nil {
 		t.Fatalf("Loops.GetByID(missing) = (%#v, %v), want (nil, nil)", project1Loop, err)
@@ -585,7 +585,7 @@ func TestDiscoverIssuesSkipsFailedPlannerLoopWhenFingerprintUnchanged(t *testing
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
-	issue := IssueSummary{Number: 77, Title: "Plan this", Body: "same body", URL: "https://github.com/acme/looper/issues/77", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
+	issue := IssueSummary{Number: 77, Title: "Plan this", Body: "same body", URL: "https://github.com/acme/looper/issues/77", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}
 	fingerprint := buildPlannerDiscoveryFingerprint(repo, fixture.now(), issue)
 	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
 	targetID := buildIssueTargetID(repo, issue.Number)
@@ -609,8 +609,8 @@ func TestDiscoverIssuesRequeuesFailedPlannerLoopWhenFingerprintChanges(t *testin
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
-	oldIssue := IssueSummary{Number: 78, Title: "Plan this", Body: "old body", URL: "https://github.com/acme/looper/issues/78", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
-	newIssue := IssueSummary{Number: 78, Title: "Plan this", Body: "new body", URL: "https://github.com/acme/looper/issues/78", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
+	oldIssue := IssueSummary{Number: 78, Title: "Plan this", Body: "old body", URL: "https://github.com/acme/looper/issues/78", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}
+	newIssue := IssueSummary{Number: 78, Title: "Plan this", Body: "new body", URL: "https://github.com/acme/looper/issues/78", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}
 	fingerprint := buildPlannerDiscoveryFingerprint(repo, fixture.now(), oldIssue)
 	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
 	targetID := buildIssueTargetID(repo, newIssue.Number)
@@ -947,7 +947,7 @@ func TestProcessClaimedItemDiscoveryQueueIgnoresManualLoopMetadata(t *testing.T)
 func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec", Stdout: "done"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
@@ -1076,7 +1076,7 @@ func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue() error = %v", err)
 	}
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"looper:plan"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{labels.DefaultPlanTrigger}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
 
@@ -1110,7 +1110,7 @@ func TestProcessClaimedItemSurfacesIssueSelfAssignmentFailure(t *testing.T) {
 	if _, err := (&Runner{repos: fixture.repos, now: fixture.now, retryMaxAttempts: 3}).enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loopResult.record.ID, Repo: "acme/looper", IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "manual": true}}); err != nil {
 		t.Fatalf("enqueue() error = %v", err)
 	}
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"looper:plan"}}, addAssigneeErr: fmt.Errorf("permission denied")}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{labels.DefaultPlanTrigger}}, addAssigneeErr: fmt.Errorf("permission denied")}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
@@ -1137,7 +1137,7 @@ func TestProcessClaimedItemAdoptsOpenBranchPRWithoutRewritingHumanBody(t *testin
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	branch := "looper/planner/42-plan-this"
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}, openPullRequests: []PullRequestSummary{{Number: 202, URL: "https://example/pr/202", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}, openPullRequests: []PullRequestSummary{{Number: 202, URL: "https://example/pr/202", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec", Lifecycle: &lifecycle.State{Branch: branch, BaseBranch: "main", PRURL: "https://example/pr/202", Actions: lifecycle.Actions{PR: lifecycle.ActionSourceAgent}}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
@@ -1177,8 +1177,8 @@ func TestProcessClaimedItemAdoptsLifecyclePRAndStampsMissingDisclosure(t *testin
 	fixture := newRunnerFixture(t)
 	branch := "looper/planner/42-plan-this"
 	github := &fakeGitHubGateway{
-		issues:      []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}},
-		issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}},
+		issues:      []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}},
+		issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}},
 		prDetail:    PullRequestDetail{Number: 202, URL: "https://example/pr/202", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Body: "## Summary\n\nLifecycle-created body"},
 	}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: branch, BaseBranch: "main"}}
@@ -1211,7 +1211,7 @@ func TestProcessClaimedItemAdoptsLifecyclePRAndStampsMissingDisclosure(t *testin
 func TestProcessClaimedItemWriteSpecResumeDoesNotRerunAgentAfterTransientInspectFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}, Body: "details", URL: "https://example/issues/42"}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}, Body: "details", URL: "https://example/issues/42"}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
 	git := &fakeGitGateway{
 		createResult:  CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"},
 		inspectErrors: []error{fmt.Errorf("temporary inspect failure")},
@@ -1261,7 +1261,7 @@ func TestProcessClaimedItemWriteSpecResumeDoesNotRerunAgentAfterTransientInspect
 func TestPublishResumeDoesNotRerunPriorSteps(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, createPRErrors: []error{fmt.Errorf("temporary create pr failure")}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}, createPRErrors: []error{fmt.Errorf("temporary create pr failure")}}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
@@ -1309,7 +1309,7 @@ func TestValidatedLifecyclePullRequestTreatsLookupErrorAsNonAdoptable(t *testing
 func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	issue := IssueSummary{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}
+	issue := IssueSummary{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}
 	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue() error = %v", err)
@@ -1366,7 +1366,7 @@ func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T)
 func TestWriteSpecFailureMarksRunQueueLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Summary: "agent failed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
@@ -1413,7 +1413,7 @@ func TestWriteSpecFailureMarksRunQueueLoop(t *testing.T) {
 func TestWriteSpecSetupFailureStaysRetryable(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "failed", Summary: "unsupported model in agent configuration for codex"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
@@ -1446,7 +1446,7 @@ func TestWriteSpecSetupFailureStaysRetryable(t *testing.T) {
 func TestPublishAutoPushDisabledPausesPlannerLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(false)})
@@ -1479,7 +1479,7 @@ func TestPublishAutoPushDisabledPausesPlannerLoop(t *testing.T) {
 func TestProcessClaimedItemPreservesPausedLoopOnRetryableFailureAfterPause(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}, wait: func(ctx context.Context) error {
 		items, err := fixture.repos.Queue.List(ctx)
@@ -1629,7 +1629,7 @@ func TestProcessClaimedItemUsesDefaultProjectWorktreeRootWhenProjectMetadataOmit
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
 

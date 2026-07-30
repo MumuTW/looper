@@ -103,9 +103,9 @@ type Config struct {
 // Scan reports every protected label value written outside its owning package,
 // sorted by file and line.
 //
-// Test files are excluded. A test may legitimately pin a wire value —
-// labels.TestLabelWireValues does exactly that — and the rule is about
-// production code carrying a second definition.
+// Test files are scanned too. A label rename must fail at every fixture that
+// constructs or asserts the protocol value, not only in production code. The
+// owner package remains exempt because its wire-value test pins those values.
 func Scan(root string) ([]Violation, error) {
 	return ScanWith(Config{Root: root, Roots: DefaultRoots(), Owners: DefaultOwners()})
 }
@@ -147,7 +147,7 @@ func ScanWith(cfg Config) ([]Violation, error) {
 				}
 				return nil
 			}
-			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			if !strings.HasSuffix(path, ".go") {
 				return nil
 			}
 			dir, absErr := filepath.Abs(filepath.Dir(path))
