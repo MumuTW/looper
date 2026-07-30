@@ -1856,7 +1856,7 @@ type projectResponse struct {
 	RepoPath   string `json:"repoPath"`
 	BaseBranch string `json:"baseBranch"`
 	Archived   bool   `json:"archived"`
-	// Provider is the resolved provider kind for display (github, forgejo, plane).
+	// Provider is the resolved provider kind for display (github, forgejo).
 	Provider     string  `json:"provider"`
 	Repo         *string `json:"repo"`
 	WorktreeRoot *string `json:"worktreeRoot"`

@@ -92,7 +92,6 @@ func partialIssueCodingDiscovery(enabled *bool, triggers *PartialIssueRoleTrigge
 		discovery.Labels = triggers.Labels
 		discovery.LabelMode = triggers.LabelMode
 		discovery.RequireAssigneeCurrentUser = triggers.RequireAssigneeCurrentUser
-		discovery.PlaneAssigneeID = triggers.PlaneAssigneeID
 	}
 	return discovery
 }
@@ -156,7 +155,7 @@ func stripRoleAgentBindings(partial PartialRoleConfigs) PartialRoleConfigs {
 }
 
 // ProjectProviderKind resolves the task-source provider kind for a project by
-// id (github / forgejo / plane). Unknown ids fall back to the GitHub default.
+// id (github / forgejo). Unknown ids fall back to the GitHub default.
 func ProjectProviderKind(cfg Config, projectID string) ProviderKind {
 	project := findConfiguredProject(cfg.Projects, projectID)
 	if project == nil {

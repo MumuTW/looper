@@ -46,11 +46,6 @@ type RoleDiscoveryConfig struct {
 
 	// Issue-source only.
 	RequireAssigneeCurrentUser bool `json:"requireAssigneeCurrentUser,omitempty"`
-	// PlaneAssigneeID scopes discovery on a Plane task-source project to
-	// work-items assigned to this Plane member UUID. Plane assignees are
-	// UUIDs (not GitHub logins), so RequireAssigneeCurrentUser cannot route
-	// them; set this per person instead. Empty = label-only discovery.
-	PlaneAssigneeID string `json:"planeAssigneeId,omitempty"`
 
 	// Pull-request-source only.
 	IncludeDrafts        bool         `json:"includeDrafts,omitempty"`
@@ -144,7 +139,6 @@ func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 			Labels:                     append([]string(nil), roles.Planner.Triggers.Labels...),
 			LabelMode:                  roles.Planner.Triggers.LabelMode,
 			RequireAssigneeCurrentUser: roles.Planner.Triggers.RequireAssigneeCurrentUser,
-			PlaneAssigneeID:            roles.Planner.Triggers.PlaneAssigneeID,
 		},
 	}
 
@@ -158,7 +152,6 @@ func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 			Labels:                     append([]string(nil), roles.Worker.Triggers.Labels...),
 			LabelMode:                  roles.Worker.Triggers.LabelMode,
 			RequireAssigneeCurrentUser: roles.Worker.Triggers.RequireAssigneeCurrentUser,
-			PlaneAssigneeID:            roles.Worker.Triggers.PlaneAssigneeID,
 		},
 	}
 
@@ -379,9 +372,6 @@ func mergePartialRoleDiscoveryConfig(base, overlay *PartialRoleDiscoveryConfig) 
 	if overlay.RequireAssigneeCurrentUser != nil {
 		base.RequireAssigneeCurrentUser = overlay.RequireAssigneeCurrentUser
 	}
-	if overlay.PlaneAssigneeID != nil {
-		base.PlaneAssigneeID = overlay.PlaneAssigneeID
-	}
 	if overlay.IncludeDrafts != nil {
 		base.IncludeDrafts = overlay.IncludeDrafts
 	}
@@ -482,9 +472,6 @@ func applyPartialCodingRoleConfig(base CodingRoleConfig, partial PartialCodingRo
 	if discovery.RequireAssigneeCurrentUser != nil {
 		base.Discovery.RequireAssigneeCurrentUser = *discovery.RequireAssigneeCurrentUser
 	}
-	if discovery.PlaneAssigneeID != nil {
-		base.Discovery.PlaneAssigneeID = *discovery.PlaneAssigneeID
-	}
 	if discovery.IncludeDrafts != nil {
 		base.Discovery.IncludeDrafts = *discovery.IncludeDrafts
 	}
@@ -540,9 +527,6 @@ func validatePartialRoleDiscovery(pathPrefix string, expectedSource WorkSource, 
 		if d.RequireAssigneeCurrentUser != nil {
 			fields = append(fields, "requireAssigneeCurrentUser")
 		}
-		if d.PlaneAssigneeID != nil {
-			fields = append(fields, "planeAssigneeId")
-		}
 	}
 	for _, field := range fields {
 		issues = append(issues, ValidationIssue{
@@ -592,9 +576,6 @@ func issueOnlyDiscoveryFieldsSet(d RoleDiscoveryConfig) []string {
 	var set []string
 	if d.RequireAssigneeCurrentUser {
 		set = append(set, "requireAssigneeCurrentUser")
-	}
-	if strings.TrimSpace(d.PlaneAssigneeID) != "" {
-		set = append(set, "planeAssigneeId")
 	}
 	return set
 }

@@ -34,7 +34,6 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"disclosure.channels.gitCommit",
 		"defaults.allowAutoPush",
 		"instructions.enabled",
-		"roles.worker.triggers.planeAssigneeId",
 		"roles.reviewer.behavior.scope",
 		"tools.looperPath",
 		"tools.osascriptPath",
@@ -95,7 +94,6 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"roles.reviewer.behavior.loop.minPublishIntervalSeconds",
 		"roles.reviewer.behavior.loop.quietPeriodSeconds",
 		"roles.reviewer.behavior.retry.maxDelayMs",
-		"roles.planner.triggers.planeAssigneeId",
 		"roles.coordinator.mergeWatch.transientRetries",
 		"roles..planner",
 	}
@@ -131,8 +129,6 @@ func TestRestartRequiredChangesReturnsConcreteSortedPaths(t *testing.T) {
 	newConfig.Logging.Level = LogLevelDebug
 	newConfig.Daemon.Environment["NEW_VAR"] = "value"
 	newConfig.Roles.Planner.Triggers.Labels = []string{"hot-label"}
-	newConfig.Roles.Planner.Triggers.PlaneAssigneeID = "restart-bound-planner-member"
-	newConfig.Roles.Worker.Triggers.PlaneAssigneeID = "hot-worker-member"
 	newConfig.Defaults.BaseBranch = "develop"
 	newConfig.Roles.Coordinator.Enabled = !newConfig.Roles.Coordinator.Enabled
 	newConfig.Providers = append(newConfig.Providers, ProviderConfig{ID: "forgejo", Kind: ProviderKindForgejo})
@@ -146,7 +142,6 @@ func TestRestartRequiredChangesReturnsConcreteSortedPaths(t *testing.T) {
 		"projects",
 		"providers",
 		"roles.coordinator.enabled",
-		"roles.planner.triggers.planeAssigneeId",
 		"scheduler.discoveryCacheTtlSeconds",
 		"scheduler.pollIntervalSeconds",
 		"scheduler.retryBaseDelayMs",

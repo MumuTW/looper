@@ -71,8 +71,6 @@ func cloneProviderConfig(provider config.ProviderConfig) config.ProviderConfig {
 	cloned.TokenEnv = cloneStringPointer(provider.TokenEnv)
 	cloned.TeaLogin = cloneStringPointer(provider.TeaLogin)
 	cloned.TeaPath = cloneStringPointer(provider.TeaPath)
-	cloned.Workspace = cloneStringPointer(provider.Workspace)
-	cloned.ProjectID = cloneStringPointer(provider.ProjectID)
 	return cloned
 }
 
@@ -221,12 +219,6 @@ func (selection Selection) UsesNativePullRequestAPI() bool {
 	return selection.kind == ProviderKindForgejo
 }
 
-// UsesExternalTaskSource is true for Plane. Plane remains explicit while its
-// SDK and provider configuration stay contained in this package.
-func (selection Selection) UsesExternalTaskSource() bool {
-	return selection.kind == ProviderKindPlane
-}
-
 func (selection Selection) PullRequestProviderName() string {
 	if selection.UsesNativePullRequestAPI() {
 		return "Forgejo"
@@ -238,8 +230,6 @@ func (selection Selection) TaskSourceName() string {
 	switch selection.kind {
 	case ProviderKindForgejo:
 		return "Forgejo"
-	case ProviderKindPlane:
-		return "Plane"
 	default:
 		return "GitHub"
 	}
@@ -253,20 +243,6 @@ func (selection Selection) ForgejoClient() (*ForgejoClient, bool, error) {
 		return nil, true, fmt.Errorf("forgejo project %s is missing repo", strings.TrimSpace(selection.project.id))
 	}
 	client, err := NewForgejoClientFromConfig(selection.provider, strings.TrimSpace(selection.project.repo))
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
-}
-
-func (selection Selection) PlaneClient() (*PlaneClient, bool, error) {
-	if !selection.UsesExternalTaskSource() {
-		return nil, false, nil
-	}
-	if strings.TrimSpace(selection.project.repo) == "" {
-		return nil, true, fmt.Errorf("plane project %s is missing repo", strings.TrimSpace(selection.project.id))
-	}
-	client, err := NewPlaneClientFromConfig(selection.provider, strings.TrimSpace(selection.project.repo))
 	if err != nil {
 		return nil, true, err
 	}
@@ -288,12 +264,4 @@ func (resolver Resolver) ForgejoForLocation(repo, cwd string) (*ForgejoClient, b
 		return nil, false, err
 	}
 	return selection.ForgejoClient()
-}
-
-func (resolver Resolver) PlaneForLocation(repo, cwd string) (*PlaneClient, bool, error) {
-	selection, matched, err := resolver.ForLocation(repo, cwd)
-	if err != nil || !matched {
-		return nil, false, err
-	}
-	return selection.PlaneClient()
 }

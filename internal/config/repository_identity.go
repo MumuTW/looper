@@ -43,9 +43,6 @@ func ProjectRepositoryIdentity(cfg Config, project ProjectRefConfig) (Repository
 		if provider.ID != providerID {
 			continue
 		}
-		if provider.Kind == ProviderKindPlane {
-			return RepositoryIdentity{ProviderID: defaultGitHubProviderID, Kind: ProviderKindGitHub, BaseURL: defaultGitHubProviderURL, Repo: repo}, true
-		}
 		baseURL := normalizeBaseURL(provider.BaseURL)
 		if provider.Kind == ProviderKindGitHub && baseURL == "" {
 			baseURL = defaultGitHubProviderURL

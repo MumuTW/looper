@@ -112,7 +112,7 @@ looper status
 
 **First decide which of the two registration paths this project uses — they do not mix.**
 
-**Forgejo and Plane projects: do NOT run `looper project add`.** Define the project entirely in the config file under `[[projects]]`, alongside its provider, and restart the daemon. `looper project add` has no way to express the provider binding those projects require, and the record it creates is marked `source = "api"`. Adding the same project to the config afterwards does not convert it: on the next start `SyncConfigured` sees a configured project whose id already belongs to an API record, fails with `configured project <id> conflicts with an API-managed project`, and **`looperd` refuses to start**. Recovering means removing the API record before the daemon will come back up. See [docs/configuration.md](../../docs/configuration.md) and [docs/plane-provider.md](../../docs/plane-provider.md).
+**Forgejo projects: do NOT run `looper project add`.** Define the project entirely in the config file under `[[projects]]`, alongside its provider, and restart the daemon. `looper project add` has no way to express the provider binding those projects require, and the record it creates is marked `source = "api"`. Adding the same project to the config afterwards does not convert it: on the next start `SyncConfigured` sees a configured project whose id already belongs to an API record, fails with `configured project <id> conflicts with an API-managed project`, and **`looperd` refuses to start**. Recovering means removing the API record before the daemon will come back up. See [docs/configuration.md](../../docs/configuration.md).
 
 **GitHub projects, with the daemon up:**
 
@@ -170,7 +170,7 @@ Inspect loops in the dashboard or via `GET /api/v1/loops`. Worktree path for a d
 
 - Reaching for `looper bootstrap`, `daemon start`, `ps`, `logs`, `plan`, `review`, `work`, `jump`
 - Passing `looper project add` a subdirectory instead of the repository root, or expecting it to take an id / base branch / provider — those are API and dashboard fields
-- Running `looper project add` for a Forgejo or Plane project, then adding it to the config file — that combination stops `looperd` from starting
+- Running `looper project add` for a Forgejo project, then adding it to the config file — that combination stops `looperd` from starting
 - Telling a user to run `looper review submit`
 - Using a PR URL as a selector
 - Force-pushing or inventing flags the strip CLI does not have

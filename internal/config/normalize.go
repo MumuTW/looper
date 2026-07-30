@@ -177,16 +177,14 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 		partials := make([]PartialProviderConfig, len(providers))
 		for i, provider := range providers {
 			partials[i] = PartialProviderConfig{
-				ID:        provider.ID,
-				Kind:      &provider.Kind,
-				BaseURL:   &provider.BaseURL,
-				GHPath:    provider.GHPath,
-				Auth:      providerAuthModePtr(provider.Auth),
-				TokenEnv:  provider.TokenEnv,
-				TeaLogin:  provider.TeaLogin,
-				TeaPath:   provider.TeaPath,
-				Workspace: provider.Workspace,
-				ProjectID: provider.ProjectID,
+				ID:       provider.ID,
+				Kind:     &provider.Kind,
+				BaseURL:  &provider.BaseURL,
+				GHPath:   provider.GHPath,
+				Auth:     providerAuthModePtr(provider.Auth),
+				TokenEnv: provider.TokenEnv,
+				TeaLogin: provider.TeaLogin,
+				TeaPath:  provider.TeaPath,
 			}
 		}
 		normalized.Providers = &partials
@@ -550,12 +548,6 @@ func normalizeProviderConfig(provider *ProviderConfig) {
 	}
 	if provider.TeaPath != nil {
 		provider.TeaPath = stringPtr(strings.TrimSpace(*provider.TeaPath))
-	}
-	if provider.Workspace != nil {
-		provider.Workspace = stringPtr(strings.TrimSpace(*provider.Workspace))
-	}
-	if provider.ProjectID != nil {
-		provider.ProjectID = stringPtr(strings.TrimSpace(*provider.ProjectID))
 	}
 }
 
@@ -1531,9 +1523,6 @@ func mergeIssueRoleTriggersConfig(config *IssueRoleTriggersConfig, partial Parti
 	if partial.RequireAssigneeCurrentUser != nil {
 		config.RequireAssigneeCurrentUser = *partial.RequireAssigneeCurrentUser
 	}
-	if partial.PlaneAssigneeID != nil {
-		config.PlaneAssigneeID = *partial.PlaneAssigneeID
-	}
 }
 
 func mergePullRequestRoleTriggersConfig(config *PullRequestRoleTriggersConfig, partial PartialPullRequestRoleTriggersConfig) {
@@ -1705,8 +1694,6 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 			providers[i].TokenEnv = cloneStringPtr(providers[i].TokenEnv)
 			providers[i].TeaLogin = cloneStringPtr(providers[i].TeaLogin)
 			providers[i].TeaPath = cloneStringPtr(providers[i].TeaPath)
-			providers[i].Workspace = cloneStringPtr(providers[i].Workspace)
-			providers[i].ProjectID = cloneStringPtr(providers[i].ProjectID)
 		}
 		cloned.Providers = &providers
 	}
@@ -1848,14 +1835,12 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 			kind = *provider.Kind
 		}
 		cloned[index] = ProviderConfig{
-			ID:        strings.TrimSpace(provider.ID),
-			Kind:      kind,
-			GHPath:    cloneStringPtr(provider.GHPath),
-			TokenEnv:  cloneStringPtr(provider.TokenEnv),
-			TeaLogin:  cloneStringPtr(provider.TeaLogin),
-			TeaPath:   cloneStringPtr(provider.TeaPath),
-			Workspace: cloneStringPtr(provider.Workspace),
-			ProjectID: cloneStringPtr(provider.ProjectID),
+			ID:       strings.TrimSpace(provider.ID),
+			Kind:     kind,
+			GHPath:   cloneStringPtr(provider.GHPath),
+			TokenEnv: cloneStringPtr(provider.TokenEnv),
+			TeaLogin: cloneStringPtr(provider.TeaLogin),
+			TeaPath:  cloneStringPtr(provider.TeaPath),
 		}
 		if provider.Auth != nil {
 			cloned[index].Auth = *provider.Auth
@@ -2145,7 +2130,6 @@ func clonePartialRoleDiscoveryConfig(config *PartialRoleDiscoveryConfig) *Partia
 		value := *config.RequireAssigneeCurrentUser
 		cloned.RequireAssigneeCurrentUser = &value
 	}
-	cloned.PlaneAssigneeID = cloneStringPtr(config.PlaneAssigneeID)
 	if config.IncludeDrafts != nil {
 		value := *config.IncludeDrafts
 		cloned.IncludeDrafts = &value
