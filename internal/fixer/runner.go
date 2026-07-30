@@ -5146,6 +5146,9 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 	}
 	checkpoint.Recheck = &checkpointRecheck{RemainingFixItems: collectFixItems(detail)}
 	blockingFixItems := excludeDeferredFixItems(checkpoint.Recheck.RemainingFixItems, checkpoint.ResolvedComments)
+	if checkpoint.Outcome != nil {
+		blockingFixItems = excludeFollowupThreads(blockingFixItems, checkpoint.Outcome.FollowUpThreadIDs)
+	}
 	verifiedNoPushHead := resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, input.Loop.MetadataJSON, checkpoint.FixItemsHash)
 	hasVerifiedNoPushHead := verifiedNoPushHead != "" && strings.TrimSpace(detail.HeadSHA) == verifiedNoPushHead
 	if shouldBlockResolveWithoutFix(checkpoint, blockingFixItems, hasVerifiedNoPushHead) {
@@ -5178,6 +5181,25 @@ func excludeDeferredFixItems(fixItems []FixItem, resolved *checkpointResolvedCom
 		_, byID := deferred["id:"+item.ID]
 		_, byThread := deferred["thread:"+item.ThreadID]
 		if !byID && !byThread {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func excludeFollowupThreads(fixItems []FixItem, threadIDs []string) []FixItem {
+	if len(threadIDs) == 0 {
+		return fixItems
+	}
+	followup := make(map[string]struct{}, len(threadIDs))
+	for _, threadID := range threadIDs {
+		if threadID = strings.TrimSpace(threadID); threadID != "" {
+			followup[threadID] = struct{}{}
+		}
+	}
+	out := make([]FixItem, 0, len(fixItems))
+	for _, item := range fixItems {
+		if _, ok := followup[item.ThreadID]; !ok {
 			out = append(out, item)
 		}
 	}
@@ -7122,8 +7144,9 @@ func (r *Runner) recordTerminalCleanup(ctx context.Context, project storage.Proj
 	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
 		return
 	}
-	encoded := mustMarshalJSON(checkpoint.Outcome)
-	if err := r.repos.Runs.UpdateCheckpointOutcome(ctx, runID, encoded, r.nowISO()); err != nil {
+	outcomeJSON := mustMarshalJSON(checkpoint.Outcome)
+	issueJSON := mustMarshalJSON(issue)
+	if err := r.repos.Runs.AppendCheckpointSecondaryIssue(ctx, runID, outcomeJSON, issueJSON, r.nowISO()); err != nil {
 		r.logError("fixer cleanup outcome persistence failed", map[string]any{"runId": runID, "message": err.Error()})
 	}
 }

@@ -37,6 +37,11 @@ func TestRecordFailedRunCleanupPersistsSecondaryIssue(t *testing.T) {
 	newerHeartbeat := "2026-04-11T12:00:01.000Z"
 	newerCheckpoint := checkpoint
 	newerCheckpoint.ResumePolicy = "restart_from_discover"
+	newerCheckpoint.Outcome = &FixerRunOutcome{
+		PrimaryFailure:    checkpoint.Outcome.PrimaryFailure,
+		Progress:          FixerDurableProgress{Pushed: true},
+		FollowUpThreadIDs: []string{"thread-newer"},
+	}
 	newerCheckpointJSON := mustMarshalJSON(newerCheckpoint)
 	run.Status = "interrupted"
 	run.CurrentStep = &newerStep
@@ -61,6 +66,9 @@ func TestRecordFailedRunCleanupPersistsSecondaryIssue(t *testing.T) {
 	}
 	if durable.ResumePolicy != "restart_from_discover" {
 		t.Fatalf("durable ResumePolicy = %q, want concurrent checkpoint field preserved", durable.ResumePolicy)
+	}
+	if !durable.Outcome.Progress.Pushed || !sameStringSlices(durable.Outcome.FollowUpThreadIDs, []string{"thread-newer"}) {
+		t.Fatalf("durable Outcome = %#v, want concurrent outcome fields preserved", durable.Outcome)
 	}
 	if persisted.Status != "interrupted" || persisted.CurrentStep == nil || *persisted.CurrentStep != newerStep || persisted.LastHeartbeatAt == nil || *persisted.LastHeartbeatAt != newerHeartbeat {
 		t.Fatalf("persisted run = %#v, want checkpoint-only update to preserve newer state", persisted)

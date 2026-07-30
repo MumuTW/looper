@@ -3347,7 +3347,7 @@ func TestRunResolveCommentsStepTreatsUnknownActionAsContractViolation(t *testing
 func TestRunResolveCommentsStepTreatsNewThreadAfterRepairAsFollowupWithoutSkippingExisting(t *testing.T) {
 	t.Parallel()
 
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+	liveWithNewThread := PullRequestDetail{
 		Number:      42,
 		State:       "OPEN",
 		HeadSHA:     "new-head",
@@ -3363,7 +3363,10 @@ func TestRunResolveCommentsStepTreatsNewThreadAfterRepairAsFollowupWithoutSkippi
 			"threadId": "t2",
 			"body":     "new feedback",
 		}},
-	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}, {ID: "t2", Comments: []ReviewThreadComment{{ID: "c2", Body: "new feedback"}}}}}
+	}
+	liveAfterResolve := liveWithNewThread
+	liveAfterResolve.Comments = []map[string]any{{"id": "c2", "threadId": "t2", "body": "new feedback"}}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{liveWithNewThread, liveAfterResolve}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}, {ID: "t2", Comments: []ReviewThreadComment{{ID: "c2", Body: "new feedback"}}}}}
 	// fixItems mirrors the snapshot the agent saw: only c1/t1.
 	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
 	// Live PR has gained thread t2/c2 since the agent ran. The agent's
@@ -3443,6 +3446,13 @@ func TestRunResolveCommentsStepTreatsNewThreadAfterRepairAsFollowupWithoutSkippi
 	}
 	if !ok || !foundT2 {
 		t.Fatalf("pending rediscovery = %#v, want durable t2 handoff", pending)
+	}
+	rechecked, err := runner.runRecheckStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: *persistedLoop, Repo: repo, PRNumber: prNumber, Checkpoint: updated})
+	if err != nil || rechecked.ResumePolicy != loops.ResumePolicyAdvanceFromCheckpoint {
+		t.Fatalf("runRecheckStep() = (%#v, %v), want scheduled t2 excluded from no-fix gate", rechecked, err)
+	}
+	if scheduled, err := runner.schedulePendingRediscoveryAfterRun(context.Background(), *persistedLoop, repo, prNumber); err != nil || !scheduled {
+		t.Fatalf("schedulePendingRediscoveryAfterRun() = (%t, %v), want t2 queued after recheck", scheduled, err)
 	}
 }
 

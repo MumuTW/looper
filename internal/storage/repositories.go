@@ -897,24 +897,34 @@ func (r *RunsRepository) UpdateCheckpoint(ctx context.Context, id, checkpointJSO
 	return nil
 }
 
-// UpdateCheckpointOutcome atomically replaces only the outcome projection,
-// preserving concurrent resume-policy and step-specific checkpoint updates.
-func (r *RunsRepository) UpdateCheckpointOutcome(ctx context.Context, id, outcomeJSON, updatedAt string) error {
+// AppendCheckpointSecondaryIssue atomically appends a cleanup issue to an
+// existing outcome. If no outcome exists yet, it initializes the supplied
+// outcome projection. Other checkpoint and outcome fields retain their latest
+// durable values.
+func (r *RunsRepository) AppendCheckpointSecondaryIssue(ctx context.Context, id, initialOutcomeJSON, issueJSON, updatedAt string) error {
 	result, err := r.q.ExecContext(ctx, `
 		UPDATE runs
-		SET checkpoint_json = json_set(COALESCE(NULLIF(checkpoint_json, ''), '{}'), '$.outcome', json(?)),
+		SET checkpoint_json = CASE
+				WHEN json_type(COALESCE(NULLIF(checkpoint_json, ''), '{}'), '$.outcome') IS NULL
+					THEN json_set(COALESCE(NULLIF(checkpoint_json, ''), '{}'), '$.outcome', json(?))
+				ELSE json_set(
+					COALESCE(NULLIF(checkpoint_json, ''), '{}'),
+					'$.outcome.secondaryIssues',
+					json_insert(COALESCE(json_extract(checkpoint_json, '$.outcome.secondaryIssues'), json('[]')), '$[#]', json(?))
+				)
+			END,
 			updated_at = ?
 		WHERE id = ?
-	`, outcomeJSON, updatedAt, id)
+	`, initialOutcomeJSON, issueJSON, updatedAt, id)
 	if err != nil {
-		return fmt.Errorf("update run checkpoint outcome: %w", err)
+		return fmt.Errorf("append run checkpoint secondary issue: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("read updated run checkpoint outcome rows: %w", err)
+		return fmt.Errorf("read appended run checkpoint secondary issue rows: %w", err)
 	}
 	if affected == 0 {
-		return fmt.Errorf("update run checkpoint outcome: run not found: %s", id)
+		return fmt.Errorf("append run checkpoint secondary issue: run not found: %s", id)
 	}
 	return nil
 }
