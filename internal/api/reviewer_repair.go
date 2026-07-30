@@ -128,8 +128,8 @@ func (a reviewerRepairGitHubAdapter) ViewPullRequest(ctx context.Context, input 
 	}, nil
 }
 
-func (a reviewerRepairGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+func (a reviewerRepairGitHubAdapter) GetCurrentUserLogin(ctx context.Context, repo, cwd string) (string, error) {
+	return a.gateway.GetCurrentUserLoginForRepo(ctx, repo, cwd)
 }
 
 func reviewerRepairCommentInfosToObjects(items []github.CommentInfo) []map[string]any {

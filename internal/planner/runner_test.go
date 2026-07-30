@@ -1731,7 +1731,7 @@ func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (
 	return detail, nil
 }
 
-func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string, string) (string, error) {
 	f.loginCalls++
 	if f.loginErr != nil {
 		return "", f.loginErr

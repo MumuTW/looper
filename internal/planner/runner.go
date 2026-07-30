@@ -170,7 +170,7 @@ type IssueAssigneesInput struct {
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
-	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
@@ -540,7 +540,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	login := ""
 	if policy.RequireAssigneeCurrentUser {
 		var err error
-		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		login, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -937,7 +937,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	reportAuthorized := plannerQueueRoutingAuthority(payload) != ""
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if currentLogin == "" && (manual || (!reportAuthorized && policy.RequireAssigneeCurrentUser) || hasRequestedReviewerSources(input.Project, input.Loop, detail.Assignees)) {
-		login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		login, err := r.github.GetCurrentUserLogin(ctx, repo, input.Project.RepoPath)
 		if err != nil {
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d: %v", repo, issueNumber, err), kind: FailureRetryableAfterResume}
 		}

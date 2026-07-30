@@ -9382,7 +9382,7 @@ func (g *fakeGitHubGateway) ListReviewRequestedPullRequests(_ context.Context, i
 	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, Author: author, ReviewRequests: reviewRequests, ReviewRequestUsers: users, Reviews: cloneCommentMaps(g.reviews)}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", Author: author, ReviewRequests: reviewRequests, ReviewRequestUsers: users}}, nil
 }
 
-func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string, string) (string, error) {
 	g.currentLoginCalls++
 	if g.currentLoginErr != nil {
 		return "", g.currentLoginErr

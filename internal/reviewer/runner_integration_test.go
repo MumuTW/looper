@@ -240,8 +240,8 @@ func (a reviewerIntegrationGatewayAdapter) ListReviewRequestedPullRequests(ctx c
 	return out, nil
 }
 
-func (a reviewerIntegrationGatewayAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	return a.Gateway.GetCurrentUserLogin(ctx, cwd)
+func (a reviewerIntegrationGatewayAdapter) GetCurrentUserLogin(ctx context.Context, repo, cwd string) (string, error) {
+	return a.Gateway.GetCurrentUserLoginForRepo(ctx, repo, cwd)
 }
 
 func (a reviewerIntegrationGatewayAdapter) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
