@@ -33,3 +33,7 @@ looper-hitl-onboarding*.zip
 # carries the HERMES_HOME of whoever registered it. Register per clone with
 # scripts/hermes-profile.sh --bootstrap's printed command instead.
 .devin/
+
+# Python bytecode from running the checked-in tools directly.
+__pycache__/
+*.pyc
