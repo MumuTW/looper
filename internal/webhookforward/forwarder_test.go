@@ -58,6 +58,38 @@ func TestForwardRefusesWhenAllowExecuteClosedAtAccept(t *testing.T) {
 	fixerRunner.assertCallCount(t, 0)
 }
 
+func TestForwardMatchesProviderQualifiedTunnelRoute(t *testing.T) {
+	repos := newTestRepositories(t)
+	metadata := `{"provider":"ghes","repo":"acme/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "project_1", RepoPath: "/tmp/project_1", MetadataJSON: &metadata, CreatedAt: "2026-05-16T12:00:00.000Z", UpdatedAt: "2026-05-16T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	cfg := testConfig(t)
+	cfg.Providers = []config.ProviderConfig{{ID: "ghes", Kind: config.ProviderKindGitHub, BaseURL: "https://github"}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "project_1", RepoPath: "/tmp/project_1", Provider: "ghes", Repo: "acme/looper"}}
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        cfg,
+		Reviewer:      newFakeTargetedRunner(nil),
+		Fixer:         targetedFixerAdapter{runner: newFakeTargetedRunner(nil)},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+	})
+	defer forwarder.Close()
+
+	result, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "enterprise-route",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "github/acme/looper", 42),
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	if result.Status != "accepted" || result.WorkItems != 1 {
+		t.Fatalf("Forward() = %#v, want accepted provider-qualified route", result)
+	}
+}
+
 // Contract (#592 review): Forward may accept while admission is open; once
 // accepted/202, worker discovery must still complete even if AllowExecute later
 // refuses. Post-accept admission recheck would drop work GitHub will not retry.

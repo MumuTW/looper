@@ -24,7 +24,7 @@ func nativeReviewAdapterConfig(workDir string) *config.Config {
 
 func nativeReviewAdapterInput(workDir string) reviewer.AgentRunInput {
 	return reviewer.AgentRunInput{
-		ExecutionID:      "reviewer_wrapper_unavailable",
+		ExecutionID:      "reviewer_capability_unavailable",
 		ProjectID:        "ghes-native",
 		RunID:            "run_reviewer",
 		WorkingDirectory: workDir,
@@ -43,16 +43,16 @@ func nativeReviewAdapterInput(workDir string) reviewer.AgentRunInput {
 	}
 }
 
-// A native-review run without a usable wrapper is refused before the agent
+// A native-review run without a usable capability is refused before the agent
 // starts, so no run is spent reviewing a PR it cannot publish to.
 //
 // The message matters as much as the refusal. Runs that never mint a proxy —
 // comment-only publish, thread-resolution classifiers — report this same
 // condition from the agent side, quoting the prompt. Asserting equality with
-// reviewer.TrustedWrapperUnavailableMessage is what keeps one phrase covering
+// reviewer.TrustedReviewCapabilityUnavailableMessage keeps one phrase covering
 // both surfaces, so an operator finds every affected run with one search
 // instead of learning which half produced which wording.
-func TestReviewerAgentStartRefusesWithThePromptsWordingWhenWrapperUnavailable(t *testing.T) {
+func TestReviewerAgentStartRefusesWithThePromptsWordingWhenCapabilityUnavailable(t *testing.T) {
 	workDir := t.TempDir()
 	customVendor := config.AgentVendor("custom")
 	adapter := reviewerAgentExecutorAdapter{
@@ -71,14 +71,14 @@ func TestReviewerAgentStartRefusesWithThePromptsWordingWhenWrapperUnavailable(t 
 	if err == nil {
 		t.Fatal("Start() error = nil, want refusal before the agent runs")
 	}
-	if err.Error() != reviewer.TrustedWrapperUnavailableMessage {
-		t.Fatalf("Start() error = %q, want exactly %q so the daemon and the agent report this condition identically", err, reviewer.TrustedWrapperUnavailableMessage)
+	if err.Error() != reviewer.TrustedReviewCapabilityUnavailableMessage {
+		t.Fatalf("Start() error = %q, want exactly %q so the daemon and the agent report this condition identically", err, reviewer.TrustedReviewCapabilityUnavailableMessage)
 	}
 }
 
-// Once a usable wrapper exists, a mint failure is the daemon's own — socket,
+// Once a usable capability exists, a mint failure is the daemon's own — socket,
 // binding or policy — and must still abort. Continuing would publish a review
-// run that blames a missing wrapper for a daemon bug.
+// run that blames a missing capability for a daemon bug.
 func TestReviewerAgentStartAbortsOnDaemonSideMintFailure(t *testing.T) {
 	scriptDir := t.TempDir()
 	realLooper := filepath.Join(scriptDir, "real-looper")
@@ -96,7 +96,7 @@ func TestReviewerAgentStartAbortsOnDaemonSideMintFailure(t *testing.T) {
 	}
 
 	// An empty working directory fails normalizeTrustedReviewCwd, which is a
-	// daemon-selection fault rather than a missing wrapper.
+	// daemon-selection fault rather than a missing capability.
 	input := nativeReviewAdapterInput("")
 	input.WorkingDirectory = ""
 

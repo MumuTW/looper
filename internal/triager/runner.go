@@ -132,10 +132,14 @@ type Enrollment struct {
 }
 
 type Confirmation struct {
-	ReportKey   string `json:"reportKey"`
-	CommentID   int64  `json:"commentId"`
-	Author      string `json:"author"`
-	ConfirmedAt string `json:"confirmedAt"`
+	ReportKey string `json:"reportKey"`
+	CommentID int64  `json:"commentId"`
+	Author    string `json:"author"`
+	// Clarification is the answer supplied with the command, if any. It is handed
+	// to Planner so the information that released the report also reaches the
+	// agent that acts on it.
+	Clarification string `json:"clarification,omitempty"`
+	ConfirmedAt   string `json:"confirmedAt"`
 }
 
 type Projection struct {
@@ -165,6 +169,7 @@ type GitHubGateway interface {
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
 	GetRepositoryPermission(context.Context, githubinfra.RepositoryPermissionInput) (string, error)
+	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
 }
 
 type PlannerRouter interface {
@@ -186,6 +191,8 @@ type Options struct {
 // Triage Report, and projects accepted low-risk reports directly into Planner
 // work. It has no configurable trigger labels and does not replace Fixer's
 // review-feedback source.
+// Stateful: it persists enrollment, report, confirmation, and projection
+// events in the local SQLite event log.
 type Runner struct {
 	repos          *storage.Repositories
 	github         GitHubGateway
@@ -516,17 +523,28 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		result.ReportsPersisted++
 	}
 	action := report.Policy.Action
+	var clarifications []string
 	if action == ActionAwaitHuman {
 		confirmed, created, err := r.confirmedByHuman(ctx, repo, project.RepoPath, detail, *report)
 		if err != nil {
 			return err
 		}
 		if !confirmed {
+			// Ask before parking. The confirmation token lives only in the local
+			// event log, so a held report nobody is told about cannot be released
+			// by anyone reading the Issue.
+			if err := r.ensureAsked(ctx, project, repo, *report); err != nil {
+				return err
+			}
 			result.AwaitingConfirmation++
 			return nil
 		}
 		if created {
 			result.Confirmed++
+		}
+		clarifications, err = r.clarificationsForReport(ctx, *report)
+		if err != nil {
+			return err
 		}
 		action = ActionRoutePlanner
 	}
@@ -538,6 +556,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		Issue: planner.IssueSummary{
 			Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL,
 			Assignees: append([]string(nil), detail.Assignees...), Labels: append([]string(nil), detail.Labels...),
+			Clarifications: clarifications,
 		},
 	})
 	if err != nil {
@@ -602,7 +621,8 @@ func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue g
 		return false, false, fmt.Errorf("triage report %s is missing its confirmation token", report.IdempotencyKey)
 	}
 	for _, comment := range issue.Comments {
-		if strings.TrimSpace(comment.Body) != confirmationCommand(confirmationToken) || strings.TrimSpace(comment.Author) == "" {
+		confirms, clarification := parseConfirmComment(comment.Body, confirmationToken)
+		if !confirms || strings.TrimSpace(comment.Author) == "" {
 			continue
 		}
 		permission, err := r.github.GetRepositoryPermission(ctx, githubinfra.RepositoryPermissionInput{
@@ -616,7 +636,7 @@ func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue g
 		}
 		confirmation := Confirmation{
 			ReportKey: report.IdempotencyKey, CommentID: comment.ID,
-			Author: comment.Author, ConfirmedAt: comment.CreatedAt,
+			Author: comment.Author, Clarification: clarification, ConfirmedAt: comment.CreatedAt,
 		}
 		if err := r.persistConfirmation(ctx, report, confirmation); err != nil {
 			return false, false, err

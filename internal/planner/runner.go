@@ -64,6 +64,11 @@ type IssueSummary struct {
 	URL       string
 	Assignees []string
 	Labels    []string
+	// Clarifications are answers a human gave to Triager's questions before this
+	// Issue was routed. They are carried explicitly rather than re-read from the
+	// Issue's comments so Planner sees exactly what was answered, without having
+	// to guess which of the comments are relevant.
+	Clarifications []string
 }
 
 type IssueDetail struct {
@@ -321,6 +326,7 @@ type DiscoveryPolicy struct {
 }
 
 // Runner is the Planner: a reactive Role that produces a Spec from an Issue.
+// Stateful: it persists runs in the local SQLite database.
 type Runner struct {
 	db                      *sql.DB
 	repos                   *storage.Repositories
@@ -405,6 +411,7 @@ type checkpointIssue struct {
 	CurrentUserLogin   string   `json:"currentUserLogin,omitempty"`
 	SpecPath           string   `json:"specPath,omitempty"`
 	RequestedReviewers []string `json:"requestedReviewers,omitempty"`
+	Clarifications     []string `json:"clarifications,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -637,6 +644,9 @@ func (r *Runner) materializeIssue(ctx context.Context, project storage.ProjectRe
 		"labels":                 issue.Labels,
 		"currentUserLogin":       currentUserLogin,
 		plannerQueuePayloadFPKey: fingerprint,
+	}
+	if len(issue.Clarifications) > 0 {
+		payload["clarifications"] = issue.Clarifications
 	}
 	if authority != "" {
 		payload[plannerQueueRoutingAuthorityKey] = authority
@@ -949,7 +959,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	}
 	if !manual && !reportAuthorized && !config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		checkpoint := input.Checkpoint
-		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
+		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin), Clarifications: toStrings(payload["clarifications"])}
 		checkpoint.ClaimedLockKey = lockKey
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer matches planner labels", repo, issueNumber)
@@ -958,7 +968,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	}
 	if !manual && !reportAuthorized && policy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
 		checkpoint := input.Checkpoint
-		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
+		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin), Clarifications: toStrings(payload["clarifications"])}
 		checkpoint.ClaimedLockKey = lockKey
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d is no longer assigned to %s", repo, issueNumber, currentLogin)
@@ -972,7 +982,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		detail.Assignees = appendUniqueStrings(detail.Assignees, currentLogin)
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
+	checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin), Clarifications: toStrings(payload["clarifications"])}
 	checkpoint.ClaimedLockKey = lockKey
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	checkpoint.SkipReason = ""
@@ -2058,6 +2068,15 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 	}
 	if strings.TrimSpace(issue.URL) != "" {
 		parts = append(parts, "Issue URL: "+issue.URL)
+	}
+	if len(issue.Clarifications) > 0 {
+		// These are the reporter's answers to Triager's questions. They post-date the
+		// Issue body and supersede it wherever the two disagree.
+		clarifications := []string{"Clarifications from the reporter (these answer questions Looper asked, and supersede the issue body where they conflict):"}
+		for _, clarification := range issue.Clarifications {
+			clarifications = append(clarifications, "- "+strings.TrimSpace(clarification))
+		}
+		parts = append(parts, strings.Join(clarifications, "\n"))
 	}
 	if agentsBlock := readAgentsBlock(project.RepoPath); agentsBlock != "" {
 		parts = append(parts, agentsBlock)

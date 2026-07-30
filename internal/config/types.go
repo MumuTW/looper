@@ -143,6 +143,9 @@ const (
 type ReviewerAutoMergeScope string
 
 const (
+	// ReviewerAutoMergeScopeLooperOnly is the Auto-merge scope: the
+	// Looper-only constraint identifying which PRs Looper may opt into
+	// auto-merge — the looper: label AND a tracked-Issue link, both required.
 	ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
 )
 
@@ -206,6 +209,10 @@ var removedProviderKinds = map[ProviderKind]string{
 	"forgejo": "Forgejo support was removed; looper is a GitHub-only product",
 }
 
+// ProviderConfig is the Provider: a configured forge integration owning
+// remote Issues, Pull Requests, labels, comments, reviews, webhooks, and
+// identity for a Project. Git remains separate and owns local repositories,
+// refs, and worktrees.
 type ProviderConfig struct {
 	ID      string       `json:"id"`
 	Kind    ProviderKind `json:"kind"`

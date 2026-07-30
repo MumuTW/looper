@@ -1930,7 +1930,12 @@ func (g *Gateway) CompareCommits(ctx context.Context, input CompareCommitsInput)
 	if input.Repo == "" || input.Base == "" || input.Head == "" {
 		return CompareCommitsResult{}, fmt.Errorf("compare commits requires repo, base, and head")
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/compare/%s...%s", input.Repo, input.Base, input.Head))
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/compare/%s...%s", repo, input.Base, input.Head)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return CompareCommitsResult{}, err
 	}
@@ -2021,7 +2026,8 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 		"comments":         processing.Comments,
 	}
 	if len(input.Comments) > 0 || strings.TrimSpace(input.CommitID) != "" {
-		endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber)
+		hostname, repo := splitRepoHostname(input.Repo)
+		endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, input.PRNumber)
 		payload := map[string]any{
 			"event":     input.Event,
 			"body":      emptyToNil(input.Body),
@@ -2057,7 +2063,11 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 		request["method"] = "POST"
 		request["endpoint"] = endpoint
 		g.emitReviewSubmitDiagnostic("github_review_submit_prepared", map[string]any{"request": request})
-		result, err := g.runGh(ctx, input.CWD, string(body), "api", endpoint, "--method", "POST", "--input", "-", "--include")
+		args := []string{"api", endpoint, "--method", "POST", "--input", "-", "--include"}
+		if hostname != "" {
+			args = append(args, "--hostname", hostname)
+		}
+		result, err := g.runGh(ctx, input.CWD, string(body), args...)
 		if err != nil {
 			fields := map[string]any{"request": request, "gh_stdout": reviewSubmitRawStdout(result.Stdout), "gh_stderr": result.Stderr, "gh_error": sanitizeReviewSubmitCommandError(err.Error())}
 			if response, ok := parseReviewSubmitHTTPResponse(result.Stdout); ok {
@@ -2112,7 +2122,8 @@ func validateReviewOutboundContent(body string, comments []ReviewComment) error 
 }
 
 func (g *Gateway) reviewSubmitRequest(input SubmitReviewInput) map[string]any {
-	endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber)
+	_, repo := splitRepoHostname(input.Repo)
+	endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, input.PRNumber)
 	request := map[string]any{
 		"repo":      input.Repo,
 		"pr_number": input.PRNumber,
@@ -2399,7 +2410,12 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 	if strings.TrimSpace(input.Marker) == "" {
 		return ReviewMarkerResult{}, nil
 	}
-	reviewsResult, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber))
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, input.PRNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	reviewsResult, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return ReviewMarkerResult{}, err
 	}
@@ -2415,7 +2431,12 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 }
 
 func (g *Gateway) fetchReviewCommentBodies(ctx context.Context, repo string, prNumber int64, reviewID string, cwd string) ([]string, error) {
-	result, err := g.runGh(ctx, cwd, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews/%s/comments", repo, prNumber, reviewID))
+	hostname, repoSlug := splitRepoHostname(repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews/%s/comments", repoSlug, prNumber, reviewID)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2640,7 +2661,12 @@ func reviewEventFromState(state string) string {
 }
 
 func (g *Gateway) AddPullRequestReaction(ctx context.Context, input PullRequestReactionInput) error {
-	_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.PRNumber), "--method", "POST", "-H", "Accept: application/vnd.github+json", "-f", "content="+input.Content)
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/reactions", repo, input.PRNumber), "--method", "POST", "-H", "Accept: application/vnd.github+json", "-f", "content=" + input.Content}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
 }
 
@@ -2652,7 +2678,12 @@ func (g *Gateway) RemovePullRequestReaction(ctx context.Context, input PullReque
 	if currentLogin == "" {
 		return nil
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.PRNumber), "-H", "Accept: application/vnd.github+json")
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/reactions", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return err
 	}
@@ -2668,7 +2699,11 @@ func (g *Gateway) RemovePullRequestReaction(ctx context.Context, input PullReque
 		if reaction.Content != input.Content || !strings.EqualFold(reaction.UserLogin, currentLogin) {
 			continue
 		}
-		if _, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/reactions/%d", input.Repo, input.PRNumber, reaction.ID), "--method", "DELETE", "-H", "Accept: application/vnd.github+json"); err != nil {
+		deleteArgs := []string{"api", fmt.Sprintf("repos/%s/issues/%d/reactions/%d", repo, input.PRNumber, reaction.ID), "--method", "DELETE", "-H", "Accept: application/vnd.github+json"}
+		if hostname != "" {
+			deleteArgs = append(deleteArgs, "--hostname", hostname)
+		}
+		if _, err := g.runGh(ctx, input.CWD, "", deleteArgs...); err != nil {
 			return err
 		}
 	}
@@ -2682,9 +2717,13 @@ func (g *Gateway) AddPullRequestLabels(ctx context.Context, input PullRequestLab
 	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
 		return err
 	}
-	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", input.Repo, input.PRNumber), "--method", "POST"}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", repo, input.PRNumber), "--method", "POST"}
 	for _, label := range input.Labels {
 		args = append(args, "-f", "labels[]="+label)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
@@ -2694,8 +2733,13 @@ func (g *Gateway) RemovePullRequestLabels(ctx context.Context, input PullRequest
 	if len(input.Labels) == 0 {
 		return nil
 	}
+	hostname, repo := splitRepoHostname(input.Repo)
 	for _, label := range input.Labels {
-		_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", input.Repo, input.PRNumber, encodeURIComponent(label)), "--method", "DELETE")
+		args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", repo, input.PRNumber, encodeURIComponent(label)), "--method", "DELETE"}
+		if hostname != "" {
+			args = append(args, "--hostname", hostname)
+		}
+		_, err := g.runGh(ctx, input.CWD, "", args...)
 		if err == nil {
 			continue
 		}
@@ -2711,9 +2755,13 @@ func (g *Gateway) AddPullRequestReviewers(ctx context.Context, input PullRequest
 	if len(input.Reviewers) == 0 {
 		return nil
 	}
-	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/requested_reviewers", input.Repo, input.PRNumber), "--method", "POST"}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/requested_reviewers", repo, input.PRNumber), "--method", "POST"}
 	for _, reviewer := range input.Reviewers {
 		args = append(args, "-f", "reviewers[]="+reviewer)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
@@ -3662,7 +3710,12 @@ func validateCloseIssueStateReason(value string) (string, error) {
 }
 
 func (g *Gateway) viewIssueState(ctx context.Context, repo string, issueNumber int64, cwd string) (string, error) {
-	result, err := g.runGh(ctx, cwd, "", "api", fmt.Sprintf("repos/%s/issues/%d", repo, issueNumber), "--jq", ".state")
+	hostname, repoSlug := splitRepoHostname(repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d", repoSlug, issueNumber), "--jq", ".state"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
 	if err != nil {
 		return "", err
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -477,7 +478,7 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
-		if !strings.EqualFold(repo, routed.repo) {
+		if !strings.EqualFold(webhookRouteRepo(project.ID, repo, view), routed.repo) {
 			continue
 		}
 		rolePolicy := view.RolePolicy(project.ID)
@@ -540,6 +541,25 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 		f.cond.Signal()
 	}
 	return matched, nil
+}
+
+// webhookRouteRepo derives the same provider-qualified key selected by an
+// authenticated tunnel URL. The configured project provider is authoritative;
+// the delivery payload never chooses its host.
+func webhookRouteRepo(projectID, repo string, view projectcatalog.OperationView) string {
+	project, found := view.Project(projectID)
+	if !found || !strings.EqualFold(strings.TrimSpace(project.Identity.Repo), strings.TrimSpace(repo)) {
+		return repo
+	}
+	baseURL, err := url.Parse(project.Identity.BaseURL)
+	if err != nil {
+		return repo
+	}
+	host := strings.TrimSpace(baseURL.Hostname())
+	if host == "" || strings.EqualFold(host, "github.com") || strings.EqualFold(host, "www.github.com") || strings.EqualFold(host, "api.github.com") {
+		return repo
+	}
+	return host + "/" + repo
 }
 
 func (f *forwarder) worker() {

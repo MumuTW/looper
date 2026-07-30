@@ -7837,7 +7837,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Group related findings by file, subsystem, function, or rule",
 		"fixture-matrix tests",
 		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT`",
-		"wrapper validates inline anchors against the live PR diff before it calls GitHub",
+		"capability validates inline anchors against the live PR diff before it calls GitHub",
 		"Review pass contract",
 		"Do not stop after the first issue",
 		"include it in this review rather than deferring it to a later pass",
@@ -7871,13 +7871,13 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"resubmit in the same session",
 		"ANSI escape sequences",
 		"file-read traces",
-		"submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment",
+		"submit exactly one APPROVE review through the trusted Looper review-submit capability with `outcome=clean`, no inline `comments`, and no extra PR conversation comment",
 		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT`",
 		"never use an LGTM, empty, or disclosure-only clean body as a fallback",
 		"visible body must start with `@<PR-author-login>`",
 		"briefly summarize what changed or what you verified",
 		"warm, friendly, encouraging acknowledgement of the author's work",
-		"wrapper rejects clean APPROVE reviews that do not start with an @mention",
+		"capability rejects clean APPROVE reviews that do not start with an @mention",
 		"<!-- looper:stamp v=1 -->",
 		`<sub>🔁 Powered by <a href="https://github.com/mumutw/looper">Looper</a> · runner=reviewer · agent=opencode · An autonomous AI dev team for your GitHub repos.</sub>`,
 		"Every inline review comment you post must also use looper's configured visible inline disclosure style",
@@ -7954,7 +7954,7 @@ func TestBuildReviewPromptKeepsCommentCleanPolicyWithoutApproveInstruction(t *te
 		t.Fatalf("prompt missing reaction-only clean instruction:\n%s", prompt)
 	}
 	for _, forbidden := range []string{
-		"submit exactly one APPROVE review through the trusted Looper CLI wrapper",
+		"submit exactly one APPROVE review through the trusted Looper review-submit capability",
 		"review submit acme/looper#42 --event APPROVE",
 	} {
 		if strings.Contains(prompt, forbidden) {
@@ -7979,7 +7979,7 @@ func TestBuildReviewPromptRequiresHumanCleanApproveBodyMentioningAuthor(t *testi
 	}
 }
 
-func TestBuildReviewPromptOmitsSubmitPathInstructionWhenTrustedWrapperUnavailable(t *testing.T) {
+func TestBuildReviewPromptOmitsSubmitPathInstructionWhenTrustedCapabilityUnavailable(t *testing.T) {
 	t.Parallel()
 
 	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "")
@@ -7987,22 +7987,22 @@ func TestBuildReviewPromptOmitsSubmitPathInstructionWhenTrustedWrapperUnavailabl
 	// Asserted against the constant, not a literal: the daemon reports the same
 	// condition with the same text, so the prompt drifting away from it would
 	// split one searchable phrase into two.
-	if !strings.Contains(prompt, TrustedWrapperUnavailableMessage) {
-		t.Fatalf("prompt missing trusted wrapper unavailable failure instruction:\n%s", prompt)
+	if !strings.Contains(prompt, TrustedReviewCapabilityUnavailableMessage) {
+		t.Fatalf("prompt missing trusted review-submit capability unavailable failure instruction:\n%s", prompt)
 	}
 	for _, want := range []string{
 		"do not publish any GitHub review",
 		"do not add or remove any GitHub reaction",
 	} {
 		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt missing wrapper-unavailable failure guard %q:\n%s", want, prompt)
+			t.Fatalf("prompt missing capability-unavailable failure guard %q:\n%s", want, prompt)
 		}
 	}
 	for _, forbidden := range []string{
 		"When submitting through",
 		"'' review submit",
 		" review submit acme/looper#42",
-		"You must publish the GitHub review yourself by calling looper's enforced review-submit wrapper",
+		"You must publish the GitHub review yourself by calling looper's enforced review-submit capability",
 		"finish successfully with the `No actionable findings` summary only",
 		"finish successfully with a summary beginning `No actionable findings`",
 	} {

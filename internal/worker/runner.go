@@ -549,7 +549,8 @@ type DiscoveryPolicy struct {
 }
 
 // Runner is the Worker: a reactive Role that implements a Spec or an Issue,
-// producing a Pull Request.
+// producing a Pull Request. Stateful: it persists runs in the local SQLite
+// database.
 type Runner struct {
 	db                      *sql.DB
 	repos                   *storage.Repositories
