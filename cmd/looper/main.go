@@ -903,7 +903,23 @@ type daemonStatusResponse struct {
 type statusServiceView struct {
 	DegradedReasons []string           `json:"degradedReasons"`
 	Recovery        statusRecoveryView `json:"recovery"`
+	Triage          statusTriageView   `json:"triage"`
 	Binary          statusBinaryView   `json:"binary"`
+}
+
+type statusTriageView struct {
+	AwaitingConfirmation statusAwaitingConfirmationView `json:"awaitingConfirmation"`
+}
+
+type statusAwaitingConfirmationView struct {
+	Count   int                                    `json:"count"`
+	Sources []statusAwaitingConfirmationSourceView `json:"sources"`
+}
+
+type statusAwaitingConfirmationSourceView struct {
+	Repo        string `json:"repo"`
+	IssueNumber int64  `json:"issueNumber"`
+	AgeSeconds  int64  `json:"ageSeconds"`
 }
 
 type statusBinaryView struct {
@@ -1005,9 +1021,34 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 			_, _ = fmt.Fprintf(stdout, "  - %s\n", quarantinedLoopLine(loop))
 		}
 	}
+	awaiting := status.Service.Triage.AwaitingConfirmation
+	if awaiting.Count > 0 {
+		_, _ = fmt.Fprintf(stdout, "triage:  awaitingHumanConfirmation=%d\n", awaiting.Count)
+		for _, source := range awaiting.Sources {
+			_, _ = fmt.Fprintf(stdout, "  - %s#%d  waiting %s\n", source.Repo, source.IssueNumber, statusAge(source.AgeSeconds))
+		}
+	}
 	if len(status.Service.DegradedReasons) > 0 {
 		_, _ = fmt.Fprintf(stdout, "degraded: %s\n", strings.Join(status.Service.DegradedReasons, ", "))
 	}
+}
+
+func statusAge(seconds int64) string {
+	if seconds < 0 {
+		seconds = 0
+	}
+	if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	minutes := seconds / 60
+	if minutes < 60 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	hours := minutes / 60
+	if hours < 48 {
+		return fmt.Sprintf("%dh", hours)
+	}
+	return fmt.Sprintf("%dd", hours/24)
 }
 
 // quarantinedLoopLine renders one outstanding quarantined loop and the single

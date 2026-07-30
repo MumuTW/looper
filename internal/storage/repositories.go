@@ -466,6 +466,28 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	return scanEventLogs(rows)
 }
 
+// ListByEntityTypeAndEventTypes reads the complete lifecycle for one entity
+// family without imposing an arbitrary status-page limit. Callers derive live
+// projections from the returned durable events; this query does not record a
+// second materialized status.
+func (r *EventsRepository) ListByEntityTypeAndEventTypes(ctx context.Context, entityType string, eventTypes []string) ([]EventLogRecord, error) {
+	if len(eventTypes) == 0 {
+		return []EventLogRecord{}, nil
+	}
+	args := make([]any, 0, len(eventTypes)+1)
+	args = append(args, entityType)
+	for _, eventType := range eventTypes {
+		args = append(args, eventType)
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE entity_type = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, id ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by entity type and event types: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 // ListFirstEventTimestampsByType returns, for each supplied entity ID that has
 // an event of eventType, the created_at of its earliest such event. Callers
 // need both the durable evidence and when it was first written, so one pass

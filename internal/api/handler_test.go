@@ -29,6 +29,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/triager"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
@@ -1086,6 +1087,61 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	}
 	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(0))
 	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
+}
+
+func TestHandlerStatusProjectsAwaitingTriageConfirmationWithoutWritingState(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	services := rt.Services()
+	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	createdAt := now.Add(-90 * time.Minute).Format(time.RFC3339Nano)
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	payload, err := json.Marshal(triager.Report{
+		Version: 2, IdempotencyKey: "triage-awaiting-status", ProjectID: "project_1", Repo: "acme/looper", IssueNumber: 42,
+		Policy: triager.PolicyDecision{Action: triager.ActionAwaitHuman}, CreatedAt: createdAt,
+	})
+	if err != nil {
+		t.Fatalf("marshal triage report: %v", err)
+	}
+	projectID, entityType, entityID := "project_1", "github_issue", "project_1:acme/looper:42"
+	if err := services.Repositories.Events.Append(context.Background(), storage.EventLogRecord{
+		ID: "triage-awaiting-status-event", EventType: triager.ReportEventType, ProjectID: &projectID,
+		EntityType: &entityType, EntityID: &entityID, PayloadJSON: string(payload), CreatedAt: createdAt,
+	}); err != nil {
+		t.Fatalf("append triage report: %v", err)
+	}
+	before, err := services.Repositories.Events.List(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("list events before status: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg), Now: func() time.Time { return now }}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	after, err := services.Repositories.Events.List(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("list events after status: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("GET /status wrote event state: before=%d after=%d", len(before), len(after))
+	}
+
+	service := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)["service"].(map[string]any)
+	awaiting := service["triage"].(map[string]any)["awaitingConfirmation"].(map[string]any)
+	assertEqual(t, awaiting["count"], float64(1))
+	sources, ok := awaiting["sources"].([]any)
+	if !ok || len(sources) != 1 {
+		t.Fatalf("awaiting.sources = %#v, want one source", awaiting["sources"])
+	}
+	source := sources[0].(map[string]any)
+	assertEqual(t, source["repo"], "acme/looper")
+	assertEqual(t, source["issueNumber"], float64(42))
+	assertEqual(t, source["createdAt"], createdAt)
+	assertEqual(t, source["ageSeconds"], float64(90*60))
 }
 
 func TestHandlerStatusSurfacesUnknownReviewPublishWithoutProbing(t *testing.T) {
