@@ -1525,18 +1525,20 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if err := coordinator.Close(); err != nil {
 		t.Fatalf("coordinator.Close() error = %v", err)
 	}
-	workDir := t.TempDir()
-	pidPath := filepath.Join(workDir, "agent.pid")
+	// Assert reaping through the containment handle bound during Start, not
+	// through a pid marker the child writes. A marker-based check cannot tell
+	// "reaped before it published its pid" from "containment never confirmed
+	// death" — Start joins that reap failure with ErrExecutionPersistence, so
+	// the earlier assertions still pass and the missing marker would be read as
+	// success. That is precisely the leak this test exists to catch.
+	owner := &trackingOwner{}
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
-		// Publish the pid with a rename so the reader never observes a created
-		// but not-yet-written file; a plain redirect makes the empty window
-		// visible and the pid unparseable.
-		"command": "/bin/sh", "args": []any{"-c", `echo $$ > "$PID_FILE.tmp"; mv "$PID_FILE.tmp" "$PID_FILE"; trap '' TERM; while true; do sleep 1; done`},
-	}}, Repos: repos, ParamsOwnerVendor: customOwner()})
+		"command": "/bin/sh", "args": []any{"-c", `trap '' TERM; while true; do sleep 1; done`},
+	}}, Repos: repos, ParamsOwnerVendor: customOwner(), Owner: owner})
 
 	handle, err := executor.Start(context.Background(), RunInput{
-		ExecutionID: "agent_initial_persist_failure", WorkingDirectory: workDir, Prompt: "ignored",
-		Timeout: time.Second, Env: map[string]string{"PID_FILE": pidPath},
+		ExecutionID: "agent_initial_persist_failure", WorkingDirectory: t.TempDir(), Prompt: "ignored",
+		Timeout: time.Second,
 	})
 	if err == nil {
 		t.Fatal("Start() error = nil, want initial persistence failure")
@@ -1547,30 +1549,12 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if handle != nil {
 		t.Fatalf("Start() handle = %#v, want nil", handle)
 	}
-	// Wait for the pid rather than reading once: a single read that lands
-	// before the child recorded its pid used to skip the reap assertion
-	// entirely, so the test passed without checking anything.
-	pid := 0
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
-		if data, readErr := os.ReadFile(pidPath); readErr == nil {
-			if parsed, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil {
-				pid = parsed
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
+	if owner.lease == nil || owner.lease.handle == nil {
+		t.Fatal("owner did not receive a containment handle; cannot verify the child was reaped")
 	}
-	if pid == 0 {
-		// Reaped before it could record a pid; there is no process to leak.
-		return
+	if !owner.lease.handle.ConfirmedDead() {
+		t.Fatalf("containment handle for pid %d is not ConfirmedDead after failed Start", owner.lease.handle.PID())
 	}
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
-		if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("spawned process %d survived failed Start", pid)
 }
 
 func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {
