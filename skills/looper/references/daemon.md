@@ -42,7 +42,7 @@ curl -sS "http://127.0.0.1:17310/api/v1/version"
 
 `GET /api/v1/status` (and the ops lines on `looper status`) is the **readiness / ops** surface: admission state, `tools.looperPath` + review-publish capability, and live `service.recovery.outstanding` quarantine/orphan debt beyond the one-shot startup recovery snapshot.
 
-Dashboard: `http://127.0.0.1:<port>/dashboard/` (mint bootstrap codes via `POST /api/v1/dashboard/bootstrap/code` when `server.authMode=local-token`).
+Dashboard: run `looper dashboard` and open the URL it prints. When `server.authMode=local-token`, the command authenticates with the selected config token or `LOOPER_TOKEN` and prints a short-lived one-shot login URL; it never puts the long-lived token in the URL.
 
 ## Runtime layout
 

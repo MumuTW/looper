@@ -125,8 +125,10 @@ In another shell, confirm the daemon answers:
 ```bash
 curl -sS "http://127.0.0.1:17310/api/v1/healthz"   # liveness (storage up)
 curl -sS "http://127.0.0.1:17310/api/v1/status"    # ops readiness (admission, review publish, quarantine debt)
-# or open the dashboard URL printed in the looperd logs / your browser on that host:port
+looper dashboard                                      # open the URL it prints
 ```
+
+With `server.authMode=local-token`, give the command the matching selected config or export `LOOPER_TOKEN`; it prints a short-lived one-shot URL and never places the long-lived token in the URL.
 
 `healthz` only means the process and storage are up. Use `/status` (or `looper status`) when you care whether reviewer publishing is enabled and whether quarantined orphan runs are still outstanding.
 

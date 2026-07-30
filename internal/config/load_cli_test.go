@@ -36,6 +36,31 @@ func TestParseCLIArgsDispatchesInterleavedFlagFamilies(t *testing.T) {
 	}
 }
 
+func TestParseCLIArgsAcceptsDeprecatedAutoUpgradeFlagsAsNoOps(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "legacy bare", args: []string{"--no-auto-upgrade"}},
+		{name: "legacy inline", args: []string{"--no-auto-upgrade=false"}},
+		{name: "legacy separate", args: []string{"--no-auto-upgrade", "true"}},
+		{name: "canonical inline", args: []string{"--package-auto-upgrade-enabled=true"}},
+		{name: "canonical separate", args: []string{"--package-auto-upgrade-enabled", "false"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, err := parseCLIArgs(test.args)
+			if err != nil {
+				t.Fatalf("parseCLIArgs() error = %v", err)
+			}
+			if parsed.overrides.Package != nil {
+				t.Fatalf("deprecated flag populated package override = %#v, want no-op", parsed.overrides.Package)
+			}
+		})
+	}
+}
+
 func TestParseCLIArgsCompatibilityPrecedenceAcrossInterleavedFamilies(t *testing.T) {
 	canonical := []string{
 		"--roles-reviewer-behavior-review-events-clean=COMMENT",

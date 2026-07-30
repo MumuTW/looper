@@ -140,6 +140,9 @@ afterEach(() => {
 describe("ConfigPage", { timeout: 30_000 }, () => {
   it("renders the /config route and its navigation item", async () => {
     window.history.replaceState({}, "", "/dashboard/config");
+    // Authentication bootstrap has its own App contract tests. Keep this
+    // route test focused on an already authenticated dashboard session.
+    sessionStorage.setItem("looper.dashboard.token", "test-session-token");
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
       if (path === "/api/v1/healthz") return response({ healthy: true });

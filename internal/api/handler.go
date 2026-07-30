@@ -1182,7 +1182,7 @@ type configResponse struct {
 	Disclosure    config.DisclosureConfig   `json:"disclosure"`
 	Tools         config.ToolPathsConfig    `json:"tools"`
 	Daemon        configDaemonResponse      `json:"daemon"`
-	Package       config.PackageConfig      `json:"package"`
+	Package       configPackageResponse     `json:"package"`
 	Defaults      config.DefaultsConfig     `json:"defaults"`
 	Instructions  config.InstructionsConfig `json:"instructions"`
 	HITL          config.HITLConfig         `json:"hitl"`
@@ -1230,6 +1230,15 @@ type configDaemonResponse struct {
 	WorktreeCleanup        config.WorktreeCleanupConfig `json:"worktreeCleanup"`
 }
 
+type configPackageResponse struct {
+	Distribution string `json:"distribution"`
+	// AutoUpgradeEnabled preserves the frozen response shape; runtime no longer
+	// reads or acts on this value.
+	AutoUpgradeEnabled         bool `json:"autoUpgradeEnabled"`
+	AutoMigrateOnStartup       bool `json:"autoMigrateOnStartup"`
+	RequireBackupBeforeMigrate bool `json:"requireBackupBeforeMigrate"`
+}
+
 func (h *Handler) buildConfigResponse() configResponse {
 	cfg := h.context.Config
 
@@ -1268,7 +1277,12 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Environment:            map[string]string{},
 			WorktreeCleanup:        cfg.Daemon.WorktreeCleanup,
 		},
-		Package:      cfg.Package,
+		Package: configPackageResponse{
+			Distribution:               cfg.Package.Distribution,
+			AutoUpgradeEnabled:         true,
+			AutoMigrateOnStartup:       cfg.Package.AutoMigrateOnStartup,
+			RequireBackupBeforeMigrate: cfg.Package.RequireBackupBeforeMigrate,
+		},
 		Defaults:     cfg.Defaults,
 		Instructions: cfg.Instructions,
 		HITL:         cfg.HITL,

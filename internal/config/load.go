@@ -598,7 +598,6 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 func parseCLIArgsWithOptions(args []string, rejectPositionals bool) (parsedCLIArgs, error) {
 	parsed := parsedCLIArgs{}
 	canonicalInstructionsEnabledOverrideSet := false
-	canonicalPackageAutoUpgradeOverrideSet := false
 	canonicalFlags := cliCanonicalFlagState{}
 
 	takeValue := func(index int, flag string) (string, int, error) {
@@ -633,7 +632,6 @@ func parseCLIArgsWithOptions(args []string, rejectPositionals bool) (parsedCLIAr
 			index,
 			&parsed,
 			&canonicalInstructionsEnabledOverrideSet,
-			&canonicalPackageAutoUpgradeOverrideSet,
 			takeValue,
 		)
 		if err != nil {
@@ -879,7 +877,6 @@ func parseOperationalCLIArg(
 	index int,
 	parsed *parsedCLIArgs,
 	canonicalInstructionsEnabledOverrideSet *bool,
-	canonicalPackageAutoUpgradeOverrideSet *bool,
 	takeValue cliValueTaker,
 ) (bool, int, error) {
 	arg := args[index]
@@ -925,22 +922,15 @@ func parseOperationalCLIArg(
 		*canonicalInstructionsEnabledOverrideSet = true
 		return true, nextIndex, nil
 	case matchesFlag(arg, "--no-auto-upgrade"):
-		disable := true
 		nextIndex := index
 		if _, value, ok := strings.Cut(arg, "="); ok {
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
+			if _, err := parseBoolean(value); err != nil {
 				return true, index, fmt.Errorf("invalid value for --no-auto-upgrade: %q is not a boolean", value)
 			}
-			disable = *parsedValue
 		} else if index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
-			if parsedValue, err := parseBoolean(args[index+1]); err == nil {
-				disable = *parsedValue
+			if _, err := parseBoolean(args[index+1]); err == nil {
 				nextIndex++
 			}
-		}
-		if !*canonicalPackageAutoUpgradeOverrideSet {
-			ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = boolPtr(!disable)
 		}
 		return true, nextIndex, nil
 	case matchesFlag(arg, "--package-auto-upgrade-enabled"):
@@ -948,12 +938,9 @@ func parseOperationalCLIArg(
 		if err != nil {
 			return true, index, err
 		}
-		parsedValue, err := parseBoolean(value)
-		if err != nil {
+		if _, err := parseBoolean(value); err != nil {
 			return true, index, fmt.Errorf("invalid value for --package-auto-upgrade-enabled: %q is not a boolean", value)
 		}
-		ensurePackageConfig(&parsed.overrides).AutoUpgradeEnabled = parsedValue
-		*canonicalPackageAutoUpgradeOverrideSet = true
 		return true, nextIndex, nil
 	case matchesFlag(arg, "--host"):
 		value, nextIndex, err := takeValue(index, "--host")
@@ -1242,6 +1229,9 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		}
 		ensureServerConfig(&overrides).Port = parsed
 	}
+	if value, ok := lookupEnv("LOOPER_TOKEN"); ok {
+		ensureServerConfig(&overrides).LocalToken = stringPtr(strings.TrimSpace(value))
+	}
 	if value, ok := lookupEnv("LOOPER_DB_PATH"); ok {
 		ensureStorageConfig(&overrides).DBPath = stringPtr(value)
 	}
@@ -1279,13 +1269,6 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_OSASCRIPT_ENABLED: %q is not a boolean", value)
 		}
 		ensureOsascriptNotificationConfig(&overrides).Enabled = parsed
-	}
-	if value, ok := lookupEnv("LOOPER_AUTO_UPGRADE_ENABLED"); ok {
-		parsed, err := parseBoolean(value)
-		if err != nil {
-			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_AUTO_UPGRADE_ENABLED: %q is not a boolean", value)
-		}
-		ensurePackageConfig(&overrides).AutoUpgradeEnabled = parsed
 	}
 	if err := applyAgentTimeoutEnvOverrides(&overrides, lookupEnv); err != nil {
 		return PartialConfig{}, err
