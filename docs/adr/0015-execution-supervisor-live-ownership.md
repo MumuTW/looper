@@ -319,6 +319,30 @@ consume the active row before all repair is durable, and never infer that repair
 is allowed from PID evidence or lease expiry alone.
 Mutations stay closed until classification finishes (#575/#580).
 
+**What "until an operator resolves them" means (#149 / #150):**
+
+The escape hatch above was named but never mechanised, so quarantine was a state
+with a by-design entrance and no exit: `retry` / `stop` / `close` requeue or
+terminate the loop without touching `agent_executions`, leaving the row active
+forever and the daemon permanently `degraded`. That is closed by
+`runtime.settleDisposedQuarantine`, whose Authority is the operator's existing
+verb — a durable loop disposition already recorded in SQLite — and never a PID
+probe:
+
+- a loop still at `paused` / `human_takeover` keeps counting as debt no matter
+  what its PID does, because nothing has been decided about it;
+- a loop the operator retried, stopped, or closed has its quarantine evidence
+  retired, and its execution moves to `quarantine_settled` — deliberately *not*
+  one of the `durableTerminalExecution` statuses, so settling never reads as
+  confirmed-dead Authority for any later classification;
+- an execution whose process still matches is retained as debt even after
+  disposition, so a live agent can never be accounted away;
+- settlement writes a `looperd.recovery.execution_quarantine_retired` event
+  beside the original quarantine event, and kills nothing.
+
+This adds no new operator command and no new inference layer; it makes the verbs
+that already exist finish the job the ADR assumed they would.
+
 **Startup recovery concept trade-off (R8):**
 
 | | |

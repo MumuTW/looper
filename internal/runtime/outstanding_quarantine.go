@@ -74,6 +74,16 @@ func CountOutstandingQuarantineDebt(ctx context.Context, repositories *storage.R
 	if len(quarantinedAtByExecutionID) == 0 {
 		return debt, nil
 	}
+	// Evidence is not a condition. Once an operator has disposed of the loop
+	// through an existing verb, the quarantine is history and the settlement
+	// pass is about to retire the row; counting it until then would report a
+	// resolved incident as live debt (#150). The loops load in the one bulk
+	// query the roster already needed, so the query shape is unchanged.
+	loopsByID, err := quarantinedLoopsByID(ctx, repositories, activeExecutions, quarantinedAtByExecutionID)
+	if err != nil {
+		return OutstandingQuarantineDebt{}, err
+	}
+
 	quarantinedRunIDs := make(map[string]struct{})
 	quarantinedAtByLoopID := make(map[string]string)
 	for _, execution := range activeExecutions {
@@ -81,23 +91,25 @@ func CountOutstandingQuarantineDebt(ctx context.Context, repositories *storage.R
 		if !quarantined {
 			continue
 		}
+		loopID := strings.TrimSpace(derefString(execution.LoopID))
+		// An execution with no loop row keeps counting: there is no disposition
+		// to read, so the safe reading is that the work is still outstanding.
+		if loop, known := loopsByID[loopID]; loopID != "" && known && !quarantineParkedLoopStatus(loop.Status) {
+			continue
+		}
 		debt.QuarantinedActiveExecutions++
 		if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
 			quarantinedRunIDs[strings.TrimSpace(*execution.RunID)] = struct{}{}
 		}
-		if execution.LoopID == nil || strings.TrimSpace(*execution.LoopID) == "" {
+		if loopID == "" {
 			continue
 		}
-		loopID := strings.TrimSpace(*execution.LoopID)
 		if existing, ok := quarantinedAtByLoopID[loopID]; !ok || (quarantinedAt != "" && quarantinedAt < existing) {
 			quarantinedAtByLoopID[loopID] = quarantinedAt
 		}
 	}
 
-	debt.Loops, err = outstandingQuarantinedLoops(ctx, repositories, quarantinedAtByLoopID)
-	if err != nil {
-		return OutstandingQuarantineDebt{}, err
-	}
+	debt.Loops = outstandingQuarantinedLoops(loopsByID, quarantinedAtByLoopID)
 
 	if repositories.Runs == nil || len(quarantinedRunIDs) == 0 {
 		return debt, nil
@@ -115,16 +127,49 @@ func CountOutstandingQuarantineDebt(ctx context.Context, repositories *storage.R
 	return debt, nil
 }
 
-func outstandingQuarantinedLoops(ctx context.Context, repositories *storage.Repositories, quarantinedAtByLoopID map[string]string) ([]OutstandingQuarantinedLoop, error) {
-	if repositories.Loops == nil || len(quarantinedAtByLoopID) == 0 {
-		return nil, nil
+// quarantinedLoopsByID bulk-loads the loops behind quarantined executions. It
+// is the single loop read for the whole count: both the parked/disposed
+// decision and the operator-facing roster are derived from this one map.
+//
+// An empty result means "nothing readable", not "nothing parked" — callers
+// treat an unknown loop as still outstanding.
+func quarantinedLoopsByID(ctx context.Context, repositories *storage.Repositories, activeExecutions []storage.AgentExecutionRecord, quarantinedAtByExecutionID map[string]string) (map[string]storage.LoopRecord, error) {
+	loopsByID := make(map[string]storage.LoopRecord)
+	if repositories.Loops == nil {
+		return loopsByID, nil
 	}
-	loops, err := repositories.Loops.ListByIDs(ctx, mapKeys(quarantinedAtByLoopID))
+	candidateLoopIDs := make(map[string]struct{})
+	for _, execution := range activeExecutions {
+		if _, quarantined := quarantinedAtByExecutionID[execution.ID]; !quarantined {
+			continue
+		}
+		if loopID := strings.TrimSpace(derefString(execution.LoopID)); loopID != "" {
+			candidateLoopIDs[loopID] = struct{}{}
+		}
+	}
+	if len(candidateLoopIDs) == 0 {
+		return loopsByID, nil
+	}
+	loops, err := repositories.Loops.ListByIDs(ctx, mapKeys(candidateLoopIDs))
 	if err != nil {
 		return nil, fmt.Errorf("list quarantined loops: %w", err)
 	}
-	roster := make([]OutstandingQuarantinedLoop, 0, len(loops))
 	for _, loop := range loops {
+		loopsByID[loop.ID] = loop
+	}
+	return loopsByID, nil
+}
+
+func outstandingQuarantinedLoops(loopsByID map[string]storage.LoopRecord, quarantinedAtByLoopID map[string]string) []OutstandingQuarantinedLoop {
+	if len(quarantinedAtByLoopID) == 0 {
+		return nil
+	}
+	roster := make([]OutstandingQuarantinedLoop, 0, len(quarantinedAtByLoopID))
+	for loopID := range quarantinedAtByLoopID {
+		loop, known := loopsByID[loopID]
+		if !known {
+			continue
+		}
 		roster = append(roster, OutstandingQuarantinedLoop{
 			LoopID:        loop.ID,
 			Seq:           loop.Seq,
@@ -135,7 +180,7 @@ func outstandingQuarantinedLoops(ctx context.Context, repositories *storage.Repo
 		})
 	}
 	sort.Slice(roster, func(i, j int) bool { return roster[i].Seq < roster[j].Seq })
-	return roster, nil
+	return roster
 }
 
 // loopForgeTarget renders a loop's target as "owner/repo#123" when the loop

@@ -78,6 +78,9 @@ type StaleRunReconcileSummary struct {
 	// QuarantinedLoopIDs names the loops parked by this pass, so a caller can
 	// report them without re-deriving the set from event_logs.
 	QuarantinedLoopIDs []string `json:"quarantinedLoopIds,omitempty"`
+	// QuarantineSettlement reports the evidence retired this pass because an
+	// operator already disposed of the loop behind it (#149 / #150).
+	QuarantineSettlement QuarantineSettlementSummary `json:"quarantineSettlement"`
 }
 
 type staleRunReconcileMode string
@@ -2343,6 +2346,16 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		return summary, nil
 	}
 	nowISO := summary.StartedAt
+	// Retire quarantine evidence the operator already resolved before scanning
+	// running runs: settling frees the one-running-run-per-loop index the
+	// replacement run would otherwise collide with.
+	settlement, err := r.settleDisposedQuarantine(ctx, repositories, nowISO)
+	if err != nil {
+		return StaleRunReconcileSummary{}, err
+	}
+	summary.QuarantineSettlement = settlement
+	summary.EventsWritten += settlement.EventsWritten
+
 	runningRuns, err := repositories.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
 	if err != nil {
 		return StaleRunReconcileSummary{}, err

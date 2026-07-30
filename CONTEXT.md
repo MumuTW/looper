@@ -191,6 +191,13 @@ carries the semantics: the durable Authority for Network Coordinator
 control-plane leadership, fencing-token validated at every GitHub side-effect
 boundary.
 
+**Quarantine settlement**:
+Defined at `runtime.settleDisposedQuarantine` in `internal/runtime`, whose doc
+comment carries the semantics: quarantine evidence stops describing an ongoing
+condition once an operator disposes of the loop behind it, on the Authority of
+that disposition rather than a PID probe.
+_Avoid_: quarantine cleanup, confirmed-dead, reconcile.
+
 ### Testing
 
 **Live sandbox**:
