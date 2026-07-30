@@ -43,3 +43,21 @@ $ ./replay_acp.py --cwd "$(mktemp -d)" --agent-type summarizer \
 # rejected: it did not make Hermes's memory tool reachable in the default
 # agent type, and it broke the coding path, because the default agent type
 # genuinely does have native tools it should be using.
+
+# ---------------------------------------------------------------------------
+# Follow-up: the capture above is bare JSON, not a <tool_call> block, so on its
+# own it shows only that Devin can put text on the message channel — not that
+# Hermes would accept it. Settled by feeding both forms through the shim's real
+# parser (agent/copilot_acp_client.py::_extract_tool_calls_from_text, Hermes
+# v2026.7.20), which needs no Devin account to reproduce:
+#
+#   captured bare JSON: 1 call(s) -> name='memory'
+#     args='{"action": "add", "content": "LOOPER-TEST-42"}' residual_text=''
+#   tagged form:        1 call(s) -> name='memory'
+#     args='{"action": "add", "content": "LOOPER-TEST-42"}' residual_text=''
+#
+# Both parse identically: the shim tries <tool_call> blocks first and falls
+# back to a bare-JSON regex when none are present. So the captured output would
+# have been accepted, and "the parsing path is fine, the model just never
+# chooses it" holds. Note this makes the prompt-contract route's failure even
+# starker — the format was never the obstacle.
