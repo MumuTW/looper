@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { useNavigate } from "react-router-dom";
+import { CopyButton } from "@/components/CopyButton";
 import { DataTable, type Column } from "@/components/DataTable";
 import { LoopActionBar } from "@/components/LoopActionBar";
 import { PanelError } from "@/components/PanelError";
@@ -521,12 +522,24 @@ export function OverviewPage({
               </dl>
               {(status?.service?.triage?.awaitingConfirmation?.sources ?? []).map(
                 (source) => (
-                  <p
-                    className="m-0 mt-1 mono text-[12px] text-[var(--text-muted)]"
+                  <div
+                    className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1"
                     key={`${source.projectId ?? ""}:${source.repo ?? ""}:${source.issueNumber ?? ""}`}
                   >
-                    {source.repo ?? "—"}#{source.issueNumber ?? "—"} · waiting {formatDurationSeconds(source.ageSeconds)}
-                  </p>
+                    <p className="m-0 mono text-[12px] text-[var(--text-muted)]">
+                      {source.repo ?? "—"}#{source.issueNumber ?? "—"} · waiting {formatDurationSeconds(source.ageSeconds)}
+                    </p>
+                    {/* The token lives only here and in `looper status`; a roster
+                        without it names a problem nobody can act on (#255). */}
+                    {source.command ? (
+                      <>
+                        <code className="rounded border border-[var(--border)] px-1 py-0.5 mono text-[11px]">
+                          {source.command}
+                        </code>
+                        <CopyButton text={source.command} label="Copy" />
+                      </>
+                    ) : null}
+                  </div>
                 ),
               )}
             </>

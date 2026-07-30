@@ -110,8 +110,8 @@ describe("triage confirmation status", () => {
               awaitingConfirmation: {
                 count: 2,
                 sources: [
-                  { repo: "acme/looper", issueNumber: 42, createdAt: "2026-07-30T10:30:00Z", ageSeconds: 5400 },
-                  { repo: "acme/looper", issueNumber: 43, createdAt: "2026-07-30T11:45:00Z", ageSeconds: 900 },
+                  { repo: "acme/looper", issueNumber: 42, createdAt: "2026-07-30T10:30:00Z", ageSeconds: 5400, command: "/plan triage-confirm-a1" },
+                  { repo: "acme/looper", issueNumber: 43, createdAt: "2026-07-30T11:45:00Z", ageSeconds: 900, command: "/plan triage-confirm-b2" },
                 ],
               },
             },
@@ -135,5 +135,9 @@ describe("triage confirmation status", () => {
     expect(screen.getByText(/acme\/looper#43/)).toBeTruthy();
     expect(screen.getByText(/waiting 1h/)).toBeTruthy();
     expect(screen.getByText(/waiting 15m/)).toBeTruthy();
+    // Without the token an operator can see the wait but cannot end it (#255).
+    expect(screen.getByText("/plan triage-confirm-a1")).toBeTruthy();
+    expect(screen.getByText("/plan triage-confirm-b2")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /copy/i })).toHaveLength(2);
   });
 });
