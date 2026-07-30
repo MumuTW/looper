@@ -126,6 +126,7 @@ type RunRecord struct {
 	CreatedAt         string
 	UpdatedAt         string
 	AgentSnapshotJSON *string // durable agent identity; set on create, immutable after insert
+	Seq               int64   // storage-owned monotonic insertion sequence; assigned on insert, immutable
 }
 
 type AgentExecutionRecord struct {
@@ -856,10 +857,11 @@ type LocksRepository struct {
 const agentExecutionColumns = `id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at`
 
 func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
-	// agent_snapshot_json is insert-only: ON CONFLICT must not overwrite an existing snapshot.
+	// agent_snapshot_json and seq are insert-only: ON CONFLICT must not overwrite
+	// an existing snapshot or reassign the storage-owned insertion sequence.
 	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at, agent_snapshot_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at, agent_snapshot_json, seq)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(existing.seq), 0) + 1 FROM runs AS existing))
 		ON CONFLICT(id) DO UPDATE SET
 			status=excluded.status,
 			current_step=excluded.current_step,
@@ -919,8 +921,15 @@ func (r *RunsRepository) ListByIDs(ctx context.Context, ids []string) ([]RunReco
 	return runs, nil
 }
 
+// latestRunOrder is the single ordering authority for latest-run selection:
+// timestamps first (millisecond precision), then the storage-owned monotonic
+// seq so same-millisecond retries resolve to the newest inserted attempt.
+func latestRunOrder(alias string) string {
+	return alias + ".started_at DESC, " + alias + ".created_at DESC, " + alias + ".seq DESC"
+}
+
 func (r *RunsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*RunRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE loop_id = ? ORDER BY started_at DESC, created_at DESC LIMIT 1`, loopID)
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE loop_id = ? ORDER BY `+latestRunOrder("runs")+` LIMIT 1`, loopID)
 	record, err := scanRun(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -936,33 +945,24 @@ func (r *RunsRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []stri
 	if len(loopIDs) == 0 {
 		return []RunRecord{}, nil
 	}
-	chunks := chunkStrings(loopIDs, sqliteMaxVariables/2)
+	chunks := chunkStrings(loopIDs, sqliteMaxVariables)
 	items := make([]RunRecord, 0, len(loopIDs))
 	for _, chunk := range chunks {
-		args := make([]any, 0, len(chunk)*2)
-		for _, loopID := range chunk {
-			args = append(args, loopID)
-		}
+		args := make([]any, 0, len(chunk))
 		for _, loopID := range chunk {
 			args = append(args, loopID)
 		}
 		rows, err := r.q.QueryContext(ctx, `
 			SELECT r.*
 			FROM runs r
-			JOIN (
-				SELECT loop_id, MAX(started_at) AS started_at
-				FROM runs
-				WHERE loop_id IN (`+sqlPlaceholders(len(chunk))+`)
-				GROUP BY loop_id
-			) latest ON latest.loop_id = r.loop_id AND latest.started_at = r.started_at
 			WHERE r.loop_id IN (`+sqlPlaceholders(len(chunk))+`)
 			AND r.id = (
-				SELECT id FROM runs latest_id
-				WHERE latest_id.loop_id = r.loop_id AND latest_id.started_at = r.started_at
-				ORDER BY latest_id.created_at DESC, latest_id.id DESC
+				SELECT latest.id FROM runs latest
+				WHERE latest.loop_id = r.loop_id
+				ORDER BY `+latestRunOrder("latest")+`
 				LIMIT 1
 			)
-			ORDER BY r.started_at DESC, r.created_at DESC, r.id DESC
+			ORDER BY `+latestRunOrder("r")+`
 		`, args...)
 		if err != nil {
 			return nil, fmt.Errorf("list latest runs by loop ids: %w", err)
@@ -984,7 +984,7 @@ func (r *RunsRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []stri
 		if items[i].CreatedAt != items[j].CreatedAt {
 			return items[i].CreatedAt > items[j].CreatedAt
 		}
-		return items[i].ID > items[j].ID
+		return items[i].Seq > items[j].Seq
 	})
 	return items, nil
 }
@@ -997,34 +997,21 @@ func (r *RunsRepository) ListLatestByLoopStatusesAndResumePolicy(ctx context.Con
 	for _, status := range statuses {
 		args = append(args, status)
 	}
-	for _, status := range statuses {
-		args = append(args, status)
-	}
 	args = append(args, resumePolicy)
 	rows, err := r.q.QueryContext(ctx, `
 		SELECT r.*
-		FROM loops l
-		JOIN (
-			SELECT latest_runs.*
-			FROM runs latest_runs
-			JOIN (
-				SELECT runs.loop_id, MAX(runs.started_at) AS started_at
-				FROM runs
-				JOIN loops candidate_loops ON candidate_loops.id = runs.loop_id
-				WHERE candidate_loops.status IN (`+sqlPlaceholders(len(statuses))+`)
-				GROUP BY runs.loop_id
-			) latest ON latest.loop_id = latest_runs.loop_id AND latest.started_at = latest_runs.started_at
-			WHERE latest_runs.id = (
-				SELECT id FROM runs latest_id
-				WHERE latest_id.loop_id = latest_runs.loop_id AND latest_id.started_at = latest_runs.started_at
-				ORDER BY latest_id.created_at DESC, latest_id.id DESC
-				LIMIT 1
-			)
-		) r ON r.loop_id = l.id
+		FROM runs r
+		JOIN loops l ON l.id = r.loop_id
 		WHERE l.status IN (`+sqlPlaceholders(len(statuses))+`)
+		AND r.id = (
+			SELECT latest.id FROM runs latest
+			WHERE latest.loop_id = r.loop_id
+			ORDER BY `+latestRunOrder("latest")+`
+			LIMIT 1
+		)
 		AND json_valid(r.checkpoint_json)
 		AND json_extract(r.checkpoint_json, '$.resumePolicy') = ?
-		ORDER BY r.started_at DESC, r.created_at DESC, r.id DESC
+		ORDER BY `+latestRunOrder("r")+`
 	`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list latest runs by loop statuses and resume policy: %w", err)
@@ -2922,12 +2909,14 @@ func scanRun(row interface{ Scan(...any) error }) (RunRecord, error) {
 		lastHeartbeatAt   sql.NullString
 		endedAt           sql.NullString
 		agentSnapshotJSON sql.NullString
+		seq               sql.NullInt64
 	)
 
-	err := row.Scan(&record.ID, &record.LoopID, &record.Status, &currentStep, &lastCompletedStep, &checkpointJSON, &summary, &errorMessage, &record.StartedAt, &lastHeartbeatAt, &endedAt, &record.CreatedAt, &record.UpdatedAt, &agentSnapshotJSON)
+	err := row.Scan(&record.ID, &record.LoopID, &record.Status, &currentStep, &lastCompletedStep, &checkpointJSON, &summary, &errorMessage, &record.StartedAt, &lastHeartbeatAt, &endedAt, &record.CreatedAt, &record.UpdatedAt, &agentSnapshotJSON, &seq)
 	if err != nil {
 		return RunRecord{}, err
 	}
+	record.Seq = seq.Int64
 	record.CurrentStep = nullableString(currentStep)
 	record.LastCompletedStep = nullableString(lastCompletedStep)
 	record.CheckpointJSON = nullableString(checkpointJSON)

@@ -658,6 +658,94 @@ func TestRunsGetLatestByLoopIDBreaksStartedAtTiesByCreatedAt(t *testing.T) {
 	}
 }
 
+func TestRunsLatestRunSelectionBreaksIdenticalTimestampsByInsertionOrder(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{
+		ID:        "project_run_seq",
+		Name:      "Looper",
+		RepoPath:  "/tmp/looper",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{
+		ID:         "loop_run_seq",
+		Seq:        1,
+		ProjectID:  "project_run_seq",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		Status:     "failed",
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// Fast retries within one millisecond: identical started_at AND created_at.
+	// IDs descend lexically so the old id-based tie-break would pick the wrong
+	// (first-inserted) attempt.
+	startedAt := "2026-04-11T12:00:01.000Z"
+	checkpoint := `{"resumePolicy":"on_failure"}`
+	for _, runID := range []string{"z_attempt_1", "m_attempt_2", "a_attempt_3"} {
+		if err := repos.Runs.Upsert(ctx, RunRecord{
+			ID:             runID,
+			LoopID:         "loop_run_seq",
+			Status:         "failed",
+			CheckpointJSON: &checkpoint,
+			StartedAt:      startedAt,
+			CreatedAt:      startedAt,
+			UpdatedAt:      startedAt,
+		}); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", runID, err)
+		}
+	}
+
+	// Re-upserting an older attempt must not reassign its insertion sequence.
+	if err := repos.Runs.Upsert(ctx, RunRecord{
+		ID:        "z_attempt_1",
+		LoopID:    "loop_run_seq",
+		Status:    "interrupted",
+		StartedAt: startedAt,
+		CreatedAt: startedAt,
+		UpdatedAt: "2026-04-11T12:00:02.000Z",
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(z_attempt_1 update) error = %v", err)
+	}
+
+	for attempt := 0; attempt < 5; attempt++ {
+		latestRun, err := repos.Runs.GetLatestByLoopID(ctx, "loop_run_seq")
+		if err != nil {
+			t.Fatalf("Runs.GetLatestByLoopID() error = %v", err)
+		}
+		if latestRun == nil || latestRun.ID != "a_attempt_3" {
+			t.Fatalf("Runs.GetLatestByLoopID() attempt %d = %#v, want a_attempt_3", attempt, latestRun)
+		}
+
+		batch, err := repos.Runs.ListLatestByLoopIDs(ctx, []string{"loop_run_seq"})
+		if err != nil {
+			t.Fatalf("Runs.ListLatestByLoopIDs() error = %v", err)
+		}
+		if len(batch) != 1 || batch[0].ID != "a_attempt_3" {
+			t.Fatalf("Runs.ListLatestByLoopIDs() attempt %d = %#v, want [a_attempt_3]", attempt, batch)
+		}
+
+		byPolicy, err := repos.Runs.ListLatestByLoopStatusesAndResumePolicy(ctx, []string{"failed"}, "on_failure")
+		if err != nil {
+			t.Fatalf("Runs.ListLatestByLoopStatusesAndResumePolicy() error = %v", err)
+		}
+		if len(byPolicy) != 1 || byPolicy[0].ID != "a_attempt_3" {
+			t.Fatalf("Runs.ListLatestByLoopStatusesAndResumePolicy() attempt %d = %#v, want [a_attempt_3]", attempt, byPolicy)
+		}
+	}
+}
+
 func TestLoopsAllocateSeqSeedsFromMaxWhenCounterMissing(t *testing.T) {
 	t.Parallel()
 
