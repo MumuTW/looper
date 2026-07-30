@@ -645,7 +645,7 @@ func runStatus(ctx context.Context, global []string, operands []string, stdout i
 
 func runProject(ctx context.Context, global []string, operands []string, stdout io.Writer) error {
 	if len(operands) == 0 {
-		return badUsage("project requires a subcommand (add, list, discover)")
+		return badUsage("project requires a subcommand (add, list, discover, remove)")
 	}
 	switch operands[0] {
 	case "list":
@@ -663,6 +663,11 @@ func runProject(ctx context.Context, global []string, operands []string, stdout 
 			return badUsage("project discover requires exactly one project id")
 		}
 		return runProjectDiscover(ctx, global, operands[1], stdout)
+	case "remove":
+		if len(operands) != 2 || strings.TrimSpace(operands[1]) == "" {
+			return badUsage("project remove requires exactly one project id")
+		}
+		return runProjectRemove(ctx, global, operands[1], stdout)
 	default:
 		return badUsage("unknown project subcommand %q", operands[0])
 	}
@@ -754,6 +759,32 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 		return err
 	}
 	return printProjectDiscoveryResult(result, stdout)
+}
+
+func runProjectRemove(ctx context.Context, global []string, identifier string, stdout io.Writer) error {
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+	endpoint := daemonBaseURL(cfg) + "/api/v1/projects/" + url.PathEscape(identifier)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	if cfg.Server.AuthMode == config.AuthModeLocalToken && cfg.Server.LocalToken != nil && strings.TrimSpace(*cfg.Server.LocalToken) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(*cfg.Server.LocalToken))
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("contact looperd at %s: %w", endpoint, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("remove project failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	_, _ = fmt.Fprintf(stdout, "removed project %s\n", identifier)
+	return nil
 }
 
 func printProjectDiscoveryResult(result createProjectResponse, stdout io.Writer) error {
@@ -1332,6 +1363,7 @@ Usage:
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
   looper project discover <id> Retry post-commit worktree/PR discovery for a project
+  looper project remove <id>   Remove an API-managed project record (recovers from ownership collisions)
   looper stop <selector>       Stop the active run for a loop ("all" stops every run)
   looper close <selector>      Stop the active run and close the loop
   looper takeover <selector>   Take a loop over for manual work
