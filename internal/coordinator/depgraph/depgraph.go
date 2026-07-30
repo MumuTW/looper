@@ -33,6 +33,9 @@ type Snapshot struct {
 	Unreachable []IssueRef
 }
 
+// Blocker is an Issue listed in another Issue's GitHub-native blocked_by set.
+// The Blocker's state and state_reason, together with blocked_by itself, are
+// the named Authority for the dependency gate.
 type Blocker struct {
 	Issue            IssueRef
 	State            string
@@ -48,6 +51,11 @@ type Blocker struct {
 
 type Cycle []IssueRef
 
+// DependencyGraph evaluates the dependency gate: the Dispatch precondition
+// that all of an Issue's Blockers be state==closed AND
+// state_reason==completed. The gate is blocked while any Blocker is open or
+// closed-not-completed, and released when every Blocker satisfies the
+// condition.
 type DependencyGraph struct {
 	readySet    []IssueRef
 	cycles      []Cycle
@@ -112,6 +120,9 @@ func Build(tracked []IssueRef, snapshot Snapshot) DependencyGraph {
 	}
 }
 
+// ReadySet returns the Ready set: the subset of tracked Issues whose
+// dependency gate is currently released — the Issues that may be Dispatched
+// this tick, subject to the existing PRD #334 conditions.
 func (g DependencyGraph) ReadySet() []IssueRef {
 	return append([]IssueRef(nil), g.readySet...)
 }
