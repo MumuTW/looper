@@ -1278,7 +1278,11 @@ func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, view p
 	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
 		return projects.DetectedRepo{Repo: remote.Repo}, nil
 	}
-	return projects.DetectedRepo{}, nil
+	// An unrecognized host is reported rather than returned as an empty
+	// detection. Returning nothing here used to register the project with no
+	// repository and no warning: the scheduler then skipped it on every tick,
+	// so registration looked successful while nothing ever ran.
+	return projects.DetectedRepo{}, fmt.Errorf("origin host %q is not github.com; looper drives GitHub only, so the repository cannot be detected — pass the repository explicitly as owner/name", strings.TrimSpace(remote.Host))
 }
 
 func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repositories) error {
