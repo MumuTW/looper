@@ -368,6 +368,62 @@
             "enabled": false
           },
           "roles": {
+            "coding": {
+              "planner": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "issue",
+                  "labels": [
+                    "looper:plan"
+                  ],
+                  "labelMode": "all",
+                  "requireAssigneeCurrentUser": true
+                },
+                "priority": 10
+              },
+              "reviewer": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "pull_request",
+                  "labels": null,
+                  "labelMode": "all",
+                  "requireReviewRequest": true
+                },
+                "priority": 30
+              },
+              "fixer": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "pull_request",
+                  "labels": null,
+                  "labelMode": "all",
+                  "authorFilter": "current_user"
+                },
+                "priority": 40
+              },
+              "gatekeeper": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "pull_request",
+                  "labels": [],
+                  "labelMode": "all",
+                  "includeDrafts": true
+                },
+                "priority": 45
+              },
+              "worker": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "issue",
+                  "labels": [
+                    "looper:worker-ready"
+                  ],
+                  "labelMode": "all",
+                  "requireAssigneeCurrentUser": true
+                },
+                "priority": 50
+              }
+            },
             "coordinator": {
               "enabled": false,
               "pollInterval": "5m",
