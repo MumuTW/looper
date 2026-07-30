@@ -243,6 +243,36 @@ func (r *Runner) acknowledgeHumanInbox(ctx context.Context, loop *storage.LoopRe
 	}
 }
 
+// requeueForSurvivingHumanInbox checks if unread human messages remain in the
+// inbox after a turn completes without asking a HITL question. If surviving
+// messages exist and the loop is not awaiting human decision, it flips the loop
+// back to queued so another turn drains them.
+func (r *Runner) requeueForSurvivingHumanInbox(ctx context.Context, loopID string) (bool, error) {
+	if r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil {
+		return false, nil
+	}
+	unlock := loops.LockLoopRequeue(loopID)
+	defer unlock()
+
+	fresh, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || fresh == nil {
+		return false, err
+	}
+	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 || fresh.Status == "awaiting_human" {
+		return false, nil
+	}
+	nowISO := r.nowISO()
+	updated := *fresh
+	updated.Status = "queued"
+	updated.NextRunAt = &nowISO
+	updated.UpdatedAt = nowISO
+	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+		return false, err
+	}
+	_, err = r.repos.Queue.RequeueLatestCancelledByLoop(ctx, loopID, nowISO)
+	return true, err
+}
+
 // markTakeoverResumeConsumed clears the takeover-resume marker after a successful
 // resumed turn so it is not re-applied on later runs. No-op when absent.
 func (r *Runner) markTakeoverResumeConsumed(ctx context.Context, loop *storage.LoopRecord) {

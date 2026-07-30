@@ -52,6 +52,23 @@ func ClearHumanInbox(metadataJSON *string) (string, error) {
 	return marshalWithHumanInbox(metadataJSON, nil)
 }
 
+// AcknowledgeHumanInbox removes up to count messages from the beginning of the
+// loop's humanInbox, preserving any newer messages appended while the turn was
+// running.
+func AcknowledgeHumanInbox(metadataJSON *string, count int) (string, error) {
+	if count <= 0 {
+		if metadataJSON == nil {
+			return "", nil
+		}
+		return *metadataJSON, nil
+	}
+	msgs := ReadHumanInbox(metadataJSON)
+	if len(msgs) <= count {
+		return ClearHumanInbox(metadataJSON)
+	}
+	return marshalWithHumanInbox(metadataJSON, msgs[count:])
+}
+
 // AcknowledgeHumanMessages removes one occurrence of each consumed message
 // (matched by At+Text) from the queued inbox, preserving arrival order of the
 // remainder. Acknowledgement is tied to the snapshot actually included in an

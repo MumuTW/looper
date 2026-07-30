@@ -31,6 +31,32 @@ func TestHumanInboxAppendReadClearCap(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeHumanInboxPreservesSurvivingMessages(t *testing.T) {
+	base := `{"worker":{"title":"x"}}`
+	m1, _ := AppendHumanMessage(&base, HumanMessage{At: "t1", Text: "msg1"})
+	m2, _ := AppendHumanMessage(&m1, HumanMessage{At: "t2", Text: "msg2"})
+	m3, _ := AppendHumanMessage(&m2, HumanMessage{At: "t3", Text: "msg3"})
+
+	// Drained 1 message out of 3
+	acked, err := AcknowledgeHumanInbox(&m3, 1)
+	if err != nil {
+		t.Fatalf("AcknowledgeHumanInbox error = %v", err)
+	}
+	remaining := ReadHumanInbox(&acked)
+	if len(remaining) != 2 {
+		t.Fatalf("remaining len = %d, want 2", len(remaining))
+	}
+	if remaining[0].Text != "msg2" || remaining[1].Text != "msg3" {
+		t.Fatalf("remaining messages = %+v, want msg2 and msg3", remaining)
+	}
+
+	// Drained all remaining messages
+	ackedAll, _ := AcknowledgeHumanInbox(&acked, 2)
+	if len(ReadHumanInbox(&ackedAll)) != 0 {
+		t.Fatalf("expected all messages cleared")
+	}
+}
+
 func TestAcknowledgeHumanMessagesRemovesOnlyConsumed(t *testing.T) {
 	t.Parallel()
 

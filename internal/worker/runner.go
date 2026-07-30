@@ -1841,6 +1841,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if r.hitlEnabled {
 			r.markHumanAnswerConsumed(ctx, &input.Loop)
 			r.acknowledgeHumanInbox(ctx, &input.Loop, includedHumanInbox)
+			_, _ = r.requeueForSurvivingHumanInbox(ctx, input.Loop.ID)
 		}
 		r.markTakeoverResumeConsumed(ctx, &input.Loop)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
