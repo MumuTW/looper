@@ -2242,8 +2242,6 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 
 type threadResolutionAgentDecision = resolution.Decision
 
-type threadResolutionAgentOutput = resolution.Output
-
 func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	policy := r.threadResolution
