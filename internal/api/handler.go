@@ -7201,10 +7201,6 @@ type agentOutputPayload struct {
 	StderrLogPath string `json:"stderrLogPath"`
 }
 
-func parseAgentOutput(logDir string, outputJSON *string) (string, string) {
-	return materializeAgentOutput(logDir, decodeAgentOutput(outputJSON))
-}
-
 func decodeAgentOutput(outputJSON *string) agentOutputPayload {
 	if outputJSON == nil || strings.TrimSpace(*outputJSON) == "" {
 		return agentOutputPayload{}
