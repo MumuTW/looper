@@ -109,18 +109,25 @@ func TestAssertStatusTransitions(t *testing.T) {
 	if !IsActiveLoopStatus(LoopStatusAwaitingHuman) {
 		t.Fatal("IsActiveLoopStatus(awaiting_human) = false, want true")
 	}
-	// Human takeover: reachable from running / awaiting_human; hands back to queued.
+	// Human takeover: every nonterminal, operator-visible loop state can be
+	// parked atomically; handback returns it to queued.
+	if err := AssertLoopStatusTransition(LoopStatusIdle, LoopStatusHumanTakeover); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(idle, human_takeover) error = %v", err)
+	}
 	if err := AssertLoopStatusTransition(LoopStatusRunning, LoopStatusHumanTakeover); err != nil {
 		t.Fatalf("AssertLoopStatusTransition(running, human_takeover) error = %v", err)
 	}
 	if err := AssertLoopStatusTransition(LoopStatusAwaitingHuman, LoopStatusHumanTakeover); err != nil {
 		t.Fatalf("AssertLoopStatusTransition(awaiting_human, human_takeover) error = %v", err)
 	}
+	if err := AssertLoopStatusTransition(LoopStatusWaiting, LoopStatusHumanTakeover); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(waiting, human_takeover) error = %v", err)
+	}
 	if err := AssertLoopStatusTransition(LoopStatusHumanTakeover, LoopStatusQueued); err != nil {
 		t.Fatalf("AssertLoopStatusTransition(human_takeover, queued) error = %v", err)
 	}
-	if err := AssertLoopStatusTransition(LoopStatusQueued, LoopStatusHumanTakeover); err == nil {
-		t.Fatal("AssertLoopStatusTransition(queued, human_takeover) error = nil, want failure")
+	if err := AssertLoopStatusTransition(LoopStatusQueued, LoopStatusHumanTakeover); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(queued, human_takeover) error = %v", err)
 	}
 	if err := AssertKnownLoopStatus(LoopStatusHumanTakeover); err != nil {
 		t.Fatalf("AssertKnownLoopStatus(human_takeover) error = %v", err)

@@ -369,7 +369,11 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		// no role can act on: every discovery lane skips a project whose repo
 		// metadata is empty. Say so at registration instead of leaving the
 		// operator to infer it from a daemon log line on every tick.
-		warnings = append(warnings, "No repository is set for this project, so no automation will run for it. Re-register with an explicit owner/name repository, or set one through the dashboard or PATCH /api/v1/projects/{id}.")
+		// The repair path is named precisely because the obvious ones do not
+		// exist: the dashboard Projects page is read-only, /api/v1/projects/{id}
+		// accepts only DELETE, and `looper project add` has no repo flag. That
+		// leaves DELETE followed by a create carrying "repo".
+		warnings = append(warnings, `No repository is set for this project, so no automation will run for it. To repair it: DELETE /api/v1/projects/`+projectID+` then POST /api/v1/projects with {"repoPath":"...","repo":"owner/name"}. The CLI cannot set a repository.`)
 	}
 
 	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {

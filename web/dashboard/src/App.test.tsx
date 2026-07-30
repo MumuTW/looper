@@ -95,3 +95,45 @@ describe("bootstrap code exchange", () => {
     expect(sessionStorage.getItem("looper.dashboard.token")).toBe("tok_local");
   });
 });
+
+describe("triage confirmation status", () => {
+  it("shows every source the daemon projects as awaiting confirmation", async () => {
+	window.history.replaceState({}, "", "/dashboard/");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/api/v1/healthz") return response({ healthy: true });
+      if (path === "/api/v1/status") {
+        return response({
+          service: {
+            healthy: true,
+            triage: {
+              awaitingConfirmation: {
+                count: 2,
+                sources: [
+                  { repo: "acme/looper", issueNumber: 42, createdAt: "2026-07-30T10:30:00Z", ageSeconds: 5400 },
+                  { repo: "acme/looper", issueNumber: 43, createdAt: "2026-07-30T11:45:00Z", ageSeconds: 900 },
+                ],
+              },
+            },
+          },
+          scheduler: {},
+          loops: {},
+        });
+      }
+      if (path === "/api/v1/runs/active") return response({ items: [] });
+      if (path === "/api/v1/projects") return response({ items: [] });
+      if (path.startsWith("/api/v1/loops")) return response({ items: [] });
+      return bootstrapRouteAbsent();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByText("Awaiting human confirmation")).toBeTruthy();
+    expect(screen.getByText("2")).toBeTruthy();
+    expect(screen.getByText(/acme\/looper#42/)).toBeTruthy();
+    expect(screen.getByText(/acme\/looper#43/)).toBeTruthy();
+    expect(screen.getByText(/waiting 1h/)).toBeTruthy();
+    expect(screen.getByText(/waiting 15m/)).toBeTruthy();
+  });
+});

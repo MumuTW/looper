@@ -503,19 +503,18 @@ type AgentExecutionStartedInput struct {
 type AgentExecutionStartedFunc func(context.Context, AgentExecutionStartedInput) error
 
 type Options struct {
-	DB                     *sql.DB
-	Repos                  *storage.Repositories
-	GitHub                 GitHubGateway
-	Git                    GitGateway
-	AgentExecutor          AgentExecutor
-	Logger                 bootstrap.Logger
-	Now                    func() time.Time
-	AgentTimeout           time.Duration
-	AgentIdleTimeout       time.Duration
-	ClaimTTL               time.Duration
-	ValidationCommands     []string
-	ValidationCodexCommand string
-	ValidationRunner       ValidationRunner
+	DB                 *sql.DB
+	Repos              *storage.Repositories
+	GitHub             GitHubGateway
+	Git                GitGateway
+	AgentExecutor      AgentExecutor
+	Logger             bootstrap.Logger
+	Now                func() time.Time
+	AgentTimeout       time.Duration
+	AgentIdleTimeout   time.Duration
+	ClaimTTL           time.Duration
+	ValidationCommands []string
+	ValidationRunner   ValidationRunner
 	// ContainmentTracker registers validation shell handles with the Execution
 	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
 	// when the runner is not daemon-owned.
@@ -560,7 +559,6 @@ type Runner struct {
 	agentIdleTimeout            time.Duration
 	claimTTL                    time.Duration
 	validationCommands          []string
-	validationCodexCommand      string
 	validationRunner            ValidationRunner
 	containmentTracker          processcontainment.LiveTracker
 	allowAutoCommit             bool
@@ -1608,7 +1606,6 @@ func New(options Options) *Runner {
 		agentIdleTimeout:            agentIdleTimeout,
 		claimTTL:                    claimTTL,
 		validationCommands:          append([]string(nil), options.ValidationCommands...),
-		validationCodexCommand:      strings.TrimSpace(options.ValidationCodexCommand),
 		validationRunner:            options.ValidationRunner,
 		containmentTracker:          options.ContainmentTracker,
 		allowAutoCommit:             options.AllowAutoCommit,
@@ -6969,9 +6966,8 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 		Commands:       input.Commands,
 		CommandTimeout: r.agentTimeout,
 	}, &validation.Options{
-		CWD:          input.CWD,
-		CodexCommand: r.validationCodexCommand,
-		Tracker:      r.containmentTracker,
+		CWD:     input.CWD,
+		Tracker: r.containmentTracker,
 	})
 	if err != nil {
 		return ValidationResult{}, err

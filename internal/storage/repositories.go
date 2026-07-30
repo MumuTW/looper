@@ -10,9 +10,18 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/nexu-io/looper/internal/domain"
 )
 
 var ErrQueueItemNotActive = errors.New("queue item not active")
+
+// ErrLoopHumanHeld rejects blind writes that would change human takeover
+// ownership. Only the loops service may cross this boundary after validating a
+// status transition.
+var ErrLoopHumanHeld = errors.New("loop is held by human takeover")
+
+func IsLoopHumanHeldError(err error) bool { return errors.Is(err, ErrLoopHumanHeld) }
 
 // ErrAgentExecutionConflict is returned when an agent_executions upsert is
 // rejected by the terminal-observation immutability guard (zero rows updated).
@@ -482,6 +491,28 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	return scanEventLogs(rows)
 }
 
+// ListByEntityTypeAndEventTypes reads the complete lifecycle for one entity
+// family without imposing an arbitrary status-page limit. Callers derive live
+// projections from the returned durable events; this query does not record a
+// second materialized status.
+func (r *EventsRepository) ListByEntityTypeAndEventTypes(ctx context.Context, entityType string, eventTypes []string) ([]EventLogRecord, error) {
+	if len(eventTypes) == 0 {
+		return []EventLogRecord{}, nil
+	}
+	args := make([]any, 0, len(eventTypes)+1)
+	args = append(args, entityType)
+	for _, eventType := range eventTypes {
+		args = append(args, eventType)
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE entity_type = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, id ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by entity type and event types: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 // ListFirstEventTimestampsByType returns, for each supplied entity ID that has
 // an event of eventType, the created_at of its earliest such event. Callers
 // need both the durable evidence and when it was first written, so one pass
@@ -624,9 +655,26 @@ func (r *ProjectsRepository) Archive(ctx context.Context, id string, updatedAt s
 type LoopsRepository struct{ q sqliteQuerier }
 
 func (r *LoopsRepository) Upsert(ctx context.Context, record LoopRecord) error {
-	_, err := r.q.ExecContext(ctx, `
+	return r.upsert(ctx, record, false)
+}
+
+// UpsertChangingHumanHold is reserved for lifecycle operations that have
+// already established authority through domain transition validation.
+func (r *LoopsRepository) UpsertChangingHumanHold(ctx context.Context, record LoopRecord) error {
+	return r.upsert(ctx, record, true)
+}
+
+func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeHumanHold bool) error {
+	insertSource := `VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	args := []any{record.ID, record.Seq, record.ProjectID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.Status, record.ConfigJSON, record.MetadataJSON, record.LastRunAt, record.NextRunAt, record.CreatedAt, record.UpdatedAt}
+	guard := ""
+	if !changeHumanHold {
+		guard = ` WHERE (loops.status = ?) = (excluded.status = ?)`
+		args = append(args, string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusHumanTakeover))
+	}
+	result, err := r.q.ExecContext(ctx, `
 		INSERT INTO loops (id, seq, project_id, type, target_type, target_id, repo, pr_number, status, config_json, metadata_json, last_run_at, next_run_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`+insertSource+`
 		ON CONFLICT(id) DO UPDATE SET
 			seq=excluded.seq,
 			project_id=excluded.project_id,
@@ -640,10 +688,19 @@ func (r *LoopsRepository) Upsert(ctx context.Context, record LoopRecord) error {
 			metadata_json=excluded.metadata_json,
 			last_run_at=excluded.last_run_at,
 			next_run_at=excluded.next_run_at,
-			updated_at=excluded.updated_at
-	`, record.ID, record.Seq, record.ProjectID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.Status, record.ConfigJSON, record.MetadataJSON, record.LastRunAt, record.NextRunAt, record.CreatedAt, record.UpdatedAt)
+			updated_at=excluded.updated_at`+guard+`
+	`, args...)
 	if err != nil {
 		return fmt.Errorf("upsert loop: %w", err)
+	}
+	if !changeHumanHold {
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("upsert loop: read rows affected: %w", err)
+		}
+		if affected == 0 {
+			return fmt.Errorf("%w: loop %s", ErrLoopHumanHeld, record.ID)
+		}
 	}
 
 	_, err = r.q.ExecContext(ctx, `
@@ -3064,6 +3121,40 @@ const queueLockConflictPredicate = `(
 	)
 )`
 
+// humanHoldClaimPredicate fences every queue item that could enter the same
+// human-held checkout. The durable loop hold is the authority: queue discovery
+// may materialize work before takeover, so checking only the held loop's item
+// leaves sibling PR roles claimable after cancellation.
+const humanHoldClaimPredicate = `NOT EXISTS (
+			SELECT 1
+			FROM loops held
+			WHERE held.status = 'human_takeover'
+				AND held.project_id = COALESCE(l.project_id, qi.project_id)
+				AND (
+					(
+						held.target_type = 'pull_request'
+						AND held.pr_number IS NOT NULL
+						AND held.pr_number = COALESCE(l.pr_number, qi.pr_number)
+						AND held.repo IS NOT NULL
+						AND held.repo = COALESCE(l.repo, qi.repo)
+					)
+					OR (
+						held.target_id IS NOT NULL
+						AND held.target_type = COALESCE(l.target_type, qi.target_type)
+						AND held.target_type != 'project'
+						AND held.target_id = COALESCE(l.target_id, qi.target_id)
+						AND (
+							held.target_type != 'issue'
+							OR (
+								held.type = 'planner'
+								AND COALESCE(l.type, qi.type) = 'planner'
+							)
+						)
+					)
+					OR held.id = qi.loop_id
+				)
+		)`
+
 const scheduledQueueBaseQuery = `
 	SELECT qi.*
 	FROM queue_items qi
@@ -3073,6 +3164,7 @@ const scheduledQueueBaseQuery = `
 		AND qi.available_at <= ?
 		AND (qi.project_id IS NULL OR p.archived = 0)
 		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
+		AND ` + humanHoldClaimPredicate + `
 		AND (
 			qi.lock_key IS NULL
 			OR NOT EXISTS (

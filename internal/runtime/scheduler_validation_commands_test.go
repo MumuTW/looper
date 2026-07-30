@@ -86,9 +86,8 @@ func TestBuildDefaultSchedulerHandlersThreadsValidationCommandsIntoWorkerAndFixe
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	vendor := config.AgentVendorCodex
+	vendor := config.AgentVendorClaudeCode
 	cfg.Agent.Vendor = &vendor
-	cfg.Agent.Params = map[string]any{"command": "/opt/open-codex/bin/codex"}
 	// Blank/padded entries exercise the resolver on the way through.
 	cfg.Defaults.ValidationCommands = []string{"  go vet ./...  ", "go test ./..."}
 
@@ -105,11 +104,6 @@ func TestBuildDefaultSchedulerHandlersThreadsValidationCommandsIntoWorkerAndFixe
 	}
 	if got := runnerValidationCommands(t, input.Fixer); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixer validationCommands = %#v, want %#v", got, want)
-	}
-	for name, runner := range map[string]any{"worker": input.Worker, "fixer": input.Fixer} {
-		if got := runnerStringField(t, runner, "validationCodexCommand"); got != "/opt/open-codex/bin/codex" {
-			t.Fatalf("%s validationCodexCommand = %q, want configured command", name, got)
-		}
 	}
 	if schedulerLoggerContains(logger, validationGateDisabledWarning) {
 		t.Fatal("scheduler warned about a disabled validation gate while commands are configured")

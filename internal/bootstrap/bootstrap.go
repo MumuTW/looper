@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/processsandbox"
 )
 
 type Runtime any
@@ -42,16 +43,17 @@ type SignalNotifier interface {
 }
 
 type Options struct {
-	Args            []string
-	Env             map[string]string
-	CWD             string
-	Stdout          io.Writer
-	Stderr          io.Writer
-	LoadConfig      LoadConfigFunc
-	CreateLogger    CreateLoggerFunc
-	StartRuntime    StartRuntimeFunc
-	WaitForShutdown bool
-	SignalNotifier  SignalNotifier
+	Args                []string
+	Env                 map[string]string
+	CWD                 string
+	Stdout              io.Writer
+	Stderr              io.Writer
+	LoadConfig          LoadConfigFunc
+	CreateLogger        CreateLoggerFunc
+	StartRuntime        StartRuntimeFunc
+	CheckSandboxRuntime func() error
+	WaitForShutdown     bool
+	SignalNotifier      SignalNotifier
 }
 
 type Result struct {
@@ -89,6 +91,13 @@ func Bootstrap(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 	if err := validateConfiguredToolPaths(loadedConfig.Config, loadedConfig.Metadata.ToolDetection); err != nil {
+		return Result{}, err
+	}
+	checkSandboxRuntime := options.CheckSandboxRuntime
+	if checkSandboxRuntime == nil {
+		checkSandboxRuntime = processsandbox.Available
+	}
+	if err := validateSandboxRuntime(loadedConfig.Config, checkSandboxRuntime); err != nil {
 		return Result{}, err
 	}
 
@@ -171,6 +180,19 @@ func Bootstrap(ctx context.Context, options Options) (Result, error) {
 	}
 
 	return result, nil
+}
+
+func validateSandboxRuntime(cfg config.Config, check func() error) error {
+	if len(config.ResolveValidationCommands(cfg)) == 0 {
+		return nil
+	}
+	if err := check(); err != nil {
+		return &config.ConfigValidationError{Issues: []config.ValidationIssue{{
+			Path:    "defaults.validationCommands",
+			Message: "requires a trusted process sandbox runtime: " + err.Error(),
+		}}}
+	}
+	return nil
 }
 
 type osSignalNotifier struct{}

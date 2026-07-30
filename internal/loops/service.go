@@ -38,6 +38,13 @@ type PauseResult struct {
 	CancelledQueueItems int64
 }
 
+// HoldResult records a durable interactive takeover fence and the queue work it
+// cancelled in the same transaction.
+type HoldResult struct {
+	Loop                storage.LoopRecord
+	CancelledQueueItems int64
+}
+
 type TerminateResult struct {
 	Loop                storage.LoopRecord
 	CancelledQueueItems int64
@@ -175,7 +182,11 @@ func (s *Service) TransitionStatus(ctx context.Context, loopID string, input Tra
 			lastRunAt := eventlog.FormatJavaScriptISOString(*input.LastRunAt)
 			updated.LastRunAt = &lastRunAt
 		}
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		write := repos.Loops.Upsert
+		if current := domain.LoopStatus(loop.Status); current == domain.LoopStatusHumanTakeover || input.Status == domain.LoopStatusHumanTakeover {
+			write = repos.Loops.UpsertChangingHumanHold
+		}
+		if err := write(ctx, updated); err != nil {
 			return storage.LoopRecord{}, err
 		}
 		return updated, nil
@@ -225,6 +236,48 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 	return result, nil
 }
 
+// Hold parks a loop for human takeover before any irreversible process stop.
+// The hold and queue cancellation commit together so no scheduler observation
+// can see a cancelled queue item while the loop remains claimable.
+func (s *Service) Hold(ctx context.Context, loopID string, reason *string) (HoldResult, error) {
+	if s.DB == nil || s.Repos == nil || s.Repos.Queue == nil {
+		return HoldResult{}, fmt.Errorf("loops service is not configured")
+	}
+	now := s.currentTime()
+	result, err := storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (HoldResult, error) {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return HoldResult{}, err
+		}
+		if loop == nil {
+			return HoldResult{}, fmt.Errorf("loop not found: %s", loopID)
+		}
+		current := domain.LoopStatus(loop.Status)
+		if current != domain.LoopStatusHumanTakeover {
+			if err := domain.AssertLoopStatusTransition(current, domain.LoopStatusHumanTakeover); err != nil {
+				return HoldResult{}, err
+			}
+		}
+		updated := *loop
+		updated.Status = string(domain.LoopStatusHumanTakeover)
+		updated.NextRunAt = nil
+		updated.UpdatedAt = eventlog.NextJavaScriptISOString(now, loop.UpdatedAt)
+		if err := repos.Loops.UpsertChangingHumanHold(ctx, updated); err != nil {
+			return HoldResult{}, err
+		}
+		cancelled, err := repos.Queue.CancelByLoop(ctx, loopID, updated.UpdatedAt, reason)
+		if err != nil {
+			return HoldResult{}, err
+		}
+		return HoldResult{Loop: updated, CancelledQueueItems: cancelled}, nil
+	})
+	if err != nil {
+		return HoldResult{}, err
+	}
+	return result, nil
+}
+
 func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) (TerminateResult, error) {
 	if s.DB == nil || s.Repos == nil || s.Repos.Queue == nil {
 		return TerminateResult{}, fmt.Errorf("loops service is not configured")
@@ -249,7 +302,11 @@ func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) 
 		updated.Status = string(domain.LoopStatusTerminated)
 		updated.NextRunAt = nil
 		updated.UpdatedAt = eventlog.NextJavaScriptISOString(now, loop.UpdatedAt)
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		write := repos.Loops.Upsert
+		if currentStatus == domain.LoopStatusHumanTakeover {
+			write = repos.Loops.UpsertChangingHumanHold
+		}
+		if err := write(ctx, updated); err != nil {
 			return TerminateResult{}, err
 		}
 		cancelled, err := repos.Queue.CancelByLoop(ctx, loopID, updated.UpdatedAt, reason)

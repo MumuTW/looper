@@ -29,6 +29,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/triager"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
@@ -1086,6 +1087,61 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	}
 	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(0))
 	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
+}
+
+func TestHandlerStatusProjectsAwaitingTriageConfirmationWithoutWritingState(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	services := rt.Services()
+	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	createdAt := now.Add(-90 * time.Minute).Format(time.RFC3339Nano)
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	payload, err := json.Marshal(triager.Report{
+		Version: 2, IdempotencyKey: "triage-awaiting-status", ProjectID: "project_1", Repo: "acme/looper", IssueNumber: 42,
+		Policy: triager.PolicyDecision{Action: triager.ActionAwaitHuman}, CreatedAt: createdAt,
+	})
+	if err != nil {
+		t.Fatalf("marshal triage report: %v", err)
+	}
+	projectID, entityType, entityID := "project_1", "github_issue", "project_1:acme/looper:42"
+	if err := services.Repositories.Events.Append(context.Background(), storage.EventLogRecord{
+		ID: "triage-awaiting-status-event", EventType: triager.ReportEventType, ProjectID: &projectID,
+		EntityType: &entityType, EntityID: &entityID, PayloadJSON: string(payload), CreatedAt: createdAt,
+	}); err != nil {
+		t.Fatalf("append triage report: %v", err)
+	}
+	before, err := services.Repositories.Events.List(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("list events before status: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg), Now: func() time.Time { return now }}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	after, err := services.Repositories.Events.List(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("list events after status: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("GET /status wrote event state: before=%d after=%d", len(before), len(after))
+	}
+
+	service := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)["service"].(map[string]any)
+	awaiting := service["triage"].(map[string]any)["awaitingConfirmation"].(map[string]any)
+	assertEqual(t, awaiting["count"], float64(1))
+	sources, ok := awaiting["sources"].([]any)
+	if !ok || len(sources) != 1 {
+		t.Fatalf("awaiting.sources = %#v, want one source", awaiting["sources"])
+	}
+	source := sources[0].(map[string]any)
+	assertEqual(t, source["repo"], "acme/looper")
+	assertEqual(t, source["issueNumber"], float64(42))
+	assertEqual(t, source["createdAt"], createdAt)
+	assertEqual(t, source["ageSeconds"], float64(90*60))
 }
 
 func TestHandlerStatusSurfacesUnknownReviewPublishWithoutProbing(t *testing.T) {
@@ -3083,6 +3139,48 @@ func TestTakeoverLoopFiltersCrossVendorResumeParams(t *testing.T) {
 	wantSame := "cd /tmp/wt-codex && /opt/codex-wrapper resume session_codex"
 	if !resp.Supported || resp.ResumeCommand != wantSame {
 		t.Fatalf("same-vendor resume = %q (supported=%v), want %q", resp.ResumeCommand, resp.Supported, wantSame)
+	}
+}
+
+func TestHandlerHandbackPersistsResumeMetadataWhileHumanTakeoverIsHeld(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	seedLoopRouteData(t, rt)
+	prepareLoopRouteForRetry(t, rt, "human_takeover")
+
+	nowISO := "2026-04-11T12:01:00.000Z"
+	sessionID := "session-handback-held"
+	if err := rt.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:              "agent_exec_handback_held",
+		ProjectID:       stringPtr("project_1"),
+		LoopID:          stringPtr("loop_1"),
+		Vendor:          "codex",
+		Status:          "completed",
+		NativeSessionID: &sessionID,
+		StartedAt:       nowISO,
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: cfg, Runtime: rt, Now: func() time.Time {
+		return time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC)
+	}})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_1/handback", strings.NewReader(`{"mode":"auto"}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	loop, err := rt.Services().Repositories.Loops.GetByID(context.Background(), "loop_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID(loop_1) = %#v, %v", loop, err)
+	}
+	if loop.Status != string(domain.LoopStatusQueued) {
+		t.Fatalf("loop status = %q, want queued", loop.Status)
+	}
+	if loop.MetadataJSON == nil || !strings.Contains(*loop.MetadataJSON, sessionID) {
+		t.Fatalf("loop metadata = %#v, want persisted takeover resume session", loop.MetadataJSON)
 	}
 }
 
@@ -7913,10 +8011,13 @@ func prepareLoopRouteForRetry(t *testing.T, rt *looperdruntime.Runtime, loopStat
 	}
 	loop.Status = loopStatus
 	loop.UpdatedAt = nowISO
-	if err := services.Repositories.Loops.Upsert(ctx, *loop); err != nil {
+	writeLoop := services.Repositories.Loops.Upsert
+	if loopStatus == "human_takeover" {
+		writeLoop = services.Repositories.Loops.UpsertChangingHumanHold
+	}
+	if err := writeLoop(ctx, *loop); err != nil {
 		t.Fatalf("Loops.Upsert(loop_1) error = %v", err)
 	}
-
 	run, err := services.Repositories.Runs.GetByID(ctx, "run_1")
 	if err != nil || run == nil {
 		t.Fatalf("Runs.GetByID(run_1) = %#v, %v", run, err)

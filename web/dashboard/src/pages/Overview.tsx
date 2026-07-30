@@ -22,6 +22,7 @@ import {
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import {
   formatAge,
+  formatDurationSeconds,
   formatAttempts,
   truncateReason,
 } from "@/lib/format";
@@ -503,6 +504,33 @@ export function OverviewPage({
               }
             />
           </dl>
+        </Card>
+
+        <Card title="Triage">
+          {statusError && !status ? (
+            <p className="m-0 text-[12px] text-[var(--danger)]">
+              Unavailable (status failed)
+            </p>
+          ) : (
+            <>
+              <dl className="m-0">
+                <Kv
+                  label="Awaiting human confirmation"
+                  value={status?.service?.triage?.awaitingConfirmation?.count ?? "—"}
+                />
+              </dl>
+              {(status?.service?.triage?.awaitingConfirmation?.sources ?? []).map(
+                (source) => (
+                  <p
+                    className="m-0 mt-1 mono text-[12px] text-[var(--text-muted)]"
+                    key={`${source.projectId ?? ""}:${source.repo ?? ""}:${source.issueNumber ?? ""}`}
+                  >
+                    {source.repo ?? "—"}#{source.issueNumber ?? "—"} · waiting {formatDurationSeconds(source.ageSeconds)}
+                  </p>
+                ),
+              )}
+            </>
+          )}
         </Card>
       </div>
 
