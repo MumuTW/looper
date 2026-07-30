@@ -259,12 +259,26 @@ func TestRunResolveCommentsDeferredClearsStaleFollowupWithoutMutation(t *testing
 	if err != nil || persisted == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v)", persisted, err)
 	}
-	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(persisted.MetadataJSON))
-	if !ok || !sameStringSlices(pending.UnresolvedThreadIDs, []string{"t1"}) {
-		t.Fatalf("loop metadata = %s, want stale t2 replaced by deferred t1", derefString(persisted.MetadataJSON))
+	persistedMetadata := parseJSONObject(persisted.MetadataJSON)
+	if _, ok := parsePendingFixerRediscoveryState(persistedMetadata); ok {
+		t.Fatalf("loop metadata = %s, want deferred thread excluded from immediate rediscovery", derefString(persisted.MetadataJSON))
+	}
+	followup, ok := parseFixerFollowupState(persistedMetadata)
+	if !ok || followup.Terminal || followup.AttemptsForFingerprint != 1 || !sameStringSlices(followup.UnresolvedThreadIDs, []string{"t1"}) || parseRFC3339OrZero(followup.NextEligibleAt).IsZero() {
+		t.Fatalf("loop metadata = %s, want bounded deferred follow-up", derefString(persisted.MetadataJSON))
 	}
 	rechecked, err := runner.runRecheckStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: *persisted, Repo: repo, PRNumber: prNumber, Checkpoint: updated})
 	if err != nil || rechecked.ResumePolicy != loops.ResumePolicyAdvanceFromCheckpoint {
 		t.Fatalf("runRecheckStep() = (%#v, %v), want deferred thread to remain follow-up without manual intervention", rechecked, err)
+	}
+	if scheduled, err := runner.schedulePendingRediscoveryAfterRun(context.Background(), *persisted, repo, prNumber); err != nil || scheduled {
+		t.Fatalf("schedulePendingRediscoveryAfterRun() = (%t, %v), want no immediate deferred rerun", scheduled, err)
+	}
+	if scheduled, err := runner.scheduleFollowupRetryAfterSuccess(context.Background(), *persisted, repo, prNumber, true); err != nil || !scheduled {
+		t.Fatalf("scheduleFollowupRetryAfterSuccess() = (%t, %v), want delayed bounded rerun", scheduled, err)
+	}
+	queued, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loop.ID)
+	if err != nil || queued == nil || !parseRFC3339OrZero(queued.AvailableAt).After(fixture.now()) {
+		t.Fatalf("queued follow-up = (%#v, %v), want future availability", queued, err)
 	}
 }

@@ -3876,6 +3876,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	resolvedCount := 0
 	contractViolationCount := 0
+	deferredThreadIDs := make([]string, 0)
 	declinedUpdates := map[string]declinedThreadRecord{}
 	commentItems := make([]FixItem, 0, len(fixItems))
 	nativeCommentItems := make([]FixItem, 0, len(fixItems))
@@ -3977,13 +3978,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 		if normalizeReplyAction(decision.Action) == string(replyActionDeferred) {
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeferred), Status: "deferred", Message: decision.Explanation, UpdatedAt: r.nowISO()})
+			deferredThreadIDs = append(deferredThreadIDs, item.ThreadID)
 			if checkpoint.Outcome == nil {
 				checkpoint.Outcome = &FixerRunOutcome{}
 			}
 			checkpoint.Outcome.FollowUpThreadIDs = canonicalizeStringSlice(append(checkpoint.Outcome.FollowUpThreadIDs, item.ThreadID))
-			if _, err := r.recordPendingFixerRediscovery(ctx, input.Loop, liveDetail.HeadSHA, hashFixItemsState(liveFixItems), unresolvedThreadIDs(liveFixItems)); err != nil {
-				return checkpoint, err
-			}
 			continue
 		}
 		if fixedDecisionMissingThreadSnapshot(decision) || threadCommentsObservedDrifted(decision, thread) {
@@ -4128,7 +4127,12 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
 		return checkpoint, classifyForgejoNativeResolveError(nativeMutationErr)
 	}
-	if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
+	deferredThreadIDs = canonicalizeStringSlice(deferredThreadIDs)
+	if len(deferredThreadIDs) > 0 {
+		if _, err := r.recordFixerFollowupState(ctx, input.Loop, fixerFollowupReasonMissingEvidence, liveDetail.HeadSHA, hashFixItemsState(liveFixItems), deferredThreadIDs, r.now()); err != nil {
+			return checkpoint, err
+		}
+	} else if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
 		return checkpoint, err
 	}
 	if hasReviewerSummary {
