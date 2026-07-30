@@ -627,6 +627,31 @@ type RoleConfigs struct {
 	Fixer       FixerRoleConfig       `json:"fixer"`
 	Worker      WorkerRoleConfig      `json:"worker"`
 	Coordinator CoordinatorRoleConfig `json:"coordinator"`
+	Gatekeeper  GatekeeperRoleConfig  `json:"gatekeeper"`
+}
+
+// GatekeeperTrustLevel is how much merge authority Merge Gatekeeper holds for a
+// project. It is a ladder, not a switch: a level is reached by explicit operator
+// promotion and never promotes itself.
+type GatekeeperTrustLevel string
+
+const (
+	// GatekeeperTrustObserve writes a Gate report and nothing else. The default
+	// for every project.
+	GatekeeperTrustObserve GatekeeperTrustLevel = "observe"
+	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
+	// the pull request, so a human can decide without redoing the judgement.
+	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
+	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible. Not yet
+	// implemented; config validation rejects it rather than accepting a value that
+	// would silently behave as advise.
+	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
+)
+
+// GatekeeperRoleConfig configures the agent-free Merge Gatekeeper.
+type GatekeeperRoleConfig struct {
+	// Trust is the merge authority level. Empty defaults to observe.
+	Trust GatekeeperTrustLevel `json:"trust,omitempty"`
 }
 
 type ProjectRefConfig struct {
@@ -1181,6 +1206,10 @@ type PartialCoordinatorRoleConfig struct {
 	MergeWatch   *PartialCoordinatorMergeWatchConfig   `json:"mergeWatch,omitempty"`
 }
 
+type PartialGatekeeperRoleConfig struct {
+	Trust *GatekeeperTrustLevel `json:"trust,omitempty"`
+}
+
 type PartialRoleConfigs struct {
 	// Coding holds TOML-authored coding-role overlays
 	// (`[roles.coding.<shipped-role>]`). It is global-only:
@@ -1193,6 +1222,7 @@ type PartialRoleConfigs struct {
 	Fixer       *PartialFixerRoleConfig            `json:"fixer,omitempty"`
 	Worker      *PartialWorkerRoleConfig           `json:"worker,omitempty"`
 	Coordinator *PartialCoordinatorRoleConfig      `json:"coordinator,omitempty"`
+	Gatekeeper  *PartialGatekeeperRoleConfig       `json:"gatekeeper,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }
