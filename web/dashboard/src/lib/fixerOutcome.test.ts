@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { formatDurableProgress, formatPrimaryFailure } from "./fixerOutcome";
+import {
+  formatDurableProgress,
+  formatPrimaryFailure,
+  formatSecondaryIssues,
+} from "./fixerOutcome";
 
 describe("formatPrimaryFailure", () => {
   it("returns null when there is nothing to show", () => {
@@ -71,5 +75,36 @@ describe("formatDurableProgress", () => {
     expect(
       formatDurableProgress({ progress: { repliesSent: 1, threadsResolved: 2 } }),
     ).toBe("1 reply · 2 threads");
+  });
+});
+
+describe("formatSecondaryIssues", () => {
+  it("returns null when there are none", () => {
+    expect(formatSecondaryIssues(undefined)).toBeNull();
+    expect(formatSecondaryIssues({})).toBeNull();
+    expect(formatSecondaryIssues({ secondaryIssues: [] })).toBeNull();
+    expect(formatSecondaryIssues({ secondaryIssues: [{}] })).toBeNull();
+  });
+
+  it("lists each issue as step and message", () => {
+    expect(
+      formatSecondaryIssues({
+        secondaryIssues: [
+          { step: "recheck", message: "worktree cleanup refused: dirty" },
+          { step: "push", message: "remote moved" },
+        ],
+      }),
+    ).toEqual([
+      "recheck — worktree cleanup refused: dirty",
+      "push — remote moved",
+    ]);
+  });
+
+  it("drops empty entries but keeps the rest", () => {
+    expect(
+      formatSecondaryIssues({
+        secondaryIssues: [{}, { message: "boom" }],
+      }),
+    ).toEqual(["boom"]);
   });
 });
