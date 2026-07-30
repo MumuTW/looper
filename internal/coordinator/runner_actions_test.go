@@ -1041,6 +1041,70 @@ func TestRunnerAutonomousDispatchPreemptionIsPerTick(t *testing.T) {
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1, 2})
 }
 
+func TestRunnerAutonomousDispatchScansEligibleBacklogOutsideRecentIssues(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 1
+	})
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 200, []string{"triaged", "dispatch/implement"})
+	backlogIssue := fixture.github.issues[0]
+	recentIssue := fixture.github.issues[1]
+	fixture.github.issues = nil
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") &&
+			strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`) {
+			return []githubinfra.IssueSummary{backlogIssue}
+		}
+		if len(input.Labels) == 0 {
+			return []githubinfra.IssueSummary{recentIssue}
+		}
+		return nil
+	}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1})
+	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, labels.DefaultWorkerReadyTrigger); got != 1 {
+		t.Fatalf("issue 1 worker-ready add count = %d, want 1", got)
+	}
+}
+
+func TestRunnerAutonomousDispatchDeduplicatesRecentAndBacklogCandidates(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 2
+	})
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if len(input.Labels) == 0 ||
+			(containsAllLabels(input.Labels, "triaged", "dispatch/implement") &&
+				strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`)) {
+			return fixture.github.issues
+		}
+		return nil
+	}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1})
+	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, labels.DefaultWorkerReadyTrigger); got != 1 {
+		t.Fatalf("issue 1 worker-ready add count = %d, want 1", got)
+	}
+}
+
 // TestReconfigurePreservesRuntimeStateThrottle verifies that reconfigure
 // carries the previous runner's RuntimeState into the replacement, so the
 // per-project throttle timestamp survives a config-snapshot rebuild. This
@@ -1324,6 +1388,7 @@ func (stubCoordinatorInspector) Inspect(context.Context, string, triage.Issue) (
 
 type stubCoordinatorGitHub struct {
 	issues                   []githubinfra.IssueSummary
+	listIssues               func(githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary
 	details                  map[int64]githubinfra.IssueDetail
 	comments                 map[int64][][]githubinfra.CommentInfo
 	timeline                 map[int64][]map[string]any
@@ -1359,7 +1424,10 @@ type stubCoordinatorGitHub struct {
 	currentLoginForRepoCalls int
 }
 
-func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
+func (s *stubCoordinatorGitHub) ListOpenIssues(_ context.Context, input githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
+	if s.listIssues != nil {
+		return append([]githubinfra.IssueSummary(nil), s.listIssues(input)...), nil
+	}
 	return append([]githubinfra.IssueSummary(nil), s.issues...), nil
 }
 func (s *stubCoordinatorGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
@@ -2270,6 +2338,22 @@ func TestRunnerDispatchSkipsDependencyAPIsWhenDisabled(t *testing.T) {
 
 func joinLabels(labels []string) string {
 	return strings.Join(labels, ",")
+}
+
+func containsAllLabels(actual []string, expected ...string) bool {
+	for _, want := range expected {
+		found := false
+		for _, got := range actual {
+			if strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(want)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func seedParentIssue(fixture coordinatorFixture, issueNumber int64) {

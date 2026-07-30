@@ -212,13 +212,13 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if project.Archived || !roleCfg.Enabled {
 		return DiscoveryResult{Skipped: true}, nil
 	}
-	issues, err := r.github.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: 100})
-	if err != nil {
-		return DiscoveryResult{}, err
-	}
 	triageCfg := roleConfigToTriageConfig(roleCfg)
 	projectRoles := config.ProjectRoleConfigs(*r.config, input.ProjectID)
 	dispatchCfg := roleConfigToDispatchConfig(roleCfg, projectRoles)
+	issues, err := r.listCoordinatorIssues(ctx, input.Repo, project.RepoPath, triageCfg, dispatchCfg)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	reviewerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleReviewer)
 	fixerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleFixer)
 	workerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleWorker)
@@ -289,6 +289,74 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	}
 	return DiscoveryResult{Ticked: true}, nil
+}
+
+func (r *Runner) listCoordinatorIssues(ctx context.Context, repo, cwd string, triageCfg triage.Config, dispatchCfg dispatch.Config) ([]githubinfra.IssueSummary, error) {
+	issues, err := r.github.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: repo, CWD: cwd, Limit: 100})
+	if err != nil {
+		return nil, err
+	}
+	// The generic page keeps fresh triage and merge-watch reactive. Targeted
+	// oldest-first queries drain durable dispatch intent that has fallen off
+	// that page; excluding each trigger makes completed work leave the query.
+	seen := make(map[int64]struct{}, len(issues))
+	for _, issue := range issues {
+		seen[issue.Number] = struct{}{}
+	}
+	backlogLanes := []struct {
+		dispatchLabel string
+		triggerLabels []string
+	}{
+		{dispatchLabel: dispatch.DispatchPlan, triggerLabels: dispatchCfg.PlannerTriggerLabels},
+		{dispatchLabel: dispatch.DispatchImplement, triggerLabels: dispatchCfg.WorkerTriggerLabels},
+	}
+	for _, lane := range backlogLanes {
+		for _, triggerLabel := range lane.triggerLabels {
+			triggerLabel = strings.TrimSpace(triggerLabel)
+			if triggerLabel == "" {
+				continue
+			}
+			search := fmt.Sprintf("-label:%q sort:created-asc", triggerLabel)
+			if dispatchCfg.Mode == dispatch.ModeAutonomous {
+				search = autonomousBacklogSearch(search, dispatchCfg.HoldLabel)
+			}
+			backlog, err := r.github.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{
+				Repo:   repo,
+				CWD:    cwd,
+				Limit:  100,
+				Labels: []string{triageCfg.TriagedLabel, lane.dispatchLabel},
+				Search: search,
+			})
+			if err != nil {
+				return nil, err
+			}
+			for _, issue := range backlog {
+				if _, ok := seen[issue.Number]; ok {
+					continue
+				}
+				seen[issue.Number] = struct{}{}
+				issues = append(issues, issue)
+			}
+		}
+	}
+	return issues, nil
+}
+
+func autonomousBacklogSearch(search, legacyHoldLabel string) string {
+	holdLabels := []string{labels.HoldGlobal, strings.TrimSpace(legacyHoldLabel)}
+	seen := map[string]struct{}{}
+	for _, holdLabel := range holdLabels {
+		if holdLabel == "" {
+			continue
+		}
+		key := strings.ToLower(holdLabel)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		search = fmt.Sprintf("-label:%q %s", holdLabel, search)
+	}
+	return search
 }
 
 func filterLoadedIssues(loaded []loadedIssue, skipped map[int64]struct{}) []loadedIssue {
