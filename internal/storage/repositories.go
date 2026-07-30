@@ -693,12 +693,28 @@ func (r *LoopsRepository) upsertWithIssueClaimAdmission(ctx context.Context, rec
 	if err != nil {
 		return err
 	}
-	if !forceIssueClaim && issueClaimAdmissionRequired(current, record) {
+	if !forceIssueClaim && !LoopForcesIssueClaimAdmission(record) && issueClaimAdmissionRequired(current, record) {
 		if err := r.AssertIssueClaimAdmission(ctx, record, false); err != nil {
 			return err
 		}
 	}
 	return r.upsert(ctx, record, changeHumanHold)
+}
+
+// LoopForcesIssueClaimAdmission reports the durable operator override carried
+// by a manually forced worker lifecycle. It is intentionally part of the
+// worker's metadata so opening or adopting its pull request cannot silently
+// forget the authority that admitted the source issue in the first place.
+func LoopForcesIssueClaimAdmission(record LoopRecord) bool {
+	if record.Type != string(domain.LoopTypeWorker) || record.MetadataJSON == nil {
+		return false
+	}
+	var metadata struct {
+		Worker struct {
+			IssueClaimOverride bool `json:"issueClaimOverride"`
+		} `json:"worker"`
+	}
+	return json.Unmarshal([]byte(*record.MetadataJSON), &metadata) == nil && metadata.Worker.IssueClaimOverride
 }
 
 func issueClaimAdmissionRequired(current *LoopRecord, candidate LoopRecord) bool {

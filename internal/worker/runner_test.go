@@ -642,6 +642,64 @@ func TestDiscoverIssuesRequeuesFailedWorkerLoopWhenFingerprintChanges(t *testing
 	}
 }
 
+func TestDiscoverIssuesSkipsSourceIssueClaimHeldByReactiveLoop(t *testing.T) {
+	t.Parallel()
+	for _, loopType := range []string{"reviewer", "fixer"} {
+		t.Run(loopType, func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			issue := IssueSummary{Number: 93, Title: "Claimed issue", URL: "https://github.com/acme/looper/issues/93", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}
+			prNumber := int64(193)
+			prTarget := "pr:acme/looper:193"
+			claimMetadata := `{"worker":{"repo":"acme/looper","issueNumber":93}}`
+			if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_" + loopType + "_claim", Seq: 2, ProjectID: "project_1", Type: loopType, TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &claimMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+				t.Fatalf("seed %s claim: %v", loopType, err)
+			}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{issue}}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+			result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+			if err != nil {
+				t.Fatalf("DiscoverIssues() error = %v", err)
+			}
+			if result.Skipped == 0 || len(result.CreatedLoopIDs) != 0 || len(result.QueueItems) != 0 {
+				t.Fatalf("result = %#v, want source-issue claim skipped", result)
+			}
+		})
+	}
+}
+
+func TestDiscoverIssuesDoesNotReactivateWorkerWhenReactiveLoopClaimsSourceIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issue := IssueSummary{Number: 94, Title: "Changed issue", Body: "new body", URL: "https://github.com/acme/looper/issues/94", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}
+	targetID := buildIssueTargetID(repo, issue.Number)
+	oldFingerprint := buildWorkerDiscoveryFingerprint(repo, "main", IssueSummary{Number: issue.Number, Title: issue.Title, Body: "old body", URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
+	workerMetadata := fmt.Sprintf(`{"worker":{"repo":"acme/looper","issueNumber":94},"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, oldFingerprint)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_failed_worker", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "failed", MetadataJSON: &workerMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("seed failed worker: %v", err)
+	}
+	prNumber := int64(194)
+	prTarget := "pr:acme/looper:194"
+	claimMetadata := `{"worker":{"repo":"acme/looper","issueNumber":94}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_claim", Seq: 3, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &claimMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("seed reviewer claim: %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{issue}}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if result.Skipped == 0 || len(result.QueueItems) != 0 {
+		t.Fatalf("result = %#v, want rediscovery blocked by reviewer claim", result)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_failed_worker")
+	if err != nil || persisted == nil || persisted.Status != "failed" {
+		t.Fatalf("rediscovered worker = %#v, %v; want failed loop unchanged", persisted, err)
+	}
+}
+
 func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2305,6 +2363,54 @@ func TestPersistPullRequestReferenceRollsBackLoopWhenQueueUpdateFails(t *testing
 	}
 	if updatedQueue.TargetType != "issue" || updatedQueue.TargetID != "issue:acme/looper:27" || updatedQueue.PRNumber != nil {
 		t.Fatalf("queue after failed persist = %#v, want original issue target", updatedQueue)
+	}
+}
+
+func TestPersistPullRequestReferenceCarriesForcedIssueClaimOverride(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want worker loop", loop, err)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want worker queue", queue, err)
+	}
+	// Start inactive so the reactive claim can exist, then model the force=true
+	// API dispatch that explicitly admits this worker alongside it.
+	loop.Status = "failed"
+	loop.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("park worker before forced dispatch: %v", err)
+	}
+	prNumber := int64(101)
+	prTarget := "pr:acme/looper:101"
+	fixerMetadata := `{"worker":{"repo":"acme/looper","issueNumber":27}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_conflicting_fixer", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &prTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &fixerMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("seed conflicting fixer: %v", err)
+	}
+	forcedMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main","issueClaimOverride":true}}`
+	loop.MetadataJSON = &forcedMetadata
+	loop.Status = "queued"
+	loop.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Loops.UpsertForcingIssueClaimAdmission(context.Background(), *loop); err != nil {
+		t.Fatalf("persist force authority on worker: %v", err)
+	}
+	forcedPayload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main","issueClaimOverride":true}`
+	queue.PayloadJSON = &forcedPayload
+	queue.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Queue.Upsert(context.Background(), *queue); err != nil {
+		t.Fatalf("persist force authority on worker queue: %v", err)
+	}
+
+	if err := runner.persistPullRequestReference(context.Background(), *loop, *queue, "acme/looper", checkpointPullPR{Number: prNumber, URL: "https://example/pr/101"}); err != nil {
+		t.Fatalf("persistPullRequestReference() error = %v, want durable force authority to carry through retarget", err)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persisted == nil || persisted.TargetType != "pull_request" || !storage.LoopForcesIssueClaimAdmission(*persisted) {
+		t.Fatalf("retargeted loop = %#v, %v; want PR target retaining force authority", persisted, err)
 	}
 }
 

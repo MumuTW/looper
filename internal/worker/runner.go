@@ -625,12 +625,16 @@ type workerInput struct {
 	IssueURL      string `json:"issueUrl,omitempty"`
 	// TriggerLogin is who created/assigned the source issue (GitHub login), shown
 	// as attribution on the HITL ask card so a human knows whose task this is.
-	TriggerLogin         string   `json:"triggerLogin,omitempty"`
-	PRNumber             int64    `json:"prNumber,omitempty"`
-	PRTitle              string   `json:"prTitle,omitempty"`
-	Branch               string   `json:"branch,omitempty"`
-	HeadSHA              string   `json:"headSha,omitempty"`
-	AutoDiscovered       bool     `json:"autoDiscovered,omitempty"`
+	TriggerLogin   string `json:"triggerLogin,omitempty"`
+	PRNumber       int64  `json:"prNumber,omitempty"`
+	PRTitle        string `json:"prTitle,omitempty"`
+	Branch         string `json:"branch,omitempty"`
+	HeadSHA        string `json:"headSha,omitempty"`
+	AutoDiscovered bool   `json:"autoDiscovered,omitempty"`
+	// IssueClaimOverride is the durable operator authority from a force=true
+	// manual issue dispatch. It follows the worker through PR creation and
+	// adoption so source-issue admission is not re-applied mid-lifecycle.
+	IssueClaimOverride   bool     `json:"issueClaimOverride,omitempty"`
 	RoutedClaimMatchMode string   `json:"routedClaimMatchMode,omitempty"`
 	Reviewers            []string `json:"reviewers,omitempty"`
 }
@@ -940,6 +944,12 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		fingerprint := buildWorkerDiscoveryFingerprint(input.Repo, firstNonEmpty(derefString(project.BaseBranch), "main"), issue)
 		loopResult, err := r.ensureLoopForDiscoveredIssue(ctx, *project, input.Repo, issue, fingerprint)
 		if err != nil {
+			// A live reviewer/fixer source-issue claim makes only this issue
+			// ineligible. Continue discovering unrelated work.
+			if _, occupied := storage.IsIssueClaimConflictError(err); occupied {
+				result.Skipped++
+				continue
+			}
 			return DiscoveryResult{}, err
 		}
 		if loopResult.created {
@@ -2432,7 +2442,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 	projectMetadata := parseJSONObject(project.MetadataJSON)
 	repo := firstNonEmpty(stringFromAnyDefault(source["repo"]), derefString(loop.Repo), stringFromAnyDefault(projectMetadata["repo"]))
 	baseBranch := firstNonEmpty(stringFromAnyDefault(source["baseBranch"]), stringFromAnyDefault(metadata["baseBranch"]), derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), Reviewers: stringSliceFromAny(source["reviewers"])}
+	work := workerInput{Title: firstNonEmpty(stringFromAnyDefault(source["title"]), "Worker run"), Prompt: stringFromAnyDefault(source["prompt"]), SpecPath: stringFromAnyDefault(source["specPath"]), Repo: repo, IssueRepo: stringFromAnyDefault(source["issueRepo"]), BaseBranch: baseBranch, ExecutionMode: executionMode, IssueNumber: int64FromAny(source["issueNumber"]), IssueURL: stringFromAnyDefault(source["issueUrl"]), TriggerLogin: stringFromAnyDefault(source["triggerLogin"]), PRNumber: int64FromAny(source["prNumber"]), Branch: stringFromAnyDefault(source["branch"]), HeadSHA: stringFromAnyDefault(source["headSha"]), AutoDiscovered: boolFromAny(source["autoDiscovered"]), IssueClaimOverride: boolFromAny(source["issueClaimOverride"]), Reviewers: stringSliceFromAny(source["reviewers"])}
 	if work.IssueNumber == 0 && loop.TargetType == "issue" {
 		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
 	}
@@ -2948,7 +2958,7 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 		updatedLoop.PRNumber = int64Ptr(pr.Number)
 		updatedLoop.MetadataJSON = stringPtr(metadataJSON)
 		updatedLoop.UpdatedAt = nowISO
-		if err := repos.Loops.AssertIssueClaimAdmission(ctx, updatedLoop, false); err != nil {
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, updatedLoop, storage.LoopForcesIssueClaimAdmission(updatedLoop)); err != nil {
 			return err
 		}
 		if err := repos.Loops.Upsert(ctx, updatedLoop); err != nil {
@@ -2990,22 +3000,47 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 			}
 			updated.MetadataJSON = &metadataJSON
 			updated.UpdatedAt = nowISO
-			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+			published, err := r.publishDiscoveredIssueLoop(ctx, updated)
+			if err != nil {
 				return loopUpsertResult{}, err
 			}
-			return loopUpsertResult{record: updated}, nil
+			return loopUpsertResult{record: published}, nil
 		}
 	}
-	seq, err := r.repos.Loops.AllocateSeq(ctx)
+	metadataJSON := mustMarshalJSON(workerMeta)
+	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), ProjectID: project.ID, Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "queued", MetadataJSON: &metadataJSON, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	published, err := r.publishDiscoveredIssueLoop(ctx, loop)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	metadataJSON := mustMarshalJSON(workerMeta)
-	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "queued", MetadataJSON: &metadataJSON, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
-		return loopUpsertResult{}, err
+	return loopUpsertResult{record: published, created: true}, nil
+}
+
+// publishDiscoveredIssueLoop shares the source-issue publication authority
+// with manual dispatch. Allocating a new loop sequence, asserting admission,
+// and exposing an active worker happen in one transaction; rediscovery follows
+// the same path when it changes an inactive worker back to queued.
+func (r *Runner) publishDiscoveredIssueLoop(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	if r.db == nil {
+		return storage.LoopRecord{}, fmt.Errorf("worker runner database is not configured")
 	}
-	return loopUpsertResult{record: loop, created: true}, nil
+	return storage.WithTransactionValue(ctx, r.db, nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		if loop.Seq == 0 {
+			seq, err := repos.Loops.AllocateSeq(ctx)
+			if err != nil {
+				return storage.LoopRecord{}, err
+			}
+			loop.Seq = seq
+		}
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, loop, false); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		return loop, nil
+	})
 }
 
 func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, repo string, issue IssueSummary, fingerprint string) (storage.QueueItemRecord, error) {

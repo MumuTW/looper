@@ -4508,21 +4508,23 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 
 	workerPayload := struct {
-		Title       string  `json:"title"`
-		Prompt      *string `json:"prompt"`
-		SpecPath    *string `json:"specPath"`
-		Repo        string  `json:"repo"`
-		BaseBranch  string  `json:"baseBranch"`
-		IssueNumber *int64  `json:"issueNumber,omitempty"`
-		PRNumber    *int64  `json:"prNumber,omitempty"`
+		Title              string  `json:"title"`
+		Prompt             *string `json:"prompt"`
+		SpecPath           *string `json:"specPath"`
+		Repo               string  `json:"repo"`
+		BaseBranch         string  `json:"baseBranch"`
+		IssueNumber        *int64  `json:"issueNumber,omitempty"`
+		PRNumber           *int64  `json:"prNumber,omitempty"`
+		IssueClaimOverride bool    `json:"issueClaimOverride,omitempty"`
 	}{
-		Title:       title,
-		Prompt:      prompt,
-		SpecPath:    effectiveSpecPath,
-		Repo:        *repo,
-		BaseBranch:  *baseBranch,
-		IssueNumber: issueNumber,
-		PRNumber:    effectivePRNumber,
+		Title:              title,
+		Prompt:             prompt,
+		SpecPath:           effectiveSpecPath,
+		Repo:               *repo,
+		BaseBranch:         *baseBranch,
+		IssueNumber:        issueNumber,
+		PRNumber:           effectivePRNumber,
+		IssueClaimOverride: issueNumber != nil && derefBool(body.Force),
 	}
 	payloadJSONBytes, err := json.Marshal(struct {
 		Worker any `json:"worker"`
@@ -5016,10 +5018,8 @@ func forcedManualWorkerQueuePayloadJSONCompat(payloadJSON *string) *string {
 	if len(payload) == 0 {
 		return payloadJSON
 	}
-	if payload["autoDiscovered"] != true {
-		return payloadJSON
-	}
 	delete(payload, "autoDiscovered")
+	payload["issueClaimOverride"] = true
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return payloadJSON
@@ -5061,11 +5061,12 @@ func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
 	if len(metadata) == 0 {
 		return metadataJSON
 	}
-	worker, _ := metadata["worker"].(map[string]any)
-	if worker["autoDiscovered"] != true {
+	worker, ok := metadata["worker"].(map[string]any)
+	if !ok {
 		return metadataJSON
 	}
 	delete(worker, "autoDiscovered")
+	worker["issueClaimOverride"] = true
 	metadata["worker"] = worker
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
@@ -5080,11 +5081,12 @@ func forcedManualWorkerCheckpointJSONCompat(checkpointJSON *string) *string {
 	if len(checkpoint) == 0 {
 		return checkpointJSON
 	}
-	work, _ := checkpoint["work"].(map[string]any)
-	if work["autoDiscovered"] != true {
+	work, ok := checkpoint["work"].(map[string]any)
+	if !ok {
 		return checkpointJSON
 	}
 	delete(work, "autoDiscovered")
+	work["issueClaimOverride"] = true
 	checkpoint["work"] = work
 	encoded, err := json.Marshal(checkpoint)
 	if err != nil {

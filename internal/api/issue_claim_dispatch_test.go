@@ -202,6 +202,17 @@ func TestHandlerWorkerCreateForceOverridesCollision(t *testing.T) {
 		t.Fatalf("force=true dispatch status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
 	assertQueuedIssueWorker(t, fixture)
+	queue, err := repos.Queue.FindActiveByDedupe(context.Background(), "worker:project_1:acme/looper:77")
+	if err != nil || queue == nil {
+		t.Fatalf("find forced worker queue = %#v, %v", queue, err)
+	}
+	loop, err := repos.Loops.GetByID(context.Background(), derefString(queue.LoopID))
+	if err != nil || loop == nil || !storage.LoopForcesIssueClaimAdmission(*loop) {
+		t.Fatalf("forced worker loop = %#v, %v; want durable issue-claim override", loop, err)
+	}
+	if payload := parseJSONObject(queue.PayloadJSON); payload["issueClaimOverride"] != true {
+		t.Fatalf("forced worker queue payload = %#v, want durable issue-claim override", payload)
+	}
 }
 
 func TestHandlerWorkerCreateIgnoresUnrelatedMalformedLoopMetadata(t *testing.T) {
