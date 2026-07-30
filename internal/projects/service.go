@@ -229,6 +229,22 @@ type AddInput struct {
 	SnapshotMode SnapshotMode
 }
 
+// UpdateStringField distinguishes an omitted patch field from an explicit JSON
+// null. Set=false preserves the stored value; Set=true with Value=nil clears a
+// nullable field. Keep this separate from AddInput because creation defaults
+// are not repair defaults.
+type UpdateStringField struct {
+	Set   bool
+	Value *string
+}
+
+type UpdateInput struct {
+	Repo         UpdateStringField
+	Name         UpdateStringField
+	BaseBranch   UpdateStringField
+	WorktreeRoot UpdateStringField
+}
+
 type AddResult struct {
 	Project  storage.ProjectRecord
 	Repo     *string
@@ -613,6 +629,146 @@ func (s *Service) ResumeIncompleteDiscoveries(ctx context.Context) error {
 	// queue; newly registered projects retain their existing async behavior.
 	s.scheduleDiscoveries(inputs)
 	return nil
+}
+
+// UpdateProject repairs an API-managed project without applying creation
+// defaults or disturbing its loops and queue items. The database record is the
+// authority; the catalog is materialized and published from that replacement
+// in the same config boundary used by registration.
+func (s *Service) UpdateProject(ctx context.Context, identifier string, input UpdateInput) (storage.ProjectRecord, error) {
+	if s.Repos == nil || s.Repos.Projects == nil {
+		return storage.ProjectRecord{}, fmt.Errorf("projects repository is not configured")
+	}
+	if !input.Repo.Set && !input.Name.Set && !input.BaseBranch.Set && !input.WorktreeRoot.Set {
+		return storage.ProjectRecord{}, ProjectValidationError{Message: "at least one project field is required"}
+	}
+
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return storage.ProjectRecord{}, ProjectValidationError{Message: "project identifier is required"}
+	}
+	project, err := s.resolveActiveProjectForRemoval(ctx, identifier)
+	if err != nil {
+		return storage.ProjectRecord{}, err
+	}
+	if project == nil {
+		return storage.ProjectRecord{}, ProjectNotFoundError{Identifier: identifier}
+	}
+
+	unlockProject, err := s.lockProjectOperations(ctx, project.ID)
+	if err != nil {
+		return storage.ProjectRecord{}, err
+	}
+	defer unlockProject()
+	// Discovery may have committed metadata while this update waited for its
+	// operation lock. Re-read before constructing a whole-record replacement.
+	project, err = s.Repos.Projects.GetByID(ctx, project.ID)
+	if err != nil {
+		return storage.ProjectRecord{}, err
+	}
+	if project == nil || project.Archived {
+		return storage.ProjectRecord{}, ProjectNotFoundError{Identifier: identifier}
+	}
+	metadata := parseMetadata(project.MetadataJSON)
+	if metadataString(metadata, "source") == "config" {
+		return storage.ProjectRecord{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", project.ID)}
+	}
+
+	updated := *project
+	previousRepo := metadataString(metadata, "repo")
+	repoChanged := false
+	if input.Name.Set {
+		if input.Name.Value == nil || strings.TrimSpace(*input.Name.Value) == "" {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: "name must not be empty when provided"}
+		}
+		updated.Name = strings.TrimSpace(*input.Name.Value)
+	}
+	if input.BaseBranch.Set {
+		if input.BaseBranch.Value == nil {
+			updated.BaseBranch = nil
+		} else if branch := strings.TrimSpace(*input.BaseBranch.Value); branch == "" {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: "baseBranch must not be empty when provided"}
+		} else {
+			updated.BaseBranch = stringPointer(branch)
+		}
+	}
+	if input.Repo.Set {
+		if input.Repo.Value == nil {
+			metadata["repo"] = nil
+			repoChanged = previousRepo != ""
+		} else {
+			repo := strings.TrimSpace(*input.Repo.Value)
+			parts := strings.Split(repo, "/")
+			if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+				return storage.ProjectRecord{}, ProjectValidationError{Message: "repo must be owner/name"}
+			}
+			metadata["repo"] = repo
+			repoChanged = previousRepo != repo
+		}
+	}
+	if input.WorktreeRoot.Set {
+		if input.WorktreeRoot.Value == nil || strings.TrimSpace(*input.WorktreeRoot.Value) == "" {
+			metadata["worktreeRoot"] = nil
+		} else {
+			metadata["worktreeRoot"] = strings.TrimSpace(*input.WorktreeRoot.Value)
+		}
+	}
+
+	var repo *string
+	if value := metadataString(metadata, "repo"); value != "" {
+		repo = stringPointer(value)
+	}
+	baseBranch := s.currentConfig().Defaults.BaseBranch
+	if updated.BaseBranch != nil && strings.TrimSpace(*updated.BaseBranch) != "" {
+		baseBranch = *updated.BaseBranch
+	}
+	if err := s.validateReviewerAutoMergeForProject(ctx, updated.ID, repo, baseBranch, s.currentConfig()); err != nil {
+		return storage.ProjectRecord{}, err
+	}
+	if repoChanged {
+		discovery := discoveryStateFromMetadata(metadata)
+		discovery.Status = DiscoveryStatusPending
+		discovery.Error = ""
+		discovery.UpdatedAt = currentISO(s.Now)
+		if discovery.SnapshotMode == "" {
+			discovery.SnapshotMode = SnapshotModeAsync
+		}
+		metadata[registrationDiscoveryMetadataKey] = discoveryStateMap(discovery)
+	}
+	metadataJSON, err := buildAddProjectMetadataJSON(metadata)
+	if err != nil {
+		return storage.ProjectRecord{}, fmt.Errorf("marshal project metadata: %w", err)
+	}
+	updated.MetadataJSON = stringPointer(metadataJSON)
+	updated.UpdatedAt = currentISO(s.Now)
+
+	var published bool
+	err = s.withConfigBoundary(func() error {
+		next, materializeErr := s.materializeCandidate(ctx, &updated, "")
+		if materializeErr != nil {
+			return ProjectValidationError{Message: materializeErr.Error()}
+		}
+		if upsertErr := s.Repos.Projects.Upsert(ctx, updated); upsertErr != nil {
+			return upsertErr
+		}
+		if s.PublishProjects != nil {
+			s.PublishProjects(next)
+			published = true
+		}
+		return nil
+	})
+	if err != nil {
+		return storage.ProjectRecord{}, err
+	}
+	if published && s.AfterPublishProjects != nil {
+		s.AfterPublishProjects()
+	}
+	if repoChanged {
+		s.scheduleDiscovery(DiscoverInput{ProjectID: updated.ID, SnapshotMode: discoveryStateFromMetadata(metadata).SnapshotMode})
+	}
+	return updated, nil
 }
 
 func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {

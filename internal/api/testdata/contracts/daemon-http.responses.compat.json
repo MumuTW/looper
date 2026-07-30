@@ -1138,6 +1138,26 @@
       }
     },
     {
+      "id": "projects.update",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "id": "project_1",
+          "name": "Looper",
+          "repoPath": "/tmp/looper",
+          "baseBranch": "main",
+          "archived": false,
+          "provider": "github",
+          "repo": "nexu-io/looper",
+          "worktreeRoot": null,
+          "createdAt": "2026-04-11T12:00:00.000Z",
+          "updatedAt": "2026-04-11T12:00:00.000Z"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
       "id": "runs.list",
       "status": 200,
       "body": {
