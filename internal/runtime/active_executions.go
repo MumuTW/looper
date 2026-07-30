@@ -59,19 +59,22 @@ type ActiveExecutionRegistry struct {
 	// cancel these so native-resume fallback cannot re-spawn after drain.
 	active        map[uint64]*spawnLease
 	stoppingLoops map[string]int
-	// stopEpoch is bumped by ClearLoopStop so outstanding BeginLoopStop release
-	// closures captured before the clear become no-ops. Without this, a
-	// temporary release (e.g. stopCandidateExecution) that outlived ClearLoopStop
-	// could still decrement a later RestoreLoopStop sticky ref and reopen
-	// AdmitSpawn for pre-stop runners.
-	stopEpoch map[string]uint64
-	// stopReleases counts outstanding BeginLoopStop release closures per loop,
-	// including invalidated ones that have not run yet. A stopEpoch entry may
-	// only be reclaimed once no closure that could still compare against it
-	// exists (stopReleases zero) and no stop gate is active; deleting earlier
-	// would reset the epoch to zero and revive a stale closure that captured
-	// epoch zero before a ClearLoopStop/RestoreLoopStop cycle.
-	stopReleases map[string]int
+	// stopGates carries the per-loop stop generation. Each BeginLoopStop
+	// release closure captures the gate pointer plus its epoch at capture
+	// time; ClearLoopStop bumps the epoch so closures captured before the
+	// clear become no-ops. Without this, a temporary release (e.g.
+	// stopCandidateExecution) that outlived ClearLoopStop could still
+	// decrement a later RestoreLoopStop sticky ref and reopen AdmitSpawn for
+	// pre-stop runners.
+	//
+	// An entry is reclaimed whenever no stop gate is active: every closure
+	// that still matches its gate holds a stoppingLoops ref, so at that
+	// boundary all un-run closures are stale, and pointer identity keeps them
+	// no-ops after a fresh gate (a new generation) is created for the loop.
+	// This also retires closures that are abandoned on purpose — haltLoop's
+	// durable pause never calls its release — the moment ClearLoopStop
+	// reactivates the loop.
+	stopGates map[string]*loopStopGate
 	// stopDrained records execution keys confirmed-drained by BeginLoopStop
 	// (or Kill) while a loop stop gate is active. haltLoop looks up Kill by
 	// durable id after BeginLoopStop; concurrent releaseLease can delete the
@@ -123,8 +126,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 		pending:          make(map[uint64]*spawnLease),
 		active:           make(map[uint64]*spawnLease),
 		stoppingLoops:    make(map[string]int),
-		stopEpoch:        make(map[string]uint64),
-		stopReleases:     make(map[string]int),
+		stopGates:        make(map[string]*loopStopGate),
 		stopDrained:      make(map[string]struct{}),
 		pendingOps:       make(map[uint64]*operationLease),
 		boundOps:         make(map[uint64]*operationLease),
@@ -716,11 +718,17 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	}
 	r.mu.Lock()
 	r.stoppingLoops[loopID]++
-	// Capture epoch so a later ClearLoopStop can invalidate this release without
-	// needing to track each closure. Epoch is only bumped on clear; the entry is
-	// reclaimed once no closure remains that could compare against it.
-	epoch := r.stopEpoch[loopID]
-	r.stopReleases[loopID]++
+	// Capture the gate pointer and its epoch so a later ClearLoopStop can
+	// invalidate this release without tracking each closure: an epoch bump
+	// invalidates closures of the live generation, and reclamation replaces
+	// the gate object entirely so closures of dead generations fail the
+	// pointer-identity check no matter what a fresh gate's epoch is.
+	gate := r.stopGates[loopID]
+	if gate == nil {
+		gate = &loopStopGate{}
+		r.stopGates[loopID] = gate
+	}
+	epoch := gate.epoch
 	targets := r.collectLoopStopTargetsLocked(loopID)
 	r.mu.Unlock()
 	drainErr := r.cancelAndDrainLoop(loopID, reason, targets)
@@ -729,10 +737,10 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 		once.Do(func() {
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			r.decStopReleasesLocked(loopID)
-			// ClearLoopStop bumped the epoch: this release no longer owns a ref.
-			if r.stopEpoch[loopID] != epoch {
-				r.maybeReclaimStopStateLocked(loopID)
+			// A different (or missing) gate means this closure belongs to a
+			// reclaimed generation; a bumped epoch means ClearLoopStop already
+			// took this ref. Either way it owns nothing now.
+			if r.stopGates[loopID] != gate || gate.epoch != epoch {
 				return
 			}
 			if r.stoppingLoops[loopID] <= 1 {
@@ -741,32 +749,26 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 			} else {
 				r.stoppingLoops[loopID]--
 			}
-			r.maybeReclaimStopStateLocked(loopID)
+			r.maybeReclaimStopGateLocked(loopID)
 		})
 	}, drainErr
 }
 
-func (r *ActiveExecutionRegistry) decStopReleasesLocked(loopID string) {
-	if r.stopReleases[loopID] <= 1 {
-		delete(r.stopReleases, loopID)
-	} else {
-		r.stopReleases[loopID]--
-	}
+// loopStopGate is one stop generation for a loop; see stopGates.
+type loopStopGate struct {
+	epoch uint64
 }
 
-// maybeReclaimStopStateLocked drops the loop's stop-epoch entry once nothing
-// can observe it: no active stop gate and no outstanding release closure. At
-// that point every un-run closure has a stale epoch by construction, and a
-// fresh BeginLoopStop starting again from epoch zero is indistinguishable from
-// a loop never stopped.
-func (r *ActiveExecutionRegistry) maybeReclaimStopStateLocked(loopID string) {
+// maybeReclaimStopGateLocked drops the loop's stop gate once no stop is
+// active. Every closure still matching its captured gate and epoch holds a
+// stoppingLoops ref, so at this boundary all un-run closures — including ones
+// abandoned by design, like haltLoop's durable pause — are stale, and the
+// pointer-identity check keeps them no-ops forever.
+func (r *ActiveExecutionRegistry) maybeReclaimStopGateLocked(loopID string) {
 	if _, active := r.stoppingLoops[loopID]; active {
 		return
 	}
-	if _, outstanding := r.stopReleases[loopID]; outstanding {
-		return
-	}
-	delete(r.stopEpoch, loopID)
+	delete(r.stopGates, loopID)
 }
 
 // ClearLoopStop reopens spawn admission for a loop after intentional re-activation
@@ -779,7 +781,7 @@ func (r *ActiveExecutionRegistry) maybeReclaimStopStateLocked(loopID string) {
 // failed start/retry/reuse TX would skip RestoreLoopStop.
 //
 // Outstanding BeginLoopStop release closures captured before this clear are
-// invalidated via stopEpoch: deleting the refcount alone is not enough, because
+// invalidated via the stop gate epoch: deleting the refcount alone is not enough;
 // a temporary release (stopCandidateExecution) can still run after a failed
 // reactivation's RestoreLoopStop and would otherwise drop the restored sticky
 // gate when it sees count <= 1.
@@ -790,11 +792,14 @@ func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) (wasActive bool) 
 	r.mu.Lock()
 	wasActive = r.stoppingLoops[loopID] > 0
 	delete(r.stoppingLoops, loopID)
-	// Bump even when wasActive is false so a concurrent BeginLoopStop that lost
-	// the race to this delete cannot leave a live release that still matches.
-	r.stopEpoch[loopID]++
+	// Bump so a BeginLoopStop that captured before this clear cannot leave a
+	// live release that still matches; the following reclaim then retires the
+	// generation, and pointer identity keeps its closures no-ops.
+	if gate, ok := r.stopGates[loopID]; ok {
+		gate.epoch++
+	}
 	r.clearStopDrainedForLoopLocked(loopID)
-	r.maybeReclaimStopStateLocked(loopID)
+	r.maybeReclaimStopGateLocked(loopID)
 	r.mu.Unlock()
 	return wasActive
 }

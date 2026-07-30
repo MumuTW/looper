@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-func (r *ActiveExecutionRegistry) stopStateSizes() (epochs, releases, stopping int) {
+func (r *ActiveExecutionRegistry) stopStateSizes() (gates, stopping int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.stopEpoch), len(r.stopReleases), len(r.stoppingLoops)
+	return len(r.stopGates), len(r.stoppingLoops)
 }
 
 func TestStopStateReclaimedAfterTerminalLoopChurn(t *testing.T) {
@@ -32,9 +32,9 @@ func TestStopStateReclaimedAfterTerminalLoopChurn(t *testing.T) {
 		release()
 	}
 
-	epochs, releases, stopping := registry.stopStateSizes()
-	if epochs != 0 || releases != 0 || stopping != 0 {
-		t.Fatalf("stop state after churn = epochs:%d releases:%d stopping:%d, want all 0", epochs, releases, stopping)
+	gates, stopping := registry.stopStateSizes()
+	if gates != 0 || stopping != 0 {
+		t.Fatalf("stop state after churn = gates:%d stopping:%d, want all 0", gates, stopping)
 	}
 }
 
@@ -69,8 +69,51 @@ func TestStaleReleaseCannotClearRestoredGateAcrossReclaim(t *testing.T) {
 	if wasActive := registry.ClearLoopStop(loopID); !wasActive {
 		t.Fatal("final ClearLoopStop() = false, want active gate")
 	}
-	epochs, releases, stopping := registry.stopStateSizes()
-	if epochs != 0 || releases != 0 || stopping != 0 {
-		t.Fatalf("stop state after final clear = epochs:%d releases:%d stopping:%d, want all 0", epochs, releases, stopping)
+	gates, stopping := registry.stopStateSizes()
+	if gates != 0 || stopping != 0 {
+		t.Fatalf("stop state after final clear = gates:%d stopping:%d, want all 0", gates, stopping)
+	}
+}
+
+func TestAbandonedStickyStopReleaseIsRetiredByClear(t *testing.T) {
+	t.Parallel()
+
+	registry := NewActiveExecutionRegistry()
+	const loopID = "loop_durable_pause"
+
+	// haltLoop's durable pause keeps the returned release uncalled on purpose:
+	// the sticky gate must survive until an intentional reactivation.
+	release, err := registry.BeginLoopStop(loopID, "durable pause")
+	if err != nil {
+		t.Fatalf("BeginLoopStop() error = %v", err)
+	}
+	if !registry.LoopStopActive(loopID) {
+		t.Fatal("LoopStopActive() = false, want sticky gate closed")
+	}
+
+	// Intentional reactivation must retire the abandoned closure's state even
+	// though that closure never runs.
+	if wasActive := registry.ClearLoopStop(loopID); !wasActive {
+		t.Fatal("ClearLoopStop() = false, want active gate")
+	}
+	gates, stopping := registry.stopStateSizes()
+	if gates != 0 || stopping != 0 {
+		t.Fatalf("stop state after reactivation = gates:%d stopping:%d, want all 0", gates, stopping)
+	}
+
+	// If the abandoned closure does run later (defensive), it must be a no-op
+	// against a fresh generation.
+	again, err := registry.BeginLoopStop(loopID, "fresh generation")
+	if err != nil {
+		t.Fatalf("BeginLoopStop(fresh) error = %v", err)
+	}
+	release()
+	if !registry.LoopStopActive(loopID) {
+		t.Fatal("LoopStopActive() = false: abandoned stale release cleared a fresh generation's gate")
+	}
+	again()
+	gates, stopping = registry.stopStateSizes()
+	if gates != 0 || stopping != 0 {
+		t.Fatalf("stop state after fresh release = gates:%d stopping:%d, want all 0", gates, stopping)
 	}
 }
