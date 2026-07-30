@@ -57,6 +57,38 @@ func TestLoopTargetGuardKeyOmitsTypeForPullRequest(t *testing.T) {
 	}
 }
 
+func TestTargetLeaseKeyKeepsProjectWorkersIndependent(t *testing.T) {
+	first := storage.LoopRecord{
+		ID: "worker_1", ProjectID: "proj", Type: string(domain.LoopTypeWorker), TargetType: string(domain.LoopTargetTypeProject),
+	}
+	second := first
+	second.ID = "worker_2"
+
+	if got := TargetLeaseKeyFromRecord(first); got != "proj|worker:worker_1" {
+		t.Fatalf("TargetLeaseKeyFromRecord(first) = %q, want project-scoped worker key", got)
+	}
+	if got := TargetLeaseKeyFromRecord(second); got != "proj|worker:worker_2" {
+		t.Fatalf("TargetLeaseKeyFromRecord(second) = %q, want independent project worker key", got)
+	}
+}
+
+func TestTargetLeaseKeySharesIssueAcrossRoles(t *testing.T) {
+	targetID := "issue:acme/looper:7"
+	planner := storage.LoopRecord{
+		ID: "planner_1", ProjectID: "proj", Type: string(domain.LoopTypePlanner), TargetType: string(domain.LoopTargetTypeIssue), TargetID: &targetID,
+	}
+	worker := planner
+	worker.ID = "worker_1"
+	worker.Type = string(domain.LoopTypeWorker)
+
+	if got := TargetLeaseKeyFromRecord(planner); got != "proj|issue:acme/looper:7" {
+		t.Fatalf("TargetLeaseKeyFromRecord(planner) = %q, want issue target key", got)
+	}
+	if got := TargetLeaseKeyFromRecord(worker); got != "proj|issue:acme/looper:7" {
+		t.Fatalf("TargetLeaseKeyFromRecord(worker) = %q, want shared issue target key", got)
+	}
+}
+
 func TestGuardRegistryReclaimsEntriesAfterChurn(t *testing.T) {
 	t.Parallel()
 

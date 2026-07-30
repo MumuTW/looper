@@ -16,6 +16,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/domain"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	"github.com/nexu-io/looper/internal/loops"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -170,6 +171,46 @@ func TestHandlerLoopRetryDiscardWorktreeChangesDirtyFixer(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected looper.worktree.changes_discarded event")
+	}
+}
+
+func TestHandlerLoopRetryDiscardRefusesHumanTargetLeaseBeforeGitMutation(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-07-31T08:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_human_lease",
+		LoopID:    "loop_retry_discard_human_lease",
+		LoopSeq:   3991,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-human-lease",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	leaseKey := loops.TargetLeaseKeyFromRecord(*loop)
+	acquired, err := services.Repositories.TargetLeases.Acquire(context.Background(), storage.TargetLeaseRecord{
+		TargetKey: leaseKey, OwnerToken: "human-token", OwnerKind: "human", OwnerID: "other-loop", Purpose: "takeover", AcquiredAt: nowISO, UpdatedAt: nowISO,
+	})
+	if err != nil || !acquired {
+		t.Fatalf("TargetLeases.Acquire() = (%v, %v), want (true, nil)", acquired, err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3991/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true,"discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "target checkout is held by human other-loop for takeover") {
+		t.Fatalf("body = %s, want target lease holder explanation", recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "dirty\n" {
+		t.Fatalf("dirty worktree changed despite human target lease: dirty.txt = %q", got)
 	}
 }
 

@@ -1,6 +1,8 @@
 package loops
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -8,6 +10,17 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// NewTargetLeaseOwnerToken returns an opaque capability used to release a
+// durable target lease. The token is deliberately unrelated to loop or queue
+// IDs so a stale owner cannot guess a later holder's release capability.
+func NewTargetLeaseOwnerToken() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate target lease owner token: %w", err)
+	}
+	return hex.EncodeToString(raw), nil
+}
 
 // guardRegistry hands out per-key mutexes and reclaims entries when the last
 // holder or waiter releases, so a long-running daemon churning through
@@ -113,6 +126,30 @@ func LoopTargetGuardKey(projectID, loopType, targetType, targetKey string) strin
 // so API and runtime share the same mutex entries.
 func LoopTargetGuardKeyFromRecord(loop storage.LoopRecord) string {
 	return LoopTargetGuardKey(loop.ProjectID, loop.Type, loop.TargetType, TargetKeyFromLoopRecord(loop))
+}
+
+// TargetLeaseKeyFromRecord returns the durable checkout-ownership key for a
+// loop. Pull requests and issues intentionally reuse the shared target key
+// used by the process-local guard. A project-scoped worker has its own branch
+// and checkout, so its lease is unique to that loop rather than omitted.
+func TargetLeaseKeyFromRecord(loop storage.LoopRecord) string {
+	if loop.Type == string(domain.LoopTypeWorker) && loop.TargetType == string(domain.LoopTargetTypeProject) {
+		projectID := strings.TrimSpace(loop.ProjectID)
+		loopID := strings.TrimSpace(loop.ID)
+		if projectID == "" || loopID == "" {
+			return ""
+		}
+		return fmt.Sprintf("%s|worker:%s", projectID, loopID)
+	}
+	projectID := strings.TrimSpace(loop.ProjectID)
+	targetKey := strings.TrimSpace(TargetKeyFromLoopRecord(loop))
+	if projectID == "" || targetKey == "" {
+		return ""
+	}
+	// Unlike the in-process guard, an issue checkout belongs to its target, not
+	// the role that happened to create it. This keeps every role that reaches
+	// the same issue checkout on one durable lease.
+	return fmt.Sprintf("%s|%s", projectID, targetKey)
 }
 
 // PullRequestTargetGuardKey builds the shared PR worktree target mutex key from

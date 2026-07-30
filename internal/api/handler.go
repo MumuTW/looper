@@ -6013,6 +6013,39 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
 	defer unlockTarget()
 
+	// A destructive retry owns the target for its entire git reset/clean window.
+	// The process-local guard above only serializes this daemon; the durable lease
+	// also orders it against takeover and cleanup across daemon restarts.
+	if discardWorktreeChanges {
+		targetLeaseKey := loops.TargetLeaseKeyFromRecord(*preflightLoop)
+		if targetLeaseKey == "" {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("Cannot derive target lease key for discard retry loop %s", loopID)}
+		}
+		ownerToken, tokenErr := loops.NewTargetLeaseOwnerToken()
+		if tokenErr != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: tokenErr.Error()}
+		}
+		acquired, acquireErr := services.Repositories.TargetLeases.Acquire(ctx, storage.TargetLeaseRecord{
+			TargetKey: targetLeaseKey, OwnerToken: ownerToken, OwnerKind: "operator", OwnerID: loopID, Purpose: "discard_retry", AcquiredAt: nowISO, UpdatedAt: nowISO,
+		})
+		if acquireErr != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: acquireErr.Error()}
+		}
+		if !acquired {
+			holder, holderErr := services.Repositories.TargetLeases.Get(ctx, targetLeaseKey)
+			if holderErr != nil {
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: holderErr.Error()}
+			}
+			if holder == nil {
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: fmt.Sprintf("Cannot discard worktree changes for loop %s because its target lease changed; retry the request", loopID)}
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: fmt.Sprintf("Cannot discard worktree changes for loop %s because its target checkout is held by %s %s for %s", loopID, holder.OwnerKind, holder.OwnerID, holder.Purpose)}
+		}
+		defer func() {
+			_, _ = services.Repositories.TargetLeases.Release(context.Background(), targetLeaseKey, ownerToken)
+		}()
+	}
+
 	// Opt-in discard runs before requeue so git mutation stays outside the
 	// queue transaction. Every non-mutating retry blocker must pass first so a
 	// later precondition failure never leaves discarded worktree changes
@@ -6148,6 +6181,31 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		target, targetErr := loopTargetFromRecordCompat(*loop)
 		if targetErr != nil {
 			return retryResult{}, targetErr
+		}
+		// A human lease remains authoritative until the handback's replacement
+		// queue item is durably published. Releasing it before this transaction
+		// would create a window where takeover reports no human owner while the
+		// loop is still parked; releasing it here makes handback's ownership
+		// change and requeue one SQLite commit.
+		if fromHandback {
+			targetLeaseKey := loops.TargetLeaseKeyFromRecord(*loop)
+			if targetLeaseKey == "" {
+				return retryResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("Cannot derive target lease key for handback loop %s", loop.ID)}
+			}
+			lease, err := repos.TargetLeases.Get(ctx, targetLeaseKey)
+			if err != nil {
+				return retryResult{}, err
+			}
+			if lease == nil || lease.OwnerKind != "human" || lease.OwnerID != loop.ID {
+				return retryResult{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: fmt.Sprintf("Cannot hand back loop %s because its human target lease is no longer held", loop.ID)}
+			}
+			released, err := repos.TargetLeases.Release(ctx, targetLeaseKey, lease.OwnerToken)
+			if err != nil {
+				return retryResult{}, err
+			}
+			if !released {
+				return retryResult{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: fmt.Sprintf("Cannot hand back loop %s because its human target lease changed", loop.ID)}
+			}
 		}
 		latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {

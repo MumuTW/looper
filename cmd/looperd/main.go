@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/dashboard"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/loops"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
@@ -453,10 +454,55 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	if err != nil {
 		return result, err
 	}
+	if services.Repositories == nil || services.Repositories.Loops == nil || services.Repositories.TargetLeases == nil {
+		return result, fmt.Errorf("target lease storage is not configured")
+	}
+	loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return result, fmt.Errorf("load loop target before takeover: %w", err)
+	}
+	if loop == nil {
+		return result, fmt.Errorf("loop not found: %s", loopID)
+	}
+	targetKey := loops.TargetLeaseKeyFromRecord(*loop)
+	if targetKey == "" {
+		return result, fmt.Errorf("derive target lease key for loop %s", loopID)
+	}
+	ownerToken, err := loops.NewTargetLeaseOwnerToken()
+	if err != nil {
+		return result, err
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(now().UTC())
+	acquired, err := services.Repositories.TargetLeases.Acquire(ctx, storage.TargetLeaseRecord{
+		TargetKey: targetKey, OwnerToken: ownerToken, OwnerKind: "human", OwnerID: loopID, Purpose: "takeover", AcquiredAt: nowISO, UpdatedAt: nowISO,
+	})
+	if err != nil {
+		return result, err
+	}
+	if !acquired {
+		holder, holderErr := services.Repositories.TargetLeases.Get(ctx, targetKey)
+		if holderErr != nil {
+			return result, holderErr
+		}
+		if holder == nil {
+			return result, fmt.Errorf("target lease acquisition raced for loop %s; retry takeover", loopID)
+		}
+		return result, fmt.Errorf("takeover refused: target checkout is held by %s %s for %s", holder.OwnerKind, holder.OwnerID, holder.Purpose)
+	}
+	releaseLease := true
+	defer func() {
+		if releaseLease {
+			_, _ = services.Repositories.TargetLeases.Release(context.Background(), targetKey, ownerToken)
+		}
+	}()
 	reasonCopy := reason
 	if _, err := services.Loops.Hold(ctx, loopID, &reasonCopy); err != nil {
 		return result, err
 	}
+	// A committed Hold transfers checkout authority to the human. Keep the
+	// lease even when stopping a sibling process fails: it is safer to report a
+	// partial takeover than to make the checkout claimable again.
+	releaseLease = false
 	if _, err := haltLoopWithPreflight(ctx, services, loopID, reason, now, signal, executionMatchesProcess, false, true, preflight); err != nil {
 		return result, err
 	}

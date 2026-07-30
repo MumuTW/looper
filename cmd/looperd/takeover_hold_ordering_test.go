@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -118,6 +119,31 @@ func TestTakeoverFencesSiblingBeforeStoppingTheRun(t *testing.T) {
 	loop, err := f.repos.Loops.GetByID(ctx, f.loopID)
 	if err != nil || loop == nil || loop.Status != "human_takeover" {
 		t.Fatalf("loop = %#v (err %v), want human_takeover committed", loop, err)
+	}
+}
+
+func TestTakeoverRefusesExistingTargetLeaseBeforeHoldingLoop(t *testing.T) {
+	ctx := context.Background()
+	f := newTakeoverFixture(t)
+	loop, err := f.repos.Loops.GetByID(ctx, f.loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	key := loops.TargetLeaseKeyFromRecord(*loop)
+	acquired, err := f.repos.TargetLeases.Acquire(ctx, storage.TargetLeaseRecord{
+		TargetKey: key, OwnerToken: "automation-token", OwnerKind: "automation", OwnerID: "queue_sibling", Purpose: "claim", AcquiredAt: takeoverNowISO, UpdatedAt: takeoverNowISO,
+	})
+	if err != nil || !acquired {
+		t.Fatalf("TargetLeases.Acquire() = (%v, %v), want (true, nil)", acquired, err)
+	}
+
+	_, err = takeoverLoop(ctx, f.services, f.loopID, "Taken over by test", func() time.Time { return f.now }, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "takeover refused: target checkout is held by automation queue_sibling for claim") {
+		t.Fatalf("takeoverLoop() error = %v, want holder refusal", err)
+	}
+	loop, err = f.repos.Loops.GetByID(ctx, f.loopID)
+	if err != nil || loop == nil || loop.Status != "running" {
+		t.Fatalf("loop after refused takeover = (%#v, %v), want running", loop, err)
 	}
 }
 

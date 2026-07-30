@@ -65,6 +65,7 @@ type Repositories struct {
 	PullRequestSnapshots *PullRequestSnapshotsRepository
 	Events               *EventsRepository
 	Locks                *LocksRepository
+	TargetLeases         *TargetLeasesRepository
 	Queue                *QueueRepository
 	Notifications        *NotificationsRepository
 	Worktrees            *WorktreesRepository
@@ -82,6 +83,7 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		PullRequestSnapshots: &PullRequestSnapshotsRepository{q: q},
 		Events:               &EventsRepository{q: q},
 		Locks:                &LocksRepository{q: q, now: time.Now},
+		TargetLeases:         &TargetLeasesRepository{q: q},
 		Queue:                &QueueRepository{q: q},
 		Notifications:        &NotificationsRepository{q: q},
 		Worktrees:            &WorktreesRepository{q: q},
@@ -214,6 +216,24 @@ type LockRecord struct {
 	ExpiresAt string
 	CreatedAt string
 	UpdatedAt string
+}
+
+// TargetLeaseRecord is the durable authority for an actor that may mutate a
+// managed checkout. OwnerToken is opaque and is required for every release, so
+// a stale holder cannot delete a later holder's lease. Leases deliberately have
+// no expiry: callers may reclaim only after process identity proves the owner is
+// gone, rather than treating elapsed time as proof of death.
+type TargetLeaseRecord struct {
+	TargetKey        string
+	OwnerToken       string
+	OwnerKind        string
+	OwnerID          string
+	Purpose          string
+	ProcessPID       *int64
+	ProcessStartTime *int64
+	ProcessBootID    *string
+	AcquiredAt       string
+	UpdatedAt        string
 }
 
 type QueueItemRecord struct {
@@ -918,6 +938,11 @@ type LocksRepository struct {
 	q   sqliteQuerier
 	now func() time.Time
 }
+
+// TargetLeasesRepository owns target lease compare-and-swap operations. It is
+// separate from LocksRepository because ordinary locks may expire and are
+// released by key, neither of which is safe for checkout ownership.
+type TargetLeasesRepository struct{ q sqliteQuerier }
 
 const agentExecutionColumns = `id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at`
 
@@ -1677,6 +1702,54 @@ func (r *LocksRepository) ListExpired(ctx context.Context, nowISO string) ([]Loc
 	defer rows.Close()
 
 	return scanLocks(rows)
+}
+
+// Acquire creates a lease only when no owner exists. It never steals a lease:
+// expiration is not authority to mutate a checkout.
+func (r *TargetLeasesRepository) Acquire(ctx context.Context, record TargetLeaseRecord) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `
+		INSERT INTO target_leases (
+			target_key, owner_token, owner_kind, owner_id, purpose,
+			process_pid, process_start_time, process_boot_id, acquired_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(target_key) DO NOTHING
+	`, record.TargetKey, record.OwnerToken, record.OwnerKind, record.OwnerID, record.Purpose,
+		record.ProcessPID, record.ProcessStartTime, record.ProcessBootID, record.AcquiredAt, record.UpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("acquire target lease: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read target lease acquire rows affected: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// Release deletes only the lease held by ownerToken. A stale cleanup cannot
+// release a newer owner after its original lease was reclaimed.
+func (r *TargetLeasesRepository) Release(ctx context.Context, targetKey, ownerToken string) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `DELETE FROM target_leases WHERE target_key = ? AND owner_token = ?`, targetKey, ownerToken)
+	if err != nil {
+		return false, fmt.Errorf("release target lease: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read target lease release rows affected: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// Get returns the current lease for targetKey, if any.
+func (r *TargetLeasesRepository) Get(ctx context.Context, targetKey string) (*TargetLeaseRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM target_leases WHERE target_key = ?`, targetKey)
+	record, err := scanTargetLease(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get target lease: %w", err)
+	}
+	return &record, nil
 }
 
 type WorktreesRepository struct{ q sqliteQuerier }
@@ -3444,6 +3517,23 @@ func scanLock(row interface{ Scan(...any) error }) (LockRecord, error) {
 	record.Reason = nullableString(reason)
 
 	return record, nil
+}
+
+func scanTargetLease(row interface{ Scan(...any) error }) (TargetLeaseRecord, error) {
+	var record TargetLeaseRecord
+	err := row.Scan(
+		&record.TargetKey,
+		&record.OwnerToken,
+		&record.OwnerKind,
+		&record.OwnerID,
+		&record.Purpose,
+		&record.ProcessPID,
+		&record.ProcessStartTime,
+		&record.ProcessBootID,
+		&record.AcquiredAt,
+		&record.UpdatedAt,
+	)
+	return record, err
 }
 
 func scanWorktrees(rows *sql.Rows) ([]WorktreeRecord, error) {
