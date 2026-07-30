@@ -52,6 +52,20 @@ func ClearHumanInbox(metadataJSON *string) (string, error) {
 	return marshalWithHumanInbox(metadataJSON, nil)
 }
 
+// ClearHumanInboxN drops the first n queued human messages (the ones drained
+// into the agent prompt for this turn). Messages appended during execution
+// remain for the next turn.
+func ClearHumanInboxN(metadataJSON *string, n int) (string, error) {
+	if n <= 0 {
+		return ClearHumanInbox(metadataJSON)
+	}
+	current := ReadHumanInbox(metadataJSON)
+	if len(current) <= n {
+		return ClearHumanInbox(metadataJSON)
+	}
+	return marshalWithHumanInbox(metadataJSON, current[n:])
+}
+
 func marshalWithHumanInbox(metadataJSON *string, msgs []HumanMessage) (string, error) {
 	meta, err := DecodeMetadataObjectForWrite(metadataJSON)
 	if err != nil {

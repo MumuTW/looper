@@ -1693,6 +1693,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err != nil {
 		return checkpoint, err
 	}
+	var inboxDrained int
 	if !executionCompleted {
 		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
@@ -1745,6 +1746,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				if nativeSessionID == "" {
 					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID, agentVendor)
 				}
+				inboxDrained = len(inbox)
 			}
 		}
 		executionID := eventlog.NewEventID("agent")
@@ -1811,7 +1813,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// retry, while a successful one never re-injects it on a later run.
 		if r.hitlEnabled {
 			r.markHumanAnswerConsumed(ctx, &input.Loop)
-			r.clearHumanInbox(ctx, &input.Loop)
+			r.clearHumanInbox(ctx, &input.Loop, inboxDrained)
 		}
 		r.markTakeoverResumeConsumed(ctx, &input.Loop)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {

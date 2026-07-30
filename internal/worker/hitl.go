@@ -212,9 +212,11 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor 
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
-// clearHumanInbox drops the loop's drained human messages after a successful turn
-// so they are not re-injected on a later run. No-op when the inbox is empty.
-func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) {
+// clearHumanInbox drops the loop's drained human messages after a successful
+// turn so they are not re-injected on a later run. n is the count drained into
+// the prompt at turn start; messages appended during execution remain for the
+// next turn. No-op when the inbox is empty.
+func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord, n int) {
 	if r.repos == nil || r.repos.Loops == nil {
 		return
 	}
@@ -225,7 +227,7 @@ func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) 
 	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
 		return
 	}
-	meta, werr := loops.ClearHumanInbox(fresh.MetadataJSON)
+	meta, werr := loops.ClearHumanInboxN(fresh.MetadataJSON, n)
 	if werr != nil {
 		return
 	}
