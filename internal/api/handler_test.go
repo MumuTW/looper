@@ -8530,24 +8530,38 @@ func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testi
 	assertEqual(t, loopStatus["latestRunStatus"], "running")
 }
 
-// Driven through the response builder rather than the redaction helper: the
-// helper being correct proves nothing about whether this path still calls it.
+// Driven through buildConfigResponse, the function that actually serves the
+// configuration, rather than through the redaction helper. The helper being
+// correct proves nothing about whether this path still calls it — and an earlier
+// version of this test said exactly that in its comment while calling the helper.
 func TestConfigResponseWithholdsProjectDeployCredentials(t *testing.T) {
-	t.Parallel()
-	environment := map[string]string{"DEPLOY_TOKEN": "response-secret"}
-	live := []config.ProjectRefConfig{{
+	// No t.Parallel: startTestRuntime uses t.Setenv.
+	const secret = "response-deploy-secret"
+	environment := map[string]string{"DEPLOY_TOKEN": secret}
+	_, cfg := startTestRuntime(t)
+	cfg.Projects = []config.ProjectRefConfig{{
 		ID: "looper",
 		Roles: &config.PartialRoleConfigs{Deployer: &config.PartialDeployerRoleConfig{
 			Environment: &environment,
 		}},
 	}}
 
-	redacted := config.RedactProjectSecrets(live)
+	response := NewHandler(Context{Config: cfg}).buildConfigResponse()
 
-	if redacted[0].Roles.Deployer.Environment != nil {
-		t.Fatalf("deploy credentials reached the config response: %v", *redacted[0].Roles.Deployer.Environment)
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal config response: %v", err)
 	}
-	if live[0].Roles.Deployer.Environment == nil {
-		t.Fatal("redaction erased the live configuration")
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("the config response carries a deploy credential:\n%s", encoded)
+	}
+
+	// Withholding the secret must not destroy it: the response builder copies a
+	// slice whose Roles pointers are shared with the live configuration.
+	if cfg.Projects[0].Roles.Deployer.Environment == nil {
+		t.Fatal("building the response erased the live deploy credentials")
+	}
+	if (*cfg.Projects[0].Roles.Deployer.Environment)["DEPLOY_TOKEN"] != secret {
+		t.Fatal("building the response altered the live deploy credentials")
 	}
 }
