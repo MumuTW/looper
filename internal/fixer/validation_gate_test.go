@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
@@ -129,14 +130,23 @@ func TestClassifyFixerValidationFailureDoesNotInferTimeoutFromTestOutput(t *test
 	}
 }
 
-func TestConfiguredGateKeepsFixerAgentFromPushing(t *testing.T) {
+// TestFixerPromptNeverInstructsAPush replaces the old fixerAgentMayPush unit test.
+// The agent used to be told to push whenever auto-push was on and no validation
+// gate was configured, which let it publish a partial fix before the run's outcome
+// existed. Looper is now the publishing boundary for every repair, so no
+// configuration produces a push instruction.
+func TestFixerPromptNeverInstructsAPush(t *testing.T) {
 	t.Parallel()
 
-	if fixerAgentMayPush(true, []string{"go test ./..."}) {
-		t.Fatal("fixerAgentMayPush() = true with a configured gate")
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HeadRefName: "feature/fix-42", BaseRefName: "main"}
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42,
+		detail, []FixItem{{ID: "fix-1", Summary: "repair"}}, config.DefaultDisclosureConfig(), "codex", "gpt-5.5")
+
+	if contains(prompt, "Commit and push") || contains(prompt, "push the repair changes") {
+		t.Fatalf("prompt instructs a push:\n%s", prompt)
 	}
-	if !fixerAgentMayPush(true, nil) {
-		t.Fatal("fixerAgentMayPush() = false without a configured gate")
+	if !contains(prompt, "Do not push the branch or update remote pull request state") {
+		t.Fatalf("prompt = %q, want the local-only instruction", prompt)
 	}
 }
 
