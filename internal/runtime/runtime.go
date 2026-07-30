@@ -875,6 +875,14 @@ func (r *Runtime) start(ctx context.Context) error {
 		}
 	}()
 
+	// Validate schema compatibility on every boot, regardless of whether
+	// migration application is enabled, so a downgraded or mixed-version binary
+	// cannot initialize repositories and run against a newer schema it cannot
+	// prove it understands. Migration application remains conditional below.
+	if err := coordinator.MigrationRunner().ValidateCompatibility(ctx); err != nil {
+		return err
+	}
+
 	if r.config.Package.AutoMigrateOnStartup {
 		_, err = coordinator.MigrationRunner().RunPending(ctx, storage.RunPendingOptions{
 			RequireBackup: r.config.Package.RequireBackupBeforeMigrate,
