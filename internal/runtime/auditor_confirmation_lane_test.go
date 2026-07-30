@@ -67,7 +67,7 @@ func TestProgressAuditorConfirmationRerequestsOnceThenRecordsMatchingFailure(t *
 
 	events, _ = repos.Events.ListByEntity(ctx, entityType, entityID)
 	confirmation := onlyAuditorConfirmation(t, events)
-	if confirmation.Outcome != auditor.ConfirmationConfirmed || confirmation.Decision != auditor.ActionEscalate || len(confirmation.ConfirmedChecks) != 1 || confirmation.ConfirmedChecks[0] != "ci" {
+	if confirmation.Version != 2 || confirmation.Outcome != auditor.ConfirmationConfirmed || confirmation.Decision != auditor.ActionEscalate || confirmation.Candidate != nil || len(confirmation.ConfirmedChecks) != 1 || confirmation.ConfirmedChecks[0] != "ci" {
 		t.Fatalf("confirmation = %#v, want confirmed escalation without attribution evidence", confirmation)
 	}
 
@@ -101,7 +101,8 @@ func TestProgressAuditorConfirmationRecordsFlakeWithoutRerequestingAgain(t *test
 func TestProgressAuditorConfirmationMarksUniquePathOverlapAsRevertProposal(t *testing.T) {
 	ctx, repos, project, repo, head, now := auditorConfirmationFixture(t, []int64{7654})
 	projectID := project.ID
-	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: gatekeeper.MergeOutcomeEventType, ProjectID: &projectID, Payload: gatekeeper.MergeOutcome{Version: 1, ProjectID: projectID, Repo: repo, PRNumber: 42, HeadSHA: "merged-pr-head", Merged: true, TouchedFiles: []string{"internal/runtime/auditor.go"}, TouchedFilesAvailable: true}, CreatedAt: now.Add(-time.Minute)}); err != nil {
+	sourceIssue := &githubinfra.IssueReference{Number: 118, Repo: repo}
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: gatekeeper.MergeOutcomeEventType, ProjectID: &projectID, Payload: gatekeeper.MergeOutcome{Version: 1, ProjectID: projectID, Repo: repo, PRNumber: 42, HeadSHA: "merged-pr-head", MergeCommitSHA: "merge-commit-1", SourceIssue: sourceIssue, Merged: true, TouchedFiles: []string{"internal/runtime/auditor.go"}, TouchedFilesAvailable: true}, CreatedAt: now.Add(-time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	gateway := &confirmationAuditorGateway{head: head, annotations: map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go", Level: "failure"}}}}
@@ -115,8 +116,25 @@ func TestProgressAuditorConfirmationMarksUniquePathOverlapAsRevertProposal(t *te
 	}
 	entityType, entityID := "branch_head", repo+"@"+head
 	confirmation := onlyAuditorConfirmation(t, mustListAuditorEvents(t, ctx, repos, entityType, entityID))
-	if confirmation.Outcome != auditor.ConfirmationConfirmed || confirmation.Decision != auditor.ActionProposeRevert {
+	if confirmation.Outcome != auditor.ConfirmationConfirmed || confirmation.Decision != auditor.ActionProposeRevert || confirmation.Candidate == nil || confirmation.Candidate.MergeCommitSHA != "merge-commit-1" || confirmation.Candidate.SourceIssueNumber != 118 {
 		t.Fatalf("confirmation = %#v, want high-confidence revert proposal decision", confirmation)
+	}
+}
+
+func TestAuditorConfirmationEscalatesWhenCandidateLacksRevertProvenance(t *testing.T) {
+	observation := auditor.FailureObservation{ObservedAt: "2026-07-31T12:00:00.000Z", FailingPaths: []string{"a.go"}}
+	confirmation := auditor.ConfirmationResult{Outcome: auditor.ConfirmationConfirmed}
+	events := []storage.EventLogRecord{{EventType: gatekeeper.MergeOutcomeEventType, PayloadJSON: `{"projectId":"project_1","repo":"acme/looper","prNumber":42,"headSha":"head","merged":true,"touchedFiles":["a.go"]}`, CreatedAt: "2026-07-31T11:59:00.000Z"}}
+	coordinator := openMigratedCoordinator(t, filepath.Join(t.TempDir(), "auditor.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	for _, event := range events {
+		if err := repos.Events.Append(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decision, err := auditorConfirmationDecision(context.Background(), repos.Events, "project_1", "acme/looper", observation, confirmation, 60)
+	if err != nil || decision.Action != auditor.ActionEscalate || decision.Reason != "missing_merge_commit_provenance" {
+		t.Fatalf("auditorConfirmationDecision() = %#v, %v", decision, err)
 	}
 }
 

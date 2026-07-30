@@ -293,7 +293,18 @@ func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepo
 		}
 	}
 	attribution := auditor.Attribute(auditor.FailureEvidence{ObservedAt: observedAt, FailingPaths: observation.FailingPaths, BaselineKnown: observation.BaselineKnown, FailingPathEvidenceComplete: observation.FailingPathEvidenceComplete}, projectCandidates)
-	return auditor.Decide(confirmation, attribution), nil
+	decision := auditor.Decide(confirmation, attribution)
+	if decision.Action != auditor.ActionProposeRevert || decision.Candidate == nil {
+		return decision, nil
+	}
+	candidate := decision.Candidate
+	if strings.TrimSpace(candidate.MergeCommitSHA) == "" {
+		return auditor.Decision{Action: auditor.ActionEscalate, Reason: "missing_merge_commit_provenance"}, nil
+	}
+	if candidate.SourceIssue == nil || candidate.SourceIssue.Number <= 0 || !strings.EqualFold(strings.TrimSpace(candidate.SourceIssue.Repo), strings.TrimSpace(repo)) {
+		return auditor.Decision{Action: auditor.ActionEscalate, Reason: "missing_unambiguous_source_issue"}, nil
+	}
+	return decision, nil
 }
 
 func appendAuditorRerunRequest(ctx context.Context, repos *storage.Repositories, projectID, entityType, entityID, observationEventID, repo, headSHA string, suiteID int64, requestedAt time.Time, initialFailedChecks, initialFailedPaths []string) error {
@@ -304,8 +315,16 @@ func appendAuditorRerunRequest(ctx context.Context, repos *storage.Repositories,
 }
 
 func appendAuditorConfirmation(ctx context.Context, repos *storage.Repositories, projectID, entityType, entityID, observationEventID, headSHA string, confirmation auditor.ConfirmationResult, decision auditor.Decision, confirmedAt time.Time) error {
+	candidate := confirmedAuditorCandidate(decision)
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType: auditor.ConfirmationEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, CausationID: &observationEventID,
-		Payload: auditor.ConfirmationRecord{Version: 1, ObservationEventID: observationEventID, HeadSHA: headSHA, Outcome: confirmation.Outcome, ConfirmedChecks: confirmation.ConfirmedChecks, Decision: decision.Action, Reason: decision.Reason, ConfirmedAt: eventlog.FormatJavaScriptISOString(confirmedAt)}, CreatedAt: confirmedAt,
+		Payload: auditor.ConfirmationRecord{Version: 2, ObservationEventID: observationEventID, HeadSHA: headSHA, Outcome: confirmation.Outcome, ConfirmedChecks: confirmation.ConfirmedChecks, Decision: decision.Action, Reason: decision.Reason, Candidate: candidate, ConfirmedAt: eventlog.FormatJavaScriptISOString(confirmedAt)}, CreatedAt: confirmedAt,
 	})
+}
+
+func confirmedAuditorCandidate(decision auditor.Decision) *auditor.ConfirmedCandidate {
+	if decision.Action != auditor.ActionProposeRevert || decision.Candidate == nil || decision.Candidate.SourceIssue == nil {
+		return nil
+	}
+	return &auditor.ConfirmedCandidate{PRNumber: decision.Candidate.PRNumber, MergeCommitSHA: decision.Candidate.MergeCommitSHA, SourceIssueNumber: decision.Candidate.SourceIssue.Number, SourceIssueRepo: decision.Candidate.SourceIssue.Repo}
 }
