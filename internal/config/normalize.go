@@ -1672,6 +1672,7 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			WorktreeRoot: cloneStringPtr(project.WorktreeRoot),
 			Network:      clonePartialProjectNetworkConfig(project.Network),
 			Webhook:      clonePartialProjectWebhookConfig(project.Webhook),
+			Validation:   clonePartialProjectValidationConfig(project.Validation),
 			Instructions: cloneStringMap(project.Instructions),
 			Roles:        clonePartialRoleConfigs(project.Roles),
 		}
@@ -1692,6 +1693,18 @@ func clonePartialProjectWebhookConfig(config *PartialProjectWebhookConfig) *Part
 		return nil
 	}
 	cloned := *config
+	return &cloned
+}
+
+func clonePartialProjectValidationConfig(config *PartialProjectValidationConfig) *PartialProjectValidationConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	if config.Commands != nil {
+		commands := append([]string(nil), (*config.Commands)...)
+		cloned.Commands = &commands
+	}
 	return &cloned
 }
 
@@ -1745,6 +1758,16 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 			Path:     project.Path,
 			Network:  ProjectNetworkConfig{Mode: NetworkModeOff},
 			Roles:    roles,
+		}
+		if project.Validation != nil {
+			validation := &ProjectValidationConfig{}
+			if project.Validation.Commands != nil {
+				validation.Commands = append([]string(nil), (*project.Validation.Commands)...)
+			}
+			if project.Validation.OptOut != nil {
+				validation.OptOut = *project.Validation.OptOut
+			}
+			cloned[index].Validation = validation
 		}
 		if project.Provider != nil {
 			cloned[index].Provider = strings.TrimSpace(*project.Provider)

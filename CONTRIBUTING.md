@@ -93,7 +93,8 @@ After `--install-hooks`, the tracked `.githooks/pre-commit` reformats and re-sta
 
 ## Tests
 
-- Add or update tests for any behavior change.
+- When feasible, add or update a failing automated test first, implement the smallest change that makes it pass, then refactor while keeping the suite green.
+- Every PR must identify the automated coverage added or updated and the commands run. If coverage is not feasible, explain why in the PR body.
 - Keep default tests hermetic: no network, no real forge calls, no writes outside `t.TempDir()`.
 - Run `go test ./...` locally before opening a PR.
 
@@ -133,7 +134,7 @@ For GitHub live sandbox tests, prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`; `LOOPER_
    - A semantic title (same rules as commits)
    - A short description of the change and motivation
    - A link to the related issue, if any
-   - Notes on testing and any user-facing impact
+   - Automated coverage and commands run, or an explicit explanation of why coverage is not feasible
 5. Be responsive to review feedback. Push fixes as additional commits; we'll squash on merge if appropriate.
 
 CI (`.github/workflows/ci.yml`) must be green before a PR can merge.

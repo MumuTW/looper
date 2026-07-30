@@ -160,6 +160,30 @@ func TestBootstrapRequiresTrustedSandboxWhenValidationIsEnabled(t *testing.T) {
 	}
 }
 
+func TestBootstrapRequiresTrustedSandboxForProjectValidationCommands(t *testing.T) {
+	root := t.TempDir()
+	vendor := config.AgentVendorCodex
+	cfg := config.Config{
+		Storage: config.StorageConfig{DBPath: filepath.Join(root, "looper.sqlite")},
+		Logging: config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 10, MaxFiles: 5},
+		Daemon:  config.DaemonConfig{LogDir: filepath.Join(root, "logs"), WorkingDirectory: root},
+		Agent:   config.AgentConfig{Vendor: &vendor},
+		Projects: []config.ProjectRefConfig{{
+			ID:         "looper",
+			Validation: &config.ProjectValidationConfig{Commands: []string{"scripts/verify.sh"}},
+		}},
+	}
+	_, err := Bootstrap(context.Background(), Options{
+		LoadConfig: func(config.LoadFileOptions) (config.LoadedFileConfig, error) {
+			return config.LoadedFileConfig{Config: cfg}, nil
+		},
+		CheckSandboxRuntime: func() error { return errors.New("untrusted srt installation") },
+	})
+	if err == nil || !strings.Contains(err.Error(), "projects[].validation.commands") || !strings.Contains(err.Error(), "untrusted srt installation") {
+		t.Fatalf("Bootstrap() error = %v, want project sandbox readiness validation", err)
+	}
+}
+
 func TestBootstrapPropagatesLoadConfigError(t *testing.T) {
 	wantErr := errors.New("boom")
 

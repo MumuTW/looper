@@ -226,6 +226,7 @@ type AddInput struct {
 	WorktreeRoot *string
 	Repo         *string
 	Provider     *string
+	Validation   *config.ProjectValidationConfig
 	SnapshotMode SnapshotMode
 }
 
@@ -419,6 +420,14 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		metadata["provider"] = *provider
 	} else {
 		delete(metadata, "provider")
+	}
+	if input.Validation != nil {
+		metadata["validation"] = config.ProjectValidationConfig{
+			Commands: append([]string(nil), input.Validation.Commands...),
+			OptOut:   input.Validation.OptOut,
+		}
+	} else if existing == nil {
+		delete(metadata, "validation")
 	}
 	delete(metadata, "roles")
 	if input.WorktreeRoot != nil {
@@ -1180,6 +1189,9 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 	if err := setProjectMetadata("webhook", project.Webhook, project.Webhook.Mode != ""); err != nil {
 		return "", err
 	}
+	if err := setProjectMetadata("validation", project.Validation, project.Validation != nil); err != nil {
+		return "", err
+	}
 	if err := setProjectMetadata("roles", project.Roles, project.Roles != nil); err != nil {
 		return "", err
 	}
@@ -1570,7 +1582,19 @@ func (s *Service) materializeCandidate(ctx context.Context, replacement *storage
 	if replacement != nil && !replaced {
 		records = append(records, *replacement)
 	}
-	return MaterializeCatalog(s.currentConfig(), records)
+	current := s.currentConfig()
+	materialized, err := MaterializeCatalog(current, records)
+	if err != nil {
+		return nil, err
+	}
+	if s.ConfigSource != nil {
+		candidate := config.CloneConfig(current)
+		candidate.Projects = materialized
+		if err := config.ValidateProjectValidationPolicies(candidate); err != nil {
+			return nil, err
+		}
+	}
+	return materialized, nil
 }
 
 func snapshotModeOrDefault(mode SnapshotMode) SnapshotMode {

@@ -456,18 +456,19 @@ type AgentExecutionStartedInput struct {
 type AgentExecutionStartedFunc func(context.Context, AgentExecutionStartedInput) error
 
 type Options struct {
-	DB                 *sql.DB
-	Repos              *storage.Repositories
-	GitHub             GitHubGateway
-	Git                GitGateway
-	AgentExecutor      AgentExecutor
-	Logger             bootstrap.Logger
-	Now                func() time.Time
-	AgentTimeout       time.Duration
-	AgentIdleTimeout   time.Duration
-	ClaimTTL           time.Duration
-	ValidationCommands []string
-	ValidationRunner   ValidationRunner
+	DB                          *sql.DB
+	Repos                       *storage.Repositories
+	GitHub                      GitHubGateway
+	Git                         GitGateway
+	AgentExecutor               AgentExecutor
+	Logger                      bootstrap.Logger
+	Now                         func() time.Time
+	AgentTimeout                time.Duration
+	AgentIdleTimeout            time.Duration
+	ClaimTTL                    time.Duration
+	ValidationCommands          []string
+	ValidationCommandsByProject map[string][]string
+	ValidationRunner            ValidationRunner
 	// ContainmentTracker registers validation shell handles with the Execution
 	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
 	// when the runner is not daemon-owned.
@@ -512,6 +513,7 @@ type Runner struct {
 	agentIdleTimeout            time.Duration
 	claimTTL                    time.Duration
 	validationCommands          []string
+	validationCommandsByProject map[string][]string
 	validationRunner            ValidationRunner
 	containmentTracker          processcontainment.LiveTracker
 	allowAutoCommit             bool
@@ -1552,6 +1554,7 @@ func New(options Options) *Runner {
 		agentIdleTimeout:            agentIdleTimeout,
 		claimTTL:                    claimTTL,
 		validationCommands:          append([]string(nil), options.ValidationCommands...),
+		validationCommandsByProject: cloneValidationCommandsByProject(options.ValidationCommandsByProject),
 		validationRunner:            options.ValidationRunner,
 		containmentTracker:          options.ContainmentTracker,
 		allowAutoCommit:             options.AllowAutoCommit,
@@ -1572,6 +1575,24 @@ func New(options Options) *Runner {
 		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
 	}
+}
+
+func cloneValidationCommandsByProject(source map[string][]string) map[string][]string {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string][]string, len(source))
+	for projectID, commands := range source {
+		cloned[projectID] = append([]string(nil), commands...)
+	}
+	return cloned
+}
+
+func (r *Runner) validationCommandsForProject(projectID string) []string {
+	if commands, ok := r.validationCommandsByProject[projectID]; ok {
+		return commands
+	}
+	return r.validationCommands
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -3139,6 +3160,7 @@ func sameManagedWorktreePath(a, b string) bool {
 
 func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	validationCommands := r.validationCommandsForProject(input.Project.ID)
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
@@ -3214,7 +3236,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
 	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.disclosure, agentVendor, derefString(agentModel))
-	if len(r.validationCommands) > 0 {
+	if len(validationCommands) > 0 {
 		prompt += validationGatedLocalOnlyPrompt
 	}
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
@@ -3231,7 +3253,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown")),
-		RestrictToolNetwork: len(r.validationCommands) > 0,
+		RestrictToolNetwork: len(validationCommands) > 0,
 		UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 	})
 	if err != nil {
@@ -3343,6 +3365,7 @@ func (r *Runner) runReconcileCommitsStep(ctx context.Context, input stepInput) (
 
 func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	validationCommands := r.validationCommandsForProject(input.Project.ID)
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
@@ -3354,7 +3377,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 	if rootErr != nil {
 		return checkpoint, rootErr
 	}
-	result, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: r.validationCommands})
+	result, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -3379,7 +3402,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		if err != nil {
 			return checkpoint, err
 		}
-		second, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: r.validationCommands})
+		second, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -3424,6 +3447,7 @@ func (r *Runner) refreshReconcileMetadata(checkpoint *fixerCheckpoint, worktree 
 
 func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	validationCommands := r.validationCommandsForProject(input.Project.ID)
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
@@ -3455,7 +3479,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if checkpoint.ReconcileCommits == nil {
 		return checkpoint, &loopError{message: "Missing reconcile-commits checkpoint for push step", kind: FailureRetryableAfterResume}
 	}
-	if len(r.validationCommands) > 0 {
+	if len(validationCommands) > 0 {
 		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)})
 		if err != nil {
 			return checkpoint, err
@@ -3496,7 +3520,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		return checkpoint, &holdSkipError{summary: summary}
 	}
 	localHeadSHA := ""
-	if len(r.validationCommands) > 0 {
+	if len(validationCommands) > 0 {
 		if checkpoint.Validation == nil || !checkpoint.Validation.Passed || strings.TrimSpace(checkpoint.Validation.HeadSHA) == "" {
 			return checkpoint, &loopError{message: "Missing validated head SHA for push step", kind: FailureRetryableAfterResume}
 		}
@@ -3616,7 +3640,8 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 		if !prepared.Clean {
 			return false, checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty after adopting agent-pushed head %s", adoptedHead), kind: FailureRetryableAfterResume}
 		}
-		validation, err := r.runValidation(ctx, ValidationInput{CWD: checkpoint.Worktree.Path, Commands: r.validationCommands})
+		validationCommands := r.validationCommandsForProject(input.Project.ID)
+		validation, err := r.runValidation(ctx, ValidationInput{CWD: checkpoint.Worktree.Path, Commands: validationCommands})
 		if err != nil {
 			return false, checkpoint, err
 		}

@@ -1038,7 +1038,6 @@ allowAutoApprove = true
 allowRiskyFixes = false
 openPrStrategy = "all_done"
 addSnapshotMode = "async"
-validationCommands = ["go build ./...", "go test ./..."]
 
 # `allowAutoApprove` is a legacy compatibility alias.
 # Prefer `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"` in new config.
@@ -1142,12 +1141,18 @@ repoPath = "/absolute/path/to/looper"
 baseBranch = "main"
 worktreeRoot = "/Users/you/.looper/worktrees/looper"
 
+[projects.validation]
+commands = ["scripts/verify.sh"]
+
 [[projects]]
 id = "second-example"
 name = "Second Example"
 repoPath = "/absolute/path/to/second-example"
 provider = "acme"
 repo = "acme/second-example"
+
+[projects.validation]
+optOut = true
 
 [projects.roles.worker.discovery]
 autoDiscovery = false
@@ -1314,22 +1319,54 @@ To restore it by default for all project additions:
 }
 ```
 
-### `defaults.validationCommands`
+### `projects[].validation` and legacy `defaults.validationCommands`
 
-`defaults.validationCommands` is the mechanical gate the worker and fixer run in the run's worktree before opening a PR or pushing. Each entry is executed with `/bin/sh -c` from the worktree root, in order, and the first non-zero exit fails the validate step; the run never advances to open-pr or push. Each command is bounded by the coding role's `agent.timeouts.*MaxRuntimeSeconds` value.
+`projects[].validation.commands` is the mechanical gate the worker and fixer run in that project's prepared worktree before opening a PR or pushing. Each entry is executed with `/bin/sh -c` from the worktree root, in order, and the first non-zero exit fails the validate step; the run never advances to open-pr or push. Each command is bounded by the coding role's `agent.timeouts.*MaxRuntimeSeconds` value.
+
+```toml
+[[projects]]
+id = "looper"
+name = "Looper"
+repoPath = "/absolute/path/to/looper"
+
+[projects.validation]
+commands = ["scripts/verify.sh"]
+
+[[projects]]
+id = "novel"
+name = "Novel"
+repoPath = "/absolute/path/to/novel"
+
+[projects.validation]
+commands = ["pnpm test", "pnpm build"]
+
+[[projects]]
+id = "fluenx"
+name = "FluenX"
+repoPath = "/absolute/path/to/fluenx"
+
+[projects.validation]
+optOut = true
+```
+
+Each project with a configured Worker or Fixer must choose commands or explicitly set `optOut = true`. `commands` and `optOut` are mutually exclusive. Missing, empty, blank, or ambiguous policies fail closed at daemon startup, catalog publication, project registration, and configuration reload. The project API accepts the same JSON shape as `"validation":{"commands":["make check"]}` or `"validation":{"optOut":true}`. Explicit opt-outs are emitted in project responses and logged at scheduler startup; they are not silently treated as successful test runs.
+
+For migration, the old global list remains a temporary fallback for projects that do not yet have a `validation` block:
 
 ```toml
 [defaults]
-validationCommands = ["test -z \"$(gofmt -l .)\"", "go vet ./...", "go test ./...", "go build ./..."]
+validationCommands = ["make check"]
 ```
 
-The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides). The command strings come from daemon configuration, but commands such as `make check` and `go test ./...` intentionally execute repository-controlled code. Looper therefore launches each command through the vendor-neutral [Sandbox Runtime](https://github.com/anthropic-experimental/sandbox-runtime) (`srt`) process boundary: network access is disabled, `HOME`/XDG/Go write caches are disposable, daemon credentials (`SSH_AUTH_SOCK`, `LOOPER_CONFIG`, forge/API keys) are omitted, and writes are limited to the worktree plus that disposable root. Tool directories on `PATH` and the existing Go module cache are read-only. Exactly `@anthropic-ai/sandbox-runtime@0.0.67` and its platform support tools are required when validation commands are enabled. Install the runtime and its complete `node_modules` dependency tree in a dedicated administrator-owned prefix, and install Node, `ripgrep`, and (on Linux) `bubblewrap`/`socat` in paths whose files and ancestor directories the daemon user cannot modify. User-writable npm/Homebrew installs are intentionally rejected so an authorized coding agent cannot replace the next restricted runner, and sandboxed execution is rejected when `looperd` runs as root. Ubuntu 24.04+ also needs SRT's documented AppArmor `userns` allowance (or `kernel.apparmor_restrict_unprivileged_userns=0`). If the runtime is missing or rejects the profile, validation fails closed rather than falling back to an unsandboxed shell.
+Looper logs each project using this deprecated fallback. Move commands into every `projects[].validation.commands` block, verify the project-specific commands, then remove `defaults.validationCommands`. A project-level policy always wins over the legacy global list, including an explicit opt-out.
+
+The command strings come from daemon configuration, but commands such as `make check` and `go test ./...` intentionally execute repository-controlled code. Looper therefore launches each command through the vendor-neutral [Sandbox Runtime](https://github.com/anthropic-experimental/sandbox-runtime) (`srt`) process boundary: network access is disabled, `HOME`/XDG/Go write caches are disposable, daemon credentials (`SSH_AUTH_SOCK`, `LOOPER_CONFIG`, forge/API keys) are omitted, and writes are limited to the worktree plus that disposable root. Tool directories on `PATH` and the existing Go module cache are read-only. Exactly `@anthropic-ai/sandbox-runtime@0.0.67` and its platform support tools are required when any project has validation commands enabled. Install the runtime and its complete `node_modules` dependency tree in a dedicated administrator-owned prefix, and install Node, `ripgrep`, and (on Linux) `bubblewrap`/`socat` in paths whose files and ancestor directories the daemon user cannot modify. User-writable npm/Homebrew installs are intentionally rejected so an authorized coding agent cannot replace the next restricted runner, and sandboxed execution is rejected when `looperd` runs as root. Ubuntu 24.04+ also needs SRT's documented AppArmor `userns` allowance (or `kernel.apparmor_restrict_unprivileged_userns=0`). If the runtime is missing or rejects the profile, validation fails closed rather than falling back to an unsandboxed shell.
 
 When this gate is configured, Looper is the fetch-and-publish authority. The daemon prepares the worktree before execution, then launches the Codex agent with a read-isolated permission profile and a disposable, allowlisted tool environment. The Codex parent can still authenticate to its model provider, but model-invoked tools cannot read daemon `HOME`/`CODEX_HOME`, SSH agents, forge credentials, or unrelated host files; they can edit and commit only inside the prepared worktree and cannot use the network. Looper then pushes the exact commit SHA that passed validation. A later local `HEAD` change is not included in that push. This mode currently supports only the Codex executor; other coding vendors fail closed because Looper cannot yet enforce the same tool-level network boundary for them.
 
 The trade-off is deliberate: the gated agent and repository-controlled validation cannot fetch new remote state, query the forge, or download dependencies while they run. Required tools must be on the daemon's `PATH`; dependencies must already exist in the worktree or approved read-only caches. Linked-worktree Git metadata and the discovered Go toolchain/GOROOT are mounted read-only so normal local Git and Go validation still work. Remote context must be present in the daemon-supplied prompt and prepared checkout. If a task needs fresh remote information, let the daemon rediscover/restart it rather than weakening the gate. The agent receives a non-secret local Git identity so local commits still work; remote credentials remain daemon-side authority. Validation uses the same internal sandbox boundary for every configured agent provider; sandbox implementation details are not exposed through provider configuration.
 
-The default is empty, which keeps the historical behavior: the validate step passes without running anything and "done" is only the agent's own self-assessment. `looperd` logs a startup warning while the list is empty so the no-op is visible. The field is restart-bound.
+Validation policy is restart-bound. Repository CI remains the merge authority after publication: configure required checks/branch protection and keep `roles.reviewer.autoMerge.requireBranchProtection = true`; auto-merge then waits for those checks to be green.
 
 ### `roles`
 
@@ -1392,6 +1429,8 @@ looperd \
 - required tool paths must resolve
 - `notifications.osascript.enabled=true` requires `tools.osascriptPath` to resolve
 - every `defaults.validationCommands[]` entry must be a non-empty string
+- every project with a configured Worker or Fixer must set non-empty `projects[].validation.commands`, inherit the deprecated global fallback, or explicitly set `projects[].validation.optOut = true`
+- `projects[].validation.commands` and `projects[].validation.optOut = true` cannot be combined
 
 ## Recommended first-time setup
 

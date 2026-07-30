@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -2651,12 +2652,14 @@ func TestProcessClaimedItemDeterministicValidationFailurePauses(t *testing.T) {
 	github := &fakeGitHubGateway{}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
 	completed := make([]RunCompletedInput, 0, 1)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+	var validatedCommands []string
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(_ context.Context, input ValidationInput) (ValidationResult, error) {
+		validatedCommands = append([]string(nil), input.Commands...)
 		return ValidationResult{Passed: false, Summary: "Validation failed"}, nil
 	}, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
 		completed = append(completed, input)
 		return nil
-	}})
+	}, ValidationCommands: []string{"wrong-global-command"}, ValidationCommandsByProject: map[string][]string{"project_1": {"project-check"}}})
 
 	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
 	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
@@ -2668,6 +2671,12 @@ func TestProcessClaimedItemDeterministicValidationFailurePauses(t *testing.T) {
 	}
 	if len(completed) != 1 {
 		t.Fatalf("len(completed) = %d, want terminal completion notification", len(completed))
+	}
+	if !slices.Equal(validatedCommands, []string{"project-check"}) {
+		t.Fatalf("validated commands = %#v, want project-specific command", validatedCommands)
+	}
+	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 {
+		t.Fatalf("push/create PR calls = %d/%d, want failed project validation to block publication", len(git.pushCalls), len(github.createPRCalls))
 	}
 	if len(github.updateIssueCommentCalls) > 0 {
 		body := github.updateIssueCommentCalls[len(github.updateIssueCommentCalls)-1].Body

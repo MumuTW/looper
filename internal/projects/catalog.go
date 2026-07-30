@@ -165,6 +165,9 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		if err := decodeMetadataValue(metadata, "webhook", &project.Webhook); err != nil {
 			return nil, fmt.Errorf("decode project %q webhook policy: %w", project.ID, err)
 		}
+		if err := decodeMetadataValue(metadata, "validation", &project.Validation); err != nil {
+			return nil, fmt.Errorf("decode project %q validation policy: %w", project.ID, err)
+		}
 		if err := decodeMetadataValue(metadata, "roles", &project.Roles); err != nil {
 			return nil, fmt.Errorf("decode project %q role policy: %w", project.ID, err)
 		}
