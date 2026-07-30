@@ -39,6 +39,15 @@ type HITLAsk struct {
 	RecommendedOption string            `json:"recommendedOption,omitempty"`
 	Consequences      map[string]string `json:"consequences,omitempty"`
 	Confidence        string            `json:"confidence,omitempty"`
+
+	// EvidenceHash identifies the malformed sentinel a synthetic ask was raised
+	// for (sha256 of the bounded bytes read, or of the symlink target). It is the
+	// persisted evidence identity that lets a resumed run recognize the SAME
+	// sentinel the human already answered and consume it under human authority
+	// instead of re-asking forever when quarantine could not remove the original.
+	// Empty for a normal, decodable agent ask and for failures that could not
+	// produce a stable fingerprint.
+	EvidenceHash string `json:"evidenceHash,omitempty"`
 }
 
 // ReadHITLAsk extracts the HITL ask state from a loop's metadata JSON. The

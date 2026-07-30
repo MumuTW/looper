@@ -3,12 +3,14 @@ package worker
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -58,8 +60,15 @@ type hitlAsk struct {
 const hitlSentinelQuarantinePattern = "ask-*"
 
 // maxAskSentinelBytes bounds a sentinel read; a decision brief is small, and
-// an enormous file is not a decodable gate request.
+// an enormous file is not a decodable gate request. It also bounds the prefix
+// duplicated into quarantine, so a compromised or looping agent cannot fill the
+// daemon storage volume by repeatedly writing huge sentinels.
 const maxAskSentinelBytes = 1 << 20
+
+// maxQuarantineIncidentsPerLoop bounds how many malformed-sentinel incidents
+// are retained per loop across all of its runs. Older incidents are pruned when
+// a new one arrives, so a looping agent cannot grow quarantine without bound.
+const maxQuarantineIncidentsPerLoop = 16
 
 // consumeAskSentinel reads and removes the agent's ask sentinel from the
 // worktree, if present. A missing sentinel is the ONLY no-question case:
@@ -69,50 +78,124 @@ const maxAskSentinelBytes = 1 << 20
 // decision must not let the worker continue to validation and publication.
 // Consuming (deleting) a valid sentinel prevents the same question from
 // re-suspending on resume.
+//
+// The sentinel path is resolved WITHOUT following symlinks: an agent-controlled
+// ask.json symlink is treated as a protocol error and only the link itself is
+// ever preserved or removed — the daemon never reads the target with its own
+// privileges. Every protocol error carries a stable evidence hash so a resumed
+// run can recognize the SAME sentinel a human already answered and consume it
+// under human authority instead of re-asking forever when quarantine could not
+// remove the original.
 func consumeAskSentinel(worktreePath, quarantineRoot, loopID, runID string) (*hitlAsk, error) {
 	if strings.TrimSpace(worktreePath) == "" {
 		return nil, nil
 	}
 	path := filepath.Join(worktreePath, hitlSentinelRelPath)
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exists but cannot be read: %w", err), askSentinelFileOps{})
+	probe := probeAskSentinel(worktreePath, hitlSentinelRelPath)
+	switch probe.kind {
+	case askSentinelMissing:
+		return nil, nil
+	case askSentinelSymlink:
+		cause := fmt.Errorf("ask sentinel is a symlink pointing at %q; a symlink is not a valid ask and its target is never read", probe.symlinkTarget)
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID, cause: cause,
+			evidenceKind: "symlink", symlinkTarget: probe.symlinkTarget,
+		})
+	case askSentinelIrregular:
+		cause := fmt.Errorf("ask sentinel is not a regular file (mode %v)", probe.info.Mode())
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID, cause: cause,
+			evidenceKind: "irregular",
+		})
+	case askSentinelProbeErr:
+		cause := fmt.Errorf("ask sentinel exists but cannot be probed: %w", probe.err)
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID, cause: cause,
+			evidenceKind: "unreadable",
+		})
 	}
-	if info.Size() > maxAskSentinelBytes {
-		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel is %d bytes (limit %d)", info.Size(), maxAskSentinelBytes), askSentinelFileOps{})
+	// askSentinelRegular. The probe confirmed (via no-follow stat) that the
+	// sentinel is a regular file; probe.file is nil only when it could not be
+	// opened for reading (e.g. mode 0), in which case the bytes are preserved by
+	// renaming the whole file instead of reading it.
+	originalSize := probe.info.Size()
+	if probe.file == nil {
+		cause := fmt.Errorf("ask sentinel exists but cannot be read: %w", probe.err)
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID, cause: cause,
+			evidenceKind: "unreadable", originalSize: originalSize, renameAllowed: true,
+		})
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exists but cannot be read: %w", err), askSentinelFileOps{})
+	defer probe.file.Close()
+	if originalSize > maxAskSentinelBytes {
+		raw := readAskSentinelPrefix(probe.file, maxAskSentinelBytes)
+		cause := fmt.Errorf("ask sentinel is %d bytes (limit %d)", originalSize, maxAskSentinelBytes)
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID, cause: cause,
+			evidenceKind: "regular", evidenceBytes: raw, originalSize: originalSize,
+		})
 	}
-	raw, readErr := io.ReadAll(io.LimitReader(file, maxAskSentinelBytes+1))
-	closeErr := file.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(probe.file, maxAskSentinelBytes+1))
 	if readErr != nil {
-		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exists but cannot be read: %w", readErr), askSentinelFileOps{})
+		cause := fmt.Errorf("ask sentinel exists but cannot be read: %w", readErr)
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID, cause: cause,
+			evidenceKind: "unreadable", originalSize: originalSize, renameAllowed: true,
+		})
 	}
-	if closeErr != nil {
-		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exists but cannot be closed after reading: %w", closeErr), askSentinelFileOps{})
-	}
-	if len(raw) > maxAskSentinelBytes {
-		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exceeds %d-byte limit while being read", maxAskSentinelBytes), askSentinelFileOps{})
+	if int64(len(raw)) > maxAskSentinelBytes {
+		cause := fmt.Errorf("ask sentinel exceeds %d-byte limit while being read", maxAskSentinelBytes)
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID, cause: cause,
+			evidenceKind: "regular", evidenceBytes: raw[:maxAskSentinelBytes], originalSize: int64(len(raw)),
+		})
 	}
 	var ask hitlAsk
 	if err := json.Unmarshal(raw, &ask); err != nil {
-		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel is not valid JSON: %w", err), askSentinelFileOps{})
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID,
+			cause:        fmt.Errorf("ask sentinel is not valid JSON: %w", err),
+			evidenceKind: "regular", evidenceBytes: raw, originalSize: int64(len(raw)),
+		})
 	}
 	if strings.TrimSpace(ask.Question) == "" {
-		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, errors.New("ask sentinel has no question"), askSentinelFileOps{})
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID,
+			cause:        errors.New("ask sentinel has no question"),
+			evidenceKind: "regular", evidenceBytes: raw, originalSize: int64(len(raw)),
+		})
 	}
 	if err := os.Remove(path); err != nil {
-		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("decoded ask sentinel could not be consumed: %w", err), askSentinelFileOps{})
+		return nil, quarantineAskSentinel(quarantineRequest{
+			path: path, root: quarantineRoot, loopID: loopID, runID: runID,
+			cause:        fmt.Errorf("decoded ask sentinel could not be consumed: %w", err),
+			evidenceKind: "regular", evidenceBytes: raw, originalSize: int64(len(raw)),
+		})
 	}
 	return &ask, nil
+}
+
+// readAskSentinelPrefix reads at most n bytes from a sentinel that is known to
+// be oversized, for a bounded evidence fingerprint and quarantined prefix. A
+// read error yields whatever was read (possibly empty); the caller still
+// quarantines the incident with the size and hash of the prefix.
+func readAskSentinelPrefix(file *os.File, n int) []byte {
+	buf := make([]byte, 0, n)
+	tmp := make([]byte, 32*1024)
+	for len(buf) < n {
+		max := n - len(buf)
+		if max > len(tmp) {
+			max = len(tmp)
+		}
+		nr, err := file.Read(tmp[:max])
+		if nr > 0 {
+			buf = append(buf, tmp[:nr]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return buf
 }
 
 // askSentinelProtocolError is structured daemon evidence that the HITL sentinel
@@ -125,6 +208,16 @@ type askSentinelProtocolError struct {
 	evidencePath    string
 	originalRemoved bool
 	quarantineErr   error
+	// evidenceKind is "regular" | "symlink" | "irregular" | "unreadable"; it
+	// drives how quarantine records the evidence without reading a symlink target.
+	evidenceKind string
+	// evidenceHash is the stable sha256 fingerprint of the evidence (kind plus
+	// the bounded bytes read, or the symlink target string). detectHumanAsk
+	// persists it on the synthetic HITLAsk so a resumed run can match it.
+	evidenceHash string
+	// symlinkTarget is the link target string for a symlink sentinel (recorded
+	// for diagnosis; the target file is never read).
+	symlinkTarget string
 }
 
 func (e *askSentinelProtocolError) Error() string {
@@ -157,19 +250,69 @@ func (ops askSentinelFileOps) withDefaults() askSentinelFileOps {
 	return ops
 }
 
-// quarantineAskSentinel moves evidence into daemon-owned durable storage. A
-// symlink is always copied through to regular-file content so it cannot become
-// a dangling link after leaving the worktree. Rename failures use a streaming
-// copy, keeping memory bounded even for an oversized sentinel.
-func quarantineAskSentinel(path, root, loopID, runID string, cause error, ops askSentinelFileOps) error {
-	incident := &askSentinelProtocolError{cause: cause, originalPath: path}
-	if strings.TrimSpace(root) == "" {
+// quarantineRequest carries everything quarantineAskSentinel needs to record an
+// incident without re-reading the worktree: the bounded bytes already read (for
+// a regular sentinel), the symlink target string (for a symlink), or nothing
+// (for an unreadable/irregular sentinel, recorded as metadata only). When
+// renameAllowed is set the sentinel could not be read, so quarantine may rename
+// the whole file to preserve its content without ever opening it.
+type quarantineRequest struct {
+	path          string
+	root          string
+	loopID        string
+	runID         string
+	cause         error
+	ops           askSentinelFileOps
+	evidenceKind  string
+	evidenceBytes []byte
+	originalSize  int64
+	symlinkTarget string
+	renameAllowed bool
+}
+
+// askSentinelEvidenceHash computes the stable fingerprint used as the persisted
+// evidence identity. The kind is mixed in so a symlink target string can never
+// collide with regular-file bytes that happen to match it. An unreadable
+// sentinel (no bytes read) is fingerprinted by its size, so distinct sizes are
+// distinct identities even when the bytes are unavailable.
+func askSentinelEvidenceHash(kind string, bytes []byte, symlinkTarget string, originalSize int64) string {
+	h := sha256.New()
+	_, _ = io.WriteString(h, kind)
+	_, _ = io.WriteString(h, "\n")
+	switch kind {
+	case "symlink":
+		_, _ = io.WriteString(h, symlinkTarget)
+	case "unreadable":
+		_, _ = io.WriteString(h, strconv.FormatInt(originalSize, 10))
+	default:
+		_, _ = h.Write(bytes)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// quarantineAskSentinel records a malformed-sentinel incident in daemon-owned
+// durable storage and removes the original from the worktree consume path. It
+// never follows a symlink: a symlink sentinel is recorded as a metadata
+// descriptor (target string only) and only the link itself is removed. Only a
+// bounded prefix of a regular sentinel is ever duplicated into quarantine,
+// alongside size/hash metadata, so an oversized sentinel cannot fill the
+// daemon volume. A per-loop retention budget prunes the oldest incidents so a
+// looping agent cannot grow quarantine without bound.
+func quarantineAskSentinel(req quarantineRequest) error {
+	incident := &askSentinelProtocolError{
+		cause:         req.cause,
+		originalPath:  req.path,
+		evidenceKind:  req.evidenceKind,
+		symlinkTarget: req.symlinkTarget,
+		evidenceHash:  askSentinelEvidenceHash(req.evidenceKind, req.evidenceBytes, req.symlinkTarget, req.originalSize),
+	}
+	if strings.TrimSpace(req.root) == "" {
 		incident.quarantineErr = errors.New("daemon quarantine root is not configured")
 		return incident
 	}
-	loopDir := filepath.Join(root, durableQuarantineComponent(loopID, "unknown-loop"))
-	parent := filepath.Join(loopDir, durableQuarantineComponent(runID, "unknown-run"))
-	for _, directory := range []string{root, loopDir, parent} {
+	loopDir := filepath.Join(req.root, durableQuarantineComponent(req.loopID, "unknown-loop"))
+	parent := filepath.Join(loopDir, durableQuarantineComponent(req.runID, "unknown-run"))
+	for _, directory := range []string{req.root, loopDir, parent} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			incident.quarantineErr = fmt.Errorf("create quarantine directory %s: %w", directory, err)
 			return incident
@@ -179,6 +322,7 @@ func quarantineAskSentinel(path, root, loopID, runID string, cause error, ops as
 			return incident
 		}
 	}
+	pruneQuarantineIncidents(loopDir, maxQuarantineIncidentsPerLoop-1)
 	dir, err := os.MkdirTemp(parent, hitlSentinelQuarantinePattern)
 	if err != nil {
 		incident.quarantineErr = fmt.Errorf("create quarantine event directory: %w", err)
@@ -188,53 +332,167 @@ func quarantineAskSentinel(path, root, loopID, runID string, cause error, ops as
 		incident.quarantineErr = fmt.Errorf("secure quarantine event directory: %w", err)
 		return incident
 	}
-	destination := filepath.Join(dir, filepath.Base(path))
+	destination := filepath.Join(dir, filepath.Base(req.path))
 	incident.evidencePath = destination
-	ops = ops.withDefaults()
-	info, lstatErr := os.Lstat(path)
-	if lstatErr == nil && info.Mode()&os.ModeSymlink == 0 {
-		if err := ops.rename(path, destination); err == nil {
+	ops := req.ops.withDefaults()
+
+	// An unreadable regular sentinel (no bytes captured) is preserved by moving
+	// the whole file, which never reads its contents. This is only attempted
+	// when the caller could not read the bytes; an oversized sentinel is never
+	// renamed, so a huge file cannot be moved into quarantine unbounded.
+	if req.renameAllowed {
+		if err := ops.rename(req.path, destination); err == nil {
 			incident.originalRemoved = true
-			if err := os.Chmod(destination, 0o600); err != nil {
-				incident.quarantineErr = fmt.Errorf("secure quarantined evidence: %w", err)
+			_ = os.Chmod(destination, 0o600)
+			if sidecar, scErr := buildQuarantineSidecar(req, incident.evidenceHash); scErr == nil {
+				_ = os.WriteFile(destination+".meta.json", sidecar, 0o600)
+				_ = os.Chmod(destination+".meta.json", 0o600)
 			}
 			return incident
 		}
+		// Rename failed (e.g. cross-device); fall through to a descriptor + remove.
 	}
-	if err := copyAskSentinel(path, destination); err != nil {
+
+	content, sidecar, writeErr := buildQuarantineEvidence(req, incident.evidenceHash)
+	if writeErr != nil {
+		incident.evidencePath = ""
+		incident.quarantineErr = writeErr
+		return incident
+	}
+	if err := writeQuarantineEvidence(destination, content, sidecar); err != nil {
 		incident.evidencePath = ""
 		incident.quarantineErr = err
 		return incident
 	}
-	if err := ops.remove(path); err != nil {
-		incident.quarantineErr = fmt.Errorf("remove original after fallback copy: %w", err)
+	if err := ops.remove(req.path); err != nil {
+		incident.quarantineErr = fmt.Errorf("remove original after quarantine copy: %w", err)
 		return incident
 	}
 	incident.originalRemoved = true
 	return incident
 }
 
-func copyAskSentinel(source, destination string) error {
-	input, err := os.Open(source)
+// buildQuarantineEvidence returns the bounded evidence bytes (or a metadata
+// descriptor for non-regular sentinels) and the sidecar metadata to persist
+// alongside. A symlink sentinel records its target string, never the target's
+// contents.
+func buildQuarantineEvidence(req quarantineRequest, hash string) ([]byte, []byte, error) {
+	sidecar, err := buildQuarantineSidecar(req, hash)
 	if err != nil {
-		return fmt.Errorf("open sentinel for fallback copy: %w", err)
+		return nil, nil, err
 	}
-	defer input.Close()
-	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	switch req.evidenceKind {
+	case "regular":
+		return req.evidenceBytes, sidecar, nil
+	case "unreadable":
+		// No bytes were captured (the file could not be read and rename failed);
+		// record a small descriptor so the incident is not an empty file.
+		return appendQuarantineDescriptor(sidecar), sidecar, nil
+	case "symlink", "irregular":
+		return appendQuarantineDescriptor(sidecar), sidecar, nil
+	default:
+		return appendQuarantineDescriptor(sidecar), sidecar, nil
+	}
+}
+
+// buildQuarantineSidecar renders the ask.meta.json sidecar recording the
+// evidence kind, size/hash, and (for symlinks) the target string. For a renamed
+// unreadable sentinel the evidence file holds the full original content and the
+// sidecar's truncated flag is false.
+func buildQuarantineSidecar(req quarantineRequest, hash string) ([]byte, error) {
+	truncated := req.evidenceKind == "regular" && req.originalSize > int64(len(req.evidenceBytes))
+	meta := map[string]any{
+		"kind":         req.evidenceKind,
+		"sha256":       hash,
+		"originalSize": req.originalSize,
+		"truncated":    truncated,
+	}
+	if req.evidenceKind == "symlink" {
+		meta["target"] = req.symlinkTarget
+	}
+	sidecar, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		return fmt.Errorf("create quarantine evidence: %w", err)
+		return nil, fmt.Errorf("encode quarantine metadata: %w", err)
 	}
-	_, copyErr := io.Copy(output, input)
-	closeErr := output.Close()
-	if copyErr != nil {
-		_ = os.Remove(destination)
-		return fmt.Errorf("copy sentinel to quarantine: %w", copyErr)
+	return sidecar, nil
+}
+
+func appendQuarantineDescriptor(sidecar []byte) []byte {
+	var meta map[string]any
+	if err := json.Unmarshal(sidecar, &meta); err != nil {
+		meta = map[string]any{}
 	}
-	if closeErr != nil {
-		_ = os.Remove(destination)
-		return fmt.Errorf("close quarantined evidence: %w", closeErr)
+	descriptor := map[string]any{
+		"kind": meta["kind"],
+		"note": "raw bytes not captured (symlink/irregular/unreadable sentinel); see ask.meta.json",
+	}
+	if target, ok := meta["target"]; ok {
+		descriptor["target"] = target
+	}
+	raw, _ := json.MarshalIndent(descriptor, "", "  ")
+	return raw
+}
+
+func writeQuarantineEvidence(destination string, content, sidecar []byte) error {
+	if err := os.WriteFile(destination, content, 0o600); err != nil {
+		return fmt.Errorf("write quarantined evidence: %w", err)
+	}
+	if err := os.Chmod(destination, 0o600); err != nil {
+		return fmt.Errorf("secure quarantined evidence: %w", err)
+	}
+	if len(sidecar) > 0 {
+		if err := os.WriteFile(destination+".meta.json", sidecar, 0o600); err != nil {
+			return fmt.Errorf("write quarantine metadata: %w", err)
+		}
+		_ = os.Chmod(destination+".meta.json", 0o600)
 	}
 	return nil
+}
+
+// pruneQuarantineIncidents removes the oldest ask-* incident directories under
+// loopDir (across all runs) until at most keep remain. Failures are best-effort:
+// pruning is a retention guard, not an authority, and must never prevent a new
+// incident from being recorded.
+func pruneQuarantineIncidents(loopDir string, keep int) {
+	if keep < 0 {
+		keep = 0
+	}
+	entries, err := os.ReadDir(loopDir)
+	if err != nil {
+		return
+	}
+	type incident struct {
+		path  string
+		mtime int64
+	}
+	var incidents []incident
+	for _, runDir := range entries {
+		if !runDir.IsDir() {
+			continue
+		}
+		runPath := filepath.Join(loopDir, runDir.Name())
+		events, err := os.ReadDir(runPath)
+		if err != nil {
+			continue
+		}
+		for _, ev := range events {
+			if !ev.IsDir() {
+				continue
+			}
+			info, err := ev.Info()
+			if err != nil {
+				continue
+			}
+			incidents = append(incidents, incident{path: filepath.Join(runPath, ev.Name()), mtime: info.ModTime().UnixNano()})
+		}
+	}
+	if len(incidents) <= keep {
+		return
+	}
+	sort.Slice(incidents, func(i, j int) bool { return incidents[i].mtime < incidents[j].mtime })
+	for i := 0; i < len(incidents)-keep; i++ {
+		_ = os.RemoveAll(incidents[i].path)
+	}
 }
 
 func durableQuarantineComponent(value, fallback string) string {
@@ -260,6 +518,10 @@ type awaitingHumanError struct {
 	recommendedOption string
 	consequences      map[string]string
 	confidence        string
+	// evidenceHash identifies the malformed sentinel a synthetic ask was raised
+	// for (empty for a normal, decodable agent ask). Persisted on the HITLAsk so
+	// a resumed run can consume the same sentinel under human authority.
+	evidenceHash string
 }
 
 func (e *awaitingHumanError) Error() string { return "worker paused awaiting human decision" }
@@ -404,9 +666,32 @@ func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord)
 // detectHumanAsk consumes the agent's ask sentinel (if any) and, when present,
 // returns a typed awaitingHumanError carrying the question, options, and the
 // agent's native session id (so the run can resume the same session).
+//
+// When a sentinel fails to decode and the original could not be removed,
+// quarantine is re-attempted on every resume. To keep that from re-asking
+// forever, the synthetic ask persists the malformed sentinel's evidence hash.
+// If the resumed run probes the SAME sentinel (same hash) and a human has
+// already answered that ask, the human's response is the authority to consume
+// the original under human authority and proceed — no new ask is raised. A
+// genuinely new malformed sentinel (different hash) still raises a fresh ask.
 func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
 	ask, err := consumeAskSentinel(worktreePath, r.hitlQuarantineRoot, input.Loop.ID, input.Run.ID)
 	if err != nil {
+		var incident *askSentinelProtocolError
+		evidenceHash := ""
+		if errors.As(err, &incident) {
+			evidenceHash = incident.evidenceHash
+			if evidenceHash != "" {
+				if existing, ok := r.readFreshHITLAsk(ctx, &input.Loop); ok &&
+					existing.EvidenceHash == evidenceHash &&
+					(existing.Status == "answered" || existing.Status == "consumed") {
+					// The human already authorized this exact evidence. Consume the
+					// original under human authority and proceed instead of looping.
+					_ = os.Remove(filepath.Join(worktreePath, hitlSentinelRelPath))
+					return nil, nil
+				}
+			}
+		}
 		// Sentinel presence is daemon-observed protocol evidence, not authority
 		// for an inferred action. Persist a synthetic, answerable HITL ask so the
 		// existing /respond path remains the only authority that resumes work.
@@ -424,7 +709,8 @@ func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePa
 				"regenerate the decision brief":         "resume the same agent context and require a new valid question before proceeding",
 				"continue without the original request": "resume only because the human explicitly authorizes proceeding without that undecodable request",
 			},
-			confidence: "low",
+			confidence:   "low",
+			evidenceHash: evidenceHash,
 		}, nil
 	}
 	if ask == nil {
@@ -490,6 +776,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		RecommendedOption: awaiting.recommendedOption,
 		Consequences:      awaiting.consequences,
 		Confidence:        awaiting.confidence,
+		EvidenceHash:      awaiting.evidenceHash,
 	}
 	// Preflight the strict metadata decode before ANY GitHub side effects: a
 	// malformed value would otherwise let deliverAskToGitHub publish a branch,
