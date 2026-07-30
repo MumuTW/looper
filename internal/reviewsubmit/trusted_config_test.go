@@ -49,6 +49,36 @@ func TestTrustedReviewConfigIgnoresChildPrecedenceLayers(t *testing.T) {
 	}
 }
 
+func TestTrustedReviewConfigAcceptsOldDaemonAutoUpgradeSnapshot(t *testing.T) {
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal(config snapshot) error = %v", err)
+	}
+	var oldDaemonSnapshot map[string]any
+	if err := json.Unmarshal(raw, &oldDaemonSnapshot); err != nil {
+		t.Fatalf("Unmarshal(config snapshot) error = %v", err)
+	}
+	oldDaemonSnapshot["package"].(map[string]any)["autoUpgradeEnabled"] = false
+	raw, err = json.Marshal(oldDaemonSnapshot)
+	if err != nil {
+		t.Fatalf("Marshal(old daemon snapshot) error = %v", err)
+	}
+
+	t.Setenv("LOOPER_TRUSTED_REVIEW_PROXY_CHILD", "1")
+	installTrustedReviewConfigFD(t, raw)
+	loaded, err := loadConfig(Options{})
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if loaded.Config.Package.DeprecatedAutoUpgradeEnabled {
+		t.Fatal("trusted snapshot autoUpgradeEnabled = true, want old daemon false wire value")
+	}
+}
+
 func TestTrustedReviewConfigClearsFDAndFailsLoudOnSecondLoad(t *testing.T) {
 	// Skip-only fix: no memoization. First load consumes the one-shot FD;
 	// a second load must fail loud so double consumers cannot mask as success.

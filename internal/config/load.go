@@ -910,6 +910,27 @@ func parseOperationalCLIArg(
 		ensureInstructionsConfig(&parsed.overrides).Enabled = parsedValue
 		*canonicalInstructionsEnabledOverrideSet = true
 		return true, nextIndex, nil
+	case matchesFlag(arg, "--no-auto-upgrade"):
+		nextIndex := index
+		if _, value, ok := strings.Cut(arg, "="); ok {
+			if _, err := parseBoolean(value); err != nil {
+				return true, index, fmt.Errorf("invalid value for --no-auto-upgrade: %q is not a boolean", value)
+			}
+		} else if index+1 < len(args) && !strings.HasPrefix(args[index+1], "--") {
+			if _, err := parseBoolean(args[index+1]); err == nil {
+				nextIndex++
+			}
+		}
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--package-auto-upgrade-enabled"):
+		value, nextIndex, err := takeValue(index, "--package-auto-upgrade-enabled")
+		if err != nil {
+			return true, index, err
+		}
+		if _, err := parseBoolean(value); err != nil {
+			return true, index, fmt.Errorf("invalid value for --package-auto-upgrade-enabled: %q is not a boolean", value)
+		}
+		return true, nextIndex, nil
 	case matchesFlag(arg, "--host"):
 		value, nextIndex, err := takeValue(index, "--host")
 		if err != nil {

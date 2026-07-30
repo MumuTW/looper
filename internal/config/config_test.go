@@ -59,6 +59,64 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestLoadFileAcceptsIgnoredDeprecatedPackageAutoUpgradeEnabledAcrossFormats(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		raw  string
+	}{
+		{name: "json", path: "config.json", raw: `{"package":{"autoUpgradeEnabled":false}}`},
+		{name: "yaml", path: "config.yaml", raw: "package:\n  autoUpgradeEnabled: false\n"},
+		{name: "toml", path: "config.toml", raw: "[package]\nautoUpgradeEnabled = false\n"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			path := filepath.Join(cwd, test.path)
+			if err := os.WriteFile(path, []byte(test.raw), 0o600); err != nil {
+				t.Fatalf("WriteFile(%s) error = %v", test.path, err)
+			}
+
+			loaded, err := LoadFile(LoadFileOptions{
+				CWD:        cwd,
+				ConfigPath: path,
+				LookupEnv:  emptyEnvLookup,
+				LookPath:   fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"}),
+			})
+			if err != nil {
+				t.Fatalf("LoadFile() error = %v", err)
+			}
+			if loaded.Partial.Package == nil || loaded.Partial.Package.DeprecatedAutoUpgradeEnabled == nil || *loaded.Partial.Package.DeprecatedAutoUpgradeEnabled {
+				t.Fatalf("deprecated package input = %#v, want decoded false placeholder", loaded.Partial.Package)
+			}
+			if !loaded.Config.Package.AutoMigrateOnStartup {
+				t.Fatal("deprecated package input changed active package config, want ignored input")
+			}
+		})
+	}
+}
+
+func TestLoadFileAcceptsDeprecatedAutoUpgradeStartupArgsAsNoOps(t *testing.T) {
+	cwd := t.TempDir()
+	loaded, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: filepath.Join(cwd, "missing.json"),
+		Args: []string{
+			"--no-auto-upgrade=true",
+			"--package-auto-upgrade-enabled", "false",
+		},
+		LookupEnv: emptyEnvLookup,
+		LookPath:  fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"}),
+	})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Package.AutoMigrateOnStartup {
+		t.Fatal("deprecated startup args changed active package config, want ignored")
+	}
+}
+
 func TestLoadFileUsesDefaultsWhenConfigFileIsTopLevelNull(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
