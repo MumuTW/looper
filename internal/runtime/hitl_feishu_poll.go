@@ -17,10 +17,9 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-// feishuInboxEvent is one event from the shared Cloudflare inbox (GET /events).
 type feishuInboxEvent struct {
 	ID           int64  `json:"id"`
-	Kind         string `json:"kind"` // "message" | "card_action"
+	Kind         string `json:"kind"`
 	RootID       string `json:"rootId"`
 	SenderOpenID string `json:"senderOpenId"`
 	Text         string `json:"text"`
@@ -30,78 +29,76 @@ type feishuInboxEvent struct {
 	} `json:"value"`
 }
 
-// feishuHITLPollDeps are the injected dependencies of the Feishu inbox poll lane.
 type feishuHITLPollDeps struct {
-	// loopByRoot maps a Feishu thread root message id to the loop that owns it
-	// (this looper's local feishu_threads); "" when it belongs to another looper.
-	loopByRoot func(ctx contextType, rootID string) string
-	// loopBySeq maps a loop seq (from a card-action value) to a loop id; "" when
-	// unknown to this looper.
-	loopBySeq func(ctx contextType, seq int64) string
-	// deliverAnswer feeds a button-click decision into the shared HITL core.
-	deliverAnswer func(ctx contextType, loopID, answer string) error
-	// enqueueMessage queues a free-text thread reply for the loop (conversational /
-	// anytime), to be drained on the loop's next turn rather than treated as a final
-	// answer.
+	loopByRoot     func(ctx contextType, rootID string) string
+	loopBySeq      func(ctx contextType, seq int64) string
+	deliverAnswer  func(ctx contextType, loopID, answer string) error
 	enqueueMessage func(ctx contextType, loopID, text string) error
 	logWarn        func(msg string, fields map[string]any)
 }
 
-// pollFeishuHITLInboxOnce delivers the answers among a batch of inbox events that
-// belong to this looper's awaiting loops, self-selecting by thread root (typed
-// replies) or loop seq (card-action clicks). Returns the highest event id seen so
-// the caller can advance its cursor. Idempotent: an event whose loop is no longer
-// awaiting is a no-op in deliverAnswer.
-func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps feishuHITLPollDeps) (delivered int, maxID int64) {
+// pollFeishuHITLInboxOnce delivers answers among a batch of inbox events.
+// Returns the count of successfully delivered events and a safe cursor value.
+// A delivery failure stops the batch before later events can be applied past
+// the retry cursor. Events intentionally skipped (wrong looper, empty text,
+// unknown kind) are consumed and do not block the cursor.
+func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps feishuHITLPollDeps, lastCursor int64) (delivered int, newCursor int64) {
+	newCursor = lastCursor
+
 	for _, e := range events {
-		if e.ID > maxID {
-			maxID = e.ID
-		}
 		loopID := ""
 		value := ""
 		var deliver func(contextType, string, string) error
 		switch strings.TrimSpace(e.Kind) {
 		case "message":
-			// A typed thread reply is conversational: queue it (question / new
-			// instruction / an answer the agent will interpret), don't force it to
-			// resolve the ask.
 			text := strings.TrimSpace(e.Text)
 			root := strings.TrimSpace(e.RootID)
 			if text == "" || root == "" || deps.loopByRoot == nil || deps.enqueueMessage == nil {
+				newCursor = maxFeishuInboxCursor(newCursor, e.ID)
 				continue
 			}
 			loopID = deps.loopByRoot(ctx, root)
 			value = text
 			deliver = deps.enqueueMessage
 		case "card_action":
-			// A button click is a clean decision → the shared answer path.
 			ans := strings.TrimSpace(e.Value.Answer)
 			seq, err := strconv.ParseInt(strings.TrimSpace(e.Value.LoopSeq), 10, 64)
 			if ans == "" || err != nil || deps.loopBySeq == nil {
+				newCursor = maxFeishuInboxCursor(newCursor, e.ID)
 				continue
 			}
 			loopID = deps.loopBySeq(ctx, seq)
 			value = ans
 			deliver = deps.deliverAnswer
 		default:
+			newCursor = maxFeishuInboxCursor(newCursor, e.ID)
 			continue
 		}
 		if strings.TrimSpace(loopID) == "" {
-			continue // belongs to another looper (or already resumed)
+			// Belongs to another looper or already resumed — does not block cursor.
+			newCursor = maxFeishuInboxCursor(newCursor, e.ID)
+			continue
 		}
 		if err := deliver(ctx, loopID, value); err != nil {
 			if deps.logWarn != nil {
-				deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"loopId": loopID, "kind": e.Kind, "error": err.Error()})
+				deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"eventId": e.ID, "loopId": loopID, "kind": e.Kind, "error": err.Error()})
 			}
-			continue
+			return delivered, newCursor
 		}
 		delivered++
+		newCursor = maxFeishuInboxCursor(newCursor, e.ID)
 	}
-	return delivered, maxID
+	return delivered, newCursor
 }
 
-// feishuInboxCursor tracks the last inbox event id this daemon has consumed. In
-// memory is sufficient: on restart it re-reads from 0 and delivery is idempotent.
+func maxFeishuInboxCursor(current, eventID int64) int64 {
+	if eventID > current {
+		return eventID
+	}
+	return current
+}
+
+// feishuInboxCursor tracks the last inbox event id this daemon has consumed.
 var feishuInboxCursor struct {
 	mu sync.Mutex
 	v  int64
@@ -109,9 +106,6 @@ var feishuInboxCursor struct {
 
 var feishuInboxHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-// runFeishuHITLPoll polls the shared Cloudflare inbox once and delivers any
-// answers for this looper's awaiting loops. Gated by the feishu transport +
-// cf-inbox inbound; a no-op otherwise.
 func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 	if input.Config == nil || !input.Config.HITL.Enabled || input.Repos == nil {
 		return
@@ -164,7 +158,6 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			if err := deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer); err != nil {
 				return err
 			}
-			// Mark the ask card resolved ("✅ 已选:X", brief preserved).
 			if input.OnHITLAnswerDelivered != nil {
 				input.OnHITLAnswerDelivered(ctx, loopID, answer)
 			}
@@ -178,11 +171,11 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 		deps.logWarn = func(msg string, fields map[string]any) { input.Logger.Warn(msg, fields) }
 	}
 
-	delivered, maxID := pollFeishuHITLInboxOnce(ctx, events, deps)
-	if maxID > 0 {
+	delivered, newCursor := pollFeishuHITLInboxOnce(ctx, events, deps, since)
+	if newCursor > 0 {
 		feishuInboxCursor.mu.Lock()
-		if maxID > feishuInboxCursor.v {
-			feishuInboxCursor.v = maxID
+		if newCursor > feishuInboxCursor.v {
+			feishuInboxCursor.v = newCursor
 		}
 		feishuInboxCursor.mu.Unlock()
 	}
@@ -224,8 +217,6 @@ func fetchFeishuInboxEvents(ctx context.Context, inboxURL, token string, since i
 	return parsed.Events, nil
 }
 
-// storageReposForFeishuPoll is a compile-time assertion that the repos we rely on
-// exist (keeps this file honest if the storage API changes).
 var _ = func(r *storage.Repositories) {
 	_ = r.FeishuThreads
 	_ = r.Loops
