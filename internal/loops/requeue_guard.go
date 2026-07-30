@@ -9,18 +9,72 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+// guardRegistry hands out per-key mutexes and reclaims entries when the last
+// holder or waiter releases, so a long-running daemon churning through
+// one-shot loops does not grow the registries monotonically.
+//
+// The registry map (under registryMu) is the single mutex authority per key:
+// an entry is present iff refs > 0, refs counts holders plus waiters, and an
+// entry is deleted only at refs == 0 under registryMu — so a later lock on
+// the same key can never mint a second live mutex for a goroutine still using
+// the old one.
+type guardRegistry struct {
+	registryMu sync.Mutex
+	entries    map[string]*guardEntry
+}
+
+type guardEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func newGuardRegistry() *guardRegistry {
+	return &guardRegistry{entries: make(map[string]*guardEntry)}
+}
+
+func (r *guardRegistry) lock(key string) func() {
+	r.registryMu.Lock()
+	entry, ok := r.entries[key]
+	if !ok {
+		entry = &guardEntry{}
+		r.entries[key] = entry
+	}
+	entry.refs++
+	r.registryMu.Unlock()
+
+	entry.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.mu.Unlock()
+			r.registryMu.Lock()
+			entry.refs--
+			if entry.refs == 0 {
+				delete(r.entries, key)
+			}
+			r.registryMu.Unlock()
+		})
+	}
+}
+
+func (r *guardRegistry) size() int {
+	r.registryMu.Lock()
+	defer r.registryMu.Unlock()
+	return len(r.entries)
+}
+
 // loopRequeueGuards serializes per-loop queue rearm across the API discard/retry
 // path and runtime free-text / HITL / recovery / discovery requeues. Without a
 // process-wide mutex, concurrent requeue can land after API preflight and
 // before git reset, wiping the worktree for a continuation that then loses the
 // retry transaction to an active-queue conflict.
-var loopRequeueGuards sync.Map // loopID -> *sync.Mutex
+var loopRequeueGuards = newGuardRegistry()
 
 // loopTargetGuards serializes same worktree-target mutations across API
 // discard/retry/start/create and runtime recovery/discovery/HITL requeues.
 // Per-loop locks alone cannot block a *different* loop on the shared PR
 // worktree from requeuing between discard preflight and git reset.
-var loopTargetGuards sync.Map // targetGuardKey -> *sync.Mutex
+var loopTargetGuards = newGuardRegistry()
 
 // LockLoopRequeue acquires the process-wide per-loop requeue mutex shared by:
 //   - API retry/start/reuse
@@ -34,10 +88,7 @@ var loopTargetGuards sync.Map // targetGuardKey -> *sync.Mutex
 // Call order with LockLoopTarget: take the per-loop lock first, then the
 // target lock.
 func LockLoopRequeue(loopID string) func() {
-	value, _ := loopRequeueGuards.LoadOrStore(loopID, &sync.Mutex{})
-	mu := value.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	return loopRequeueGuards.lock(loopID)
 }
 
 // LoopTargetGuardKey builds the process-wide target mutex key shared by API
@@ -115,8 +166,5 @@ func LockLoopTarget(key string) func() {
 	if strings.TrimSpace(key) == "" {
 		return func() {}
 	}
-	value, _ := loopTargetGuards.LoadOrStore(key, &sync.Mutex{})
-	mu := value.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	return loopTargetGuards.lock(key)
 }
