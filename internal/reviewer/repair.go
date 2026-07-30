@@ -12,7 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -369,7 +369,7 @@ func staleFilterSkip(skip map[string]any, detail PullRequestDetail, currentLogin
 		if label == "" {
 			return false
 		}
-		return !specpr.HasLabel(detail.Labels, label)
+		return !labels.Has(detail.Labels, label)
 	default:
 		return false
 	}

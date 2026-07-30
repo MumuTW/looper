@@ -114,10 +114,18 @@ rather than letting the wording imply the stronger one.
 Guaranteed from the moment takeover commits, until `looper handback`:
 
 - **No new claim** is granted on the held loop, or on any other loop sharing its
-  checkout — same project + repo + PR number for a PR target, same project +
-  target_id for an issue target. A project target is *not* a shared checkout
-  (project workers run concurrently by design, each on its own branch), so a
-  project-target hold fences only the held loop.
+  checkout — same project + repo + PR number for a PR target; same project +
+  target_id for an issue target, among planner loops only. Two target types are
+  *not* shared checkouts, and each fences only the held loop:
+  - A **project** target: project workers run concurrently by design, each on its
+    own branch.
+  - A **non-planner issue** loop: planner is the only role whose issue branch is
+    issue-derived (`looper/planner/<issue>-<slug>`), so a replacement planner loop
+    on the same issue does land on the held checkout. A worker's branch carries
+    its own loop hash (`looper/<issue>-<slug>-<loopHash>`), so a worker on the same
+    issue never shares the planner's checkout or another worker's. The ordinary
+    issue lock serialises the roles while one is running, and takeover cancels the
+    held loop's queue item, so no shared resource survives the hold.
 - **The selected loop's in-flight run is stopped**, and spawn admission for it
   stays closed.
 - **Its worktree is kept out of cleanup**: worktree cleanup skips it, and the

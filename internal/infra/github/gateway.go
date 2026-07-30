@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,9 +18,8 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -67,9 +67,15 @@ const (
 )
 
 type Options struct {
-	GHPath                 string
-	GitPath                string
-	CWD                    string
+	GHPath  string
+	GitPath string
+	CWD     string
+	// Env carries the credential variables (see config.DaemonGitHubCredentialEnv)
+	// that every `gh` child of this gateway must receive. Entries are merged over
+	// the parent process environment, so the child keeps PATH/HOME and only the
+	// named keys are overridden. Nil means inherit the parent environment
+	// unchanged — which, in a detached daemon, means anonymous GitHub calls.
+	Env                    map[string]string
 	Now                    func() time.Time
 	DiscoveryCacheTTL      time.Duration
 	GHRun                  func(context.Context, shell.Options) (shell.Result, error)
@@ -78,9 +84,12 @@ type Options struct {
 }
 
 type Gateway struct {
-	ghPath                 string
-	gitPath                string
-	cwd                    string
+	ghPath  string
+	gitPath string
+	cwd     string
+	// ghEnv is the fully materialized child environment for gh invocations
+	// (parent environment plus Options.Env), or nil to inherit unchanged.
+	ghEnv                  map[string]string
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
 	discoveryCacheMu       sync.Mutex
@@ -657,12 +666,6 @@ type InitializeLabelsInput struct {
 	DryRun bool
 }
 
-type LabelDefinition struct {
-	Name        string `json:"name"`
-	Color       string `json:"color"`
-	Description string `json:"description"`
-}
-
 type LabelInitResult struct {
 	Repo    string           `json:"repo"`
 	DryRun  bool             `json:"dryRun"`
@@ -680,7 +683,6 @@ type LabelInitItem struct {
 
 type LabelInitSummary struct {
 	Created int `json:"created"`
-	Updated int `json:"updated"`
 	Skipped int `json:"skipped"`
 	Failed  int `json:"failed"`
 }
@@ -718,6 +720,7 @@ func New(options Options) *Gateway {
 		ghPath:                 ghPath,
 		gitPath:                gitPath,
 		cwd:                    options.CWD,
+		ghEnv:                  mergeIntoProcessEnv(options.Env),
 		now:                    now,
 		discoveryCacheTTL:      options.DiscoveryCacheTTL,
 		discoveryPRCache:       map[string]discoveryPullRequestListCacheEntry{},
@@ -1195,7 +1198,7 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 // fixer/reviewer protocols cross that bounded boundary.
 func (g *Gateway) listPullRequestAutomationComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	filter := `.[] | select((.body // "") | (contains("looper:forgejo-reviewer-summary") or contains("looper:fixer-round") or contains("looper:conflict-notice") or contains("looper:reviewer:automerge-refused") or contains("looper:forgejo-fixer-summary"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
+	filter := `.[] | select((.body // "") | (contains("looper:fixer-round") or contains("looper:conflict-notice") or contains("looper:reviewer:automerge-refused"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
 	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--jq", filter}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
@@ -3017,42 +3020,91 @@ func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsIn
 	if err := validateGitHubRepoSlug(repo); err != nil {
 		return LabelInitResult{}, err
 	}
+	return g.ensureLabels(ctx, repo, input.CWD, labels.Standard(), ensureLabelsOptions{
+		dryRun: input.DryRun,
+		// Provisioning reports a per-label plan, so it keeps going and records
+		// every outcome rather than stopping at the first failure.
+		requireListing: input.DryRun,
+	})
+}
 
-	existing, err := g.listRepositoryLabels(ctx, repo, input.CWD)
-	if err != nil {
-		return LabelInitResult{}, err
+// ensureLabels creates every definition the repository does not already have,
+// and reports what it did.
+//
+// This is the single label-creating path. There used to be two — bulk
+// provisioning and the per-apply check — and each grew the same overwrite
+// defect independently, which is why the same fix had to be written twice.
+// One implementation cannot diverge from itself.
+//
+// Create-only, always. Looper needs a label to exist; it has no claim on how a
+// maintainer has worded one that already does.
+//
+// The requested definitions are the authority. Listing is drift detection —
+// it exists only to skip creates that would fail anyway — so a failed list
+// must not block the caller: nothing is then known to exist, every create is
+// attempted, and one that loses to an existing label is tolerated exactly as a
+// lost race is.
+type ensureLabelsOptions struct {
+	dryRun bool
+	// requireListing makes a failed listing fatal. Tolerating one is only safe
+	// when creates follow: an attempted create corrects a wrong guess about
+	// what exists. A dry run performs none, so its entire output would be that
+	// guess presented as a plan.
+	requireListing bool
+	// stopOnFirstFailure abandons the remaining definitions once the caller's
+	// action is already known to fail. The apply paths want this: continuing
+	// to create labels that will never be applied leaves the repository
+	// changed for an action that did not happen.
+	stopOnFirstFailure bool
+}
+
+func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definitions []labels.Definition, opts ensureLabelsOptions) (LabelInitResult, error) {
+	result := LabelInitResult{Repo: repo, DryRun: opts.dryRun, Labels: make([]LabelInitItem, 0, len(definitions))}
+	if len(definitions) == 0 {
+		return result, nil
 	}
 
-	result := LabelInitResult{Repo: repo, DryRun: input.DryRun, Labels: make([]LabelInitItem, 0, len(StandardLooperLabels()))}
-	for _, definition := range StandardLooperLabels() {
-		item := LabelInitItem{Name: definition.Name, Color: definition.Color, Description: definition.Description}
-		current, ok := existing[strings.ToLower(definition.Name)]
-		switch {
-		case !ok:
-			item.Status = "created"
-			if !input.DryRun {
-				_, err = g.runGh(ctx, input.CWD, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description)
-			}
-		case normalizeLabelColor(current.Color) == normalizeLabelColor(definition.Color) && strings.TrimSpace(current.Description) == definition.Description:
-			item.Status = "skipped"
-		default:
-			item.Status = "updated"
-			if !input.DryRun {
-				_, err = g.runGh(ctx, input.CWD, "", "label", "edit", current.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description)
-			}
+	existing, listErr := g.listRepositoryLabels(ctx, repo, cwd)
+	if listErr != nil {
+		if opts.requireListing {
+			return LabelInitResult{}, listErr
 		}
+		existing = nil
+	}
 
-		if err != nil {
-			item.Status = "failed"
-			item.Error = err.Error()
-			err = nil
+	var firstFailure error
+	for _, definition := range definitions {
+		item := LabelInitItem{Name: definition.Name, Color: definition.Color, Description: definition.Description}
+		if _, exists := existing[labels.Normalize(definition.Name)]; exists {
+			item.Status = "skipped"
+		} else {
+			item.Status = "created"
+			if !opts.dryRun {
+				if _, createErr := g.runGh(ctx, cwd, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description); createErr != nil {
+					if isLabelAlreadyExistsError(createErr) {
+						item.Status = "skipped"
+					} else {
+						item.Status = "failed"
+						item.Error = createErr.Error()
+						if firstFailure == nil {
+							firstFailure = fmt.Errorf("create label %s: %w", definition.Name, createErr)
+						}
+					}
+				}
+			}
 		}
 		result.Labels = append(result.Labels, item)
 		incrementLabelSummary(&result.Summary, item.Status)
+		if firstFailure != nil && opts.stopOnFirstFailure {
+			break
+		}
 	}
 
-	if result.Summary.Failed > 0 {
-		return result, fmt.Errorf("%d label mutation(s) failed", result.Summary.Failed)
+	// Return the underlying failure rather than a count. A caller applying a
+	// label needs to know it hit a 403, not that one mutation failed; the
+	// per-item errors on the result still carry the rest.
+	if firstFailure != nil {
+		return result, firstFailure
 	}
 	return result, nil
 }
@@ -3374,21 +3426,54 @@ func (g *Gateway) getReviewThread(ctx context.Context, threadID, cwd string) (*r
 	return &reviewThreadNode{ID: id, IsResolved: asBool(node["isResolved"])}, nil
 }
 
-func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, labels []string, cwd string) error {
+// ensureLabelsExist creates any label about to be applied that the repository
+// does not have yet, so that applying a label to a fresh repository does not
+// fail on a missing label.
+//
+// Presentation comes from labels.Standard when the label is one Looper owns,
+// and falls back to a neutral default for anything else — a project may
+// configure its own trigger labels, and those have no entry in the table.
+func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []string, cwd string) error {
+	definitions := make([]labels.Definition, 0, len(wanted))
 	seen := map[string]struct{}{}
-	for _, label := range labels {
-		if _, ok := seen[label]; ok {
+	for _, label := range wanted {
+		normalized := labels.Normalize(label)
+		if normalized == "" {
 			continue
 		}
-		seen[label] = struct{}{}
-		if _, err := g.runGh(ctx, cwd, "", "label", "create", label, "--repo", repo, "--color", resolveLabelColor(label), "--description", resolveLabelDescription(label), "--force"); err != nil {
-			return err
+		if _, duplicate := seen[normalized]; duplicate {
+			continue
 		}
+		seen[normalized] = struct{}{}
+		definitions = append(definitions, labelPresentation(label))
 	}
-	return nil
+	_, err := g.ensureLabels(ctx, repo, cwd, definitions, ensureLabelsOptions{stopOnFirstFailure: true})
+	return err
 }
 
-func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd string) (map[string]LabelDefinition, error) {
+// isLabelAlreadyExistsError reports whether a `gh label create` failure is the
+// duplicate-label outcome real gh produces without --force. The label already
+// exists, so the caller can treat it as success rather than aborting a label
+// application that lost a create race.
+func isLabelAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already exists")
+}
+
+// labelPresentation resolves the color and description to create a label with.
+func labelPresentation(label string) labels.Definition {
+	normalized := labels.Normalize(label)
+	for _, definition := range labels.Standard() {
+		if labels.Normalize(definition.Name) == normalized {
+			return definition
+		}
+	}
+	return labels.Definition{Name: label, Color: "5319e7", Description: "Managed by looper"}
+}
+
+func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd string) (map[string]labels.Definition, error) {
 	result, err := g.runGh(ctx, cwd, "", "label", "list", "--repo", repo, "--limit", "1000", "--json", "name,color,description")
 	if err != nil {
 		return nil, err
@@ -3397,13 +3482,13 @@ func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd str
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]LabelDefinition, len(rows))
+	out := make(map[string]labels.Definition, len(rows))
 	for _, row := range rows {
 		name := strings.TrimSpace(asString(row["name"]))
 		if name == "" {
 			continue
 		}
-		out[strings.ToLower(name)] = LabelDefinition{Name: name, Color: normalizeLabelColor(asString(row["color"])), Description: strings.TrimSpace(asString(row["description"]))}
+		out[strings.ToLower(name)] = labels.Definition{Name: name, Color: normalizeLabelColor(asString(row["color"])), Description: strings.TrimSpace(asString(row["description"]))}
 	}
 	return out, nil
 }
@@ -3412,8 +3497,34 @@ func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) 
 	return g.runGhWithTimeout(ctx, cwd, stdin, defaultGhCommandTimeout, args...)
 }
 
+// mergeIntoProcessEnv materializes a full child environment from the parent
+// process environment plus overrides. shell.Options.Env replaces the child
+// environment wholesale, so a partial map would strip PATH/HOME from gh.
+// Returns nil when there is nothing to override, which keeps inheritance.
+func mergeIntoProcessEnv(overrides map[string]string) map[string]string {
+	if len(overrides) == 0 {
+		return nil
+	}
+	merged := map[string]string{}
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		merged[key] = value
+	}
+	for key, value := range overrides {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		merged[key] = value
+	}
+	return merged
+}
+
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
-	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: g.ghEnv, Stdin: stdin, Timeout: timeout})
 	if result.StdoutTruncated || result.StderrTruncated {
 		streams := make([]string, 0, 2)
 		if result.StdoutTruncated {
@@ -3733,59 +3844,6 @@ func extractIssueRepository(value any) IssueRepository {
 	}
 }
 
-func resolveLabelColor(label string) string {
-	switch strings.ToLower(strings.TrimSpace(label)) {
-	case "looper:plan":
-		return "5319e7"
-	case specpr.ReviewingLabel:
-		return "1d76db"
-	case specpr.ReadyLabel:
-		return "0e8a16"
-	case specpr.NeedsHumanLabel:
-		return "d93f0b"
-	case domain.HoldLabelGlobal, domain.HoldLabelWorker, domain.HoldLabelFixer, domain.HoldLabelReviewer:
-		return "b60205"
-	default:
-		return "5319e7"
-	}
-}
-
-func resolveLabelDescription(label string) string {
-	switch strings.ToLower(strings.TrimSpace(label)) {
-	case "looper:plan":
-		return "Picked up automatically by planner"
-	case specpr.ReviewingLabel:
-		return "Spec PR is under review"
-	case specpr.ReadyLabel:
-		return "Spec PR is ready for implementation"
-	case specpr.NeedsHumanLabel:
-		return "Looper requires manual intervention"
-	case domain.HoldLabelGlobal:
-		return "Block all automatic Looper activity for this issue or PR"
-	case domain.HoldLabelWorker:
-		return "Block automatic worker activity for this issue or PR"
-	case domain.HoldLabelFixer:
-		return "Block automatic fixer activity for this issue or PR"
-	case domain.HoldLabelReviewer:
-		return "Block automatic reviewer activity for this issue or PR"
-	default:
-		return "Managed by looper"
-	}
-}
-
-func StandardLooperLabels() []LabelDefinition {
-	return []LabelDefinition{
-		{Name: "looper:plan", Color: resolveLabelColor("looper:plan"), Description: resolveLabelDescription("looper:plan")},
-		{Name: specpr.ReviewingLabel, Color: resolveLabelColor(specpr.ReviewingLabel), Description: resolveLabelDescription(specpr.ReviewingLabel)},
-		{Name: specpr.ReadyLabel, Color: resolveLabelColor(specpr.ReadyLabel), Description: resolveLabelDescription(specpr.ReadyLabel)},
-		{Name: specpr.NeedsHumanLabel, Color: resolveLabelColor(specpr.NeedsHumanLabel), Description: resolveLabelDescription(specpr.NeedsHumanLabel)},
-		{Name: domain.HoldLabelGlobal, Color: resolveLabelColor(domain.HoldLabelGlobal), Description: resolveLabelDescription(domain.HoldLabelGlobal)},
-		{Name: domain.HoldLabelWorker, Color: resolveLabelColor(domain.HoldLabelWorker), Description: resolveLabelDescription(domain.HoldLabelWorker)},
-		{Name: domain.HoldLabelFixer, Color: resolveLabelColor(domain.HoldLabelFixer), Description: resolveLabelDescription(domain.HoldLabelFixer)},
-		{Name: domain.HoldLabelReviewer, Color: resolveLabelColor(domain.HoldLabelReviewer), Description: resolveLabelDescription(domain.HoldLabelReviewer)},
-	}
-}
-
 func normalizeLabelColor(value string) string {
 	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(value)), "#")
 }
@@ -3794,8 +3852,6 @@ func incrementLabelSummary(summary *LabelInitSummary, status string) {
 	switch status {
 	case "created":
 		summary.Created++
-	case "updated":
-		summary.Updated++
 	case "skipped":
 		summary.Skipped++
 	case "failed":

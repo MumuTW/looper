@@ -22,9 +22,10 @@ import (
 
 func TestDiscoverIssuesRespectsMaxPerTick(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Triage.MaxPerTick = 5
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Triage.MaxPerTick = 5
+	})
 	for i := 1; i <= 50; i++ {
 		fixture.github.issues = append(fixture.github.issues, githubinfra.IssueSummary{Number: int64(i), Labels: nil})
 		fixture.github.details[int64(i)] = githubinfra.IssueDetail{Number: int64(i), Title: "Issue", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339)}
@@ -42,8 +43,7 @@ func TestDiscoverIssuesRespectsMaxPerTick(t *testing.T) {
 
 func TestRunnerAppliesLabelsThenCommentThenTriaged(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339)}
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
@@ -58,8 +58,7 @@ func TestRunnerAppliesLabelsThenCommentThenTriaged(t *testing.T) {
 
 func TestRunnerEditsExistingMarkerComment(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339)}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Comments: []githubinfra.CommentInfo{{ID: 91, Author: "looper", Body: triageCommentMarker + "\n\nOld", CreatedAt: fixture.now.Format(time.RFC3339)}}}
@@ -74,8 +73,7 @@ func TestRunnerEditsExistingMarkerComment(t *testing.T) {
 
 func TestRunnerStaysSilentWhenHumanCommentsBeforePost(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339)}
 	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 77, Author: "human", Body: "I triaged this", CreatedAt: fixture.now.Add(time.Second).Format(time.RFC3339)}}}
@@ -93,8 +91,7 @@ func TestRunnerStaysSilentWhenHumanCommentsBeforePost(t *testing.T) {
 
 func TestRunnerStaysSilentWhenHumanCommentsInSameSecond(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.now = fixture.now.Add(500 * time.Millisecond)
 	fixture.runner.now = func() time.Time { return fixture.now }
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
@@ -116,8 +113,7 @@ func TestRunnerStaysSilentWhenHumanCommentsInSameSecond(t *testing.T) {
 
 func TestRunnerReTriagesStaleClarifiedIssueInSamePass(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number:    1,
@@ -158,8 +154,7 @@ func TestRunnerReTriagesStaleClarifiedIssueInSamePass(t *testing.T) {
 
 func TestRunnerLeavesIssueUntriagedWhenReTriageCommentSkipped(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number:    1,
@@ -194,8 +189,7 @@ func TestRunnerLeavesIssueUntriagedWhenReTriageCommentSkipped(t *testing.T) {
 
 func TestRunnerIgnoresAlreadyLoadedSameSecondComment(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.now = fixture.now.Add(500 * time.Millisecond)
 	fixture.runner.now = func() time.Time { return fixture.now }
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
@@ -230,8 +224,7 @@ func TestRunnerIgnoresAlreadyLoadedSameSecondComment(t *testing.T) {
 
 func TestRunnerKeepsNeedsInfoWhenReTriageTriagedWriteFails(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.failAddLabels = map[string]error{"triaged": errors.New("boom")}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
@@ -261,8 +254,7 @@ func TestRunnerKeepsNeedsInfoWhenReTriageTriagedWriteFails(t *testing.T) {
 
 func TestRunnerKeepsNeedsInfoWhenReTriageStaysUnclear(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.runner.triageLLM = stubUnclearCoordinatorLLM{}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"needs-info", "triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
@@ -292,10 +284,24 @@ func TestRunnerKeepsNeedsInfoWhenReTriageStaysUnclear(t *testing.T) {
 
 func TestRunnerProjectConfigRequiresConfig(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config = nil
+	// Runner is constructed with Repos but no Config, matching the only
+	// production path that can leave the config unset.
+	coord, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "coordinator.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coord.Close() })
+	if _, err := coord.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coord.DB())
+	now := time.Now()
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: t.TempDir(), CreatedAt: now.Format(time.RFC3339), UpdatedAt: now.Format(time.RFC3339)}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	runner := New(Options{Repos: repos})
 
-	_, _, err := fixture.runner.projectConfig(context.Background(), fixture.projectID)
+	_, _, err = runner.projectConfig(context.Background(), coordinatorFixtureProjectID)
 	if err == nil || !strings.Contains(err.Error(), "coordinator config is not configured") {
 		t.Fatalf("projectConfig() error = %v, want missing config error", err)
 	}
@@ -326,9 +332,10 @@ func TestLocalRepositoryInspectorStopsAfterContextCaps(t *testing.T) {
 
 func TestRunnerHumanDispatchOrdersAssignLabelReact(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
 	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
@@ -341,9 +348,10 @@ func TestRunnerHumanDispatchOrdersAssignLabelReact(t *testing.T) {
 
 func TestRunnerHumanDispatchAllowsCurrentAuthenticatedBotAuthor(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	})
 	fixture.github.currentLogin = "looper-sandbox-e2e[bot]"
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "looper-sandbox-e2e[bot]", AuthorAssociation: "NONE", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
@@ -397,8 +405,7 @@ func TestRunnerCommentHasWriteAccessFallsBackToRepositoryPermissionWhenCurrentUs
 
 func TestRunnerDispatchFailureDedupesMarkedComment(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-10 * 24 * time.Hour).Format(time.RFC3339), Comments: []githubinfra.CommentInfo{{ID: 12, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
 	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 12, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}, {ID: 99, Author: "looper", Body: stampedCoordinatorBody(fixture.cfg, dispatchFailureCommentMarker+"\n\nOld failure"), CreatedAt: fixture.now.Format(time.RFC3339)}}}
@@ -413,11 +420,12 @@ func TestRunnerDispatchFailureDedupesMarkedComment(t *testing.T) {
 
 func TestRunnerAutonomousDispatchAppliesConfiguredPlannerTrigger(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Roles.Planner.Triggers.Labels = []string{"my-custom-plan"}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Roles.Planner.Triggers.Labels = []string{"my-custom-plan"}
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}}
 	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
@@ -429,12 +437,13 @@ func TestRunnerAutonomousDispatchAppliesConfiguredPlannerTrigger(t *testing.T) {
 
 func TestRunnerAutonomousDispatchAppliesAllConfiguredPlannerTriggersWhenLabelModeAll(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Roles.Planner.Triggers.Labels = []string{"my-custom-plan", "team:planner"}
-	fixture.runner.config.Roles.Planner.Triggers.LabelMode = config.LabelModeAll
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Roles.Planner.Triggers.Labels = []string{"my-custom-plan", "team:planner"}
+		cfg.Roles.Planner.Triggers.LabelMode = config.LabelModeAll
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}}
 	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
@@ -446,10 +455,11 @@ func TestRunnerAutonomousDispatchAppliesAllConfiguredPlannerTriggersWhenLabelMod
 
 func TestRunnerLocalOnlyImplementAdmissionAddsWorkerReadyWithoutTargetLabel(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/implement"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Build it", Author: "octo", URL: "https://github.com/acme/looper/issues/1", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/implement"}}
 	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
@@ -468,11 +478,12 @@ func TestRunnerLocalOnlyImplementAdmissionAddsWorkerReadyWithoutTargetLabel(t *t
 
 func TestRunnerPlanDispatchIgnoresStaleWorkerReadyLabel(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "human-gated"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Roles.Planner.Triggers.Labels = []string{"my-custom-plan"}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "human-gated"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Roles.Planner.Triggers.Labels = []string{"my-custom-plan"}
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan", "looper:worker-ready"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number:    1,
@@ -500,10 +511,11 @@ func TestRunnerPlanDispatchIgnoresStaleWorkerReadyLabel(t *testing.T) {
 
 func TestRunnerRoutedImplementAdmissionAssignsReadyThenExactTargetLast(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}},
 		Memberships: []protocol.Membership{
@@ -534,10 +546,11 @@ func TestRunnerRoutedImplementAdmissionAssignsReadyThenExactTargetLast(t *testin
 
 func TestRunnerRoutedImplementAdmissionRepairsHumanWorkerReadyIntent(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}},
 		Memberships: []protocol.Membership{
@@ -558,10 +571,11 @@ func TestRunnerRoutedImplementAdmissionRepairsHumanWorkerReadyIntent(t *testing.
 
 func TestRunnerRoutedImplementAdmissionRetargetsIssueToSingleWorker(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}},
 		Memberships: []protocol.Membership{
@@ -586,10 +600,11 @@ func TestRunnerRoutedImplementAdmissionRetargetsIssueToSingleWorker(t *testing.T
 
 func TestRunnerRoutedImplementAdmissionRemovesMixedCaseStaleTargetLabel(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}},
 		Memberships: []protocol.Membership{
@@ -614,10 +629,11 @@ func TestRunnerRoutedImplementAdmissionRemovesMixedCaseStaleTargetLabel(t *testi
 
 func TestRunnerRoutedImplementAdmissionSkipsDuplicateIdentityWorkers(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}},
 		Memberships: []protocol.Membership{
@@ -645,10 +661,11 @@ func TestRunnerRoutedImplementAdmissionSkipsDuplicateIdentityWorkers(t *testing.
 
 func TestRunnerRoutedImplementAdmissionStopsBeforeTargetLabelWhenLeaseLostMidSequence(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}},
 		Memberships: []protocol.Membership{
@@ -676,8 +693,7 @@ func TestRunnerRoutedImplementAdmissionStopsBeforeTargetLabelWhenLeaseLostMidSeq
 
 func TestRunnerDiscoverIssuesPropagatesRepositoryPermissionFailures(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.permissionErr = errors.New("permission lookup failed")
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
@@ -695,10 +711,11 @@ func TestRunnerDiscoverIssuesPropagatesRepositoryPermissionFailures(t *testing.T
 
 func TestRunnerCycleDetectionRemovesLabelsAndPostsOneComment(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
-	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+	})
 	seedDispatchIssue(fixture, 1)
 	seedDispatchIssue(fixture, 2)
 	fixture.github.blockedBy[1] = []githubinfra.DependencyIssue{{Number: 2, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
@@ -726,9 +743,10 @@ func TestRunnerCycleDetectionRemovesLabelsAndPostsOneComment(t *testing.T) {
 
 func TestRunnerCycleDetectionIsIdempotent(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+	})
 	seedDispatchIssue(fixture, 1)
 	seedDispatchIssue(fixture, 2)
 	fixture.github.blockedBy[1] = []githubinfra.DependencyIssue{{Number: 2, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
@@ -751,9 +769,10 @@ func TestRunnerCycleDetectionIsIdempotent(t *testing.T) {
 
 func TestRunnerCycleDetectionUpdatesExistingMarkedComment(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+	})
 	seedDispatchIssue(fixture, 1)
 	seedDispatchIssue(fixture, 2)
 	fixture.github.blockedBy[1] = []githubinfra.DependencyIssue{{Number: 2, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
@@ -779,9 +798,10 @@ func TestRunnerCycleDetectionUpdatesExistingMarkedComment(t *testing.T) {
 
 func TestRunnerClosedNotPlannedBlockerReturnsDependentToRetriage(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+	})
 	seedDispatchIssue(fixture, 1)
 	seedDispatchIssue(fixture, 2)
 	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "closed", StateReason: "not_planned"}}
@@ -801,9 +821,10 @@ func TestRunnerClosedNotPlannedBlockerReturnsDependentToRetriage(t *testing.T) {
 
 func TestRunnerClosedDuplicateBlockerReturnsDependentToRetriage(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+	})
 	seedDispatchIssue(fixture, 1)
 	seedDispatchIssue(fixture, 2)
 	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "closed", StateReason: "duplicate"}}
@@ -818,12 +839,13 @@ func TestRunnerClosedDuplicateBlockerReturnsDependentToRetriage(t *testing.T) {
 
 func TestRunnerTieBreaksAutonomousDispatchByParentSubIssueOrder(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 2
+	})
 	seedParentIssue(fixture, 10)
 	seedDispatchIssueWithLabels(fixture, 11, []string{"triaged", "dispatch/implement"})
 	seedDispatchIssueWithLabels(fixture, 12, []string{"triaged", "dispatch/implement"})
@@ -846,12 +868,13 @@ func TestRunnerTieBreaksAutonomousDispatchByParentSubIssueOrder(t *testing.T) {
 
 func TestRunnerTieBreakFallsBackToAscendingIssueNumber(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 2
+	})
 	seedDispatchIssueWithLabels(fixture, 22, []string{"triaged", "dispatch/implement"})
 	seedDispatchIssueWithLabels(fixture, 21, []string{"triaged", "dispatch/implement"})
 	seedDispatchIssueWithLabels(fixture, 23, []string{"triaged", "dispatch/implement"})
@@ -866,12 +889,13 @@ func TestRunnerTieBreakFallsBackToAscendingIssueNumber(t *testing.T) {
 
 func TestRunnerTieBreakFallsBackWhenSubIssueLookupFails(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 2
+	})
 	seedParentIssue(fixture, 10)
 	seedDispatchIssueWithLabels(fixture, 22, []string{"triaged", "dispatch/implement"})
 	seedDispatchIssueWithLabels(fixture, 21, []string{"triaged", "dispatch/implement"})
@@ -927,27 +951,28 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			fixture := newCoordinatorFixture(t)
-			fixture.runner.config.Roles.Coordinator.Enabled = true
-			fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
-			fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-			fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-			fixture.runner.config.Scheduler.MaxConcurrentRuns = tc.maxConcurrentRuns
 			reviewerLabels := tc.reviewerLabels
 			if reviewerLabels == nil {
 				reviewerLabels = []string{"looper:review"}
 			}
-			fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = reviewerLabels
 			fixerLabels := tc.fixerLabels
 			if fixerLabels == nil {
 				fixerLabels = []string{"looper:fix"}
 			}
-			fixture.runner.config.Roles.Fixer.Triggers.Labels = fixerLabels
+			fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+				cfg.Roles.Coordinator.Enabled = true
+				cfg.Roles.Coordinator.PollInterval = "0s"
+				cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+				cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+				cfg.Scheduler.MaxConcurrentRuns = tc.maxConcurrentRuns
+				cfg.Roles.Reviewer.Discovery.Triggers.Labels = reviewerLabels
+				cfg.Roles.Fixer.Triggers.Labels = fixerLabels
+				if tc.projectRoles != nil {
+					cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Roles: tc.projectRoles}}
+				}
+			})
 			if tc.currentLogin != "" {
 				fixture.github.currentLogin = tc.currentLogin
-			}
-			if tc.projectRoles != nil {
-				fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Roles: tc.projectRoles}}
 			}
 			readyLabels := tc.readyLabels
 			if readyLabels == nil {
@@ -986,13 +1011,14 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 
 func TestRunnerAutonomousDispatchPreemptionIsPerTick(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 2
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
 	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/implement"})
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
@@ -1007,24 +1033,58 @@ func TestRunnerAutonomousDispatchPreemptionIsPerTick(t *testing.T) {
 	}
 
 	clearRunningQueueItems(t, fixture)
-	fixture.runner.config.Scheduler.MaxConcurrentRuns = 3
+	fixture.reconfigure(func(cfg *config.Config) { cfg.Scheduler.MaxConcurrentRuns = 3 })
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() second tick error = %v", err)
 	}
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1, 2})
 }
 
+// TestReconfigurePreservesRuntimeStateThrottle verifies that reconfigure
+// carries the previous runner's RuntimeState into the replacement, so the
+// per-project throttle timestamp survives a config-snapshot rebuild. This
+// mirrors the production rebuild path in internal/runtime/scheduler.go, which
+// shares one coordinatorState across snapshots via Options.State. A fresh
+// RuntimeState on rebuild would reset lastTickByProject and let the second
+// tick at the same now() run despite the poll interval.
+func TestReconfigurePreservesRuntimeStateThrottle(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "1h"
+	})
+
+	res, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() first tick error = %v", err)
+	}
+	if res.Skipped {
+		t.Fatalf("first tick skipped, want ticked")
+	}
+
+	fixture.reconfigure(func(cfg *config.Config) { cfg.Roles.Coordinator.PollInterval = "1h" })
+
+	res, err = fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() second tick error = %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("second tick after reconfigure not throttled, want skipped (RuntimeState not preserved)")
+	}
+}
+
 func TestRunnerAutonomousDispatchPreemptionCountsWorkerDispatchesFromDispatchType(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
-	fixture.runner.config.Roles.Worker.Triggers.Labels = []string{"looper:worker", "team:backend"}
-	fixture.runner.config.Roles.Worker.Triggers.LabelMode = config.LabelModeAll
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 2
+		cfg.Roles.Worker.Triggers.Labels = []string{"looper:worker", "team:backend"}
+		cfg.Roles.Worker.Triggers.LabelMode = config.LabelModeAll
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement", "looper:worker"})
 	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/implement"})
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
@@ -1038,13 +1098,14 @@ func TestRunnerAutonomousDispatchPreemptionCountsWorkerDispatchesFromDispatchTyp
 
 func TestRunnerAutonomousDispatchPreemptionOnlyCountsWorkersWithinTickBudget(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 2
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/plan"})
 	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/implement"})
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
@@ -1059,13 +1120,14 @@ func TestRunnerAutonomousDispatchPreemptionOnlyCountsWorkersWithinTickBudget(t *
 
 func TestRunnerAutonomousDispatchPreemptionSkipsWorkerWithoutZeroingBudget(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 2
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
 	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/plan"})
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
@@ -1080,12 +1142,13 @@ func TestRunnerAutonomousDispatchPreemptionSkipsWorkerWithoutZeroingBudget(t *te
 
 func TestRunnerAutonomousDispatchNoOpWorkerAdmissionDoesNotConsumeBudget(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Scheduler.MaxConcurrentRuns = 1
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 1
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{
 		{Number: 1, Labels: []string{"looper:worker-ready"}},
 		{Number: 2, Labels: []string{"triaged", "dispatch/implement"}},
@@ -1112,9 +1175,10 @@ func TestRunnerAutonomousDispatchNoOpWorkerAdmissionDoesNotConsumeBudget(t *test
 
 func TestRunnerMatchesHostnameQualifiedRepoDependencies(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+	})
 	seedDispatchIssue(fixture, 1)
 	seedDispatchIssue(fixture, 2)
 	fixture.github.blockedBy[1] = []githubinfra.DependencyIssue{{Number: 2, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
@@ -1133,9 +1197,10 @@ func TestRunnerMatchesHostnameQualifiedRepoDependencies(t *testing.T) {
 
 func TestRunnerReopenedBlockerDoesNothingForInFlightIssue(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+	})
 	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/plan", "looper:plan"})
 	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/plan"})
 	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
@@ -1153,11 +1218,12 @@ func TestRunnerReopenedBlockerDoesNothingForInFlightIssue(t *testing.T) {
 
 func TestRunnerReopenedBlockerHoldsUndispatchedDependent(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	})
 	seedDispatchIssue(fixture, 1)
 	seedDispatchIssue(fixture, 2)
 	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
@@ -1170,6 +1236,11 @@ func TestRunnerReopenedBlockerHoldsUndispatchedDependent(t *testing.T) {
 	}
 }
 
+// coordinatorFixtureProjectID is the project ID seeded by newCoordinatorFixture.
+// It is exposed as a constant so config-shaping hooks (which run before the
+// fixture they configure exists) can reference it without a fixture value.
+const coordinatorFixtureProjectID = "demo"
+
 type coordinatorFixture struct {
 	runner    *Runner
 	github    *stubCoordinatorGitHub
@@ -1180,7 +1251,11 @@ type coordinatorFixture struct {
 	coord     *storage.SQLiteCoordinator
 }
 
-func newCoordinatorFixture(t *testing.T) coordinatorFixture {
+// newCoordinatorFixture builds a coordinator test fixture. Any configure
+// functions run against the config value before the Runner is constructed,
+// so every test config value reaches New(Options{...}) the same way
+// production does.
+func newCoordinatorFixture(t *testing.T, configure ...func(*config.Config)) coordinatorFixture {
 	t.Helper()
 	now := time.Date(2026, time.May, 14, 12, 0, 0, 0, time.UTC)
 	coord, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "coordinator.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
@@ -1192,7 +1267,7 @@ func newCoordinatorFixture(t *testing.T) coordinatorFixture {
 		t.Fatalf("RunPending() error = %v", err)
 	}
 	repos := storage.NewRepositories(coord.DB())
-	projectID := "demo"
+	projectID := coordinatorFixtureProjectID
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Demo", RepoPath: t.TempDir(), CreatedAt: now.Format(time.RFC3339), UpdatedAt: now.Format(time.RFC3339)}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -1203,10 +1278,27 @@ func newCoordinatorFixture(t *testing.T) coordinatorFixture {
 	cfg.Projects = []config.ProjectRefConfig{{ID: projectID}}
 	cfg.Disclosure.Enabled = true
 	cfg.Disclosure.Channels.IssueComment = true
+	for _, fn := range configure {
+		fn(&cfg)
+	}
 	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, branchProtection: map[string]githubinfra.BranchProtection{}}
 	network := &stubCoordinatorNetwork{}
 	runner := New(Options{Repos: repos, GitHub: github, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}, Network: network})
 	return coordinatorFixture{runner: runner, github: github, network: network, cfg: &cfg, projectID: projectID, now: now, coord: coord}
+}
+
+// reconfigure rebuilds the fixture's Runner from a fresh config value produced
+// by configure, going back through New(Options{...}) rather than mutating the
+// existing Runner's config in place. The underlying storage, GitHub stub,
+// network stub, and RuntimeState are reused so state accumulated by earlier
+// ticks (throttle timestamps, watch locks) carries over — mirroring the
+// production config-snapshot rebuild path in internal/runtime/scheduler.go,
+// which shares one coordinatorState across rebuilds via Options.State.
+func (f *coordinatorFixture) reconfigure(configure func(*config.Config)) {
+	cfg := *f.cfg
+	configure(&cfg)
+	f.cfg = &cfg
+	f.runner = New(Options{Repos: storage.NewRepositories(f.coord.DB()), GitHub: f.github, Config: f.cfg, Now: func() time.Time { return f.now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}, Network: f.network, State: f.runner.state})
 }
 
 func timePtr(value time.Time) *time.Time { return &value }
@@ -1473,9 +1565,10 @@ func (s *stubCoordinatorNetwork) RevalidateLease(_ context.Context, req protocol
 
 func TestRunnerHumanDispatchBlockedByPostsFailureComment(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
 	fixture.github.details[9] = githubinfra.IssueDetail{Number: 9, State: "open"}
@@ -1494,9 +1587,10 @@ func TestRunnerHumanDispatchBlockedByPostsFailureComment(t *testing.T) {
 
 func TestRunnerMergeWatchConflictRoutesToFixerAndUpdatesMarker(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Fixer.Triggers.Labels = []string{"looper:fix"}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Fixer.Triggers.Labels = []string{"looper:fix"}
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number: 1,
@@ -1541,9 +1635,10 @@ func TestRunnerMergeWatchConflictRoutesToFixerAndUpdatesMarker(t *testing.T) {
 
 func TestRunnerMergeWatchHumanDisabledRemovesMarkerOnly(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Fixer.Triggers.Labels = []string{"looper:fix"}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Fixer.Triggers.Labels = []string{"looper:fix"}
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number: 1,
@@ -1583,9 +1678,10 @@ func TestRunnerMergeWatchHumanDisabledRemovesMarkerOnly(t *testing.T) {
 
 func TestRunnerMergeWatchTransientErrorKeepsMarkerAndSchedulesRetry(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.MergeWatch.TransientRetries = 3
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.MergeWatch.TransientRetries = 3
+	})
 	fixture.github.failPRCheckRuns = map[string]error{"abc123": errors.New("HTTP 504 gateway timeout")}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
@@ -1633,9 +1729,10 @@ func TestRunnerMergeWatchTransientErrorKeepsMarkerAndSchedulesRetry(t *testing.T
 
 func TestRunnerMergeWatchPRDetailTransientErrorConsumesRetryBudget(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.MergeWatch.TransientRetries = 3
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.MergeWatch.TransientRetries = 3
+	})
 	fixture.github.failPRDetails = map[int64][]error{77: {nil, errors.New("HTTP 504 gateway timeout")}}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
@@ -1680,9 +1777,10 @@ func TestRunnerMergeWatchPRDetailTransientErrorConsumesRetryBudget(t *testing.T)
 
 func TestRunnerMergeWatchBranchProtectionTransientErrorConsumesRetryBudget(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.MergeWatch.TransientRetries = 3
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.MergeWatch.TransientRetries = 3
+	})
 	fixture.github.failBranchProtection = map[string]error{"main": errors.New("HTTP 429 rate limit")}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
@@ -1733,15 +1831,16 @@ func TestRunnerMergeWatchBranchProtectionTransientErrorConsumesRetryBudget(t *te
 
 func TestRunnerAssignsReviewerInLocalOnlyMode(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	fixture.github.currentLogin = "reviewer"
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
 	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -1756,15 +1855,16 @@ func TestRunnerAssignsReviewerInLocalOnlyMode(t *testing.T) {
 
 func TestRunnerSkipsLocalReviewerAssignmentWithoutReviewRequestWhenRequired(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = true
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	fixture.github.currentLogin = "reviewer"
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
 	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = true
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -1776,10 +1876,12 @@ func TestRunnerSkipsLocalReviewerAssignmentWithoutReviewRequestWhenRequired(t *t
 
 func TestRunnerAssignsReviewerAndTargetInRoutedMode(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
-	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
@@ -1789,7 +1891,6 @@ func TestRunnerAssignsReviewerAndTargetInRoutedMode(t *testing.T) {
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
 	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -1802,11 +1903,12 @@ func TestRunnerAssignsReviewerAndTargetInRoutedMode(t *testing.T) {
 
 func TestRunnerAssignsReviewerAndTargetInRoutedModeWhenLocalAutoDiscoveryDisabled(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Reviewer.Discovery.AutoDiscovery = false
-	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
-	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Reviewer.Discovery.AutoDiscovery = false
+		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
@@ -1825,10 +1927,12 @@ func TestRunnerAssignsReviewerAndTargetInRoutedModeWhenLocalAutoDiscoveryDisable
 
 func TestRunnerAssignsDeterministicTargetForDuplicateReviewerIdentity(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
-	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{
@@ -1841,7 +1945,6 @@ func TestRunnerAssignsDeterministicTargetForDuplicateReviewerIdentity(t *testing
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
 	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -1853,10 +1956,12 @@ func TestRunnerAssignsDeterministicTargetForDuplicateReviewerIdentity(t *testing
 
 func TestRunnerExcludesSelfReviewCandidatesDuringRoutedAssignment(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
-	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{
@@ -1869,7 +1974,6 @@ func TestRunnerExcludesSelfReviewCandidatesDuringRoutedAssignment(t *testing.T) 
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
 	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -1881,10 +1985,12 @@ func TestRunnerExcludesSelfReviewCandidatesDuringRoutedAssignment(t *testing.T) 
 
 func TestRunnerStopsBeforeTargetLabelWhenLeaseRevalidationFails(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
-	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
@@ -1895,7 +2001,6 @@ func TestRunnerStopsBeforeTargetLabelWhenLeaseRevalidationFails(t *testing.T) {
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
 	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err == nil || !strings.Contains(err.Error(), "lost lease") {
 		t.Fatalf("DiscoverIssues() error = %v, want lost lease", err)
@@ -1917,10 +2022,11 @@ func TestLeaseProbeURLPreservesSingleLabelHost(t *testing.T) {
 
 func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestWhenRequired(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
-	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(true)}}}}},
@@ -1947,10 +2053,11 @@ func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestWhenRequired(t *testing.
 
 func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestForLegacyCapabilityPayload(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
-	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID}}}}},
@@ -1971,10 +2078,12 @@ func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestForLegacyCapabilityPaylo
 
 func TestRunnerSkipsRoutedAssignmentWhenNoEligibleReviewerNodeExists(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
-	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{{NodeID: "node-self", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "octo", NumericID: 11}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
@@ -1984,7 +2093,6 @@ func TestRunnerSkipsRoutedAssignmentWhenNoEligibleReviewerNodeExists(t *testing.
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
 	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
-	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -2008,8 +2116,7 @@ func TestRunnerSkipsRoutedAssignmentWhenNoEligibleReviewerNodeExists(t *testing.
 
 func TestRunnerMergeWatchStatusContextsPreventMissingRequiredCheck(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number: 1,
@@ -2054,10 +2161,11 @@ func TestRunnerMergeWatchStatusContextsPreventMissingRequiredCheck(t *testing.T)
 
 func TestRunnerMergeWatchRetriggerSkipsSameTickDispatch(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-	fixture.runner.config.Roles.Coordinator.MergeWatch.MaxIndeterminateDuration = "15m"
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Roles.Coordinator.MergeWatch.MaxIndeterminateDuration = "15m"
+	})
 	firstUnknownAt := fixture.now.Add(-16 * time.Minute)
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
@@ -2106,10 +2214,11 @@ func TestRunnerMergeWatchRetriggerSkipsSameTickDispatch(t *testing.T) {
 
 func TestRunnerAutonomousDispatchBlockedByVetoesSilently(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}}
 	fixture.github.details[9] = githubinfra.IssueDetail{Number: 9, State: "open"}
@@ -2126,10 +2235,11 @@ func TestRunnerAutonomousDispatchBlockedByVetoesSilently(t *testing.T) {
 
 func TestRunnerBlockedByDependencyReadRetriesTransientErrors(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.Enabled = true
-	fixture.runner.config.Roles.Coordinator.Dependencies.APIRetryAttempts = 3
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+		cfg.Roles.Coordinator.Dependencies.APIRetryAttempts = 3
+	})
 	fixture.github.failBlockedByIssues = map[int64][]error{1: {errors.New("request timed out"), errors.New("request timed out")}}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
@@ -2149,8 +2259,7 @@ func TestRunnerBlockedByDependencyReadRetriesTransientErrors(t *testing.T) {
 
 func TestRunnerDispatchSkipsDependencyAPIsWhenDisabled(t *testing.T) {
 	t.Parallel()
-	fixture := newCoordinatorFixture(t)
-	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) { cfg.Roles.Coordinator.Enabled = true })
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
 	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}

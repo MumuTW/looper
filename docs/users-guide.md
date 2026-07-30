@@ -1,6 +1,6 @@
 # Looper Quick User Guide
 
-This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, native reviewer requests/reviews, summary-comment compatibility, and the manual/direct native-review-comment fixer path.
+This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with GitHub issues and PRs.
 
 > **CLI strip (read first).** The full `looper` CLI was removed ahead of the role-model rewrite. The **only** operator verbs are:
 >
@@ -33,12 +33,9 @@ Also make sure:
 - `looperd` is running (foreground, or under your own process manager)
 - your local repo can `git fetch` and `git push`
 - GitHub projects: `gh` is authenticated with the target GitHub account
-- Forgejo projects: put provider auth in the config file (`tokenEnv` or `teaLogin`) and export any required env vars in the daemon environment
 - each coding role you want to run can resolve a vendor: set global `agent.vendor` in the config (for example `vendor = "opencode"`), or supply vendor via `agent.profiles` / `roles.<role>.agent` as described in [Multi-role agent vendor and model](configuration.md#multi-role-agent-vendor-and-model). A single global vendor is the zero-diff default that covers planner, worker, reviewer, and fixer until you add per-role bindings. Coordinator triage always uses the global agent only and is skipped when global vendor is unset.
 
-Forgejo projects are onboarded by editing the config file's `providers` and `projects` sections (or importing `[[projects]]` at daemon startup). There is no `looper bootstrap --provider forgejo` and no `looper provider` CLI. See [configuration](configuration.md#provider-support).
-
-Provider health is visible on the dashboard and via `GET /api/v1/status`. `looper status` reports the config file, daemon reachability, and the registered projects, but not per-provider health.
+`GET /api/v1/status` reports service, storage, scheduler, agent, webhook, loop, network, safety, notification, and tool state; there is no per-provider health surface. `looper status` reports the config file, daemon reachability, and the registered projects.
 
 ### Grok Build (xAI)
 
@@ -99,14 +96,6 @@ There is no current-directory inference and no `--project` flag: the stripped CL
 | `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | Review request under the default policy; configured label policy or `POST /api/v1/loops` otherwise |
 | `fixer` | Fixes PR issues based on review comments and tries to resolve threads | Discovery on open PRs with actionable threads (or `POST /api/v1/loops`) |
 | `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | Label the issue `looper:worker-ready` (or `POST /api/v1/workers`) |
-
-Forgejo MVP role support:
-
-- Planner and Worker are supported over the Forgejo REST API.
-- Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level Reviewer Summary compatibility protocol.
-- Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and direct/manual fixer loops (`POST /api/v1/loops`, not a `looper fix` verb) also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
-- Coordinator, auto-merge, routed network mode, and webhook modes remain unsupported for Forgejo.
-- A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
 ## 4. Recommended flow
 
@@ -284,8 +273,6 @@ For the default review-requested path, Looper asks GitHub for PRs requested from
 
 For spec PRs, `looper:spec-reviewing` marks the review phase, but it does not by itself authorize other users' Looper instances to run. Request review from the intended GitHub user to trigger that user's automatic reviewer.
 
-For Forgejo projects, reviewer auto-discovery defaults to review requests. Configured labels can be used independently or combined with review requests; combined results are deduplicated deterministically. Reviewer publishes native `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` reviews according to configuration and preserves Looper disclosure/idempotency markers. Self-authored PRs are skipped by default; when self-review is enabled, an attempted clean approval is explicitly downgraded to `COMMENT`. Set reviewer `publishMode` to `summary_comment` to keep the legacy Reviewer Summary/Fixer Summary workflow.
-
 ### What happens after reviewer finishes
 
 If reviewer considers the spec review clean, it will:
@@ -335,13 +322,6 @@ Fixer will:
 - push back to the same PR branch
 - after validation and push succeed, try to resolve only the review threads that were both verified by Looper and explicitly confirmed by the fixer agent
 
-For Forgejo projects, automatic Fixer runs are summary-only because Forgejo's public REST API does not currently expose a native review-comment resolve mutation:
-
-- reviewer-summary items still come from the top-level Reviewer Summary comment
-- native Forgejo PR review comments do not trigger automatic Fixer runs, even when their response includes a `resolver` field
-- the `resolver` response field describes state; it is not treated as proof that a resolve mutation exists
-- explicit manual Fixer runs may inspect native comments, but stop with a manual-intervention error when the provider cannot resolve them
-
 If the PR is still in the spec review phase and the review becomes clean, fixer can also move the labels from:
 
 - `looper:spec-reviewing` → `looper:spec-ready`
@@ -371,8 +351,6 @@ That means issue → planner → worker can flow through without manually copyin
 
 When worker claims an issue, it adds the current GitHub user as an assignee and preserves any existing assignees. If GitHub assignment fails, the claim reports a retryable failure instead of silently continuing with ambiguous ownership.
 
-For Forgejo projects, Worker does not claim issues by mutating assignees. The issue must already be assigned to the current Forgejo provider user, and Worker re-checks that assignment before side effects.
-
 ### Start directly from a spec
 
 The removed `looper work` verb took a spec path. The daemon endpoint still does — pass `specPath` (with `title` or `prompt`) instead of `issueNumber`:
@@ -382,6 +360,18 @@ curl -sS -X POST "http://127.0.0.1:17310/api/v1/workers" \
   -H 'Content-Type: application/json' \
   -d '{"projectId":"<project-id>","title":"Implement the cache layer","specPath":"specs/2026-04-17-cache/spec.md"}'
 ```
+
+### Hand an existing PR to worker
+
+```bash
+curl -sS -X POST "http://127.0.0.1:17310/api/v1/workers" \
+  -H 'Content-Type: application/json' \
+  -d '{"projectId":"<project-id>","prNumber":42}'
+```
+
+Worker adopts the PR's head branch and pushes to it rather than opening a new PR. It needs a spec path to work from: normally the one written into the PR body, but you can pass `specPath` alongside `prNumber` when the body carries no spec marker.
+
+The PR does not have to have been discovered or reviewed first — if the daemon has no snapshot of it, it reads the PR from the forge. Merged and closed PRs are refused. The loop takes the same per-PR lock as reviewer and fixer, so it queues behind any run already working that PR instead of racing it.
 
 ### What happens when worker takes over a `spec-ready` PR
 

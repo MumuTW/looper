@@ -2,10 +2,13 @@ package runtime
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/gatekeeper"
 	"github.com/nexu-io/looper/internal/triager"
 )
 
@@ -23,23 +26,21 @@ func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(
 		t.Fatalf("lane positions = %#v, want triager before planner", positions)
 	}
 	githubCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindGitHub)
-	forgejoCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindForgejo)
-	planeCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindPlane)
-	if byName["triager"].Supported(githubCapabilities) != true ||
-		byName["triager"].Supported(forgejoCapabilities) != false ||
-		byName["triager"].Supported(planeCapabilities) != false {
+	// A provider that does not serve issues through the GitHub gateway must not
+	// feed the GitHub-issue lanes. No such provider is configurable today, so
+	// synthesize one to keep the predicate honest.
+	nonGitHubIssueCapabilities := githubCapabilities
+	nonGitHubIssueCapabilities.GitHubIssues = false
+	if !byName["triager"].Supported(githubCapabilities) || byName["triager"].Supported(nonGitHubIssueCapabilities) {
 		t.Fatal("triager must accept GitHub issues only")
 	}
-	if !byName[config.CodingRoleFixer].Supported(forgejoCapabilities) {
-		t.Fatal("triager registration changed fixer Forgejo discovery support")
-	}
-	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(forgejoCapabilities) || byName["coordinator"].Supported(planeCapabilities) {
+	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(nonGitHubIssueCapabilities) {
 		t.Fatal("coordinator must run only where GitHub owns issue authority")
 	}
 	// triager and coordinator both discover GitHub issues through the GitHub
 	// gateway, so they must share one authority predicate and never drift apart
 	// (the per-lane predicates previously drifted to different wrong flags).
-	for _, capabilities := range []forge.Capabilities{githubCapabilities, forgejoCapabilities, planeCapabilities} {
+	for _, capabilities := range []forge.Capabilities{githubCapabilities, nonGitHubIssueCapabilities} {
 		if byName["triager"].Supported(capabilities) != byName["coordinator"].Supported(capabilities) {
 			t.Fatalf("triager and coordinator must share GitHub issue authority, drifted on %#v", capabilities)
 		}
@@ -58,6 +59,33 @@ func TestTriagerLaneSharesOneDecisionBudgetAcrossProjects(t *testing.T) {
 	}
 	if len(runner.budgets) != 2 || runner.budgets[0] != 1 || runner.budgets[1] != 0 {
 		t.Fatalf("decision budgets = %v, want [1 0]", runner.budgets)
+	}
+}
+
+// Projects are discovered concurrently through one lane, so every project shares
+// the tick-wide budget. This asserts the lane still hands the same budget to each
+// caller under concurrency; the reservation invariant itself is proven under real
+// contention by TestDecisionBudgetReserveNeverExceedsLimitUnderContention.
+func TestTriagerLaneDecisionBudgetIsSharedAcrossConcurrentProjects(t *testing.T) {
+	t.Parallel()
+	const projects = 4
+	runner := &budgetTriager{}
+	lane := triagerLane(defaultSchedulerTickInput{Triager: runner})
+
+	var wg sync.WaitGroup
+	wg.Add(projects)
+	for i := 0; i < projects; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := lane.Discover(context.Background(), "project", "acme/repo", nil); err != nil {
+				t.Errorf("Discover() error = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := int(runner.reserved.Load()); got != triager.DefaultDecisionLimit {
+		t.Fatalf("successful reservations = %d, want %d (lane handed out more than one tick-wide budget)", got, triager.DefaultDecisionLimit)
 	}
 }
 
@@ -82,16 +110,49 @@ func TestDiscoveryLanesOrderFromCanonicalRegistryPriority(t *testing.T) {
 	t.Fatal("worker discovery lane missing")
 }
 
-type budgetTriager struct{ budgets []int }
+type budgetTriager struct {
+	mu       sync.Mutex
+	budgets  []int
+	reserved atomic.Int64
+	onCall   func()
+}
 
 func (f *budgetTriager) DiscoverIssues(_ context.Context, input triager.DiscoveryInput) (triager.DiscoveryResult, error) {
+	if f.onCall != nil {
+		f.onCall()
+	}
 	if input.DecisionBudget == nil {
+		f.mu.Lock()
 		f.budgets = append(f.budgets, -1)
+		f.mu.Unlock()
 		return triager.DiscoveryResult{}, nil
 	}
-	f.budgets = append(f.budgets, *input.DecisionBudget)
-	if *input.DecisionBudget > 0 {
-		*input.DecisionBudget--
+	remaining := input.DecisionBudget.Remaining()
+	if input.DecisionBudget.Reserve() {
+		f.reserved.Add(1)
 	}
+	f.mu.Lock()
+	f.budgets = append(f.budgets, remaining)
+	f.mu.Unlock()
 	return triager.DiscoveryResult{}, nil
+}
+
+// Gatekeeper lists DefaultDiscoveryPullRequestLimit open PRs with no filters, so a
+// smaller shared page always fails the snapshot's truncation check: the lane
+// discards the page it was handed and pays a second raw query. Sizing the page to
+// the largest limit a lane requests is what makes the shared page usable.
+func TestProjectDiscoverySnapshotOptionsCoversGatekeeperPullRequestLimit(t *testing.T) {
+	t.Parallel()
+
+	withoutGatekeeper := projectDiscoverySnapshotOptions(defaultSchedulerTickInput{}, "looper")
+	if withoutGatekeeper.PullRequestLimit >= gatekeeper.DefaultDiscoveryPullRequestLimit {
+		t.Fatalf("PullRequestLimit without gatekeeper = %d, want below the gatekeeper limit %d",
+			withoutGatekeeper.PullRequestLimit, gatekeeper.DefaultDiscoveryPullRequestLimit)
+	}
+
+	withGatekeeper := projectDiscoverySnapshotOptions(defaultSchedulerTickInput{Gatekeeper: &fakeGatekeeperScheduler{}}, "looper")
+	if withGatekeeper.PullRequestLimit < gatekeeper.DefaultDiscoveryPullRequestLimit {
+		t.Fatalf("PullRequestLimit with gatekeeper = %d, want at least %d so the page is not discarded",
+			withGatekeeper.PullRequestLimit, gatekeeper.DefaultDiscoveryPullRequestLimit)
+	}
 }

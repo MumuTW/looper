@@ -113,9 +113,8 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 }
 
 // supportsGitHubIssueDiscovery is the single authority for lanes that discover
-// GitHub issues through the GitHub gateway (triager and coordinator). Plane
-// owns its own task issues and delegates only pull requests to GitHub, so it
-// must not feed these lanes; Forgejo owns its own issues as well.
+// GitHub issues through the GitHub gateway (triager and coordinator). A
+// provider that does not serve issues through that gateway must not feed them.
 //
 // Both lanes used to hand-write this predicate independently, and each picked a
 // different wrong flag (coordinator: GitHubPullRequests; triager:
@@ -145,7 +144,9 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 // triagerLane is an internal issue-source role. Its persisted report is the
 // routing authority; the lane does not need a label-gated CodingRoleConfig.
 func triagerLane(input defaultSchedulerTickInput) discoveryLane {
-	decisionBudget := triager.DefaultDecisionLimit
+	// One budget per tick, shared by every project this lane discovers. Projects
+	// are discovered concurrently, so the budget synchronizes its own reservation.
+	decisionBudget := triager.NewDecisionBudget(triager.DefaultDecisionLimit)
 	return discoveryLane{
 		Name:     "triager",
 		Priority: config.PriorityTriager,
@@ -155,7 +156,7 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 		},
 		Supported: supportsGitHubIssueDiscovery,
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
-			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: &decisionBudget})
+			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: decisionBudget})
 			return result.QueueItems, err
 		},
 	}

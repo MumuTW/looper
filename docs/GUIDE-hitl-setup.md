@@ -146,23 +146,6 @@ Whoever set the team up fills these once and distributes the filled `hitl.env` p
 ### Per-person — coding agent
 - **`agent.params.command`** — absolute path to your `codex` / `claude` binary (`which codex`), and it must be **logged in**.
 
-### Per-person — Plane (only if your tasks live in Plane) — use the `plane` CLI
-The self-developed [`plane` CLI](https://github.com/powerformer/plane-cli) reads everything with your own API key. Configure it once — put your key + workspace in `~/.plane/plane.toml` (or export `PLANE_API_KEY` / `PLANE_WORKSPACE_SLUG`) — then:
-
-| Config value | Command to get it |
-| --- | --- |
-| **`PLANE_API_KEY`** (env; each person their **own** key) | Plane → workspace settings → **API Tokens** → create one |
-| **`planeAssigneeId`** = your member UUID (`roles.worker.triggers.planeAssigneeId`) | `plane api me` → the `id:` line |
-| provider **`projectId`** (Plane project UUID) | `plane api project list` → first column of your project |
-| provider **`workspace`** (slug) | it's your workspace slug (e.g. `open-design`); `plane api me` echoes the base |
-| provider **`baseUrl`** | `https://plane.powerformer.net/api/v1` (the default) |
-
-`plane api me` doubles as an auth smoke-test. An admin can hand out anyone's UUID with `plane api member workspace-list`.
-Put your UUID in `planeAssigneeId` so your looper only picks up Plane work-items **assigned to you**; leaving it empty
-falls back to label-only discovery (every looper watching that project grabs every item — use one central looper then).
-Each teammate should use **their own** Plane API key (correct attribution + `plane api me` gives their UUID), not a
-shared one. Full Plane setup: [`skills/looper/references/plane.md`](../skills/looper/references/plane.md).
-
 ### looper's own data
 - **`storage` / `daemon` paths** — anywhere you like; default `~/.looper` (`looper.sqlite`, `backups/`, `logs/`).
 

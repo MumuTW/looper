@@ -154,6 +154,15 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 			want: []ReasonCode{ReasonHold},
 		},
 		{
+			// A Gate report that omitted this would record the PR as eligible
+			// while a human veto is in force.
+			name: "global hold despite case and padding",
+			mutate: func(f *gatekeeperFixture) {
+				f.github.detail.Labels = []string{" Looper:Hold "}
+			},
+			want: []ReasonCode{ReasonHold},
+		},
+		{
 			name: "provider mergeability is ambiguous",
 			mutate: func(f *gatekeeperFixture) {
 				f.github.mergeable.Mergeable = nil
@@ -280,24 +289,31 @@ type fakeGatekeeperGitHub struct {
 	threads          []githubinfra.ReviewThread
 	finalHeadSHA     string
 	protectionErr    error
+	// perPullRequestCalls counts the forge round trips that only a full evaluation
+	// makes, so a test can prove a pull request was skipped rather than evaluated.
+	perPullRequestCalls int
 }
 
 func (f *fakeGatekeeperGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
 	return f.openPullRequests, nil
 }
 func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	f.perPullRequestCalls++
 	return f.detail, nil
 }
 func (f *fakeGatekeeperGitHub) ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
 	return f.mergeable, nil
 }
 func (f *fakeGatekeeperGitHub) GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	f.perPullRequestCalls++
 	return f.protection, f.protectionErr
 }
 func (f *fakeGatekeeperGitHub) ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error) {
+	f.perPullRequestCalls++
 	return f.checks, nil
 }
 func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
+	f.perPullRequestCalls++
 	return f.threads, nil
 }
 func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {

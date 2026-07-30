@@ -26,6 +26,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
@@ -61,7 +62,6 @@ const (
 	workerBranchSlugMaxWords         = 5
 	workerBranchHashLength           = 16
 	workerPRDedupeLookupLimit        = 1000
-	issueDiscoveryLabel              = "looper:worker-ready"
 	maxPublicIssueClaimSummaryLength = 240
 )
 
@@ -544,10 +544,6 @@ type DiscoveryPolicy struct {
 	LabelMode                  config.LabelMode
 	RequireAssigneeCurrentUser bool
 	RoutedClaimPolicy          networkpolicy.ProjectPolicy
-	// IsPlane marks a Plane task-source project; PlaneAssigneeID, when set,
-	// scopes discovery to work-items assigned to that Plane member UUID.
-	IsPlane         bool
-	PlaneAssigneeID string
 }
 
 type Runner struct {
@@ -818,7 +814,7 @@ func New(options Options) *Runner {
 	}
 	policy := options.DiscoveryPolicy
 	if policy.LabelMode == "" {
-		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{issueDiscoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
+		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultWorkerReadyTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
 	return &Runner{
 		db:                      options.DB,
@@ -901,12 +897,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	assigneeFilter := ""
-	if policy.IsPlane {
-		// Plane assignees are UUIDs, so the GitHub-login assignee gate can't
-		// route them. Scope to the owner's configured Plane member UUID when set
-		// (empty = label-only discovery); never fall back to the GitHub login.
-		assigneeFilter = policy.PlaneAssigneeID
-	} else if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
 	requiredTargetLabel, err := r.requiredTargetLabel(ctx, project.ID)
@@ -960,8 +951,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if !ok {
 		return r.discoveryPolicy
 	}
-	isPlane := r.providerSelectionForProject(projectID).UsesExternalTaskSource()
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), IsPlane: isPlane, PlaneAssigneeID: strings.TrimSpace(role.Discovery.PlaneAssigneeID)}
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
 }
 
 func (r *Runner) requiredTargetLabel(ctx context.Context, projectID string) (string, error) {
@@ -1135,12 +1125,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}
 	}
-	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	if startedLoop, held, err := r.beginLoopRun(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
+	} else if held {
+		return r.finishHeldWorkerQueueItem(ctx, *project, startedLoop, &run, queueItem, checkpoint, workerRunStartHeldSummary)
 	}
 	if err := validateWorkerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
 		failure := r.classifyFailureWithBoundary(err, failureclass.BoundaryCheckpoint)
@@ -1464,30 +1456,14 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	provider := r.providerSelectionForProject(input.Project.ID)
-	if provider.UsesNativePullRequestAPI() && work.IssueNumber > 0 && r.github != nil {
-		stillAssigned, err := r.workerIssueAssignedToCurrentUser(ctx, work, input.Project.RepoPath)
-		if err != nil {
-			_ = r.repos.Locks.Release(context.Background(), lockKey)
-			return checkpoint, err
-		}
-		if !stillAssigned {
-			checkpoint.Work = &work
-			checkpoint.ClaimedLockKey = lockKey
-			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-			checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is not currently assigned to the configured user", formatIssueReference(issueLookupRepo(work), work.IssueNumber))
-			_ = r.repos.Locks.Release(context.Background(), lockKey)
-			checkpoint.ClaimedLockKey = ""
-			return checkpoint, nil
-		}
-	} else if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
+	if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
 		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
 			_ = r.repos.Locks.Release(context.Background(), lockKey)
 			return checkpoint, err
 		}
 	}
 	if input.Loop.TargetType == "pull_request" && work.Repo != "" && work.PRNumber > 0 && r.github != nil {
-		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath})
+		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath})
 	}
 	checkpoint.Work = &work
 	checkpoint.ClaimedLockKey = lockKey
@@ -1517,34 +1493,6 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 		return &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, work.IssueNumber, login, err), kind: FailureRetryableAfterResume}
 	}
 	return nil
-}
-
-func (r *Runner) workerIssueAssignedToCurrentUser(ctx context.Context, work workerInput, cwd string) (bool, error) {
-	if r.github == nil || work.IssueNumber <= 0 {
-		return false, nil
-	}
-	repo := issueLookupRepo(work)
-	if repo == "" {
-		return false, nil
-	}
-	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
-	if err != nil {
-		return false, &loopError{message: fmt.Sprintf("Unable to resolve provider login for worker issue assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
-	}
-	login = normalizeLogin(login)
-	if login == "" {
-		return false, &loopError{message: fmt.Sprintf("Unable to resolve provider login for worker issue assignment on %s#%d", repo, work.IssueNumber), kind: FailureRetryableAfterResume}
-	}
-	issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: repo, IssueNumber: work.IssueNumber, CWD: cwd})
-	if err != nil {
-		return false, err
-	}
-	for _, assignee := range issue.AssigneeUsers {
-		if normalizeLogin(assignee.Login) == login {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
@@ -2529,8 +2477,13 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		work.ExecutionMode = "push-existing"
 		work.SpecPath = firstNonEmpty(work.SpecPath, specpr.ParseSpecPathFromPullRequestBody(detail.Body))
 		work.Reviewers = append([]string(nil), detail.ReviewRequests...)
-		if work.SpecPath == "" {
-			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
+		// A spec path is the usual input for a PR-target worker, but an
+		// operator-supplied prompt is also a complete instruction: the API
+		// accepts prNumber+prompt, and buildWorkerPromptWithInstructions reads
+		// the prompt directly when no spec path is present. Stop for manual
+		// intervention only when neither is available.
+		if work.SpecPath == "" && strings.TrimSpace(work.Prompt) == "" {
+			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path or prompt found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
 		}
 	}
 	return work, nil
@@ -3065,6 +3018,34 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil
+}
+
+// workerRunStartHeldSummary is the run outcome recorded when takeover wins the
+// race against a claim: the run is completed without ever entering the workflow.
+const workerRunStartHeldSummary = "Worker stopped before starting because the loop is held by human takeover"
+
+// beginLoopRun applies the run-start loop transition and reports whether
+// `looper takeover` already owns the loop.
+//
+// This is the run-*boundary* counterpart to updateLoop's mid-turn behaviour, and
+// the two differ on purpose. updateLoop swallows a hold and returns the persisted
+// row: a takeover that lands in the middle of an in-flight turn must not fail that
+// turn, and the turn's remaining status/schedule writes are correctly no-ops
+// because the human now owns them. At a run boundary there is no in-flight turn to
+// protect. The side effects the caller is about to perform — worktree preparation,
+// agent launch — have not happened yet, and they are precisely what the hold
+// exists to prevent, so the boundary must abort instead of proceeding on a row
+// that says human_takeover.
+//
+// How a reader tells the two apart: exactly one updateLoop call per runner opens
+// the run by writing Status = "running", and that call goes through here. Every
+// other call site is mid-turn or terminal and keeps the swallow.
+func (r *Runner) beginLoopRun(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, bool, error) {
+	updated, err := r.updateLoop(ctx, loop, mutate)
+	if err != nil {
+		return storage.LoopRecord{}, false, err
+	}
+	return updated, domain.LoopIsHumanHeld(updated.Status), nil
 }
 
 func (r *Runner) buildSuccessSummary(loop storage.LoopRecord, checkpoint workerCheckpoint) string {

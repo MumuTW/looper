@@ -26,17 +26,15 @@ func TestRuntimeConfigMetadataMarksHotOverridesReadOnly(t *testing.T) {
 			ConfigPath:        "/tmp/config.toml",
 			ConfigFilePresent: true,
 			FieldSources: map[string]config.ValueSource{
-				"agent.vendor":                           config.ValueSourceConfigFile,
-				"agent.params.apiKey":                    config.ValueSourceConfigFile,
-				"agent.params.nested.token":              config.ValueSourceConfigFile,
-				"agent.env.OPENAI_API_KEY":               config.ValueSourceConfigFile,
-				"daemon.environment.SECRET":              config.ValueSourceConfigFile,
-				"server.localToken":                      config.ValueSourceConfigFile,
-				"agent.timeouts.workerSeconds":           config.ValueSourceConfigFile,
-				"roles.planner.triggers.planeAssigneeId": config.ValueSourceConfigFile,
-				"roles.worker.triggers.planeAssigneeId":  config.ValueSourceConfigFile,
-				"scheduler.maxConcurrentRuns":            config.ValueSourceEnv,
-				"scheduler.pollIntervalSeconds":          config.ValueSourceDefault,
+				"agent.vendor":                  config.ValueSourceConfigFile,
+				"agent.params.apiKey":           config.ValueSourceConfigFile,
+				"agent.params.nested.token":     config.ValueSourceConfigFile,
+				"agent.env.OPENAI_API_KEY":      config.ValueSourceConfigFile,
+				"daemon.environment.SECRET":     config.ValueSourceConfigFile,
+				"server.localToken":             config.ValueSourceConfigFile,
+				"agent.timeouts.workerSeconds":  config.ValueSourceConfigFile,
+				"scheduler.maxConcurrentRuns":   config.ValueSourceEnv,
+				"scheduler.pollIntervalSeconds": config.ValueSourceDefault,
 			},
 		},
 	}
@@ -57,12 +55,6 @@ func TestRuntimeConfigMetadataMarksHotOverridesReadOnly(t *testing.T) {
 	}
 	if field := metadata.Fields["scheduler.pollIntervalSeconds"]; field.Editable || field.ApplyMode != "restart" {
 		t.Fatalf("poll interval metadata = %#v, want read-only restart", field)
-	}
-	if field := metadata.Fields["roles.planner.triggers.planeAssigneeId"]; field.Editable || field.ApplyMode != "restart" {
-		t.Fatalf("planner Plane assignee metadata = %#v, want read-only restart", field)
-	}
-	if field := metadata.Fields["roles.worker.triggers.planeAssigneeId"]; !field.Editable || field.ApplyMode != "hot" {
-		t.Fatalf("worker Plane assignee metadata = %#v, want editable hot", field)
 	}
 	if field := metadata.Fields["agent.env.OPENAI_API_KEY"]; !field.Editable {
 		t.Fatalf("write-only agent env metadata = %#v, want editable key", field)

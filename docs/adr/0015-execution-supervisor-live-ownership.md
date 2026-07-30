@@ -385,7 +385,7 @@ storage close (#580 aligns with #577).
 | Producer | Spawn boundary | Containment |
 |----------|----------------|-------------|
 | **Worker / Fixer validation shell** | `internal/infra/shell.Run` (`Configure` + `Start` + `Bind`) + `LiveTracker` | Cancel/timeout → `Handle.Kill` confirmed drain; normal exit → `Handle.Drain`; track + `ReportDrainFailure` for retain-storage |
-| **Other daemon `shell.Run` work steps** on inventory-listed role helpers | same package boundary | Same as validation when Supervisor-owned; short git/gh/tea remain independently lifecycle-owned (gateway Authority, Tracker nil) but still get group containment when they share `shell.Run` |
+| **Other daemon `shell.Run` work steps** on inventory-listed role helpers | same package boundary | Same as validation when Supervisor-owned; short git/gh remain independently lifecycle-owned (gateway Authority, Tracker nil) but still get group containment when they share `shell.Run` |
 | **Trusted review-submit children** | `internal/forge/trusted_review_proxy.go` + `LiveTracker` | `Configure` + `Bind` after Start; cancel → `Handle.Kill`; success path `Drain`; track + report for retain-storage |
 
 Raw PID signal-only stop is removed at these boundaries. Agent live SQLite-PID
@@ -434,7 +434,7 @@ live a `queue_items.status=running` claim is an owned **operation** under #579
 | **CLI daemon spawn / stop** | `internal/cliapp/daemon_runtime.go` `SpawnDetached` / `KillProcess` of **looperd** | CLI/service manager owns the daemon process, not in-daemon work ownership. |
 | **CLI config editor / dashboard browser open** | `config_commands.go`, `dashboard_command.go` | Short-lived operator tools; CLI-owned. |
 | **osascript notifications** | `internal/infra/notify/gateway.go` via `shell.Run` | Notification channel lifecycle; short-lived; not queue/agent ownership. |
-| **git / gh / tea tool invocations** | `internal/infra/git`, `internal/infra/github`, `internal/forge/tea` via `shell.Run` | Provider/tool gateways; request-scoped short commands under their gateways, not Supervisor agent leases. If a future path becomes long-lived owned work, reclassify before cutover. |
+| **git / gh tool invocations** | `internal/infra/git`, `internal/infra/github` via `shell.Run` | Provider/tool gateways; request-scoped short commands under their gateways, not Supervisor agent leases. If a future path becomes long-lived owned work, reclassify before cutover. |
 | **Daemon `ps` liveness/identity probes** | `internal/runtime/runtime.go` (`defaultReadProcessCommand` for agent execution match); `internal/runtime/webhook_lifecycle.go` (`defaultProcessProbe.Argv` / `psProcessStart` non-Linux paths for forwarder identity) | Short-lived recovery/identity **evidence** only (see Authority). Not Supervisor-owned work producers and not R4 containment targets. They must never authorize live stop, terminal, requeue, or overlap while the daemon is live, and must not become confirmed-dead Authority after restart solely from PID absence. #575/#581 keep probes as evidence; do not migrate them onto Supervisor leases. |
 
 ### Explicitly out of scope

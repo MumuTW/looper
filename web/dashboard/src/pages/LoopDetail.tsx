@@ -13,6 +13,11 @@ import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
+  formatDurableProgress,
+  formatPrimaryFailure,
+  formatSecondaryIssues,
+} from "@/lib/fixerOutcome";
+import {
   fetchLoop,
   openLoopLogsStream,
   type Loop,
@@ -407,6 +412,19 @@ export function LoopDetailPage() {
   const activeRunItems = activeRuns.data?.items;
   const forceRefreshActiveRuns = activeRuns.forceRefresh;
 
+  const primaryFailure = useMemo(
+    () => formatPrimaryFailure(data?.outcome),
+    [data?.outcome],
+  );
+  const durableProgress = useMemo(
+    () => formatDurableProgress(data?.outcome),
+    [data?.outcome],
+  );
+  const secondaryIssues = useMemo(
+    () => formatSecondaryIssues(data?.outcome),
+    [data?.outcome],
+  );
+
   const hasActiveRun = useMemo(() => {
     if (!data) return false;
     const items = activeRunItems ?? [];
@@ -504,6 +522,58 @@ export function LoopDetailPage() {
                     <span className="whitespace-pre-wrap break-words">
                       {data.lastFailureReason.trim()}
                     </span>
+                  ) : (
+                    "—"
+                  )
+                }
+              />
+              {/*
+                The row above is the latest error from the queue. This one is the
+                first, causal failure from the run, which differs exactly when a
+                later problem piled on top of the real cause.
+              */}
+              <Kv
+                label="First failure"
+                value={
+                  primaryFailure ? (
+                    <span className="whitespace-pre-wrap break-words">
+                      {primaryFailure}
+                    </span>
+                  ) : (
+                    "—"
+                  )
+                }
+              />
+              {/*
+                What survived the run. Paired with "First failure" this is the
+                difference between "nothing shipped, retry freely" and "some of
+                this already landed".
+              */}
+              <Kv
+                label={
+                  data.outcome?.partialSuccess ? "Kept (partial)" : "Kept"
+                }
+                value={durableProgress ?? "—"}
+              />
+              {/*
+                Problems around the run's own result -- a refused cleanup, a failure
+                while parking. Kept separate from "First failure" so the causal one
+                stays easy to find.
+              */}
+              <Kv
+                label="Also"
+                value={
+                  secondaryIssues ? (
+                    <ul className="m-0 list-none space-y-0.5 p-0">
+                      {secondaryIssues.map((issue) => (
+                        <li
+                          key={issue}
+                          className="whitespace-pre-wrap break-words"
+                        >
+                          {issue}
+                        </li>
+                      ))}
+                    </ul>
                   ) : (
                     "—"
                   )

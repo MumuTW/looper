@@ -140,41 +140,11 @@ func TestHumanTakeoverReleaseRestoresSiblingClaims(t *testing.T) {
 	}
 }
 
-// TestHumanTakeoverHoldsSiblingIssueTarget covers the non-PR half of the same
-// invariant: issue-target loops of different roles share an issue worktree the
-// same way.
-func TestHumanTakeoverHoldsSiblingIssueTarget(t *testing.T) {
-	t.Parallel()
-	f := newHumanHoldFixture(t)
-	targetID := "issue:acme/looper:7"
-	repo := "acme/looper"
-	for _, seed := range []struct{ id, loopType, status string }{
-		{"loop_held_planner", "planner", "human_takeover"},
-		{"loop_sibling_worker", "worker", "queued"},
-	} {
-		f.seedLoop(t, LoopRecord{
-			ID: seed.id, Seq: int64(len(seed.id)), ProjectID: "project_1", Type: seed.loopType,
-			TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: seed.status,
-			CreatedAt: humanHoldNow, UpdatedAt: humanHoldNow,
-		})
-	}
-	projectID := "project_1"
-	loopID := "loop_sibling_worker"
-	if err := f.repos.Queue.Upsert(f.ctx, QueueItemRecord{
-		ID: "queue_sibling_worker", ProjectID: &projectID, LoopID: &loopID, Type: "worker",
-		TargetType: "issue", TargetID: targetID, Repo: &repo, DedupeKey: "worker:acme/looper:7",
-		Status: "queued", Priority: 5, AvailableAt: humanHoldNow, MaxAttempts: 5,
-		CreatedAt: humanHoldNow, UpdatedAt: humanHoldNow,
-	}); err != nil {
-		t.Fatalf("Queue.Upsert() error = %v", err)
-	}
-
-	if item, err := f.repos.Queue.ClaimNext(f.ctx, humanHoldNow, "scheduler"); err != nil {
-		t.Fatalf("ClaimNext() error = %v", err)
-	} else if item != nil {
-		t.Fatalf("ClaimNext() = %#v, want no claim while a sibling loop on the same issue is human_takeover", item)
-	}
-}
+// The issue-target half of this invariant moved to
+// loop_human_hold_issue_scope_test.go once it was narrowed: an issue target is a
+// shared checkout only among planner loops, so the cross-role case this file used
+// to assert (a held planner fencing a worker on the same issue) is now an
+// over-block with its own test.
 
 // TestHumanTakeoverClaimHoldIsScopedToItsTarget guards the other direction: an
 // unrelated PR must stay claimable, so the predicate is a hold on one worktree

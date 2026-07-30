@@ -456,7 +456,7 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 	const repo = "acme/looper"
 	const prNumber int64 = 42
 
-	for _, projectID := range []string{"github", "forgejo", "unrelated"} {
+	for _, projectID := range []string{"github", "second", "unrelated"} {
 		if err := repos.Projects.Upsert(ctx, ProjectRecord{
 			ID:        projectID,
 			Name:      projectID,
@@ -471,7 +471,7 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 	snapshots := []PullRequestSnapshotRecord{
 		{ID: "github-old", ProjectID: "github", Repo: repo, PRNumber: prNumber, HeadSHA: "github-old", CapturedAt: "2026-07-13T09:00:00.000Z", CreatedAt: "2026-07-13T09:00:00.000Z"},
 		{ID: "github-new", ProjectID: "github", Repo: repo, PRNumber: prNumber, HeadSHA: "github-new", CapturedAt: "2026-07-13T10:00:00.000Z", CreatedAt: "2026-07-13T10:00:00.000Z"},
-		{ID: "forgejo-new", ProjectID: "forgejo", Repo: repo, PRNumber: prNumber, HeadSHA: "forgejo-new", CapturedAt: "2026-07-13T11:00:00.000Z", CreatedAt: "2026-07-13T11:00:00.000Z"},
+		{ID: "second-new", ProjectID: "second", Repo: repo, PRNumber: prNumber, HeadSHA: "second-new", CapturedAt: "2026-07-13T11:00:00.000Z", CreatedAt: "2026-07-13T11:00:00.000Z"},
 		{ID: "other-pr", ProjectID: "unrelated", Repo: repo, PRNumber: 99, HeadSHA: "other-pr", CapturedAt: "2026-07-13T12:00:00.000Z", CreatedAt: "2026-07-13T12:00:00.000Z"},
 		{ID: "other-repo", ProjectID: "unrelated", Repo: "acme/other", PRNumber: prNumber, HeadSHA: "other-repo", CapturedAt: "2026-07-13T13:00:00.000Z", CreatedAt: "2026-07-13T13:00:00.000Z"},
 	}
@@ -485,8 +485,8 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 	if err != nil {
 		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() error = %v", err)
 	}
-	if got := snapshotIDs(gotSnapshots); !reflect.DeepEqual(got, []string{"forgejo-new", "github-new"}) {
-		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() IDs = %v, want [forgejo-new github-new]", got)
+	if got := snapshotIDs(gotSnapshots); !reflect.DeepEqual(got, []string{"second-new", "github-new"}) {
+		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() IDs = %v, want [second-new github-new]", got)
 	}
 
 	matchingRepo := "Acme/Looper"
@@ -2634,5 +2634,70 @@ func TestQueueStickySnapshotClaimInspectsNewestTiedRun(t *testing.T) {
 	}
 	if second != nil {
 		t.Fatalf("second ClaimNextNonLongTermRetryAmongTypeSets() = %#v, want nil: newest tied run is completed", second)
+	}
+}
+
+func TestRunsTouchHeartbeatOnlyMovesForward(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_touch_hb", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_touch_hb", Seq: 1, ProjectID: "project_touch_hb", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpoint := `{"resumePolicy":"always"}`
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_touch_hb", LoopID: "loop_touch_hb", Status: "running", CheckpointJSON: &checkpoint, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	// NULL heartbeat: first touch sets it.
+	t2 := "2026-04-11T12:00:02.000Z"
+	if err := repos.Runs.TouchHeartbeat(ctx, "run_touch_hb", t2); err != nil {
+		t.Fatalf("TouchHeartbeat(t2) error = %v", err)
+	}
+	run, err := repos.Runs.GetByID(ctx, "run_touch_hb")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.LastHeartbeatAt == nil || *run.LastHeartbeatAt != t2 {
+		t.Fatalf("LastHeartbeatAt = %v, want %q", run.LastHeartbeatAt, t2)
+	}
+
+	// A stale writer cannot move liveness evidence backward.
+	t1 := "2026-04-11T12:00:01.000Z"
+	if err := repos.Runs.TouchHeartbeat(ctx, "run_touch_hb", t1); err != nil {
+		t.Fatalf("TouchHeartbeat(t1) error = %v", err)
+	}
+	run, err = repos.Runs.GetByID(ctx, "run_touch_hb")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.LastHeartbeatAt == nil || *run.LastHeartbeatAt != t2 {
+		t.Fatalf("LastHeartbeatAt after stale touch = %v, want %q retained", run.LastHeartbeatAt, t2)
+	}
+	if run.UpdatedAt != t2 {
+		t.Fatalf("UpdatedAt after stale touch = %q, want %q retained", run.UpdatedAt, t2)
+	}
+
+	// Forward touch advances, and no other column is disturbed.
+	t3 := "2026-04-11T12:00:03.000Z"
+	if err := repos.Runs.TouchHeartbeat(ctx, "run_touch_hb", t3); err != nil {
+		t.Fatalf("TouchHeartbeat(t3) error = %v", err)
+	}
+	run, err = repos.Runs.GetByID(ctx, "run_touch_hb")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.LastHeartbeatAt == nil || *run.LastHeartbeatAt != t3 {
+		t.Fatalf("LastHeartbeatAt = %v, want %q", run.LastHeartbeatAt, t3)
+	}
+	if run.Status != "running" || run.CheckpointJSON == nil || *run.CheckpointJSON != checkpoint || run.StartedAt != now {
+		t.Fatalf("TouchHeartbeat disturbed other columns: %#v", run)
 	}
 }

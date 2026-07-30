@@ -564,11 +564,11 @@ type HITLAskCard struct {
 
 	// Source identifies where the task came from so the human knows what they are
 	// deciding about. SourceType is a human label ("GitHub Issue", "GitHub PR",
-	// "Plane"), SourceRef the short id ("#132"), SourceURL the clickable link.
+	// "GitHub"), SourceRef the short id ("#132"), SourceURL the clickable link.
 	SourceType string
 	SourceRef  string
 	SourceURL  string
-	// TriggerLogin is who created/assigned the task (GitHub login / Plane account),
+	// TriggerLogin is who created/assigned the task (the forge account login),
 	// rendered as attribution so the human knows whose work this is.
 	TriggerLogin string
 

@@ -100,8 +100,7 @@ const (
 type ReviewerPublishMode string
 
 const (
-	ReviewerPublishModeSingleReview   ReviewerPublishMode = "single_review"
-	ReviewerPublishModeSummaryComment ReviewerPublishMode = "summary_comment"
+	ReviewerPublishModeSingleReview ReviewerPublishMode = "single_review"
 )
 
 type ReviewerThreadResolutionMode string
@@ -196,41 +195,26 @@ const (
 type ProviderKind string
 
 const (
-	ProviderKindGitHub  ProviderKind = "github"
-	ProviderKindForgejo ProviderKind = "forgejo"
-	// ProviderKindPlane is a task-source provider: issues (work-items) are read
-	// from a Plane project, while pull requests / diffs / reviews are delegated
-	// to the project's GitHub code repo. See internal/forge/plane.go.
-	ProviderKindPlane ProviderKind = "plane"
+	ProviderKindGitHub ProviderKind = "github"
 )
 
-// ProviderAuthMode selects how a forgejo provider authenticates API calls.
-// token-env uses a native HTTP client with a token from the named environment
-// variable. tea reuses an explicitly selected tea CLI login as transport and
-// never extracts or stores the underlying token.
-type ProviderAuthMode string
-
-const (
-	ProviderAuthTokenEnv ProviderAuthMode = "token-env"
-	ProviderAuthTea      ProviderAuthMode = "tea"
-)
+// removedProviderKinds are provider kinds looper used to support. They are
+// rejected explicitly so an existing configuration fails loudly instead of
+// being silently reinterpreted as GitHub.
+var removedProviderKinds = map[ProviderKind]string{
+	"plane":   "Plane support was removed; looper reads work-items from GitHub issues only",
+	"forgejo": "Forgejo support was removed; looper is a GitHub-only product",
+}
 
 type ProviderConfig struct {
-	ID       string           `json:"id"`
-	Kind     ProviderKind     `json:"kind"`
-	BaseURL  string           `json:"baseUrl,omitempty"`
-	GHPath   *string          `json:"ghPath,omitempty"`
-	Auth     ProviderAuthMode `json:"auth,omitempty"`
-	TokenEnv *string          `json:"tokenEnv,omitempty"`
-	// TeaLogin is the explicit tea CLI login name used when Auth is "tea".
-	// Required for tea-backed Forgejo providers; never inferred from tea's default.
-	TeaLogin *string `json:"teaLogin,omitempty"`
-	// TeaPath optionally overrides the tea executable path (otherwise PATH lookup).
-	TeaPath *string `json:"teaPath,omitempty"`
-	// Workspace and ProjectID identify the Plane project a plane provider reads
-	// its work-items from. Ignored for github/forgejo providers.
-	Workspace *string `json:"workspace,omitempty"`
-	ProjectID *string `json:"projectId,omitempty"`
+	ID      string       `json:"id"`
+	Kind    ProviderKind `json:"kind"`
+	BaseURL string       `json:"baseUrl,omitempty"`
+	GHPath  *string      `json:"ghPath,omitempty"`
+	// TokenEnv names the environment variable holding this provider's API
+	// token. The daemon passes it through to trusted looper children; it is
+	// never exposed to agent environments.
+	TokenEnv *string `json:"tokenEnv,omitempty"`
 }
 
 // AgentBindingConfig is vendor+model only (profiles).
@@ -496,13 +480,6 @@ type IssueRoleTriggersConfig struct {
 	Labels                     []string  `json:"labels"`
 	LabelMode                  LabelMode `json:"labelMode"`
 	RequireAssigneeCurrentUser bool      `json:"requireAssigneeCurrentUser"`
-	// PlaneAssigneeID scopes discovery on a Plane task-source project to
-	// work-items assigned to this Plane member UUID. Plane assignees are UUIDs
-	// (not GitHub logins), so RequireAssigneeCurrentUser can't route them; set
-	// this per person instead so each looper only picks up its owner's items.
-	// Empty = label-only discovery (every watching looper sees every item).
-	// Ignored for non-Plane providers.
-	PlaneAssigneeID string `json:"planeAssigneeId,omitempty"`
 }
 
 type PullRequestRoleTriggersConfig struct {
@@ -685,16 +662,11 @@ type PartialProjectWebhookConfig struct {
 }
 
 type PartialProviderConfig struct {
-	ID        string            `json:"id"`
-	Kind      *ProviderKind     `json:"kind,omitempty"`
-	BaseURL   *string           `json:"baseUrl,omitempty"`
-	GHPath    *string           `json:"ghPath,omitempty"`
-	Auth      *ProviderAuthMode `json:"auth,omitempty"`
-	TokenEnv  *string           `json:"tokenEnv,omitempty"`
-	TeaLogin  *string           `json:"teaLogin,omitempty"`
-	TeaPath   *string           `json:"teaPath,omitempty"`
-	Workspace *string           `json:"workspace,omitempty"`
-	ProjectID *string           `json:"projectId,omitempty"`
+	ID       string        `json:"id"`
+	Kind     *ProviderKind `json:"kind,omitempty"`
+	BaseURL  *string       `json:"baseUrl,omitempty"`
+	GHPath   *string       `json:"ghPath,omitempty"`
+	TokenEnv *string       `json:"tokenEnv,omitempty"`
 }
 
 type Config struct {
@@ -1017,7 +989,6 @@ type PartialIssueRoleTriggersConfig struct {
 	Labels                     *[]string  `json:"labels,omitempty"`
 	LabelMode                  *LabelMode `json:"labelMode,omitempty"`
 	RequireAssigneeCurrentUser *bool      `json:"requireAssigneeCurrentUser,omitempty"`
-	PlaneAssigneeID            *string    `json:"planeAssigneeId,omitempty"`
 }
 
 type PartialPullRequestRoleTriggersConfig struct {
@@ -1094,8 +1065,7 @@ type PartialRoleDiscoveryConfig struct {
 	LabelMode *LabelMode  `json:"labelMode,omitempty"`
 
 	// Issue-source only.
-	RequireAssigneeCurrentUser *bool   `json:"requireAssigneeCurrentUser,omitempty"`
-	PlaneAssigneeID            *string `json:"planeAssigneeId,omitempty"`
+	RequireAssigneeCurrentUser *bool `json:"requireAssigneeCurrentUser,omitempty"`
 
 	// Pull-request-source only.
 	IncludeDrafts        *bool         `json:"includeDrafts,omitempty"`

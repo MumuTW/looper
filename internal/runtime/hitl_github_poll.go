@@ -7,6 +7,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -314,7 +315,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		return
 	}
 
-	awaitingLabel := "looper:awaiting-human"
+	awaitingLabel := labels.AwaitingHuman
 	var answerAuthors []string
 	if gh := input.Config.HITL.GitHub; gh != nil {
 		if strings.TrimSpace(gh.AwaitingLabel) != "" {

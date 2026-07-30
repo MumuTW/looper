@@ -20,7 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
@@ -35,7 +35,6 @@ const (
 	stepPublish         PlannerStep = "publish"
 	stepNotify          PlannerStep = "notify"
 
-	discoveryLabel             = "looper:plan"
 	plannerPRDedupeLookupLimit = 1000
 
 	defaultAgentTimeout = 30 * time.Minute
@@ -515,7 +514,7 @@ func New(options Options) *Runner {
 	}
 	policy := options.DiscoveryPolicy
 	if policy.LabelMode == "" {
-		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
+		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
 	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
 }
@@ -784,12 +783,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			_ = r.repos.Locks.Release(context.Background(), claimedLockKey)
 		}
 	}()
-	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	if startedLoop, held, err := r.beginLoopRun(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
+	} else if held {
+		return r.finishHeldPlannerQueueItem(ctx, startedLoop, &run, queueItem, checkpoint, plannerRunStartHeldSummary)
 	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
@@ -1315,11 +1316,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
-	if !stringInSlice(specpr.ReviewingLabel, checkpoint.Publish.LabelsAdded) {
-		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+	if !stringInSlice(labels.SpecReviewing, checkpoint.Publish.LabelsAdded) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{labels.SpecReviewing}, CWD: input.Project.RepoPath}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		checkpoint.Publish.LabelsAdded = append(checkpoint.Publish.LabelsAdded, specpr.ReviewingLabel)
+		checkpoint.Publish.LabelsAdded = append(checkpoint.Publish.LabelsAdded, labels.SpecReviewing)
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
@@ -1977,6 +1978,34 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	return updated, nil
 }
 
+// plannerRunStartHeldSummary is the run outcome recorded when takeover wins the
+// race against a claim: the run is completed without ever entering the workflow.
+const plannerRunStartHeldSummary = "Planner stopped before starting because the loop is held by human takeover"
+
+// beginLoopRun applies the run-start loop transition and reports whether
+// `looper takeover` already owns the loop.
+//
+// This is the run-*boundary* counterpart to updateLoop's mid-turn behaviour, and
+// the two differ on purpose. updateLoop swallows a hold and returns the persisted
+// row: a takeover that lands in the middle of an in-flight turn must not fail that
+// turn, and the turn's remaining status/schedule writes are correctly no-ops
+// because the human now owns them. At a run boundary there is no in-flight turn to
+// protect. The side effects the caller is about to perform — worktree preparation,
+// agent launch — have not happened yet, and they are precisely what the hold
+// exists to prevent, so the boundary must abort instead of proceeding on a row
+// that says human_takeover.
+//
+// How a reader tells the two apart: exactly one updateLoop call per runner opens
+// the run by writing Status = "running", and that call goes through here. Every
+// other call site is mid-turn or terminal and keeps the swallow.
+func (r *Runner) beginLoopRun(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, bool, error) {
+	updated, err := r.updateLoop(ctx, loop, mutate)
+	if err != nil {
+		return storage.LoopRecord{}, false, err
+	}
+	return updated, domain.LoopIsHumanHeld(updated.Status), nil
+}
+
 func (r *Runner) classifyFailure(err error) *loopError {
 	return r.classifyFailureWithBoundary(err, failureclass.BoundaryUnknown)
 }
@@ -2320,20 +2349,20 @@ func uniqueNonEmptyLabels(labels []string) []string {
 	return result
 }
 
-func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+func labelsMatch(itemLabels []string, required []string, mode config.LabelMode) bool {
 	if len(required) == 0 {
 		return true
 	}
 	if mode == config.LabelModeAny {
 		for _, label := range required {
-			if specpr.HasLabel(labels, label) {
+			if labels.Has(itemLabels, label) {
 				return true
 			}
 		}
 		return false
 	}
 	for _, label := range required {
-		if !specpr.HasLabel(labels, label) {
+		if !labels.Has(itemLabels, label) {
 			return false
 		}
 	}

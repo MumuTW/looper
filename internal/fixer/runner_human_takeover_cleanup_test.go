@@ -122,7 +122,7 @@ func TestTerminalCleanupStillRunsAfterHandback(t *testing.T) {
 		t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
 	}
 	checkpoint := &fixerCheckpoint{Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-42"), Branch: "fix/pr-42", PreparedAt: nowISO}}
-	runner.cleanupFixerWorktreeIfTerminal(ctx, *project, loopID, checkpoint)
+	runner.cleanupFixerWorktreeIfTerminal(ctx, *project, loopID, "", checkpoint)
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("cleanup calls = %#v, want one cleanup for an unheld loop", git.cleanupCalls)
 	}

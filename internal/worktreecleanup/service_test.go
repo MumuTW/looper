@@ -335,3 +335,62 @@ func iso(value time.Time) string {
 func strPtr(value string) *string {
 	return &value
 }
+
+// TestPlanReclaimsAgedOrphansAndAgesThemLikeAnyOther covers the reason the sweeper
+// was inert in practice: the reference graph drops old worktrees as loops move on,
+// so almost everything eligible by age has no loop/run/queue reference. Excluding
+// orphans therefore skipped those records at any age -- a pass could scan dozens of
+// candidates and clean none.
+//
+// Including them is safe because Plan notes every candidate's own createdAt and
+// updatedAt, so the retention window gates an orphan exactly like a referenced
+// worktree. Both halves are asserted here: aged orphans become eligible, fresh ones
+// are still held by retention.
+func TestPlanReclaimsAgedOrphansAndAgesThemLikeAnyOther(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFixture(t)
+	aged := fixture.now.Add(-10 * 24 * time.Hour)
+	fresh := fixture.now.Add(-2 * 24 * time.Hour)
+
+	fixture.worktree("wt_orphan_aged", "looper/orphan-aged", aged)
+	fixture.worktree("wt_orphan_fresh", "looper/orphan-fresh", fresh)
+
+	service := fixture.service()
+	service.Config.IncludeOrphans = true
+	result, err := service.Plan(context.Background())
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+
+	assertDecision(t, result, "wt_orphan_aged", ActionWouldClean, "eligible in dry-run plan")
+	assertDecision(t, result, "wt_orphan_fresh", ActionSkipped, "within retention window")
+	if result.Summary.Orphans != 2 {
+		t.Fatalf("Summary.Orphans = %d, want 2", result.Summary.Orphans)
+	}
+	if result.Summary.Candidates != 1 {
+		t.Fatalf("Summary.Candidates = %d, want 1 aged orphan eligible", result.Summary.Candidates)
+	}
+}
+
+// TestPlanStillHonorsIncludeOrphansFalse keeps the escape hatch working: an operator
+// who sets includeOrphans=false keeps unreferenced worktrees indefinitely, at the
+// cost of the sweeper reclaiming almost nothing.
+func TestPlanStillHonorsIncludeOrphansFalse(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFixture(t)
+	fixture.worktree("wt_orphan_aged", "looper/orphan-aged", fixture.now.Add(-30*24*time.Hour))
+
+	service := fixture.service()
+	service.Config.IncludeOrphans = false
+	result, err := service.Plan(context.Background())
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+
+	assertDecision(t, result, "wt_orphan_aged", ActionSkipped, "orphan worktree and includeOrphans=false")
+	if result.Summary.Candidates != 0 {
+		t.Fatalf("Summary.Candidates = %d, want 0 when orphans are excluded", result.Summary.Candidates)
+	}
+}

@@ -161,6 +161,25 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 			if run.Status == "running" {
 				states[index].block("referenced by running run")
 			}
+			// For fixer and reviewer loops the worktree path lives only in the run
+			// checkpoint, never in loop metadata, so the loop pass above cannot match
+			// the loop to this worktree and its status check never runs. Takeover
+			// cancels the queue item and drives the run terminal, which is exactly
+			// when the `running` guard above stops applying — so without this the
+			// checkout a human was just handed becomes eligible once it ages past
+			// retention, while the loop still says human_takeover.
+			//
+			// Only the human-held statuses are applied here, not the full
+			// protectsLoopStatus set. A run checkpoint is a record of a past run, not
+			// a durable attachment: fixer and reviewer loops sit in idle/queued/paused
+			// between runs, all of which are "protected", so applying the whole set
+			// would block every checkpoint-derived worktree forever and make retention
+			// cleanup a no-op for precisely the loops it exists to serve. A human hold
+			// is different in kind — it is an active claim on the checkout with no
+			// expiry but the human's own handback.
+			if ok && domain.LoopIsHumanHeld(loop.Status) {
+				states[index].block("referenced by protected loop status " + loop.Status)
+			}
 		}
 	}
 
