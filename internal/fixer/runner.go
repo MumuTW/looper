@@ -3316,28 +3316,21 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// The parse gate above only proves a structured result arrived. The declared
 	// outcome is what authorizes advancing to reconcile/validate/push, so read it
 	// before any downstream step can act on this run.
+	//
+	// Neither rejection path records checkpoint.Repair. A stored repair record with
+	// ParseStatus "parsed" is what the replay guard at the top of this function
+	// treats as a finished repair, so recording one here would let the next
+	// automatic retry of a retryable block skip the agent entirely and publish
+	// whatever the blocked attempt left behind. The agent's own reason survives as
+	// the run's failure summary and in the event log; leaving the repair unrecorded
+	// keeps the step replayable, which is what a retryable classification means.
 	blocked, blockedMessage, blockedKind, outcomeErr := fixerRepairTaskOutcome(result)
 	if outcomeErr != nil {
-		checkpoint.Repair = repair
-		if persistErr := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); persistErr != nil {
-			r.logError("fixer outcome checkpoint persist failed", map[string]any{
-				"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID,
-				"message": persistErr.Error(),
-			})
-		}
 		return checkpoint, outcomeErr
 	}
 	if blocked {
 		// A declared block is the agent reporting it could not do the work, not a
-		// Looper failure. Persist the repair record so the classification rests on
-		// stored evidence, then fail with the kind the agent declared.
-		checkpoint.Repair = repair
-		if persistErr := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); persistErr != nil {
-			r.logError("fixer blocked-outcome checkpoint persist failed", map[string]any{
-				"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID,
-				"message": persistErr.Error(),
-			})
-		}
+		// Looper failure, so it fails with the kind the agent declared.
 		return checkpoint, &loopError{message: blockedMessage, kind: blockedKind}
 	}
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {

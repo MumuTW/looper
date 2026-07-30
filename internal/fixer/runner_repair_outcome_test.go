@@ -1,9 +1,12 @@
 package fixer
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 // The fixer treats the agent's declared `outcome` as the authority for whether a
@@ -141,5 +144,72 @@ func TestIsTemplateCompletionPayloadSkipsEchoedFixerTemplate(t *testing.T) {
 		if isTemplateCompletionPayload(payload) {
 			t.Fatalf("isTemplateCompletionPayload(%s) = true, want a real completion kept", payload)
 		}
+	}
+}
+
+// TestRunRepairStepReplaysAfterRejectedOutcome is the regression guard for the
+// replay hole. The guard at the top of runRepairStep treats any stored repair
+// record whose ParseStatus is "parsed" as a finished repair. Recording one for a
+// blocked or unauthorized attempt therefore let the next automatic retry skip the
+// agent and advance to reconcile/validate/push, publishing whatever the blocked
+// attempt left in the worktree.
+func TestRunRepairStepReplaysAfterRejectedOutcome(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "declared block", payload: `{"outcome":"blocked","failure_kind":"retryable_transient","summary":"rate limited"}`},
+		{name: "no outcome declared", payload: `{"summary":"applied fixes"}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			detail := PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+			github := &fakeGitHubGateway{
+				listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+				viewResponses: []PullRequestDetail{detail, detail},
+			}
+			git := &fakeGitGateway{
+				createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+				prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+			}
+			agent := &fakeAgentExecutor{results: []AgentResult{{
+				Status: "completed", ParseStatus: "parsed", Summary: "attempted",
+				CompletionPayload: testCase.payload,
+			}}}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+			if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+				t.Fatalf("DiscoverPullRequests() error = %v", err)
+			}
+			claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+			}
+			result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+			if err != nil {
+				t.Fatalf("ProcessClaimedItem() error = %v", err)
+			}
+			if result.Status != "failed" {
+				t.Fatalf("result = %#v, want the rejected outcome to fail the run", result)
+			}
+
+			run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+			if err != nil || run == nil {
+				t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
+			}
+			stored := parseCheckpoint(run.CheckpointJSON)
+			if stored.Repair != nil {
+				t.Fatalf("stored checkpoint.Repair = %#v, want no repair record so the step stays replayable", stored.Repair)
+			}
+			// The replay guard must not treat this checkpoint as a finished repair.
+			if replayed, replayErr := runner.runRepairStep(context.Background(), stepInput{
+				Project: storage.ProjectRecord{ID: "project_1"}, Loop: storage.LoopRecord{ID: result.LoopID},
+				Run: *run, Repo: "acme/looper", PRNumber: 42, Checkpoint: stored,
+			}); replayErr == nil && replayed.Repair != nil && replayed.Repair.ParseStatus == "parsed" {
+				t.Fatal("runRepairStep advanced on the stored checkpoint, want the repair replayed")
+			}
+		})
 	}
 }
