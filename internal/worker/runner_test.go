@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/disclosure"
 	"github.com/MumuTW/looper/internal/labels"
@@ -1510,6 +1511,142 @@ func TestRunExecuteStepRechecksWorkerHoldAfterAgentCompletion(t *testing.T) {
 	}
 	if len(git.inspectCalls) != 0 || len(git.commitCalls) != 0 {
 		t.Fatalf("git reconciliation calls = inspect %d, commit %d; want none", len(git.inspectCalls), len(git.commitCalls))
+	}
+}
+
+func TestRunExecuteStepPersistsProgressBeforeTimeoutTermination(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreeRoot, err := workerWorktreeRoot(*project)
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(project.RepoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repo) error = %v", err)
+	}
+	worktreePath := filepath.Join(worktreeRoot, "worker-timeout")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: /tmp/test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_progress", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+		HeadSHA: "after-head", Branch: "looper/issue-27", HasUncommittedChanges: true,
+		ChangedFiles: []string{"modified.go", "staged.go", "new.txt"}, StagedFiles: []string{"staged.go"}, UntrackedFiles: []string{"new.txt"}, DiffFingerprint: "status-only-sha",
+	}}
+	agentExecutor := &timeoutObservingAgentExecutor{result: AgentResult{Status: "timeout", Summary: "agent became idle", TimeoutType: "idle", LastProgressAt: "2026-04-11T12:00:01.000Z"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_27", Path: worktreePath, Branch: "looper/issue-27", BaseBranch: "main", HeadSHA: "before-head"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("runExecuteStep() error = %v, want retryable timeout", err)
+	}
+	progress := checkpoint.Execution.ProgressBeforeTimeout
+	if progress == nil {
+		t.Fatalf("checkpoint.Execution.ProgressBeforeTimeout = nil, want snapshot")
+	}
+	if progress.HeadSHA != "after-head" || progress.WorktreeID != "worktree_27" || progress.Branch != "looper/issue-27" || progress.TimeoutType != "idle" || progress.DiffFingerprint != "status-only-sha" || progress.ChangedFileCount != 3 || progress.StagedFileCount != 1 || progress.UntrackedFileCount != 1 {
+		t.Fatalf("progress = %#v, want captured timeout state", progress)
+	}
+	if got := progress.StagedFiles; len(got) != 1 || got[0] != "staged.go" {
+		t.Fatalf("progress.StagedFiles = %#v, want [staged.go]", got)
+	}
+	storedRun, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want stored run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.ProgressBeforeTimeout == nil || storedCheckpoint.Execution.ProgressBeforeTimeout.DiffFingerprint != "status-only-sha" {
+		t.Fatalf("stored timeout snapshot = %#v, want persisted progress", storedCheckpoint.Execution)
+	}
+	if len(git.inspectCalls) != 1 || git.inspectCalls[0].BaseRef != "" {
+		t.Fatalf("InspectHead calls = %#v, want one snapshot without unused history traversal", git.inspectCalls)
+	}
+}
+
+func TestRunExecuteStepStopsRetryWhenTimeoutProgressSnapshotFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreeRoot, err := workerWorktreeRoot(*project)
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(project.RepoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repo) error = %v", err)
+	}
+	worktreePath := filepath.Join(worktreeRoot, "worker-timeout-failed-snapshot")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: /tmp/test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_progress_failure", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{inspectErrors: []error{errors.New("git status unavailable")}}
+	agentExecutor := &timeoutObservingAgentExecutor{result: AgentResult{Status: "timeout", Summary: "agent became idle", TimeoutType: "idle"}}
+	agentExecutor.afterObservation = func(observationErr error) {
+		if observationErr == nil {
+			t.Fatal("timeout observation error = nil, want Git inspection failure")
+		}
+		storedRun, getErr := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+		if getErr != nil || storedRun == nil {
+			t.Fatalf("Runs.GetByID(during observation) = (%#v, %v), want stored run", storedRun, getErr)
+		}
+		storedCheckpoint, parseErr := parseCheckpoint(storedRun.CheckpointJSON)
+		if parseErr != nil {
+			t.Fatalf("parseCheckpoint(during observation) error = %v", parseErr)
+		}
+		if storedCheckpoint.ResumePolicy != loops.ResumePolicyManualIntervention || storedCheckpoint.Execution == nil || !strings.Contains(storedCheckpoint.Execution.ProgressSnapshotError, "git status unavailable") {
+			t.Fatalf("checkpoint during observation = %#v, want durable failure before Wait returns", storedCheckpoint)
+		}
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{Work: &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"}, Worktree: &checkpointWorktree{ID: "worktree_27", Path: worktreePath, Branch: "looper/issue-27", BaseBranch: "main", HeadSHA: "before-head"}, Plan: &checkpointPlan{Summary: "Implement worker loop"}},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		t.Fatalf("runExecuteStep() error = %v, want manual intervention", err)
+	}
+	if checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention || checkpoint.Execution == nil || !strings.Contains(checkpoint.Execution.ProgressSnapshotError, "git status unavailable") {
+		t.Fatalf("checkpoint = %#v, want persisted snapshot failure and manual intervention", checkpoint)
 	}
 }
 
@@ -5473,6 +5610,39 @@ func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
 }
 
 func (f fakeAgentExecution) Kill(string) error { return nil }
+
+type timeoutObservingAgentExecutor struct {
+	starts           []AgentRunInput
+	result           AgentResult
+	afterObservation func(error)
+}
+
+func (f *timeoutObservingAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
+	f.starts = append(f.starts, input)
+	return timeoutObservingAgentExecution{input: input, result: f.result, afterObservation: f.afterObservation}, nil
+}
+
+type timeoutObservingAgentExecution struct {
+	input            AgentRunInput
+	result           AgentResult
+	afterObservation func(error)
+}
+
+func (f timeoutObservingAgentExecution) Wait(context.Context) (AgentResult, error) {
+	var observationErr error
+	if f.input.OnBeforeTimeout != nil {
+		observationErr = f.input.OnBeforeTimeout(context.Background(), agent.TimeoutObservation{TimeoutType: f.result.TimeoutType, LastProgressAt: f.result.LastProgressAt})
+		if observationErr != nil {
+			f.result.PreTimeoutError = observationErr.Error()
+		}
+	}
+	if f.afterObservation != nil {
+		f.afterObservation(observationErr)
+	}
+	return f.result, nil
+}
+
+func (timeoutObservingAgentExecution) Kill(string) error { return nil }
 
 type testLogger struct{}
 
