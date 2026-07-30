@@ -1528,7 +1528,10 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	workDir := t.TempDir()
 	pidPath := filepath.Join(workDir, "agent.pid")
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
-		"command": "/bin/sh", "args": []any{"-c", `echo $$ > "$PID_FILE"; trap '' TERM; while true; do sleep 1; done`},
+		// Publish the pid with a rename so the reader never observes a created
+		// but not-yet-written file; a plain redirect makes the empty window
+		// visible and the pid unparseable.
+		"command": "/bin/sh", "args": []any{"-c", `echo $$ > "$PID_FILE.tmp"; mv "$PID_FILE.tmp" "$PID_FILE"; trap '' TERM; while true; do sleep 1; done`},
 	}}, Repos: repos, ParamsOwnerVendor: customOwner()})
 
 	handle, err := executor.Start(context.Background(), RunInput{
@@ -1544,20 +1547,30 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if handle != nil {
 		t.Fatalf("Start() handle = %#v, want nil", handle)
 	}
-	if data, readErr := os.ReadFile(pidPath); readErr == nil {
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if parseErr != nil {
-			t.Fatalf("parse pid: %v", parseErr)
-		}
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
-				return
+	// Wait for the pid rather than reading once: a single read that lands
+	// before the child recorded its pid used to skip the reap assertion
+	// entirely, so the test passed without checking anything.
+	pid := 0
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if data, readErr := os.ReadFile(pidPath); readErr == nil {
+			if parsed, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil {
+				pid = parsed
+				break
 			}
-			time.Sleep(10 * time.Millisecond)
 		}
-		t.Fatalf("spawned process %d survived failed Start", pid)
+		time.Sleep(10 * time.Millisecond)
 	}
+	if pid == 0 {
+		// Reaped before it could record a pid; there is no process to leak.
+		return
+	}
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("spawned process %d survived failed Start", pid)
 }
 
 func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {

@@ -154,9 +154,13 @@ printf '%s\n' '__LOOPER_RESULT__={"summary":"fake Devin completed"}'
 func TestConfiguredExecutorCancelsDevinProcessGroup(t *testing.T) {
 	startedPath := filepath.Join(t.TempDir(), "started")
 	fakeDevin := filepath.Join(t.TempDir(), "devin")
+	// Publish the marker with a rename so os.Stat cannot observe a created but
+	// empty file, and install the trap before announcing readiness so a Kill
+	// racing the announcement is still handled.
 	script := `#!/bin/sh
-printf 'started\n' > "$STARTED_PATH"
 trap 'exit 0' TERM INT
+printf 'started\n' > "$STARTED_PATH.tmp"
+mv "$STARTED_PATH.tmp" "$STARTED_PATH"
 while :; do sleep 1; done
 `
 	if err := os.WriteFile(fakeDevin, []byte(script), 0o755); err != nil {
@@ -179,7 +183,10 @@ while :; do sleep 1; done
 		t.Fatalf("Start() error = %v", err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	// Spawning a shell can take well over 2s on a loaded CI runner. The
+	// deadline only has to bound a genuine hang, so give it the run's whole
+	// budget rather than an arbitrarily tighter slice of it.
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(startedPath); err == nil {
 			break
