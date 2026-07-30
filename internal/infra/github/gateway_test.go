@@ -1797,6 +1797,48 @@ func TestGatewayUsesQualifiedHostnameForRepoScopedAPICommands(t *testing.T) {
 	}
 }
 
+func TestGatewayRemovePullRequestReactionUsesRepoHostIdentity(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api user --jq .login":
+			return shell.Result{Stdout: "public-user\n"}, nil
+		case "api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json":
+			return shell.Result{Stdout: `[{"id":6,"content":"eyes","user":{"login":"public-user"}}]`}, nil
+		case "api repos/acme/looper/issues/42/reactions/6 --method DELETE -H Accept: application/vnd.github+json":
+			return shell.Result{Stdout: "{}"}, nil
+		case "api user --jq .login --hostname ghes":
+			return shell.Result{Stdout: "enterprise-user\n"}, nil
+		case "api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname ghes":
+			return shell.Result{Stdout: `[{"id":7,"content":"eyes","user":{"login":"enterprise-user"}},{"id":8,"content":"eyes","user":{"login":"public-user"}}]`}, nil
+		case "api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json --hostname ghes":
+			return shell.Result{Stdout: "{}"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.RemovePullRequestReaction(context.Background(), PullRequestReactionInput{Repo: "acme/looper", PRNumber: 42, Content: "eyes"}); err != nil {
+		t.Fatalf("RemovePullRequestReaction(github.com) error = %v", err)
+	}
+	if err := gateway.RemovePullRequestReaction(context.Background(), PullRequestReactionInput{Repo: "ghes/acme/looper", PRNumber: 42, Content: "eyes"}); err != nil {
+		t.Fatalf("RemovePullRequestReaction(GHES) error = %v", err)
+	}
+	if want := []string{
+		"api user --jq .login",
+		"api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json",
+		"api repos/acme/looper/issues/42/reactions/6 --method DELETE -H Accept: application/vnd.github+json",
+		"api user --jq .login --hostname ghes",
+		"api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname ghes",
+		"api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json --hostname ghes",
+	}; !slices.Equal(runner.calls, want) {
+		t.Fatalf("gh calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
 func TestGatewayIsAuthenticatedTracksGHAuthStatus(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
