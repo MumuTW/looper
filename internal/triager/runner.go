@@ -90,16 +90,15 @@ type SourceEvent struct {
 // are intentionally absent: they may be projected later, but do not authorize
 // Planner.
 type Report struct {
-	Version                    int            `json:"version"`
-	IdempotencyKey             string         `json:"idempotencyKey"`
-	ProjectID                  string         `json:"projectId"`
-	Repo                       string         `json:"repo"`
-	IssueNumber                int64          `json:"issueNumber"`
-	Source                     SourceEvent    `json:"source"`
-	Decision                   Decision       `json:"decision"`
-	Policy                     PolicyDecision `json:"policy"`
-	ConfirmationAfterCommentID int64          `json:"confirmationAfterCommentId,omitempty"`
-	CreatedAt                  string         `json:"createdAt"`
+	Version        int            `json:"version"`
+	IdempotencyKey string         `json:"idempotencyKey"`
+	ProjectID      string         `json:"projectId"`
+	Repo           string         `json:"repo"`
+	IssueNumber    int64          `json:"issueNumber"`
+	Source         SourceEvent    `json:"source"`
+	Decision       Decision       `json:"decision"`
+	Policy         PolicyDecision `json:"policy"`
+	CreatedAt      string         `json:"createdAt"`
 }
 
 type Enrollment struct {
@@ -109,7 +108,6 @@ type Enrollment struct {
 	Repo           string      `json:"repo"`
 	IssueNumber    int64       `json:"issueNumber"`
 	Source         SourceEvent `json:"source"`
-	CommentID      int64       `json:"commentId"`
 	EnrolledAt     string      `json:"enrolledAt"`
 }
 
@@ -270,7 +268,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		enrollment := Enrollment{
 			Version: 1, IdempotencyKey: key, ProjectID: input.ProjectID, Repo: input.Repo,
-			IssueNumber: detail.Number, Source: source, CommentID: latestCommentID(detail.Comments),
+			IssueNumber: detail.Number, Source: source,
 			EnrolledAt: r.now().UTC().Format(time.RFC3339Nano),
 		}
 		if err := r.persistEnrollment(ctx, enrollment); err != nil {
@@ -447,7 +445,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		value := Report{
 			Version: 1, IdempotencyKey: enrollment.IdempotencyKey, ProjectID: enrollment.ProjectID, Repo: enrollment.Repo,
 			IssueNumber: enrollment.IssueNumber, Source: detailSource, Decision: decision,
-			Policy: validateDecision(decision), ConfirmationAfterCommentID: enrollment.CommentID, CreatedAt: created,
+			Policy: validateDecision(decision), CreatedAt: created,
 		}
 		if err := r.persistReport(ctx, value); err != nil {
 			return err
@@ -538,26 +536,17 @@ func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue g
 			return true, false, nil
 		}
 	}
-	var reportedAt time.Time
-	if report.ConfirmationAfterCommentID == 0 {
-		reportedAt, err = time.Parse(time.RFC3339Nano, report.CreatedAt)
-		if err != nil {
-			return false, false, fmt.Errorf("parse triage report timestamp: %w", err)
-		}
+	reportedAt, err := time.Parse(time.RFC3339Nano, report.CreatedAt)
+	if err != nil {
+		return false, false, fmt.Errorf("parse triage report timestamp: %w", err)
 	}
 	for _, comment := range issue.Comments {
 		if strings.TrimSpace(comment.Body) != "/plan" || strings.TrimSpace(comment.Author) == "" {
 			continue
 		}
-		if report.ConfirmationAfterCommentID > 0 {
-			if comment.ID <= report.ConfirmationAfterCommentID {
-				continue
-			}
-		} else {
-			commentedAt, err := time.Parse(time.RFC3339Nano, comment.CreatedAt)
-			if err != nil || commentedAt.Before(reportedAt.Truncate(time.Second)) {
-				continue
-			}
+		commentedAt, err := time.Parse(time.RFC3339Nano, comment.CreatedAt)
+		if err != nil || !commentedAt.After(reportedAt) {
+			continue
 		}
 		permission, err := r.github.GetRepositoryPermission(ctx, githubinfra.RepositoryPermissionInput{
 			Repo: repo, User: comment.Author, CWD: cwd,
@@ -797,16 +786,6 @@ func compactStrings(values []string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func latestCommentID(comments []githubinfra.CommentInfo) int64 {
-	var latest int64
-	for _, comment := range comments {
-		if comment.ID > latest {
-			latest = comment.ID
-		}
-	}
-	return latest
 }
 
 func stringValue(value any) string {

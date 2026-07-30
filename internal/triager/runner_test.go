@@ -292,3 +292,42 @@ func (f *fakePlanner) RouteIssue(_ context.Context, input planner.RouteIssueInpu
 func eligibleDecisionJSON() string {
 	return `{"classification":"feature","scope":"in_scope","risk":"low","confidence":0.94,"missingInformation":[],"recommendedNextRole":"planner","rationale":"The request is bounded and ready for planning."}`
 }
+
+// TestConfirmationRequiresCommentAfterReportPersistence verifies that a /plan
+// comment posted while the LLM is deciding cannot authorize a report that is
+// persisted afterwards. The durable report timestamp, rather than a GitHub
+// snapshot, is the confirmation boundary.
+func TestConfirmationRequiresCommentAfterReportPersistence(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.now = fixture.now.Add(time.Second)
+	// High-risk decision goes to awaiting confirmation.
+	fixture.llm.responses = []string{`{"classification":"feature","scope":"in_scope","risk":"high","confidence":0.98,"missingInformation":[],"recommendedNextRole":"planner","rationale":"Touches credentials."}`}
+
+	fixture.github.detail.Comments = []githubinfra.CommentInfo{{ID: 100, Body: "initial"}}
+
+	withoutNewComment := fixture.github.detail
+	withNewComment := fixture.github.detail
+	withNewComment.Comments = []githubinfra.CommentInfo{
+		{ID: 100, Body: "initial"},
+		{ID: 200, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Add(-time.Second).Format(time.RFC3339Nano)},
+	}
+	// The first two views occur before the LLM decision. The comment appears
+	// only in the post-decision refresh, immediately before report persistence.
+	fixture.github.viewSequence = []githubinfra.IssueDetail{withoutNewComment, withoutNewComment, withNewComment}
+	fixture.github.permission = "write"
+
+	result, err := fixture.runner().DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if result.AwaitingConfirmation != 1 {
+		t.Fatalf("AwaitingConfirmation = %d, want 1", result.AwaitingConfirmation)
+	}
+	if result.Routed != 0 || len(fixture.planner.inputs) != 0 {
+		t.Fatalf("routed/planner calls = %d/%d, want 0/0", result.Routed, len(fixture.planner.inputs))
+	}
+	if fixture.github.viewCalls != 3 {
+		t.Fatalf("ViewIssue calls = %d, want post-decision refresh on third call", fixture.github.viewCalls)
+	}
+}

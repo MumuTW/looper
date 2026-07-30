@@ -66,7 +66,7 @@ func TestDiscoverIssuesRoutesConfirmedUnsafeReportWithoutRepeatingLLM(t *testing
 	}
 }
 
-func TestDiscoverIssuesAcceptsNewConfirmationInReportTimestampSecond(t *testing.T) {
+func TestDiscoverIssuesRejectsConfirmationInReportTimestampSecond(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	fixture.now = fixture.now.Add(500 * time.Millisecond)
@@ -88,7 +88,7 @@ func TestDiscoverIssuesAcceptsNewConfirmationInReportTimestampSecond(t *testing.
 	if err != nil {
 		t.Fatalf("second DiscoverIssues() error = %v", err)
 	}
-	if second.Confirmed != 1 || second.Routed != 1 {
-		t.Fatalf("second DiscoverIssues() = %#v", second)
+	if second.Confirmed != 0 || second.Routed != 0 || second.AwaitingConfirmation != 1 {
+		t.Fatalf("second DiscoverIssues() = %#v, want same-second confirmation rejected", second)
 	}
 }
