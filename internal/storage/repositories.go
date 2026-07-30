@@ -928,17 +928,23 @@ func latestRunOrder(alias string) string {
 	return alias + ".started_at DESC, " + alias + ".created_at DESC, " + alias + ".seq DESC"
 }
 
-// SortRunsLatestFirst is the Go-side mirror of latestRunOrder for callers that
-// pick a latest run from already-loaded records; keep both in sync.
+// RunNewer is the Go-side mirror of latestRunOrder for callers that compare
+// already-loaded records; keep both in sync. It reports whether candidate is
+// strictly newer than current.
+func RunNewer(candidate, current RunRecord) bool {
+	if candidate.StartedAt != current.StartedAt {
+		return candidate.StartedAt > current.StartedAt
+	}
+	if candidate.CreatedAt != current.CreatedAt {
+		return candidate.CreatedAt > current.CreatedAt
+	}
+	return candidate.Seq > current.Seq
+}
+
+// SortRunsLatestFirst orders runs newest-first under the RunNewer authority.
 func SortRunsLatestFirst(runs []RunRecord) {
 	sort.SliceStable(runs, func(i, j int) bool {
-		if runs[i].StartedAt != runs[j].StartedAt {
-			return runs[i].StartedAt > runs[j].StartedAt
-		}
-		if runs[i].CreatedAt != runs[j].CreatedAt {
-			return runs[i].CreatedAt > runs[j].CreatedAt
-		}
-		return runs[i].Seq > runs[j].Seq
+		return RunNewer(runs[i], runs[j])
 	})
 }
 
@@ -2010,7 +2016,7 @@ func queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes []string) (p
 					SELECT status, agent_snapshot_json
 					FROM runs
 					WHERE loop_id = qi.loop_id
-					ORDER BY started_at DESC, created_at DESC
+					ORDER BY `+latestRunOrder("runs")+`
 					LIMIT 1
 				) latest
 				WHERE latest.status IN ('failed', 'interrupted')

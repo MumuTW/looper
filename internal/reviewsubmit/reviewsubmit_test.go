@@ -288,7 +288,10 @@ func TestTrustedManualReviewerRunRequiresMatchingManualLoop(t *testing.T) {
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_old_manual", Seq: 3, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &manualMetadata, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Loops.Upsert(loop_old_manual) error = %v", err)
 	}
-	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual", LoopID: "loop_manual", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+	// run_manual must be the newest running attempt on its own merits, not via
+	// an accidental tie-break against run_auto.
+	manualStartedAt := "2026-04-11T12:00:01.000Z"
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual", LoopID: "loop_manual", Status: "running", StartedAt: manualStartedAt, CreatedAt: manualStartedAt, UpdatedAt: manualStartedAt}); err != nil {
 		t.Fatalf("Runs.Upsert(run_manual) error = %v", err)
 	}
 	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_auto", LoopID: "loop_auto", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
