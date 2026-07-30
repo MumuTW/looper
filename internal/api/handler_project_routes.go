@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
