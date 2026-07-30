@@ -15,16 +15,27 @@ import (
 // repoRoot is two levels up from internal/glossary.
 const repoRoot = "../.."
 
-// adrReference matches "ADR-0003" style citations.
-var adrReference = regexp.MustCompile(`ADR-(\d{4})`)
+// externalPackageQualifiers lists package names CONTEXT.md may reference that
+// are not part of this repository. It is empty today and deliberately explicit:
+// an unknown qualifier is a typo far more often than a new external reference,
+// so the check denies by default and this is the visible escape hatch.
+var externalPackageQualifiers = map[string]struct{}{}
+
+// adrReference matches an ADR citation loosely so that a malformed one such as
+// ADR-00010 is caught here rather than silently matching its first four digits.
+// RE2 has no lookahead, so the token is captured whole and checked below.
+var adrReference = regexp.MustCompile(`ADR-([0-9A-Za-z]+)`)
+
+// exactlyFourDigits guards a captured ADR token and an ADR filename prefix.
+var exactlyFourDigits = regexp.MustCompile(`^[0-9]{4}$`)
 
 // codePointer matches a backticked package-qualified exported identifier, such
 // as `forge.ReviewItemID`. The shape is deliberately strict so that the many
 // other backticked strings in CONTEXT.md — config keys (roles.planner.triggers),
 // event names (triage.report), GitHub fields (blocked_by), label values — are
 // not mistaken for code references. Anything not matching is simply not
-// checked; this test is a guard against rot, not a completeness requirement.
-var codePointer = regexp.MustCompile("`([a-z][a-z0-9]*)\\.([A-Z][A-Za-z0-9]*)`")
+// checked; this test guards against rot, it does not require completeness.
+var codePointer = regexp.MustCompile("`([a-z][a-z0-9_]*)\\.([A-Z][A-Za-z0-9_]*)`")
 
 // packagePath matches a backticked repository path, such as `internal/labels`
 // or `internal/disclosure/disclosure.go`.
@@ -51,16 +62,29 @@ func TestContextADRReferencesResolve(t *testing.T) {
 	}
 	present := map[string]string{}
 	for _, entry := range entries {
-		if number, _, found := strings.Cut(entry.Name(), "-"); found {
-			if existing, duplicate := present[number]; duplicate {
-				t.Errorf("ADR number %s is used by two files: %s and %s", number, existing, entry.Name())
-			}
-			present[number] = entry.Name()
+		// Only a regular .md file is a decision record. A directory or asset
+		// carrying a numeric prefix would otherwise satisfy a citation that has
+		// no rationale behind it.
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
 		}
+		number, _, found := strings.Cut(entry.Name(), "-")
+		if !found || !exactlyFourDigits.MatchString(number) {
+			continue
+		}
+		if existing, duplicate := present[number]; duplicate {
+			t.Errorf("ADR number %s is used by two files: %s and %s", number, existing, entry.Name())
+		}
+		present[number] = entry.Name()
 	}
 
 	for _, match := range adrReference.FindAllStringSubmatch(contextDoc(t), -1) {
-		if _, ok := present[match[1]]; !ok {
+		cited := match[1]
+		if !exactlyFourDigits.MatchString(cited) {
+			t.Errorf("CONTEXT.md cites %s, which is not a four-digit ADR number", match[0])
+			continue
+		}
+		if _, ok := present[cited]; !ok {
 			t.Errorf("CONTEXT.md cites %s, but docs/adr has no such ADR", match[0])
 		}
 	}
@@ -78,36 +102,56 @@ func TestContextPackagePathsResolve(t *testing.T) {
 	}
 }
 
-// The load-bearing one. Entries now say "defined by forge.ReviewItemID"
-// instead of restating the definition, so a rename that misses CONTEXT.md
-// turns the entry into a confident lie. This makes that a build failure.
+// The load-bearing one. Entries say "defined by forge.ReviewItemID" instead of
+// restating the definition, so a rename that misses CONTEXT.md turns the entry
+// into a confident lie. This makes that a build failure.
 func TestContextCodePointersResolve(t *testing.T) {
 	t.Parallel()
 
-	declared := declaredIdentifiers(t)
+	byName := packagesByName(t)
 	for _, match := range codePointer.FindAllStringSubmatch(contextDoc(t), -1) {
 		pkg, ident := match[1], match[2]
-		names, ok := declared[pkg]
-		if !ok {
-			// Not a package in this repository — CONTEXT.md also backticks
-			// things like `json.Marshal`-shaped names from elsewhere.
+		if _, external := externalPackageQualifiers[pkg]; external {
 			continue
 		}
-		if _, ok := names[ident]; !ok {
-			t.Errorf("CONTEXT.md references %s.%s, but package %s declares no such identifier", pkg, ident, pkg)
+		candidates := byName[pkg]
+		switch len(candidates) {
+		case 0:
+			// Denying by default is the point. A mistyped qualifier such as
+			// `protcol.ParseTargetLabel` is exactly the stale pointer this test
+			// exists to catch; skipping it would leave the primary guarantee
+			// unenforced.
+			t.Errorf("CONTEXT.md references %s.%s, but no package in this repository is named %q; fix the reference or add %q to externalPackageQualifiers", pkg, ident, pkg, pkg)
+		case 1:
+			if _, ok := candidates[0].idents[ident]; !ok {
+				t.Errorf("CONTEXT.md references %s.%s, but %s declares no such identifier", pkg, ident, candidates[0].path)
+			}
+		default:
+			paths := make([]string, 0, len(candidates))
+			for _, candidate := range candidates {
+				paths = append(paths, candidate.path)
+			}
+			sort.Strings(paths)
+			t.Errorf("CONTEXT.md references %s.%s, but %q is ambiguous across %s; name the path instead of the bare package", pkg, ident, pkg, strings.Join(paths, " and "))
 		}
 	}
 }
 
-// declaredIdentifiers maps package name to the set of top-level identifiers it
-// declares. Package name rather than import path is enough here: CONTEXT.md
-// writes `forge.ReviewItemID`, the way the code reads.
-func declaredIdentifiers(t *testing.T) map[string]map[string]struct{} {
+type declaredPackage struct {
+	path   string
+	idents map[string]struct{}
+}
+
+// packagesByName groups packages by declared name while keeping their paths
+// distinct. Pooling identifiers by name alone would let a pointer resolve
+// against the wrong package — internal/api and pkg/api are both named api — so
+// an ambiguous qualifier is reported rather than quietly satisfied by either.
+func packagesByName(t *testing.T) map[string][]declaredPackage {
 	t.Helper()
 
-	out := map[string]map[string]struct{}{}
-	roots := []string{"internal", "cmd", "pkg"}
-	for _, root := range roots {
+	byDir := map[string]*declaredPackage{}
+	nameByDir := map[string]string{}
+	for _, root := range []string{"internal", "cmd", "pkg"} {
 		err := filepath.WalkDir(filepath.Join(repoRoot, root), func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -119,18 +163,29 @@ func declaredIdentifiers(t *testing.T) map[string]map[string]struct{} {
 			if parseErr != nil {
 				return nil
 			}
-			pkg := file.Name.Name
-			if out[pkg] == nil {
-				out[pkg] = map[string]struct{}{}
+			dir := filepath.Dir(path)
+			if byDir[dir] == nil {
+				rel, relErr := filepath.Rel(repoRoot, dir)
+				if relErr != nil {
+					rel = dir
+				}
+				byDir[dir] = &declaredPackage{path: filepath.ToSlash(rel), idents: map[string]struct{}{}}
+				nameByDir[dir] = file.Name.Name
 			}
 			for _, name := range topLevelNames(file) {
-				out[pkg][name] = struct{}{}
+				byDir[dir].idents[name] = struct{}{}
 			}
 			return nil
 		})
 		if err != nil {
 			t.Fatalf("walk %s: %v", root, err)
 		}
+	}
+
+	out := map[string][]declaredPackage{}
+	for dir, pkg := range byDir {
+		name := nameByDir[dir]
+		out[name] = append(out[name], *pkg)
 	}
 	return out
 }
@@ -156,6 +211,5 @@ func topLevelNames(file *ast.File) []string {
 			}
 		}
 	}
-	sort.Strings(names)
 	return names
 }
