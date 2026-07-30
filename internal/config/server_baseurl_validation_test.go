@@ -68,6 +68,18 @@ func TestCanonicalizeServerBaseURL(t *testing.T) {
 		{value: "http://bücher.example", wantMessage: "IDNA/punycode"},
 		{value: "http://0.0.0.0:17310", wantMessage: "unspecified (wildcard) host"},
 		{value: "http://[::]:17310", wantMessage: "unspecified (wildcard) host"},
+		// Colon-bearing hosts: url.Parse splits the authority on the final
+		// colon, so the misparse is preserved unless the host is a bracketed
+		// IPv6 literal.
+		{value: "http://localhost:80:90", wantMessage: "colon-bearing host"},
+		{value: "http://::1", wantMessage: "colon-bearing host"},
+		// Trailing-dot numeric IPv4 spellings: browsers strip the terminal dot
+		// while canonicalizing, but Go's net.ParseIP rejects the dotted form,
+		// so the stored authority and dial target would diverge.
+		{value: "http://0.0.0.0.:17310", wantMessage: "canonical dotted-quad"},
+		{value: "http://127.0.0.1.:17310", wantMessage: "canonical dotted-quad"},
+		{value: "http://2130706433.:17310", wantMessage: "canonical dotted-quad"},
+		{value: "http://0x7f.0x0.0x0.0x1.:17310", wantMessage: "canonical dotted-quad"},
 	}
 	for _, tt := range invalid {
 		got, err := CanonicalizeServerBaseURL(tt.value)
@@ -148,6 +160,48 @@ func TestValidateRequiresTokenAuthForPublicBaseURL(t *testing.T) {
 	cfg.Server.LocalToken = &token
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("Validate() error = %v, want public baseUrl accepted with local-token", err)
+	}
+}
+
+func TestValidateRejectsNonCanonicalServerBaseURL(t *testing.T) {
+	t.Parallel()
+
+	// A config constructed directly (bypassing Normalize) must already hold
+	// the canonical form: Validate only computes canonical without storing it,
+	// so a raw spelling like "https://daemon.example:0443" would otherwise pass
+	// while allowedAuthorities records port "0443" and the browser omits the
+	// default :443.
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "secret"
+	cfg.Server.AuthMode = AuthModeLocalToken
+	cfg.Server.LocalToken = &token
+
+	nonCanonical := "https://daemon.example:0443"
+	cfg.Server.BaseURL = &nonCanonical
+	err = Validate(cfg)
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %T %v, want *ConfigValidationError", err, err)
+	}
+	found := false
+	for _, issue := range validationErr.Issues {
+		if issue.Path == "server.baseUrl" && strings.Contains(issue.Message, "must be in canonical form") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Validate() issues = %#v, want server.baseUrl canonical-form issue", validationErr.Issues)
+	}
+
+	// The canonical spelling of the same authority is accepted.
+	canonical := "https://daemon.example"
+	cfg.Server.BaseURL = &canonical
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v, want canonical baseUrl accepted", err)
 	}
 }
 

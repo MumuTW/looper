@@ -348,13 +348,25 @@ func validateServerConfig(server ServerConfig, issues *[]ValidationIssue) {
 		canonical, err := CanonicalizeServerBaseURL(*server.BaseURL)
 		if err != nil {
 			*issues = append(*issues, ValidationIssue{Path: "server.baseUrl", Message: err.Error()})
-		} else if server.AuthMode == AuthModeNone {
-			// A non-loopback advertised authority means a proxy or tunnel
-			// fronts the daemon; the token-less loopback trust model does not
-			// survive that hop (a local proxy can deliver remote requests with
-			// a loopback peer address and the configured public Host/Origin).
-			if parsed, parseErr := url.Parse(canonical); parseErr == nil && !isLoopbackBindHost(parsed.Hostname()) {
-				*issues = append(*issues, ValidationIssue{Path: "server.authMode", Message: "none is allowed only when server.baseUrl advertises a loopback authority; use local-token when a proxy, tunnel, or public hostname fronts the daemon"})
+		} else {
+			// The canonical form is the single authority consumers (CLI dialing,
+			// browser Host/Origin allowlisting) read. The load pipeline stores
+			// it via Normalize, but configs constructed directly bypass that
+			// step and Validate only computes canonical without storing it, so
+			// a raw spelling like "https://daemon.example:0443" would pass here
+			// while allowedAuthorities records port "0443" and the browser omits
+			// the default :443. Require the stored value to already be canonical
+			// at this boundary so direct-config paths cannot diverge.
+			if *server.BaseURL != canonical {
+				*issues = append(*issues, ValidationIssue{Path: "server.baseUrl", Message: "must be in canonical form; the load pipeline canonicalizes server.baseUrl, but configs constructed directly must set the canonical value (lowercase scheme/host, no trailing slash, default ports omitted) themselves"})
+			} else if server.AuthMode == AuthModeNone {
+				// A non-loopback advertised authority means a proxy or tunnel
+				// fronts the daemon; the token-less loopback trust model does not
+				// survive that hop (a local proxy can deliver remote requests with
+				// a loopback peer address and the configured public Host/Origin).
+				if parsed, parseErr := url.Parse(canonical); parseErr == nil && !isLoopbackBindHost(parsed.Hostname()) {
+					*issues = append(*issues, ValidationIssue{Path: "server.authMode", Message: "none is allowed only when server.baseUrl advertises a loopback authority; use local-token when a proxy, tunnel, or public hostname fronts the daemon"})
+				}
 			}
 		}
 	}
@@ -584,6 +596,15 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 	if parsed.Host == "" || parsed.Hostname() == "" {
 		return "", errors.New("must include a host")
 	}
+	// An unbracketed colon in the host is malformed: url.Parse splits the
+	// authority on the final colon, so "localhost:80:90" yields host
+	// "localhost:80" port "90" and "::1" yields host ":" port "1". Go's
+	// transport would then dial invalid targets like "[localhost:80]:90" or
+	// "[:]:1", while the stored authority preserves the misparse. Only
+	// bracketed IPv6 literals may carry colons.
+	if hostname := parsed.Hostname(); strings.Contains(hostname, ":") && !strings.HasPrefix(parsed.Host, "[") {
+		return "", errors.New("must not use a colon-bearing host; bracket IPv6 literals as in http://[::1]")
+	}
 	// Go's transport and browsers send the IDNA/Punycode authority on the
 	// wire, so a stored Unicode host would never match Host/Origin checks.
 	for _, r := range parsed.Hostname() {
@@ -654,6 +675,16 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 // decimal or 0x-prefixed hexadecimal number — the shapes browsers parse as an
 // IPv4 integer rather than a DNS name.
 func isNumericIPv4Spelling(host string) bool {
+	if host == "" {
+		return false
+	}
+	// Browsers strip a trailing dot while canonicalizing numeric hosts, but
+	// Go's net.ParseIP rejects the dotted spelling, so "127.0.0.1." would
+	// otherwise produce an empty final label here, slip past as a non-numeric
+	// DNS name, and diverge from the dial target. Trim the terminal dot(s)
+	// before applying the numeric-host check so these spellings are rejected
+	// as noncanonical by the caller.
+	host = strings.TrimRight(host, ".")
 	if host == "" {
 		return false
 	}
