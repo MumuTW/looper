@@ -3251,11 +3251,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	// A configured validation gate makes Looper the publishing boundary: the
-	// agent leaves changes local, then the validate and push steps publish only
-	// the content that passed.
-	agentMayPush := fixerAgentMayPush(r.allowAutoPush, r.validationCommands)
-	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, agentMayPush, r.disclosure, agentVendor, derefString(agentModel))
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.disclosure, agentVendor, derefString(agentModel))
 	if len(r.validationCommands) > 0 {
 		prompt += validationGatedLocalOnlyPrompt
 	}
@@ -3373,10 +3369,6 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
-}
-
-func fixerAgentMayPush(allowAutoPush bool, validationCommands []string) bool {
-	return allowAutoPush && len(validationCommands) == 0
 }
 
 func (r *Runner) runReconcileCommitsStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -7831,7 +7823,7 @@ func fixerAgentSideFetchContract(repo string, prNumber int64, detail *checkpoint
 	}, "\n")
 }
 
-func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
+func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
 	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber), buildFixerMinimalPRSeed(repo, prNumber, detail, fixItems), fixerAgentSideFetchContract(repo, prNumber, detail, fixItems)}
 	if headSHA := detailHeadSHA(detail); headSHA != "" {
 		parts = append(parts, "Head SHA: "+headSHA)
@@ -7858,13 +7850,14 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 	if instructionBlock.Text != "" {
 		parts = append(parts, instructionBlock.Text)
 	}
-	if allowAutoPush {
-		parts = append(parts, "Commit and push the repair changes to the current PR branch when you can do so safely; Looper will reconcile any missing repository actions after your edits.")
-		parts = append(parts, lifecycle.PromptInstruction("fixer", "", "", true, false, disclosureCfg, agentRuntime, agentModel))
-	} else {
-		parts = append(parts, "Do not push the branch or update remote pull request state; leave repository publishing for Looper/manual follow-up after your edits.")
-		parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentRuntime, agentModel))
-	}
+	// Looper is the publishing boundary for every repair, gated or not. The repair
+	// agent's declared outcome is what authorizes publishing, and that outcome does
+	// not exist until the agent finishes -- so an agent asked to push during the
+	// repair could publish a partial fix for one item and then report `blocked` for
+	// another, which is the hole this closes. Looper's own push step publishes after
+	// the outcome is read.
+	parts = append(parts, "Do not push the branch or update remote pull request state; leave repository publishing for Looper/manual follow-up after your edits.")
+	parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentRuntime, agentModel))
 	parts = append(parts, "For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round. Do not mechanically reuse the PR title or a previous fixer subject when this round's edits are narrower or different.")
 	return agent.AppendFixerCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 }
