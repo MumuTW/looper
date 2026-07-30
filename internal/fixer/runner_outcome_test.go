@@ -99,6 +99,24 @@ func TestDeriveRunOutcomeDecoratesHistoricalFixerCheckpoint(t *testing.T) {
 	}
 }
 
+func TestDeriveRunOutcomeRecognizesEarlyAndOutcomeOnlyFixerCheckpoints(t *testing.T) {
+	t.Parallel()
+
+	earlyJSON := `{"resumePolicy":"replay_step"}`
+	earlyStep := string(stepDiscoverPR)
+	earlyMessage := "discovery failed"
+	early := DeriveRunOutcome(storage.RunRecord{Status: "failed", CurrentStep: &earlyStep, CheckpointJSON: &earlyJSON, ErrorMessage: &earlyMessage})
+	if early == nil || early.PrimaryFailure == nil || early.PrimaryFailure.Step != earlyStep {
+		t.Fatalf("early DeriveRunOutcome() = %#v, want discover failure", early)
+	}
+
+	outcomeOnlyJSON := `{"outcome":{"progress":{"pushed":true}}}`
+	outcomeOnly := DeriveRunOutcome(storage.RunRecord{Status: "success", CheckpointJSON: &outcomeOnlyJSON})
+	if outcomeOnly == nil || !outcomeOnly.Progress.Pushed {
+		t.Fatalf("outcome-only DeriveRunOutcome() = %#v, want persisted outcome", outcomeOnly)
+	}
+}
+
 func TestRecordFailedRunCleanupPersistsSecondaryIssue(t *testing.T) {
 	t.Parallel()
 
@@ -123,6 +141,14 @@ func TestRecordFailedRunCleanupPersistsSecondaryIssue(t *testing.T) {
 	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
+	newerStep := string(stepRecheck)
+	newerHeartbeat := "2026-04-11T12:00:01.000Z"
+	run.Status = "interrupted"
+	run.CurrentStep = &newerStep
+	run.LastHeartbeatAt = &newerHeartbeat
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert(newer state) error = %v", err)
+	}
 
 	runner.recordFailedRunCleanup(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, run.ID, &checkpoint)
 
@@ -136,6 +162,9 @@ func TestRecordFailedRunCleanupPersistsSecondaryIssue(t *testing.T) {
 	durable := parseCheckpoint(persisted.CheckpointJSON)
 	if durable.Outcome == nil || len(durable.Outcome.SecondaryIssues) != 1 {
 		t.Fatalf("durable Outcome = %#v, want persisted cleanup issue", durable.Outcome)
+	}
+	if persisted.Status != "interrupted" || persisted.CurrentStep == nil || *persisted.CurrentStep != newerStep || persisted.LastHeartbeatAt == nil || *persisted.LastHeartbeatAt != newerHeartbeat {
+		t.Fatalf("persisted run = %#v, want checkpoint-only update to preserve newer state", persisted)
 	}
 }
 

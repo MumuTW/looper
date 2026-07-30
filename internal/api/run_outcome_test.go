@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/storage"
@@ -16,5 +17,23 @@ func TestSerializeRunDerivesHistoricalFixerOutcome(t *testing.T) {
 
 	if response.Outcome == nil || response.Outcome.PrimaryFailure == nil || response.Outcome.PrimaryFailure.Message != errorMessage || !response.Outcome.PartialSuccess {
 		t.Fatalf("serializeRun().Outcome = %#v, want read-time historical outcome", response.Outcome)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	outcome, ok := wire["outcome"].(map[string]any)
+	if !ok {
+		t.Fatalf("wire outcome = %#v, want object", wire["outcome"])
+	}
+	if _, ok := outcome["primaryFailure"].(map[string]any); !ok {
+		t.Fatalf("wire primaryFailure = %#v, want object", outcome["primaryFailure"])
+	}
+	if progress, ok := outcome["progress"].(map[string]any); !ok || progress["pushed"] != true {
+		t.Fatalf("wire progress = %#v, want pushed outcome", outcome["progress"])
 	}
 }

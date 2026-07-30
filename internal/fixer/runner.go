@@ -1098,15 +1098,17 @@ func DeriveRunOutcome(run storage.RunRecord) *FixerRunOutcome {
 	if run.CheckpointJSON == nil || strings.TrimSpace(*run.CheckpointJSON) == "" {
 		return nil
 	}
-	var raw map[string]json.RawMessage
-	if json.Unmarshal([]byte(*run.CheckpointJSON), &raw) != nil || !looksLikeFixerCheckpoint(raw) {
-		return nil
-	}
 	var checkpoint fixerCheckpoint
 	if json.Unmarshal([]byte(*run.CheckpointJSON), &checkpoint) != nil {
 		return nil
 	}
-	if checkpoint.Outcome == nil && runStatusIsFailure(run.Status) {
+	if !looksLikeFixerCheckpoint(run, checkpoint) {
+		return nil
+	}
+	if checkpoint.Outcome != nil {
+		return checkpoint.Outcome
+	}
+	if runStatusIsFailure(run.Status) {
 		step := asFixerStep(derefString(run.CurrentStep))
 		if step == "" {
 			step = asFixerStep(derefString(run.LastCompletedStep))
@@ -1122,9 +1124,13 @@ func DeriveRunOutcome(run storage.RunRecord) *FixerRunOutcome {
 	return checkpoint.Outcome
 }
 
-func looksLikeFixerCheckpoint(raw map[string]json.RawMessage) bool {
-	for _, key := range []string{"fixItems", "repair", "reconcileCommits", "resolvedComments", "summaryComment"} {
-		if _, ok := raw[key]; ok {
+func looksLikeFixerCheckpoint(run storage.RunRecord, checkpoint fixerCheckpoint) bool {
+	if checkpoint.Outcome != nil || checkpoint.Detail != nil || checkpoint.Worktree != nil || len(checkpoint.FixItems) > 0 || checkpoint.Repair != nil || checkpoint.ReconcileCommits != nil || checkpoint.ResolvedComments != nil || checkpoint.SummaryComment != nil {
+		return true
+	}
+	for _, step := range []string{derefString(run.CurrentStep), derefString(run.LastCompletedStep)} {
+		switch asFixerStep(step) {
+		case stepDiscoverPR, stepClaimPR, stepCollectFixes, stepPrepareWorktree, stepRepair, stepResolveComments, stepRecheck:
 			return true
 		}
 	}
@@ -2349,15 +2355,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
-			if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+			scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber)
+			if err != nil {
 				return ProcessResult{}, err
-			} else if scheduled {
-				r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
+			}
+			r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
+			if scheduled {
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 			}
-		}
-		if queueResultIsTerminalForCleanup(failedQueue) {
-			r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 	}
@@ -2491,15 +2496,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
-				if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+				scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber)
+				if err != nil {
 					return ProcessResult{}, err
-				} else if scheduled {
-					r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
+				}
+				r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
+				if scheduled {
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 				}
-			}
-			if queueResultIsTerminalForCleanup(failedQueue) {
-				r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 		}
@@ -7011,19 +7015,8 @@ func (r *Runner) recordFailedRunCleanup(ctx context.Context, project storage.Pro
 	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
 		return
 	}
-	run, err := r.repos.Runs.GetByID(ctx, runID)
-	if err != nil || run == nil {
-		message := "run not found"
-		if err != nil {
-			message = err.Error()
-		}
-		r.logError("fixer cleanup outcome load failed", map[string]any{"runId": runID, "message": message})
-		return
-	}
 	encoded := mustMarshalJSON(*checkpoint)
-	run.CheckpointJSON = &encoded
-	run.UpdatedAt = r.nowISO()
-	if err := r.repos.Runs.Upsert(ctx, *run); err != nil {
+	if err := r.repos.Runs.UpdateCheckpoint(ctx, runID, encoded, r.nowISO()); err != nil {
 		r.logError("fixer cleanup outcome persistence failed", map[string]any{"runId": runID, "message": err.Error()})
 	}
 }

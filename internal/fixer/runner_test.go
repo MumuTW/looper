@@ -7625,6 +7625,12 @@ func TestHasProgressedExcludesAlreadyResolvedComment(t *testing.T) {
 	if hasProgressed(checkpoint) {
 		t.Fatalf("hasProgressed() = true, want external resolution excluded from current-run progress")
 	}
+	for _, item := range []checkpointResolvedComment{{Status: "resolved"}, {Status: "agent_declined"}, {ReplyState: "sent"}} {
+		progressed := fixerCheckpoint{ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{item}}}
+		if !hasProgressed(progressed) {
+			t.Fatalf("hasProgressed(%#v) = false, want current-run progress", item)
+		}
+	}
 }
 
 func TestProcessClaimedItemSkipsSummaryWhenNoNewCommits(t *testing.T) {
