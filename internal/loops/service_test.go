@@ -178,6 +178,86 @@ func TestServicePauseWaitingLoopCancelsQueuedWork(t *testing.T) {
 	}
 }
 
+// Hold is the takeover fence: accepting a loop for interactive work must make
+// the scheduler-visible lifecycle state and the queued work agree together.
+func TestServiceHoldMovesClaimableLoopToHumanTakeoverAndCancelsQueue(t *testing.T) {
+	t.Parallel()
+
+	for _, initialStatus := range []domain.LoopStatus{domain.LoopStatusQueued, domain.LoopStatusRunning} {
+		t.Run(string(initialStatus), func(t *testing.T) {
+			coordinator := openCoordinator(t)
+			ctx := context.Background()
+			repos := storage.NewRepositories(coordinator.DB())
+			now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+			nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+			seedProject(t, repos, now)
+			service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+			loop, err := service.Create(ctx, CreateInput{
+				ProjectID: "project_1",
+				Type:      domain.LoopTypeReviewer,
+				Target:    domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 44},
+				Status:    initialStatus,
+			})
+			if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			projectID := "project_1"
+			repo := "acme/looper"
+			prNumber := int64(44)
+			if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_" + string(initialStatus), ProjectID: &projectID, LoopID: &loop.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:hold:" + string(initialStatus), Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Queue.Upsert() error = %v", err)
+			}
+
+			reason := "interactive takeover"
+			held, err := service.Hold(ctx, loop.ID, &reason)
+			if err != nil {
+				t.Fatalf("Hold() error = %v", err)
+			}
+			if held.Loop.Status != string(domain.LoopStatusHumanTakeover) || held.Loop.NextRunAt != nil {
+				t.Fatalf("Hold().Loop = %#v, want human_takeover without next run", held.Loop)
+			}
+			if held.CancelledQueueItems != 1 {
+				t.Fatalf("Hold().CancelledQueueItems = %d, want 1", held.CancelledQueueItems)
+			}
+			queue, err := repos.Queue.GetByID(ctx, "queue_"+string(initialStatus))
+			if err != nil || queue == nil || queue.Status != "cancelled" || queue.LastError == nil || *queue.LastError != reason {
+				t.Fatalf("Queue.GetByID() = (%#v, %v), want cancelled queue with takeover reason", queue, err)
+			}
+		})
+	}
+}
+
+func TestServiceHoldIsIdempotentForHumanTakeover(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	seedProject(t, repos, now)
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	loop, err := service.Create(ctx, CreateInput{
+		ProjectID: "project_1",
+		Type:      domain.LoopTypeReviewer,
+		Target:    domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 45},
+		Status:    domain.LoopStatusRunning,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	reason := "interactive takeover"
+	if _, err := service.Hold(ctx, loop.ID, &reason); err != nil {
+		t.Fatalf("first Hold() error = %v", err)
+	}
+	second, err := service.Hold(ctx, loop.ID, &reason)
+	if err != nil {
+		t.Fatalf("second Hold() error = %v", err)
+	}
+	if second.Loop.Status != string(domain.LoopStatusHumanTakeover) || second.CancelledQueueItems != 0 {
+		t.Fatalf("second Hold() = %#v, want idempotent human takeover", second)
+	}
+}
+
 func TestTargetFromRecordNormalizesRepeatedProjectPrefix(t *testing.T) {
 	t.Parallel()
 

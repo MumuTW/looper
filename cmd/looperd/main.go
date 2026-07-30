@@ -19,7 +19,6 @@ import (
 	"github.com/nexu-io/looper/internal/dashboard"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/loops"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
@@ -456,10 +455,18 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			}
 		}
 	}
-	if _, err := stopLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess); err != nil {
+	// Establish the durable takeover fence before cancelling an agent. A stopped
+	// queue item with only a paused loop was claimable by a concurrent discovery
+	// tick; Hold commits human_takeover and cancellation together.
+	preflight, err := loadHaltPreflight(ctx, services, loopID)
+	if err != nil {
 		return result, err
 	}
-	if _, err := services.Loops.TransitionStatus(ctx, loopID, loops.TransitionInput{Status: domain.LoopStatusHumanTakeover}); err != nil {
+	reasonCopy := reason
+	if _, err := services.Loops.Hold(ctx, loopID, &reasonCopy); err != nil {
+		return result, err
+	}
+	if _, err := haltLoopWithPreflight(ctx, services, loopID, reason, now, signal, executionMatchesProcess, false, true, preflight); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -497,7 +504,6 @@ func loadHaltPreflight(ctx context.Context, services looperdruntime.Services, lo
 }
 
 func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc, terminal bool) (any, error) {
-	result := stopLoopResult{Stopped: false, LoopID: loopID, Outcome: stopOutcomePausedOnly}
 	if services.Loops == nil {
 		return nil, fmt.Errorf("loops service is not configured")
 	}
@@ -505,6 +511,14 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	if err != nil {
 		return nil, err
 	}
+	return haltLoopWithPreflight(ctx, services, loopID, reason, now, signal, executionMatchesProcess, terminal, false, preflight)
+}
+
+// haltLoopWithPreflight stops execution after the caller has completed all
+// abortable reads. held skips Pause because Hold already durably parked and
+// cancelled the loop in one transaction.
+func haltLoopWithPreflight(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc, terminal, held bool, preflight haltPreflight) (any, error) {
+	result := stopLoopResult{Stopped: held, LoopID: loopID, Outcome: stopOutcomePausedOnly}
 
 	reasonCopy := reason
 	complete := func() (any, error) {
@@ -524,7 +538,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	// lease contexts wired into execution.run and cannot be undone; doing it
 	// before Pause would half-kill agents when a transient Pause error leaves
 	// the loop still running. Terminal close has no pre-kill status transition.
-	if !terminal {
+	if !terminal && !held {
 		paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
 		if err != nil {
 			return nil, err

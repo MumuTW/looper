@@ -77,3 +77,40 @@ func TestTakeoverLoopAbortsWhenExecutionLookupFails(t *testing.T) {
 		t.Fatal("LoopStopActive = true after aborted takeover preflight, want gate never opened")
 	}
 }
+
+// Takeover must establish its durable fence before halt observes that there is
+// no process to stop. In particular, each scheduler-visible active state must
+// end in human_takeover with its stale queue work cancelled.
+func TestTakeoverLoopHoldsActiveStatesBeforeHalting(t *testing.T) {
+	for _, initialStatus := range []string{"queued", "running", "paused", "awaiting_human"} {
+		t.Run(initialStatus, func(t *testing.T) {
+			ctx := context.Background()
+			services, repos, now := newStopAllTestServices(t)
+			loopID := "loop_takeover_" + initialStatus
+			insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{
+				loopID:      loopID,
+				seq:         42,
+				loopType:    "worker",
+				loopStatus:  initialStatus,
+				queueStatus: "queued",
+			})
+
+			result, err := takeoverLoop(ctx, services, loopID, "Interactive takeover", func() time.Time { return now }, nil, nil)
+			if err != nil {
+				t.Fatalf("takeoverLoop() error = %v", err)
+			}
+			if result.LoopID != loopID {
+				t.Fatalf("takeoverLoop().LoopID = %q, want %q", result.LoopID, loopID)
+			}
+
+			loop, err := repos.Loops.GetByID(ctx, loopID)
+			if err != nil || loop == nil || loop.Status != "human_takeover" || loop.NextRunAt != nil {
+				t.Fatalf("Loops.GetByID() = (%#v, %v), want held loop without next run", loop, err)
+			}
+			queue, err := repos.Queue.GetByID(ctx, "queue_"+loopID)
+			if err != nil || queue == nil || queue.Status != "cancelled" || queue.LastError == nil || *queue.LastError != "Interactive takeover" {
+				t.Fatalf("Queue.GetByID() = (%#v, %v), want cancelled queue with takeover reason", queue, err)
+			}
+		})
+	}
+}
