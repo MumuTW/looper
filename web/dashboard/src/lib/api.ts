@@ -136,6 +136,18 @@ export type StatusData = {
     daemonMode?: string;
     startedAt?: string;
     admissionState?: string;
+    triage?: {
+      awaitingConfirmation?: {
+        count?: number;
+        sources?: Array<{
+          projectId?: string;
+          repo?: string;
+          issueNumber?: number;
+          createdAt?: string;
+          ageSeconds?: number;
+        }>;
+      };
+    };
   };
   scheduler?: {
     healthy?: boolean;

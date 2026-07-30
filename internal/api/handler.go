@@ -36,6 +36,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/triager"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
@@ -992,10 +993,17 @@ type statusService struct {
 	// Recovery mixes the one-shot startup snapshot with live outstanding
 	// quarantine/orphan debt under recovery.outstanding.
 	Recovery any `json:"recovery"`
+	// Triage is a read-only projection of the triage report lifecycle. It does
+	// not authorize routing and does not add a materialized awaiting state.
+	Triage statusTriage `json:"triage"`
 	// DegradedReasons lists sticky ops signals (review publish disabled,
 	// quarantine orphan debt). Empty when none apply.
 	DegradedReasons []string     `json:"degradedReasons,omitempty"`
 	Binary          statusBinary `json:"binary"`
+}
+
+type statusTriage struct {
+	AwaitingConfirmation triager.AwaitingConfirmationSummary `json:"awaitingConfirmation"`
 }
 
 type statusBinary struct {
@@ -1437,6 +1445,10 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.effectiveConfig())
 	forgeCredential := looperdruntime.ForgeCredentialReadinessFor(h.effectiveConfig())
 	outstanding, debtErr := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
+	awaitingConfirmation, err := triager.AwaitingConfirmationStatus(ctx, services.Repositories, h.now())
+	if err != nil {
+		return statusResponse{}, err
+	}
 	recovery := h.recoveryWithOutstanding(outstanding)
 	binaryIdentity := h.daemonBinaryStatus()
 	degradedReasons := statusDegradedReasons(reviewPublish, forgeCredential, outstanding, debtErr, binaryIdentity)
@@ -1453,6 +1465,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			AdmissionState:  admissionState,
 			StartedAt:       h.startedAtISO(),
 			Recovery:        recovery,
+			Triage:          statusTriage{AwaitingConfirmation: awaitingConfirmation},
 			DegradedReasons: degradedReasons,
 			Binary: statusBinary{
 				Name:             "looperd",

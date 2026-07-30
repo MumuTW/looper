@@ -52,6 +52,8 @@ type fakeDaemon struct {
 	reviewReason                string
 	quarantinedActiveExecutions int
 	quarantinedRunningRuns      int
+	awaitingConfirmationCount   int
+	awaitingConfirmationSources []map[string]any
 	degradedReasons             []string
 }
 
@@ -82,6 +84,12 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 						"outstanding": map[string]any{
 							"quarantinedActiveExecutions": daemon.quarantinedActiveExecutions,
 							"quarantinedRunningRuns":      daemon.quarantinedRunningRuns,
+						},
+					},
+					"triage": map[string]any{
+						"awaitingConfirmation": map[string]any{
+							"count":   daemon.awaitingConfirmationCount,
+							"sources": daemon.awaitingConfirmationSources,
 						},
 					},
 				},
@@ -1026,6 +1034,25 @@ func TestStatusOmitsQuarantineRosterWhenEmpty(t *testing.T) {
 	}})
 	if got := stdout.String(); got != "orphans:  quarantinedActiveExecutions=1 quarantinedRunningRuns=0\n" {
 		t.Fatalf("status output = %q, want the counter line alone", got)
+	}
+}
+
+func TestStatusListsSourcesAwaitingTriageConfirmation(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		Triage: statusTriageView{AwaitingConfirmation: statusAwaitingConfirmationView{
+			Count: 2,
+			Sources: []statusAwaitingConfirmationSourceView{
+				{Repo: "MumuTW/looper", IssueNumber: 255, AgeSeconds: 26 * 60},
+				{Repo: "MumuTW/looper", IssueNumber: 254, AgeSeconds: 3 * 60 * 60},
+			},
+		}},
+	}})
+	want := "triage:  awaitingHumanConfirmation=2\n" +
+		"  - MumuTW/looper#255  waiting 26m\n" +
+		"  - MumuTW/looper#254  waiting 3h\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("status output =\n%q\nwant\n%q", got, want)
 	}
 }
 

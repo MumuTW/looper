@@ -13,6 +13,18 @@ export function formatAge(iso: string | null | undefined, nowMs = Date.now()): s
   return `${day}d`;
 }
 
+/** Compact elapsed duration supplied by the daemon, without consulting client time. */
+export function formatDurationSeconds(value: number | null | undefined): string {
+  if (value == null || Number.isNaN(Number(value))) return "—";
+  const sec = Math.max(0, Math.floor(Number(value)));
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  if (hr < 48) return `${hr}h`;
+  return `${Math.floor(hr / 24)}d`;
+}
+
 export function formatTs(iso: string | null | undefined): string {
   if (!iso) return "—";
   const t = Date.parse(iso);
