@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
@@ -513,7 +515,7 @@ func TestCloseLoopDoesNotTerminateLoopWhenActiveKillFails(t *testing.T) {
 	active := &fakeActiveExecution{onKill: func() error {
 		return killErr
 	}}
-	unregister := registry.Register(loop.ID, run.ID, agentExecution.ID, active)
+	unregister := bindTestActiveExecution(t, registry, loop.ID, run.ID, agentExecution.ID, active)
 	defer unregister()
 	services := looperdruntime.Services{
 		Coordinator:      coordinator,
@@ -579,7 +581,7 @@ func TestStopLoopKillsActiveInMemoryExecution(t *testing.T) {
 
 	registry := looperdruntime.NewActiveExecutionRegistry()
 	active := &fakeActiveExecution{}
-	unregister := registry.Register(loop.ID, run.ID, agentExecution.ID, active)
+	unregister := bindTestActiveExecution(t, registry, loop.ID, run.ID, agentExecution.ID, active)
 	defer unregister()
 	services := looperdruntime.Services{
 		Coordinator:      coordinator,
@@ -652,7 +654,7 @@ func TestStopLoopActiveInMemoryExecutionWinsBeforeVerifierRejectsPID(t *testing.
 
 	registry := looperdruntime.NewActiveExecutionRegistry()
 	active := &fakeActiveExecution{}
-	unregister := registry.Register(loop.ID, run.ID, agentExecution.ID, active)
+	unregister := bindTestActiveExecution(t, registry, loop.ID, run.ID, agentExecution.ID, active)
 	defer unregister()
 	services := looperdruntime.Services{Coordinator: coordinator, Repositories: repos, Loops: &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}, ActiveExecutions: registry}
 
@@ -715,7 +717,7 @@ func TestStopLoopRetriesActiveInMemoryExecutionAlreadyCancelling(t *testing.T) {
 
 	registry := looperdruntime.NewActiveExecutionRegistry()
 	active := &fakeActiveExecution{}
-	unregister := registry.Register(loop.ID, run.ID, agentExecution.ID, active)
+	unregister := bindTestActiveExecution(t, registry, loop.ID, run.ID, agentExecution.ID, active)
 	defer unregister()
 	services := looperdruntime.Services{
 		Coordinator:      coordinator,
@@ -889,7 +891,7 @@ func TestStopLoopSkipsStaleActiveExecutionWhenLatestExecutionCompleted(t *testin
 
 	registry := looperdruntime.NewActiveExecutionRegistry()
 	active := &fakeActiveExecution{}
-	unregister := registry.Register(loop.ID, run.ID, agentExecution.ID, active)
+	unregister := bindTestActiveExecution(t, registry, loop.ID, run.ID, agentExecution.ID, active)
 	defer unregister()
 	services := looperdruntime.Services{
 		Coordinator:      coordinator,
@@ -967,7 +969,7 @@ func TestStopLoopDoesNotOverwriteCompletedExecutionAfterActiveKill(t *testing.T)
 		completed.Status = "completed"
 		return repos.AgentExecutions.Upsert(ctx, completed)
 	}}
-	unregister := registry.Register(loop.ID, run.ID, agentExecution.ID, active)
+	unregister := bindTestActiveExecution(t, registry, loop.ID, run.ID, agentExecution.ID, active)
 	defer unregister()
 	services := looperdruntime.Services{
 		Coordinator:      coordinator,
@@ -1377,6 +1379,39 @@ type fakeActiveExecution struct {
 	killed bool
 	reason string
 	onKill func() error
+}
+
+// bindTestActiveExecution exercises the same admission and containment binding
+// path as a production agent process. The soft-kill callback preserves each
+// test's status assertion while the short-lived child supplies real drain
+// authority for the registry.
+func bindTestActiveExecution(t *testing.T, registry *looperdruntime.ActiveExecutionRegistry, loopID, runID, executionID string, active *fakeActiveExecution) func() {
+	t.Helper()
+	lease, err := registry.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: loopID, RunID: runID, ExecutionID: executionID})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		lease.Release()
+		t.Fatalf("start test process: %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{GracePeriod: 10 * time.Millisecond, DrainTimeout: time.Second})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		lease.Release()
+		t.Fatalf("bind test process: %v", err)
+	}
+	if err := lease.BindHandle(handle, active.Kill); err != nil {
+		_ = handle.Kill(context.Background())
+		lease.Release()
+		t.Fatalf("BindHandle: %v", err)
+	}
+	return func() {
+		_ = handle.Kill(context.Background())
+		lease.Release()
+	}
 }
 
 func (f *fakeActiveExecution) Kill(reason string) error {

@@ -369,22 +369,6 @@ func (r *ActiveExecutionRegistry) cancelBoundOperationsLocked(cause error, loopI
 	}
 }
 
-// waitPendingOperations waits for pending operation bind/release windows.
-func (r *ActiveExecutionRegistry) waitPendingOperations(wait []<-chan struct{}, budget time.Duration) error {
-	var waitErr error
-	for _, done := range wait {
-		if done == nil {
-			continue
-		}
-		select {
-		case <-done:
-		case <-time.After(budget):
-			waitErr = errors.Join(waitErr, errShutdownDrainTimeout)
-		}
-	}
-	return waitErr
-}
-
 // waitBoundOperations waits for bound operation leases to Release after durable
 // finalize (shutdown finalizer drain). Does not force-release on timeout.
 func (r *ActiveExecutionRegistry) waitBoundOperations(budget time.Duration) error {
