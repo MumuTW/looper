@@ -1220,6 +1220,28 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Worker != nil {
 		mergeWorkerRoleConfig(&config.Worker, *partial.Worker)
 	}
+	if partial.Deployer != nil {
+		mergeDeployerRoleConfig(&config.Deployer, *partial.Deployer)
+	}
+}
+
+func mergeDeployerRoleConfig(config *DeployerRoleConfig, partial PartialDeployerRoleConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.Command != nil {
+		config.Command = strings.TrimSpace(*partial.Command)
+	}
+	if partial.TimeoutSeconds != nil {
+		config.TimeoutSeconds = *partial.TimeoutSeconds
+	}
+	if partial.Environment != nil {
+		environment := make(map[string]string, len(*partial.Environment))
+		for key, value := range *partial.Environment {
+			environment[key] = value
+		}
+		config.Environment = environment
+	}
 }
 
 func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCoordinatorRoleConfig) {

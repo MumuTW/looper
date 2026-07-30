@@ -727,6 +727,68 @@ allowedUserIds = [123456789]
 defaultProjectId = "looper"
 ```
 
+## Deploy on merge (`roles.deployer`)
+
+When a project's base branch moves, the deployer runs one configured command and
+tells you the result. It is agent-free: Looper does not interpret the command,
+judge success beyond its exit status, or roll anything back.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.deployer.enabled` | Enables the lane for this project | `false` |
+| `roles.deployer.command` | Run with `/bin/sh -c` from the repository root | — |
+| `roles.deployer.timeoutSeconds` | Bounds one deploy | `900` |
+| `roles.deployer.environment` | Extra environment for the command (values, not names) | none |
+
+Project overrides use the same shape under `projects[].roles.deployer.*`, which
+is the common case: a deploy command differs per repository.
+
+```toml
+[roles.deployer]
+enabled = true
+command = "./scripts/deploy.sh"
+timeoutSeconds = 600
+```
+
+### What counts as "already deployed"
+
+**GitHub Deployments are the authority**, under the `looper` environment — the
+same preference for forge-native state as the dependency gate (ADR-0004) and
+auto-merge (ADR-0005). Looper keeps no private record that could disagree with
+what GitHub shows.
+
+Each tick the lane reads the base branch head and asks GitHub whether that exact
+commit already has a Looper deployment:
+
+| State | Action |
+| --- | --- |
+| No deployment | Deploy it |
+| `success` | Nothing |
+| `failure` | **Nothing.** A deploy that failed tends to keep failing, and retrying every tick turns one broken deploy into a stream of them. Re-running is your call |
+| `in_progress` | Nothing — a deploy of this commit is already running |
+
+The deployment is recorded *before* the command runs. A crash mid-deploy
+therefore leaves an `in_progress` record rather than an untracked side effect,
+and the next tick declines to start a second copy of a deploy that may still be
+going. A stalled lane is visible and a human can clear it; two concurrent deploys
+of different commits are not something you can undo.
+
+Because the unit of work is a commit rather than a pull request, several PRs
+merging together produce **one** deploy of the resulting head, not one per PR.
+
+### What you get told
+
+On completion Looper sends a notification through the configured channels with
+the branch, the short SHA, the duration, and a **compare link** covering
+everything since the last successful deploy — which is the thing you actually
+want when checking that your change shipped. Command output is included only on
+failure, where the last lines are usually the whole diagnosis.
+
+The deploy command runs with network access and the daemon's own environment,
+unlike validation commands, which are sandboxed without network. It is arbitrary
+local execution by design — the same trust the daemon already extends to the
+agent CLIs it runs — and only a merge into the base branch triggers it.
+
 ## Project override rules
 
 Project entries stay in `projects[]`, but any override-bearing config must mirror the same local shape it uses globally.
