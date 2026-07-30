@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -251,9 +252,16 @@ func TestServiceRejectsPositionalArgument(t *testing.T) {
 	fs := &serviceTestFS{files: map[string][]byte{}}
 	var commands []string
 	var stdout, stderr bytes.Buffer
+	deps := testServiceDeps(config.DaemonModeLaunchd, fs, &commands)
+	deps.loadConfig = func(args []string) (config.LoadedFileConfig, error) {
+		if len(args) > 0 {
+			return config.LoadedFileConfig{}, fmt.Errorf("unexpected positional argument: %s", args[0])
+		}
+		return config.LoadedFileConfig{}, nil
+	}
 
-	if code := runServiceCommand(context.Background(), []string{"uninstall", "status"}, &stdout, &stderr, testServiceDeps(config.DaemonModeLaunchd, fs, &commands)); code != 2 {
-		t.Fatalf("uninstall with positional argument exit = %d, want 2", code)
+	if code := runServiceCommand(context.Background(), []string{"uninstall", "status"}, &stdout, &stderr, deps); code != 1 {
+		t.Fatalf("uninstall with positional argument exit = %d, want 1", code)
 	}
 	if len(fs.files) != 0 || len(commands) != 0 {
 		t.Fatalf("invalid invocation touched service state: files=%v commands=%v", fs.files, commands)

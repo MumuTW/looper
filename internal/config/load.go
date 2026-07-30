@@ -51,8 +51,12 @@ type LoadFileOptions struct {
 	ConfigPathOverride string
 	DefaultConfigPath  string
 	Args               []string
-	LookupEnv          EnvLookupFunc
-	LookPath           LookPathFunc
+	// RejectPositionals makes command-specific callers fail when Args contains a
+	// non-flag token that is not consumed as a flag value. The daemon retains its
+	// historical permissive mode, while destructive subcommands can opt in.
+	RejectPositionals bool
+	LookupEnv         EnvLookupFunc
+	LookPath          LookPathFunc
 }
 
 type parsedCLIArgs struct {
@@ -132,7 +136,7 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		lookupEnv = os.LookupEnv
 	}
 
-	parsedCLI, err := parseCLIArgs(options.Args)
+	parsedCLI, err := parseCLIArgsWithOptions(options.Args, options.RejectPositionals)
 	if err != nil {
 		return LoadedFileConfig{}, err
 	}
@@ -588,6 +592,10 @@ func decodeTopLevelConfigSection[T any](raw json.RawMessage, key string, target 
 }
 
 func parseCLIArgs(args []string) (parsedCLIArgs, error) {
+	return parseCLIArgsWithOptions(args, false)
+}
+
+func parseCLIArgsWithOptions(args []string, rejectPositionals bool) (parsedCLIArgs, error) {
 	parsed := parsedCLIArgs{}
 	canonicalInstructionsEnabledOverrideSet := false
 	canonicalPackageAutoUpgradeOverrideSet := false
@@ -614,6 +622,9 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		if !strings.HasPrefix(arg, "--") {
+			if rejectPositionals {
+				return parsedCLIArgs{}, fmt.Errorf("unexpected positional argument: %s", arg)
+			}
 			continue
 		}
 

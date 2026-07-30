@@ -2,6 +2,13 @@ package config
 
 import "testing"
 
+func TestParseCLIArgsWithOptionsRejectsUnconsumedPositionals(t *testing.T) {
+	_, err := parseCLIArgsWithOptions([]string{"--config", "config.toml", "status"}, true)
+	if err == nil || err.Error() != "unexpected positional argument: status" {
+		t.Fatalf("parseCLIArgsWithOptions() error = %v, want unexpected positional argument", err)
+	}
+}
+
 func TestParseCLIArgsDispatchesInterleavedFlagFamilies(t *testing.T) {
 	parsed, err := parseCLIArgs([]string{
 		"--host", "127.0.0.2",

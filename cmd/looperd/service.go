@@ -34,7 +34,7 @@ func defaultServiceDeps() serviceDeps {
 			if err != nil {
 				return config.LoadedFileConfig{}, err
 			}
-			return config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: args})
+			return config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: args, RejectPositionals: true})
 		},
 		executable: os.Executable,
 		homeDir:    os.UserHomeDir,
@@ -79,11 +79,6 @@ func runServiceCommand(ctx context.Context, args []string, stdout, stderr io.Wri
 		}
 		plan, err = buildDefaultUninstallPlan(deps)
 	} else {
-		if len(rest) > 0 && !strings.HasPrefix(rest[0], "--") {
-			_, _ = fmt.Fprintf(stderr, "looperd service: unexpected positional argument %q\n", rest[0])
-			writeServiceUsage(stderr)
-			return 2
-		}
 		plan, configPath, err = buildServicePlan(rest, deps, subcommand == "install")
 	}
 	if err != nil {
