@@ -9350,7 +9350,7 @@ func TestBuildReviewerSummaryFromCompletionRejectsSupersededUpdatedReviewItemID(
 		Outcome: "blocking",
 		Findings: []reviewerCommentOnlyFindingResult{
 			{ReviewItemID: "R-001", Title: "Keep ID", Body: "Still broken after the latest patch."},
-			{Title: "Replacement", Body: "This narrows the old broad issue.", Supersedes: []string{"R-001"}},
+			{Title: "Replacement", Body: "This narrows the old broad issue.", Supersedes: []forge.ReviewItemID{"R-001"}},
 		},
 	}
 

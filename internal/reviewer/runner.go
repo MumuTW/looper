@@ -653,12 +653,17 @@ type reviewerCommentOnlyCompletion struct {
 	Findings []reviewerCommentOnlyFindingResult `json:"findings"`
 }
 
+// reviewerCommentOnlyFindingResult is one finding as the review agent reported
+// it. ReviewItemID is empty when the agent is reporting a new issue and set
+// when it claims the issue is the same one an existing Reviewer Summary item
+// already names; buildReviewerSummaryFromCompletion mints IDs for the former
+// and verifies the claim for the latter.
 type reviewerCommentOnlyFindingResult struct {
-	ReviewItemID string   `json:"review_item_id,omitempty"`
-	Title        string   `json:"title"`
-	Body         string   `json:"body"`
-	Files        []string `json:"files,omitempty"`
-	Supersedes   []string `json:"supersedes,omitempty"`
+	ReviewItemID forge.ReviewItemID   `json:"review_item_id,omitempty"`
+	Title        string               `json:"title"`
+	Body         string               `json:"body"`
+	Files        []string             `json:"files,omitempty"`
+	Supersedes   []forge.ReviewItemID `json:"supersedes,omitempty"`
 }
 
 type threadResolutionCheckpoint struct {
@@ -4238,10 +4243,10 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 	if len(completion.Findings) == 0 {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only actionable completion must include at least one finding")
 	}
-	seenFindingIDs := map[string]struct{}{}
+	seenFindingIDs := map[forge.ReviewItemID]struct{}{}
 	for i := range completion.Findings {
 		finding := &completion.Findings[i]
-		finding.ReviewItemID = strings.TrimSpace(finding.ReviewItemID)
+		finding.ReviewItemID = finding.ReviewItemID.Normalized()
 		finding.Title = strings.TrimSpace(finding.Title)
 		finding.Body = strings.TrimSpace(finding.Body)
 		if finding.Title == "" || finding.Body == "" {
@@ -4253,7 +4258,7 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 			}
 			seenFindingIDs[finding.ReviewItemID] = struct{}{}
 		}
-		seenSupersedes := map[string]struct{}{}
+		seenSupersedes := map[forge.ReviewItemID]struct{}{}
 		files := finding.Files[:0]
 		for _, file := range finding.Files {
 			file = strings.TrimSpace(file)
@@ -4264,7 +4269,7 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 		finding.Files = files
 		supersedes := finding.Supersedes[:0]
 		for _, id := range finding.Supersedes {
-			id = strings.TrimSpace(id)
+			id = id.Normalized()
 			if id == "" {
 				return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %q supersedes contains empty review_item_id", finding.Title)
 			}
@@ -4312,7 +4317,7 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 	if existing.ReviewRoundID > 0 {
 		reviewRoundID = existing.ReviewRoundID + 1
 	}
-	itemsByID := map[string]forge.ReviewItem{}
+	itemsByID := map[forge.ReviewItemID]forge.ReviewItem{}
 	maxID := 0
 	for _, item := range existing.Items {
 		itemsByID[item.ReviewItemID] = item
@@ -4320,14 +4325,14 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 			maxID = n
 		}
 	}
-	updatedExistingIDs := map[string]struct{}{}
+	updatedExistingIDs := map[forge.ReviewItemID]struct{}{}
 	for _, finding := range completion.Findings {
 		if finding.ReviewItemID != "" {
 			updatedExistingIDs[finding.ReviewItemID] = struct{}{}
 		}
 	}
-	assigned := map[string]struct{}{}
-	supersededTargets := map[string]string{}
+	assigned := map[forge.ReviewItemID]struct{}{}
+	supersededTargets := map[forge.ReviewItemID]forge.ReviewItemID{}
 	updated := make([]forge.ReviewItem, 0, len(existing.Items)+len(completion.Findings))
 	for _, finding := range completion.Findings {
 		id := finding.ReviewItemID
@@ -4336,8 +4341,10 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 				return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion references unknown review_item_id %q", id)
 			}
 		} else {
+			// Sole mint point for a Review Item ID: a finding the agent
+			// reported without claiming continuity with an existing item.
 			maxID++
-			id = fmt.Sprintf("R-%03d", maxID)
+			id = forge.ReviewItemID(fmt.Sprintf("R-%03d", maxID))
 		}
 		if _, exists := assigned[id]; exists {
 			return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion assigns review_item_id %q more than once", id)
@@ -4359,9 +4366,9 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 			}
 			supersededTargets[supersededID] = id
 		}
-		updated = append(updated, forge.ReviewItem{ReviewItemID: id, Status: forge.ReviewItemStatusOpen, Title: finding.Title, Body: finding.Body, Files: append([]string(nil), finding.Files...), Supersedes: append([]string(nil), finding.Supersedes...), LastSeenRoundID: reviewRoundID})
+		updated = append(updated, forge.ReviewItem{ReviewItemID: id, Status: forge.ReviewItemStatusOpen, Title: finding.Title, Body: finding.Body, Files: append([]string(nil), finding.Files...), Supersedes: append([]forge.ReviewItemID(nil), finding.Supersedes...), LastSeenRoundID: reviewRoundID})
 	}
-	seenUpdated := map[string]forge.ReviewItem{}
+	seenUpdated := map[forge.ReviewItemID]forge.ReviewItem{}
 	for _, item := range updated {
 		seenUpdated[item.ReviewItemID] = item
 	}
@@ -4397,11 +4404,12 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 	return summary, forge.ValidateReviewerSummary(summary)
 }
 
-func parseReviewItemOrdinal(id string) (int, bool) {
-	if !strings.HasPrefix(id, "R-") {
+func parseReviewItemOrdinal(id forge.ReviewItemID) (int, bool) {
+	raw := string(id)
+	if !strings.HasPrefix(raw, "R-") {
 		return 0, false
 	}
-	n, err := strconv.Atoi(strings.TrimPrefix(id, "R-"))
+	n, err := strconv.Atoi(strings.TrimPrefix(raw, "R-"))
 	if err != nil || n <= 0 {
 		return 0, false
 	}

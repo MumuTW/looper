@@ -130,8 +130,13 @@ func (s *fixerDiscoveryLockSet) With(key string, fn func() error) error {
 }
 
 type FixItem struct {
-	Type                string   `json:"type"`
-	Source              string   `json:"source,omitempty"`
+	Type   string `json:"type"`
+	Source string `json:"source,omitempty"`
+	// ID identifies the item within its Source and is a union across sources:
+	// for "forgejo-reviewer-summary" it carries a forge.ReviewItemID, and for
+	// the native review-comment sources it carries a provider comment ID.
+	// Crossings in either direction are explicit conversions, because only
+	// Source tells you which identity space an ID belongs to.
 	ID                  string   `json:"id,omitempty"`
 	ThreadID            string   `json:"threadId,omitempty"`
 	ThreadFingerprint   string   `json:"threadFingerprint,omitempty"`
@@ -4020,7 +4025,7 @@ func buildForgejoFixerSummary(checkpoint fixerCheckpoint, reviewerSummary forge.
 		if reviewItem.Status != forge.ReviewItemStatusOpen {
 			continue
 		}
-		fixItem, ok := fixItemsByID[reviewItem.ReviewItemID]
+		fixItem, ok := fixItemsByID[string(reviewItem.ReviewItemID)]
 		if !ok {
 			return forge.FixerSummary{}, fmt.Errorf("forgejo fixer missing fix item for open review_item_id %q", reviewItem.ReviewItemID)
 		}
@@ -7221,12 +7226,13 @@ func forgejoReviewerSummaryFixItems(summary forge.ReviewerSummary) []FixItem {
 		if item.Status != forge.ReviewItemStatusOpen {
 			continue
 		}
+		reviewItemID := string(item.ReviewItemID.Normalized())
 		items = append(items, FixItem{
 			Type:              "comment",
 			Source:            "forgejo-reviewer-summary",
-			ID:                strings.TrimSpace(item.ReviewItemID),
-			ThreadID:          strings.TrimSpace(item.ReviewItemID),
-			ThreadFingerprint: normalizeThreadFingerprint("forgejo-reviewer-summary", strings.TrimSpace(item.ReviewItemID), strings.TrimSpace(item.ReviewItemID)),
+			ID:                reviewItemID,
+			ThreadID:          reviewItemID,
+			ThreadFingerprint: normalizeThreadFingerprint("forgejo-reviewer-summary", reviewItemID, reviewItemID),
 			Summary:           strings.TrimSpace(item.Title + "\n\n" + item.Body),
 			Files:             cloneStrings(item.Files),
 			Path:              firstNonEmptyFromSlice(item.Files),
