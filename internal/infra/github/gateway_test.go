@@ -2684,10 +2684,80 @@ func TestRepositoryPermissionAllowsWrite(t *testing.T) {
 			t.Fatalf("RepositoryPermissionAllowsWrite(%q) = false", permission)
 		}
 	}
-	for _, permission := range []string{"", "read", "triage"} {
+	for _, permission := range []string{"", "read", "triage", "none"} {
 		if RepositoryPermissionAllowsWrite(permission) {
 			t.Fatalf("RepositoryPermissionAllowsWrite(%q) = true", permission)
 		}
+	}
+}
+
+func TestGetRepositoryPermission(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		stdout  string
+		execErr error
+		want    string
+		wantErr bool
+	}{
+		{
+			name:   "write permission",
+			stdout: `{"permission":"write"}`,
+			want:   "write",
+		},
+		{
+			name:   "read permission is unauthorized but valid",
+			stdout: `{"permission":"read"}`,
+			want:   "read",
+		},
+		{
+			name:   "none permission is a valid denial, not malformed",
+			stdout: `{"permission":"none"}`,
+			want:   "none",
+		},
+		{
+			name: "404 maps to empty permission without error",
+			execErr: &shell.CommandExecutionError{
+				Result: shell.Result{Stderr: "HTTP 404: Not Found"},
+			},
+			want: "",
+		},
+		{
+			name:    "malformed empty object is an error",
+			stdout:  `{}`,
+			wantErr: true,
+		},
+		{
+			name:    "unrecognized permission value is an error",
+			stdout:  `{"permission":"superuser"}`,
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			runner := &fakeGHRunner{t: t}
+			runner.respond = func(options shell.Options) (shell.Result, error) {
+				return shell.Result{Stdout: tc.stdout}, tc.execErr
+			}
+			gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+			got, err := gateway.GetRepositoryPermission(context.Background(), RepositoryPermissionInput{Repo: "acme/looper", User: "octo"})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("GetRepositoryPermission() error = nil, want malformed-response error (got %q)", got)
+				}
+				if !strings.Contains(err.Error(), "malformed collaborator permission response") {
+					t.Fatalf("GetRepositoryPermission() error = %v, want malformed-response diagnostic", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetRepositoryPermission() error = %v, want nil", err)
+			}
+			if got != tc.want {
+				t.Fatalf("GetRepositoryPermission() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
