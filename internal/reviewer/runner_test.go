@@ -9321,6 +9321,20 @@ type runnerFixture struct {
 	now         func() time.Time
 }
 
+// enqueue exercises the reusable queue helper outside discovery transactions.
+// Production discovery uses enqueueAndMarkLoopQueuedForReview so queue work and
+// source-issue admission remain one atomic publication.
+func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
+	queueItem, wake, err := r.enqueueWithQueue(ctx, r.repos.Queue, input)
+	if err != nil {
+		return storage.QueueItemRecord{}, err
+	}
+	if wake {
+		r.wakeSchedulerAfterEnqueue()
+	}
+	return queueItem, nil
+}
+
 func newRunnerFixture(t *testing.T) *runnerFixture {
 	t.Helper()
 	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "reviewer.sqlite"), storage.SQLiteCoordinatorOptions{BackupDir: t.TempDir()})

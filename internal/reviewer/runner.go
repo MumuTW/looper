@@ -4415,17 +4415,6 @@ type enqueueInput struct {
 	AvailableAt time.Time
 }
 
-func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
-	queueItem, wake, err := r.enqueueWithQueue(ctx, r.repos.Queue, input)
-	if err != nil {
-		return storage.QueueItemRecord{}, err
-	}
-	if wake {
-		r.wakeSchedulerAfterEnqueue()
-	}
-	return queueItem, nil
-}
-
 // enqueueWithQueue keeps queue construction usable inside a caller-owned
 // transaction. The caller wakes the scheduler only after that transaction has
 // committed, so it can never observe a queue item without its loop transition.
