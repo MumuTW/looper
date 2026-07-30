@@ -242,6 +242,10 @@ func containsExact(values []string, want string) bool {
 	return false
 }
 
+// ValidateNodeName validates a Node's human-readable Name (a short,
+// label-safe string; convention is a color such as red or cyan). A Node is a
+// single looperd instance enrolled in a Network, identified by an opaque
+// cloud-issued ID plus this Name.
 func ValidateNodeName(value string) error {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {

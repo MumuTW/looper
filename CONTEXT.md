@@ -13,11 +13,15 @@ A configured forge integration that owns remote Issues, Pull Requests, labels, c
 _Avoid_: forge, host, remote.
 
 **Project**:
-A durable local registration that binds one repository to one Provider and supplies the project-level policy consumed by Roles. The SQLite project record is the runtime Authority for whether a Project exists and for its repository/Provider binding; `[[projects]]` is a startup import, not a parallel runtime Authority.
+Defined at `storage.ProjectRecord` in `internal/storage`, whose doc comment
+carries the semantics: the durable registration that is the runtime Authority
+for a Project's existence and repository/Provider binding.
 _Avoid_: config project, runtime binding.
 
 **Project Catalog**:
-The startup-built, immutable view of active Projects materialized from SQLite records after configuration import. Runtime modules consume the Project Catalog through the existing normalized project configuration interface; they do not consult the original `[[projects]]` input.
+Defined at `internal/projects.Catalog`, whose doc comment carries the
+semantics: the startup-built, immutable view of active Projects materialized
+from SQLite records.
 _Avoid_: registry, live config projects.
 
 **Planner**:
@@ -77,11 +81,11 @@ routing.
 _Avoid_: routing label, inferred issue state.
 
 **Triage enrollment**:
-Triager's durable record that a specific new/reopened source event entered the
-workflow before any LLM call. `triage.enrolled` provides retry identity across
-agent outages and source-lookback expiry; it does not authorize Planner.
-`triage.routed` acknowledges an accepted projection, while `triage.retired`
-settles a source that closed or was superseded.
+Defined at `triager.EnrollmentEventType` in `internal/triager`, whose doc
+comment carries the semantics: the durable pre-LLM record giving a source
+event retry identity. `triage.routed` acknowledges an accepted projection and
+`triage.retired` settles a closed or superseded source (constants in the same
+block).
 _Avoid_: routing authority, report.
 
 **Triage routing**:
@@ -171,7 +175,9 @@ A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) 
 A coordinated set of `looperd` instances that share Coordinator admission/assignment decisions for a configured set of repositories. A Node joins exactly one Network at a time. Hosted by a `loopernet` instance (one Network per `loopernet`).
 
 **Node**:
-A single `looperd` instance enrolled in a Network. Identified by an opaque cloud-issued ID and a human-readable Name (short label-safe string; convention is to use a color, e.g. `red`, `blue`, `cyan`).
+Defined at `internal/network/protocol.ValidateNodeName`, whose doc comment
+carries the semantics: a single `looperd` instance enrolled in a Network,
+identified by an opaque cloud-issued ID plus a validated human-readable Name.
 _Avoid_: peer, member, instance, agent.
 
 **Coordinator control plane**:
@@ -179,7 +185,10 @@ The Network-aware Coordinator responsibility that decides Issue admission and PR
 _Avoid_: router, dispatcher, scheduler, balancer.
 
 **Routed project**:
-A project whose `network.mode` is `routed`. Coordinator admission/assignment is performed by the current Network Lease holder. Worker/Reviewer claim only when the exact target label matches the local Node and the role-specific GitHub-native coarse target is present. The complement is a *local-only project*, whose Roles keep existing single-machine behaviour and ignore `looper:target:*` labels.
+Defined at `networkpolicy.IsRouted` in `internal/networkpolicy`, whose doc
+comment carries the semantics: `network.mode` `routed`, Lease-held
+admission/assignment, exact-target claiming; the complement is a local-only
+project.
 
 **Target label**:
 Constructed and parsed by `protocol.TargetLabelForNode` and `protocol.ParseTargetLabel` in `internal/network/protocol`, which is where they live because forming one requires validating a Node name. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim; target labels are ignored in local-only projects.

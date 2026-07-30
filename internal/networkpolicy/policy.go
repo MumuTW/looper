@@ -48,6 +48,11 @@ func ProjectPolicyForProject(cfg config.Config, projectID string) ProjectPolicy 
 	return policy
 }
 
+// IsRouted reports a Routed project: network.mode "routed", where Coordinator
+// admission/assignment is performed by the current Network Lease holder and
+// Worker/Reviewer claim only on an exact matching target label plus the
+// role-specific coarse target. The complement is a local-only project, whose
+// Roles keep single-machine behaviour and ignore looper:target:* labels.
 func IsRouted(policy ProjectPolicy) bool {
 	return normalizeMode(policy.Mode) == config.NetworkModeRouted
 }
