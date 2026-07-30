@@ -203,6 +203,8 @@ func TestWebhookForwarderManagerPassesDaemonCredentialEnv(t *testing.T) {
 	}
 	cfg.Webhook.Enabled = true
 	cfg.Agent.Env = map[string]string{"GH_TOKEN": "token"}
+	ghPath := "/resolved/gh"
+	cfg.Tools.GHPath = &ghPath
 	got := make(chan webhookForwarderCommand, 1)
 	m := newWebhookForwarderManager(webhookForwarderManagerOptions{Config: cfg, StartProcess: func(_ context.Context, command webhookForwarderCommand) (webhookForwarderStartResult, error) {
 		got <- command
@@ -213,6 +215,9 @@ func TestWebhookForwarderManagerPassesDaemonCredentialEnv(t *testing.T) {
 	if command := <-got; !containsEnv(command.Process.Env, "GH_TOKEN=token") {
 		t.Fatalf("child env = %q, want GH_TOKEN", command.Process.Env)
 	}
+	// Do not leave the supervisor blocked in Wait when this focused assertion
+	// finishes. Stop closes its child streams and waits for the goroutine.
+	m.Stop()
 }
 
 func TestWebhookForwarderEventsIncludePushAndCheckRun(t *testing.T) {
@@ -533,6 +538,12 @@ func (p *testWebhookForwarderProcess) Stop() error {
 }
 
 func (p *testWebhookForwarderProcess) Kill() error {
+	p.mu.Lock()
+	onStop := p.onStop
+	p.mu.Unlock()
+	if onStop != nil {
+		onStop()
+	}
 	p.exit(nil)
 	return nil
 }
