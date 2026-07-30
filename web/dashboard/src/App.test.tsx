@@ -32,11 +32,12 @@ function bootstrapRouteAbsent(): Response {
 
 function stubDaemon(
   exchange: () => Response,
+  health: () => Response = () => response({ healthy: true }),
 ): ReturnType<typeof vi.fn> {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const path = String(input);
     if (path === "/api/v1/dashboard/bootstrap/exchange") return exchange();
-    if (path === "/api/v1/healthz") return response({ healthy: true });
+    if (path === "/api/v1/healthz") return health();
     if (path === "/api/v1/runs/active") return response({ items: [] });
     if (path === "/api/v1/projects") return response({ items: [] });
     if (path.startsWith("/api/v1/loops")) return response({ items: [] });
@@ -65,7 +66,7 @@ describe("bootstrap code exchange", () => {
     render(<App />);
 
     expect(await screen.findByRole("navigation")).toBeTruthy();
-    expect(screen.queryByText("Bootstrap failed")).toBeNull();
+    expect(screen.queryByText("Dashboard login required")).toBeNull();
     expect(sessionStorage.getItem("looper.dashboard.token")).toBeNull();
   });
 
@@ -78,11 +79,33 @@ describe("bootstrap code exchange", () => {
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", { name: "Bootstrap failed" }),
+      await screen.findByRole("heading", { name: "Dashboard login required" }),
     ).toBeTruthy();
     expect(screen.getByText(/Invalid bootstrap code/)).toBeTruthy();
-		expect(screen.getByText(/may indicate an expired code/)).toBeTruthy();
-		expect(screen.queryByText(/It answered, so/)).toBeNull();
+    expect(screen.getByText(/missing or expired code/)).toBeTruthy();
+    expect(screen.getByText("looper dashboard")).toBeTruthy();
+    expect(screen.getByText("LOOPER_TOKEN")).toBeTruthy();
+  });
+
+  it("points an unauthenticated local-token browser to the CLI login flow", async () => {
+    window.history.replaceState({}, "", "/dashboard/");
+    stubDaemon(
+      () => response({ token: "unused" }),
+      () =>
+        response(
+          { code: "UNAUTHORIZED", message: "Authorization token is required" },
+          401,
+        ),
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard login required" }),
+    ).toBeTruthy();
+    expect(screen.getByText(/Authorization token is required/)).toBeTruthy();
+    expect(screen.getByText("looper dashboard")).toBeTruthy();
+    expect(screen.queryByRole("navigation")).toBeNull();
   });
 
   it("stores the session token when the exchange succeeds", async () => {

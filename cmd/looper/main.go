@@ -112,6 +112,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return reportError(stderr, runInit(parsed.Global, parsed.Operands, stdout))
 	case "status":
 		return reportError(stderr, runStatus(ctx, parsed.Global, parsed.Operands, stdout))
+	case "dashboard":
+		return reportError(stderr, runDashboard(ctx, parsed.Global, parsed.Operands, stdout))
 	case "project":
 		return reportError(stderr, runProject(ctx, parsed.Global, parsed.Operands, stdout))
 	}
@@ -1329,6 +1331,7 @@ func usage(w io.Writer) {
 Usage:
   looper init                  Write a starter config file (never overwrites)
   looper status                Report config, daemon reachability, and projects
+  looper dashboard             Print a dashboard URL authenticated for this session
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
   looper project discover <id> Retry post-commit worktree/PR discovery for a project
