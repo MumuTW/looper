@@ -179,3 +179,44 @@ func TestTerminalCleanupWithoutRunIDStaysInMemory(t *testing.T) {
 		t.Fatal("in-memory CleanedAt is empty, want the cleanup still reflected for the caller")
 	}
 }
+
+// TestTerminalCleanupSurvivesLaterRetryPolicyWrite covers the opposite
+// interleaving from TestTerminalCleanupPreservesConcurrentRunState: cleanup
+// persists first, and an operator retry rewrites the resume policy afterwards.
+// While the retry writers replaced the whole checkpoint, that second write pushed
+// their earlier snapshot back and the completed cleanup vanished from durable
+// state again. Both orders have to hold, since the two writers are unordered.
+func TestTerminalCleanupSurvivesLaterRetryPolicyWrite(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_then_retry", filepath.Join(t.TempDir(), "wt-47"))
+
+	// The retry writer reads the run here, before cleanup records anything.
+	before, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_then_retry")
+	if err != nil || before == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", before, err)
+	}
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, "run_cleanup_then_retry", &checkpoint)
+
+	// ...and writes its policy change afterwards, from that stale read.
+	if err := fixture.repos.Runs.MergeRunResumePolicy(context.Background(), before.ID, loops.ResumePolicyRestartFromDiscover, fixture.nowISO()); err != nil {
+		t.Fatalf("MergeRunResumePolicy() error = %v", err)
+	}
+
+	after, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_then_retry")
+	if err != nil || after == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", after, err)
+	}
+	final := parseCheckpoint(after.CheckpointJSON)
+	if final.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("ResumePolicy = %q, want the retry rewrite applied", final.ResumePolicy)
+	}
+	if final.Worktree == nil || final.Worktree.CleanedAt == "" {
+		t.Fatalf("stored worktree = %#v, want the earlier cleanup preserved under the later policy write", final.Worktree)
+	}
+}

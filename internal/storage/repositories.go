@@ -881,6 +881,36 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 	return nil
 }
 
+// MergeRunResumePolicy rewrites only the checkpoint's resume policy.
+//
+// The retry-policy writers read a run, change this one field, and would otherwise
+// write the whole row back. That loses any checkpoint field a concurrent terminal
+// cleanup persisted in between -- the mirror of the race
+// MergeWorktreeCleanupTimestamps exists to avoid, since the two writers can
+// interleave in either order.
+func (r *RunsRepository) MergeRunResumePolicy(ctx context.Context, id, resumePolicy, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET checkpoint_json = json_set(
+				COALESCE(NULLIF(checkpoint_json, ''), '{}'),
+				'$.resumePolicy', ?
+			),
+			updated_at = ?
+		WHERE id = ?
+	`, resumePolicy, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("merge run resume policy: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read merged run resume policy rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("merge run resume policy: run not found: %s", id)
+	}
+	return nil
+}
+
 // MergeWorktreeCleanupTimestamps records a terminal worktree cleanup attempt on a
 // run without disturbing anything else about it.
 //

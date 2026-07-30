@@ -5576,13 +5576,9 @@ func restartLatestRunFromDiscover(ctx context.Context, repos *storage.Repositori
 	if latestRun.Status != "failed" && latestRun.Status != "interrupted" {
 		return fmt.Errorf("cannot restart failure-streak loop %s without a failed or interrupted run", loopID)
 	}
-	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
-	checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-	updated := *latestRun
-	encoded := mustMarshalJSON(checkpoint)
-	updated.CheckpointJSON = &encoded
-	updated.UpdatedAt = updatedAt
-	return repos.Runs.Upsert(ctx, updated)
+	// Field-level so a concurrent terminal cleanup's timestamps are not lost; the
+	// two writers can interleave in either order.
+	return repos.Runs.MergeRunResumePolicy(ctx, latestRun.ID, loops.ResumePolicyRestartFromDiscover, updatedAt)
 }
 
 // fixerRunParkedOnInvalidCompletion reports whether a manual-intervention park was
@@ -5642,12 +5638,9 @@ func MarkInvalidCompletionRunRestartFromDiscover(ctx context.Context, repos *sto
 	if !fixerRunParkedOnInvalidCompletion(*latestRun, checkpoint) {
 		return false, nil
 	}
-	checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-	updated := *latestRun
-	encoded := mustMarshalJSON(checkpoint)
-	updated.CheckpointJSON = &encoded
-	updated.UpdatedAt = updatedAt
-	if err := repos.Runs.Upsert(ctx, updated); err != nil {
+	// Field-level so a concurrent terminal cleanup's timestamps are not lost; the
+	// two writers can interleave in either order.
+	if err := repos.Runs.MergeRunResumePolicy(ctx, latestRun.ID, loops.ResumePolicyRestartFromDiscover, updatedAt); err != nil {
 		return false, err
 	}
 	return true, nil
