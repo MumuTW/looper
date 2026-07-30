@@ -1604,10 +1604,11 @@ func TestRunExecuteStepPersistsProgressBeforeTimeoutTermination(t *testing.T) {
 	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+	progressInspect := InspectHeadResult{
 		HeadSHA: "after-head", Branch: "looper/issue-27", HasUncommittedChanges: true,
 		ChangedFiles: []string{"modified.go", "staged.go", "new.txt"}, StagedFiles: []string{"staged.go"}, UntrackedFiles: []string{"new.txt"}, DiffFingerprint: "status-only-sha",
-	}}
+	}
+	git := &fakeGitGateway{inspectResults: []InspectHeadResult{progressInspect, progressInspect}}
 	agentExecutor := &timeoutObservingAgentExecutor{result: AgentResult{Status: "timeout", Summary: "agent became idle", TimeoutType: "idle", LastProgressAt: "2026-04-11T12:00:01.000Z"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
 
@@ -1644,8 +1645,88 @@ func TestRunExecuteStepPersistsProgressBeforeTimeoutTermination(t *testing.T) {
 	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.ProgressBeforeTimeout == nil || storedCheckpoint.Execution.ProgressBeforeTimeout.DiffFingerprint != "status-only-sha" {
 		t.Fatalf("stored timeout snapshot = %#v, want persisted progress", storedCheckpoint.Execution)
 	}
-	if len(git.inspectCalls) != 1 || git.inspectCalls[0].BaseRef != "" {
-		t.Fatalf("InspectHead calls = %#v, want one snapshot without unused history traversal", git.inspectCalls)
+	if len(git.inspectCalls) != 2 {
+		t.Fatalf("InspectHead calls = %#v, want pre-timeout and post-termination observations", git.inspectCalls)
+	}
+}
+
+func TestRunExecuteStepStopsBeforeReplacementWhenTimeoutProgressDrifts(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreeRoot, err := workerWorktreeRoot(*project)
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(project.RepoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repo) error = %v", err)
+	}
+	worktreePath := filepath.Join(worktreeRoot, "worker-timeout-drift")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: /tmp/test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_drift", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "same-head", Branch: "looper/issue-27", DiffFingerprint: "different-status"}}
+	agentExecutor := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:      &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree:  &checkpointWorktree{ID: "worktree_27", Path: worktreePath, Branch: "looper/issue-27", BaseBranch: "main", HeadSHA: "same-head"},
+			Plan:      &checkpointPlan{Summary: "Implement worker loop"},
+			Execution: &checkpointExecution{Status: "timeout", ProgressBeforeTimeout: &worktreeProgress{HeadSHA: "same-head", Branch: "looper/issue-27", DiffFingerprint: "before-status"}},
+		},
+	})
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("runExecuteStep() error = %v, want manual intervention", err)
+	}
+	if len(agentExecutor.starts) != 0 {
+		t.Fatalf("replacement agent starts = %#v, want no second writer after progress drift", agentExecutor.starts)
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.ProgressSnapshotError == "" || checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		t.Fatalf("checkpoint = %#v, want persisted drift evidence and manual intervention", checkpoint)
+	}
+}
+
+func TestVerifyTimeoutProgressAfterTerminationRejectsDrift(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	runner := New(Options{Git: &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "after-head", Branch: "feature/test", DiffFingerprint: "after-status"}}, Logger: fixture.logger, Now: fixture.now})
+	err = runner.verifyTimeoutProgressAfterTermination(context.Background(), *project, workerInput{BaseBranch: "main"}, checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"}, worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", DiffFingerprint: "before-status"})
+	if err == nil || !strings.Contains(err.Error(), "changed after termination") {
+		t.Fatalf("verifyTimeoutProgressAfterTermination() error = %v, want drift rejection", err)
+	}
+}
+
+func TestRewindCheckpointForExecuteRetryPreservesTimeoutSnapshot(t *testing.T) {
+	t.Parallel()
+	progress := &worktreeProgress{HeadSHA: "head", Branch: "feature/test", DiffFingerprint: "status"}
+	got := rewindCheckpointForExecuteRetry(workerCheckpoint{Execution: &checkpointExecution{Status: "timeout", ProgressBeforeTimeout: progress}, Validation: &ValidationResult{}, PullRequest: &checkpointPullPR{Number: 1}, SkipReason: "retry"})
+	if got.Execution == nil || got.Execution.ProgressBeforeTimeout != progress {
+		t.Fatalf("rewindCheckpointForExecuteRetry().Execution = %#v, want timeout snapshot retained", got.Execution)
+	}
+	if got.Validation != nil || got.PullRequest != nil || got.SkipReason != "" {
+		t.Fatalf("rewindCheckpointForExecuteRetry() = %#v, want execute-only checkpoint", got)
 	}
 }
 

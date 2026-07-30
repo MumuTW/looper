@@ -304,10 +304,12 @@ type PushInput struct {
 }
 
 type InspectHeadInput struct {
-	RepoPath     string
-	WorktreeRoot string
-	WorktreePath string
-	BaseRef      string
+	RepoPath       string
+	WorktreeRoot   string
+	WorktreePath   string
+	BaseRef        string
+	ContentPaths   []string
+	CompareHeadSHA string
 }
 
 type InspectHeadResult struct {
@@ -319,6 +321,8 @@ type InspectHeadResult struct {
 	StagedFiles           []string
 	UntrackedFiles        []string
 	DiffFingerprint       string
+	ContentFingerprint    string
+	HeadDescendsFromCompare bool
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -707,6 +711,8 @@ type worktreeProgress struct {
 	UntrackedFiles     []string `json:"untrackedFiles,omitempty"`
 	UntrackedFileCount int      `json:"untrackedFileCount"`
 	DiffFingerprint    string   `json:"diffFingerprint,omitempty"`
+	ContentFingerprint      string   `json:"contentFingerprint,omitempty"`
+	HeadDescendsFromCompare bool     `json:"-"`
 	TimeoutType        string   `json:"timeoutType,omitempty"`
 	LastProgressAt     string   `json:"lastProgressAt,omitempty"`
 	CapturedAt         string   `json:"capturedAt,omitempty"`
@@ -2262,6 +2268,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				return checkpoint, awaiting
 			}
 		}
+		if err := r.verifyTimeoutProgressBeforeReplacement(ctx, input.Project, input.Run.ID, work, worktree, &checkpoint); err != nil {
+			return checkpoint, err
+		}
 		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
@@ -2340,7 +2349,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			progressMu         sync.Mutex
 		)
 		onBeforeTimeout := func(timeoutCtx context.Context, observation agent.TimeoutObservation) error {
-			progress, progressErr := r.captureWorktreeProgress(timeoutCtx, input.Project, work, worktree, observation)
+			progress, progressErr := r.captureWorktreeProgress(timeoutCtx, input.Project, work, worktree, observation, nil)
 			progressMu.Lock()
 			defer progressMu.Unlock()
 			if progressErr != nil {
@@ -2401,6 +2410,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				}
 				return checkpoint, &runpipe.LoopError{Message: "Worker timeout progress snapshot failed: " + result.PreTimeoutError, Kind: runpipe.FailureManualIntervention}
 			}
+			if result.Status == "timeout" && preTimeoutProgress != nil {
+				if err := r.verifyTimeoutProgressAfterTermination(ctx, input.Project, work, worktree, *preTimeoutProgress); err != nil {
+					checkpoint.Execution.ProgressSnapshotError = err.Error()
+					checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+					if persistErr := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); persistErr != nil {
+						return checkpoint, &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+					}
+					return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureManualIntervention}
+				}
+			}
 			checkpoint.ResumePolicy = "retry_from_timeout_context"
 			if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
 				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
@@ -2452,7 +2471,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	return checkpoint, nil
 }
 
-func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, observation agent.TimeoutObservation) (worktreeProgress, error) {
+func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, observation agent.TimeoutObservation, compare *worktreeProgress) (worktreeProgress, error) {
 	if r.git == nil {
 		return worktreeProgress{}, fmt.Errorf("worker git gateway is not configured")
 	}
@@ -2460,7 +2479,13 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 	if err != nil {
 		return worktreeProgress{}, err
 	}
-	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path})
+	contentPaths := []string(nil)
+	compareHeadSHA := ""
+	if compare != nil {
+		contentPaths = append(contentPaths, compare.ChangedFiles...)
+		compareHeadSHA = compare.HeadSHA
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch, work.BaseBranch), ContentPaths: contentPaths, CompareHeadSHA: compareHeadSHA})
 	if err != nil {
 		return worktreeProgress{}, err
 	}
@@ -2474,7 +2499,7 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 		StagedFileCount:    len(inspect.StagedFiles),
 		UntrackedFiles:     boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap),
 		UntrackedFileCount: len(inspect.UntrackedFiles),
-		DiffFingerprint:    inspect.DiffFingerprint,
+		DiffFingerprint:    inspect.DiffFingerprint, ContentFingerprint: inspect.ContentFingerprint, HeadDescendsFromCompare: inspect.HeadDescendsFromCompare,
 		TimeoutType:        observation.TimeoutType,
 		LastProgressAt:     observation.LastProgressAt,
 		CapturedAt:         eventlog.FormatJavaScriptISOString(r.now().UTC()),
@@ -2491,6 +2516,63 @@ func boundPathList(paths []string, capN int) []string {
 	}
 	return append([]string(nil), paths[:capN]...)
 }
+
+func (r *Runner) verifyTimeoutProgressAfterTermination(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, before worktreeProgress) error {
+	after, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, &before)
+	if err != nil {
+		return fmt.Errorf("worker timeout progress verification after termination failed: %w", err)
+	}
+	if !preservesWorktreeProgress(before, after) {
+		return fmt.Errorf("worker timeout progress changed after termination; operator action is required before retry")
+	}
+	return nil
+}
+
+func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, project storage.ProjectRecord, runID string, work workerInput, worktree checkpointWorktree, checkpoint *workerCheckpoint) error {
+	if checkpoint.Execution == nil || checkpoint.Execution.Status != "timeout" || checkpoint.Execution.ProgressBeforeTimeout == nil {
+		return nil
+	}
+	current, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, checkpoint.Execution.ProgressBeforeTimeout)
+	if err != nil {
+		return &runpipe.LoopError{Message: fmt.Sprintf("worker timeout progress verification before retry failed: %v", err), Kind: runpipe.FailureManualIntervention}
+	}
+	if preservesWorktreeProgress(*checkpoint.Execution.ProgressBeforeTimeout, current) {
+		return nil
+	}
+	checkpoint.Execution.ProgressSnapshotError = "worker timeout progress changed before replacement; operator action is required before retry"
+	checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+	if err := r.persistCheckpoint(ctx, runID, *checkpoint); err != nil {
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+	}
+	return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
+}
+
+func sameWorktreeProgress(before, after worktreeProgress) bool {
+	return before.HeadSHA == after.HeadSHA && before.Branch == after.Branch && before.DiffFingerprint == after.DiffFingerprint
+}
+
+func preservesWorktreeProgress(before, after worktreeProgress) bool {
+	if before.ChangedFileCount == 0 {
+		return true
+	}
+	if sameWorktreeProgress(before, after) {
+		return true
+	}
+	return before.HeadSHA != "" && after.HeadSHA != "" && before.HeadSHA != after.HeadSHA && after.ChangedFileCount == 0 && after.HeadDescendsFromCompare && before.ContentFingerprint == after.ContentFingerprint
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
 
 func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, run storage.RunRecord) (bool, error) {
 	checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
@@ -4275,7 +4357,9 @@ func executeStepAlreadyCompleted(checkpoint workerCheckpoint) bool {
 }
 
 func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoint {
-	checkpoint.Execution = nil
+	if checkpoint.Execution == nil || checkpoint.Execution.Status != "timeout" || checkpoint.Execution.ProgressBeforeTimeout == nil {
+		checkpoint.Execution = nil
+	}
 	checkpoint.Validation = nil
 	checkpoint.PullRequest = nil
 	checkpoint.SkipReason = ""

@@ -234,6 +234,9 @@ func TestGatewayInspectHeadRecordsExactRenamePathsAndDetachedBranch(t *testing.T
 	if got := inspect.StagedFiles; len(got) != 1 || got[0] != "after name.txt" {
 		t.Fatalf("InspectHead().StagedFiles = %#v, want exact rename destination", got)
 	}
+	if strings.Contains(inspect.ChangedFiles[0], " -> ") {
+		t.Fatalf("InspectHead().ChangedFiles = %#v, must not contain formatted rename text", inspect.ChangedFiles)
+	}
 
 	runGit(t, worktree.WorktreePath, "checkout", "--detach")
 	detached, err := gateway.InspectHead(ctx, InspectHeadInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath})

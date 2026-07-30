@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -86,10 +87,12 @@ type PrepareWorktreeResult struct {
 }
 
 type InspectHeadInput struct {
-	RepoPath     string
-	WorktreeRoot string
-	WorktreePath string
-	BaseRef      string
+	RepoPath       string
+	WorktreeRoot   string
+	WorktreePath   string
+	BaseRef        string
+	ContentPaths   []string
+	CompareHeadSHA string
 }
 
 type InspectHeadResult struct {
@@ -106,7 +109,9 @@ type InspectHeadResult struct {
 	UntrackedFiles []string
 	// DiffFingerprint fingerprints porcelain status codes and paths only (not
 	// file contents), so content-only edits of untracked files stay stable.
-	DiffFingerprint string
+	DiffFingerprint         string
+	ContentFingerprint      string
+	HeadDescendsFromCompare bool
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -877,7 +882,11 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	fingerprintParts := make([]string, 0, len(status))
 	for _, entry := range status {
 		changedFiles = append(changedFiles, entry.Path)
-		fingerprintParts = append(fingerprintParts, entry.Code+"\t"+entry.Path)
+		part := entry.Code + "\t" + entry.Path
+		if entry.OriginalPath != "" {
+			part += "\t" + entry.OriginalPath
+		}
+		fingerprintParts = append(fingerprintParts, part)
 		if entry.Code == "??" {
 			untrackedFiles = append(untrackedFiles, entry.Path)
 			continue
@@ -893,15 +902,35 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		diffFingerprint = hex.EncodeToString(sum[:])
 	}
 
+	contentPaths := make([]string, 0, len(status)+len(input.ContentPaths))
+	for _, entry := range status {
+		contentPaths = append(contentPaths, entry.Path)
+	}
+	contentPaths = append(contentPaths, input.ContentPaths...)
+	contentFingerprint, err := g.contentFingerprint(ctx, input.WorktreePath, contentPaths)
+	if err != nil {
+		return InspectHeadResult{}, err
+	}
+
+	headDescendsFromCompare := false
+	if input.CompareHeadSHA != "" {
+		headDescendsFromCompare, err = g.isAncestor(ctx, input.WorktreePath, input.CompareHeadSHA, headSHA)
+		if err != nil {
+			return InspectHeadResult{}, err
+		}
+	}
+
 	return InspectHeadResult{
-		HeadSHA:               headSHA,
-		Branch:                branch,
-		NewCommitSHAs:         newCommitSHAs,
-		HasUncommittedChanges: len(status) > 0,
-		ChangedFiles:          changedFiles,
-		StagedFiles:           stagedFiles,
-		UntrackedFiles:        untrackedFiles,
-		DiffFingerprint:       diffFingerprint,
+		HeadSHA:                 headSHA,
+		Branch:                  branch,
+		NewCommitSHAs:           newCommitSHAs,
+		HasUncommittedChanges:   len(status) > 0,
+		ChangedFiles:            changedFiles,
+		StagedFiles:             stagedFiles,
+		UntrackedFiles:          untrackedFiles,
+		DiffFingerprint:         diffFingerprint,
+		ContentFingerprint:      contentFingerprint,
+		HeadDescendsFromCompare: headDescendsFromCompare,
 	}, nil
 }
 
@@ -999,6 +1028,77 @@ func (g *Gateway) gitCommonDir(ctx context.Context, path string) (string, error)
 		return filepath.Clean(abs), nil
 	}
 	return filepath.Clean(resolved), nil
+}
+
+// contentFingerprint hashes file identity and contents without persisting the
+// contents themselves. Missing paths are included so deletions can be
+// compared with a later committed deletion.
+func (g *Gateway) contentFingerprint(ctx context.Context, worktreePath string, paths []string) (string, error) {
+	unique := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if !filepath.IsLocal(path) {
+			return "", fmt.Errorf("unsafe worktree content path %q", path)
+		}
+		unique[path] = struct{}{}
+	}
+	sortedPaths := make([]string, 0, len(unique))
+	for path := range unique {
+		sortedPaths = append(sortedPaths, path)
+	}
+	sort.Strings(sortedPaths)
+
+	fingerprint := sha256.New()
+	for _, path := range sortedPaths {
+		_, _ = fingerprint.Write([]byte(path))
+		_, _ = fingerprint.Write([]byte{'\x00'})
+		info, err := os.Lstat(filepath.Join(worktreePath, path))
+		if errors.Is(err, os.ErrNotExist) {
+			_, _ = fingerprint.Write([]byte("missing"))
+			_, _ = fingerprint.Write([]byte{'\x00'})
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(filepath.Join(worktreePath, path))
+			if err != nil {
+				return "", err
+			}
+			_, _ = fingerprint.Write([]byte("symlink"))
+			_, _ = fingerprint.Write([]byte{'\x00'})
+			_, _ = fingerprint.Write([]byte(target))
+			_, _ = fingerprint.Write([]byte{'\x00'})
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("worktree content path %q is not a regular file", path)
+		}
+		result, err := g.runGitResult(ctx, worktreePath, nil, "hash-object", "--no-filters", "--", path)
+		if err != nil {
+			return "", err
+		}
+		_, _ = fingerprint.Write([]byte("file"))
+		_, _ = fingerprint.Write([]byte{'\x00'})
+		_, _ = fingerprint.Write([]byte(strings.TrimSpace(result.Stdout)))
+		_, _ = fingerprint.Write([]byte{'\x00'})
+	}
+	return fmt.Sprintf("%x", fingerprint.Sum(nil)), nil
+}
+
+func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
+	result, err := g.runGitResult(ctx, repoPath, nil, "merge-base", "--is-ancestor", ancestor, descendant)
+	if result.ExitCode == 0 {
+		return true, nil
+	}
+	if result.ExitCode == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %w", ancestor, descendant, err)
 }
 
 func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, error) {
@@ -1232,18 +1332,6 @@ func (g *Gateway) MergeBaseIntoWorktree(ctx context.Context, input MergeBaseInpu
 	// Some other merge failure — abort so the worktree isn't left half-merged.
 	_, _ = g.runGitResult(ctx, input.WorktreePath, nil, "merge", "--abort")
 	return MergeBaseResult{}, err
-}
-
-func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
-	_, err := g.runGitResult(ctx, repoPath, nil, "merge-base", "--is-ancestor", ancestor, descendant)
-	if err == nil {
-		return true, nil
-	}
-	var commandErr *shell.CommandExecutionError
-	if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 1 {
-		return false, nil
-	}
-	return false, err
 }
 
 func (g *Gateway) isHealthyWorktree(ctx context.Context, worktreePath string) (bool, error) {
@@ -1521,8 +1609,9 @@ func (g *Gateway) listCommitsSince(ctx context.Context, repoPath, baseRef string
 }
 
 type statusEntry struct {
-	Code string
-	Path string
+	Code         string
+	Path         string
+	OriginalPath string
 }
 
 func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntry, error) {
@@ -1552,8 +1641,10 @@ func parseStatusResult(result shell.Result) ([]statusEntry, error) {
 			continue
 		}
 		code, path := line[:2], strings.TrimSpace(line[3:])
+		originalPath := ""
 		// Renames/copies: "R  old -> new" — keep the destination path only.
 		if idx := strings.Index(path, " -> "); idx >= 0 {
+			originalPath = strings.TrimSpace(path[:idx])
 			path = strings.TrimSpace(path[idx+4:])
 		}
 		// Quoted paths from git for special characters.
@@ -1567,7 +1658,7 @@ func parseStatusResult(result shell.Result) ([]statusEntry, error) {
 			// decisions, mirroring the staging exclusion in Commit.
 			continue
 		}
-		entries = append(entries, statusEntry{Code: code, Path: path})
+		entries = append(entries, statusEntry{Code: code, Path: path, OriginalPath: originalPath})
 	}
 	return entries, nil
 }
