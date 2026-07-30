@@ -321,8 +321,11 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", existing.ID)}
 	}
 	if existing != nil && !existing.Archived {
-		derivedReusesSameCheckout := input.IDSource == "derived" && sameProjectRepoPath(existing.RepoPath, input.RepoPath)
-		if !derivedReusesSameCheckout {
+		// Re-registration is the only non-destructive repair path for an API
+		// project with missing repository metadata. The stable authority is the
+		// existing project ID and its checkout, not whether the caller supplied
+		// that ID or the API derived it from the path.
+		if !sameProjectRepoPath(existing.RepoPath, input.RepoPath) {
 			return AddResult{}, nil, ProjectIDCollisionError{ProjectID: projectID}
 		}
 	}
@@ -369,11 +372,17 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		// no role can act on: every discovery lane skips a project whose repo
 		// metadata is empty. Say so at registration instead of leaving the
 		// operator to infer it from a daemon log line on every tick.
-		// The repair path is named precisely because the obvious ones do not
-		// exist: the dashboard Projects page is read-only, /api/v1/projects/{id}
-		// accepts only DELETE, and `looper project add` has no repo flag. That
-		// leaves DELETE followed by a create carrying "repo".
-		warnings = append(warnings, `No repository is set for this project, so no automation will run for it. To repair it: DELETE /api/v1/projects/`+projectID+` then POST /api/v1/projects with {"repoPath":"...","repo":"owner/name"}. The CLI cannot set a repository.`)
+		// Deliberately silent about DELETE. RemoveProject terminates every loop
+		// and cancels every queue item for the project, and "terminated" has no
+		// outbound transition, so advising it here would destroy automation state
+		// to fix a missing field. Re-registration touches no loops.
+		//
+		// This warning fires during registration, so the operator is already
+		// holding the request that needs the field. It does not claim to be a
+		// general repair: re-registration applies creation defaults to omitted
+		// fields, which is why the reset is stated rather than glossed. A proper
+		// partial update belongs behind its own operation.
+		warnings = append(warnings, fmt.Sprintf(`No repository is set for this project, so no automation will run for it. Register %s again with the same repoPath and an explicit "repo":"owner/name"; this keeps any existing loops, but resends the whole record, so include the current name, baseBranch, and snapshotMode or they return to defaults. The CLI cannot set a repository.`, projectID))
 	}
 
 	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
