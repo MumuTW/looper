@@ -1304,8 +1304,8 @@ esac
 	if githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Agent: config.AgentConfig{Env: map[string]string{"GH_TOKEN": "fake-test-token"}}, Tools: config.ToolPathsConfig{GHPath: &unauthenticatedPath}}, unauthenticatedGateway, logger, "nexu-io/looper", rootDir) {
 		t.Fatal("githubCLIAutoPROpeningAvailable() = true, want false for unauthenticated gh cli")
 	}
-	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{}, authenticatedGateway, logger, "nexu-io/looper", rootDir) {
-		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true when gateway can recheck authenticated gh cli without configured path")
+	if githubCLIAutoPROpeningAvailable(context.Background(), config.Config{}, authenticatedGateway, logger, "nexu-io/looper", rootDir) {
+		t.Fatal("githubCLIAutoPROpeningAvailable() = true, want false without a daemon credential")
 	}
 }
 

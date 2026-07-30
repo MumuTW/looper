@@ -2349,6 +2349,12 @@ func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, git
 		return false
 	}
 	hostname := githubAuthHostname(repo)
+	if !githubGateway.HasDaemonCredentialForHost(hostname) {
+		if logger != nil {
+			logger.Warn("github cli daemon credential unavailable; disabling automatic PR opening", map[string]any{"repo": repo, "hostname": hostname})
+		}
+		return false
+	}
 	authenticated, err := githubGateway.IsAuthenticated(ctx, cwd, hostname)
 	if err != nil {
 		if logger != nil {

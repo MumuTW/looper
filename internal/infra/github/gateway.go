@@ -3124,6 +3124,19 @@ func (g *Gateway) UpdateCredentialEnv(env map[string]string) {
 	g.authHealthCache = map[string]authHealthCacheEntry{}
 }
 
+// HasDaemonCredentialForHost reports whether this gateway can prepare an
+// authenticated daemon-owned child for hostname. Callers that only perform an
+// auth preflight use it to reject ambient or anonymous gh execution before
+// invoking a command.
+func (g *Gateway) HasDaemonCredentialForHost(hostname string) bool {
+	if g == nil {
+		return false
+	}
+	g.authHealthMu.Lock()
+	defer g.authHealthMu.Unlock()
+	return len(githubCredentialForHost(g.credentialEnv, hostname)) > 0
+}
+
 func hasGitHubCredential(env map[string]string) bool {
 	for _, key := range config.GitHubTokenEnvKeys {
 		if strings.TrimSpace(env[key]) != "" {

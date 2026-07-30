@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -149,6 +150,41 @@ func TestGatewayAuthHealthRefreshesAfterCacheTTL(t *testing.T) {
 	_ = gateway.AuthHealth(context.Background(), "", "github.com")
 	if calls != 2 {
 		t.Fatalf("gh calls = %d, want refresh after TTL", calls)
+	}
+}
+
+func TestGatewayAuthHealthConcurrentSameHostReadsCachedResultSafely(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	gateway := New(Options{
+		Env:               map[string]string{"GH_TOKEN": "configured-token"},
+		RequireCredential: true,
+		GHRun: func(context.Context, shell.Options) (shell.Result, error) {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			return shell.Result{Stdout: "HTTP/2.0 200 OK\nX-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: 4000\nX-Ratelimit-Reset: 1785414807\n\nMumuTW\n"}, nil
+		},
+	})
+	if health := gateway.AuthHealth(context.Background(), "", "github.com"); !health.Authenticated {
+		t.Fatalf("initial AuthHealth() = %#v, want authenticated", health)
+	}
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if health := gateway.AuthHealth(context.Background(), "", "github.com"); !health.Authenticated {
+				t.Errorf("cached AuthHealth() = %#v, want authenticated", health)
+			}
+		}()
+	}
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("gh calls = %d, want one initial probe followed by cache reads", calls)
 	}
 }
 
