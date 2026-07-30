@@ -175,7 +175,11 @@ func (s *Service) TransitionStatus(ctx context.Context, loopID string, input Tra
 			lastRunAt := eventlog.FormatJavaScriptISOString(*input.LastRunAt)
 			updated.LastRunAt = &lastRunAt
 		}
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		// AssertLoopStatusTransition above is the authority for leaving
+		// human_takeover: its only non-terminal outgoing edge is handback's
+		// → queued. Every other writer goes through the guarded Upsert and
+		// cannot release the hold.
+		if err := repos.Loops.UpsertReleasingHumanHold(ctx, updated); err != nil {
 			return storage.LoopRecord{}, err
 		}
 		return updated, nil
@@ -210,7 +214,9 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 		updated.Status = string(domain.LoopStatusPaused)
 		updated.NextRunAt = nil
 		updated.UpdatedAt = eventlog.NextJavaScriptISOString(now, loop.UpdatedAt)
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		// human_takeover has no → paused edge, so the assertion above already
+		// refused a held loop before this write is reached.
+		if err := repos.Loops.UpsertReleasingHumanHold(ctx, updated); err != nil {
 			return PauseResult{}, err
 		}
 		cancelled, err := repos.Queue.CancelByLoop(ctx, loopID, updated.UpdatedAt, reason)
@@ -249,7 +255,9 @@ func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) 
 		updated.Status = string(domain.LoopStatusTerminated)
 		updated.NextRunAt = nil
 		updated.UpdatedAt = eventlog.NextJavaScriptISOString(now, loop.UpdatedAt)
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		// Terminate is an explicit operator exit and is on human_takeover's
+		// transition list; the assertion above is the authority.
+		if err := repos.Loops.UpsertReleasingHumanHold(ctx, updated); err != nil {
 			return TerminateResult{}, err
 		}
 		cancelled, err := repos.Queue.CancelByLoop(ctx, loopID, updated.UpdatedAt, reason)

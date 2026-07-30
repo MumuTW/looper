@@ -8,9 +8,29 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/nexu-io/looper/internal/domain"
 )
 
 var ErrQueueItemNotActive = errors.New("queue item not active")
+
+// ErrLoopHumanHeld is returned when a loop write would move a loop out of the
+// status a human holds it in (`looper takeover`). It is the write half of the
+// takeover hold: the claim boundary refuses to hand the loop to a lane, and this
+// refuses to let any blind read-modify-Upsert rewrite the status that boundary
+// keys on. Only the sanctioned release path
+// (LoopsRepository.UpsertReleasingHumanHold, reached from the validated
+// transition service and /handback) may clear it.
+//
+// The check is evaluated inside the writing statement, so a discovery tick that
+// read the loop before takeover committed cannot win the race by writing its
+// stale record afterwards (#162).
+var ErrLoopHumanHeld = errors.New("loop is held by human takeover")
+
+// IsLoopHumanHeldError reports whether err is the human-takeover write refusal.
+// Discovery and reconcile paths treat it as "leave this loop alone", not as a
+// failure: the human owns the loop until handback.
+func IsLoopHumanHeldError(err error) bool { return errors.Is(err, ErrLoopHumanHeld) }
 
 // ErrAgentExecutionConflict is returned when an agent_executions upsert is
 // rejected by the terminal-observation immutability guard (zero rows updated).
@@ -573,8 +593,41 @@ func (r *ProjectsRepository) Archive(ctx context.Context, id string, updatedAt s
 
 type LoopsRepository struct{ q sqliteQuerier }
 
+// Upsert writes a loop row. It refuses, with ErrLoopHumanHeld, to change the
+// status of a loop a human currently holds via `looper takeover`: writes that
+// keep the held status (metadata refreshes) still land, and every other loop is
+// unaffected.
+//
+// This is deliberately the default for all ~50 read-modify-Upsert call sites.
+// #162 was not one lane forgetting a guard, it was a full-row blind write
+// bypassing domain.AssertLoopStatusTransition; making the refusal a property of
+// the write itself means no lane can forget it and no caller has to re-read.
 func (r *LoopsRepository) Upsert(ctx context.Context, record LoopRecord) error {
-	_, err := r.q.ExecContext(ctx, `
+	return r.upsert(ctx, record, false)
+}
+
+// UpsertReleasingHumanHold is the sanctioned exit from a human hold. It is for
+// callers that have already established the authority to release it: the loops
+// service, which applies domain.AssertLoopStatusTransition (whose only
+// non-terminal edge out of human_takeover is handback's → queued), and the
+// /handback API path itself.
+func (r *LoopsRepository) UpsertReleasingHumanHold(ctx context.Context, record LoopRecord) error {
+	return r.upsert(ctx, record, true)
+}
+
+func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, releaseHumanHold bool) error {
+	// Evaluated in the writing statement, not read-then-write, so a tick that
+	// loaded the loop before takeover committed still loses this race.
+	humanHoldGuard := ""
+	if !releaseHumanHold {
+		humanHoldGuard = `
+		WHERE loops.status != ? OR excluded.status = loops.status`
+	}
+	args := []any{record.ID, record.Seq, record.ProjectID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.Status, record.ConfigJSON, record.MetadataJSON, record.LastRunAt, record.NextRunAt, record.CreatedAt, record.UpdatedAt}
+	if !releaseHumanHold {
+		args = append(args, string(domain.LoopStatusHumanTakeover))
+	}
+	result, err := r.q.ExecContext(ctx, `
 		INSERT INTO loops (id, seq, project_id, type, target_type, target_id, repo, pr_number, status, config_json, metadata_json, last_run_at, next_run_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -590,10 +643,18 @@ func (r *LoopsRepository) Upsert(ctx context.Context, record LoopRecord) error {
 			metadata_json=excluded.metadata_json,
 			last_run_at=excluded.last_run_at,
 			next_run_at=excluded.next_run_at,
-			updated_at=excluded.updated_at
-	`, record.ID, record.Seq, record.ProjectID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.Status, record.ConfigJSON, record.MetadataJSON, record.LastRunAt, record.NextRunAt, record.CreatedAt, record.UpdatedAt)
+			updated_at=excluded.updated_at`+humanHoldGuard+`
+	`, args...)
 	if err != nil {
 		return fmt.Errorf("upsert loop: %w", err)
+	}
+	if !releaseHumanHold {
+		// Zero rows can only mean the guard rejected the write: an insert always
+		// counts one, and SQLite counts a DO UPDATE even when values are identical.
+		affected, affectedErr := result.RowsAffected()
+		if affectedErr == nil && affected == 0 {
+			return fmt.Errorf("%w: loop %s (wanted status %q); run `looper handback` to release it", ErrLoopHumanHeld, record.ID, record.Status)
+		}
 	}
 
 	_, err = r.q.ExecContext(ctx, `
@@ -2671,6 +2732,38 @@ const queueLockConflictPredicate = `(
 	)
 )`
 
+// humanHoldClaimPredicate is the claim boundary's takeover hold. It is
+// deliberately target-wide, not per-item: the thing a human takes over is a
+// *worktree*, and the managed PR checkout (looper-fix-<project>-pr-<N>-detached)
+// is shared by every role that targets that PR — fixer, reviewer, PR-targeted
+// worker. Filtering only the queue item's own loop status left a sibling loop on
+// the same PR fully claimable while its sibling was human_takeover, and takeover
+// cancels the held loop's queue item so no running lock blocks it either: the
+// sibling could prepare or clean the human's checkout seconds after takeover
+// reported success (#162, whose PR carried loops of more than one role).
+//
+// Same project + same PR number is exactly the shared-worktree key; issue and
+// project targets are matched on target_id for the same reason.
+const humanHoldClaimPredicate = `NOT EXISTS (
+			SELECT 1
+			FROM loops held
+			WHERE held.status = 'human_takeover'
+				AND held.project_id = COALESCE(l.project_id, qi.project_id)
+				AND (
+					(
+						held.target_type = 'pull_request'
+						AND held.pr_number IS NOT NULL
+						AND held.pr_number = COALESCE(l.pr_number, qi.pr_number)
+					)
+					OR (
+						held.target_id IS NOT NULL
+						AND held.target_type = COALESCE(l.target_type, qi.target_type)
+						AND held.target_id = COALESCE(l.target_id, qi.target_id)
+					)
+					OR held.id = qi.loop_id
+				)
+		)`
+
 const scheduledQueueBaseQuery = `
 	SELECT qi.*
 	FROM queue_items qi
@@ -2679,11 +2772,12 @@ const scheduledQueueBaseQuery = `
 	WHERE qi.status = 'queued'
 		AND qi.available_at <= ?
 		AND (qi.project_id IS NULL OR p.archived = 0)
-		-- human_takeover is the claim boundary's hold: a human ran ` + "`looper takeover`" + `
-		-- and owns the loop's worktree until ` + "`looper handback`" + `. Filtering it only in
-		-- discovery loses to a queue item that was already materialised, so the
-		-- refusal lives here, where every role lane claims (#162).
-		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped', 'human_takeover')
+		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
+		-- The takeover hold. It lives here, at the one predicate every role lane
+		-- claims through, rather than as a per-lane guard: #162's queue item was
+		-- already materialised when takeover landed, so a discovery-side check
+		-- had nothing left to prevent.
+		AND ` + humanHoldClaimPredicate + `
 		AND (
 			qi.lock_key IS NULL
 			OR NOT EXISTS (

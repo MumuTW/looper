@@ -102,10 +102,13 @@ type stopLoopResult struct {
 }
 
 const (
-	stopOutcomeProcessSignaled = "process_signaled"
-	stopOutcomePausedOnly      = "paused_only"
-	stopOutcomeAlreadyStopping = "already_stopping"
-	stopOutcomeAlreadyFinished = "already_finished"
+	// Aliased from internal/api, which derives the operator-facing takeover
+	// wording from these values: one definition, so the report cannot drift from
+	// what the stop path actually did.
+	stopOutcomeProcessSignaled = looperdapi.RunStopOutcomeProcessSignaled
+	stopOutcomePausedOnly      = looperdapi.RunStopOutcomePausedOnly
+	stopOutcomeAlreadyStopping = looperdapi.RunStopOutcomeAlreadyStopping
+	stopOutcomeAlreadyFinished = looperdapi.RunStopOutcomeAlreadyFinished
 
 	processSkipNoRuns              = "no_running_run"
 	processSkipNoExecution         = "no_execution"

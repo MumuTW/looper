@@ -5268,6 +5268,11 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		// A taken-over loop is the human's. Rediscovery must not rewrite its status
 		// back to queued — that both re-arms the lane and erases the record of the
 		// hold, leaving handback no longer the exit it was promised to be (#162).
+		//
+		// This read is only the fast path: `existing` was loaded before takeover
+		// may have committed, so the authority is the guarded write below, which
+		// evaluates the hold inside the writing statement and returns
+		// storage.ErrLoopHumanHeld. Both funnel into the same skipped result.
 		if domain.LoopIsHumanHeld(existing.Status) {
 			return loopUpsertResult{record: *existing, created: false, skipped: true}, nil
 		}
@@ -5325,6 +5330,9 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			}
 			updatedLoop.UpdatedAt = eventlog.NextJavaScriptISOString(now, updatedLoop.UpdatedAt)
 			if err := r.repos.Loops.Upsert(ctx, updatedLoop); err != nil {
+				if storage.IsLoopHumanHeldError(err) {
+					return r.humanHeldLoopSkip(ctx, updatedLoop.ID)
+				}
 				return loopUpsertResult{}, err
 			}
 			return loopUpsertResult{record: updatedLoop, created: false, pending: true}, nil
@@ -5333,6 +5341,11 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		updatedLoop.NextRunAt = &availableAtISO
 		updatedLoop.UpdatedAt = eventlog.NextJavaScriptISOString(now, updatedLoop.UpdatedAt)
 		if err := r.repos.Loops.Upsert(ctx, updatedLoop); err != nil {
+			// A takeover committed between the read above and this write. The
+			// guard rejected the stale record; report the hold, not a failure.
+			if storage.IsLoopHumanHeldError(err) {
+				return r.humanHeldLoopSkip(ctx, updatedLoop.ID)
+			}
 			return loopUpsertResult{}, err
 		}
 		return loopUpsertResult{record: updatedLoop, created: false, availableAt: availableAt}, nil
@@ -5347,6 +5360,18 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		return loopUpsertResult{}, err
 	}
 	return loopUpsertResult{record: loop, created: true, availableAt: now}, nil
+}
+
+// humanHeldLoopSkip reports the same skipped result as the pre-write check, from
+// the persisted record. It is the landing point for the takeover-versus-discovery
+// race: the guarded write refused the tick's stale record, so the tick reports
+// the loop as held rather than failing the whole discovery pass.
+func (r *Runner) humanHeldLoopSkip(ctx context.Context, loopID string) (loopUpsertResult, error) {
+	current, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || current == nil {
+		return loopUpsertResult{skipped: true}, nil
+	}
+	return loopUpsertResult{record: *current, created: false, skipped: true}, nil
 }
 
 func (r *Runner) resumePausedZeroProgressLoopIfStateChanged(ctx context.Context, projectID, repo string, prNumber int64, headSHA, fixItemsStateHash string) error {

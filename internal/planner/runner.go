@@ -623,8 +623,7 @@ func (r *Runner) materializeIssue(ctx context.Context, project storage.ProjectRe
 	if loopResult.created {
 		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 	}
-	switch loopResult.record.Status {
-	case "paused", "completed", "awaiting_human", "failed":
+	if plannerLoopSkipsMaterialization(loopResult.record.Status) {
 		result.Skipped = 1
 		result.ProjectionAccepted = authority != "" && loopResult.authorityMatch
 		return result, nil
@@ -1747,6 +1746,12 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 		}
 	} else {
 		for _, existing := range matching {
+			// Held loops get no write at all, not even a metadata refresh: writing
+			// the preserved status back would restore it over a handback that
+			// committed since this list was read.
+			if domain.LoopIsHumanHeld(existing.Status) {
+				return loopUpsertResult{record: existing, created: false}, nil
+			}
 			pausedOrCompleted := plannerLoopParked(existing.Status)
 			updated := existing
 			updated.Repo = stringPtr(repo)
@@ -1761,6 +1766,10 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 			}
 			updated.UpdatedAt = nowISO
 			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+				// Takeover committed between the list read and this write.
+				if storage.IsLoopHumanHeldError(err) {
+					return loopUpsertResult{record: existing, created: false}, nil
+				}
 				return loopUpsertResult{}, err
 			}
 			return loopUpsertResult{record: updated, created: false}, nil
@@ -1784,6 +1793,11 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 }
 
 func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopRecord, repo string, issue IssueSummary, nowISO, currentFingerprint, authority string) (storage.LoopRecord, error) {
+	// See ensureLoopForIssueWithAuthority: a human-held loop is not refreshed at
+	// all, so a concurrent handback cannot be overwritten with the stale hold.
+	if domain.LoopIsHumanHeld(existing.Status) {
+		return existing, nil
+	}
 	pausedOrCompleted := plannerLoopParked(existing.Status)
 	updated := existing
 	updated.Repo = stringPtr(repo)
@@ -1802,9 +1816,22 @@ func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopReco
 	}
 	updated.UpdatedAt = nowISO
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+		// Takeover committed between the caller's read and this write.
+		if storage.IsLoopHumanHeldError(err) {
+			return existing, nil
+		}
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil
+}
+
+// plannerLoopSkipsMaterialization reports whether discovery must not create or
+// refresh an active planner queue item for a loop in this status. It is
+// plannerLoopParked plus failed — one list, so the two enumerations that
+// disagreed about human_takeover (preserve the status, but still enqueue for it)
+// cannot disagree again.
+func plannerLoopSkipsMaterialization(status string) bool {
+	return plannerLoopParked(status) || status == "failed"
 }
 
 // plannerLoopParked reports whether rediscovery must leave a planner loop's

@@ -689,6 +689,14 @@ func asAPIError(err error, target *apiError) bool {
 		return false
 	}
 
+	// The storage write guard refuses to move a loop out of human_takeover. It is
+	// a precondition failure, not a server fault: surface it as a conflict with
+	// the release command, wherever a loop write bubbles up.
+	if storage.IsLoopHumanHeldError(err) {
+		*target = apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: err.Error()}
+		return true
+	}
+
 	typed, ok := err.(apiError)
 	if !ok {
 		return false
@@ -5286,6 +5294,22 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 	}
 
 	services := h.context.Runtime.Services()
+	// Refuse a human-held loop before anything else: /start and /pause both
+	// rewrite the status through a blind upsert, and /start additionally clears
+	// the sticky stop gate below. Either one silently ends the hold the operator
+	// was promised, so both are refused here for every target status — only
+	// /handback releases it. Checked outside the TX so the gate is never touched.
+	if services.Repositories != nil && services.Repositories.Loops != nil {
+		heldLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if heldLoop != nil && heldLoop.Status != string(status) {
+			if err := rejectReactivationWhileHumanHeld(heldLoop.Status, loopID, loopStatusMutationVerb(status)); err != nil {
+				return loopResponse{}, err
+			}
+		}
+	}
 	if status == domain.LoopStatusRunning {
 		if services.Repositories == nil || services.Coordinator == nil {
 			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
@@ -5521,17 +5545,52 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	// lane can re-claim the loop while it stays in human_takeover, but that hold is
 	// separate from whether the human can *resume* the vendor session interactively.
 	// Conflating the two is what made the old message over-promise (#162).
-	runClause := "no run was in flight"
-	if result.RunStopped {
-		runClause = "the daemon's in-flight run was stopped"
-	}
-	hold := fmt.Sprintf("%s; the loop is parked in human_takeover and no role lane will claim it until you run `looper handback`", runClause)
+	hold := fmt.Sprintf("%s; the loop is parked in human_takeover and no role lane will claim it until you run `looper handback`", takeoverRunClause(result.RunID, result.RunStopOutcome))
 	if ok {
 		resp.Message = hold + "."
 	} else {
 		resp.Message = "Interactive takeover needs a captured session id and a supported agent (codex/claude), so there is no resume command; " + hold + "."
 	}
 	return resp, nil
+}
+
+// Run-stop outcomes reported by the daemon's stop path. Defined here, next to
+// the operator wording derived from them, so the two cannot drift: cmd/looperd
+// aliases these rather than keeping a private copy.
+const (
+	RunStopOutcomeProcessSignaled = "process_signaled"
+	RunStopOutcomePausedOnly      = "paused_only"
+	RunStopOutcomeAlreadyStopping = "already_stopping"
+	RunStopOutcomeAlreadyFinished = "already_finished"
+)
+
+// takeoverRunClause states what takeover did to the run that was in flight.
+//
+// The discriminator is runID, not "did we signal a process": the stop path
+// populates runID only when a run row was actually running, and then reports how
+// far it got. Treating every un-signalled stop as "no run was in flight" told the
+// operator nothing existed in four real cases — a run with no execution row yet,
+// an execution with no live handle, one with no PID, and one already reconciled.
+// In each of those a run *did* exist and was fenced (loop paused, spawn
+// admission closed stickily, queue item cancelled), and the human needed to know
+// that. This PR exists because a control misreported what it did; this string is
+// held to the same standard.
+func takeoverRunClause(runID, outcome string) string {
+	if strings.TrimSpace(runID) == "" {
+		return "no run was in flight"
+	}
+	switch outcome {
+	case RunStopOutcomeProcessSignaled:
+		return fmt.Sprintf("the daemon's in-flight run %s was stopped", runID)
+	case RunStopOutcomeAlreadyStopping:
+		return fmt.Sprintf("the daemon's in-flight run %s was already stopping and is now fenced", runID)
+	case RunStopOutcomeAlreadyFinished:
+		return fmt.Sprintf("the daemon's run %s had already finished; it is fenced and will not resume", runID)
+	default:
+		// paused_only with a run id: the run existed but no agent process could be
+		// signalled. Do not claim it was stopped — say it was fenced instead.
+		return fmt.Sprintf("the daemon's run %s could not be signalled (no live agent process); it is fenced and will not resume", runID)
+	}
 }
 
 // handbackLoop re-arms a taken-over loop so the daemon resumes it. It stamps the
@@ -5945,6 +6004,14 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	if preflightLoop == nil {
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 	}
+	// Reject before the sticky stop gate is cleared below: clearing it for a
+	// held loop would reopen spawn admission for the human's worktree even if
+	// the requeue then failed.
+	if !fromHandback {
+		if err := rejectReactivationWhileHumanHeld(preflightLoop.Status, loopID, "retry"); err != nil {
+			return retryLoopResponse{}, err
+		}
+	}
 	target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
 	if targetErr != nil {
 		return retryLoopResponse{}, targetErr
@@ -6168,7 +6235,13 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		}
 
 		updated := queueLoop
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		// Handback is the one sanctioned release of a human takeover hold; a
+		// direct /retry is refused above and by the guarded write below.
+		upsertLoop := repos.Loops.Upsert
+		if fromHandback {
+			upsertLoop = repos.Loops.UpsertReleasingHumanHold
+		}
+		if err := upsertLoop(ctx, updated); err != nil {
 			return retryResult{}, err
 		}
 		persisted, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord)
@@ -6585,6 +6658,40 @@ func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	status, _ := loopMeta["status"].(string)
 	return status == "terminated" || status == "stopped" || status == "failed"
+}
+
+// rejectReactivationWhileHumanHeld refuses an API reactivation of a loop a human
+// holds via `looper takeover`. /start, /pause and a direct /retry all rewrite the
+// loop status through a blind upsert; once the status is no longer
+// human_takeover the claim boundary stops applying and a lane can reach the
+// human's worktree before handback (#162).
+//
+// Only /handback releases the hold. The storage write guard
+// (storage.ErrLoopHumanHeld) is the backstop that closes the read-to-write race;
+// this exists so the operator gets the reason and the next command instead of a
+// generic conflict, and so the sticky stop gate is never cleared for a held loop.
+// loopStatusMutationVerb names the operator-facing route behind a
+// mutateLoopStatus call so a refusal reads as the command that was run.
+func loopStatusMutationVerb(status domain.LoopStatus) string {
+	switch status {
+	case domain.LoopStatusRunning:
+		return "start"
+	case domain.LoopStatusPaused:
+		return "pause"
+	default:
+		return fmt.Sprintf("set %s on", status)
+	}
+}
+
+func rejectReactivationWhileHumanHeld(status, loopID, action string) error {
+	if !domain.LoopIsHumanHeld(status) {
+		return nil
+	}
+	return apiError{
+		code:    pkgapi.ErrorCodeValidationFailed,
+		status:  http.StatusConflict,
+		message: fmt.Sprintf("Cannot %s loop %s while it is parked in human_takeover; a human owns its worktree until `looper handback` releases it", action, loopID),
+	}
 }
 
 // rejectDiscardWhileParkedForHuman refuses discard+retry when the loop is
