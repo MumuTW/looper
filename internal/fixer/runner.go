@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer/discovery"
 	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
 	"github.com/nexu-io/looper/internal/fixer/publish"
 	"github.com/nexu-io/looper/internal/fixer/reconcile"
@@ -1860,6 +1861,12 @@ func defaultDiscoveryLimit(limit int) int {
 	return limit
 }
 
+// pullRequestEligibleForDiscovery gathers the I/O-derived facts (loop
+// records, lock state) and delegates the decision to the discovery
+// authority. Fact-gathering now always performs the local lock lookup,
+// where the old inline rules skipped it for non-open or draft candidates
+// — a deliberate cost (one SQLite read on candidates the pure gates will
+// reject) taken so the precedence lives in exactly one place.
 func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID string, pr PullRequestSummary, repo, currentUser string, policy DiscoveryPolicy, loopsByPR map[int64][]storage.LoopRecord) bool {
 	candidates := []storage.LoopRecord(nil)
 	if loopsByPR != nil {
@@ -1869,13 +1876,9 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 	if manualFollowupLoop == nil && loopsByPR == nil {
 		manualFollowupLoop, _ = r.findManualFixerFollowupLoopByPR(ctx, projectID, repo, pr.Number)
 	}
-	if normalizePRState(pr.State) != "open" {
-		return false
-	}
-	if manualFollowupLoop == nil && !policy.IncludeDrafts && pr.IsDraft {
-		return false
-	}
+	facts := discovery.Facts{HasManualFollowupLoop: manualFollowupLoop != nil}
 	if r.hasActivePRLock(ctx, projectID, repo, pr.Number) {
+		facts.LockHeld = true
 		var (
 			loop *storage.LoopRecord
 			err  error
@@ -1885,23 +1888,18 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 		} else {
 			loop, err = r.findRunningFixerLoopByPR(ctx, projectID, repo, pr.Number, nil)
 		}
-		if err != nil || loop == nil {
-			return false
+		if err == nil && loop != nil {
+			facts.HasRunningLoop = true
+			facts.RunningLoopManual = isManualFixerLoop(*loop)
+			facts.RunningLoopFollowUpdates = fixerFollowUpdatesEnabled(*loop)
 		}
-		if isManualFixerLoop(*loop) && !fixerFollowUpdatesEnabled(*loop) {
-			return false
-		}
 	}
-	if manualFollowupLoop != nil {
-		return true
-	}
-	if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
-		return false
-	}
-	if !config.LabelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
-		return false
-	}
-	return true
+	return discovery.Eligible(
+		discovery.PR{State: pr.State, IsDraft: pr.IsDraft, Author: pr.Author, Labels: pr.Labels},
+		currentUser,
+		discovery.Policy{IncludeDrafts: policy.IncludeDrafts, AuthorFilter: policy.AuthorFilter, Labels: policy.Labels, LabelMode: policy.LabelMode},
+		facts,
+	)
 }
 
 func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail, result *DiscoveryResult) error {
