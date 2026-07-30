@@ -2085,7 +2085,14 @@ func TestHandlerMatchesFrozenErrorArtifactForStatusRoutes(t *testing.T) {
 }
 
 func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
-	fixture := newTestFixture(t)
+	// The frozen status artifact captures the seeded queue before a claim. Keep
+	// the asynchronous claim pump out of this snapshot; the dynamic status test
+	// separately asserts the queued/running occupancy invariant.
+	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
+		options.RunSchedulerClaim = func(context.Context, looperdruntime.Services) error {
+			return nil
+		}
+	})
 	seedStatusData(t, fixture.runtime)
 
 	routes := loadResponseArtifact(t)
