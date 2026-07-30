@@ -944,10 +944,17 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 		}
 	}
 
+	storageOK := state.OK
+	// Admission state is the authority for operational readiness.
+	// During starting/stopping/degraded, report unhealthy so load
+	// balancers and probes don't route to a daemon that can't mutate.
+	admissionOK := h.admissionStateString() == string(looperdruntime.AdmissionReady)
+	healthy := storageOK && admissionOK
+
 	startedAt := h.startedAtISO()
 
 	return healthResponse{
-		Healthy:   state.OK,
+		Healthy:   healthy,
 		StartedAt: startedAt,
 		Storage: storageHealth{
 			OK:          state.OK,
@@ -1467,7 +1474,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Healthy:           storageState.OK,
 		},
 		Scheduler: statusScheduler{
-			Healthy:        true,
+			Healthy:        h.admissionStateString() == string(looperdruntime.AdmissionReady),
 			QueuedItems:    int(queueCounts["queued"]),
 			RunningItems:   int(queueCounts["running"]),
 			CompletedItems: int(queueCounts["completed"]),

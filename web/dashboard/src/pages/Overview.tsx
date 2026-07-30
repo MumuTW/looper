@@ -343,23 +343,6 @@ export function OverviewPage({
 
   const healthData = health.data;
   const loopTotals = sumLoopCounts(status?.loops);
-  // Never default missing healthy to true / green.
-  const serviceHealthy =
-    status?.service?.healthy === true
-      ? true
-      : status?.service?.healthy === false
-        ? false
-        : sharedHealthy === true
-          ? true
-          : sharedHealthy === false
-            ? false
-            : undefined;
-  const schedulerHealthy =
-    status?.scheduler?.healthy === true
-      ? true
-      : status?.scheduler?.healthy === false
-        ? false
-        : undefined;
   const storageHealthy = (() => {
     if (healthData?.storage?.ok === false || status?.storage?.healthy === false) {
       return false;
@@ -389,18 +372,23 @@ export function OverviewPage({
         <Card title="Service">
           <dl className="m-0">
             <Kv
-              label="Healthy"
+              label="Admission"
               value={
-                serviceHealthy === undefined ? (
-                  "—"
-                ) : (
+                status?.service?.admissionState ? (
                   <span
                     style={{
-                      color: serviceHealthy ? "var(--ok)" : "var(--danger)",
+                      color:
+                        status.service.admissionState === "ready"
+                          ? "var(--ok)"
+                          : status.service.admissionState === "degraded"
+                            ? "var(--warning)"
+                            : "var(--text-muted)",
                     }}
                   >
-                    {serviceHealthy ? "yes" : "no"}
+                    {status.service.admissionState}
                   </span>
+                ) : (
+                  "—"
                 )
               }
             />
@@ -438,18 +426,18 @@ export function OverviewPage({
                 </div>
               ) : null}
               <Kv
-                label="Healthy"
+                label="Status"
                 value={
-                  schedulerHealthy === undefined ? (
-                    "—"
+                  status?.service?.admissionState === "ready" ? (
+                    <span style={{ color: "var(--ok)" }}>yes</span>
+                  ) : status?.service?.admissionState === "degraded" ? (
+                    <span style={{ color: "var(--warning)" }}>degraded</span>
+                  ) : status?.service?.admissionState === "stopping" ? (
+                    <span style={{ color: "var(--danger)" }}>stopping</span>
+                  ) : status?.service?.admissionState === "starting" ? (
+                    <span style={{ color: "var(--text-muted)" }}>starting</span>
                   ) : (
-                    <span
-                      style={{
-                        color: schedulerHealthy ? "var(--ok)" : "var(--danger)",
-                      }}
-                    >
-                      {schedulerHealthy ? "yes" : "no"}
-                    </span>
+                    "—"
                   )
                 }
               />

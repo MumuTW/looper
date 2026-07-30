@@ -135,6 +135,7 @@ export type StatusData = {
     version?: string;
     daemonMode?: string;
     startedAt?: string;
+    admissionState?: string;
   };
   scheduler?: {
     healthy?: boolean;
