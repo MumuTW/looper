@@ -747,6 +747,20 @@ type pendingFixerRediscoveryState struct {
 type FixerRunOutcome struct {
 	PrimaryFailure  *FixerOutcomeFailure  `json:"primaryFailure,omitempty"`
 	SecondaryIssues []FixerOutcomeFailure `json:"secondaryIssues,omitempty"`
+	Progress        FixerDurableProgress  `json:"progress"`
+	// PartialSuccess marks a failed run that nonetheless left durable effects, so an
+	// operator can tell "nothing happened, retry freely" from "some of this shipped".
+	PartialSuccess bool `json:"partialSuccess,omitempty"`
+}
+
+// FixerDurableProgress counts only effects that outlived the run: commits made,
+// a push that landed, replies sent, threads resolved. Heartbeats and attempts are
+// not progress -- nothing here is inferred from the agent having run.
+type FixerDurableProgress struct {
+	CommitProduced  bool `json:"commitProduced,omitempty"`
+	Pushed          bool `json:"pushed,omitempty"`
+	RepliesSent     int  `json:"repliesSent,omitempty"`
+	ThreadsResolved int  `json:"threadsResolved,omitempty"`
 }
 
 // FixerOutcomeFailure is one recorded failure. Retryable is a pointer so "not
@@ -1299,13 +1313,19 @@ func DeriveRunOutcome(run storage.RunRecord) *FixerRunOutcome {
 		// were terminated without passing through a failure-classification site.
 		if runStatusIsFailure(run.Status) && checkpoint.Outcome.PrimaryFailure == nil {
 			checkpoint.Outcome.PrimaryFailure = backfilledPrimaryFailure(run, checkpoint)
+			// Stored progress stays authoritative; only the derived flag is filled in.
+			checkpoint.Outcome.PartialSuccess = outcomeHasDurableProgress(checkpoint.Outcome.Progress)
 		}
 		return checkpoint.Outcome
 	}
 	if !runStatusIsFailure(run.Status) {
 		return nil
 	}
-	return &FixerRunOutcome{PrimaryFailure: backfilledPrimaryFailure(run, checkpoint)}
+	// No stored outcome: reconstruct progress from the checkpoint's own evidence so a
+	// historical run still reports what it accomplished.
+	checkpoint.refreshOutcomeProgress()
+	checkpoint.Outcome.PrimaryFailure = backfilledPrimaryFailure(run, checkpoint)
+	return checkpoint.Outcome
 }
 
 // backfilledPrimaryFailure reconstructs a failure from the run record for historical runs
@@ -1350,6 +1370,96 @@ func runStatusIsFailure(status string) bool {
 	default:
 		return false
 	}
+}
+
+// refreshOutcomeProgress recomputes durable progress from the checkpoint.
+//
+// Every source is filtered through outcomeEvidenceInCurrentRun, so a retry reports
+// what *it* accomplished rather than inheriting its predecessor's commits and
+// pushes. Without that filter a retry of a run that had already pushed would report
+// a push it never made, and "partial success" would stop meaning anything.
+func (checkpoint *fixerCheckpoint) refreshOutcomeProgress() {
+	if checkpoint.Outcome == nil {
+		checkpoint.Outcome = &FixerRunOutcome{}
+	}
+	progress := FixerDurableProgress{}
+	if checkpoint.ReconcileCommits != nil && checkpoint.outcomeEvidenceInCurrentRun(checkpoint.ReconcileCommits.CompletedAt) {
+		progress.CommitProduced = len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0
+	}
+	if checkpoint.Push != nil && checkpoint.outcomeEvidenceInCurrentRun(checkpoint.Push.PushedAt) {
+		progress.Pushed = checkpoint.Push.Pushed
+	}
+	if checkpoint.ResolvedComments != nil {
+		for _, item := range checkpoint.ResolvedComments.Items {
+			if !checkpoint.outcomeEvidenceInCurrentRun(item.UpdatedAt) {
+				continue
+			}
+			if item.ReplyState == "sent" {
+				progress.RepliesSent++
+			}
+			if item.Status == "resolved" || item.Status == "agent_declined" {
+				progress.ThreadsResolved++
+			}
+		}
+	}
+	checkpoint.Outcome.Progress = progress
+	checkpoint.Outcome.PartialSuccess = outcomeHasDurableProgress(progress)
+}
+
+// outcomeEvidenceInCurrentRun reports whether an effect observed at observedAt
+// belongs to this run rather than a predecessor.
+//
+// The baseline is the run's own start. A checkpoint with no baseline predates that
+// bookkeeping, and there the honest answer is to count the evidence rather than
+// discard it -- an unattributable effect still happened. An effect with no timestamp
+// is not counted, because the one thing we must not do is credit the current run for
+// something we cannot place in it.
+func (checkpoint fixerCheckpoint) outcomeEvidenceInCurrentRun(observedAt string) bool {
+	baseline := firstNonEmpty(checkpoint.RunStartedAt, checkpoint.RunPreStartAt)
+	if baseline == "" {
+		return true
+	}
+	if strings.TrimSpace(observedAt) == "" {
+		return false
+	}
+	observed, observedErr := time.Parse(time.RFC3339Nano, observedAt)
+	started, startedErr := time.Parse(time.RFC3339Nano, baseline)
+	if observedErr == nil && startedErr == nil {
+		return !observed.Before(started)
+	}
+	// Both timestamps are written by the same ISO formatter, so a lexical compare is
+	// a sound fallback when one fails to parse.
+	return observedAt >= baseline
+}
+
+func outcomeHasDurableProgress(progress FixerDurableProgress) bool {
+	return progress.CommitProduced || progress.Pushed || progress.RepliesSent > 0 || progress.ThreadsResolved > 0
+}
+
+// mergeProgressFrom carries newer in-memory evidence onto a checkpoint reloaded from
+// storage, so a run that completed effects and then failed to persist them does not
+// report zero progress. Newest-wins per source, compared on each source's own
+// timestamp.
+func (checkpoint *fixerCheckpoint) mergeProgressFrom(inMemory fixerCheckpoint) {
+	if inMemory.ReconcileCommits != nil && (checkpoint.ReconcileCommits == nil || inMemory.ReconcileCommits.CompletedAt >= checkpoint.ReconcileCommits.CompletedAt) {
+		checkpoint.ReconcileCommits = inMemory.ReconcileCommits
+	}
+	if inMemory.Push != nil && (checkpoint.Push == nil || inMemory.Push.PushedAt >= checkpoint.Push.PushedAt) {
+		checkpoint.Push = inMemory.Push
+	}
+	if inMemory.ResolvedComments != nil && (checkpoint.ResolvedComments == nil || latestResolvedCommentUpdatedAt(inMemory.ResolvedComments.Items) >= latestResolvedCommentUpdatedAt(checkpoint.ResolvedComments.Items)) {
+		checkpoint.ResolvedComments = inMemory.ResolvedComments
+	}
+}
+
+func latestResolvedCommentUpdatedAt(items []checkpointResolvedComment) string {
+	latest := ""
+	for _, item := range items {
+		if trimmed := strings.TrimSpace(item.UpdatedAt); trimmed > latest {
+			latest = trimmed
+		}
+	}
+	return latest
 }
 
 // recordFailure appends a failure to the run's outcome, first-write-wins.
@@ -2318,7 +2428,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		failure := r.classifyFailure(retErr)
 		latest := r.getLatestCheckpoint(context.Background(), run, checkpoint)
+		// The reloaded checkpoint can be older than what this run achieved in memory.
+		latest.mergeProgressFrom(checkpoint)
 		latest.recordFailure(asFixerStep(derefString(persisted.CurrentStep)), failure)
+		latest.refreshOutcomeProgress()
 		latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 		completed, err := r.completeRun(context.Background(), *persisted, "failed", failure.message, failure.message, latest)
 		if err != nil {
@@ -2373,6 +2486,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		failure := r.classifyFailure(err)
 		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 		latest.recordFailure(resumedRun.StartStep, failure)
+		latest.refreshOutcomeProgress()
 		// createRunContext sets a resumed checkpoint's policy to
 		// advance_from_checkpoint, so NormalizeResumePolicy would preserve that
 		// nonempty advance policy and leave the failed run ineligible for
@@ -2519,6 +2633,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			failure := r.classifyFailureWithBoundary(err, failurepolicy.BoundaryForStep(string(step)))
 			latest := checkpoint
 			latest.recordFailure(step, failure)
+			latest.refreshOutcomeProgress()
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
