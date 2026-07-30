@@ -62,11 +62,10 @@ authority, and they do not run concurrently for one Project.
 _Avoid_: assessment.
 
 **Triage Report**:
-Triager's durable structured record containing classification, scope, risk,
-confidence, missing information, recommended next Role, rationale, the source
-Issue event, idempotency key, and policy outcome. It is stored as a
-`triage.report` event and is the semantic Authority for automatic Planner
-routing. GitHub labels may project its outcome but cannot replace it.
+Defined at `triager.ReportEventType` in `internal/triager`, whose doc comment
+carries the semantics: Triager's durable structured record, stored as a
+`triage.report` event, and the semantic Authority for automatic Planner
+routing.
 _Avoid_: routing label, inferred issue state.
 
 **Triage enrollment**:
@@ -87,7 +86,9 @@ collaborator with write access.
 _Avoid_: Dispatch (reserved for Coordinator).
 
 **Disposition**:
-Coordinator's high-level conclusion about an Issue. One of `valid`, `out-of-scope`, `unclear`. Distinct from `kind`/`area`/`complexity`, which are classification labels applied only when the Disposition is `valid`.
+Defined at `internal/coordinator/triage.Disposition`, whose doc comment carries
+the semantics: the high-level conclusion (`valid` / `out-of-scope` / `unclear`),
+distinct from the classification labels applied only when `valid`.
 _Avoid_: verdict, outcome, status.
 
 **Dispatch**:
@@ -120,10 +121,14 @@ The Looper-only constraint identifying which PRs Looper may opt into auto-merge:
 The GitHub-native state of a Pull Request after `gh pr merge --auto` has been called and before GitHub merges or a **Veto signal** arrives. The PR's `auto_merge` field is non-null in this state. Coordinator's merge-watch classifies merge-pending PRs into WatchActions.
 
 **Watch marker**:
-The `<!-- looper:coordinator:merge-watch retries=N -->` HTML-comment marker Coordinator places on the linked Issue rather than the PR, keeping Coordinator's state rooted on the Issue, to carry merge-watch retry-counter state across ticks. Public, durable, idempotent — preserves ADR-0001's stateless property.
+Defined at `internal/coordinator/mergewatch.PriorWatchMarker`, whose doc
+comment carries the semantics: the Issue-rooted HTML-comment marker that
+carries merge-watch retry-counter state across ticks.
 
 **Gate report**:
-The durable `pull_request.merge_gate.evaluated` event written by Merge Gatekeeper. It records `eligible` or `blocked`, stable reasons and evidence, and the observed head SHA. It is audit evidence, not merge authority: a future merge path must rerun every gate immediately before merging because holds, reviews, threads, and Project policy can change without moving the head.
+Defined at `gatekeeper.GateReportEventType` in `internal/gatekeeper`, whose doc
+comment carries the semantics: Merge Gatekeeper's durable evaluation event —
+audit evidence, not merge authority.
 
 ### Authority and statelessness
 
@@ -191,6 +196,7 @@ _Avoid_: local sandbox, mock sandbox.
 
 ## Flagged ambiguities
 
+- **Disposition (name collision)** — `criteria.AggregateDisposition` (pass/fail/unverifiable) and `depgraph`'s blocker disposition reuse the word for unrelated concepts; only `internal/coordinator/triage.Disposition` is the glossary's Disposition. Qualify on first use anywhere the packages meet.
 - **classification** — used by humans to mean both Disposition and the kind/area labels. Resolved: Disposition is the high-level conclusion (`valid` / `out-of-scope` / `unclear`); kind/area/complexity are classification *labels* applied during a `valid` Triage. The unqualified word "classification" is avoided in favor of "Disposition" or "label".
 - **handoff** — already used in code (`authoritative handoff fields`) for the PR-seed contract between Reviewer and Fixer. Not used for Coordinator's Dispatch action, which is a different concept. Use "Dispatch" exclusively for the Coordinator action.
 - **manager / commander / maintainer** — early names considered for the Coordinator Role. Rejected: "manager" implies it directs other Roles (it doesn't, it sets labels), "commander" overpromises authority, "maintainer" is a human role.

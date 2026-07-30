@@ -23,7 +23,13 @@ import (
 )
 
 const (
-	EnrollmentEventType   = "triage.enrolled"
+	EnrollmentEventType = "triage.enrolled"
+	// ReportEventType is the Triage Report: Triager's durable structured
+	// record of classification, scope, risk, confidence, missing information,
+	// recommended next Role, rationale, the source Issue event, idempotency
+	// key, and policy outcome. It is the semantic Authority for automatic
+	// Planner routing; GitHub labels may project its outcome but cannot
+	// replace it.
 	ReportEventType       = "triage.report"
 	ConfirmationEventType = "triage.confirmed"
 	ProjectionEventType   = "triage.routed"
