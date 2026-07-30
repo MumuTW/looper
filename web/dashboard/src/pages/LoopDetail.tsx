@@ -12,6 +12,7 @@ import { PanelError } from "@/components/PanelError";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { formatPrimaryFailure } from "@/lib/fixerOutcome";
 import {
   fetchLoop,
   openLoopLogsStream,
@@ -407,6 +408,11 @@ export function LoopDetailPage() {
   const activeRunItems = activeRuns.data?.items;
   const forceRefreshActiveRuns = activeRuns.forceRefresh;
 
+  const primaryFailure = useMemo(
+    () => formatPrimaryFailure(data?.outcome),
+    [data?.outcome],
+  );
+
   const hasActiveRun = useMemo(() => {
     if (!data) return false;
     const items = activeRunItems ?? [];
@@ -503,6 +509,23 @@ export function LoopDetailPage() {
                   data.lastFailureReason?.trim() ? (
                     <span className="whitespace-pre-wrap break-words">
                       {data.lastFailureReason.trim()}
+                    </span>
+                  ) : (
+                    "—"
+                  )
+                }
+              />
+              {/*
+                The row above is the latest error from the queue. This one is the
+                first, causal failure from the run, which differs exactly when a
+                later problem piled on top of the real cause.
+              */}
+              <Kv
+                label="First failure"
+                value={
+                  primaryFailure ? (
+                    <span className="whitespace-pre-wrap break-words">
+                      {primaryFailure}
                     </span>
                   ) : (
                     "—"

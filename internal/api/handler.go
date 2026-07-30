@@ -1818,6 +1818,9 @@ type loopResponse struct {
 	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
 	LastFailureKind   *string `json:"lastFailureKind,omitempty"`
 	LastFailureReason *string `json:"lastFailureReason,omitempty"`
+	// Outcome is the latest run's derived outcome, so a loop view shows what that
+	// run actually accomplished rather than only that it failed.
+	Outcome *fixer.FixerRunOutcome `json:"outcome,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -1915,6 +1918,9 @@ type runResponse struct {
 	EndedAt           *string `json:"endedAt"`
 	CreatedAt         string  `json:"createdAt"`
 	UpdatedAt         string  `json:"updatedAt"`
+	// Outcome is derived at read time rather than stored, so runs recorded before
+	// the fixer wrote outcomes still report their failure story.
+	Outcome *fixer.FixerRunOutcome `json:"outcome,omitempty"`
 }
 
 type activeRunsListResponse struct {
@@ -3405,6 +3411,9 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord) {
 	if view == nil {
 		return
+	}
+	if latestRun != nil {
+		view.Outcome = fixer.DeriveRunOutcome(*latestRun)
 	}
 	if latestQueue != nil {
 		attempts := latestQueue.Attempts
@@ -6330,6 +6339,7 @@ func serializeRun(run storage.RunRecord) runResponse {
 		EndedAt:           run.EndedAt,
 		CreatedAt:         run.CreatedAt,
 		UpdatedAt:         run.UpdatedAt,
+		Outcome:           fixer.DeriveRunOutcome(run),
 	}
 }
 
