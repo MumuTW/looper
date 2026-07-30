@@ -16,6 +16,18 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func waitForWebhookCondition(t *testing.T, timeout time.Duration, predicate func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if predicate() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for condition")
+}
+
 func TestSchedulerFullPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {
 	t.Parallel()
 

@@ -457,14 +457,13 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		result.Skipped++
 		return nil
 	}
-	currentSource, matches, err := r.sourceStillCurrent(ctx, repo, project.RepoPath, detail, enrollment)
+	_, matches, err := r.sourceStillCurrent(ctx, repo, project.RepoPath, detail, enrollment)
 	if err != nil {
 		return err
 	}
 	if !matches {
 		return r.retireSource(ctx, state, "source_superseded", result)
 	}
-	detailSource := currentSource
 	report := state.report
 	if report == nil {
 		// The per-runner limit is checked first because it is this project's own
@@ -501,11 +500,10 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 			return r.retireSource(ctx, state, "source_superseded", result)
 		}
 		detail = refreshed
-		detailSource = refreshedSource
 		created := r.now().UTC().Format(time.RFC3339Nano)
 		value := Report{
 			Version: 2, IdempotencyKey: enrollment.IdempotencyKey, ProjectID: enrollment.ProjectID, Repo: enrollment.Repo,
-			IssueNumber: enrollment.IssueNumber, Source: detailSource, Decision: decision,
+			IssueNumber: enrollment.IssueNumber, Source: refreshedSource, Decision: decision,
 			Policy: validateDecision(decision), CreatedAt: created,
 		}
 		if value.Policy.Action == ActionAwaitHuman {

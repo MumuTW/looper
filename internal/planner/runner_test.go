@@ -17,6 +17,10 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func (r *Runner) ensureLoopForIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentFingerprint string) (loopUpsertResult, error) {
+	return r.ensureLoopForIssueWithAuthority(ctx, project, repo, issue, currentFingerprint, "")
+}
+
 func TestBuildPlannerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 	t.Parallel()
 

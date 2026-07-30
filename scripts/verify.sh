@@ -2,7 +2,8 @@
 # Local mirror of CI's blocking gates — run this before you push and CI won't
 # surprise you. Covers .github/workflows/ci.yml's `verify` and `race` jobs:
 #   optional gofmt -w → dashboard (pnpm install/test/build + artifact checks)
-#   → gofmt -l  →  go vet  →  go test  →  go test -race (focused)
+#   → gofmt -l  →  go vet  →  production-only staticcheck  →  go test
+#   → go test -race (focused)
 #   → go build (with release ldflags)
 #
 # The remaining ci.yml jobs (contract/invariant smoke and the conditional E2E
@@ -71,6 +72,12 @@ echo "  clean"
 
 step "go vet ./..."
 go vet ./...
+
+step "staticcheck (production-only unreachable code)"
+go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 \
+  -tests=false \
+  -checks='U1000,SA1006,SA4004,SA4006' \
+  ./...
 
 step "go test ./..."
 go test ./...

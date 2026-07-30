@@ -568,14 +568,6 @@ func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
 	}
 }
 
-// cancelWorkProducers aborts in-flight scheduler ticks, deferred recovery,
-// worktree cleanup, and (for process-exit paths) webhook discovery. Prefer
-// invokeForDegrade vs invokeForShutdown at the call site: sticky degrade must
-// not CancelExecute accepted webhook work.
-func (r *Runtime) cancelWorkProducers() {
-	r.snapshotWorkProducerCancels().invokeForShutdown()
-}
-
 // StorageRetained reports whether Stop skipped SQLite close after a drain
 // failure (ADR-0015 / #577). Operators must not treat stop as graceful success.
 func (r *Runtime) StorageRetained() bool {
@@ -2178,15 +2170,6 @@ func compactStrings(values []string) []string {
 	return compacted
 }
 
-func runtimeNativeResumeSupported(vendor string) bool {
-	switch config.AgentVendor(vendor) {
-	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI:
-		return true
-	default:
-		return false
-	}
-}
-
 func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway, now time.Time) (int64, error) {
 	if repositories == nil || githubGateway == nil {
 		return 0, nil
@@ -2994,45 +2977,6 @@ func (r *Runtime) appendExecutionLivenessEvent(ctx context.Context, repositories
 	return true, nil
 }
 
-func (r *Runtime) markRecoveredExecutionTerminal(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, pid int, nowISO string, message string) error {
-	// Retained for any non-recovery callers; startup recovery must not use this
-	// to invent cleanliness from raw PID probes (#575).
-	cleaned := execution
-	cleaned.Status = "killed"
-	if cleaned.ErrorMessage == nil {
-		cleaned.ErrorMessage = stringPtr(message)
-	}
-	if r.Config().Agent.NativeResume.Enabled && runtimeNativeResumeSupported(cleaned.Vendor) && cleaned.NativeSessionID != nil && strings.TrimSpace(*cleaned.NativeSessionID) != "" {
-		cleaned.NativeResumeMode = stringPtr("native_resume")
-		cleaned.NativeResumeStatus = stringPtr("pending")
-		if r.logger != nil {
-			r.logger.Info("agent execution eligible for native resume", map[string]any{"executionId": execution.ID, "runId": execution.RunID, "vendor": execution.Vendor})
-		}
-	} else if r.logger != nil {
-		r.logger.Info("agent execution will restart from checkpoint", map[string]any{"executionId": execution.ID, "runId": execution.RunID, "vendor": execution.Vendor})
-	}
-	cleaned.EndedAt = stringPtr(nowISO)
-	cleaned.UpdatedAt = nowISO
-	if err := repositories.AgentExecutions.Upsert(ctx, cleaned); err != nil {
-		return err
-	}
-	payload := map[string]any{"recoveredAt": nowISO}
-	if pid > 0 {
-		payload["pid"] = pid
-	}
-	return appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-		ID:          newRuntimeEventID(),
-		EventType:   "agent.killed",
-		ProjectID:   execution.ProjectID,
-		LoopID:      execution.LoopID,
-		RunID:       execution.RunID,
-		EntityType:  stringPtr("agent_execution"),
-		EntityID:    stringPtr(execution.ID),
-		PayloadJSON: mustMarshalJSON(payload),
-		CreatedAt:   nowISO,
-	})
-}
-
 // quarantineRecoveryEvidence parks work tied to uncertain/orphan execution
 // evidence using existing manual_intervention / paused states. It does not
 // signal processes or mark agent_executions terminal.
@@ -3203,21 +3147,6 @@ func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Reposito
 	}
 	_, _, err = repositories.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord)
 	return err
-}
-
-func shouldInterruptStaleRunningRun(run storage.RunRecord, latestRun *storage.RunRecord, hasActiveAgent bool, hasUncertainAgent bool) bool {
-	if run.Status != string(domain.RunStatusRunning) {
-		return false
-	}
-	if latestRun == nil || latestRun.ID != run.ID {
-		return true
-	}
-	if hasActiveAgent || hasUncertainAgent {
-		return false
-	}
-	// Recovery runs during daemon startup, so a persisted running run without an
-	// active agent execution is orphaned regardless of loop status or heartbeat.
-	return true
 }
 
 func interruptRecoveryRun(ctx context.Context, repositories *storage.Repositories, run storage.RunRecord, loop storage.LoopRecord, nowISO string, message string) error {
@@ -3473,101 +3402,6 @@ func executionProcessBirth(execution storage.AgentExecutionRecord) (processident
 	}, true
 }
 
-func expectedExecutionCommandTokens(execution storage.AgentExecutionRecord) ([]string, error) {
-	if execution.CommandJSON == nil || strings.TrimSpace(*execution.CommandJSON) == "" {
-		return nil, fmt.Errorf("missing execution command metadata")
-	}
-	var payload struct {
-		Command string   `json:"command"`
-		Args    []string `json:"args"`
-	}
-	if err := json.Unmarshal([]byte(*execution.CommandJSON), &payload); err != nil {
-		return nil, fmt.Errorf("parse execution command metadata: %w", err)
-	}
-	if strings.TrimSpace(payload.Command) == "" {
-		return nil, fmt.Errorf("missing execution command")
-	}
-	tokens := make([]string, 0, len(payload.Args)+1)
-	tokens = append(tokens, payload.Command)
-	tokens = append(tokens, payload.Args...)
-	return tokens, nil
-}
-
-func commandPrefixMatches(expected, actual []string) bool {
-	if len(expected) == 0 || len(actual) == 0 {
-		return false
-	}
-	if filepath.Base(expected[0]) != filepath.Base(actual[0]) {
-		return false
-	}
-	if len(expected) == 1 {
-		return true
-	}
-	if len(actual) < len(expected)-1 {
-		return false
-	}
-	for i := 1; i < len(expected)-1; i++ {
-		if !processCommandTokenMatches(expected[i], actual[i]) {
-			return false
-		}
-	}
-	actualTail := strings.Join(actual[len(expected)-1:], " ")
-	expectedTail := expected[len(expected)-1]
-	return processCommandTokenMatches(expectedTail, actualTail)
-}
-
-func processCommandTokenMatches(expected, actual string) bool {
-	return expected == actual
-}
-
-func splitProcessCommand(command string) []string {
-	command = strings.TrimSpace(command)
-	if command == "" {
-		return nil
-	}
-
-	tokens := make([]string, 0)
-	var current strings.Builder
-	var quote rune
-	escaped := false
-
-	flush := func() {
-		if current.Len() == 0 {
-			return
-		}
-		tokens = append(tokens, current.String())
-		current.Reset()
-	}
-
-	for _, r := range command {
-		if escaped {
-			current.WriteRune(r)
-			escaped = false
-			continue
-		}
-
-		switch {
-		case r == '\\' && quote != 0:
-			escaped = true
-		case quote != 0:
-			if r == quote {
-				quote = 0
-				continue
-			}
-			current.WriteRune(r)
-		case r == '\'' || r == '"':
-			quote = r
-		case r == ' ' || r == '\t' || r == '\n':
-			flush()
-		default:
-			current.WriteRune(r)
-		}
-	}
-
-	flush()
-	return tokens
-}
-
 func defaultReadProcessCommand(ctx context.Context, pid int) (string, error) {
 	cmd := exec.CommandContext(ctx, "ps", "-p", fmt.Sprintf("%d", pid), "-o", "command=")
 	output, err := cmd.Output()
@@ -3597,19 +3431,6 @@ func defaultReadProcessBootID(ctx context.Context, _ int) (string, error) {
 
 func defaultSignalProcess(pid int, signal syscall.Signal) error {
 	return syscall.Kill(pid, signal)
-}
-
-func (r *Runtime) signalAgentProcessGroup(pid int, signal syscall.Signal) error {
-	if r.signalProcess == nil {
-		return nil
-	}
-	if err := r.signalProcess(-pid, signal); err != nil {
-		if !errors.Is(err, syscall.ESRCH) {
-			return err
-		}
-		return r.signalProcess(pid, signal)
-	}
-	return nil
 }
 
 func createEmptyRecoverySummary() RecoverySummary {

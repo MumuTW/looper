@@ -261,25 +261,6 @@ func containsConfigPath(paths []string, target string) bool {
 	return false
 }
 
-func validateConfiguredToolPath(path *string, field string) error {
-	if isNilOrEmptyString(path) {
-		return nil
-	}
-	value := strings.TrimSpace(*path)
-	if !filepath.IsAbs(value) && !strings.ContainsRune(value, os.PathSeparator) {
-		return nil
-	}
-	info, err := os.Stat(value)
-	if err == nil && !info.IsDir() {
-		return nil
-	}
-	message := "must reference an existing executable file"
-	if err == nil && info.IsDir() {
-		message = "must reference a file, not a directory"
-	}
-	return &ConfigValidationError{Issues: []ValidationIssue{{Path: field, Message: message}}}
-}
-
 func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial PartialConfig) {
 	if config == nil || partial.Roles == nil || partial.Roles.Reviewer == nil {
 		return
@@ -1684,14 +1665,6 @@ func ensureDaemonConfig(partial *PartialConfig) *PartialDaemonConfig {
 	}
 
 	return partial.Daemon
-}
-
-func ensurePackageConfig(partial *PartialConfig) *PartialPackageConfig {
-	if partial.Package == nil {
-		partial.Package = &PartialPackageConfig{}
-	}
-
-	return partial.Package
 }
 
 func ensureDefaultsConfig(partial *PartialConfig) *PartialDefaultsConfig {

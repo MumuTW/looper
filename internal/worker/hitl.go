@@ -212,52 +212,6 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor 
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
-// finalizeCompletedHumanInboxTurn completes the loop or re-arms the completed
-// queue item for a survivor. It runs after Queue.Complete: requeueing while the
-// old item is still running cannot create an eligible follow-up claim.
-func (r *Runner) finalizeCompletedHumanInboxTurn(ctx context.Context, loopID, queueID string) (bool, error) {
-	if r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil {
-		return false, nil
-	}
-	unlock := loops.LockLoopRequeue(loopID)
-	defer unlock()
-
-	fresh, err := r.repos.Loops.GetByID(ctx, loopID)
-	if err != nil || fresh == nil {
-		return false, err
-	}
-	// A terminal operator action wins over the agent result. It must not be
-	// reopened merely because a late human message exists.
-	if fresh.Status != "running" {
-		return false, nil
-	}
-	unlockTarget := loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*fresh))
-	defer unlockTarget()
-
-	nowISO := r.nowISO()
-	if r.hitlEnabled && len(loops.ReadHumanInbox(fresh.MetadataJSON)) > 0 {
-		requeued, err := r.repos.Queue.RequeueCompletedByID(ctx, loopID, queueID, nowISO)
-		if err != nil {
-			return false, err
-		}
-		if requeued == 0 {
-			return false, fmt.Errorf("requeue completed queue item %s for loop %s: no eligible completed item", queueID, loopID)
-		}
-		fresh.Status = "queued"
-		fresh.NextRunAt = &nowISO
-		fresh.UpdatedAt = nowISO
-		if err := r.repos.Loops.Upsert(ctx, *fresh); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	fresh.Status = "completed"
-	fresh.NextRunAt = nil
-	fresh.LastRunAt = stringPtr(nowISO)
-	fresh.UpdatedAt = nowISO
-	return false, r.repos.Loops.Upsert(ctx, *fresh)
-}
-
 // acknowledgePostTurnMetadata serializes every post-turn metadata mutation
 // with free-text enqueue. A single fresh read and upsert avoids one mutation
 // restoring metadata that an earlier mutation had just preserved.

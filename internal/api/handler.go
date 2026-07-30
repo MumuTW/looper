@@ -2030,16 +2030,6 @@ type activeRunWorktree struct {
 	Branch *string `json:"branch"`
 }
 
-type stopLoopInput struct {
-	LoopID string
-	Reason string
-}
-
-type stopLoopResponse struct {
-	Stopped bool   `json:"stopped"`
-	LoopID  string `json:"loopId"`
-}
-
 type projectService interface {
 	List(context.Context) ([]storage.ProjectRecord, error)
 	AddProject(context.Context, projects.AddInput) (projects.AddResult, error)
@@ -2990,9 +2980,9 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 
-	queueItems := make([]storage.QueueItemRecord, 0)
-	loopsList := make([]storage.LoopRecord, 0)
-	latestRunsByLoopID := map[string]*storage.RunRecord{}
+	var queueItems []storage.QueueItemRecord
+	var loopsList []storage.LoopRecord
+	var latestRunsByLoopID map[string]*storage.RunRecord
 	if includeInactiveLoops {
 		queueItems, err = services.Repositories.Queue.List(ctx)
 		if err != nil {
@@ -5275,11 +5265,6 @@ func (h *Handler) maybeFindPlannerLoopForIssue(ctx context.Context, input findPl
 	return nil, nil
 }
 
-func (h *Handler) isPlannerPullRequestOpen(ctx context.Context, projectID, repo string, prNumber int64) bool {
-	isOpen, known, err := h.getPlannerPullRequestOpenState(ctx, projectID, repo, prNumber)
-	return err == nil && known && isOpen
-}
-
 func (h *Handler) getPlannerPullRequestOpenState(ctx context.Context, projectID, repo string, prNumber int64) (bool, bool, error) {
 	if prNumber <= 0 {
 		return false, true, nil
@@ -7314,10 +7299,6 @@ func stringPtrOrNil(value string) *string {
 	return &trimmed
 }
 
-func isCodingAgentConfigured(cfg config.Config) bool {
-	return config.AnyCodingRoleAgentConfigured(cfg)
-}
-
 func isCodingRoleAgentConfigured(cfg config.Config, role string) bool {
 	return config.CodingRoleAgentConfigured(cfg, role)
 }
@@ -7589,14 +7570,6 @@ func stringMetadataPtr(metadata map[string]any, key string) *string {
 
 	result := text
 	return &result
-}
-
-func stringFromAnyDefault(value any) string {
-	text, ok := value.(string)
-	if !ok {
-		return ""
-	}
-	return text
 }
 
 func normalizeOptionalString(value *string) *string {

@@ -146,92 +146,6 @@ func TestTrustedManualReviewerRunRequiresMatchingManualLoop(t *testing.T) {
 	}
 }
 
-func TestReviewSubmitFollowUpHasNewHead(t *testing.T) {
-	t.Parallel()
-
-	followUpMeta := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","loop":{"enabled":true}}`
-	if !reviewSubmitFollowUpHasNewHead(&followUpMeta, "new-head") {
-		t.Fatal("reviewSubmitFollowUpHasNewHead(follow-up new head) = false, want true")
-	}
-	if reviewSubmitFollowUpHasNewHead(&followUpMeta, "old-head") {
-		t.Fatal("reviewSubmitFollowUpHasNewHead(same head) = true, want false")
-	}
-	disabledFollow := `{"followUpdates":false,"lastPublishedHeadSha":"old-head","loop":{"enabled":true}}`
-	if reviewSubmitFollowUpHasNewHead(&disabledFollow, "new-head") {
-		t.Fatal("reviewSubmitFollowUpHasNewHead(followUpdates false) = true, want false")
-	}
-	loopDisabled := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","loop":{"enabled":false}}`
-	if reviewSubmitFollowUpHasNewHead(&loopDisabled, "new-head") {
-		t.Fatal("reviewSubmitFollowUpHasNewHead(loop.enabled false) = true, want false")
-	}
-	noPublished := `{"followUpdates":true,"loop":{"enabled":true}}`
-	if reviewSubmitFollowUpHasNewHead(&noPublished, "new-head") {
-		t.Fatal("reviewSubmitFollowUpHasNewHead(no lastPublishedHeadSha) = true, want false")
-	}
-}
-
-func TestTrustedFollowUpNewHeadReviewRequestBypass(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
-	if err != nil {
-		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
-	}
-	t.Cleanup(func() { _ = coordinator.Close() })
-	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
-		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
-	}
-	repos := storage.NewRepositories(coordinator.DB())
-	now := "2026-04-11T12:00:00.000Z"
-	repo := "acme/looper"
-	prNumber := int64(42)
-	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", CreatedAt: now, UpdatedAt: now}); err != nil {
-		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
-	}
-	followUpMeta := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","loop":{"enabled":true}}`
-	sameHeadMeta := `{"followUpdates":true,"lastPublishedHeadSha":"new-head","loop":{"enabled":true}}`
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_followup", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &followUpMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
-		t.Fatalf("Loops.Upsert(loop_followup) error = %v", err)
-	}
-	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_followup", LoopID: "loop_followup", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
-		t.Fatalf("Runs.Upsert(run_followup) error = %v", err)
-	}
-
-	// Automatic follow-up prompts do not pass --reviewer-run-id; resolve via current run.
-	bypass, err := trustedCurrentFollowUpNewHeadReviewerBypass(context.Background(), repos, repo, prNumber, "new-head")
-	if err != nil || !bypass {
-		t.Fatalf("trustedCurrentFollowUpNewHeadReviewerBypass(new head) = %v, %v; want true, nil", bypass, err)
-	}
-	bypass, err = trustedCurrentFollowUpNewHeadReviewerBypass(context.Background(), repos, repo, prNumber, "old-head")
-	if err != nil || bypass {
-		t.Fatalf("trustedCurrentFollowUpNewHeadReviewerBypass(same head) = %v, %v; want false, nil", bypass, err)
-	}
-
-	// Explicit run-id path must also honor follow-up new-head.
-	bypass, err = trustedFollowUpNewHeadReviewerRun(context.Background(), repos, repo, prNumber, "run_followup", "new-head")
-	if err != nil || !bypass {
-		t.Fatalf("trustedFollowUpNewHeadReviewerRun(new head) = %v, %v; want true, nil", bypass, err)
-	}
-	bypass, err = trustedFollowUpNewHeadReviewerRun(context.Background(), repos, repo, prNumber, "run_followup", "old-head")
-	if err != nil || bypass {
-		t.Fatalf("trustedFollowUpNewHeadReviewerRun(same head) = %v, %v; want false, nil", bypass, err)
-	}
-	bypass, err = trustedFollowUpNewHeadReviewerRun(context.Background(), repos, repo, prNumber, "missing_run", "new-head")
-	if err != nil || bypass {
-		t.Fatalf("trustedFollowUpNewHeadReviewerRun(missing run) = %v, %v; want false, nil", bypass, err)
-	}
-
-	// Same published head must not bypass even when followUpdates is enabled.
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_followup", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &sameHeadMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
-		t.Fatalf("Loops.Upsert(same head) error = %v", err)
-	}
-	bypass, err = trustedCurrentFollowUpNewHeadReviewerBypass(context.Background(), repos, repo, prNumber, "new-head")
-	if err != nil || bypass {
-		t.Fatalf("trustedCurrentFollowUpNewHeadReviewerBypass(same published head) = %v, %v; want false, nil", bypass, err)
-	}
-}
-
 func TestValidateReviewSubmitEventAcceptsRequestChanges(t *testing.T) {
 	t.Parallel()
 
@@ -600,35 +514,6 @@ func TestValidateReviewerReviewSubmitHoldAcceptsExistingFileURI(t *testing.T) {
 	}
 	if err := validateReviewerReviewSubmitHold(context.Background(), config.Config{Storage: config.StorageConfig{DBPath: "file:" + dbPath}}, "acme/looper", 42, true, "run_manual", []string{labels.HoldReviewer}); err == nil || !strings.Contains(err.Error(), "currently held") {
 		t.Fatalf("validateReviewerReviewSubmitHold(file URI) error = %v, want normal held rejection after URI-aware stat", err)
-	}
-}
-
-func TestValidateLatestReviewerReviewSubmitHoldRefreshesLabels(t *testing.T) {
-	t.Parallel()
-
-	gh := &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{Number: 42, Labels: []string{labels.HoldReviewer}}}
-
-	labels, err := validateLatestReviewerReviewSubmitHold(context.Background(), gh, config.Config{}, "acme/looper", 42, false, "", "/repo")
-	if err == nil || !strings.Contains(err.Error(), "currently held") {
-		t.Fatalf("validateLatestReviewerReviewSubmitHold() error = %v, want held rejection", err)
-	}
-	if labels != nil {
-		t.Fatalf("labels = %#v, want nil on hold rejection", labels)
-	}
-	if len(gh.calls) != 1 {
-		t.Fatalf("ViewPullRequest calls = %#v, want one refresh", gh.calls)
-	}
-	if gh.calls[0].Repo != "acme/looper" || gh.calls[0].PRNumber != 42 || gh.calls[0].CWD != "/repo" {
-		t.Fatalf("ViewPullRequest call = %#v, want requested PR and cwd", gh.calls[0])
-	}
-
-	gh = &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{Number: 42, Labels: []string{"ready-for-review"}}}
-	labels, err = validateLatestReviewerReviewSubmitHold(context.Background(), gh, config.Config{}, "acme/looper", 42, false, "", "/repo")
-	if err != nil {
-		t.Fatalf("validateLatestReviewerReviewSubmitHold(unheld) error = %v", err)
-	}
-	if len(labels) != 1 || labels[0] != "ready-for-review" {
-		t.Fatalf("labels = %#v, want refreshed PR labels for publish authority", labels)
 	}
 }
 
