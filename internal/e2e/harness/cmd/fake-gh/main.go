@@ -45,6 +45,30 @@ type state struct {
 	// Looper reads it before creating a label so that applying a label never
 	// rewrites one a maintainer already worded; modelling it here is what lets
 	// a contract test observe that.
+	//
+	// Trade-off for this persisted harness concept (AGENTS.md "New concepts
+	// require an explicit trade-off"):
+	//
+	//   Failure it prevents: a regression that reintroduces `gh label create
+	//   --force`, or that recreates a label a maintainer already worded, is
+	//   observable at the contract layer through a real list/create round trip,
+	//   not only in a unit test that asserts on argv strings.
+	//
+	//   Cost: this is new persisted state that must stay aligned with real gh's
+	//   label semantics. The duplicate-create branch below must match gh's
+	//   behavior (reject without --force, update with --force) or it masks the
+	//   exact regressions it exists to expose. State is written to disk and
+	//   carried across invocations within a test, so test isolation depends on
+	//   each test starting from a fresh state file. The model is a fidelity
+	//   approximation of the label API, not a full reimplementation — only
+	//   name/color/description are tracked, and `label list` only honors the
+	//   allowlisted JSON fields.
+	//
+	//   Why a simpler invocation assertion is insufficient: asserting "no
+	//   --force in argv" cannot observe that the stored wording survives a
+	//   create round trip. The stateful model makes the round trip observable:
+	//   a test seeds a hand-worded label, runs the gateway, and confirms the
+	//   stored description is unchanged after the create path executes.
 	RepositoryLabels map[string][]labelState `json:"repositoryLabels,omitempty"`
 }
 
@@ -172,7 +196,15 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 		}
 		return emitDefaultJSON(key, fields)
 	case "label list":
-		payload, err := json.Marshal(repositoryLabels(st, strings.TrimSpace(flagValue(os.Args[1:], "--repo"))))
+		fields := requestedJSONFields(os.Args[1:])
+		allowed := schemaDoc.JSONFieldAllowlist[key]
+		if len(allowed) == 0 && mode == "strict" {
+			return fmt.Errorf("missing fake-gh allowlist for %s", key)
+		}
+		if err := validateFields(key, fields, allowed); err != nil {
+			return err
+		}
+		payload, err := json.Marshal(repositoryLabelsJSON(st, strings.TrimSpace(flagValue(os.Args[1:], "--repo")), fields))
 		if err != nil {
 			return err
 		}
@@ -217,19 +249,52 @@ func repositoryLabels(st state, repo string) []labelState {
 	return out
 }
 
-// handleLabelCreate records a created label. A repeated create keeps the
-// stored wording rather than replacing it: real `gh label create` rejects a
-// duplicate unless --force is passed, and Looper no longer passes --force.
+// repositoryLabelsJSON projects the stored label set onto exactly the requested
+// JSON fields, matching real `gh label list --json`: a caller that omits a
+// field does not receive it, and an unsupported field is rejected upstream by
+// validateFields against the schema allowlist.
+func repositoryLabelsJSON(st state, repo string, fields []string) []map[string]any {
+	labels := repositoryLabels(st, repo)
+	out := make([]map[string]any, 0, len(labels))
+	for _, label := range labels {
+		row := map[string]any{}
+		for _, field := range fields {
+			switch field {
+			case "name":
+				row["name"] = label.Name
+			case "color":
+				row["color"] = label.Color
+			case "description":
+				row["description"] = label.Description
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// handleLabelCreate models `gh label create`. Real gh rejects a duplicate
+// without --force and updates an existing label's color and description with
+// --force (https://cli.github.com/manual/gh_label_create); mirroring both
+// outcomes is what lets the harness expose a reintroduced --force or a
+// list/create race rather than masking them.
 func handleLabelCreate(st *state, args []string) error {
 	repo := strings.TrimSpace(flagValue(args, "--repo"))
 	name := strings.TrimSpace(firstNonFlag(args[2:]))
 	if repo == "" || name == "" {
 		return nil
 	}
-	for _, existing := range st.RepositoryLabels[repo] {
-		if strings.EqualFold(existing.Name, name) {
-			return nil
+	force := slices.Contains(args, "--force")
+	for index, existing := range st.RepositoryLabels[repo] {
+		if !strings.EqualFold(existing.Name, name) {
+			continue
 		}
+		if !force {
+			return fmt.Errorf("label %q already exists", name)
+		}
+		st.RepositoryLabels[repo][index].Color = strings.TrimSpace(flagValue(args, "--color"))
+		st.RepositoryLabels[repo][index].Description = strings.TrimSpace(flagValue(args, "--description"))
+		return saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st)
 	}
 	if st.RepositoryLabels == nil {
 		st.RepositoryLabels = map[string][]labelState{}

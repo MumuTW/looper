@@ -3409,10 +3409,29 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []s
 		}
 		definition := labelPresentation(label)
 		if _, err := g.runGh(ctx, cwd, "", "label", "create", label, "--repo", repo, "--color", definition.Color, "--description", definition.Description); err != nil {
+			// A second action can create the same missing label between our
+			// list and this create; real `gh label create` without --force then
+			// fails with "already exists". The label is present, which is all
+			// we need, so tolerate that one outcome and continue. Any other
+			// failure still surfaces.
+			if isLabelAlreadyExistsError(err) {
+				continue
+			}
 			return err
 		}
 	}
 	return nil
+}
+
+// isLabelAlreadyExistsError reports whether a `gh label create` failure is the
+// duplicate-label outcome real gh produces without --force. The label already
+// exists, so the caller can treat it as success rather than aborting a label
+// application that lost a create race.
+func isLabelAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
 
 // labelPresentation resolves the color and description to create a label with.

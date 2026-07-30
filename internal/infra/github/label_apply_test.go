@@ -56,3 +56,78 @@ func TestApplyingLabelsNeverRewritesAnExistingLabel(t *testing.T) {
 		t.Errorf("missing label %s was not created:\n%s", labels.DefaultPlanTrigger, log)
 	}
 }
+
+// Two daemon actions can concurrently target the same missing label: both list
+// before either creates it, the first create succeeds, and the second no-force
+// `gh label create` then fails with "already exists". The label is present,
+// which is all ensureLabelsExist needs, so that one outcome must be tolerated
+// and the issue-label POST must still run.
+func TestApplyingLabelsToleratesLabelCreatedAfterList(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case args == "label list --repo acme/looper --limit 1000 --json name,color,description":
+			// The list ran before the race created the label, so it is missing.
+			return shell.Result{Stdout: `[]`}, nil
+		case strings.HasPrefix(args, "label create "+labels.DefaultPlanTrigger+" "):
+			// Another action created it between our list and our create.
+			return shell.Result{Stderr: "HTTP 422: Label already exists"}, &shell.CommandExecutionError{Message: "Command exited with code 1: HTTP 422: Label already exists", Category: shell.FailureNonZeroExit}
+		case strings.HasPrefix(args, "api repos/acme/looper/issues/7/labels"):
+			return shell.Result{Stdout: "[]"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.AddIssueLabels(context.Background(), IssueLabelsInput{
+		Repo:        "acme/looper",
+		IssueNumber: 7,
+		Labels:      []string{labels.DefaultPlanTrigger},
+	})
+	if err != nil {
+		t.Fatalf("AddIssueLabels() error = %v, want the duplicate-create race tolerated", err)
+	}
+
+	log := strings.Join(runner.calls, "\n")
+	if !strings.Contains(log, "api repos/acme/looper/issues/7/labels") {
+		t.Errorf("issue-label POST did not run after the tolerated create race:\n%s", log)
+	}
+}
+
+// A create failure that is NOT the duplicate-label race must still surface, so
+// the tolerance does not mask real errors (permissions, network, etc.).
+func TestApplyingLabelsSurfacesNonDuplicateCreateFailure(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case args == "label list --repo acme/looper --limit 1000 --json name,color,description":
+			return shell.Result{Stdout: `[]`}, nil
+		case strings.HasPrefix(args, "label create "+labels.DefaultPlanTrigger+" "):
+			return shell.Result{Stderr: "HTTP 403: Resource not accessible by integration"}, &shell.CommandExecutionError{Message: "Command exited with code 1: HTTP 403: Resource not accessible by integration", Category: shell.FailureNonZeroExit}
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.AddIssueLabels(context.Background(), IssueLabelsInput{
+		Repo:        "acme/looper",
+		IssueNumber: 7,
+		Labels:      []string{labels.DefaultPlanTrigger},
+	})
+	if err == nil {
+		t.Fatal("AddIssueLabels() error = nil, want the non-duplicate create failure to surface")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Fatalf("AddIssueLabels() error = %v, want the original 403 failure propagated", err)
+	}
+}
