@@ -24,7 +24,10 @@ var externalPackageQualifiers = map[string]struct{}{}
 // adrReference matches an ADR citation loosely so that a malformed one such as
 // ADR-00010 is caught here rather than silently matching its first four digits.
 // RE2 has no lookahead, so the token is captured whole and checked below.
-var adrReference = regexp.MustCompile(`ADR-([0-9A-Za-z]+)`)
+// Both spellings are in use: ADR filenames and headings say "ADR 0005" while
+// prose says "ADR-0005". Recognising only one leaves citations in the other
+// spelling unvalidated, so "ADR 9999" would pass by not being seen at all.
+var adrReference = regexp.MustCompile(`ADR[-\s]([0-9A-Za-z]+)`)
 
 // exactlyFourDigits guards a captured ADR token and an ADR filename prefix.
 var exactlyFourDigits = regexp.MustCompile(`^[0-9]{4}$`)
@@ -42,7 +45,26 @@ var codePointer = regexp.MustCompile("`([a-z][a-z0-9_]*)\\.([A-Z][A-Za-z0-9_]*)`
 // backtick rather than stopping at the characters a path usually contains, so
 // that a reference carrying a suffix — an anchor, a stray bracket — is checked
 // and fails, instead of not matching at all and being silently skipped.
-var packagePath = regexp.MustCompile("`((?:internal|cmd|pkg)/[^`]+)`")
+var packagePath = regexp.MustCompile("`([A-Za-z0-9_.-]+/[^`]+)`")
+
+// repoTopLevelDirs is what a backticked path is checked against, read from the
+// repository rather than listed here: a path under docs or tools is as much a
+// reference that can rot as one under internal, and a new top-level directory
+// should not need this test edited to be covered.
+func repoTopLevelDirs(t *testing.T) map[string]struct{} {
+	t.Helper()
+	entries, err := os.ReadDir(repoRoot)
+	if err != nil {
+		t.Fatalf("read repo root: %v", err)
+	}
+	out := map[string]struct{}{}
+	for _, entry := range entries {
+		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+			out[entry.Name()] = struct{}{}
+		}
+	}
+	return out
+}
 
 func contextDoc(t *testing.T) string {
 	t.Helper()
@@ -129,9 +151,17 @@ func adrHeadingNumber(path string) (string, bool) {
 func TestContextPackagePathsResolve(t *testing.T) {
 	t.Parallel()
 
+	dirs := repoTopLevelDirs(t)
 	for _, match := range packagePath.FindAllStringSubmatch(contextDoc(t), -1) {
-		if _, err := os.Stat(filepath.Join(repoRoot, match[1])); err != nil {
-			t.Errorf("CONTEXT.md references %q, which does not exist", match[1])
+		reference := match[1]
+		top, _, _ := strings.Cut(reference, "/")
+		if _, isRepoPath := dirs[top]; !isRepoPath {
+			// Not a repository path — CONTEXT.md also backticks config keys
+			// and forge routes that happen to contain a slash.
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(repoRoot, reference)); err != nil {
+			t.Errorf("CONTEXT.md references %q, which does not exist", reference)
 		}
 	}
 }
