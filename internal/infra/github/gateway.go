@@ -66,9 +66,13 @@ const (
 )
 
 type Options struct {
-	GHPath                 string
-	GitPath                string
-	CWD                    string
+	GHPath  string
+	GitPath string
+	CWD     string
+	// Env holds environment overrides for every `gh` this gateway runs. Build it
+	// with AuthEnv so the daemon's own forge calls carry a credential instead of
+	// depending on an ambient one the daemon may not be able to read.
+	Env                    map[string]string
 	Now                    func() time.Time
 	DiscoveryCacheTTL      time.Duration
 	GHRun                  func(context.Context, shell.Options) (shell.Result, error)
@@ -80,6 +84,7 @@ type Gateway struct {
 	ghPath                 string
 	gitPath                string
 	cwd                    string
+	env                    map[string]string
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
 	discoveryCacheMu       sync.Mutex
@@ -717,6 +722,7 @@ func New(options Options) *Gateway {
 		ghPath:                 ghPath,
 		gitPath:                gitPath,
 		cwd:                    options.CWD,
+		env:                    options.Env,
 		now:                    now,
 		discoveryCacheTTL:      options.DiscoveryCacheTTL,
 		discoveryPRCache:       map[string]discoveryPullRequestListCacheEntry{},
@@ -3412,7 +3418,7 @@ func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) 
 }
 
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
-	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: g.env, Stdin: stdin, Timeout: timeout})
 	if result.StdoutTruncated || result.StderrTruncated {
 		streams := make([]string, 0, 2)
 		if result.StdoutTruncated {

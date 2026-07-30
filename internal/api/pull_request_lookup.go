@@ -20,7 +20,7 @@ func NewGatewayPullRequestLookup(cfg config.Config, now func() time.Time) func(c
 	if cfg.Tools.GHPath != nil {
 		ghPath = strings.TrimSpace(*cfg.Tools.GHPath)
 	}
-	gateway := github.New(github.Options{GHPath: ghPath, Now: now})
+	gateway := github.New(github.Options{GHPath: ghPath, Env: github.AuthEnv(cfg), Now: now})
 	return func(ctx context.Context, repo string, prNumber int64, cwd string) (PullRequestTarget, error) {
 		detail, err := gateway.ViewPullRequest(ctx, github.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 		if err != nil {

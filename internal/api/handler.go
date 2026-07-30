@@ -983,6 +983,23 @@ type statusService struct {
 	// quarantine orphan debt). Empty when none apply.
 	DegradedReasons []string     `json:"degradedReasons,omitempty"`
 	Binary          statusBinary `json:"binary"`
+	// ForgeAuth answers "is the daemon itself authenticated to GitHub", which a
+	// terminal's `gh auth status` cannot answer: the daemon may be unable to read
+	// the keyring the terminal reads. Resolved from configuration, so reporting it
+	// costs no forge request.
+	ForgeAuth statusForgeAuth `json:"forgeAuth"`
+}
+
+type statusForgeAuth struct {
+	// Resolved is false when neither configuration nor the daemon environment
+	// yields a credential, which normally means unauthenticated calls against
+	// GitHub's 60-per-hour per-IP budget.
+	Resolved bool `json:"resolved"`
+	// Source is "config", "environment", or "none". It never carries the value.
+	// The explanation of what an unresolved credential costs is logged at startup
+	// rather than carried here; degradedReasons gains "forge_auth_unresolved" so
+	// operators can alert on it without matching prose.
+	Source string `json:"source"`
 }
 
 type statusBinary struct {
@@ -1408,7 +1425,8 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.effectiveConfig())
 	outstanding, debtErr := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
 	recovery := h.recoveryWithOutstanding(outstanding)
-	degradedReasons := statusDegradedReasons(reviewPublish, outstanding, debtErr)
+	forgeAuth := forgeAuthStatus(h.effectiveConfig(), forgeAuthGetenv)
+	degradedReasons := statusDegradedReasons(reviewPublish, outstanding, debtErr, forgeAuth)
 
 	return statusResponse{
 		Service: statusService{
@@ -1420,6 +1438,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			StartedAt:       h.startedAtISO(),
 			Recovery:        recovery,
 			DegradedReasons: degradedReasons,
+			ForgeAuth:       forgeAuth,
 			Binary: statusBinary{
 				Name:             "looperd",
 				Path:             daemonExecutablePath(),
@@ -1706,8 +1725,11 @@ func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.Outstanding
 	return normalized
 }
 
-func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error) []string {
+func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error, forgeAuth statusForgeAuth) []string {
 	var reasons []string
+	if !forgeAuth.Resolved {
+		reasons = append(reasons, "forge_auth_unresolved")
+	}
 	if reviewPublish.Known && reviewPublish.PublishingDisabled {
 		reasons = append(reasons, "review_publish_disabled")
 	}
@@ -4635,7 +4657,7 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if ghPath == "" {
 		return nil
 	}
-	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, GHRun: shell.Run})
+	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, Env: githubinfra.AuthEnv(h.effectiveConfig()), GHRun: shell.Run})
 	labels := []string(nil)
 	switch target.TargetType {
 	case domain.LoopTargetTypeIssue:
@@ -7575,4 +7597,22 @@ func looperdArtifactName(target string) *string {
 
 	value := "looperd-" + target
 	return &value
+}
+
+// forgeAuthStatus reports where the daemon's GitHub credential comes from, or
+// that it has none. Deliberately configuration-only: probing `gh api rate_limit`
+// on every status poll would spend the very budget this field exists to protect.
+// forgeAuthGetenv is the environment reader status uses. Tests replace it so a
+// token on the build machine cannot change a frozen response contract.
+var forgeAuthGetenv = os.Getenv
+
+func forgeAuthStatus(cfg config.Config, getenv func(string) string) statusForgeAuth {
+	if githubinfra.MissingAuthWarningFrom(cfg, getenv) != "" {
+		return statusForgeAuth{Resolved: false, Source: "none"}
+	}
+	source := "config"
+	if githubinfra.HasAmbientAuthFrom(getenv) {
+		source = "environment"
+	}
+	return statusForgeAuth{Resolved: true, Source: source}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -46,9 +47,13 @@ type Result struct {
 }
 
 type Options struct {
-	Command          string
-	Args             []string
-	CWD              string
+	Command string
+	Args    []string
+	CWD     string
+	// Env holds overrides applied *on top of* this process's environment, not a
+	// replacement for it. A replacement would silently drop PATH and HOME from
+	// every child, which is how a token injection turns into "command not
+	// found". Keys here win over inherited values of the same name.
 	Env              map[string]string
 	Stdin            string
 	Timeout          time.Duration
@@ -323,7 +328,7 @@ func startContainedCommand(ctx context.Context, options Options, gracefulShutdow
 		cmd := exec.Command(options.Command, options.Args...)
 		cmd.Dir = options.CWD
 		if len(options.Env) > 0 {
-			cmd.Env = envSlice(options.Env)
+			cmd.Env = mergedEnvSlice(os.Environ(), options.Env)
 		}
 		if options.Stdin != "" {
 			cmd.Stdin = strings.NewReader(options.Stdin)
@@ -418,6 +423,23 @@ func envSlice(env map[string]string) []string {
 		values = append(values, key+"="+env[key])
 	}
 	return values
+}
+
+// mergedEnvSlice layers overrides on top of an inherited environment. An
+// inherited entry is dropped only when an override replaces it by name, so the
+// child keeps everything the parent had.
+func mergedEnvSlice(inherited []string, overrides map[string]string) []string {
+	merged := make([]string, 0, len(inherited)+len(overrides))
+	for _, entry := range inherited {
+		name, _, found := strings.Cut(entry, "=")
+		if found {
+			if _, overridden := overrides[name]; overridden {
+				continue
+			}
+		}
+		merged = append(merged, entry)
+	}
+	return append(merged, envSlice(overrides)...)
 }
 
 func exitCode(handle *processcontainment.Handle) int {

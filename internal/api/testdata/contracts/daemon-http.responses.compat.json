@@ -62,6 +62,7 @@
             "daemonMode": "foreground",
             "admissionState": "ready",
             "degradedReasons": [
+              "forge_auth_unresolved",
               "review_publish_disabled"
             ],
             "startedAt": "2026-04-11T12:00:00.000Z",
@@ -71,6 +72,10 @@
                 "quarantinedActiveExecutions": 0,
                 "quarantinedRunningRuns": 0
               }
+            },
+            "forgeAuth": {
+              "resolved": false,
+              "source": "none"
             },
             "binary": {
               "name": "looperd",

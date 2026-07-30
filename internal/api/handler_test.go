@@ -1142,7 +1142,7 @@ func TestStatusDegradedReasonsIncludesKnownDisabledPublishWithoutLooperPath(t *t
 	reasons := statusDegradedReasons(looperdruntime.ReviewPublishReadiness{
 		Known:              true,
 		PublishingDisabled: true,
-	}, looperdruntime.OutstandingQuarantineDebt{}, nil)
+	}, looperdruntime.OutstandingQuarantineDebt{}, nil, statusForgeAuth{Resolved: true, Source: "config"})
 	if got := strings.Join(reasons, ","); got != "review_publish_disabled" {
 		t.Fatalf("statusDegradedReasons() = %q, want review_publish_disabled", got)
 	}
@@ -1153,6 +1153,7 @@ func TestStatusDegradedReasonsIncludesUnavailableQuarantineDebt(t *testing.T) {
 		looperdruntime.ReviewPublishReadiness{},
 		looperdruntime.OutstandingQuarantineDebt{},
 		errors.New("sqlite temporarily unavailable"),
+		statusForgeAuth{Resolved: true, Source: "config"},
 	)
 	if got := strings.Join(reasons, ","); got != "quarantine_debt_unavailable" {
 		t.Fatalf("statusDegradedReasons() = %q, want quarantine_debt_unavailable", got)
@@ -7583,6 +7584,11 @@ func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) te
 	// TestMain pins a binary-wide LOOPER_HOME; give each fixture its own so
 	// default-derived paths stay isolated per test.
 	t.Setenv("LOOPER_HOME", filepath.Join(homeDir, ".looper"))
+	// A GH_TOKEN exported on the developer's machine or in CI must not change a
+	// frozen response contract, so status reads an empty forge environment here.
+	previousForgeAuthGetenv := forgeAuthGetenv
+	forgeAuthGetenv = func(string) string { return "" }
+	t.Cleanup(func() { forgeAuthGetenv = previousForgeAuthGetenv })
 	cfg, err := config.DefaultConfig(rootDir)
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)

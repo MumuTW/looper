@@ -810,6 +810,16 @@ OPENAI_API_KEY = "replace-me"
 # PATH, HOME, locale, temporary/configuration directories, certificate paths,
 # SSH_AUTH_SOCK, and LOOPER_CONFIG so trusted wrappers resolve the same config).
 # Add required credentials or tool-specific variables here.
+#
+# GH_TOKEN here also authenticates the daemon's own `gh` calls (discovery, PR
+# reads, labels, merges), not just agent processes. Set it: `gh` keeps its login
+# in the OS keyring by default, and a daemon started by launchd or systemd has no
+# login session to read that keyring with, so without a token its calls go out
+# unauthenticated and share GitHub's limit of 60 requests per hour per IP. A
+# token exported in the daemon's own service environment wins over this value.
+# `GET /api/v1/status` reports which source was used under `service.forgeAuth`,
+# and adds `forge_auth_unresolved` to `service.degradedReasons` when neither
+# supplies one.
 
 [agent.nativeResume]
 enabled = true

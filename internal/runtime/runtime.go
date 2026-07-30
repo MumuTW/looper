@@ -888,7 +888,12 @@ func (r *Runtime) start(ctx context.Context) error {
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
 	var githubGateway *githubinfra.Gateway
 	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
-		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: githubinfra.AuthEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+		// Say this once at startup rather than let every role discover it as a
+		// rate-limit 403 an hour at a time.
+		if warning := githubinfra.MissingAuthWarning(r.config); warning != "" && r.logger != nil {
+			r.logger.Error("looperd has no resolvable GitHub credential", map[string]any{"detail": warning})
+		}
 	}
 	projectService := &projects.Service{
 		DB:             coordinator.DB(),
@@ -967,7 +972,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.config = r.projectCatalog.Snapshot()
 	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
 		if githubGateway == nil {
-			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: githubinfra.AuthEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 		}
 	} else {
 		githubGateway = nil

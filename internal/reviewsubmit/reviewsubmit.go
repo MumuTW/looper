@@ -233,6 +233,7 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 		GHPath:                 *cfg.Tools.GHPath,
 		GitPath:                gitPath,
 		CWD:                    cwd,
+		Env:                    githubinfra.AuthEnv(cfg),
 		GHRun:                  shell.Run,
 		GitRun:                 shell.Run,
 		ReviewSubmitDiagnostic: diagnostic,
