@@ -53,6 +53,15 @@ type fakeDaemon struct {
 	quarantinedActiveExecutions int
 	quarantinedRunningRuns      int
 	degradedReasons             []string
+
+	// labelsInit captures the body of POST /api/v1/labels/init and replies with
+	// labelsInitResult (or labelsInitStatus when non-zero). labelsInitRepo is
+	// echoed back so a test can assert the slug the CLI forwarded.
+	labelsInitBody   map[string]any
+	labelsInitResult map[string]any
+	labelsInitStatus int
+	labelsInitError  string
+	labelsInitRepo   string
 }
 
 func newFakeDaemon(t *testing.T) *fakeDaemon {
@@ -122,6 +131,35 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 					"discoveredPullRequests": 1,
 				},
 			})
+		case r.URL.Path == "/api/v1/labels/init" && r.Method == http.MethodPost:
+			body := map[string]any{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode labels init body: %v", err)
+			}
+			daemon.labelsInitBody = body
+			if daemon.labelsInitStatus != 0 {
+				w.WriteHeader(daemon.labelsInitStatus)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"ok":    false,
+					"error": map[string]any{"code": "VALIDATION_FAILED", "message": daemon.labelsInitError},
+				})
+				return
+			}
+			result := daemon.labelsInitResult
+			if result == nil {
+				repo, _ := body["repo"].(string)
+				daemon.labelsInitRepo = repo
+				result = map[string]any{
+					"repo":   repo,
+					"dryRun": false,
+					"labels": []map[string]any{
+						{"name": "looper:worker-ready", "status": "created", "color": "0052cc", "description": "Picked up automatically by worker"},
+						{"name": "looper:plan", "status": "skipped", "color": "5319e7", "description": "Picked up automatically by planner"},
+					},
+					"summary": map[string]any{"created": 1, "updated": 0, "skipped": 1, "failed": 0},
+				}
+			}
+			writeEnvelope(w, http.StatusOK, result)
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -227,9 +265,9 @@ func TestUsageListsEveryImplementedVerb(t *testing.T) {
 	usage(buffer)
 	for _, verb := range []string{
 		"looper init", "looper status", "looper project add", "looper project list",
-		"looper stop", "looper close", "looper takeover", "looper handback",
-		"looper retry", "looper start", "looper pause", "looper respond",
-		"looper version",
+		"looper labels init", "looper stop", "looper close", "looper takeover",
+		"looper handback", "looper retry", "looper start", "looper pause",
+		"looper respond", "looper version",
 	} {
 		if !strings.Contains(buffer.String(), verb) {
 			t.Errorf("usage does not document %q", verb)
@@ -989,6 +1027,91 @@ func TestProjectRejectsBadSubcommands(t *testing.T) {
 			}
 			if !strings.Contains(stderr, "looper project add") {
 				t.Fatalf("stderr = %q, want usage text", stderr)
+			}
+		})
+	}
+}
+
+func TestLabelsInitProvisionsRepoAndPrintsSummary(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	configForDaemon(t, daemon.server.URL)
+
+	code, stdout, stderr := runCLI(t, "labels", "init", "acme/looper")
+	if code != 0 {
+		t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
+	}
+	if got, want := daemon.labelsInitBody["repo"], "acme/looper"; got != want {
+		t.Fatalf("labels init body repo = %v, want %q", got, want)
+	}
+	for _, want := range []string{
+		"provisioned labels for acme/looper:",
+		"created=1", "skipped=1", "failed=0",
+		"created: looper:worker-ready",
+		"skipped: looper:plan",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q\n%s", want, stdout)
+		}
+	}
+}
+
+func TestLabelsInitSurfacesDaemonFailure(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	daemon.labelsInitStatus = http.StatusBadRequest
+	daemon.labelsInitError = "invalid GitHub repo: not-a-slug"
+	configForDaemon(t, daemon.server.URL)
+
+	code, _, stderr := runCLI(t, "labels", "init", "not-a-slug")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "invalid GitHub repo: not-a-slug") {
+		t.Fatalf("stderr = %q, want the daemon's validation message", stderr)
+	}
+}
+
+func TestLabelsInitExitsNonzeroWhenSomeLabelsFail(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	daemon.labelsInitResult = map[string]any{
+		"repo":   "acme/looper",
+		"dryRun": false,
+		"labels": []map[string]any{
+			{"name": "looper:worker-ready", "status": "created", "color": "0052cc", "description": "Picked up automatically by worker"},
+			{"name": "looper:hold:worker", "status": "failed", "color": "b60205", "description": "Block automatic worker activity", "error": "permission denied"},
+		},
+		"summary": map[string]any{"created": 1, "updated": 0, "skipped": 0, "failed": 1},
+	}
+	configForDaemon(t, daemon.server.URL)
+
+	code, stdout, stderr := runCLI(t, "labels", "init", "acme/looper")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 when a label failed", code)
+	}
+	if !strings.Contains(stdout, "failed=1") || !strings.Contains(stdout, "failed: looper:hold:worker") {
+		t.Fatalf("stdout = %q, want the failed label reported", stdout)
+	}
+	if !strings.Contains(stderr, "1 label(s) failed to provision") {
+		t.Fatalf("stderr = %q, want a non-zero-exit explanation", stderr)
+	}
+}
+
+func TestLabelsRejectsBadSubcommands(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		args []string
+	}{
+		{name: "missing subcommand", args: []string{"labels"}},
+		{name: "unknown subcommand", args: []string{"labels", "remove", "x"}},
+		{name: "init without repo", args: []string{"labels", "init"}},
+		{name: "init with extra args", args: []string{"labels", "init", "a", "b"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			code, _, stderr := runCLI(t, testCase.args...)
+			if code != 2 {
+				t.Fatalf("exit code = %d, want 2", code)
+			}
+			if !strings.Contains(stderr, "labels") {
+				t.Fatalf("stderr = %q, want a labels usage message", stderr)
 			}
 		})
 	}

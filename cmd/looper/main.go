@@ -114,6 +114,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return reportError(stderr, runStatus(ctx, parsed.Global, parsed.Operands, stdout))
 	case "project":
 		return reportError(stderr, runProject(ctx, parsed.Global, parsed.Operands, stdout))
+	case "labels":
+		return reportError(stderr, runLabels(ctx, parsed.Global, parsed.Operands, stdout))
 	}
 
 	request, err := routeForVerb(parsed.Verb, parsed.Operands)
@@ -526,7 +528,7 @@ func runInit(global []string, operands []string, stdout io.Writer) error {
 	}
 
 	_, _ = fmt.Fprintf(stdout, "wrote starter config to %s\n", path)
-	_, _ = fmt.Fprintf(stdout, "next: edit it, start looperd, then run `looper project add <repo>` and `looper status`\n")
+	_, _ = fmt.Fprintf(stdout, "next: edit it, start looperd, then run `looper project add <repo>`, `looper labels init <owner/name>`, and `looper status`\n")
 	return nil
 }
 
@@ -785,6 +787,63 @@ func requestProjectDiscoveryWithin(ctx context.Context, timeout time.Duration, c
 	return requestJSONWithin[createProjectResponse](ctx, timeout, cfg, http.MethodPost, "/api/v1/projects/"+url.PathEscape(identifier)+"/discover", nil)
 }
 
+// --- labels -----------------------------------------------------------------
+
+// runLabels provisions looper's standard GitHub labels. It is the supported
+// entrypoint that makes InitializeLabels reachable: without it the label set
+// is defined but never applied, so fresh repositories miss looper:worker-ready
+// and default Worker discovery never fires.
+func runLabels(ctx context.Context, global []string, operands []string, stdout io.Writer) error {
+	if len(operands) == 0 {
+		return badUsage("labels requires a subcommand (init)")
+	}
+	switch operands[0] {
+	case "init":
+		if len(operands) != 2 || strings.TrimSpace(operands[1]) == "" {
+			return badUsage("labels init requires exactly one repository (owner/name)")
+		}
+		return runLabelsInit(ctx, global, operands[1], stdout)
+	default:
+		return badUsage("unknown labels subcommand %q", operands[0])
+	}
+}
+
+func runLabelsInit(ctx context.Context, global []string, repo string, stdout io.Writer) error {
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]string{"repo": strings.TrimSpace(repo)})
+	if err != nil {
+		return err
+	}
+	result, err := requestJSON[labelsInitResponse](ctx, cfg, http.MethodPost, "/api/v1/labels/init", body)
+	if err != nil {
+		return err
+	}
+	return printLabelsInitResult(result, stdout)
+}
+
+func printLabelsInitResult(result labelsInitResponse, stdout io.Writer) error {
+	dryRunPrefix := ""
+	if result.DryRun {
+		dryRunPrefix = " (dry run)"
+	}
+	_, _ = fmt.Fprintf(stdout, "provisioned labels for %s%s: created=%d updated=%d skipped=%d failed=%d\n",
+		result.Repo, dryRunPrefix, result.Summary.Created, result.Summary.Updated, result.Summary.Skipped, result.Summary.Failed)
+	for _, label := range result.Labels {
+		line := fmt.Sprintf("  %s: %s", label.Status, label.Name)
+		if label.Error != "" {
+			line += " — " + singleLine(label.Error)
+		}
+		_, _ = fmt.Fprintln(stdout, line)
+	}
+	if result.Summary.Failed > 0 {
+		return fmt.Errorf("%d label(s) failed to provision; re-run `looper labels init %s` to retry the remaining labels", result.Summary.Failed, result.Repo)
+	}
+	return nil
+}
+
 // resolveRepoRoot turns an operator-supplied path into the absolute repository
 // root the daemon should store.
 //
@@ -1004,6 +1063,32 @@ type discoveryResponse struct {
 	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
 	DiscoveredWorktrees    int      `json:"discoveredWorktrees"`
 	Warnings               []string `json:"warnings"`
+}
+
+// labelsInitResponse mirrors the daemon's github.LabelInitResult. It is restated
+// here rather than imported because cmd/looper talks to looperd over HTTP and
+// does not depend on internal/infra/github, the same way it restates the
+// project and discovery shapes.
+type labelsInitResponse struct {
+	Repo    string            `json:"repo"`
+	DryRun  bool              `json:"dryRun"`
+	Labels  []labelsInitItem  `json:"labels"`
+	Summary labelsInitSummary `json:"summary"`
+}
+
+type labelsInitItem struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
+	Error       string `json:"error,omitempty"`
+}
+
+type labelsInitSummary struct {
+	Created int `json:"created"`
+	Updated int `json:"updated"`
+	Skipped int `json:"skipped"`
+	Failed  int `json:"failed"`
 }
 
 // daemonBaseURL is where this CLI expects the daemon to answer.
@@ -1227,6 +1312,8 @@ Usage:
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
   looper project discover <id> Retry post-commit worktree/PR discovery for a project
+  looper labels init <owner/name>
+                               Provision looper's standard GitHub labels on a repo
   looper stop <selector>       Stop the active run for a loop ("all" stops every run)
   looper close <selector>      Stop the active run and close the loop
   looper takeover <selector>   Take a loop over for manual work
