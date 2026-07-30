@@ -305,6 +305,7 @@ type PullRequestLabelsInput struct {
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	GetPullRequestAuthor(context.Context, ViewPullRequestInput) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error)
@@ -1644,7 +1645,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	policy := r.discoveryPolicyForProject(project.ID)
 	currentUser := ""
 	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
-		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentUser, err = r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -1751,7 +1752,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	}
 	currentUser := ""
 	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
-		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentUser, err = r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -1804,7 +1805,7 @@ func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, in
 	policy := r.discoveryPolicyForProject(project.ID)
 	currentUser := ""
 	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
-		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentUser, err = r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -2779,7 +2780,7 @@ func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, loop storag
 	if r.discoveryPolicyForProject(projectID).AuthorFilter == config.FixerAuthorFilterAny {
 		return "", nil
 	}
-	currentUser, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	currentUser, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
 	if err != nil {
 		return "", err
 	}

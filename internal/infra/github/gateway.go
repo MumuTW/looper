@@ -2926,6 +2926,29 @@ func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, 
 	return g.getCurrentUserLoginRaw(ctx, cwd)
 }
 
+// GetCurrentUserLoginForRepo resolves the authenticated user using the
+// hostname derived from the repo (host/owner/name form). This ensures
+// mixed github.com/GHES projects in one daemon resolve independent
+// identities instead of relying on ambient gh defaults.
+func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo, cwd string) (string, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.getCurrentUserLogin(ctx, cwd)
+	}
+	hostname, _ := splitRepoHostname(repo)
+	args := []string{"api", "user", "--jq", ".login"}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", strings.TrimSpace(hostname))
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		if isUserLoginUnsupportedForCurrentToken(err) {
+			return g.getViewerLogin(ctx, cwd, hostname)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(result.Stdout), nil
+}
+
 func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (CurrentUserIdentity, error) {
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", `{login: .login, id: .id}`)
 	if err != nil {
@@ -2950,22 +2973,6 @@ func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (strin
 	if err != nil {
 		if isUserLoginUnsupportedForCurrentToken(err) {
 			return "", nil
-		}
-		return "", err
-	}
-	return strings.TrimSpace(result.Stdout), nil
-}
-
-func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo string, cwd string) (string, error) {
-	hostname, _ := splitRepoHostname(repo)
-	args := []string{"api", "user", "--jq", ".login"}
-	if hostname != "" {
-		args = append(args, "--hostname", hostname)
-	}
-	result, err := g.runGh(ctx, cwd, "", args...)
-	if err != nil {
-		if isUserLoginUnsupportedForCurrentToken(err) {
-			return g.getViewerLogin(ctx, cwd, hostname)
 		}
 		return "", err
 	}

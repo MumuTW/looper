@@ -420,6 +420,11 @@ func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd strin
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
 
+func (a plannerGitHubAdapter) GetCurrentUserLoginForRepo(ctx context.Context, repo, cwd string) (string, error) {
+	return a.gateway.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+}
+
+
 func (a plannerGitHubAdapter) AddIssueAssignees(ctx context.Context, input planner.IssueAssigneesInput) error {
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
@@ -598,6 +603,11 @@ func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd stri
 	}
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
+
+func (a reviewerGitHubAdapter) GetCurrentUserLoginForRepo(ctx context.Context, repo, cwd string) (string, error) {
+	return a.gateway.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+}
+
 
 func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
 	if a.gateway == nil {
@@ -1150,6 +1160,11 @@ func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string)
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
 
+func (a fixerGitHubAdapter) GetCurrentUserLoginForRepo(ctx context.Context, repo, cwd string) (string, error) {
+	return a.gateway.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+}
+
+
 func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {
 	return a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 }
@@ -1394,6 +1409,11 @@ func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string
 	}
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }
+
+func (a workerGitHubAdapter) GetCurrentUserLoginForRepo(ctx context.Context, repo, cwd string) (string, error) {
+	return a.gateway.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+}
+
 
 func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker.IssueAssigneesInput) error {
 	if a.gateway == nil {

@@ -374,6 +374,7 @@ type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ListReviewRequestedPullRequests(context.Context, ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error)
@@ -785,7 +786,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	currentLogin := ""
 	if policy.RequireReviewRequest || !policy.EnableSelfReview {
 		var err error
-		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentLogin, err = r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -940,7 +941,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 
 	currentLogin := ""
 	if policy.RequireReviewRequest || !policy.EnableSelfReview {
-		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentLogin, err = r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -1040,7 +1041,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		return nil
 	}
 	if reviewerLastSkipNeedsCurrentLogin(meta, pr) && *currentLogin == "" {
-		lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		lookupLogin, lookupErr := r.github.GetCurrentUserLoginForRepo(ctx, project.RepoPath, project.RepoPath)
 		if lookupErr != nil {
 			lookupLogin = ""
 		}
@@ -1142,7 +1143,7 @@ func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo stri
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {
 	currentLogin := ""
 	if r.discoveryPolicy.RequireReviewRequest {
-		login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+		login, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
 		if err != nil {
 			return nil, err
 		}
@@ -1773,7 +1774,7 @@ func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project stor
 	}
 	decision := routedReviewerClaimDecision(policy, "", detail.Author, detail.Labels, detail.ReviewRequestUsers)
 	if !decision.Allowed && policy.EnableSelfReview && decision.Reason == "local GitHub identity is not requested for review" {
-		currentLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentLogin, lookupErr := r.github.GetCurrentUserLoginForRepo(ctx, *queueItem.Repo, project.RepoPath)
 		if lookupErr != nil {
 			return &loopError{message: lookupErr.Error(), kind: FailureRetryableTransient}
 		}
