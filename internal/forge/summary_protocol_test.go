@@ -77,6 +77,39 @@ func TestReviewItemIDWireFormatIsPlainString(t *testing.T) {
 	}
 }
 
+// A summary comment can carry a padded ID — a human editing the marker, or an
+// older writer. Validation compares normalized IDs, so such a summary parses
+// clean; if parsing then handed the raw ID onward, the reviewer's rebuild would
+// index by " R-001 ", miss a finding claiming "R-001", and report the item as
+// unknown. Parsing normalizes so no consumer has to remember to.
+func TestParseNormalizesReviewItemIDs(t *testing.T) {
+	t.Parallel()
+
+	padded := `<!-- looper:forgejo-reviewer-summary {"kind":"looper.forgejo.reviewer_summary","schema_version":1,"review_round_id":3,"items":[{"review_item_id":" R-001 ","status":"open","title":"Open","body":"Fix it.","last_seen_round_id":3},{"review_item_id":"R-002","status":"superseded","title":"Old","body":"Old wording.","supersedes":["  R-001"],"superseded_by":" R-001\t","last_seen_round_id":2}]} -->`
+	parsed, err := ParseReviewerSummary(padded)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary() error = %v", err)
+	}
+	if parsed.Items[0].ReviewItemID != "R-001" {
+		t.Errorf("item 0 ReviewItemID = %q, want %q", parsed.Items[0].ReviewItemID, "R-001")
+	}
+	if parsed.Items[1].SupersededBy != "R-001" {
+		t.Errorf("item 1 SupersededBy = %q, want %q", parsed.Items[1].SupersededBy, "R-001")
+	}
+	if len(parsed.Items[1].Supersedes) != 1 || parsed.Items[1].Supersedes[0] != "R-001" {
+		t.Errorf("item 1 Supersedes = %q, want [R-001]", parsed.Items[1].Supersedes)
+	}
+
+	paddedFixer := `<!-- looper:forgejo-fixer-summary {"kind":"looper.forgejo.fixer_summary","schema_version":1,"fix_round_id":1,"consumed_review_round_id":3,"results":[{"review_item_id":" R-001 ","result":"fixed","explanation":"Done."}]} -->`
+	fixer, err := ParseFixerSummary(paddedFixer)
+	if err != nil {
+		t.Fatalf("ParseFixerSummary() error = %v", err)
+	}
+	if fixer.Results[0].ReviewItemID != "R-001" {
+		t.Errorf("fixer result ReviewItemID = %q, want %q", fixer.Results[0].ReviewItemID, "R-001")
+	}
+}
+
 // Normalized/IsZero are the single normalization point for IDs arriving from
 // agent JSON and from summary comments parsed off the forge.
 func TestReviewItemIDNormalization(t *testing.T) {

@@ -36,8 +36,13 @@ const (
 type ReviewItemID string
 
 // Normalized returns the ID with surrounding whitespace removed. IDs arrive
-// from agent JSON output and from summary comments parsed off the forge, so
-// callers normalize before comparing or using an ID as a map key.
+// from agent JSON output and from summary comments parsed off the forge, both
+// of which can carry padding.
+//
+// Consumers of a parsed summary do not need to call this: ParseReviewerSummary
+// and ParseFixerSummary normalize before returning, so IDs reaching a consumer
+// are already comparable and safe as map keys. It is exported for the agent
+// output path, where a finding is normalized as it is validated.
 func (id ReviewItemID) Normalized() ReviewItemID { return ReviewItemID(strings.TrimSpace(string(id))) }
 
 // IsZero reports whether the ID is unassigned, treating whitespace-only as
@@ -109,6 +114,28 @@ type FixerResult struct {
 	Explanation  string          `json:"explanation"`
 }
 
+// normalizeIDs canonicalizes every ReviewItemID the summary carries. Parsing
+// runs this before validation so the invariant holds for every consumer at
+// once. Leaving it to each consumer is what let a padded ID in a summary
+// comment miss the map lookup in the reviewer's summary rebuild: validation
+// compared normalized IDs and passed, then the rebuild indexed by raw ID and
+// reported the item as unknown.
+func (s *ReviewerSummary) normalizeIDs() {
+	for i := range s.Items {
+		s.Items[i].ReviewItemID = s.Items[i].ReviewItemID.Normalized()
+		s.Items[i].SupersededBy = s.Items[i].SupersededBy.Normalized()
+		for j := range s.Items[i].Supersedes {
+			s.Items[i].Supersedes[j] = s.Items[i].Supersedes[j].Normalized()
+		}
+	}
+}
+
+func (s *FixerSummary) normalizeIDs() {
+	for i := range s.Results {
+		s.Results[i].ReviewItemID = s.Results[i].ReviewItemID.Normalized()
+	}
+}
+
 func NewReviewerSummary(reviewRoundID int, items []ReviewItem) ReviewerSummary {
 	return ReviewerSummary{Kind: ReviewerSummaryKind, SchemaVersion: ForgejoSummarySchemaVersion, ReviewRoundID: reviewRoundID, Items: items}
 }
@@ -140,6 +167,7 @@ func ParseReviewerSummary(body string) (ReviewerSummary, error) {
 	if err := json.Unmarshal([]byte(payload), &summary); err != nil {
 		return ReviewerSummary{}, fmt.Errorf("parse reviewer summary JSON: %w", err)
 	}
+	summary.normalizeIDs()
 	if err := ValidateReviewerSummary(summary); err != nil {
 		return ReviewerSummary{}, err
 	}
@@ -155,6 +183,7 @@ func ParseFixerSummary(body string) (FixerSummary, error) {
 	if err := json.Unmarshal([]byte(payload), &summary); err != nil {
 		return FixerSummary{}, fmt.Errorf("parse fixer summary JSON: %w", err)
 	}
+	summary.normalizeIDs()
 	if err := ValidateFixerSummary(summary); err != nil {
 		return FixerSummary{}, err
 	}
