@@ -13,83 +13,21 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-// Terminal close must not BeginLoopStop (lease cancel is irreversible for
-// execution.run) before abortable run/execution preflight. A transient lookup
-// error leaves the loop running, so active agents must not be half-killed.
-func TestCloseLoopDoesNotCancelLeasesWhenRunLookupFails(t *testing.T) {
-	ctx := context.Background()
-	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
-	if err != nil {
-		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
-	}
-	if _, err := coordinator.MigrationRunner().RunPending(ctx); err != nil {
-		t.Fatalf("MigrationRunner().RunPending() error = %v", err)
-	}
-
-	repos := storage.NewRepositories(coordinator.DB())
-	now := time.Date(2026, time.April, 21, 12, 0, 0, 0, time.UTC)
-	nowISO := "2026-04-21T12:00:00.000Z"
-	project := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := repos.Projects.Upsert(ctx, project); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-	loop := storage.LoopRecord{ID: "loop_1", Seq: 30, ProjectID: project.ID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := repos.Loops.Upsert(ctx, loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-
-	registry := looperdruntime.NewActiveExecutionRegistry()
-	lease, err := registry.AdmitSpawn(ctx, agent.SpawnMeta{
-		LoopID: loop.ID, RunID: "run_live", ExecutionID: "exec_live",
-	})
-	if err != nil {
-		t.Fatalf("AdmitSpawn() error = %v", err)
-	}
-	if lease.Context().Err() != nil {
-		t.Fatalf("lease already cancelled before close: %v", lease.Context().Err())
-	}
-
-	services := looperdruntime.Services{
-		Coordinator:      coordinator,
-		Repositories:     repos,
-		Loops:            &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }},
-		ActiveExecutions: registry,
-	}
-
-	// Force Runs.GetLatestByLoopID to fail after preflight would otherwise open
-	// the stop gate: close the SQLite coordinator under the services.
-	if err := coordinator.Close(); err != nil {
-		t.Fatalf("coordinator.Close() error = %v", err)
-	}
-
-	if _, err := closeLoop(ctx, services, loop.ID, "Closed by test", func() time.Time { return now }, nil, nil); err == nil {
-		t.Fatal("closeLoop() error = nil, want run lookup failure")
-	}
-	if err := lease.Context().Err(); err != nil {
-		t.Fatalf("lease cancelled after failed close preflight: %v (BeginLoopStop must run only after abortable lookups)", err)
-	}
-	if registry.LoopStopActive(loop.ID) {
-		t.Fatal("LoopStopActive = true after aborted close preflight, want gate never opened")
-	}
-	if _, err := registry.AdmitSpawn(ctx, agent.SpawnMeta{
-		LoopID: loop.ID, RunID: "run_after", ExecutionID: "exec_after",
-	}); err != nil {
-		t.Fatalf("AdmitSpawn after failed close preflight error = %v, want success", err)
-	}
-}
-
 // Every repository read that establishes stop ownership must happen before
 // Pause. A failed run or execution lookup used to leave stopLoop's loop paused
 // and its live lease cancelled, even though the caller received an error.
-func TestStopLoopDoesNotMutateWhenOwnershipPreflightLookupFails(t *testing.T) {
+func TestHaltLoopDoesNotMutateWhenOwnershipPreflightLookupFails(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		dropTable string
 		withRun   bool
 		wantError string
+		terminal  bool
 	}{
-		{name: "run", dropTable: "runs", wantError: "load latest run before halt"},
-		{name: "execution", dropTable: "agent_executions", withRun: true, wantError: "load latest agent execution before halt"},
+		{name: "stop run", dropTable: "runs", wantError: "load latest run before halt"},
+		{name: "stop execution", dropTable: "agent_executions", withRun: true, wantError: "load latest agent execution before halt"},
+		{name: "close run", dropTable: "runs", wantError: "load latest run before halt", terminal: true},
+		{name: "close execution", dropTable: "agent_executions", withRun: true, wantError: "load latest agent execution before halt", terminal: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -135,10 +73,16 @@ func TestStopLoopDoesNotMutateWhenOwnershipPreflightLookupFails(t *testing.T) {
 			if _, err := coordinator.DB().ExecContext(ctx, "DROP TABLE "+tc.dropTable); err != nil {
 				t.Fatalf("DROP TABLE %s: %v", tc.dropTable, err)
 			}
-			if _, err := stopLoop(ctx, services, loop.ID, "Stopped by test", func() time.Time { return now }, nil, nil); err == nil {
-				t.Fatal("stopLoop() error = nil, want preflight lookup failure")
+			halt := stopLoop
+			reason := "Stopped by test"
+			if tc.terminal {
+				halt = closeLoop
+				reason = "Closed by test"
+			}
+			if _, err := halt(ctx, services, loop.ID, reason, func() time.Time { return now }, nil, nil); err == nil {
+				t.Fatal("haltLoop() error = nil, want preflight lookup failure")
 			} else if !strings.Contains(err.Error(), tc.wantError) {
-				t.Fatalf("stopLoop() error = %v, want %q", err, tc.wantError)
+				t.Fatalf("haltLoop() error = %v, want %q", err, tc.wantError)
 			}
 
 			storedLoop, err := repos.Loops.GetByID(ctx, loop.ID)
