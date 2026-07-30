@@ -703,7 +703,7 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 			if args != "api repos/acme/looper/commits/abc123/check-runs?filter=latest&per_page=100 -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
 			}
-			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success","app":{"id":15368},"check_suite":{"id":7654}}]}`}, nil
+			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success","started_at":"2026-07-31T12:00:00Z","completed_at":"2026-07-31T12:01:00Z","app":{"id":15368},"check_suite":{"id":7654}}]}`}, nil
 		case 2:
 			if args != "api repos/acme/looper/commits/abc123/status -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
@@ -725,6 +725,9 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 	}
 	if runs.CheckRuns[0].AppID != 15368 || runs.CheckRuns[0].CheckSuiteID != 7654 {
 		t.Fatalf("CheckRuns[0] = %#v, want app and check-suite identities", runs.CheckRuns[0])
+	}
+	if runs.CheckRuns[0].StartedAt != "2026-07-31T12:00:00Z" || runs.CheckRuns[0].CompletedAt != "2026-07-31T12:01:00Z" {
+		t.Fatalf("CheckRuns[0] = %#v, want run timestamps", runs.CheckRuns[0])
 	}
 	if len(runs.Statuses) != 2 || runs.Statuses[0].Context != "legacy-ci" || runs.Statuses[1].Context != "lint" {
 		t.Fatalf("Statuses = %#v, want deduped status contexts in API order", runs.Statuses)
