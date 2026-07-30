@@ -26,7 +26,6 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/triager"
@@ -958,45 +957,6 @@ func TestActiveRunsAllSurfacesClosedLoopWithoutManualInterventionDisplayOverride
 	assertEqual(t, item["lastFailureReason"], "needs close")
 }
 
-func TestHandlerReviewerRepairInvokesContextAndTriggersScheduler(t *testing.T) {
-	t.Parallel()
-
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	var gotInput reviewer.RepairInput
-	triggered := 0
-	h := NewHandler(Context{
-		Config: cfg,
-		RepairReviewer: func(_ context.Context, input reviewer.RepairInput) (reviewer.RepairResult, error) {
-			gotInput = input
-			return reviewer.RepairResult{Repo: input.Repo, PRNumber: input.PRNumber, ProjectID: input.ProjectID, Apply: input.Apply, Applied: true, AppliedChanges: 1}, nil
-		},
-		TriggerSchedulerTick: func() { triggered++ },
-	})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/reviewer/repair", strings.NewReader(`{"projectId":"project_1","repo":"acme/looper","prNumber":42,"apply":true}`))
-	req.Header.Set("x-request-id", "repair-request-id")
-	recorder := httptest.NewRecorder()
-
-	h.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
-	}
-	if gotInput.Repo != "acme/looper" || gotInput.PRNumber != 42 || gotInput.ProjectID != "project_1" || !gotInput.Apply {
-		t.Fatalf("RepairReviewer input = %#v, want requested repo/pr/project/apply", gotInput)
-	}
-	if triggered != 1 {
-		t.Fatalf("scheduler trigger count = %d, want 1", triggered)
-	}
-	body := parseJSONMap(t, recorder.Body.Bytes())
-	assertEqual(t, body["ok"], true)
-	data := body["data"].(map[string]any)
-	assertEqual(t, data["repo"], "acme/looper")
-	assertEqual(t, data["applied"], true)
-}
-
 func TestIsTerminalReviewerLoopRecordTreatsFailedAsTerminal(t *testing.T) {
 	t.Parallel()
 	metadata := `{"loop":{"status":"failed"}}`
@@ -1803,58 +1763,17 @@ func TestHandlerRouteAndMethodErrors(t *testing.T) {
 	if got := routeBody["requestId"].(string); got == "" {
 		t.Fatal("generated requestId is empty")
 	}
-}
 
-func TestHandlerReconcileStaleRunsRoute(t *testing.T) {
-	fixture := newTestFixture(t)
-	triggered := 0
-	h := NewHandler(Context{
-		Config:  fixture.config,
-		Runtime: fixture.runtime,
-		ReconcileStaleRuns: func(context.Context) (looperdruntime.StaleRunReconcileSummary, error) {
-			return looperdruntime.StaleRunReconcileSummary{Mode: "manual", CandidateRuns: 2, InterruptedRuns: 1, LoopsRequeued: 1, RunIDs: []string{"run_1"}, LoopIDs: []string{"loop_1"}}, nil
-		},
-		TriggerSchedulerTick: func() { triggered++ },
-	})
-
-	t.Run("success", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/reconcile-stale", nil)
+	for _, path := range []string{"/api/v1/reviewer/repair", "/api/v1/runs/reconcile-stale"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
 		recorder := httptest.NewRecorder()
 		h.ServeHTTP(recorder, req)
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("POST %s status = %d, want 404; body=%s", path, recorder.Code, recorder.Body.String())
 		}
 		body := parseJSONMap(t, recorder.Body.Bytes())
-		data := body["data"].(map[string]any)
-		assertEqual(t, data["mode"], "manual")
-		assertEqual(t, data["candidateRuns"], float64(2))
-		assertEqual(t, data["interruptedRuns"], float64(1))
-		assertEqual(t, data["loopsRequeued"], float64(1))
-		assertEqual(t, triggered, 1)
-	})
-
-	t.Run("method not allowed", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/reconcile-stale", nil)
-		recorder := httptest.NewRecorder()
-		h.ServeHTTP(recorder, req)
-		if recorder.Code != http.StatusMethodNotAllowed {
-			t.Fatalf("status = %d, want 405", recorder.Code)
-		}
-		body := parseJSONMap(t, recorder.Body.Bytes())
-		assertEqual(t, body["error"].(map[string]any)["code"], "METHOD_NOT_ALLOWED")
-	})
-
-	t.Run("runtime control unavailable", func(t *testing.T) {
-		unavailable := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/reconcile-stale", nil)
-		recorder := httptest.NewRecorder()
-		unavailable.ServeHTTP(recorder, req)
-		if recorder.Code != http.StatusNotImplemented {
-			t.Fatalf("status = %d, want 501", recorder.Code)
-		}
-		body := parseJSONMap(t, recorder.Body.Bytes())
-		assertEqual(t, body["error"].(map[string]any)["code"], "RUNTIME_CONTROL_UNAVAILABLE")
-	})
+		assertEqual(t, body["error"].(map[string]any)["code"], "ROUTE_NOT_FOUND")
+	}
 }
 
 func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testing.T) {
