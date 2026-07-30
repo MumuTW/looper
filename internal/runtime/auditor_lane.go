@@ -17,6 +17,7 @@ import (
 type auditorGateway interface {
 	GetBranchHeadSHA(context.Context, githubinfra.BranchHeadInput) (string, error)
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
+	RerequestCheckSuite(context.Context, githubinfra.RerequestCheckSuiteInput) error
 }
 
 // runAuditorLane observes, but never mutates, a project's default branch. The
@@ -30,7 +31,11 @@ func runAuditorLane(ctx context.Context, input defaultSchedulerTickInput, projec
 	if !role.Enabled {
 		return nil
 	}
-	return observePostMergeFailure(ctx, input.Repos, input.GitHubGateway, project, repo, deployBaseBranch(*input.Config, project), role, input.Now)
+	baseBranch := deployBaseBranch(*input.Config, project)
+	if err := observePostMergeFailure(ctx, input.Repos, input.GitHubGateway, project, repo, baseBranch, role, input.Now); err != nil {
+		return err
+	}
+	return progressAuditorConfirmation(ctx, input.Repos, input.GitHubGateway, project, repo, baseBranch, role, input.Now)
 }
 
 func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, gateway auditorGateway, project storage.ProjectRecord, repo, baseBranch string, role config.AuditorRoleConfig, now func() time.Time) error {

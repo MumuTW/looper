@@ -200,6 +200,8 @@ type PullRequestCheckRun struct {
 	Conclusion   string
 	AppID        int64
 	CheckSuiteID int64
+	StartedAt    string
+	CompletedAt  string
 }
 
 type PullRequestStatus struct {
@@ -1953,7 +1955,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 	checkRuns := toObjectSlice(row["check_runs"])
 	out := PullRequestCheckRuns{TotalCount: int(asInt64(row["total_count"])), CheckRuns: make([]PullRequestCheckRun, 0, len(checkRuns))}
 	for _, checkRun := range checkRuns {
-		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id")})
+		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id"), StartedAt: asString(checkRun["started_at"]), CompletedAt: asString(checkRun["completed_at"])})
 	}
 	statuses := toObjectSlice(statusRow["statuses"])
 	out.StatusesTotalCount = int(asInt64(statusRow["total_count"]))
