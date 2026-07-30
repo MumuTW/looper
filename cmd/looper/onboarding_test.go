@@ -932,6 +932,27 @@ func TestProjectDiscoverHonorsCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestProjectDiscoverPrintsStructuredFailureBeforeReturningError(t *testing.T) {
+	var stdout bytes.Buffer
+	err := printProjectDiscoveryResult(createProjectResponse{
+		projectResponse: projectResponse{ID: "repo"},
+		Discovery: &discoveryResponse{
+			Status:   "failed",
+			Error:    "git worktree list failed",
+			Warnings: []string{"partial discovery"},
+		},
+	}, &stdout)
+	if err == nil || err.Error() != "git worktree list failed" {
+		t.Fatalf("runProjectDiscover() error = %v, want discovery failure", err)
+	}
+	output := stdout.String()
+	for _, want := range []string{"discovery for project repo: failed", "error:      git worktree list failed", "warning:    partial discovery"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("stdout = %q, want %q", output, want)
+		}
+	}
+}
+
 func TestProjectRejectsBadSubcommands(t *testing.T) {
 	for _, testCase := range []struct {
 		name string

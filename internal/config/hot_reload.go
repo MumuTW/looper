@@ -436,7 +436,11 @@ func resolvedModelBindingPath(cfg Config, role string) string {
 		}
 	}
 	if binding != nil && binding.Model != nil {
-		path = "roles." + role + ".agent.model"
+		if len(cfg.Roles.Coding) > 0 {
+			path = "roles.coding." + role + ".agent.model"
+		} else {
+			path = "roles." + role + ".agent.model"
+		}
 	}
 	return path
 }

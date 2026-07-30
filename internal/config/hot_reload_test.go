@@ -431,6 +431,30 @@ func TestRestartRequiredChangesGuardsGlobalVendorWhenRolesOverride(t *testing.T)
 	}
 }
 
+func TestRestartRequiredChangesReportsCanonicalRoleModelPath(t *testing.T) {
+	t.Parallel()
+	oldConfig, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	oldConfig.Agent.Params = map[string]any{}
+	roleVendor := AgentVendorCodex
+	oldConfig.Roles.Coding = CodingRolesFromLegacy(oldConfig.Roles)
+	worker := oldConfig.Roles.Coding[CodingRoleWorker]
+	worker.Agent = &RoleAgentConfig{Vendor: &roleVendor, Model: stringPtr("gpt-5")}
+	oldConfig.Roles.Coding[CodingRoleWorker] = worker
+
+	switched := CloneConfig(oldConfig)
+	newVendor := AgentVendorClaudeCode
+	worker = switched.Roles.Coding[CodingRoleWorker]
+	worker.Agent = &RoleAgentConfig{Vendor: &newVendor, Model: stringPtr("gpt-5")}
+	switched.Roles.Coding[CodingRoleWorker] = worker
+
+	if got, want := RestartRequiredChanges(oldConfig, switched), []string{"roles.coding.worker", "roles.coding.worker.agent.model"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical role vendor switch = %#v, want %#v", got, want)
+	}
+}
+
 func agentVendorPtr(v AgentVendor) *AgentVendor {
 	return &v
 }

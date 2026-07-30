@@ -7064,7 +7064,7 @@ func TestProcessClaimedItemClearsFailureStreakOnSuccess(t *testing.T) {
 	}
 }
 
-func TestRecordFixerFailureStreakResetsCountWhenHeadChanges(t *testing.T) {
+func TestRecordFixerFailureStreakContinuesWhenHeadChanges(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"
@@ -7086,10 +7086,10 @@ func TestRecordFixerFailureStreakResetsCountWhenHeadChanges(t *testing.T) {
 		if err != nil {
 			t.Fatalf("recordFixerFailureStreak() error = %v", err)
 		}
-		// A new head SHA resets the streak, so each run with a different head is
-		// the first failure for that head.
-		if streak != 1 {
-			t.Fatalf("recordFixerFailureStreak() streak = %d on run %d, want 1", streak, i+1)
+		// A pushed head does not prove the same later-step failure was repaired;
+		// continuity comes from the unchanged step and fix-item state.
+		if streak != i+1 {
+			t.Fatalf("recordFixerFailureStreak() streak = %d on run %d, want %d", streak, i+1, i+1)
 		}
 	}
 }

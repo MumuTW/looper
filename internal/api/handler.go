@@ -1682,7 +1682,7 @@ func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.Outstanding
 
 func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt) []string {
 	var reasons []string
-	if reviewPublish.Known && reviewPublish.PublishingDisabled && strings.TrimSpace(reviewPublish.LooperPath) != "" {
+	if reviewPublish.Known && reviewPublish.PublishingDisabled {
 		reasons = append(reasons, "review_publish_disabled")
 	}
 	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {
@@ -2099,6 +2099,9 @@ func (h *Handler) buildProjectDiscoverResponse(r *http.Request, service projectS
 	}
 	result, err := service.DiscoverProject(r.Context(), projects.DiscoverInput{ProjectID: identifier})
 	if err != nil {
+		if result.Discovery.Status == projects.DiscoveryStatusFailed {
+			return projectDiscoverResponse(result, h.context.Config), nil
+		}
 		var notFound projects.ProjectNotFoundError
 		var validation projects.ProjectValidationError
 		switch {
@@ -2110,15 +2113,19 @@ func (h *Handler) buildProjectDiscoverResponse(r *http.Request, service projectS
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
+	return projectDiscoverResponse(result, h.context.Config), nil
+}
+
+func projectDiscoverResponse(result projects.DiscoverResult, cfg config.Config) createProjectResponse {
 	return createProjectResponse{
-		projectResponse:        serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
+		projectResponse:        serializeProject(result.Project, cfg, cfg.Defaults.BaseBranch),
 		Discovery:              serializeDiscovery(result.Discovery),
 		DiscoveredPullRequests: result.Discovery.DiscoveredPullRequests,
 		DiscoveredWorktrees:    result.Discovery.DiscoveredWorktrees,
 		PendingSnapshots:       result.Discovery.PendingSnapshots,
 		CapturedSnapshots:      result.Discovery.CapturedSnapshots,
 		Warnings:               append([]string{}, result.Discovery.Warnings...),
-	}, nil
+	}
 }
 
 func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {

@@ -1048,6 +1048,16 @@ func TestHandlerStatusSurfacesUnknownReviewPublishWithoutProbing(t *testing.T) {
 	}
 }
 
+func TestStatusDegradedReasonsIncludesKnownDisabledPublishWithoutLooperPath(t *testing.T) {
+	reasons := statusDegradedReasons(looperdruntime.ReviewPublishReadiness{
+		Known:              true,
+		PublishingDisabled: true,
+	}, looperdruntime.OutstandingQuarantineDebt{})
+	if got := strings.Join(reasons, ","); got != "review_publish_disabled" {
+		t.Fatalf("statusDegradedReasons() = %q, want review_publish_disabled", got)
+	}
+}
+
 func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
 		options.ReadProcessCommand = func(context.Context, int) (string, error) { return "", nil }
@@ -2358,6 +2368,38 @@ func TestHandlerProjectDiscoverRouteRetriesDiscovery(t *testing.T) {
 	}
 	assertEqual(t, discovery["status"], string(projects.DiscoveryStatusSucceeded))
 	assertEqual(t, discovery["discoveredWorktrees"], float64(2))
+}
+
+func TestHandlerProjectDiscoverRouteReturnsStructuredFailedDiscovery(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/looper/discover", nil)
+	recorder := httptest.NewRecorder()
+	metadataJSON := `{"repo":"acme/looper","source":"api"}`
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{
+		discoverProject: func(context.Context, projects.DiscoverInput) (projects.DiscoverResult, error) {
+			return projects.DiscoverResult{
+				Project: storage.ProjectRecord{ID: "looper", Name: "Looper", MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				Discovery: projects.DiscoveryState{
+					Status:   projects.DiscoveryStatusFailed,
+					Error:    "git worktree list failed",
+					Warnings: []string{"partial discovery"},
+				},
+			}, errors.New("git worktree list failed")
+		},
+	}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	discovery := data["discovery"].(map[string]any)
+	assertEqual(t, discovery["status"], string(projects.DiscoveryStatusFailed))
+	assertEqual(t, discovery["error"], "git worktree list failed")
+	if warnings, ok := discovery["warnings"].([]any); !ok || len(warnings) != 1 {
+		t.Fatalf("discovery.warnings = %#v, want one warning", discovery["warnings"])
+	}
 }
 
 func TestHandlerProjectDiscoverRouteRejectsGet(t *testing.T) {

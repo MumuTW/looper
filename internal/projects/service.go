@@ -102,13 +102,14 @@ type DiscoveryState struct {
 }
 
 type Service struct {
-	mutationMu   sync.Mutex
-	projectLocks sync.Map // map[string]*projectOperationLock
-	DB           *sql.DB
-	Repos        *storage.Repositories
-	Logger       bootstrap.Logger
-	Config       config.Config
-	ConfigSource ConfigSource
+	mutationMu     sync.Mutex
+	projectLocksMu sync.Mutex
+	projectLocks   map[string]*projectOperationLock
+	DB             *sql.DB
+	Repos          *storage.Repositories
+	Logger         bootstrap.Logger
+	Config         config.Config
+	ConfigSource   ConfigSource
 	// ConfigBoundary serializes project materialization/commit/publication with
 	// global config validation/publication. It prevents a valid mutation on each
 	// side from combining into an invalid catalog snapshot.
@@ -137,7 +138,10 @@ type Service struct {
 	DiscoveryContext func() context.Context
 }
 
-type projectOperationLock struct{ token chan struct{} }
+type projectOperationLock struct {
+	token chan struct{}
+	refs  int
+}
 
 func newProjectOperationLock() *projectOperationLock {
 	lock := &projectOperationLock{token: make(chan struct{}, 1)}
@@ -165,10 +169,32 @@ func (s *Service) lockProjectOperations(ctx context.Context, ids ...string) (fun
 	}
 	sort.Strings(orderedIDs)
 
+	s.projectLocksMu.Lock()
+	if s.projectLocks == nil {
+		s.projectLocks = make(map[string]*projectOperationLock)
+	}
 	locks := make([]*projectOperationLock, 0, len(orderedIDs))
 	for _, id := range orderedIDs {
-		value, _ := s.projectLocks.LoadOrStore(id, newProjectOperationLock())
-		locks = append(locks, value.(*projectOperationLock))
+		lock := s.projectLocks[id]
+		if lock == nil {
+			lock = newProjectOperationLock()
+			s.projectLocks[id] = lock
+		}
+		lock.refs++
+		locks = append(locks, lock)
+	}
+	s.projectLocksMu.Unlock()
+
+	releaseReferences := func() {
+		s.projectLocksMu.Lock()
+		defer s.projectLocksMu.Unlock()
+		for index, id := range orderedIDs {
+			lock := locks[index]
+			lock.refs--
+			if lock.refs == 0 && s.projectLocks[id] == lock {
+				delete(s.projectLocks, id)
+			}
+		}
 	}
 
 	for index, lock := range locks {
@@ -177,6 +203,7 @@ func (s *Service) lockProjectOperations(ctx context.Context, ids ...string) (fun
 			for releaseIndex := index - 1; releaseIndex >= 0; releaseIndex-- {
 				locks[releaseIndex].token <- struct{}{}
 			}
+			releaseReferences()
 			return nil, ctx.Err()
 		case <-lock.token:
 		}
@@ -186,6 +213,7 @@ func (s *Service) lockProjectOperations(ctx context.Context, ids ...string) (fun
 		for index := len(locks) - 1; index >= 0; index-- {
 			locks[index].token <- struct{}{}
 		}
+		releaseReferences()
 	}, nil
 }
 
@@ -545,6 +573,29 @@ func (s *Service) List(ctx context.Context) ([]storage.ProjectRecord, error) {
 		}
 	}
 	return active, nil
+}
+
+// ResumeRunningDiscoveries reschedules work whose persisted running state
+// outlived its process. The runtime calls this once after startup has
+// materialized the project catalog and installed its discovery lifecycle.
+func (s *Service) ResumeRunningDiscoveries(ctx context.Context) error {
+	if s == nil || s.Repos == nil || s.Repos.Projects == nil {
+		return fmt.Errorf("projects repository is not configured")
+	}
+	records, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.Archived {
+			continue
+		}
+		discovery := DiscoveryStateFromRecord(record)
+		if discovery.Status == DiscoveryStatusRunning {
+			s.scheduleDiscovery(DiscoverInput{ProjectID: record.ID, SnapshotMode: discovery.SnapshotMode})
+		}
+	}
+	return nil
 }
 
 func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {

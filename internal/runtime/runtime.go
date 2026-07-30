@@ -1007,6 +1007,10 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 
+	if err := projectService.ResumeRunningDiscoveries(ctx); err != nil {
+		return err
+	}
+
 	if r.deferRecovery {
 		if r.networkManager != nil {
 			_ = r.networkManager.Start(context.Background())

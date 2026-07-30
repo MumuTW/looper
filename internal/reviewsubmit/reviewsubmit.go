@@ -215,8 +215,11 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 			if err != nil {
 				return nil, err
 			}
-			roles := config.ProjectRoleConfigs(roleCfg, matched.ID)
-			return forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(cfg), requireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), labelMode: roles.Reviewer.Discovery.Triggers.LabelMode}, nil
+			reviewer, ok := config.ProjectCodingRoleConfig(roleCfg, matched.ID, config.CodingRoleReviewer)
+			if !ok {
+				return nil, fmt.Errorf("reviewer coding role is not configured")
+			}
+			return forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(cfg), requireReviewRequest: reviewer.Discovery.RequireReviewRequest, labels: append([]string(nil), reviewer.Discovery.Labels...), labelMode: reviewer.Discovery.LabelMode}, nil
 		}
 	}
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" {

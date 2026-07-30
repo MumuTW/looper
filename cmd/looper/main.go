@@ -752,6 +752,10 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 	if err != nil {
 		return err
 	}
+	return printProjectDiscoveryResult(result, stdout)
+}
+
+func printProjectDiscoveryResult(result createProjectResponse, stdout io.Writer) error {
 	if result.Discovery == nil {
 		_, _ = fmt.Fprintf(stdout, "discovery for project %s: unknown (daemon did not report discovery status)\n", result.ID)
 		return nil
@@ -766,6 +770,12 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 	}
 	for _, warning := range result.Discovery.Warnings {
 		_, _ = fmt.Fprintf(stdout, "  warning:    %s\n", singleLine(warning))
+	}
+	if result.Discovery.Status == "failed" {
+		if message := strings.TrimSpace(result.Discovery.Error); message != "" {
+			return errors.New(message)
+		}
+		return errors.New("project discovery failed")
 	}
 	return nil
 }

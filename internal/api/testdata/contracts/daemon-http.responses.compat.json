@@ -63,6 +63,9 @@
             },
             "daemonMode": "foreground",
             "admissionState": "ready",
+            "degradedReasons": [
+              "review_publish_disabled"
+            ],
             "startedAt": "2026-04-11T12:00:00.000Z",
             "recovery": {
               "expiredLocksReleased": 1,
