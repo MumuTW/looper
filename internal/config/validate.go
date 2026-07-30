@@ -256,6 +256,15 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", issues)
+	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
+	for i, project := range config.Projects {
+		if project.Roles == nil || project.Roles.Deployer == nil {
+			continue
+		}
+		role := config.Roles.Deployer
+		MergeDeployerRoleConfig(&role, *project.Roles.Deployer)
+		validateDeployerRoleConfig(role, fmt.Sprintf("projects[%d].roles.deployer", i), issues)
+	}
 	for i, project := range config.Projects {
 		if project.Roles == nil || project.Roles.Gatekeeper == nil || project.Roles.Gatekeeper.Trust == nil {
 			continue
@@ -448,6 +457,22 @@ func validateIntakeConfig(config Config, issues *[]ValidationIssue) {
 // "auto" is rejected rather than accepted-and-ignored on purpose: a merge
 // authority that silently behaves one level below what the operator configured
 // is the worst possible failure for this setting.
+// validateDeployerRoleConfig fails startup rather than at deploy time. A project
+// configured to deploy but unable to is otherwise only discovered on the first
+// merge, which is the worst moment to learn it.
+func validateDeployerRoleConfig(deployerRole DeployerRoleConfig, path string, issues *[]ValidationIssue) {
+	if !deployerRole.Enabled {
+		return
+	}
+	if strings.TrimSpace(deployerRole.Command) == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".command", Message: "is required when the deployer is enabled"})
+	}
+	if deployerRole.TimeoutSeconds < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".timeoutSeconds", Message: "must not be negative"})
+	}
+	validateEnvironmentNames(deployerRole.Environment, path+".environment", issues)
+}
+
 func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, issues *[]ValidationIssue) {
 	switch GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(gatekeeper.Trust)))) {
 	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise:

@@ -93,6 +93,7 @@ type schedulerAsyncRunner interface {
 type defaultSchedulerTickInput struct {
 	Repos             *storage.Repositories
 	GitHubGateway     *githubinfra.Gateway
+	GitGateway        *gitinfra.Gateway
 	Logger            bootstrap.Logger
 	Now               func() time.Time
 	MaxConcurrentRuns int
@@ -132,6 +133,9 @@ type defaultSchedulerTickInput struct {
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
+	// OnDeployFinished, when set, reports a completed deploy so the person who
+	// asked for the change learns it shipped.
+	OnDeployFinished func(context.Context, DeployNotification)
 }
 
 type defaultSchedulerHandlers struct {
@@ -2191,6 +2195,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		return defaultSchedulerTickInput{
 			Repos:                services.Repositories,
 			GitHubGateway:        githubGateway,
+			GitGateway:           gitGateway,
 			Logger:               logger,
 			Now:                  now,
 			MaxConcurrentRuns:    cfg.Scheduler.MaxConcurrentRuns,
@@ -2221,6 +2226,25 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			WorkerDiscoveryEnabled:   boolPtr(workerConfigured && view.AnyProjectRoleAutoDiscovery("worker")),
 			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
+			OnDeployFinished: func(ctx context.Context, notification DeployNotification) {
+				level := "info"
+				if !notification.Outcome.Succeeded {
+					level = "action_required"
+				}
+				notificationGateway.Notify(ctx, notify.SystemNotificationPayload{
+					ID:         fmt.Sprintf("deploy-%d", notification.Outcome.DeploymentID),
+					ProjectID:  notification.ProjectID,
+					Level:      level,
+					Title:      notification.Title(),
+					Subtitle:   notification.Subtitle(),
+					Body:       notification.Body(),
+					EntityType: "deployment",
+					EntityID:   notification.Outcome.SHA,
+					// One notification per deployment: a retried status write must not
+					// produce a second ping for the same deploy.
+					DedupeKey: fmt.Sprintf("deploy:%s:%s", notification.Repo, notification.Outcome.SHA),
+				})
+			},
 		}
 	}
 
@@ -2459,15 +2483,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 		runGitHubHITLPoll(ctx, input, project)
 
-		// Settle queued worker items whose target issue closed while they waited.
-		// Reuses the open-issue list the discovery lanes already fetched into this
-		// project's snapshot; no-ops when discovery did not read open issues or the
-		// list is incomplete. Bounded per discovery pass, never per-queue-item.
-		settleQueuedWorkerIssueTargets(ctx, input.Repos, snapshot, project.ID, repo, formatJavaScriptISOString(now()), func(msg string, fields map[string]any) {
-			if input.Logger != nil {
-				input.Logger.Debug(msg, fields)
-			}
-		})
+		// Deploy last for this project: a commit that just landed should be picked
+		// up by the tick that observed it, but never ahead of discovery.
+		if err := admissionRefuseWork(input); err != nil {
+			break
+		}
+		runDeployLane(ctx, input, project, repo)
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and
