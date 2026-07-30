@@ -118,6 +118,12 @@ func NewRuntimeState() *RuntimeState {
 	}
 }
 
+// Runner is the Coordinator: a proactive, LLM-driven Role for the legacy
+// label-mediated intake path that performs Triage on fresh Issues and
+// executes Dispatch. In Network mode it is also the control plane for Issue
+// admission, PR review assignment, and exact Node targeting, gated by the
+// Network Lease. The internal Triager stands down while Coordinator is
+// enabled for a Project so the two intake authorities cannot race.
 type Runner struct {
 	repos      *storage.Repositories
 	github     GitHubGateway

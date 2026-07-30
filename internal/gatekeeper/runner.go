@@ -153,6 +153,10 @@ type Options struct {
 	PolicyPermitsTarget func(projectID, repo, baseRefName string) bool
 }
 
+// Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
+// re-fetches current Pull Request state and writes an observe-only Gate
+// report. It never reviews code, repairs a Pull Request, resolves comments,
+// or merges.
 type Runner struct {
 	repos               *storage.Repositories
 	github              GitHubGateway

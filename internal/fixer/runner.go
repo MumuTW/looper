@@ -546,6 +546,8 @@ type DiscoveryPolicy struct {
 	LabelMode     config.LabelMode
 }
 
+// Runner is the Fixer: a reactive Role that addresses review feedback on a
+// Pull Request.
 type Runner struct {
 	db                          *sql.DB
 	repos                       *storage.Repositories
