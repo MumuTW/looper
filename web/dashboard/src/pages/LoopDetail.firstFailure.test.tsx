@@ -2,7 +2,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { Loop } from "@/lib/api";
+import type { ActiveRun, Loop } from "@/lib/api";
 import { DashboardDataProvider } from "@/lib/DashboardDataContext";
 import { ToastProvider } from "@/lib/toast";
 import { LoopDetailPage } from "./LoopDetail";
@@ -26,12 +26,12 @@ function loopFixture(overrides: Partial<Loop> = {}): Loop {
   };
 }
 
-function renderLoopDetail(loop: Loop) {
+function renderLoopDetail(loop: Loop, activeRuns: ActiveRun[] = []) {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      const data = url.includes("/loops/") ? loop : { items: [] };
+      const data = url.includes("/loops/") ? loop : { items: activeRuns };
       // apiFetch requires a well-formed success envelope.
       return new Response(JSON.stringify({ ok: true, data }), {
         status: 200,
@@ -123,6 +123,57 @@ describe("LoopDetail durable progress row", () => {
       expect(screen.getByText("Kept")).toBeTruthy();
     });
     expect(screen.queryByText("Kept (partial)")).toBeNull();
+  });
+});
+
+describe("LoopDetail timeout continuation", () => {
+  it("shows daemon-owned preservation evidence without source paths", async () => {
+    renderLoopDetail(loopFixture({ status: "paused" }), [
+      {
+        seq: 42,
+        runId: "run_retry",
+        loopId: "loop_1",
+        projectId: "project_1",
+        type: "worker",
+        status: "failed",
+        loopStatus: "paused",
+        displayStatus: "manual_intervention",
+        target: { type: "pull_request", label: "acme/looper#42" },
+        continuation: {
+          predecessorRunId: "run_timeout",
+          predecessorExecutionId: "agent_timeout",
+          mode: "checkpoint_same_worktree",
+          outcome: "lost",
+          beforeTimeout: {
+            headSha: "before-head",
+            worktreeId: "wt_1",
+            branch: "feature/continue",
+            changedFileCount: 3,
+            stagedFileCount: 1,
+            untrackedFileCount: 1,
+            diffFingerprint: "status-sha",
+            lastProgressAt: "2026-07-30T12:00:00.000Z",
+          },
+          afterRestart: {
+            headSha: "before-head",
+            worktreeId: "wt_1",
+            branch: "feature/continue",
+            changedFileCount: 0,
+            stagedFileCount: 0,
+            untrackedFileCount: 0,
+            diffFingerprint: "clean-sha",
+          },
+        },
+      },
+    ]);
+
+    await waitFor(() => {
+      expect(screen.getByText("Timeout continuation")).toBeTruthy();
+    });
+    expect(screen.getByText("lost")).toBeTruthy();
+    expect(screen.getByText("run_timeout")).toBeTruthy();
+    expect(screen.getByText(/3\/1\/1 changed\/staged\/untracked/)).toBeTruthy();
+    expect(screen.queryByText("private.go")).toBeNull();
   });
 });
 

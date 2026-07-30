@@ -654,6 +654,58 @@ func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {
 	assertEqual(t, item["lastFailureReason"], runError)
 }
 
+func TestHandlerActiveRunsProjectsWorkerTimeoutContinuationWithoutPaths(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_timeout_continuation"
+	loopID := "loop_timeout_continuation"
+	targetID := projectID
+	checkpoint := `{
+		"resumePolicy":"manual_intervention",
+		"continuation":{
+			"predecessorRunId":"run_predecessor",
+			"predecessorExecutionId":"agent_predecessor",
+			"mode":"checkpoint_same_worktree",
+			"outcome":"lost",
+			"beforeTimeout":{"headSha":"before-head","worktreeId":"wt_1","branch":"feature/continue","changedFileCount":3,"stagedFileCount":1,"untrackedFileCount":1,"changedFiles":["private.go"],"diffFingerprint":"before-status","timeoutType":"idle","lastProgressAt":"2026-04-11T11:59:00.000Z"},
+			"afterRestart":{"headSha":"before-head","worktreeId":"wt_1","branch":"feature/continue","changedFileCount":0,"stagedFileCount":0,"untrackedFileCount":0,"diffFingerprint":"clean-status","capturedAt":"2026-04-11T12:00:00.000Z"}
+		}
+	}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 48, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_timeout_continuation", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	items := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items len = %d, want 1: %#v", len(items), items)
+	}
+	continuation := items[0].(map[string]any)["continuation"].(map[string]any)
+	assertEqual(t, continuation["predecessorRunId"], "run_predecessor")
+	assertEqual(t, continuation["predecessorExecutionId"], "agent_predecessor")
+	assertEqual(t, continuation["mode"], "checkpoint_same_worktree")
+	assertEqual(t, continuation["outcome"], "lost")
+	before := continuation["beforeTimeout"].(map[string]any)
+	assertEqual(t, before["changedFileCount"], float64(3))
+	assertEqual(t, before["diffFingerprint"], "before-status")
+	if _, ok := before["changedFiles"]; ok {
+		t.Fatalf("beforeTimeout = %#v, must not expose persisted file paths", before)
+	}
+}
+
 // Successful completeRun summaries must not populate lastFailureReason when there
 // is no queue error (queued/running loops and ps --all completed rows).
 func TestHandlerActiveRunsDoesNotUseSuccessSummaryAsFailureReason(t *testing.T) {

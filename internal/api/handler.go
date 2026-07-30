@@ -2110,25 +2110,26 @@ type activeRunsQuery struct {
 }
 
 type activeRunView struct {
-	Seq               int64              `json:"seq"`
-	RunID             *string            `json:"runId"`
-	LoopID            string             `json:"loopId"`
-	ProjectID         string             `json:"projectId"`
-	Type              string             `json:"type"`
-	Status            string             `json:"status"`
-	LoopStatus        string             `json:"loopStatus"`
-	DisplayStatus     string             `json:"displayStatus"`
-	Attempts          *int64             `json:"attempts,omitempty"`
-	MaxAttempts       *int64             `json:"maxAttempts,omitempty"`
-	LastFailureKind   *string            `json:"lastFailureKind,omitempty"`
-	LastFailureReason *string            `json:"lastFailureReason,omitempty"`
-	ResumePolicy      *string            `json:"resumePolicy,omitempty"`
-	CurrentStep       *string            `json:"currentStep"`
-	StartedAt         *string            `json:"startedAt"`
-	EndedAt           *string            `json:"endedAt,omitempty"`
-	Target            activeRunTarget    `json:"target"`
-	Agent             *activeRunAgent    `json:"agent"`
-	Worktree          *activeRunWorktree `json:"worktree"`
+	Seq               int64                  `json:"seq"`
+	RunID             *string                `json:"runId"`
+	LoopID            string                 `json:"loopId"`
+	ProjectID         string                 `json:"projectId"`
+	Type              string                 `json:"type"`
+	Status            string                 `json:"status"`
+	LoopStatus        string                 `json:"loopStatus"`
+	DisplayStatus     string                 `json:"displayStatus"`
+	Attempts          *int64                 `json:"attempts,omitempty"`
+	MaxAttempts       *int64                 `json:"maxAttempts,omitempty"`
+	LastFailureKind   *string                `json:"lastFailureKind,omitempty"`
+	LastFailureReason *string                `json:"lastFailureReason,omitempty"`
+	ResumePolicy      *string                `json:"resumePolicy,omitempty"`
+	CurrentStep       *string                `json:"currentStep"`
+	StartedAt         *string                `json:"startedAt"`
+	EndedAt           *string                `json:"endedAt,omitempty"`
+	Target            activeRunTarget        `json:"target"`
+	Agent             *activeRunAgent        `json:"agent"`
+	Worktree          *activeRunWorktree     `json:"worktree"`
+	Continuation      *activeRunContinuation `json:"continuation,omitempty"`
 }
 
 type retryLoopRequest struct {
@@ -2171,6 +2172,31 @@ type activeRunWorktree struct {
 	ID     *string `json:"id"`
 	Path   string  `json:"path"`
 	Branch *string `json:"branch"`
+}
+
+// activeRunContinuation is a redacted, read-only projection of a Worker's
+// persisted timeout-retry evidence. It intentionally omits changed file paths
+// and diff contents: the dashboard needs preservation status, not source data.
+type activeRunContinuation struct {
+	PredecessorRunID       string                 `json:"predecessorRunId,omitempty"`
+	PredecessorExecutionID string                 `json:"predecessorExecutionId,omitempty"`
+	Mode                   string                 `json:"mode,omitempty"`
+	Outcome                string                 `json:"outcome,omitempty"`
+	BeforeTimeout          *activeRunProgressView `json:"beforeTimeout,omitempty"`
+	AfterRestart           *activeRunProgressView `json:"afterRestart,omitempty"`
+}
+
+type activeRunProgressView struct {
+	HeadSHA            string `json:"headSha,omitempty"`
+	WorktreeID         string `json:"worktreeId,omitempty"`
+	Branch             string `json:"branch,omitempty"`
+	ChangedFileCount   int    `json:"changedFileCount"`
+	StagedFileCount    int    `json:"stagedFileCount"`
+	UntrackedFileCount int    `json:"untrackedFileCount"`
+	DiffFingerprint    string `json:"diffFingerprint,omitempty"`
+	TimeoutType        string `json:"timeoutType,omitempty"`
+	LastProgressAt     string `json:"lastProgressAt,omitempty"`
+	CapturedAt         string `json:"capturedAt,omitempty"`
 }
 
 type projectService interface {
@@ -3597,6 +3623,7 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 		}
 	}
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
+	view.Continuation = buildActiveRunContinuation(latestRun)
 	// Do not override a closed loop's status with manual_intervention: the loop
 	// is no longer actionable even if the latest queue item still has that status.
 	if !isClosedLoopStatus(loop.Status) && (isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention)) {
@@ -3974,6 +4001,75 @@ func buildWorktreeSummary(loop storage.LoopRecord, run storage.RunRecord) *activ
 		ID:     firstNonEmptyString(readObjectString(checkpointWorktree, "id"), readStringMap(loopMetadata, "worktreeId")),
 		Path:   *path,
 		Branch: firstNonEmptyString(readObjectString(checkpointWorktree, "branch"), readStringMap(loopMetadata, "branch")),
+	}
+}
+
+func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
+	if run == nil || run.CheckpointJSON == nil {
+		return nil
+	}
+	checkpoint := parseJSONObject(run.CheckpointJSON)
+	continuation := readObject(checkpoint, "continuation")
+	if continuation != nil {
+		before := buildActiveRunProgress(readObject(continuation, "beforeTimeout"))
+		after := buildActiveRunProgress(readObject(continuation, "afterRestart"))
+		if before == nil && after == nil {
+			return nil
+		}
+		return &activeRunContinuation{
+			PredecessorRunID:       derefString(readObjectString(continuation, "predecessorRunId")),
+			PredecessorExecutionID: derefString(readObjectString(continuation, "predecessorExecutionId")),
+			Mode:                   derefString(readObjectString(continuation, "mode")),
+			Outcome:                derefString(readObjectString(continuation, "outcome")),
+			BeforeTimeout:          before,
+			AfterRestart:           after,
+		}
+	}
+	// A timeout that has not retried yet stores its evidence under execution.
+	// Project it too, so an operator can inspect it before choosing recovery.
+	execution := readObject(checkpoint, "execution")
+	before := buildActiveRunProgress(readObject(execution, "progressBeforeTimeout"))
+	if before == nil {
+		return nil
+	}
+	return &activeRunContinuation{
+		PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
+		Mode:                   "timeout_observed",
+		BeforeTimeout:          before,
+	}
+}
+
+func buildActiveRunProgress(value map[string]any) *activeRunProgressView {
+	if value == nil {
+		return nil
+	}
+	return &activeRunProgressView{
+		HeadSHA:            derefString(readObjectString(value, "headSha")),
+		WorktreeID:         derefString(readObjectString(value, "worktreeId")),
+		Branch:             derefString(readObjectString(value, "branch")),
+		ChangedFileCount:   readObjectInt(value, "changedFileCount"),
+		StagedFileCount:    readObjectInt(value, "stagedFileCount"),
+		UntrackedFileCount: readObjectInt(value, "untrackedFileCount"),
+		DiffFingerprint:    derefString(readObjectString(value, "diffFingerprint")),
+		TimeoutType:        derefString(readObjectString(value, "timeoutType")),
+		LastProgressAt:     derefString(readObjectString(value, "lastProgressAt")),
+		CapturedAt:         derefString(readObjectString(value, "capturedAt")),
+	}
+}
+
+func readObjectInt(value map[string]any, key string) int {
+	if value == nil {
+		return 0
+	}
+	switch typed := value[key].(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	default:
+		return 0
 	}
 }
 

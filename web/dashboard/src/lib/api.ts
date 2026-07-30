@@ -246,6 +246,29 @@ export type ActiveRunWorktree = {
   branch?: string | null;
 };
 
+/** Redacted daemon-owned evidence for a Worker timeout continuation. */
+export type ActiveRunProgress = {
+  headSha?: string | null;
+  worktreeId?: string | null;
+  branch?: string | null;
+  changedFileCount: number;
+  stagedFileCount: number;
+  untrackedFileCount: number;
+  diffFingerprint?: string | null;
+  timeoutType?: string | null;
+  lastProgressAt?: string | null;
+  capturedAt?: string | null;
+};
+
+export type ActiveRunContinuation = {
+  predecessorRunId?: string | null;
+  predecessorExecutionId?: string | null;
+  mode?: string | null;
+  outcome?: "preserved" | "changed" | "committed" | "lost" | string | null;
+  beforeTimeout?: ActiveRunProgress | null;
+  afterRestart?: ActiveRunProgress | null;
+};
+
 export type ActiveRun = {
   seq: number;
   runId?: string | null;
@@ -268,6 +291,7 @@ export type ActiveRun = {
   target: ActiveRunTarget;
   agent?: ActiveRunAgent | null;
   worktree?: ActiveRunWorktree | null;
+  continuation?: ActiveRunContinuation | null;
 };
 
 export type ActiveRunsList = {
