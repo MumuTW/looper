@@ -1301,6 +1301,155 @@ func TestHandlerStatusKeepsDebtForUnprovableLiveQuarantinedExecution(t *testing.
 	}
 }
 
+// Contract for #150: the production exit path is startup quarantine -> admission
+// ready -> scheduler full tick -> live reconciliation. This test exercises the
+// real default scheduler (no no-op RunSchedulerTick) and the real
+// CompleteStartup ordering: recovery parks the dead quarantined execution, the
+// scheduler's periodic full tick drives the live reconcile, and /status then
+// reports the daemon ready with quarantine debt cleared.
+func TestHandlerStatusClearsQuarantineDebtThroughSchedulerLifecycle(t *testing.T) {
+	rootDir := t.TempDir()
+	homeDir := t.TempDir()
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", homeDir, err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_HOME", filepath.Join(homeDir, ".looper"))
+	cfg, err := config.DefaultConfig(rootDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	backupDir := filepath.Join(rootDir, "backups")
+	cfg.Network = config.NetworkConfig{}
+	cfg.Storage.DBPath = filepath.Join(rootDir, "state", "looper.sqlite")
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Daemon.LogDir = filepath.Join(rootDir, "logs")
+	cfg.Daemon.WorkingDirectory = rootDir
+	cfg.Notifications.Osascript.Enabled = true
+	cfg.Tools.GitPath = stringPtr("/usr/bin/git")
+	cfg.Tools.GHPath = stringPtr("/usr/bin/gh")
+	cfg.Tools.OsascriptPath = stringPtr("/usr/bin/osascript")
+	vendor := config.AgentVendorOpenCode
+	cfg.Agent.Vendor = &vendor
+
+	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	// Real default scheduler: do NOT override RunSchedulerTick. The recorded
+	// leader PID holds no process and its process group is empty, so the live
+	// reconcile settles the parked execution once the scheduler ticks.
+	options := looperdruntime.Options{
+		Config:               cfg,
+		Logger:               noopLogger{},
+		DeferRecovery:        true,
+		Now:                  func() time.Time { return now },
+		ReadProcessCommand:   func(context.Context, int) (string, error) { return "", nil },
+		ReadProcessGroupLive: func(int) (bool, bool) { return false, true },
+	}
+	rt := looperdruntime.New(options)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Runtime.Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	// Seed the dead quarantined execution before recovery runs so startup
+	// recovery parks it and the scheduler's live reconcile settles it.
+	repos := rt.Services().Repositories
+	oldISO := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	projectID := "project_scheduler_lifecycle"
+	loopID := "loop_scheduler_lifecycle"
+	runID := "run_scheduler_lifecycle"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Scheduler", RepoPath: rootDir, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("work"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_scheduler_lifecycle", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "worker:scheduler-lifecycle", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: oldISO, StartedAt: &oldISO, MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	pid := int64(9393)
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "execution_scheduler_lifecycle", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(rootDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	// CompleteStartup runs recovery (quarantine), opens admission, starts the
+	// real scheduler loop, and triggers a full tick whose live reconcile settles
+	// the parked execution.
+	if err := rt.CompleteStartup(context.Background()); err != nil {
+		t.Fatalf("Runtime.CompleteStartup() error = %v", err)
+	}
+	if err := rt.WaitForDeferredReviewerRecovery(context.Background()); err != nil {
+		t.Fatalf("Runtime.WaitForDeferredReviewerRecovery() error = %v", err)
+	}
+
+	// Poll /status until the scheduler tick has cleared the quarantine debt.
+	deadline := time.Now().Add(5 * time.Second)
+	var cleared bool
+	for time.Now().Before(deadline) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+		recorder := httptest.NewRecorder()
+		NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+		}
+		data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+		outstanding := data["service"].(map[string]any)["recovery"].(map[string]any)["outstanding"].(map[string]any)
+		if outstanding["quarantinedActiveExecutions"] == float64(0) {
+			cleared = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !cleared {
+		t.Fatalf("quarantine debt never cleared through the scheduler lifecycle within timeout")
+	}
+
+	// Final state: daemon ready, debt gone, execution settled, run interrupted,
+	// loop still parked, and the quarantine audit trail preserved.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	service := data["service"].(map[string]any)
+	outstanding := service["recovery"].(map[string]any)["outstanding"].(map[string]any)
+	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(0))
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
+	if strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
+		t.Fatalf("degradedReasons = %#v, want no quarantine debt after scheduler settlement", service["degradedReasons"])
+	}
+	assertEqual(t, data["scheduler"].(map[string]any)["activeRuns"], float64(0))
+	if exec, err := repos.AgentExecutions.GetByID(context.Background(), "execution_scheduler_lifecycle"); err != nil || exec == nil || exec.Status != "failed" {
+		t.Fatalf("execution = %#v, %v; want settled terminal row", exec, err)
+	}
+	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "interrupted" {
+		t.Fatalf("run = %#v, %v; want interrupted run after settlement", run, err)
+	}
+	if loop, err := repos.Loops.GetByID(context.Background(), loopID); err != nil || loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, %v; want work still parked", loop, err)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_scheduler_lifecycle")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	var hasQuarantine, hasSettled bool
+	for _, event := range events {
+		if event.EventType == "looperd.recovery.execution_quarantined" {
+			hasQuarantine = true
+		}
+		if event.EventType == "looperd.recovery.execution_quarantine_settled" {
+			hasSettled = true
+		}
+	}
+	if !hasQuarantine || !hasSettled {
+		t.Fatalf("events = %#v, want both the quarantine and settlement audit trail preserved", events)
+	}
+}
+
 func TestHandlerStatusIncludesRedactedForgejoProviderHealth(t *testing.T) {
 	t.Setenv("FORGEJO_STATUS_TOKEN", "status-secret")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

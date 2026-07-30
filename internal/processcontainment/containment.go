@@ -536,6 +536,16 @@ func (h *Handle) groupHasLiveMember(pgid int) (hasLive bool, ok bool) {
 	return groupHasNonZombieMember(pgid)
 }
 
+// ProcessGroupHasLiveMember reports whether the process group pgid still has a
+// non-zombie member. ok is false when the platform cannot scan the group (the
+// caller should fall back to a signal-0 probe). It is the exported form of
+// groupHasNonZombieMember so callers outside this package (e.g. quarantine
+// settlement descendant containment) can reuse the same /proc authority
+// without re-deriving it.
+func ProcessGroupHasLiveMember(pgid int) (hasLive bool, ok bool) {
+	return groupHasNonZombieMember(pgid)
+}
+
 func (h *Handle) withDrainTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if h.drainTimeout <= 0 {
 		return context.WithCancel(ctx)

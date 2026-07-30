@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/processidentity"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
@@ -42,6 +43,12 @@ type ReadProcessCommandFunc func(context.Context, int) (string, error)
 type ReadProcessStartFunc func(context.Context, int) (int64, error)
 
 type ReadProcessBootIDFunc func(context.Context, int) (string, error)
+
+// ReadProcessGroupLiveFunc reports whether the process group pgid still has a
+// live (non-zombie) member. ok is false when liveness cannot be determined
+// (probe failure / unsupported platform without a fallback); callers must
+// treat that as uncertain rather than absence.
+type ReadProcessGroupLiveFunc func(pgid int) (hasLive bool, ok bool)
 
 type SignalProcessFunc func(int, syscall.Signal) error
 
@@ -123,6 +130,7 @@ type Options struct {
 	ReadProcessCommand          ReadProcessCommandFunc
 	ReadProcessStart            ReadProcessStartFunc
 	ReadProcessBootID           ReadProcessBootIDFunc
+	ReadProcessGroupLive        ReadProcessGroupLiveFunc
 	SignalProcess               SignalProcessFunc
 	DeferRecovery               bool
 }
@@ -170,6 +178,7 @@ type Runtime struct {
 	readProcessCommand     ReadProcessCommandFunc
 	readProcessStart       ReadProcessStartFunc
 	readProcessBootID      ReadProcessBootIDFunc
+	readProcessGroupLive   ReadProcessGroupLiveFunc
 	signalProcess          SignalProcessFunc
 	shutdownTimeout        time.Duration
 	deferRecovery          bool
@@ -264,6 +273,10 @@ func New(options Options) *Runtime {
 	if readProcessBootID == nil {
 		readProcessBootID = defaultReadProcessBootID
 	}
+	readProcessGroupLive := options.ReadProcessGroupLive
+	if readProcessGroupLive == nil {
+		readProcessGroupLive = defaultReadProcessGroupLive
+	}
 
 	signalProcess := options.SignalProcess
 	if signalProcess == nil {
@@ -304,6 +317,7 @@ func New(options Options) *Runtime {
 		readProcessCommand:          readProcessCommand,
 		readProcessStart:            readProcessStart,
 		readProcessBootID:           readProcessBootID,
+		readProcessGroupLive:        readProcessGroupLive,
 		signalProcess:               signalProcess,
 		shutdownTimeout:             shutdownTimeout,
 		worktreeCleanupInitialDelay: options.WorktreeCleanupInitialDelay,
@@ -2236,6 +2250,10 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 	// requeued by the post-interrupt repair pass or the later interrupted-loop
 	// sweep while agent_executions remain running evidence (#575).
 	quarantinedLoopIDs := make(map[string]struct{})
+	// processedExecutionIDs tracks executions the running-run loop already
+	// examined (and may have settled). The orphan settlement pass skips them to
+	// avoid redundant probes and double run interruption.
+	processedExecutionIDs := make(map[string]struct{})
 	for _, run := range runningRuns {
 		if err := ctx.Err(); err != nil {
 			return StaleRunReconcileSummary{}, err
@@ -2264,6 +2282,7 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			summary.EventsWritten += decision.EventsWritten
 			settledExecutions := 0
 			for _, execution := range decision.ConfirmationExecutions {
+				processedExecutionIDs[execution.ID] = struct{}{}
 				reason := "needs confirmation: execution liveness is not authoritative"
 				quarantined, wrote, err := r.quarantineRecoveryEvidence(ctx, repositories, execution, nowISO, reason)
 				if err != nil {
@@ -2341,6 +2360,27 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		summary.QueueItemsRequeued += queueRepair.QueueItemsRequeued
 		summary.QueueItemsCancelled += queueRepair.QueueItemsCancelled
 		summary.EventsWritten += queueRepair.EventsWritten
+	}
+	// Settlement above is reachable only while iterating running runs, and active
+	// executions with an empty RunID are skipped there. A dead quarantined
+	// execution with a missing/terminal run, no run ID, or a missing loop would
+	// otherwise leave the daemon permanently degraded: CountOutstandingQuarantineDebt
+	// counts every active row carrying the quarantine event. The live/manual
+	// reconcile settles those orphans too; startup recovery only parks (ADR-0015 R8).
+	if mode != staleRunReconcileModeStartup {
+		orphanSummary, err := r.settleOrphanedQuarantinedExecutions(ctx, repositories, nowISO, processedExecutionIDs)
+		if err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		summary.SettledQuarantinedExecutions += orphanSummary.SettledQuarantinedExecutions
+		summary.InterruptedRuns += orphanSummary.InterruptedRuns
+		summary.EventsWritten += orphanSummary.EventsWritten
+		summary.ExecutionIDs = append(summary.ExecutionIDs, orphanSummary.ExecutionIDs...)
+		summary.RunIDs = append(summary.RunIDs, orphanSummary.RunIDs...)
+		summary.LoopIDs = append(summary.LoopIDs, orphanSummary.LoopIDs...)
+		for _, loopID := range orphanSummary.LoopIDs {
+			quarantinedLoopIDs[loopID] = struct{}{}
+		}
 	}
 	if repositories.Queue != nil {
 		loops, err := repositories.Loops.List(ctx)
@@ -3455,6 +3495,30 @@ func defaultReadProcessBootID(ctx context.Context, _ int) (string, error) {
 		return "", err
 	}
 	return processidentity.LinuxBootID()
+}
+
+// defaultReadProcessGroupLive reports whether the process group pgid still has
+// a live member. It prefers the platform /proc scan (Linux) and falls back to
+// kill(-pgid, 0) where no scan exists (non-Linux). ok is false only when the
+// group liveness cannot be determined at all, which callers treat as uncertain
+// rather than absence.
+func defaultReadProcessGroupLive(pgid int) (hasLive bool, ok bool) {
+	if pgid <= 0 {
+		return false, true
+	}
+	if live, scanned := processcontainment.ProcessGroupHasLiveMember(pgid); scanned {
+		return live, true
+	}
+	// No /proc probe (non-Linux) or scan failed: fall back to a signal-0 probe
+	// of the process group. ESRCH means no addressable member; any other error
+	// is uncertain.
+	if err := syscall.Kill(-pgid, 0); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return false, true
+		}
+		return false, false
+	}
+	return true, true
 }
 
 func defaultSignalProcess(pid int, signal syscall.Signal) error {
