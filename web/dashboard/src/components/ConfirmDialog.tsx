@@ -42,6 +42,15 @@ const originalBodyChildStates = new Map<
   { inert: string | null; ariaHidden: string | null }
 >();
 let bodyObserver: MutationObserver | null = null;
+let restoreFocusTarget: HTMLElement | null = null;
+
+function setToastDismissButtonsInert(container: Element, inert: boolean) {
+  for (const dismiss of container.querySelectorAll<HTMLElement>(
+    "[data-toast-dismiss]",
+  )) {
+    dismiss.toggleAttribute("inert", inert);
+  }
+}
 
 function updateBackgroundInertState() {
   if (typeof document === "undefined") return;
@@ -49,13 +58,10 @@ function updateBackgroundInertState() {
   const topModal = activeModalsStack[activeModalsStack.length - 1];
 
   for (const child of Array.from(document.body.children)) {
-    if (
-      child.hasAttribute("data-toast-container") ||
-      child.getAttribute("aria-live") ||
-      child.querySelector("[aria-live]")
-    ) {
+    if (child.hasAttribute("data-toast-container")) {
       child.removeAttribute("inert");
       child.removeAttribute("aria-hidden");
+      setToastDismissButtonsInert(child, topModal !== undefined);
       continue;
     }
 
@@ -90,7 +96,7 @@ function hideBackground(modalRoot: HTMLElement): () => void {
     bodyObserver = new MutationObserver(() => {
       updateBackgroundInertState();
     });
-    bodyObserver.observe(document.body, { childList: true });
+    bodyObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   return () => {
@@ -105,6 +111,11 @@ function hideBackground(modalRoot: HTMLElement): () => void {
       if (bodyObserver) {
         bodyObserver.disconnect();
         bodyObserver = null;
+      }
+      for (const container of document.querySelectorAll(
+        "[data-toast-container]",
+      )) {
+        setToastDismissButtonsInert(container, false);
       }
       for (const [child, state] of originalBodyChildStates.entries()) {
         if (child.isConnected) {
@@ -123,8 +134,8 @@ function hideBackground(modalRoot: HTMLElement): () => void {
  * Dense operator confirmation modal.
  *
  * Safe initial focus prefers Cancel, then Confirm when no cancel action exists,
- * and finally the panel when every action is disabled. Closing restores the
- * initiating element if it still belongs to the document.
+ * and finally the panel when every action is disabled. Stacked dialogs retain
+ * the first dialog's initiating element until the final dialog closes.
  */
 export function ConfirmDialog({
   open,
@@ -141,14 +152,15 @@ export function ConfirmDialog({
   const titleId = useId();
   const modalRootRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
-  const initiatingElementRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
-    initiatingElementRef.current =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
+    if (activeModalsStack.length === 0) {
+      restoreFocusTarget =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
+    }
 
     const restoreBackground = modalRootRef.current
       ? hideBackground(modalRootRef.current)
@@ -167,10 +179,12 @@ export function ConfirmDialog({
 
     return () => {
       restoreBackground();
-      const initiatingElement = initiatingElementRef.current;
-      initiatingElementRef.current = null;
-      if (activeModalsStack.length === 0 && initiatingElement?.isConnected) {
-        initiatingElement.focus();
+      if (activeModalsStack.length === 0) {
+        const target = restoreFocusTarget;
+        restoreFocusTarget = null;
+        if (target?.isConnected) {
+          target.focus();
+        }
       }
     };
   }, [open]);

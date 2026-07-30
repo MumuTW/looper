@@ -108,6 +108,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 >
                   <span className="break-words">{t.message}</span>
                   <Button
+                    data-toast-dismiss
                     variant="ghost"
                     size="sm"
                     className="h-6 px-1.5 text-[11px]"
