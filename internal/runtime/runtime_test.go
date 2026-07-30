@@ -130,6 +130,37 @@ func TestRuntimeStartExclusivelyOwnsDatabaseForItsLifetime(t *testing.T) {
 	third.Stop("test cleanup")
 }
 
+func TestRuntimeStartWithoutAutoMigrateExclusivelyOwnsDatabaseForItsLifetime(t *testing.T) {
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Package.AutoMigrateOnStartup = false
+	seed, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() seed error = %v", err)
+	}
+	if _, err := seed.MigrationRunner().RunPending(context.Background()); err != nil {
+		_ = seed.Close()
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("seed Close() error = %v", err)
+	}
+
+	first := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("first Start() error = %v", err)
+	}
+	defer first.Stop("test cleanup")
+	second := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := second.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "database compatibility lock is held") {
+		t.Fatalf("second Start() error = %v, want exclusive database ownership failure", err)
+	}
+}
+
 func TestRuntimeStartMaterializesProjectCatalogFromDatabase(t *testing.T) {
 	t.Parallel()
 

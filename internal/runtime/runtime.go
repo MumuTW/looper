@@ -847,11 +847,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		backupDir = *r.config.Storage.BackupDir
 	}
 
-	lockMode := storage.DatabaseLockShared
-	if r.config.Package.AutoMigrateOnStartup {
-		lockMode = storage.DatabaseLockExclusive
-	}
-	lock, err := storage.AcquireDatabaseLock(r.config.Storage.DBPath, lockMode)
+	lock, err := storage.AcquireDatabaseLock(r.config.Storage.DBPath, storage.DatabaseLockExclusive)
 	if err != nil {
 		if r.logger != nil {
 			r.logger.Warn("runtime.database.lock_failed", map[string]any{"error": err.Error()})
@@ -859,7 +855,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		return err
 	}
 	if r.logger != nil {
-		r.logger.Info("runtime.database.lock_acquired", map[string]any{"mode": lockMode})
+		r.logger.Info("runtime.database.lock_acquired", map[string]any{"mode": storage.DatabaseLockExclusive})
 	}
 
 	coordinator, err := r.openSQLiteCoordinator(ctx, r.config.Storage.DBPath, storage.SQLiteCoordinatorOptions{
@@ -900,12 +896,8 @@ func (r *Runtime) start(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := lock.Release(); err != nil {
-			return fmt.Errorf("release exclusive database migration lock: %w", err)
-		}
-		lock, err = storage.AcquireDatabaseLock(r.config.Storage.DBPath, storage.DatabaseLockShared)
-		if err != nil {
-			return fmt.Errorf("acquire shared database runtime lock: %w", err)
+		if err := lock.Downgrade(); err != nil {
+			return fmt.Errorf("downgrade database migration lock to shared: %w", err)
 		}
 	}
 

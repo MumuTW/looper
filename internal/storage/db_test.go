@@ -63,6 +63,28 @@ func TestDatabaseLockAllowsSharedAuthorityReadsButExcludesMigration(t *testing.T
 	}
 }
 
+func TestDatabaseLockDowngradeKeepsFenceWithoutReleaseGap(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "looper.sqlite")
+	lock, err := AcquireDatabaseLock(dbPath, DatabaseLockExclusive)
+	if err != nil {
+		t.Fatalf("AcquireDatabaseLock(exclusive) error = %v", err)
+	}
+	defer lock.Release()
+	if err := lock.Downgrade(); err != nil {
+		t.Fatalf("DatabaseLock.Downgrade() error = %v", err)
+	}
+	reader, err := AcquireDatabaseLock(dbPath, DatabaseLockShared)
+	if err != nil {
+		t.Fatalf("AcquireDatabaseLock(shared) after downgrade error = %v", err)
+	}
+	defer reader.Release()
+	writer, err := AcquireDatabaseLock(dbPath, DatabaseLockExclusive)
+	if err == nil {
+		_ = writer.Release()
+		t.Fatal("AcquireDatabaseLock(exclusive) error = nil, want shared fence after downgrade")
+	}
+}
+
 func TestDatabaseLockUsesCanonicalPerDatabasePath(t *testing.T) {
 	root := t.TempDir()
 	firstPath := filepath.Join(root, "first.sqlite")
@@ -99,6 +121,16 @@ func TestSQLiteFilesystemPathParsesFileURI(t *testing.T) {
 	}
 	if !isFile || path != "/var/lib/looper/looper.sqlite" {
 		t.Fatalf("SQLiteFilesystemPath(file URI) = (%q, %t), want (/var/lib/looper/looper.sqlite, true)", path, isFile)
+	}
+}
+
+func TestSQLiteFilesystemPathParsesOpaqueFileURI(t *testing.T) {
+	path, isFile, err := SQLiteFilesystemPath("file:looper.sqlite?_busy_timeout=5000")
+	if err != nil {
+		t.Fatalf("SQLiteFilesystemPath(opaque file URI) error = %v", err)
+	}
+	if !isFile || path != "looper.sqlite" {
+		t.Fatalf("SQLiteFilesystemPath(opaque file URI) = (%q, %t), want (looper.sqlite, true)", path, isFile)
 	}
 }
 

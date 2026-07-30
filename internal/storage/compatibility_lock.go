@@ -60,6 +60,19 @@ func (l *DatabaseLock) Release() error {
 	return err
 }
 
+// Downgrade converts an exclusive lock to shared on the same descriptor, so a
+// migration fence remains continuously held while a runtime begins serving
+// compatibility-dependent reads.
+func (l *DatabaseLock) Downgrade() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	if err := syscall.Flock(int(l.file.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		return fmt.Errorf("downgrade database compatibility lock: %w", err)
+	}
+	return nil
+}
+
 func databaseLockPath(dbPath string) (string, bool, error) {
 	canonical, ok, err := canonicalDatabasePath(dbPath)
 	if err != nil || !ok {
@@ -107,6 +120,9 @@ func SQLiteFilesystemPath(dbPath string) (string, bool, error) {
 		}
 		if strings.EqualFold(parsed.Query().Get("mode"), "memory") {
 			return "", false, nil
+		}
+		if parsed.Path == "" {
+			parsed.Path = parsed.Opaque
 		}
 		if parsed.Path == "" {
 			return "", false, fmt.Errorf("SQLite file URI has no filesystem path")
