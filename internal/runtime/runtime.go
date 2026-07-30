@@ -902,7 +902,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		ConfigBoundary: &r.configBoundary,
 		Now:            r.now,
 		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
-			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.Snapshot(), repoPath)
+			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.View(), repoPath)
 		},
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
 			if githubGateway == nil {
@@ -1236,7 +1236,7 @@ func runtimeProjectBinding(cfg config.Config, projectID string) (config.ProjectR
 	return config.ProjectRefConfig{}, false
 }
 
-func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg config.Config, repoPath string) (projects.DetectedRepo, error) {
+func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, view projects.OperationView, repoPath string) (projects.DetectedRepo, error) {
 	if gitGateway == nil {
 		return projects.DetectedRepo{}, fmt.Errorf("git gateway is not configured")
 	}
@@ -1247,8 +1247,8 @@ func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg co
 	if strings.TrimSpace(remote.Repo) == "" {
 		return projects.DetectedRepo{}, nil
 	}
-	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, remote.Host); ok {
-		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.ID}, nil
+	if provider, ok := view.ProviderByRemoteHost(remote.Host); ok {
+		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.Provider.ID}, nil
 	}
 	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
 		return projects.DetectedRepo{Repo: remote.Repo}, nil
