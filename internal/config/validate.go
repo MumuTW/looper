@@ -128,7 +128,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: agentVendorValidationMessage()})
 	}
 	validateAgentProfiles(config.Agent.Profiles, &issues)
-	validateRoleAgentBindings(config, &issues)
 	validateEnvironmentNames(config.Agent.Env, "agent.env", &issues)
 	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", &issues)
 
@@ -297,10 +296,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 	validateInstructions(config, &issues)
 	validateCoordinatorRoleConfig(config.Roles.Coordinator, "roles.coordinator", &issues)
-	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
-	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
-	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
-	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
 	validateCodingRoleRegistry(config, &issues)
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
@@ -979,22 +974,6 @@ func validateAgentProfiles(profiles map[string]AgentBindingConfig, issues *[]Val
 		if binding.Vendor != nil && !isValidAgentVendor(*binding.Vendor) {
 			*issues = append(*issues, ValidationIssue{Path: path + ".vendor", Message: agentVendorValidationMessage()})
 		}
-	}
-}
-
-func validateRoleAgentBindings(config Config, issues *[]ValidationIssue) {
-	type roleBinding struct {
-		role  string
-		agent *RoleAgentConfig
-	}
-	bindings := []roleBinding{
-		{role: CodingRolePlanner, agent: config.Roles.Planner.Agent},
-		{role: CodingRoleWorker, agent: config.Roles.Worker.Agent},
-		{role: CodingRoleReviewer, agent: config.Roles.Reviewer.Agent},
-		{role: CodingRoleFixer, agent: config.Roles.Fixer.Agent},
-	}
-	for _, binding := range bindings {
-		validateRoleAgentBinding(config, "roles."+binding.role+".agent", binding.agent, issues)
 	}
 }
 

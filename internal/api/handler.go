@@ -1164,10 +1164,19 @@ type configResponse struct {
 	Defaults      config.DefaultsConfig     `json:"defaults"`
 	Instructions  config.InstructionsConfig `json:"instructions"`
 	HITL          config.HITLConfig         `json:"hitl"`
-	Roles         config.RoleConfigs        `json:"roles"`
+	Roles         configRolesResponse       `json:"roles"`
 	Providers     []config.ProviderConfig   `json:"providers"`
 	Projects      []config.ProjectRefConfig `json:"projects"`
 	Metadata      ConfigMetadata            `json:"metadata"`
+}
+
+type configRolesResponse struct {
+	Coding      map[string]config.CodingRoleConfig `json:"coding"`
+	Planner     config.PlannerRoleConfig           `json:"planner"`
+	Reviewer    config.ReviewerRoleConfig          `json:"reviewer"`
+	Fixer       config.FixerRoleConfig             `json:"fixer"`
+	Worker      config.WorkerRoleConfig            `json:"worker"`
+	Coordinator config.CoordinatorRoleConfig       `json:"coordinator"`
 }
 
 type configServerResponse struct {
@@ -1241,10 +1250,17 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Defaults:     cfg.Defaults,
 		Instructions: cfg.Instructions,
 		HITL:         cfg.HITL,
-		Roles:        cfg.Roles,
-		Providers:    append([]config.ProviderConfig{}, cfg.Providers...),
-		Projects:     append([]config.ProjectRefConfig{}, cfg.Projects...),
-		Metadata:     h.buildConfigMetadata(),
+		Roles: configRolesResponse{
+			Coding:      config.EffectiveCodingRoles(cfg.Roles),
+			Planner:     cfg.Roles.Planner,
+			Reviewer:    cfg.Roles.Reviewer,
+			Fixer:       cfg.Roles.Fixer,
+			Worker:      cfg.Roles.Worker,
+			Coordinator: cfg.Roles.Coordinator,
+		},
+		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
+		Projects:  append([]config.ProjectRefConfig{}, cfg.Projects...),
+		Metadata:  h.buildConfigMetadata(),
 	}
 }
 
@@ -1376,7 +1392,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	installDir := filepath.Join(homeDirOrEmpty(), ".looper", "bin")
 	artifactName := looperdArtifactName(currentTarget)
 
-	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.context.Config)
+	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.effectiveConfig())
 	outstanding, debtErr := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
 	recovery := h.recoveryWithOutstanding(outstanding)
 	degradedReasons := statusDegradedReasons(reviewPublish, outstanding, debtErr)

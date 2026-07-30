@@ -224,8 +224,8 @@ func TestServiceResumeIncompleteDiscoveriesReschedulesPersistedWork(t *testing.T
 	if err := service.ResumeIncompleteDiscoveries(context.Background()); err != nil {
 		t.Fatalf("ResumeIncompleteDiscoveries() error = %v", err)
 	}
-	if scheduled != 2 {
-		t.Fatalf("scheduled = %d, want persisted pending and running discoveries", scheduled)
+	if scheduled != 1 {
+		t.Fatalf("scheduled = %d, want one bounded job for the persisted discovery backlog", scheduled)
 	}
 	stored, err := repos.Projects.GetByID(context.Background(), "running")
 	if err != nil || stored == nil {

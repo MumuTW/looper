@@ -877,6 +877,12 @@ func describeProject(project projectResponse) string {
 	if project.Archived {
 		line += "\t(archived)"
 	}
+	if project.Discovery != nil && project.Discovery.Status != "" {
+		line += "\tdiscovery=" + project.Discovery.Status
+		if project.Discovery.Error != "" {
+			line += ": " + singleLine(project.Discovery.Error)
+		}
+	}
 	return line
 }
 
@@ -972,12 +978,13 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 }
 
 type projectResponse struct {
-	ID         string  `json:"id"`
-	Name       string  `json:"name"`
-	RepoPath   string  `json:"repoPath"`
-	BaseBranch string  `json:"baseBranch"`
-	Archived   bool    `json:"archived"`
-	Repo       *string `json:"repo"`
+	ID         string             `json:"id"`
+	Name       string             `json:"name"`
+	RepoPath   string             `json:"repoPath"`
+	BaseBranch string             `json:"baseBranch"`
+	Archived   bool               `json:"archived"`
+	Repo       *string            `json:"repo"`
+	Discovery  *discoveryResponse `json:"discovery"`
 }
 
 type projectsListResponse struct {

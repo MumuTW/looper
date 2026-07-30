@@ -590,15 +590,20 @@ func (s *Service) ResumeIncompleteDiscoveries(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	inputs := make([]DiscoverInput, 0)
 	for _, record := range records {
 		if record.Archived {
 			continue
 		}
 		discovery := DiscoveryStateFromRecord(record)
 		if discovery.Status == DiscoveryStatusRunning || discovery.Status == DiscoveryStatusPending {
-			s.scheduleDiscovery(DiscoverInput{ProjectID: record.ID, SnapshotMode: discovery.SnapshotMode})
+			inputs = append(inputs, DiscoverInput{ProjectID: record.ID, SnapshotMode: discovery.SnapshotMode})
 		}
 	}
+	// Resume the persisted backlog through one lifecycle-owned job. This keeps
+	// restart fan-out bounded without adding another worker pool or persisted
+	// queue; newly registered projects retain their existing async behavior.
+	s.scheduleDiscoveries(inputs)
 	return nil
 }
 
@@ -1456,10 +1461,17 @@ func worktreeCreatedAt(existing *storage.WorktreeRecord, nowISO string) string {
 }
 
 func (s *Service) scheduleDiscovery(input DiscoverInput) {
+	s.scheduleDiscoveries([]DiscoverInput{input})
+}
+
+func (s *Service) scheduleDiscoveries(inputs []DiscoverInput) {
+	if len(inputs) == 0 {
+		return
+	}
 	if s == nil || s.ScheduleDiscovery == nil {
 		if s != nil && s.Logger != nil {
 			s.Logger.Warn("post-commit project discovery left pending without a lifecycle owner", map[string]any{
-				"projectId": input.ProjectID,
+				"projectId": inputs[0].ProjectID,
 			})
 		}
 		return
@@ -1471,14 +1483,19 @@ func (s *Service) scheduleDiscovery(input DiscoverInput) {
 		}
 	}
 	run := func() {
-		_, err := s.DiscoverProject(ctx, input)
-		if err == nil || s.Logger == nil {
-			return
+		for _, input := range inputs {
+			if ctx.Err() != nil {
+				return
+			}
+			_, err := s.DiscoverProject(ctx, input)
+			if err == nil || s.Logger == nil {
+				continue
+			}
+			s.Logger.Warn("post-commit project discovery failed", map[string]any{
+				"projectId": input.ProjectID,
+				"message":   err.Error(),
+			})
 		}
-		s.Logger.Warn("post-commit project discovery failed", map[string]any{
-			"projectId": input.ProjectID,
-			"message":   err.Error(),
-		})
 	}
 	s.ScheduleDiscovery(run)
 }

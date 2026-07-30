@@ -1048,6 +1048,51 @@ func TestHandlerStatusSurfacesUnknownReviewPublishWithoutProbing(t *testing.T) {
 	}
 }
 
+func TestHandlerStatusUsesLiveConfigForReviewPublishReadiness(t *testing.T) {
+	rt, startupConfig := startTestRuntime(t)
+	startupPath := filepath.Join(t.TempDir(), "startup-looper")
+	livePath := filepath.Join(t.TempDir(), "live-looper")
+	startupConfig.Tools.LooperPath = &startupPath
+	liveConfig := startupConfig
+	liveConfig.Tools.LooperPath = &livePath
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{
+		Config:  startupConfig,
+		Runtime: runtimeWithConfig(rt, startupConfig),
+		ConfigSnapshot: func() (config.Config, ConfigMetadata) {
+			return liveConfig, ConfigMetadata{}
+		},
+	}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	tools := data["tools"].(map[string]any)
+	assertEqual(t, tools["looperPath"], livePath)
+	reviewPublish := tools["reviewPublish"].(map[string]any)
+	assertEqual(t, reviewPublish["looperPath"], livePath)
+	assertEqual(t, reviewPublish["known"], false)
+}
+
+func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
+	_, cfg := startTestRuntime(t)
+	worker := config.EffectiveCodingRoles(cfg.Roles)[config.CodingRoleWorker]
+	worker.Priority = 7
+	worker.Discovery.Enabled = false
+	cfg.Roles.Coding = map[string]config.CodingRoleConfig{config.CodingRoleWorker: worker}
+
+	response := NewHandler(Context{Config: cfg}).buildConfigResponse()
+	got := response.Roles.Coding[config.CodingRoleWorker]
+	if got.Priority != 7 || got.Discovery.Enabled {
+		t.Fatalf("roles.coding.worker = %#v, want canonical API projection", got)
+	}
+	if response.Roles.Worker.AutoDiscovery == got.Discovery.Enabled {
+		t.Fatal("test setup did not retain a divergent legacy worker field")
+	}
+}
+
 func TestStatusDegradedReasonsIncludesKnownDisabledPublishWithoutLooperPath(t *testing.T) {
 	reasons := statusDegradedReasons(looperdruntime.ReviewPublishReadiness{
 		Known:              true,
