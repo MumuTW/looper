@@ -1,8 +1,13 @@
-# ADR-0005: Auto-merge via GitHub-native auto-merge and Coordinator watch
+# ADR-0017: Auto-merge via GitHub-native auto-merge and Coordinator watch
 
 - Status: Accepted
 - Date: 2026-05-18
 - Related: ADR-0002, PRD #352, slice #357, issue #358
+- Note: originally numbered 0005. Two ADRs were merged on 2026-05-18 from
+  parallel branches (#399, #400) and both claimed 0005, leaving "ADR-0005"
+  ambiguous. ADR-0015 cites 0005 meaning the webhook forwarder decision, so
+  that one keeps the number and this one was renumbered. The decision, date,
+  and content are unchanged.
 
 ## Context
 
