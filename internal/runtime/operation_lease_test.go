@@ -34,6 +34,10 @@ func TestBindClaimRefusesAfterShutdownWithoutStartingPermit(t *testing.T) {
 
 	// Mark admission closed without BeginShutdown wait (bound finalizer drain).
 	// BindClaim must return an explicit refuse and retain ownership until Release.
+	// Kept white-box under #121: this simulates the mid-BeginShutdown window
+	// (admission closed, this lease not yet cancelled). The production API
+	// cannot hold that window open - BeginShutdown cancels pending leases in
+	// the same critical section - so the poke IS the scenario.
 	reg.mu.Lock()
 	reg.admissionClosed = true
 	reg.shutdownReason = "drain"

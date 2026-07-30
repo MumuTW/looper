@@ -165,6 +165,10 @@ func TestSafetyFloorMarkDegradedCancelsWorktreeCleanupContext(t *testing.T) {
 	}
 
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	// Kept white-box under #121: injecting the cleanup cancel is how the
+	// test OBSERVES that MarkDegraded cancels the worktree-cleanup context;
+	// the context itself never leaves the runtime, so there is no
+	// production-shaped seam to observe it through.
 	rt.mu.Lock()
 	rt.worktreeCleanupCancel = cleanupCancel
 	rt.mu.Unlock()
