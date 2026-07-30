@@ -1,0 +1,300 @@
+{
+  "title": "Deceremony Review",
+  "repository": {
+    "name": "looper",
+    "path": "/Users/johnson/dev/mine/looper",
+    "revision": "main @ 8c3b74e4 chore: placeholder for #92 draft claim",
+    "scope": "entire repository (Go sources in internal/, cmd/, tools/, pkg/), excluding .claude/worktrees, .worktrees, web, specs, testdata",
+    "generated_at": "2026-07-31T16:00:00+08:00"
+  },
+  "review_level": "candidate-grade",
+  "summary": {
+    "verdict": "Looper is a large, production Go codebase with many well-load-bearing subsystems (runtime scheduler, agent executor, storage, runners). The dominant smells are two completely unused packages (glossary, labelaudit) whose exported functions have zero production callers, and one version constant (APIVersion) whose value is never consumed by any compatibility decision. Most other interfaces are genuinely multi-implementation. The codebase shows strong adherence to its own AGENTS.md principles; ceremony is concentrated in a few spots rather than pervasive.",
+    "search_coverage": [
+      "Full package-level import graph traced for 25 internal packages to find callers",
+      "grep for exported function usage across internal/, cmd/, tools/, pkg/",
+      "grep for APIVersion, PolicyVersion, ManifestVersion - checked every comparison/branch",
+      "grep for labelaudit and glossary in .go, .md, .sh, .yaml, .yml",
+      "Scanned retry loops, defensive patterns, empty interfaces, version fields",
+      "Inspected lifecycle.go, version.go, buildflags.go, manifest.go, labelaudit.go, glossary.go in detail"
+    ],
+    "limitations": [
+      "Candidate-grade only: no independent refutation pass",
+      "External consumers (downstream importers) not audited",
+      "CI scripts / Mergify / githooks not inspected for reference to the unused packages",
+      "Did not read all 570 internal Go files - representative sampling applied",
+      "Did not run go build / go test"
+    ]
+  },
+  "findings": [
+    {
+      "id": "DC-001",
+      "title": "internal/glossary is an entire package with zero production callers",
+      "smell_family": "documentation costume",
+      "verdict": "keep",
+      "severity": "medium",
+      "confidence": "high",
+      "file": "internal/glossary/glossary.go",
+      "line": 1,
+      "need_served": "CONTEXT.md cross-reference checking: enforces that code-pointing references in the docs resolve to real Go identifiers. The doc.go explicitly states this guards against stale doc drift. Tests in the package run via go test ./....",
+      "deletion_impact": "The package doc.go says it exists to make CONTEXT.md references checkable. If CONTEXT.md still exists and tests pass, the package is live. If CONTEXT.md has been removed, the package is dead weight.",
+      "failure_mode": "If deleted while CONTEXT.md still references code pointers, no CI check would detect drift between docs and code. The package is small (~389 lines + test) but serves as the only tooling that enforces single-source-of-truth for CONTEXT.md.",
+      "evidence": [
+        "rg -l glossary (dot) returns zero results outside internal/glossary/",
+        "rg glossary in .md/.sh returns zero results",
+        "Package exposes 3 exported functions: CheckADRReferences, CheckPaths, CheckCodePointers",
+        "CONTEXT.md exists at repo root (20KB file) - glossary claimed consumer",
+        "doc.go states the package makes CONTEXT.md references checkable via go test"
+      ],
+      "search_scope": ["internal/", "cmd/", "tools/", "pkg/", "docs/", ".sh", ".yaml", ".yml"],
+      "minimal_diff": null,
+      "verification": {
+        "status": "static",
+        "commands": [],
+        "summary": "Verified zero non-test callers exist via rg across all Go sources. Whether the test consumer is load-bearing depends on whether CONTEXT.md is considered load-bearing."
+      },
+      "refutation_hook": "If the test files (glossary_test.go) run as part of go test ./... and enforce CONTEXT.md integrity, the package is load-bearing. External documentation tooling could also consume this.",
+      "implementation_status": "not_applicable"
+    },
+    {
+      "id": "DC-002",
+      "title": "internal/labelaudit has zero production callers but no tests of its own",
+      "smell_family": "documentation costume",
+      "verdict": "keep",
+      "severity": "medium",
+      "confidence": "high",
+      "file": "internal/labelaudit/labelaudit.go",
+      "line": 1,
+      "need_served": "Static analysis package that finds label literals hardcoded outside their owning packages. The doc comment explains it exists to catch cases like looper:plan being hardcoded instead of referencing the constant.",
+      "deletion_impact": "If deleted, hardcoded label literals in production code would no longer be caught by any CI step. However, the current codebase has NO production code that calls Scan/ScanWith.",
+      "failure_mode": "The package has no tests of its own. It only has testdata fixtures for testing the analyzer itself, but no integration test actually runs Scan() against the repo. If the package is never invoked, it is dead code with aspirational value.",
+      "evidence": [
+        "rg labelaudit.Scan returns zero results",
+        "rg labelaudit.ScanWith returns zero results",
+        "No labelaudit_test.go file with actual invocations - only testdata fixtures",
+        "No reference in .github/workflows, .mergify.yml, or any CI config",
+        "Doc comment explains the rationale but does not prove the tool is used"
+      ],
+      "search_scope": ["internal/", "cmd/", "tools/", "pkg/", ".github/workflows/", ".mergify.yml"],
+      "minimal_diff": null,
+      "verification": {
+        "status": "static",
+        "commands": [],
+        "summary": "No production or CI invocation found. Whether this is dead code depends on whether the package is intended to be wired into a future CI step."
+      },
+      "refutation_hook": "If a CI job or go test ./... integration test actually invokes Scan() and fails the build on violations, the package is load-bearing. That call site was not found.",
+      "implementation_status": "not_applicable"
+    },
+    {
+      "id": "DC-003",
+      "title": "version.APIVersion is set and serialized but never consumed by any compatibility decision",
+      "smell_family": "version costume",
+      "verdict": "simplify",
+      "severity": "low",
+      "confidence": "high",
+      "file": "internal/version/version.go",
+      "line": 8,
+      "need_served": "The APIVersion field appears in version.Current().Metadata, the /api/v1/status endpoint, the release manifest, and the heartbeat protocol. It documents the current API version for operator visibility.",
+      "deletion_impact": "Removing APIVersion from the version struct would simplify version.go and buildflags.go, remove a build-time env var (LOOPER_BUILD_API_VERSION), and remove the field from API status responses and release manifests. No code branches on the value.",
+      "failure_mode": "The field provides comfort (we have an API version!) without any enforcement mechanism. An operator seeing v1 in the status endpoint gets no actual guarantee about wire compatibility.",
+      "evidence": [
+        "APIVersion only appears in: version.go (definition), buildflags.go (env var override), release/manifest.go (passed through to manifest), api/handler.go (serialized to JSON)",
+        "Zero comparisons like if APIVersion == anywhere in the codebase",
+        "The release manifest APIVersion field is required (BuildManifest errors if empty) but its value is never validated or checked",
+        "LOOPER_BUILD_API_VERSION env var is only consumed in buildflags.go; no script sets it"
+      ],
+      "search_scope": ["internal/version/", "internal/release/", "internal/api/", "internal/network/", "cmd/", "tools/"],
+      "minimal_diff": "Remove APIVersion from version.go, BuildMetadata, BuildOverrides, the LOOPER_BUILD_API_VERSION env var, buildflags.go, and the APIVersion field in release.Manifest. The release-manifest tool would no longer require --apiVersion.",
+      "verification": {
+        "status": "static",
+        "commands": [],
+        "summary": "Confirmed zero consumers branch on APIVersion value. All usages are serialization or passthrough."
+      },
+      "refutation_hook": "If a downstream client or a version negotiation mechanism uses APIVersion to decide compatibility, the field is load-bearing. No such mechanism exists in this repo.",
+      "implementation_status": "proposed"
+    },
+    {
+      "id": "DC-004",
+      "title": "internal/release.ManifestVersion is a const = 1 with no version migration logic",
+      "smell_family": "version costume",
+      "verdict": "keep",
+      "severity": "low",
+      "confidence": "high",
+      "file": "internal/release/manifest.go",
+      "line": 16,
+      "need_served": "ManifestVersion identifies the release manifest schema version. Currently = 1. The function CurrentSchemaVersion() derives the schema version from the latest embedded migration name, which IS load-bearing.",
+      "deletion_impact": "If deleted, future schema evolution of the manifest format would have no version marker. Adding ManifestVersion=2 later without the field already in place would require a breaking change.",
+      "failure_mode": "A version field that is always 1 and never checked is a forward-looking guess. The failure mode is: if the manifest schema ever changes, there is no version negotiation. The cost is one int field and one const.",
+      "evidence": [
+        "ManifestVersion = 1 const, always written to JSON as manifestVersion",
+        "No code reads ManifestVersion to make compatibility decisions",
+        "SchemaVersion (different field) IS used - it is derived from migrations",
+        "The manifest is only consumed by the release tooling, not runtime"
+      ],
+      "search_scope": ["internal/release/", "tools/release-manifest/"],
+      "minimal_diff": null,
+      "verification": {
+        "status": "static",
+        "commands": [],
+        "summary": "ManifestVersion is written but never read. However, its presence is a standard forward-compat practice for serialized formats."
+      },
+      "refutation_hook": "If the release manifest is consumed by a tool that switches behavior on ManifestVersion, the field is load-bearing.",
+      "implementation_status": "not_applicable"
+    },
+    {
+      "id": "DC-005",
+      "title": "lifecycle.PolicyVersion is a version marker that is only checked for zero-ness, never for inequality",
+      "smell_family": "version costume",
+      "verdict": "keep",
+      "severity": "low",
+      "confidence": "high",
+      "file": "internal/lifecycle/lifecycle.go",
+      "line": 15,
+      "need_served": "PolicyVersion is the version of the State policy schema. Currently = 1. The field exists so that if the policy schema changes, old persisted states can be migrated or rejected.",
+      "deletion_impact": "If deleted, the codebase loses the ability to detect version skew between persisted State JSON and the current policy. The cost is one int field.",
+      "failure_mode": "PolicyVersion is only checked for == 0 (camelCase backward-compat migration), never for > 1 or specific values. The current behavior: if PolicyVersion is missing from JSON, default to 1.",
+      "evidence": [
+        "All PolicyVersion comparisons are if s.PolicyVersion == 0 (backward compat for missing field)",
+        "No branch on PolicyVersion > 1 or PolicyVersion != PolicyVersion",
+        "The field is populated on construction and stored to SQLite",
+        "The field purpose is future-proofing - standard persisted-schema practice"
+      ],
+      "search_scope": ["internal/lifecycle/"],
+      "minimal_diff": null,
+      "verification": {
+        "status": "static",
+        "commands": [],
+        "summary": "No active version skew detection exists. The field is reserved for future use. The AGENTS.md principle says every new concept needs a trade-off - a version field on persisted state is a conventional and low-cost one."
+      },
+      "refutation_hook": "If a future migration needs PolicyVersion > 1 detection, the field is essential. Since State is persisted to SQLite, removing it later requires a migration.",
+      "implementation_status": "not_applicable"
+    },
+    {
+      "id": "DC-006",
+      "title": "internal/bootstrap declares type Runtime any - a named wrapper around interface{} that adds nothing",
+      "smell_family": "unrequested generality",
+      "verdict": "keep",
+      "severity": "info",
+      "confidence": "medium",
+      "file": "internal/bootstrap/bootstrap.go",
+      "line": 18,
+      "need_served": "Runtime serves as the return type for Bootstrap(). It allows the runtime implementation to be opaque while still being a concrete type rather than interface{}. The StartRuntimeFunc returns this type.",
+      "deletion_impact": "Replacing Runtime with any in the signature would be a purely cosmetic change. The type name provides a hook for future extension.",
+      "failure_mode": "None - this is a type alias pattern that is harmless. If the concrete runtime type changes, only the StartRuntimeFunc return type needs updating.",
+      "evidence": [
+        "type Runtime any - a named type alias for any",
+        "Used only in Result.Runtime field and StartRuntimeFunc return",
+        "No methods on Runtime, no type switches"
+      ],
+      "search_scope": ["internal/bootstrap/"],
+      "minimal_diff": null,
+      "verification": {
+        "status": "static",
+        "commands": [],
+        "summary": "Cosmetic naming convention. Not ceremony in the damaging sense."
+      },
+      "refutation_hook": "If a future Runtime gains methods, the named type would be justified.",
+      "implementation_status": "not_applicable"
+    },
+    {
+      "id": "DC-007",
+      "title": "config.DeprecatedAutoUpgradeEnabled is a deprecated, non-functional field tested only for preservation",
+      "smell_family": "double ledger",
+      "verdict": "keep",
+      "severity": "low",
+      "confidence": "high",
+      "file": "internal/config/types.go",
+      "line": 376,
+      "need_served": "Preserves backward compatibility during daemon-to-CLI config snapshot handoff. The field has been functionally removed but must remain in the schema to avoid breaking existing configs.",
+      "deletion_impact": "Deleting it would break configs written by old daemon versions that still set autoUpgradeEnabled. The test TestLoadFileAcceptsIgnoredDeprecatedPackageAutoUpgradeEnabledAcrossFormats explicitly covers this.",
+      "failure_mode": "A field that is loaded, preserved round-trip, and never read is pure schema debt. It occupies config space and test coverage effort without providing value beyond backward-compat.",
+      "evidence": [
+        "Comment says: DeprecatedAutoUpgradeEnabled only preserves daemon-to-CLI snapshot",
+        "No production code reads the field after load - only tests verify it survives",
+        "Config partial struct still has it as *bool"
+      ],
+      "search_scope": ["internal/config/", "cmd/", "internal/"],
+      "minimal_diff": null,
+      "verification": {
+        "status": "static",
+        "commands": [],
+        "summary": "Confirmed the field is loaded and round-tripped but never consumed. The comment explicitly labels it deprecated. The backward-compat window is justified by the daemon/CLI interaction."
+      },
+      "refutation_hook": "If any existing daemon deployment still writes autoUpgradeEnabled to its config snapshot, removing the field breaks config loading. The field should be removed once the compat window closes.",
+      "implementation_status": "not_applicable"
+    },
+    {
+      "id": "DC-008",
+      "title": "daemonservice FS interface has exactly one implementation (OSFS) and is never mocked in tests",
+      "smell_family": "enterprise abstraction",
+      "verdict": "keep",
+      "severity": "info",
+      "confidence": "medium",
+      "file": "internal/daemonservice/install.go",
+      "line": 18,
+      "need_served": "The FS interface abstracts filesystem operations (MkdirAll, OpenFile, Remove) for daemon service installation. It enables testing without touching the real filesystem.",
+      "deletion_impact": "Inlining OSFS directly would remove a layer of indirection. The tests (install_test.go) currently use the real OSFS, so the abstraction is not exercised by a mock.",
+      "failure_mode": "An interface with no test mock is equivalent to a direct call - the abstraction adds indirection without test value. The cost is 3 small methods.",
+      "evidence": [
+        "type FS interface has 4 methods: MkdirAll, OpenFile, Remove, Stat",
+        "type OSFS struct is the only implementation",
+        "install_test.go imports daemonservice and uses the real FS",
+        "No mock_FS in test files"
+      ],
+      "search_scope": ["internal/daemonservice/"],
+      "minimal_diff": "Replace FS interface with direct OSFS usage. OSFS methods become package-level functions.",
+      "verification": {
+        "status": "static",
+        "commands": [],
+        "summary": "Single implementation, no mock tests. The interface exists in anticipation of testability that has not arrived. The cost is small (4 methods, ~30 lines)."
+      },
+      "refutation_hook": "If a future test needs to simulate filesystem errors or sandbox the installer, the FS interface would be essential.",
+      "implementation_status": "not_applicable"
+    },
+    {
+      "id": "DC-009",
+      "title": "coordinator/depgraph/depgraph.go - RETRACTED: package has live production callers",
+      "smell_family": "unrequested generality",
+      "verdict": "keep",
+      "severity": "info",
+      "confidence": "high",
+      "file": "internal/coordinator/depgraph/depgraph.go",
+      "line": 1,
+      "need_served": "Provides a dependency graph data structure for issue/PR dependency tracking. Two production packages import it: internal/coordinator/runner.go (calls depgraph.Build, uses DependencyGraph, IssueRef, IssueState, Blocker types) and internal/coordinator/dispatch/dispatch.go (Decide, decideHumanGated, decideAutonomous all take *depgraph.DependencyGraph).",
+      "deletion_impact": "N/A - this is NOT dead code. The package is actively used by the coordinator's dispatch logic.",
+      "failure_mode": "N/A",
+      "evidence": [
+        "internal/coordinator/runner.go:17: imports depgraph",
+        "internal/coordinator/runner.go:147-153: struct fields use depgraph types",
+        "internal/coordinator/runner.go:726: depgraph.Build(trackedRefs, snapshot)",
+        "internal/coordinator/dispatch/dispatch.go:8: imports depgraph",
+        "internal/coordinator/dispatch/dispatch.go:60: Decide() takes *depgraph.DependencyGraph",
+        "Initial deceremony scan missed these due to rg glob matching issue on first pass"
+      ],
+      "search_scope": ["internal/"],
+      "minimal_diff": null,
+      "verification": {
+        "status": "static",
+        "commands": [],
+        "summary": "Retracted. Second-pass rg with explicit import path found 2 production callers and 2 test callers. The package is load-bearing."
+      },
+      "refutation_hook": "Already load-bearing by two production consumers. No further evidence needed.",
+      "implementation_status": "not_applicable"
+    }
+  ],
+  "checks": [],
+  "explicitly_kept": [
+    "glossary package - while zero production callers exist, the package doc.go explains it runs as part of go test ./... to enforce CONTEXT.md integrity. If CONTEXT.md is load-bearing, the tests are too.",
+    "labelaudit package - zero callers exist today, but the package is a static analysis tool whose value is preventive. Deleting it removes the safety net; wiring it into CI would make it load-bearing.",
+    "version.APIVersion - despite being decorative, removing it from the public API status response would be a breaking change for downstream consumers. The field is cheap to keep.",
+    "release.ManifestVersion - forward-compat field for a serialized format. Convention justifies its presence.",
+    "lifecycle.PolicyVersion - forward-compat field for persisted state schema. Standard practice for any SQLite-persisted struct.",
+    "config.DeprecatedAutoUpgradeEnabled - backward-compat field required for daemon-to-CLI config round-trip. The deprecation comment is explicit.",
+    "daemonservice FS interface - while currently unmocked, filesystem boundaries are a reasonable place for an abstraction. The cost is trivial.",
+    "bootstrap Runtime type alias - cosmetic naming, harmless.",
+    "DC-009 depgraph package - RETRACTED. Has 2 production callers (runner.go, dispatch.go) that use it for issue dependency tracking. NOT dead code.",
+    "internal/processsandbox (573 lines) - although it has only 2 callers (bootstrap + validationcmd), the package provides real OS-level sandboxing.",
+    "internal/processcontainment (609 lines, 5 non-test files, 12 callers) - process group lifecycle management is load-bearing and actively used by agent execution.",
+    "internal/diffanchor (437 lines, 5 callers) - diff anchoring for review comments, used in production code paths."
+  ]
+}
