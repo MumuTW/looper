@@ -1110,7 +1110,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 }
 
 func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.ViewReviewThreadInput) (fixer.ReviewThread, error) {
-	thread, err := a.gateway.ViewReviewThread(ctx, githubinfra.ViewReviewThreadInput{ThreadID: input.ThreadID, CWD: input.CWD})
+	thread, err := a.gateway.ViewReviewThread(ctx, githubinfra.ViewReviewThreadInput{ThreadID: input.ThreadID, CWD: input.CWD, Hostname: input.Hostname})
 	if err != nil {
 		return fixer.ReviewThread{}, err
 	}
