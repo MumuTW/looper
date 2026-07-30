@@ -981,8 +981,10 @@
           "vendor": "codex",
           "sessionId": "session_fixture_1",
           "worktreePath": "/tmp/worktrees/loop_1",
+          "runStopped": false,
           "supported": true,
-          "resumeCommand": "cd /tmp/worktrees/loop_1 && codex resume session_fixture_1"
+          "resumeCommand": "cd /tmp/worktrees/loop_1 && codex resume session_fixture_1",
+          "message": "no run was in flight; the loop is parked in human_takeover and no role lane will claim it until you run `looper handback`."
         },
         "requestId": "fixture-request-id"
       }

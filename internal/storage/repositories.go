@@ -2679,7 +2679,11 @@ const scheduledQueueBaseQuery = `
 	WHERE qi.status = 'queued'
 		AND qi.available_at <= ?
 		AND (qi.project_id IS NULL OR p.archived = 0)
-		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
+		-- human_takeover is the claim boundary's hold: a human ran ` + "`looper takeover`" + `
+		-- and owns the loop's worktree until ` + "`looper handback`" + `. Filtering it only in
+		-- discovery loses to a queue item that was already materialised, so the
+		-- refusal lives here, where every role lane claims (#162).
+		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped', 'human_takeover')
 		AND (
 			qi.lock_key IS NULL
 			OR NOT EXISTS (

@@ -110,11 +110,16 @@ type Context struct {
 // TakeoverResult is what a takeover yields: the native session id + worktree +
 // vendor of the loop's last run, so the caller can hand a human the exact resume
 // command.
+// RunStopped/RunStopOutcome record what the takeover did to the run that was in
+// flight, so the response never implies ownership the daemon did not take.
 type TakeoverResult struct {
-	LoopID       string
-	Vendor       string
-	SessionID    string
-	WorktreePath string
+	LoopID         string
+	Vendor         string
+	SessionID      string
+	WorktreePath   string
+	RunID          string
+	RunStopped     bool
+	RunStopOutcome string
 }
 
 type Handler struct {
@@ -5469,13 +5474,16 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 }
 
 type takeoverLoopResponse struct {
-	LoopID        string `json:"loopId"`
-	Vendor        string `json:"vendor,omitempty"`
-	SessionID     string `json:"sessionId,omitempty"`
-	WorktreePath  string `json:"worktreePath,omitempty"`
-	Supported     bool   `json:"supported"`
-	ResumeCommand string `json:"resumeCommand,omitempty"`
-	Message       string `json:"message,omitempty"`
+	LoopID         string `json:"loopId"`
+	Vendor         string `json:"vendor,omitempty"`
+	SessionID      string `json:"sessionId,omitempty"`
+	WorktreePath   string `json:"worktreePath,omitempty"`
+	RunID          string `json:"runId,omitempty"`
+	RunStopped     bool   `json:"runStopped"`
+	RunStopOutcome string `json:"runStopOutcome,omitempty"`
+	Supported      bool   `json:"supported"`
+	ResumeCommand  string `json:"resumeCommand,omitempty"`
+	Message        string `json:"message,omitempty"`
 }
 
 // takeoverLoop parks a loop for interactive human takeover and returns the exact
@@ -5491,10 +5499,13 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 		return takeoverLoopResponse{}, err
 	}
 	resp := takeoverLoopResponse{
-		LoopID:       result.LoopID,
-		Vendor:       result.Vendor,
-		SessionID:    result.SessionID,
-		WorktreePath: result.WorktreePath,
+		LoopID:         result.LoopID,
+		Vendor:         result.Vendor,
+		SessionID:      result.SessionID,
+		WorktreePath:   result.WorktreePath,
+		RunID:          result.RunID,
+		RunStopped:     result.RunStopped,
+		RunStopOutcome: result.RunStopOutcome,
 	}
 	vendor := config.AgentVendor(strings.TrimSpace(result.Vendor))
 	// Global agent.params (especially command/args) are owned by agent.vendor.
@@ -5505,8 +5516,20 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	resp.Supported = ok
 	if ok {
 		resp.ResumeCommand = cmdLine
+	}
+	// State what was actually fenced. The daemon's in-flight run is stopped and no
+	// lane can re-claim the loop while it stays in human_takeover, but that hold is
+	// separate from whether the human can *resume* the vendor session interactively.
+	// Conflating the two is what made the old message over-promise (#162).
+	runClause := "no run was in flight"
+	if result.RunStopped {
+		runClause = "the daemon's in-flight run was stopped"
+	}
+	hold := fmt.Sprintf("%s; the loop is parked in human_takeover and no role lane will claim it until you run `looper handback`", runClause)
+	if ok {
+		resp.Message = hold + "."
 	} else {
-		resp.Message = "Interactive takeover needs a captured session id and a supported agent (codex/claude); the loop is parked in human_takeover — hand it back with `looper handback` to resume the daemon."
+		resp.Message = "Interactive takeover needs a captured session id and a supported agent (codex/claude), so there is no resume command; " + hold + "."
 	}
 	return resp, nil
 }

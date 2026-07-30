@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -266,9 +267,14 @@ func (s *candidateState) block(reason string) {
 	s.blockReason = reason
 }
 
+// protectsLoopStatus lists every non-terminal loop status: a worktree referenced
+// by such a loop is still someone's working directory. awaiting_human and
+// human_takeover were added to the status set later and never backfilled here,
+// which let cleanup delete a worktree a human had been told they owned (#162).
 func protectsLoopStatus(status string) bool {
 	switch status {
-	case "idle", "queued", "running", "waiting", "paused", "failed", "interrupted":
+	case "idle", "queued", "running", "waiting", "paused", "failed", "interrupted",
+		string(domain.LoopStatusAwaitingHuman), string(domain.LoopStatusHumanTakeover):
 		return true
 	default:
 		return false

@@ -112,7 +112,11 @@ var loopStatusTransitions = map[LoopStatus][]LoopStatus{
 	LoopStatusPaused:        {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
 	LoopStatusWaiting:       {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusTerminated},
 	LoopStatusAwaitingHuman: {LoopStatusRunning, LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
-	LoopStatusHumanTakeover: {LoopStatusQueued, LoopStatusRunning, LoopStatusStopped, LoopStatusTerminated},
+	// human_takeover releases only via handback (→ queued) or an explicit
+	// stop/terminate. There is deliberately no direct → running edge: a run may
+	// start only after handback re-queues the loop, so no lane can drive a
+	// taken-over loop straight back into execution.
+	LoopStatusHumanTakeover: {LoopStatusQueued, LoopStatusStopped, LoopStatusTerminated},
 	LoopStatusStopped:       {},
 	LoopStatusTerminated:    {},
 	LoopStatusCompleted:     {},
@@ -194,6 +198,17 @@ func IsActiveLoopStatus(status LoopStatus) bool {
 func IsConflictingActiveLoopStatus(status LoopStatus) bool {
 	_, ok := conflictingActiveLoopStatuses[status]
 	return ok
+}
+
+// LoopIsHumanHeld reports whether a loop's persisted status means a human owns
+// its worktree and agent session, so the daemon must not claim it, revive it in
+// discovery, or clean its worktree up.
+//
+// The authority is the human's own `looper takeover` call, durably recorded as
+// the loop's status; nothing is inferred from infra state. Only `looper handback`
+// releases the hold (human_takeover's single non-terminal outgoing transition).
+func LoopIsHumanHeld(status string) bool {
+	return status == string(LoopStatusHumanTakeover)
 }
 
 func IsTerminalRunStatus(status RunStatus) bool {

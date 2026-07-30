@@ -445,8 +445,18 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			}
 		}
 	}
-	if _, err := stopLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess); err != nil {
+	stopped, err := stopLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess)
+	if err != nil {
 		return result, err
+	}
+	// Report what the stop actually did rather than letting the caller imply it.
+	// stopLoop fails loudly when a live agent cannot be reached
+	// (ErrAgentLiveHandleMissing), so a successful takeover either signalled the
+	// in-flight run or found none; the caller says which.
+	if stopResult, ok := stopped.(stopLoopResult); ok {
+		result.RunID = stopResult.RunID
+		result.RunStopOutcome = stopResult.Outcome
+		result.RunStopped = stopResult.Outcome == stopOutcomeProcessSignaled || stopResult.Outcome == stopOutcomeAlreadyStopping
 	}
 	if _, err := services.Loops.TransitionStatus(ctx, loopID, loops.TransitionInput{Status: domain.LoopStatusHumanTakeover}); err != nil {
 		return result, err

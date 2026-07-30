@@ -1747,7 +1747,7 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 		}
 	} else {
 		for _, existing := range matching {
-			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed" || existing.Status == "awaiting_human"
+			pausedOrCompleted := plannerLoopParked(existing.Status)
 			updated := existing
 			updated.Repo = stringPtr(repo)
 			suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
@@ -1784,7 +1784,7 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 }
 
 func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopRecord, repo string, issue IssueSummary, nowISO, currentFingerprint, authority string) (storage.LoopRecord, error) {
-	pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed" || existing.Status == "awaiting_human"
+	pausedOrCompleted := plannerLoopParked(existing.Status)
 	updated := existing
 	updated.Repo = stringPtr(repo)
 	suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
@@ -1805,6 +1805,13 @@ func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopReco
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil
+}
+
+// plannerLoopParked reports whether rediscovery must leave a planner loop's
+// status alone. human_takeover belongs here for the same reason paused does:
+// rewriting it to queued would silently revoke a hold a human was told they had.
+func plannerLoopParked(status string) bool {
+	return status == "paused" || status == "completed" || status == "awaiting_human" || domain.LoopIsHumanHeld(status)
 }
 
 func plannerLoopTerminal(status string) bool {

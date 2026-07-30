@@ -5265,6 +5265,12 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		return loopUpsertResult{}, err
 	}
 	if existing != nil {
+		// A taken-over loop is the human's. Rediscovery must not rewrite its status
+		// back to queued — that both re-arms the lane and erases the record of the
+		// hold, leaving handback no longer the exit it was promised to be (#162).
+		if domain.LoopIsHumanHeld(existing.Status) {
+			return loopUpsertResult{record: *existing, created: false, skipped: true}, nil
+		}
 		updatedLoop := *existing
 		if updatedLoop.Status == "paused" {
 			if resumed, updated, err := r.resumePausedZeroProgressLoop(ctx, updatedLoop, headSHA, fixItemsStateHash); err != nil {
