@@ -918,7 +918,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		if requiredTargetLabel != "" && !hasLabel(issue.Labels, requiredTargetLabel) {
+		if requiredTargetLabel != "" && !labels.Has(issue.Labels, requiredTargetLabel) {
 			result.Skipped++
 			continue
 		}
@@ -4014,18 +4014,9 @@ func includesLogin(values []string, target string) bool {
 	return false
 }
 
-func hasLabel(labels []string, target string) bool {
-	for _, label := range labels {
-		if strings.EqualFold(strings.TrimSpace(label), target) {
-			return true
-		}
-	}
-	return false
-}
-
 func shouldClaimWorkerIssue(issue IssueSummary, login string, policy DiscoveryPolicy) bool {
 	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		if !labelsMatch(issue.Labels, policy.Labels, policy.LabelMode) {
+		if !config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode) {
 			return false
 		}
 		decision := networkpolicy.EvaluateWorker(policy.RoutedClaimPolicy, issue.Labels, issue.AssigneeUsers)
@@ -4034,7 +4025,7 @@ func shouldClaimWorkerIssue(issue IssueSummary, login string, policy DiscoveryPo
 	if policy.RequireAssigneeCurrentUser && !includesLogin(issue.Assignees, login) {
 		return false
 	}
-	return labelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+	return config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
 }
 
 func safeIssueQueryLabel(labels []string) string {
@@ -4154,26 +4145,6 @@ func uniqueNonEmptyLabels(labels []string) []string {
 		result = append(result, label)
 	}
 	return result
-}
-
-func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
-	if len(required) == 0 {
-		return true
-	}
-	if mode == config.LabelModeAny {
-		for _, label := range required {
-			if hasLabel(labels, label) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, label := range required {
-		if !hasLabel(labels, label) {
-			return false
-		}
-	}
-	return true
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
