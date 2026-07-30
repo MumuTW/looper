@@ -31,13 +31,15 @@ var adrCitation = regexp.MustCompile(`ADR[- ]([0-9][0-9A-Za-z]*)`)
 
 var exactlyFourDigits = regexp.MustCompile(`^[0-9]{4}$`)
 
-// codePointer matches a backticked package-qualified exported identifier, such
-// as `forge.ReviewItemID`. The shape is deliberately strict so that the many
-// other backticked strings in CONTEXT.md — config keys (roles.planner.triggers),
-// event names (triage.report), GitHub fields (blocked_by), label values — are
-// not mistaken for code references. Anything not matching is simply not
-// checked; this guards against rot, it does not require completeness.
-var codePointer = regexp.MustCompile("`([a-z][a-z0-9_]*)\\.([A-Z][A-Za-z0-9_]*)`")
+// codePointer matches a backticked package-qualified or package-path-qualified
+// exported identifier, such as `forge.ReviewItemID` or
+// `internal/forge.ReviewItemID`. The shape is deliberately strict so that the
+// many other backticked strings in CONTEXT.md — config keys
+// (roles.planner.triggers), event names (triage.report), GitHub fields
+// (blocked_by), label values — are not mistaken for code references. Anything
+// not matching is simply not checked; this guards against rot, it does not
+// require completeness.
+var codePointer = regexp.MustCompile("`([a-z][a-z0-9_]*(?:/[a-z][a-z0-9_.-]*)*)\\.([A-Z][A-Za-z0-9_]*)`")
 
 // repoReference matches a backticked path or root file name.
 var repoReference = regexp.MustCompile("`([A-Za-z0-9_.-]+(?:/[^`]*)?)`")
@@ -151,6 +153,11 @@ func CheckPaths(root string) ([]Finding, error) {
 	findings := []Finding{}
 	for _, match := range repoReference.FindAllStringSubmatch(doc, -1) {
 		reference := match[1]
+		if codePointer.MatchString(match[0]) {
+			// A path-qualified code pointer contains a slash, but it is
+			// checked by CheckCodePointers rather than as a filesystem path.
+			continue
+		}
 		top, hasSlash := reference, strings.Contains(reference, "/")
 		if hasSlash {
 			top, _, _ = strings.Cut(reference, "/")
@@ -165,7 +172,10 @@ func CheckPaths(root string) ([]Finding, error) {
 			if _, isRootExtension := extensions[path.Ext(reference)]; !isRootExtension {
 				continue
 			}
-		} else if _, isRepoReference := names[top]; !isRepoReference {
+		} else if _, isCurrentRoot := names[top]; !isCurrentRoot && path.Ext(reference) == "" {
+			// Slash-separated labels such as dispatch/needs-plan are not
+			// repository paths. A file extension still identifies a stale path
+			// after its top-level directory is deleted or renamed.
 			continue
 		}
 		// A reference is a claim about repository content, so it has to stay
@@ -227,6 +237,23 @@ func CheckCodePointers(root string) ([]Finding, error) {
 	findings := []Finding{}
 	for _, match := range codePointer.FindAllStringSubmatch(doc, -1) {
 		pkg, ident := match[1], match[2]
+		if strings.Contains(pkg, "/") {
+			candidate, found := packageByPath(byName, pkg)
+			if !found {
+				findings = append(findings, Finding{
+					Reference: pkg + "." + ident,
+					Detail:    fmt.Sprintf("no package in this repository is at %q", pkg),
+				})
+				continue
+			}
+			if _, ok := candidate.idents[ident]; !ok {
+				findings = append(findings, Finding{
+					Reference: pkg + "." + ident,
+					Detail:    fmt.Sprintf("%s declares no such identifier", candidate.path),
+				})
+			}
+			continue
+		}
 		if _, external := ExternalPackageQualifiers[pkg]; external {
 			continue
 		}
@@ -260,6 +287,17 @@ func CheckCodePointers(root string) ([]Finding, error) {
 		}
 	}
 	return findings, nil
+}
+
+func packageByPath(byName map[string][]declaredPackage, path string) (declaredPackage, bool) {
+	for _, candidates := range byName {
+		for _, candidate := range candidates {
+			if candidate.path == path {
+				return candidate, true
+			}
+		}
+	}
+	return declaredPackage{}, false
 }
 
 type declaredPackage struct {
