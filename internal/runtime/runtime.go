@@ -69,12 +69,15 @@ type StaleRunReconcileSummary struct {
 	CleanedExecutions   int64  `json:"cleanedExecutions"`
 	// QuarantinedExecutions counts executions parked via quarantineRecoveryEvidence
 	// (still-running evidence + manual_intervention). Never report these as cleaned.
-	QuarantinedExecutions int64    `json:"quarantinedExecutions"`
-	SkippedUncertainRuns  int64    `json:"skippedUncertainRuns"`
-	EventsWritten         int64    `json:"eventsWritten"`
-	RunIDs                []string `json:"runIds,omitempty"`
-	LoopIDs               []string `json:"loopIds,omitempty"`
-	ExecutionIDs          []string `json:"executionIds,omitempty"`
+	QuarantinedExecutions int64 `json:"quarantinedExecutions"`
+	// SettledQuarantinedExecutions are previously quarantined rows whose recorded
+	// PID was observed absent while their loop remained parked.
+	SettledQuarantinedExecutions int64    `json:"settledQuarantinedExecutions"`
+	SkippedUncertainRuns         int64    `json:"skippedUncertainRuns"`
+	EventsWritten                int64    `json:"eventsWritten"`
+	RunIDs                       []string `json:"runIds,omitempty"`
+	LoopIDs                      []string `json:"loopIds,omitempty"`
+	ExecutionIDs                 []string `json:"executionIds,omitempty"`
 	// QuarantinedLoopIDs names the loops parked by this pass, so a caller can
 	// report them without re-deriving the set from event_logs.
 	QuarantinedLoopIDs []string `json:"quarantinedLoopIds,omitempty"`
@@ -2343,6 +2346,13 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		return summary, nil
 	}
 	nowISO := summary.StartedAt
+	if mode != staleRunReconcileModeStartup {
+		settled, err := r.settleQuarantinedDeadExecutions(ctx, repositories, nowISO)
+		if err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		summary.SettledQuarantinedExecutions = settled
+	}
 	runningRuns, err := repositories.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
 	if err != nil {
 		return StaleRunReconcileSummary{}, err
@@ -2467,6 +2477,84 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 	}
 	summary.CompletedAt = nowISO
 	return summary, nil
+}
+
+// settleQuarantinedDeadExecutions retires quarantine debt after the recorded
+// leader PID is observed absent. It never requeues: the loop must already be
+// parked by quarantine, so descendant uncertainty cannot admit another writer.
+func (r *Runtime) settleQuarantinedDeadExecutions(ctx context.Context, repositories *storage.Repositories, nowISO string) (int64, error) {
+	if repositories == nil || repositories.AgentExecutions == nil || repositories.Events == nil || repositories.Loops == nil {
+		return 0, nil
+	}
+	active, err := repositories.AgentExecutions.ListActive(ctx)
+	if err != nil || len(active) == 0 {
+		return 0, err
+	}
+	ids := make([]string, 0, len(active))
+	for _, execution := range active {
+		ids = append(ids, execution.ID)
+	}
+	quarantined, err := repositories.Events.ListFirstEventTimestampsByType(ctx, recoveryExecutionQuarantinedEventType, "agent_execution", ids)
+	if err != nil {
+		return 0, err
+	}
+	var settled int64
+	for _, execution := range active {
+		if _, ok := quarantined[execution.ID]; !ok || execution.PID == nil || *execution.PID <= 0 || execution.LoopID == nil || strings.TrimSpace(*execution.LoopID) == "" {
+			continue
+		}
+		_, running, probeErr := r.executionMatchesProcess(ctx, execution, int(*execution.PID))
+		if probeErr != nil || running {
+			continue
+		}
+		loop, err := repositories.Loops.GetByID(ctx, *execution.LoopID)
+		if err != nil {
+			return settled, err
+		}
+		if loop == nil || !quarantineParkedLoopStatus(loop.Status) {
+			continue
+		}
+		terminal := execution
+		terminal.Status = "timeout"
+		terminal.EndedAt = stringPtr(nowISO)
+		terminal.UpdatedAt = nowISO
+		message := "recovery quarantine settled after recorded process was observed absent; loop remains parked"
+		terminal.ErrorMessage = &message
+		if err := repositories.AgentExecutions.Upsert(ctx, terminal); err != nil {
+			return settled, err
+		}
+		if execution.RunID != nil && repositories.Runs != nil {
+			run, err := repositories.Runs.GetByID(ctx, *execution.RunID)
+			if err != nil {
+				return settled, err
+			}
+			if run != nil && run.Status == string(domain.RunStatusRunning) {
+				interrupted := *run
+				interrupted.Status = string(domain.RunStatusInterrupted)
+				interrupted.EndedAt = stringPtr(nowISO)
+				interrupted.LastHeartbeatAt = stringPtr(nowISO)
+				interrupted.ErrorMessage = &message
+				interrupted.UpdatedAt = nowISO
+				if err := repositories.Runs.Upsert(ctx, interrupted); err != nil {
+					return settled, err
+				}
+			}
+		}
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{ID: newRuntimeEventID(), EventType: "looperd.recovery.execution_quarantine_settled", ProjectID: execution.ProjectID, LoopID: execution.LoopID, RunID: execution.RunID, EntityType: stringPtr("agent_execution"), EntityID: stringPtr(execution.ID), PayloadJSON: mustMarshalJSON(map[string]any{"settledAt": nowISO, "pid": *execution.PID, "reason": "recorded_pid_not_running_loop_parked"}), CreatedAt: nowISO}); err != nil {
+			return settled, err
+		}
+		settled++
+	}
+	return settled, nil
+}
+
+func quarantineParkedLoopStatus(status string) bool {
+	switch domain.LoopStatus(status) {
+	case domain.LoopStatusPaused, domain.LoopStatusHumanTakeover, domain.LoopStatusCompleted, domain.LoopStatusFailed, domain.LoopStatusStopped, domain.LoopStatusTerminated:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Runtime) appendStoppedEvent(ctx context.Context, repositories *storage.Repositories, reason string) error {

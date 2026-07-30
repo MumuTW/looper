@@ -239,6 +239,42 @@ func TestRuntimeReconcileStaleRunningRunsPreservesQuarantineAfterExpiry(t *testi
 	}
 }
 
+func TestRuntimeReconcileSettlesDeadQuarantineWithoutRequeueing(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	rt, repos := newStaleExecutionLeaseRuntime(t, now, func(context.Context, int) (string, error) { return "", nil })
+	loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "settle_dead")
+	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
+	pid := int64(2299)
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "execution_settle_dead", ProjectID: stringPtr("project_1"), LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), LastHeartbeatAt: &oldISO, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.ReconcileStaleRunningRuns(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.SettledQuarantinedExecutions != 1 || summary.LoopsRequeued != 0 {
+		t.Fatalf("summary = %#v, want one settled execution without requeue", summary)
+	}
+	execution, _ := repos.AgentExecutions.GetByID(context.Background(), "execution_settle_dead")
+	run, _ := repos.Runs.GetByID(context.Background(), runID)
+	loop, _ := repos.Loops.GetByID(context.Background(), loopID)
+	if execution == nil || execution.Status != "timeout" || run == nil || run.Status != "interrupted" || loop == nil || loop.Status != "paused" {
+		t.Fatalf("execution=%#v run=%#v loop=%#v, want terminal execution/run and parked loop", execution, run, loop)
+	}
+	debt, err := CountOutstandingQuarantineDebt(context.Background(), repos)
+	if err != nil || debt.QuarantinedActiveExecutions != 0 || debt.QuarantinedRunningRuns != 0 {
+		t.Fatalf("debt=%#v err=%v, want cleared live debt", debt, err)
+	}
+	events, _ := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_settle_dead")
+	if !containsEventType(events, recoveryExecutionQuarantinedEventType) || !containsEventType(events, "looperd.recovery.execution_quarantine_settled") {
+		t.Fatalf("events=%#v, want quarantine audit and settlement", events)
+	}
+}
+
 func newStaleExecutionLeaseRuntime(t *testing.T, now time.Time, readProcess ReadProcessCommandFunc) (*Runtime, *storage.Repositories) {
 	t.Helper()
 	root := t.TempDir()
