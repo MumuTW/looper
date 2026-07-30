@@ -888,11 +888,21 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 // cleanup persisted in between -- the mirror of the race
 // MergeWorktreeCleanupTimestamps exists to avoid, since the two writers can
 // interleave in either order.
+//
+// The CASE guard normalizes a non-object checkpoint_json to an empty object. Without
+// it, failure-streak recovery on a run with malformed legacy content aborted the
+// transaction, and a run whose checkpoint was null/an array/a scalar reported success
+// without writing the policy -- leaving the loop paused after an apparently
+// successful handoff.
 func (r *RunsRepository) MergeRunResumePolicy(ctx context.Context, id, resumePolicy, updatedAt string) error {
 	result, err := r.q.ExecContext(ctx, `
 		UPDATE runs
 		SET checkpoint_json = json_set(
-				COALESCE(NULLIF(checkpoint_json, ''), '{}'),
+				CASE
+					WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+						THEN checkpoint_json
+					ELSE '{}'
+				END,
 				'$.resumePolicy', ?
 			),
 			updated_at = ?
@@ -924,11 +934,21 @@ func (r *RunsRepository) MergeRunResumePolicy(ctx context.Context, id, resumePol
 //
 // json_set writes only the two cleanup fields, creating $.worktree if the stored
 // checkpoint has none and preserving its other fields when it does.
+//
+// The CASE guard replaces a non-object checkpoint_json with an empty object first.
+// The column is arbitrary text: malformed content makes json_set abort the statement,
+// and valid-but-non-object content (null, an array, a scalar) makes it return the
+// input unchanged while the UPDATE still reports a row affected -- a silent no-op.
+// Normalizing matches what the previous read-modify-write path did in Go.
 func (r *RunsRepository) MergeWorktreeCleanupTimestamps(ctx context.Context, id, cleanupAttemptedAt, cleanedAt, updatedAt string) error {
 	result, err := r.q.ExecContext(ctx, `
 		UPDATE runs
 		SET checkpoint_json = json_set(
-				COALESCE(NULLIF(checkpoint_json, ''), '{}'),
+				CASE
+					WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+						THEN checkpoint_json
+					ELSE '{}'
+				END,
 				'$.worktree.cleanupAttemptedAt', ?,
 				'$.worktree.cleanedAt', ?
 			),
