@@ -30,3 +30,78 @@ func TestHumanInboxAppendReadClearCap(t *testing.T) {
 		t.Fatal("inbox not cleared")
 	}
 }
+
+func TestAcknowledgeHumanInboxPreservesSurvivingMessages(t *testing.T) {
+	base := `{"worker":{"title":"x"}}`
+	m1, _ := AppendHumanMessage(&base, HumanMessage{At: "t1", Text: "msg1"})
+	m2, _ := AppendHumanMessage(&m1, HumanMessage{At: "t2", Text: "msg2"})
+	m3, _ := AppendHumanMessage(&m2, HumanMessage{At: "t3", Text: "msg3"})
+
+	// Drained 1 message out of 3
+	acked, err := AcknowledgeHumanInbox(&m3, 1)
+	if err != nil {
+		t.Fatalf("AcknowledgeHumanInbox error = %v", err)
+	}
+	remaining := ReadHumanInbox(&acked)
+	if len(remaining) != 2 {
+		t.Fatalf("remaining len = %d, want 2", len(remaining))
+	}
+	if remaining[0].Text != "msg2" || remaining[1].Text != "msg3" {
+		t.Fatalf("remaining messages = %+v, want msg2 and msg3", remaining)
+	}
+
+	// Drained all remaining messages
+	ackedAll, _ := AcknowledgeHumanInbox(&acked, 2)
+	if len(ReadHumanInbox(&ackedAll)) != 0 {
+		t.Fatalf("expected all messages cleared")
+	}
+}
+
+func TestAcknowledgeHumanMessagesRemovesOnlyConsumed(t *testing.T) {
+	t.Parallel()
+
+	meta, err := AppendHumanMessage(nil, HumanMessage{At: "t1", Text: "first"})
+	if err != nil {
+		t.Fatalf("AppendHumanMessage(first) error = %v", err)
+	}
+	meta, err = AppendHumanMessage(&meta, HumanMessage{At: "t2", Text: "second"})
+	if err != nil {
+		t.Fatalf("AppendHumanMessage(second) error = %v", err)
+	}
+	consumed := ReadHumanInbox(&meta)
+
+	// A third message arrives after the consumed snapshot was captured.
+	meta, err = AppendHumanMessage(&meta, HumanMessage{At: "t3", Text: "mid-run arrival"})
+	if err != nil {
+		t.Fatalf("AppendHumanMessage(third) error = %v", err)
+	}
+
+	meta, err = AcknowledgeHumanMessages(&meta, consumed)
+	if err != nil {
+		t.Fatalf("AcknowledgeHumanMessages error = %v", err)
+	}
+	remaining := ReadHumanInbox(&meta)
+	if len(remaining) != 1 || remaining[0].Text != "mid-run arrival" {
+		t.Fatalf("remaining = %#v, want only the unobserved mid-run arrival", remaining)
+	}
+
+	// Acknowledging everything empties the inbox key.
+	meta, err = AcknowledgeHumanMessages(&meta, remaining)
+	if err != nil {
+		t.Fatalf("AcknowledgeHumanMessages(rest) error = %v", err)
+	}
+	if msgs := ReadHumanInbox(&meta); msgs != nil {
+		t.Fatalf("inbox after full acknowledgement = %#v, want empty", msgs)
+	}
+
+	// Duplicate messages acknowledge one occurrence each.
+	meta, _ = AppendHumanMessage(nil, HumanMessage{At: "t4", Text: "dup"})
+	meta, _ = AppendHumanMessage(&meta, HumanMessage{At: "t4", Text: "dup"})
+	meta, err = AcknowledgeHumanMessages(&meta, []HumanMessage{{At: "t4", Text: "dup"}})
+	if err != nil {
+		t.Fatalf("AcknowledgeHumanMessages(dup) error = %v", err)
+	}
+	if msgs := ReadHumanInbox(&meta); len(msgs) != 1 {
+		t.Fatalf("inbox after single-dup acknowledgement = %#v, want one remaining duplicate", msgs)
+	}
+}

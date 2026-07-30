@@ -9,11 +9,12 @@ import (
 // WorkerSuccessFinalizationInput is the complete durable outcome of a worker
 // attempt whose execution steps have already finished.
 type WorkerSuccessFinalizationInput struct {
-	Run         RunRecord
-	QueueItemID string
-	LoopID      string
-	LoopStatus  string
-	FinishedAt  string
+	Run                  RunRecord
+	QueueItemID          string
+	LoopID               string
+	LoopStatus           string
+	FinishedAt           string
+	RequeueForHumanInbox bool
 }
 
 // FinalizeWorkerSuccess atomically records run success, consumes the queue
@@ -57,6 +58,20 @@ func FinalizeWorkerSuccess(ctx context.Context, db *sql.DB, input WorkerSuccessF
 			if err := repos.Queue.Complete(ctx, input.QueueItemID, input.FinishedAt); err != nil {
 				return err
 			}
+		}
+		if input.RequeueForHumanInbox && loop.Status == "running" {
+			requeued, err := repos.Queue.RequeueCompletedByID(ctx, input.LoopID, input.QueueItemID, input.FinishedAt)
+			if err != nil {
+				return err
+			}
+			if requeued == 0 {
+				return fmt.Errorf("finalize worker success: completed queue item %s could not be requeued for a human inbox turn", input.QueueItemID)
+			}
+			loop.Status = "queued"
+			loop.LastRunAt = &input.FinishedAt
+			loop.NextRunAt = &input.FinishedAt
+			loop.UpdatedAt = input.FinishedAt
+			return repos.Loops.Upsert(ctx, *loop)
 		}
 		if loop.Status != "terminated" {
 			loop.Status = input.LoopStatus

@@ -1335,9 +1335,7 @@ func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storag
 		checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is no longer an open issue", formatIssueReference(issueLookupRepo(*checkpoint.Work), checkpoint.Work.IssueNumber))
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		summary := r.buildSuccessSummary(loop, *checkpoint)
-		finishedAt := r.nowISO()
-		completedRun := completedRunRecord(run, "success", summary, "", *checkpoint, finishedAt)
-		err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completedRun, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt})
+		completedRun, err := r.finalizeSuccessfulClaim(ctx, run, queueItem, loop, *checkpoint, summary)
 		if err != nil {
 			return ProcessResult{}, true, err
 		}
@@ -1694,6 +1692,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// HITL (gated): let the agent pause to ask a human, and on resume feed the
 		// human's answer back into the same agent session.
 		nativeResumePrompt := ""
+		// Snapshot the inbox actually included in this prompt: acknowledgement
+		// after the turn must remove exactly these messages, not ones that
+		// arrive while the agent is running.
+		includedHumanInbox := loops.ReadHumanInbox(input.Loop.MetadataJSON)
 		nativeSessionID := ""
 		if r.hitlEnabled {
 			prompt += hitlPromptInstruction
@@ -1717,7 +1719,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// conversation. Conversational: the agent may answer + ask again rather than
 		// treat them as a final decision.
 		if r.hitlEnabled {
-			if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
+			if inbox := includedHumanInbox; len(inbox) > 0 {
 				var msgs strings.Builder
 				msgs.WriteString("While you were working, the human sent these messages in the task thread:")
 				for _, m := range inbox {
@@ -1795,11 +1797,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// answer that seeded it has been acted on. Flip it to "consumed" now — after
 		// the turn, never before — so a failed/timed-out turn re-reads the answer on
 		// retry, while a successful one never re-injects it on a later run.
-		if r.hitlEnabled {
-			r.markHumanAnswerConsumed(ctx, &input.Loop)
-			r.clearHumanInbox(ctx, &input.Loop)
-		}
-		r.markTakeoverResumeConsumed(ctx, &input.Loop)
+		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 			return checkpoint, err
 		}
@@ -2511,6 +2509,13 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	startStep := stepPrepareWork
 	resumedCheckpoint := checkpoint
+	// A successful worker normally has no follow-up turn. A survivor in the
+	// human inbox is the exception: keep its work/session context but clear the
+	// completed execution so the next queued claim actually starts the agent.
+	if latestRun != nil && latestRun.Status == "success" && r.hitlEnabled && len(loops.ReadHumanInbox(loop.MetadataJSON)) > 0 {
+		resumedCheckpoint.Execution = nil
+		resumedCheckpoint.Validation = nil
+	}
 	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
 		if restartFromDiscover {
 			startStep = stepPrepareWork
@@ -2647,9 +2652,19 @@ func IsSuccessfulClaimFinalizationCandidate(run storage.RunRecord) bool {
 }
 
 func (r *Runner) finalizeSuccessfulClaim(ctx context.Context, run storage.RunRecord, queueItem storage.QueueItemRecord, loop storage.LoopRecord, checkpoint workerCheckpoint, summary string) (storage.RunRecord, error) {
+	unlock := loops.LockLoopRequeue(loop.ID)
+	defer unlock()
+	requeueForHumanInbox := false
+	if r.hitlEnabled && r.repos != nil && r.repos.Loops != nil {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return storage.RunRecord{}, err
+		}
+		requeueForHumanInbox = fresh != nil && fresh.Status == "running" && len(loops.ReadHumanInbox(fresh.MetadataJSON)) > 0
+	}
 	finishedAt := r.nowISO()
 	completed := completedRunRecord(run, "success", summary, "", checkpoint, finishedAt)
-	if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt}); err != nil {
+	if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt, RequeueForHumanInbox: requeueForHumanInbox}); err != nil {
 		return storage.RunRecord{}, errors.Join(ErrSuccessfulClaimFinalization, err)
 	}
 	return completed, nil
