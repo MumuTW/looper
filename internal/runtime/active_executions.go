@@ -21,7 +21,9 @@ type ownedExecution struct {
 	executionID string
 	// softKill notifies the agent execution status path (async killCh).
 	softKill agent.SoftKillFunc
-	// handle is the process containment Authority for confirmed drain.
+	// handle is the process-containment authority for confirmed drain. Every
+	// execution entry is published by BindHandle, so handle is non-nil; pending
+	// spawn windows stay in pending until they have a containment handle.
 	handle *processcontainment.Handle
 }
 
@@ -548,6 +550,8 @@ type loopStopTargets struct {
 }
 
 // collectLoopStopTargetsLocked snapshots leases and bound handles for loopID.
+// The bound containment handle is authoritative for live process ownership;
+// durable execution status may lag it and must not make a live entry skippable.
 // Caller must hold r.mu.
 func (r *ActiveExecutionRegistry) collectLoopStopTargetsLocked(loopID string) loopStopTargets {
 	var t loopStopTargets

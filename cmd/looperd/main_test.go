@@ -857,7 +857,7 @@ func TestStopLoopDoesNotClaimProcessSignaledWithoutSignaler(t *testing.T) {
 	}
 }
 
-func TestStopLoopSkipsStaleActiveExecutionWhenLatestExecutionCompleted(t *testing.T) {
+func TestStopLoopDrainsLiveOwnershipWhenLatestExecutionCompleted(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
 	if err != nil {
@@ -916,8 +916,8 @@ func TestStopLoopSkipsStaleActiveExecutionWhenLatestExecutionCompleted(t *testin
 	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomeAlreadyFinished || result.ProcessSkipReason != processSkipAlreadyFinished {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
-	if active.killed {
-		t.Fatal("active execution Kill invoked, want stale registry entry skipped")
+	if !active.killed {
+		t.Fatal("active execution Kill not invoked, want live containment ownership drained")
 	}
 	if signaled {
 		t.Fatal("signal invoked, want completed execution to be skipped")
