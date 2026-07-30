@@ -143,6 +143,7 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 	// One budget per tick, shared by every project this lane discovers. Projects
 	// are discovered concurrently, so the budget synchronizes its own reservation.
 	decisionBudget := triager.NewDecisionBudget(triager.DefaultDecisionLimit)
+	pendingReadBudget := triager.NewReadBudget(triager.DefaultPendingReadLimit)
 	return discoveryLane{
 		Name:     "triager",
 		Priority: config.PriorityTriager,
@@ -151,7 +152,13 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 			return input.TriagerEnabled != nil && input.TriagerEnabled(projectID)
 		},
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
-			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: decisionBudget})
+			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: decisionBudget, PendingReadBudget: pendingReadBudget})
+			if input.Logger != nil && result.PendingReadSkipped > 0 {
+				input.Logger.Info("triager pending source reads bounded", map[string]any{
+					"projectId": projectID, "repo": repo, "skipped": result.PendingReadSkipped,
+					"remaining": pendingReadBudget.Remaining(),
+				})
+			}
 			return result.QueueItems, err
 		},
 	}

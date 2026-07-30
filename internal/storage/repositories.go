@@ -475,6 +475,16 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	return scanEventLogs(rows)
 }
 
+func (r *EventsRepository) ListByCorrelationID(ctx context.Context, projectID, entityType, correlationID string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE project_id = ? AND entity_type = ? AND correlation_id = ? ORDER BY created_at ASC, id ASC`, projectID, entityType, correlationID)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by correlation id: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 // ListByEntityTypeAndEventTypes reads the complete lifecycle for one entity
 // family without imposing an arbitrary status-page limit. Callers derive live
 // projections from the returned durable events; this query does not record a
@@ -549,6 +559,69 @@ func (r *EventsRepository) ListByProjectAndEntityType(ctx context.Context, proje
 	}
 	defer rows.Close()
 
+	return scanEventLogs(rows)
+}
+
+// CountLatestUnresolvedSourceLifecycles counts source lifecycles whose latest event has
+// not reached one of the supplied terminal event types. Callers use the count
+// only to rotate a bounded read window; event payloads remain the authority.
+func (r *EventsRepository) CountLatestUnresolvedSourceLifecycles(ctx context.Context, projectID, entityType string, terminalEventTypes []string) (int, error) {
+	if len(terminalEventTypes) == 0 {
+		return 0, fmt.Errorf("terminal event types are required")
+	}
+	args := []any{projectID, entityType}
+	for _, eventType := range terminalEventTypes {
+		args = append(args, eventType)
+	}
+	row := r.q.QueryRowContext(ctx, `
+		WITH ranked AS (
+			SELECT event_type, ROW_NUMBER() OVER (PARTITION BY correlation_id ORDER BY created_at DESC, id DESC) AS rank
+			FROM event_logs WHERE project_id = ? AND entity_type = ? AND correlation_id IS NOT NULL
+		)
+		SELECT COUNT(*) FROM ranked WHERE rank = 1 AND event_type NOT IN (`+sqlPlaceholders(len(terminalEventTypes))+`)
+	`, args...)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count latest unresolved source lifecycles: %w", err)
+	}
+	return count, nil
+}
+
+// ListLatestUnresolvedSourceLifecycles returns complete event histories for a
+// bounded rotating window of unresolved sources. It avoids a project-wide
+// history transfer while still letting callers fold the authoritative lifecycle.
+func (r *EventsRepository) ListLatestUnresolvedSourceLifecycles(ctx context.Context, projectID, entityType string, terminalEventTypes []string, limit, offset int) ([]EventLogRecord, error) {
+	if len(terminalEventTypes) == 0 {
+		return nil, fmt.Errorf("terminal event types are required")
+	}
+	if limit <= 0 {
+		return []EventLogRecord{}, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	args := []any{projectID, entityType}
+	for _, eventType := range terminalEventTypes {
+		args = append(args, eventType)
+	}
+	args = append(args, limit, offset)
+	rows, err := r.q.QueryContext(ctx, `
+		WITH ranked AS (
+			SELECT correlation_id, event_type, created_at, id,
+				ROW_NUMBER() OVER (PARTITION BY correlation_id ORDER BY created_at DESC, id DESC) AS rank
+			FROM event_logs WHERE project_id = ? AND entity_type = ? AND correlation_id IS NOT NULL
+		), entities AS (
+			SELECT correlation_id FROM ranked
+			WHERE rank = 1 AND event_type NOT IN (`+sqlPlaceholders(len(terminalEventTypes))+`)
+			ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?
+		)
+		SELECT e.* FROM event_logs e JOIN entities ON entities.correlation_id = e.correlation_id
+		WHERE e.project_id = ? AND e.entity_type = ? ORDER BY e.created_at ASC, e.id ASC
+	`, append(args, projectID, entityType)...)
+	if err != nil {
+		return nil, fmt.Errorf("list latest unresolved source lifecycles: %w", err)
+	}
+	defer rows.Close()
 	return scanEventLogs(rows)
 }
 

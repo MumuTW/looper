@@ -62,16 +62,20 @@ const (
 	NextRolePlanner NextRole = "planner"
 	NextRoleHuman   NextRole = "human"
 
-	defaultIssueLimit                     = 100
-	defaultDecisionLimit                  = 1
-	defaultSourceLookback                 = 5 * time.Minute
-	autoRouteConfidence                   = 0.8
-	reportEntityType                      = "github_issue"
-	sourceEventNew        SourceEventKind = "new"
-	sourceEventReopened   SourceEventKind = "reopened"
+	defaultIssueLimit                          = 100
+	defaultDecisionLimit                       = 1
+	defaultPendingReadLimit                    = 12
+	defaultSourceLookback                      = 5 * time.Minute
+	pendingStateBatchSize                      = 32
+	pendingSourceMaxForgeReads                 = 4
+	autoRouteConfidence                        = 0.8
+	reportEntityType                           = "github_issue"
+	sourceEventNew             SourceEventKind = "new"
+	sourceEventReopened        SourceEventKind = "reopened"
 )
 
 const DefaultDecisionLimit = defaultDecisionLimit
+const DefaultPendingReadLimit = defaultPendingReadLimit
 
 type Classification string
 type Scope string
@@ -210,6 +214,9 @@ type DiscoveryInput struct {
 	// DecisionBudget is the tick-wide decision cap shared by every project in the
 	// tick. Nil means uncapped.
 	DecisionBudget *DecisionBudget
+	// PendingReadBudget bounds GitHub reads required to revisit durable sources.
+	// Nil preserves the embedding contract for callers that do not share a tick.
+	PendingReadBudget *ReadBudget
 }
 
 type DiscoveryResult struct {
@@ -220,6 +227,7 @@ type DiscoveryResult struct {
 	AwaitingConfirmation int
 	Confirmed            int
 	Skipped              int
+	PendingReadSkipped   int
 	Retired              int
 	QueueItems           []storage.QueueItemRecord
 }
@@ -306,6 +314,14 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if _, exists := states[key]; exists {
 			continue
 		}
+		existing, err := r.loadSourceState(ctx, input.ProjectID, input.Repo, key)
+		if err != nil {
+			return result, err
+		}
+		if existing != nil {
+			states[key] = existing
+			continue
+		}
 		enrollment := Enrollment{
 			Version: 1, IdempotencyKey: key, ProjectID: input.ProjectID, Repo: input.Repo,
 			IssueNumber: detail.Number, Source: source, CommentID: latestCommentID(detail.Comments),
@@ -337,6 +353,11 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
+		if !input.PendingReadBudget.Reserve(pendingSourceMaxForgeReads) {
+			result.PendingReadSkipped++
+			result.Skipped++
+			continue
+		}
 		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, &result); err != nil {
 			return result, err
 		}
@@ -352,10 +373,35 @@ type sourceState struct {
 }
 
 func (r *Runner) loadSourceStates(ctx context.Context, projectID, repo string) (map[string]*sourceState, error) {
-	events, err := r.repos.Events.ListByProjectAndEntityType(ctx, projectID, reportEntityType)
+	terminal := []string{ProjectionEventType, RetirementEventType}
+	count, err := r.repos.Events.CountLatestUnresolvedSourceLifecycles(ctx, projectID, reportEntityType, terminal)
 	if err != nil {
 		return nil, err
 	}
+	if count == 0 {
+		return map[string]*sourceState{}, nil
+	}
+	offset := int(r.now().UTC().Unix()/int64(defaultSourceLookback.Seconds())) % count
+	events, err := r.repos.Events.ListLatestUnresolvedSourceLifecycles(ctx, projectID, reportEntityType, terminal, pendingStateBatchSize, offset)
+	if err != nil {
+		return nil, err
+	}
+	return sourceStatesFromEvents(events, projectID, repo)
+}
+
+func (r *Runner) loadSourceState(ctx context.Context, projectID, repo, key string) (*sourceState, error) {
+	events, err := r.repos.Events.ListByCorrelationID(ctx, projectID, reportEntityType, key)
+	if err != nil {
+		return nil, err
+	}
+	states, err := sourceStatesFromEvents(events, projectID, repo)
+	if err != nil {
+		return nil, err
+	}
+	return states[key], nil
+}
+
+func sourceStatesFromEvents(events []storage.EventLogRecord, projectID, repo string) (map[string]*sourceState, error) {
 	states := map[string]*sourceState{}
 	for _, event := range events {
 		switch event.EventType {
@@ -600,7 +646,7 @@ func (r *Runner) retireSource(ctx context.Context, state *sourceState, reason st
 }
 
 func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue githubinfra.IssueDetail, report Report) (confirmed, created bool, err error) {
-	events, err := r.repos.Events.ListByEntity(ctx, reportEntityType, reportEntityID(report.ProjectID, report.Repo, report.IssueNumber))
+	events, err := r.repos.Events.ListByCorrelationID(ctx, report.ProjectID, reportEntityType, report.IdempotencyKey)
 	if err != nil {
 		return false, false, err
 	}
@@ -771,10 +817,11 @@ func (r *Runner) persistEnrollment(ctx context.Context, enrollment Enrollment) e
 	projectID := enrollment.ProjectID
 	entityType := reportEntityType
 	entityID := reportEntityID(enrollment.ProjectID, enrollment.Repo, enrollment.IssueNumber)
+	correlationID := enrollment.IdempotencyKey
 	actorType, actorID := "system", "triager"
 	return r.repos.Events.Append(ctx, storage.EventLogRecord{
 		ID: eventlog.NewEventID("triage-enroll"), EventType: EnrollmentEventType, ProjectID: &projectID,
-		EntityType: &entityType, EntityID: &entityID, ActorType: &actorType, ActorID: &actorID,
+		EntityType: &entityType, EntityID: &entityID, CorrelationID: &correlationID, ActorType: &actorType, ActorID: &actorID,
 		PayloadJSON: string(payload), CreatedAt: enrollment.EnrolledAt,
 	})
 }
@@ -787,10 +834,11 @@ func (r *Runner) persistReport(ctx context.Context, report Report) error {
 	projectID := report.ProjectID
 	entityType := reportEntityType
 	entityID := reportEntityID(report.ProjectID, report.Repo, report.IssueNumber)
+	correlationID := report.IdempotencyKey
 	actorType, actorID := "system", "triager"
 	return r.repos.Events.Append(ctx, storage.EventLogRecord{
 		ID: eventlog.NewEventID("triage"), EventType: ReportEventType, ProjectID: &projectID,
-		EntityType: &entityType, EntityID: &entityID, ActorType: &actorType, ActorID: &actorID,
+		EntityType: &entityType, EntityID: &entityID, CorrelationID: &correlationID, ActorType: &actorType, ActorID: &actorID,
 		PayloadJSON: string(payload), CreatedAt: report.CreatedAt,
 	})
 }
@@ -803,10 +851,11 @@ func (r *Runner) persistConfirmation(ctx context.Context, report Report, confirm
 	projectID := report.ProjectID
 	entityType := reportEntityType
 	entityID := reportEntityID(report.ProjectID, report.Repo, report.IssueNumber)
+	correlationID := report.IdempotencyKey
 	actorType, actorID := "human", confirmation.Author
 	return r.repos.Events.Append(ctx, storage.EventLogRecord{
 		ID: eventlog.NewEventID("triage-confirm"), EventType: ConfirmationEventType, ProjectID: &projectID,
-		EntityType: &entityType, EntityID: &entityID, ActorType: &actorType, ActorID: &actorID,
+		EntityType: &entityType, EntityID: &entityID, CorrelationID: &correlationID, ActorType: &actorType, ActorID: &actorID,
 		PayloadJSON: string(payload), CreatedAt: confirmation.ConfirmedAt,
 	})
 }
@@ -824,10 +873,11 @@ func (r *Runner) persistProjection(ctx context.Context, report Report, route pla
 	projectID := report.ProjectID
 	entityType := reportEntityType
 	entityID := reportEntityID(report.ProjectID, report.Repo, report.IssueNumber)
+	correlationID := report.IdempotencyKey
 	actorType, actorID := "system", "triager"
 	return r.repos.Events.Append(ctx, storage.EventLogRecord{
 		ID: eventlog.NewEventID("triage-route"), EventType: ProjectionEventType, ProjectID: &projectID,
-		EntityType: &entityType, EntityID: &entityID, ActorType: &actorType, ActorID: &actorID,
+		EntityType: &entityType, EntityID: &entityID, CorrelationID: &correlationID, ActorType: &actorType, ActorID: &actorID,
 		PayloadJSON: string(payload), CreatedAt: projection.RoutedAt,
 	})
 }
@@ -840,10 +890,11 @@ func (r *Runner) persistRetirement(ctx context.Context, enrollment Enrollment, r
 	projectID := enrollment.ProjectID
 	entityType := reportEntityType
 	entityID := reportEntityID(enrollment.ProjectID, enrollment.Repo, enrollment.IssueNumber)
+	correlationID := enrollment.IdempotencyKey
 	actorType, actorID := "system", "triager"
 	return r.repos.Events.Append(ctx, storage.EventLogRecord{
 		ID: eventlog.NewEventID("triage-retire"), EventType: RetirementEventType, ProjectID: &projectID,
-		EntityType: &entityType, EntityID: &entityID, ActorType: &actorType, ActorID: &actorID,
+		EntityType: &entityType, EntityID: &entityID, CorrelationID: &correlationID, ActorType: &actorType, ActorID: &actorID,
 		PayloadJSON: string(payload), CreatedAt: retirement.RetiredAt,
 	})
 }

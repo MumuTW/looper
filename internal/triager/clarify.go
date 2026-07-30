@@ -71,7 +71,7 @@ func (r *Runner) ensureAsked(ctx context.Context, project storage.ProjectRecord,
 }
 
 func (r *Runner) alreadyAsked(ctx context.Context, report Report) (bool, error) {
-	events, err := r.repos.Events.ListByEntity(ctx, reportEntityType, reportEntityID(report.ProjectID, report.Repo, report.IssueNumber))
+	events, err := r.repos.Events.ListByCorrelationID(ctx, report.ProjectID, reportEntityType, report.IdempotencyKey)
 	if err != nil {
 		return false, err
 	}
@@ -98,10 +98,11 @@ func (r *Runner) persistAsk(ctx context.Context, report Report, ask Ask) error {
 	projectID := report.ProjectID
 	entityType := reportEntityType
 	entityID := reportEntityID(report.ProjectID, report.Repo, report.IssueNumber)
+	correlationID := report.IdempotencyKey
 	actorType, actorID := "system", "triager"
 	return r.repos.Events.Append(ctx, storage.EventLogRecord{
 		ID: eventlog.NewEventID("triage-ask"), EventType: AskEventType, ProjectID: &projectID,
-		EntityType: &entityType, EntityID: &entityID, ActorType: &actorType, ActorID: &actorID,
+		EntityType: &entityType, EntityID: &entityID, CorrelationID: &correlationID, ActorType: &actorType, ActorID: &actorID,
 		PayloadJSON: string(payload), CreatedAt: ask.AskedAt,
 	})
 }
@@ -153,7 +154,7 @@ func parseConfirmComment(body, token string) (confirms bool, clarification strin
 // clarificationsForReport collects the answers recorded against a report, in the
 // order they were confirmed.
 func (r *Runner) clarificationsForReport(ctx context.Context, report Report) ([]string, error) {
-	events, err := r.repos.Events.ListByEntity(ctx, reportEntityType, reportEntityID(report.ProjectID, report.Repo, report.IssueNumber))
+	events, err := r.repos.Events.ListByCorrelationID(ctx, report.ProjectID, reportEntityType, report.IdempotencyKey)
 	if err != nil {
 		return nil, err
 	}

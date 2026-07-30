@@ -80,6 +80,59 @@ func TestAgentExecutionTerminalToDifferentTerminalIsConflict(t *testing.T) {
 	}
 }
 
+func TestEventsLatestUnresolvedSourceLifecyclesBoundsAndRotates(t *testing.T) {
+	t.Parallel()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	projectID, entityType := "project_triage", "github_issue"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Triage", RepoPath: t.TempDir(), CreatedAt: "2026-07-30T12:00:00.000Z", UpdatedAt: "2026-07-30T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	events := []struct {
+		eventType string
+		sourceKey string
+		issue     int
+	}{
+		{eventType: "triage.report", sourceKey: "source-a", issue: 1},
+		{eventType: "triage.report", sourceKey: "source-b", issue: 1},
+		{eventType: "triage.routed", sourceKey: "source-b", issue: 1},
+		{eventType: "triage.report", sourceKey: "source-c", issue: 2},
+		{eventType: "triage.confirmed", sourceKey: "source-d", issue: 3},
+		{eventType: "triage.retired", sourceKey: "source-e", issue: 4},
+		{eventType: "triage.enrolled", sourceKey: "source-f", issue: 5},
+	}
+	for i, event := range events {
+		entityID := fmt.Sprintf("%s:acme/looper#%d", projectID, event.issue)
+		project, typ, entity := projectID, entityType, entityID
+		createdAt := fmt.Sprintf("2026-07-30T12:00:0%d.000Z", i)
+		if err := repos.Events.Append(ctx, EventLogRecord{ID: fmt.Sprintf("event_triage_%d", i), EventType: event.eventType, ProjectID: &project, EntityType: &typ, EntityID: &entity, CorrelationID: &event.sourceKey, PayloadJSON: `{}`, CreatedAt: createdAt}); err != nil {
+			t.Fatalf("Events.Append(%d) error = %v", i, err)
+		}
+	}
+	terminal := []string{"triage.routed", "triage.retired"}
+	count, err := repos.Events.CountLatestUnresolvedSourceLifecycles(ctx, projectID, entityType, terminal)
+	if err != nil || count != 4 {
+		t.Fatalf("CountLatestUnresolvedSourceLifecycles() = %d, %v; want 4", count, err)
+	}
+	first, err := repos.Events.ListLatestUnresolvedSourceLifecycles(ctx, projectID, entityType, terminal, 2, 0)
+	if err != nil {
+		t.Fatalf("ListLatestUnresolvedSourceLifecycles(first) error = %v", err)
+	}
+	second, err := repos.Events.ListLatestUnresolvedSourceLifecycles(ctx, projectID, entityType, terminal, 2, 2)
+	if err != nil {
+		t.Fatalf("ListLatestUnresolvedSourceLifecycles(second) error = %v", err)
+	}
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("window lengths = %d/%d, want 2/2", len(first), len(second))
+	}
+	for _, event := range append(first, second...) {
+		if event.EventType == "triage.routed" || event.EventType == "triage.retired" {
+			t.Fatalf("resolved event leaked into unresolved lifecycle window: %#v", event)
+		}
+	}
+}
+
 func TestAgentExecutionSameTerminalFieldEnrichmentAllowed(t *testing.T) {
 	t.Parallel()
 

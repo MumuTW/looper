@@ -54,9 +54,10 @@ func awaitingExpired(state *sourceState, now time.Time) bool {
 // selectAwaitingRechecks decides which quiet awaiting-confirmation sources to
 // re-verify this tick.
 //
-// pending arrives oldest-first, so taking from the front round-robins over the
-// backlog: every source is eventually re-verified even if its issue never appears
-// in the update window, and no tick pays more than the budget.
+// The source-lifecycle window rotates independently in Runner.loadSourceStates;
+// pending is then oldest-first within that bounded window. Together, every source
+// is eventually re-verified even if its issue never appears in the update window,
+// and no tick pays more than the budget.
 func selectAwaitingRechecks(pending []*sourceState, touched map[int64]struct{}, budget int) map[string]struct{} {
 	selected := make(map[string]struct{})
 	if budget <= 0 {
