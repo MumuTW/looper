@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"sort"
 	"strings"
 
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -26,21 +27,35 @@ type githubAnswerComment struct {
 // when the bot and a human share the same GitHub account.
 const looperCommentMarker = "<!-- looper:"
 
-// detectGitHubHITLAnswer returns the human's answer to a GitHub HITL ask, or ""
-// when none has arrived yet. The answer is the FIRST comment posted after the ask
-// (comment id > askCommentID; GitHub comment ids are monotonic) that is NOT one of
-// looper's own comments (no looper marker). When answerAuthors is non-empty the
-// commenter must be on that allowlist; otherwise any human reply may answer.
-// Empty-bodied comments are ignored so ordinary reactions/edits don't count.
+// detectGitHubHITLAnswer returns the first explicitly allowlisted answer to a
+// GitHub HITL ask. An empty allowlist fails closed; repository permission is
+// checked separately by the poller. Empty-bodied and Looper-authored comments
+// are never candidates.
 func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, answerAuthors []string) string {
+	allow := githubHITLAnswerAuthorAllowlist(answerAuthors)
+	if len(allow) == 0 {
+		return ""
+	}
+	for _, c := range githubHITLAnswerCandidates(comments, askCommentID) {
+		if allow[strings.ToLower(strings.TrimSpace(c.Author))] {
+			return strings.TrimSpace(c.Body)
+		}
+	}
+	return ""
+}
+
+func githubHITLAnswerAuthorAllowlist(answerAuthors []string) map[string]bool {
 	allow := make(map[string]bool, len(answerAuthors))
 	for _, a := range answerAuthors {
 		if a = strings.TrimSpace(a); a != "" {
 			allow[strings.ToLower(a)] = true
 		}
 	}
-	bestID := int64(0)
-	answer := ""
+	return allow
+}
+
+func githubHITLAnswerCandidates(comments []githubAnswerComment, askCommentID int64) []githubAnswerComment {
+	candidates := make([]githubAnswerComment, 0, len(comments))
 	for _, c := range comments {
 		if c.ID <= askCommentID {
 			continue
@@ -52,19 +67,14 @@ func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, 
 		if author == "" {
 			continue
 		}
-		if len(allow) > 0 && !allow[strings.ToLower(author)] {
-			continue
-		}
 		body := strings.TrimSpace(c.Body)
 		if body == "" {
 			continue
 		}
-		if bestID == 0 || c.ID < bestID {
-			bestID = c.ID
-			answer = body
-		}
+		candidates = append(candidates, githubAnswerComment{ID: c.ID, Author: author, Body: body})
 	}
-	return answer
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+	return candidates
 }
 
 // githubHITLPollDeps are the injected dependencies of the answer-poll lane, kept
@@ -81,7 +91,10 @@ type githubHITLPollDeps struct {
 	// projectCWD returns the local repo path for a project (gh runs there).
 	projectCWD    func(projectID string) string
 	answerAuthors []string
-	logWarn       func(msg string, fields map[string]any)
+	// authorizeAuthor checks the repository's current permission when no
+	// explicit answer author allowlist is configured.
+	authorizeAuthor func(ctx contextType, repo, author, cwd string) (bool, error)
+	logWarn         func(msg string, fields map[string]any)
 }
 
 // githubHITLAwaitingLoop is the minimal loop shape the lane needs.
@@ -124,6 +137,26 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 			continue
 		}
 		answer := detectGitHubHITLAnswer(comments, loop.AskCommentID, deps.answerAuthors)
+		if answer == "" && len(githubHITLAnswerAuthorAllowlist(deps.answerAuthors)) == 0 {
+			for _, candidate := range githubHITLAnswerCandidates(comments, loop.AskCommentID) {
+				if deps.authorizeAuthor == nil {
+					break
+				}
+				allowed, err := deps.authorizeAuthor(ctx, repo, candidate.Author, cwd)
+				if err != nil {
+					if deps.logWarn != nil {
+						deps.logWarn("hitl github poll: authorize answer author failed", map[string]any{
+							"loopId": loop.ID, "repo": repo, "pr": loop.PRNumber, "author": candidate.Author, "error": err.Error(),
+						})
+					}
+					break
+				}
+				if allowed {
+					answer = candidate.Body
+					break
+				}
+			}
+		}
 		if answer == "" {
 			continue
 		}
@@ -303,6 +336,17 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		},
 		projectCWD:    func(string) string { return project.RepoPath },
 		answerAuthors: answerAuthors,
+		authorizeAuthor: func(ctx contextType, repo, author, cwd string) (bool, error) {
+			permission, err := gw.GetRepositoryPermission(ctx, githubinfra.RepositoryPermissionInput{
+				Repo: repo,
+				User: author,
+				CWD:  cwd,
+			})
+			if err != nil {
+				return false, err
+			}
+			return githubinfra.RepositoryPermissionAllowsWrite(permission), nil
+		},
 	}
 	if input.Logger != nil {
 		deps.logWarn = func(msg string, fields map[string]any) { input.Logger.Warn(msg, fields) }

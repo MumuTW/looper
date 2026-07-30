@@ -139,7 +139,7 @@ for nearly free.
     "github": {
       "awaitingLabel": "looper:awaiting-human",
       "mentionLogins": ["lefarcen"],
-      "answerAuthors": []           // empty = any non-bot; else allowlist
+      "answerAuthors": []           // empty = repository writer; else allowlist
     },
     "feishu": {                      // optional; secrets via env only
       "inbound": "cf-inbox",        // "long-connection" | "cf-inbox"
@@ -196,6 +196,7 @@ for nearly free.
 ## Open questions
 
 1. First vs latest human comment as the GitHub answer (default: first).
-2. GitHub answerers: any non-bot vs allowlist (default: any non-bot).
+2. GitHub answerers: explicit allowlist or, by default, a current repository
+   collaborator with write, maintain, or admin permission.
 3. Ship Phase 1 (GitHub) upstream before building Phase 2 (nexu Feishu/CF), or run
    them in parallel since this team wants Feishu sooner?

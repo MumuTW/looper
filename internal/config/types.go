@@ -757,7 +757,7 @@ type HITLGitHubConfig struct {
 	// MentionLogins are GitHub logins to /cc on an ask so a human is notified.
 	MentionLogins []string `json:"mentionLogins,omitempty"`
 	// AnswerAuthors, when non-empty, restricts who may answer to these logins.
-	// Empty means any non-bot commenter.
+	// When empty, current repository write/maintain/admin permission is required.
 	AnswerAuthors []string `json:"answerAuthors,omitempty"`
 }
 
