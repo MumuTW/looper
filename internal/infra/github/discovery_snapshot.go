@@ -143,6 +143,14 @@ func (s *DiscoverySnapshot) listOpenIssues(ctx context.Context, input ListOpenIs
 	return limitIssues(issues, input.Limit), nil
 }
 
+// EnsureOpenIssues populates the snapshot's open-issue cache for the given repo
+// if it has not been fetched yet this tick. It is the exported seam callers
+// outside the github package (the queue-settling pass, tests) use to make
+// OpenIssueNumbers return ok=true without re-running discovery lanes.
+func (s *DiscoverySnapshot) EnsureOpenIssues(ctx context.Context, input ListOpenIssuesInput) error {
+	return s.ensureOpenIssues(ctx, input)
+}
+
 func (s *DiscoverySnapshot) ensureOpenIssues(ctx context.Context, input ListOpenIssuesInput) error {
 	s.mu.Lock()
 	ready := s.openIssuesFetched && s.openIssuesFetchRepo == input.Repo && s.openIssuesFetchCWD == input.CWD
@@ -195,6 +203,31 @@ func (s *DiscoverySnapshot) filteredIssues(input ListOpenIssuesInput) []IssueSum
 	issues := cloneIssueSummaries(s.openIssues)
 	s.mu.Unlock()
 	return filterIssues(issues, input)
+}
+
+// OpenIssueNumbers returns the issue numbers the snapshot has cached as open for
+// its repo, plus whether that cached list is complete (the forge returned fewer
+// items than the fetch limit, so nothing open was truncated away). Callers that
+// need to infer "this issue is no longer open" from absence may only do so when
+// Complete is true; an incomplete list cannot distinguish a closed issue from
+// one past the limit. Returns ok=false when the snapshot has not fetched open
+// issues for this repo yet, so callers fall back to no-op rather than retiring
+// everything.
+func (s *DiscoverySnapshot) OpenIssueNumbers() (numbers map[int64]struct{}, complete bool, ok bool) {
+	if s == nil {
+		return nil, false, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.openIssuesFetched {
+		return nil, false, false
+	}
+	numbers = make(map[int64]struct{}, len(s.openIssues))
+	for _, issue := range s.openIssues {
+		numbers[issue.Number] = struct{}{}
+	}
+	complete = len(s.openIssues) < s.openIssuesLimit
+	return numbers, complete, true
 }
 
 func (g *Gateway) listOpenPullRequestsForDiscovery(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {

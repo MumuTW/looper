@@ -2450,6 +2450,16 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			break
 		}
 		runGitHubHITLPoll(ctx, input, project)
+
+		// Settle queued worker items whose target issue closed while they waited.
+		// Reuses the open-issue list the discovery lanes already fetched into this
+		// project's snapshot; no-ops when discovery did not read open issues or the
+		// list is incomplete. Bounded per discovery pass, never per-queue-item.
+		settleQueuedWorkerIssueTargets(ctx, input.Repos, snapshot, project.ID, repo, formatJavaScriptISOString(now()), func(msg string, fields map[string]any) {
+			if input.Logger != nil {
+				input.Logger.Debug(msg, fields)
+			}
+		})
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and
