@@ -18,26 +18,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
-	"github.com/nexu-io/looper/internal/fixer/publish"
-	"github.com/nexu-io/looper/internal/fixer/reconcile"
-	"github.com/nexu-io/looper/internal/fixer/workflow"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/specpr"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/lifecycle"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/loops/failureclass"
-	"github.com/nexu-io/looper/internal/processcontainment"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/validation"
-	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/fixer/adopt"
+	"github.com/MumuTW/looper/internal/fixer/discovery"
+	"github.com/MumuTW/looper/internal/fixer/failurepolicy"
+	"github.com/MumuTW/looper/internal/fixer/publish"
+	"github.com/MumuTW/looper/internal/fixer/reconcile"
+	"github.com/MumuTW/looper/internal/fixer/workflow"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/specpr"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/validation"
+	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
 // FixerStep aliases the extracted workflow authority's step type; the
@@ -455,18 +457,19 @@ type AgentExecutionStartedInput struct {
 type AgentExecutionStartedFunc func(context.Context, AgentExecutionStartedInput) error
 
 type Options struct {
-	DB                 *sql.DB
-	Repos              *storage.Repositories
-	GitHub             GitHubGateway
-	Git                GitGateway
-	AgentExecutor      AgentExecutor
-	Logger             bootstrap.Logger
-	Now                func() time.Time
-	AgentTimeout       time.Duration
-	AgentIdleTimeout   time.Duration
-	ClaimTTL           time.Duration
-	ValidationCommands []string
-	ValidationRunner   ValidationRunner
+	DB                          *sql.DB
+	Repos                       *storage.Repositories
+	GitHub                      GitHubGateway
+	Git                         GitGateway
+	AgentExecutor               AgentExecutor
+	Logger                      bootstrap.Logger
+	Now                         func() time.Time
+	AgentTimeout                time.Duration
+	AgentIdleTimeout            time.Duration
+	ClaimTTL                    time.Duration
+	ValidationCommands          []string
+	ValidationCommandsByProject map[string][]string
+	ValidationRunner            ValidationRunner
 	// ContainmentTracker registers validation shell handles with the Execution
 	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
 	// when the runner is not daemon-owned.
@@ -511,6 +514,7 @@ type Runner struct {
 	agentIdleTimeout            time.Duration
 	claimTTL                    time.Duration
 	validationCommands          []string
+	validationCommandsByProject map[string][]string
 	validationRunner            ValidationRunner
 	containmentTracker          processcontainment.LiveTracker
 	allowAutoCommit             bool
@@ -1551,6 +1555,7 @@ func New(options Options) *Runner {
 		agentIdleTimeout:            agentIdleTimeout,
 		claimTTL:                    claimTTL,
 		validationCommands:          append([]string(nil), options.ValidationCommands...),
+		validationCommandsByProject: cloneValidationCommandsByProject(options.ValidationCommandsByProject),
 		validationRunner:            options.ValidationRunner,
 		containmentTracker:          options.ContainmentTracker,
 		allowAutoCommit:             options.AllowAutoCommit,
@@ -1571,6 +1576,24 @@ func New(options Options) *Runner {
 		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
 	}
+}
+
+func cloneValidationCommandsByProject(source map[string][]string) map[string][]string {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string][]string, len(source))
+	for projectID, commands := range source {
+		cloned[projectID] = append([]string(nil), commands...)
+	}
+	return cloned
+}
+
+func (r *Runner) validationCommandsForProject(projectID string) []string {
+	if commands, ok := r.validationCommandsByProject[projectID]; ok {
+		return commands
+	}
+	return r.validationCommands
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -1860,6 +1883,12 @@ func defaultDiscoveryLimit(limit int) int {
 	return limit
 }
 
+// pullRequestEligibleForDiscovery gathers the I/O-derived facts (loop
+// records, lock state) and delegates the decision to the discovery
+// authority. Fact-gathering now always performs the local lock lookup,
+// where the old inline rules skipped it for non-open or draft candidates
+// — a deliberate cost (one SQLite read on candidates the pure gates will
+// reject) taken so the precedence lives in exactly one place.
 func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID string, pr PullRequestSummary, repo, currentUser string, policy DiscoveryPolicy, loopsByPR map[int64][]storage.LoopRecord) bool {
 	candidates := []storage.LoopRecord(nil)
 	if loopsByPR != nil {
@@ -1869,13 +1898,9 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 	if manualFollowupLoop == nil && loopsByPR == nil {
 		manualFollowupLoop, _ = r.findManualFixerFollowupLoopByPR(ctx, projectID, repo, pr.Number)
 	}
-	if normalizePRState(pr.State) != "open" {
-		return false
-	}
-	if manualFollowupLoop == nil && !policy.IncludeDrafts && pr.IsDraft {
-		return false
-	}
+	facts := discovery.Facts{HasManualFollowupLoop: manualFollowupLoop != nil}
 	if r.hasActivePRLock(ctx, projectID, repo, pr.Number) {
+		facts.LockHeld = true
 		var (
 			loop *storage.LoopRecord
 			err  error
@@ -1885,23 +1910,18 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 		} else {
 			loop, err = r.findRunningFixerLoopByPR(ctx, projectID, repo, pr.Number, nil)
 		}
-		if err != nil || loop == nil {
-			return false
+		if err == nil && loop != nil {
+			facts.HasRunningLoop = true
+			facts.RunningLoopManual = isManualFixerLoop(*loop)
+			facts.RunningLoopFollowUpdates = fixerFollowUpdatesEnabled(*loop)
 		}
-		if isManualFixerLoop(*loop) && !fixerFollowUpdatesEnabled(*loop) {
-			return false
-		}
 	}
-	if manualFollowupLoop != nil {
-		return true
-	}
-	if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
-		return false
-	}
-	if !config.LabelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
-		return false
-	}
-	return true
+	return discovery.Eligible(
+		discovery.PR{State: pr.State, IsDraft: pr.IsDraft, Author: pr.Author, Labels: pr.Labels},
+		currentUser,
+		discovery.Policy{IncludeDrafts: policy.IncludeDrafts, AuthorFilter: policy.AuthorFilter, Labels: policy.Labels, LabelMode: policy.LabelMode},
+		facts,
+	)
 }
 
 func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail, result *DiscoveryResult) error {
@@ -2997,7 +3017,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 // prepared while later dirty adopt can never satisfy hasFixerWorktreeProvenance.
 func (r *Runner) finishPreparedWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot, worktreePath, headSHA string) (fixerCheckpoint, error) {
 	preparedAt := r.nowISO()
-	ownerToken := newFixerWorktreeOwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
+	ownerToken := adopt.OwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
 	if err := worktreesafety.WriteFixerOwnerToken(worktreePath, ownerToken); err != nil {
 		return checkpoint, fmt.Errorf("stamp fixer ownership for %s: %w", worktreePath, err)
 	}
@@ -3027,19 +3047,16 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 	if !hasFixerWorktreeProvenance(checkpoint, created.WorktreePath) {
 		return false, checkpoint, nil
 	}
-	switch input.Loop.Status {
-	case string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusAwaitingHuman):
-		return false, checkpoint, nil
-	}
-	if _, ok := loops.ReadTakeoverResume(input.Loop.MetadataJSON); ok {
-		return false, checkpoint, nil
-	}
+	_, hasTakeoverResume := loops.ReadTakeoverResume(input.Loop.MetadataJSON)
+	loopParked := input.Loop.Status == string(domain.LoopStatusHumanTakeover) || input.Loop.Status == string(domain.LoopStatusAwaitingHuman)
 	expectedHead := strings.TrimSpace(detailHeadSHA(checkpoint.Detail))
-	if expectedHead == "" {
-		return false, checkpoint, nil
-	}
-	// prepared.HeadSHA is remote when dirty; require it still matches expected.
-	if remoteHead := strings.TrimSpace(prepared.HeadSHA); remoteHead != "" && remoteHead != expectedHead {
+	if !adopt.EligiblePreflight(adopt.Preflight{
+		LoopParked:     loopParked,
+		TakeoverResume: hasTakeoverResume,
+		ExpectedHead:   expectedHead,
+		// prepared.HeadSHA is remote when dirty.
+		RemoteHead: prepared.HeadSHA,
+	}) {
 		return false, checkpoint, nil
 	}
 	local, err := r.git.InspectHead(ctx, InspectHeadInput{
@@ -3050,7 +3067,7 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 	if err != nil {
 		return false, checkpoint, err
 	}
-	if strings.TrimSpace(local.HeadSHA) != expectedHead {
+	if !adopt.ConfirmLocalHead(local.HeadSHA, expectedHead) {
 		return false, checkpoint, nil
 	}
 	preparedAt := r.nowISO()
@@ -3108,22 +3125,6 @@ func hasFixerWorktreeProvenance(checkpoint fixerCheckpoint, worktreePath string)
 	return diskToken == token
 }
 
-func newFixerWorktreeOwnerToken(loopID, runID, preparedAt string) string {
-	loopID = strings.TrimSpace(loopID)
-	runID = strings.TrimSpace(runID)
-	preparedAt = strings.TrimSpace(preparedAt)
-	if loopID == "" {
-		loopID = "unknown-loop"
-	}
-	if runID == "" {
-		runID = "unknown-run"
-	}
-	if preparedAt == "" {
-		preparedAt = "unknown-time"
-	}
-	return "fixer:" + loopID + ":" + runID + ":" + preparedAt
-}
-
 func sameManagedWorktreePath(a, b string) bool {
 	if a == b {
 		return true
@@ -3141,6 +3142,7 @@ func sameManagedWorktreePath(a, b string) bool {
 
 func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	validationCommands := r.validationCommandsForProject(input.Project.ID)
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
@@ -3216,7 +3218,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
 	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.disclosure, agentVendor, derefString(agentModel))
-	if len(r.validationCommands) > 0 {
+	if len(validationCommands) > 0 {
 		prompt += validationGatedLocalOnlyPrompt
 	}
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
@@ -3233,7 +3235,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown")),
-		RestrictToolNetwork: len(r.validationCommands) > 0,
+		RestrictToolNetwork: len(validationCommands) > 0,
 		UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 	})
 	if err != nil {
@@ -3345,6 +3347,7 @@ func (r *Runner) runReconcileCommitsStep(ctx context.Context, input stepInput) (
 
 func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	validationCommands := r.validationCommandsForProject(input.Project.ID)
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
@@ -3356,7 +3359,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 	if rootErr != nil {
 		return checkpoint, rootErr
 	}
-	result, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: r.validationCommands})
+	result, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -3381,7 +3384,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		if err != nil {
 			return checkpoint, err
 		}
-		second, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: r.validationCommands})
+		second, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -3426,6 +3429,7 @@ func (r *Runner) refreshReconcileMetadata(checkpoint *fixerCheckpoint, worktree 
 
 func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	validationCommands := r.validationCommandsForProject(input.Project.ID)
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
@@ -3457,7 +3461,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if checkpoint.ReconcileCommits == nil {
 		return checkpoint, &loopError{message: "Missing reconcile-commits checkpoint for push step", kind: FailureRetryableAfterResume}
 	}
-	if len(r.validationCommands) > 0 {
+	if len(validationCommands) > 0 {
 		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)})
 		if err != nil {
 			return checkpoint, err
@@ -3498,7 +3502,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		return checkpoint, &holdSkipError{summary: summary}
 	}
 	localHeadSHA := ""
-	if len(r.validationCommands) > 0 {
+	if len(validationCommands) > 0 {
 		if checkpoint.Validation == nil || !checkpoint.Validation.Passed || strings.TrimSpace(checkpoint.Validation.HeadSHA) == "" {
 			return checkpoint, &loopError{message: "Missing validated head SHA for push step", kind: FailureRetryableAfterResume}
 		}
@@ -3618,7 +3622,8 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 		if !prepared.Clean {
 			return false, checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty after adopting agent-pushed head %s", adoptedHead), kind: FailureRetryableAfterResume}
 		}
-		validation, err := r.runValidation(ctx, ValidationInput{CWD: checkpoint.Worktree.Path, Commands: r.validationCommands})
+		validationCommands := r.validationCommandsForProject(input.Project.ID)
+		validation, err := r.runValidation(ctx, ValidationInput{CWD: checkpoint.Worktree.Path, Commands: validationCommands})
 		if err != nil {
 			return false, checkpoint, err
 		}

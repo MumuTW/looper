@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // CQ-001 regression: with server.host on a wildcard address (e.g. 0.0.0.0) and

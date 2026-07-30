@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/processcontainment"
 )
 
 // Contract (#577): shutdown order is admission → cancel/drain producers →
@@ -233,6 +233,9 @@ func TestBeginShutdownCancelsProducersBeforeNonAgentDrain(t *testing.T) {
 	// Wait until the shell handle is tracked (or fail fast).
 	deadline := time.Now().Add(3 * time.Second)
 	for {
+		// Read-only peek at reg.nonAgentHandles, kept under #121: the drain
+		// condition being awaited has no exported counter, and adding one for
+		// tests alone would be a prop.
 		reg.mu.Lock()
 		n := len(reg.nonAgentHandles)
 		reg.mu.Unlock()

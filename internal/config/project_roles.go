@@ -9,6 +9,10 @@ package config
 // memory, they are stripped before merge.
 func ProjectRoleConfigs(cfg Config, projectID string) RoleConfigs {
 	roles := cfg.Roles
+	if roles.Planner.Escalation != nil {
+		cloned := *roles.Planner.Escalation
+		roles.Planner.Escalation = &cloned
+	}
 	project := findConfiguredProject(cfg.Projects, projectID)
 	if project == nil {
 		return roles

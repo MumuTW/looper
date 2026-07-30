@@ -3,7 +3,7 @@ package specpr
 import (
 	"testing"
 
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func TestResolvePullRequestPhase(t *testing.T) {

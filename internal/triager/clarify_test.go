@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 )
 
 const underspecifiedDecision = `{"classification":"bug","scope":"in_scope","risk":"low","confidence":0.95,"missingInformation":["Which page shows the bug?","What did you expect to happen?"],"recommendedNextRole":"planner","rationale":"Report lacks reproduction detail."}`

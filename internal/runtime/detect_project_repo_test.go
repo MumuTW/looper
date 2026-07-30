@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	"github.com/nexu-io/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/config"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/projects"
 )
 
 // detectProjectRepo is the production half of the fix for a checkout looper

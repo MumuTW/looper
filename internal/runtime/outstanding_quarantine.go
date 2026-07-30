@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const recoveryExecutionQuarantinedEventType = "looperd.recovery.execution_quarantined"

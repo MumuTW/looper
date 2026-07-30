@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 )
 
 // Contract (#580 review): when admission is already closed, do not emit durable

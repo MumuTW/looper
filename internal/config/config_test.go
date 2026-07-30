@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
@@ -2857,7 +2857,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "scheduler.discoveryCacheTtlSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "logging.level", "must be one of: debug, info, warn, error")
 	assertValidationIssue(t, validationErr, "logging.maxFiles", "must be a positive integer")
-	assertValidationIssue(t, validationErr, "daemon.mode", "must be one of: foreground, launchd")
+	assertValidationIssue(t, validationErr, "daemon.mode", "must be one of: foreground, launchd, systemd")
 	assertValidationIssue(t, validationErr, "daemon.shutdownTimeoutMs", "must be a positive integer")
 	assertValidationIssue(t, validationErr, "defaults.openPrStrategy", "must be one of: all_done, first_commit, manual")
 	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")

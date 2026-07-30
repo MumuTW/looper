@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/diffanchor"
-	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/diffanchor"
+	"github.com/MumuTW/looper/internal/infra/shell"
 )
 
 // Authority for inline review anchors is the complete base/head PR diff for the

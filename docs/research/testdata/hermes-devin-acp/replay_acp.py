@@ -4,7 +4,10 @@
 Mirrors the JSON-RPC sequence in Hermes v2026.7.20
 agent/copilot_acp_client.py: initialize -> session/new -> session/prompt,
 collecting agent_message_chunk / agent_thought_chunk updates, denying
-session/request_permission, and rejecting unknown client methods with -32601.
+session/request_permission by default, and rejecting unknown client methods
+with -32601. --approve-allow-once is an explicit replay-only exception: it
+selects exactly the server-offered allow_once option and still denies every
+other grant shape.
 
 This is the probe behind docs/research/hermes-devin-acp-spike.md. It exists so
 the protocol, token, and error-code claims in that document can be re-derived
@@ -24,6 +27,7 @@ Usage:
   ./replay_acp.py --cwd /path/to/disposable/dir
   ./replay_acp.py --cwd /tmp/scratch --agent-type summarizer
   ./replay_acp.py --cwd /tmp/scratch --prompt-file custom_prompt.txt
+  ./replay_acp.py --cwd /tmp/scratch --prompt-file ask-for-mcp.txt --approve-allow-once
 """
 from __future__ import annotations
 
@@ -42,6 +46,33 @@ DEFAULT_PROMPT = (
 )
 
 
+def permission_outcome(params: object, *, approve_allow_once: bool) -> dict:
+    """Return a narrowly scoped response to session/request_permission.
+
+    The default mirrors stock Hermes and cancels every request. The opt-in
+    replay mode exists only to reproduce the recorded MCP route: it selects
+    the exact ``allow_once`` option from the captured Devin wire shape. It
+    must not substitute a session-wide or persistent option if that shape
+    drifts.
+    """
+    cancelled = {"outcome": {"outcome": "cancelled"}}
+    if not approve_allow_once or not isinstance(params, dict):
+        return cancelled
+
+    options = params.get("options")
+    if not isinstance(options, list):
+        return cancelled
+    for option in options:
+        if isinstance(option, dict) and option.get("optionId") == "allow_once":
+            return {
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": "allow_once",
+                }
+            }
+    return cancelled
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cwd", required=True, help="Disposable working directory for the ACP session")
@@ -51,6 +82,11 @@ def main() -> int:
     ap.add_argument("--prompt-file", default=None, help="Read the prompt from this file")
     ap.add_argument("--timeout", type=float, default=180.0)
     ap.add_argument("--show-thoughts", action="store_true")
+    ap.add_argument(
+        "--approve-allow-once",
+        action="store_true",
+        help="Replay only: approve a request only when its exact allow_once option is offered",
+    )
     args = ap.parse_args()
 
     # Resolve before use: a relative --cwd would otherwise mean one thing to
@@ -126,7 +162,15 @@ def main() -> int:
         mid = msg.get("id")
         if method == "session/request_permission":
             permission_requests += 1
-            resp = {"jsonrpc": "2.0", "id": mid, "result": {"outcome": {"outcome": "cancelled"}}}
+            outcome = permission_outcome(msg.get("params"), approve_allow_once=args.approve_allow_once)
+            if args.approve_allow_once:
+                selected = outcome["outcome"].get("optionId")
+                print(
+                    f"  [permission] options={'allow_once' if selected else 'no allow_once'} "
+                    f"-> {selected or 'cancelled'}",
+                    flush=True,
+                )
+            resp = {"jsonrpc": "2.0", "id": mid, "result": outcome}
         else:
             unknown_methods.append(method)
             resp = {

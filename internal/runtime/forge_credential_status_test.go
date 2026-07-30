@@ -3,7 +3,7 @@ package runtime
 import (
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func githubProjectConfig(agentEnv map[string]string) config.Config {

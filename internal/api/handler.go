@@ -22,23 +22,23 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/daemonbinary"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/fixer"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/loops"
-	networkclient "github.com/nexu-io/looper/internal/network/client"
-	"github.com/nexu-io/looper/internal/projects"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/triager"
-	"github.com/nexu-io/looper/internal/version"
-	"github.com/nexu-io/looper/internal/webhookforward"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/daemonbinary"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/fixer"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/loops"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/projects"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/triager"
+	"github.com/MumuTW/looper/internal/version"
+	"github.com/MumuTW/looper/internal/webhookforward"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 const (
@@ -1205,6 +1205,28 @@ type configResponse struct {
 	Metadata      ConfigMetadata            `json:"metadata"`
 }
 
+// redactProjectSecrets copies projects with their deploy credentials removed.
+//
+// projects[].roles.deployer.environment holds the values a deploy authenticates
+// with — the same class of secret as daemon.environment, which this response
+// already withholds. The copy is deep through Roles because the slice copy shares
+// that pointer with the live configuration.
+func redactProjectSecrets(projects []config.ProjectRefConfig) []config.ProjectRefConfig {
+	redacted := append([]config.ProjectRefConfig{}, projects...)
+	for i := range redacted {
+		roles := redacted[i].Roles
+		if roles == nil || roles.Deployer == nil || roles.Deployer.Environment == nil {
+			continue
+		}
+		deployer := *roles.Deployer
+		deployer.Environment = nil
+		clonedRoles := *roles
+		clonedRoles.Deployer = &deployer
+		redacted[i].Roles = &clonedRoles
+	}
+	return redacted
+}
+
 type configRolesResponse struct {
 	Coding      map[string]config.CodingRoleConfig `json:"coding"`
 	Planner     config.PlannerRoleConfig           `json:"planner"`
@@ -1308,7 +1330,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Coordinator: cfg.Roles.Coordinator,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
-		Projects:  append([]config.ProjectRefConfig{}, cfg.Projects...),
+		Projects:  redactProjectSecrets(cfg.Projects),
 		Metadata:  h.buildConfigMetadata(),
 	}
 }
@@ -1908,14 +1930,21 @@ type projectResponse struct {
 	BaseBranch string `json:"baseBranch"`
 	Archived   bool   `json:"archived"`
 	// Provider is the resolved provider kind for display.
-	Provider     string  `json:"provider"`
-	Repo         *string `json:"repo"`
-	WorktreeRoot *string `json:"worktreeRoot"`
-	CreatedAt    string  `json:"createdAt"`
-	UpdatedAt    string  `json:"updatedAt"`
+	Provider     string                     `json:"provider"`
+	Repo         *string                    `json:"repo"`
+	WorktreeRoot *string                    `json:"worktreeRoot"`
+	Validation   *projectValidationResponse `json:"validation,omitempty"`
+	CreatedAt    string                     `json:"createdAt"`
+	UpdatedAt    string                     `json:"updatedAt"`
 	// Discovery reports post-commit worktree/PR discovery status when the
 	// project record carries it; omitted for records that predate it.
 	Discovery *discoveryResponse `json:"discovery,omitempty"`
+}
+
+type projectValidationResponse struct {
+	Commands []string `json:"commands,omitempty"`
+	OptOut   bool     `json:"optOut,omitempty"`
+	Source   string   `json:"source"`
 }
 
 // discoveryResponse is the observable post-commit discovery contract. Counts
@@ -2046,6 +2075,7 @@ type activeRunWorktree struct {
 type projectService interface {
 	List(context.Context) ([]storage.ProjectRecord, error)
 	AddProject(context.Context, projects.AddInput) (projects.AddResult, error)
+	UpdateProject(context.Context, string, projects.UpdateInput) (storage.ProjectRecord, error)
 	RemoveProject(context.Context, string) (storage.ProjectRecord, error)
 	DiscoverProject(context.Context, projects.DiscoverInput) (projects.DiscoverResult, error)
 }
@@ -2125,6 +2155,9 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 
 	if discoverRoute {
 		return h.buildProjectDiscoverResponse(r, service, identifier)
+	}
+	if r.Method == http.MethodPatch {
+		return h.buildUpdateProjectResponse(r, service, identifier)
 	}
 
 	if r.Method != http.MethodDelete {
@@ -7445,14 +7478,72 @@ func urlPathSegment(parts []string, index int) (string, error) {
 }
 
 type createProjectRequest struct {
-	RepoPath     *string `json:"repoPath"`
-	ID           *string `json:"id"`
-	Name         *string `json:"name"`
-	BaseBranch   *string `json:"baseBranch"`
-	WorktreeRoot *string `json:"worktreeRoot"`
-	Repo         *string `json:"repo"`
-	Provider     *string `json:"provider"`
-	SnapshotMode *string `json:"snapshotMode"`
+	RepoPath     *string                         `json:"repoPath"`
+	ID           *string                         `json:"id"`
+	Name         *string                         `json:"name"`
+	BaseBranch   *string                         `json:"baseBranch"`
+	WorktreeRoot *string                         `json:"worktreeRoot"`
+	Repo         *string                         `json:"repo"`
+	Provider     *string                         `json:"provider"`
+	Validation   *config.ProjectValidationConfig `json:"validation"`
+	SnapshotMode *string                         `json:"snapshotMode"`
+}
+
+type updateProjectStringField struct {
+	Set   bool
+	Value *string
+}
+
+func (f *updateProjectStringField) UnmarshalJSON(raw []byte) error {
+	f.Set = true
+	if string(raw) == "null" {
+		f.Value = nil
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	f.Value = &value
+	return nil
+}
+
+type updateProjectRequest struct {
+	Repo         updateProjectStringField `json:"repo"`
+	Name         updateProjectStringField `json:"name"`
+	BaseBranch   updateProjectStringField `json:"baseBranch"`
+	WorktreeRoot updateProjectStringField `json:"worktreeRoot"`
+}
+
+func updateProjectField(field updateProjectStringField) projects.UpdateStringField {
+	return projects.UpdateStringField{Set: field.Set, Value: field.Value}
+}
+
+func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectService, identifier string) (any, error) {
+	body := updateProjectRequest{}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return nil, *aerr
+	}
+	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
+		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
+		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
+	})
+	if err != nil {
+		var notFound projects.ProjectNotFoundError
+		var ambiguous projects.AmbiguousProjectIdentifierError
+		var validation projects.ProjectValidationError
+		switch {
+		case errors.As(err, &notFound):
+			return nil, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", notFound.Identifier)}
+		case errors.As(err, &ambiguous):
+			return nil, apiError{code: pkgapi.ErrorCodeProjectAmbiguous, status: http.StatusConflict, message: err.Error()}
+		case errors.As(err, &validation):
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
+		default:
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+	}
+	return serializeProject(updated, h.context.Config, h.context.Config.Defaults.BaseBranch), nil
 }
 
 func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectService) (createProjectResponse, error) {
@@ -7501,6 +7592,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
 		Provider:     normalizeOptionalString(body.Provider),
+		Validation:   cloneProjectValidation(body.Validation),
 		SnapshotMode: snapshotMode,
 	})
 	if err != nil {
@@ -7560,6 +7652,7 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		Provider:     resolveProjectProviderKind(cfg, project.ID, metadata),
 		Repo:         stringMetadataPtr(metadata, "repo"),
 		WorktreeRoot: stringMetadataPtr(metadata, "worktreeRoot"),
+		Validation:   serializeProjectValidation(metadata, cfg),
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
 	}
@@ -7568,6 +7661,29 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		response.Discovery = &serialized
 	}
 	return response
+}
+
+func cloneProjectValidation(source *config.ProjectValidationConfig) *config.ProjectValidationConfig {
+	if source == nil {
+		return nil
+	}
+	return &config.ProjectValidationConfig{Commands: append([]string(nil), source.Commands...), OptOut: source.OptOut}
+}
+
+func serializeProjectValidation(metadata map[string]any, cfg config.Config) *projectValidationResponse {
+	if raw, ok := metadata["validation"]; ok && raw != nil {
+		encoded, err := json.Marshal(raw)
+		if err == nil {
+			var policy config.ProjectValidationConfig
+			if json.Unmarshal(encoded, &policy) == nil {
+				return &projectValidationResponse{Commands: append([]string(nil), policy.Commands...), OptOut: policy.OptOut, Source: "project"}
+			}
+		}
+	}
+	if commands := config.ResolveValidationCommands(cfg); len(commands) > 0 {
+		return &projectValidationResponse{Commands: commands, Source: "defaults"}
+	}
+	return nil
 }
 
 // resolveProjectProviderKind returns the display provider kind for a project:

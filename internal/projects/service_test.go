@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
@@ -199,7 +199,7 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 		Repos:             repos,
 		Now:               func() time.Time { return now },
 		ScheduleDiscovery: func(func()) {},
-		DetectRepo:        func(context.Context, string) (DetectedRepo, error) { return DetectedRepo{Repo: "nexu-io/looper"}, nil },
+		DetectRepo:        func(context.Context, string) (DetectedRepo, error) { return DetectedRepo{Repo: "MumuTW/looper"}, nil },
 		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
 			return []WorktreeListEntry{{Path: "/tmp/looper", Branch: "main", HeadSHA: "abc123"}, {Path: "/tmp/looper-pr-1", Branch: "pr-1", HeadSHA: "def456"}}, nil
 		},
@@ -208,7 +208,7 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 		},
 		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
 			capturedAt := now.UTC().Format(time.RFC3339Nano)
-			return storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "looper", Repo: "nexu-io/looper", PRNumber: 1, HeadSHA: "abc123", Title: stringPointer("PR 1"), CapturedAt: capturedAt, CreatedAt: capturedAt}, nil
+			return storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "looper", Repo: "MumuTW/looper", PRNumber: 1, HeadSHA: "abc123", Title: stringPointer("PR 1"), CapturedAt: capturedAt, CreatedAt: capturedAt}, nil
 		},
 	}
 
@@ -216,8 +216,8 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
-	if added.Repo == nil || *added.Repo != "nexu-io/looper" {
-		t.Fatalf("AddProject().Repo = %v, want nexu-io/looper", added.Repo)
+	if added.Repo == nil || *added.Repo != "MumuTW/looper" {
+		t.Fatalf("AddProject().Repo = %v, want MumuTW/looper", added.Repo)
 	}
 	if added.Discovery.Status != DiscoveryStatusPending {
 		t.Fatalf("AddProject().Discovery.Status = %q, want pending", added.Discovery.Status)
@@ -244,12 +244,57 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 	if len(worktrees) != 2 {
 		t.Fatalf("len(worktrees) = %d, want 2", len(worktrees))
 	}
-	snapshot, err := repos.PullRequestSnapshots.GetLatest(ctx, "nexu-io/looper", 1)
+	snapshot, err := repos.PullRequestSnapshots.GetLatest(ctx, "MumuTW/looper", 1)
 	if err != nil {
 		t.Fatalf("PullRequestSnapshots.GetLatest() error = %v", err)
 	}
 	if snapshot == nil || snapshot.Title == nil || *snapshot.Title != "PR 1" {
 		t.Fatalf("snapshot = %#v, want PR 1 snapshot", snapshot)
+	}
+}
+
+func TestServiceDiscoverProjectReusesPathIdentityWhenBranchChanges(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 30, 12, 34, 56, 0, time.UTC)
+	branch := "main"
+	service := &Service{
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
+		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
+			return []WorktreeListEntry{{Path: "/tmp/looper-primary", Branch: branch, HeadSHA: "abc123"}}, nil
+		},
+	}
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper-primary", BaseBranch: "main"}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if _, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeOff}); err != nil {
+		t.Fatalf("DiscoverProject(main) error = %v", err)
+	}
+	initial, err := repos.Worktrees.GetByPath(ctx, "/tmp/looper-primary")
+	if err != nil || initial == nil {
+		t.Fatalf("GetByPath(main) = %#v, %v", initial, err)
+	}
+
+	branch = "feature/fixer"
+	if _, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeOff}); err != nil {
+		t.Fatalf("DiscoverProject(feature) error = %v", err)
+	}
+	updated, err := repos.Worktrees.GetByPath(ctx, "/tmp/looper-primary")
+	if err != nil || updated == nil {
+		t.Fatalf("GetByPath(feature) = %#v, %v", updated, err)
+	}
+	if updated.ID != initial.ID || updated.Branch != "feature/fixer" {
+		t.Fatalf("updated worktree = %#v, want path identity %q on feature/fixer", updated, initial.ID)
+	}
+	items, err := repos.Worktrees.ListByProject(ctx, "looper")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("ListByProject() = %#v, %v; want one path row", items, err)
 	}
 }
 
@@ -260,7 +305,7 @@ func TestServiceAddProjectDefaultAsyncEnqueuesSnapshotsWithoutCapturing(t *testi
 	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
 	captured := false
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	service := &Service{
 		DB:                coordinator.DB(),
 		Repos:             repos,
@@ -309,7 +354,7 @@ func TestServiceAddProjectAsyncFallsBackToFullWhenQueueDisabled(t *testing.T) {
 	coordinator := openCoordinator(t)
 	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
 	service := &Service{
 		DB:                coordinator.DB(),
@@ -362,7 +407,7 @@ func TestServiceAddProjectSnapshotModeOffSkipsPullRequestDiscovery(t *testing.T)
 	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
 	listed := false
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	service := &Service{
 		DB:                coordinator.DB(),
 		Repos:             repos,
@@ -408,7 +453,7 @@ func TestServiceDiscoverProjectRecordsListErrorsAsFailure(t *testing.T) {
 			return storage.PullRequestSnapshotRecord{}, nil
 		},
 	}
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 
 	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
@@ -459,7 +504,7 @@ func TestServiceAddProjectWarnsWhenPullRequestSnapshotFails(t *testing.T) {
 			return storage.PullRequestSnapshotRecord{}, errors.New("could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)")
 		},
 	}
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 
 	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
@@ -513,7 +558,7 @@ func TestServiceAddProjectSucceedsIndependentlyOfDiscoveryCancellation(t *testin
 			return storage.PullRequestSnapshotRecord{}, context.Canceled
 		},
 	}
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 
 	added, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull})
 	if err != nil {
@@ -562,7 +607,7 @@ func TestServiceDiscoverProjectRetryIsIdempotent(t *testing.T) {
 			return []PullRequestSummary{{Number: 1, State: "OPEN", IsDraft: false}}, nil
 		},
 	}
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
@@ -616,7 +661,7 @@ func TestServiceDiscoverProjectRecordsCommandErrorCancellationAsFailure(t *testi
 			return storage.PullRequestSnapshotRecord{}, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1}}
 		},
 	}
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	if _, err := service.AddProject(context.Background(), AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo, SnapshotMode: SnapshotModeFull}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
@@ -805,7 +850,7 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 		Repos: repos,
 		Now:   func() time.Time { return now },
 		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
-			return DetectedRepo{Repo: "nexu-io/looper"}, nil
+			return DetectedRepo{Repo: "MumuTW/looper"}, nil
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -821,7 +866,7 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Projects.GetByID() error = %v", err)
 	}
-	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"config"}` {
+	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != `{"repo":"MumuTW/looper","worktreeRoot":null,"source":"config"}` {
 		t.Fatalf("project.MetadataJSON = %#v, want refreshed transferred repo metadata", project)
 	}
 }
@@ -951,7 +996,7 @@ func TestServiceSyncConfiguredDoesNotDeleteUnlistedProjects(t *testing.T) {
 	now := time.Date(2026, time.April, 21, 7, 46, 20, 0, time.UTC)
 	nowISO := now.UTC().Format(time.RFC3339Nano)
 	baseBranch := "main"
-	metadata := `{"repo":"nexu-io/looper","source":"api"}`
+	metadata := `{"repo":"MumuTW/looper","source":"api"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -1095,7 +1140,7 @@ func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
 	nowISO := now.UTC().Format(time.RFC3339Nano)
 	baseBranch := "main"
-	metadata := `{"repo":"nexu-io/looper","source":"api"}`
+	metadata := `{"repo":"MumuTW/looper","source":"api"}`
 	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}

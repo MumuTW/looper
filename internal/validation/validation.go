@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/processcontainment"
-	"github.com/nexu-io/looper/internal/validationcmd"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/validationcmd"
 )
 
 type FailureCategory string

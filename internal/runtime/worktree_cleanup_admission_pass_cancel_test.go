@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 )
 
 // Contract (#592 review): when MarkDegraded cancels the pass context mid-pass,

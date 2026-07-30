@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/planner"
-	"github.com/nexu-io/looper/internal/storage"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/planner"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestDiscoverIssuesRoutesEligibleReportToPlanner(t *testing.T) {

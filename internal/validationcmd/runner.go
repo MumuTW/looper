@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/processcontainment"
-	"github.com/nexu-io/looper/internal/processsandbox"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/processsandbox"
 )
 
 // Sandbox is the legacy Codex-specific disposable tool environment used by

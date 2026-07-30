@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 func TestEvaluateWorkerIgnoresTargetLabelsForLocalOnlyProjects(t *testing.T) {

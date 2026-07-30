@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // ConfigReloadStatus is transient diagnostic state. The config file overlaid by
@@ -205,6 +205,9 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 	}
 	if err := config.Validate(runtimeCandidate); err != nil {
 		return r.rejectConfigReloadLocked("invalid", nil, err)
+	}
+	if err := config.ValidateProjectValidationPolicies(runtimeCandidate); err != nil {
+		return r.rejectConfigReloadLocked("invalid", configValidationPaths(err), err)
 	}
 
 	changed := !reflect.DeepEqual(r.loadedConfig.Config, loaded.Config)

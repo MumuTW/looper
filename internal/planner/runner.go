@@ -12,27 +12,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/lifecycle"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/loops/failureclass"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
 const (
-	stepDiscoverIssues  PlannerStep = "discover-issues"
-	stepPrepareWorktree PlannerStep = "prepare-worktree"
-	stepWriteSpec       PlannerStep = "write-spec"
-	stepPublish         PlannerStep = "publish"
-	stepNotify          PlannerStep = "notify"
+	stepDiscoverIssues    PlannerStep = "discover-issues"
+	stepPrepareWorktree   PlannerStep = "prepare-worktree"
+	stepAssessSuitability PlannerStep = "assess-suitability"
+	stepWriteSpec         PlannerStep = "write-spec"
+	stepPublish           PlannerStep = "publish"
+	stepNotify            PlannerStep = "notify"
 
 	plannerPRDedupeLookupLimit = 1000
 
@@ -44,7 +45,7 @@ const (
 	defaultIssueLimit   = 30
 )
 
-var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepNotify}
+var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepAssessSuitability, stepWriteSpec, stepPublish, stepNotify}
 
 type PlannerStep string
 
@@ -393,6 +394,7 @@ type plannerCheckpoint struct {
 	Issue          *checkpointIssue        `json:"issue,omitempty"`
 	ClaimedLockKey string                  `json:"claimedLockKey,omitempty"`
 	Worktree       *checkpointWorktree     `json:"worktree,omitempty"`
+	Assessment     *checkpointAssessment   `json:"assessment,omitempty"`
 	WriteSpec      *checkpointWriteSpec    `json:"writeSpec,omitempty"`
 	Lifecycle      *lifecycle.State        `json:"gitPrLifecycle,omitempty"`
 	Publish        *checkpointPublishState `json:"publish,omitempty"`
@@ -812,6 +814,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
 		if err != nil {
+			var awaiting *plannerAwaitingHumanError
+			if errors.As(err, &awaiting) {
+				return r.suspendPlannerForHuman(ctx, *loop, run, queueItem, checkpoint, awaiting)
+			}
 			var holdErr *holdSkipError
 			if errors.As(err, &holdErr) {
 				return r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
@@ -902,6 +908,8 @@ func (r *Runner) executeStep(ctx context.Context, step PlannerStep, input stepIn
 		return r.runDiscoverIssueStep(ctx, input)
 	case stepPrepareWorktree:
 		return r.runPrepareWorktreeStep(ctx, input)
+	case stepAssessSuitability:
+		return r.runAssessSuitabilityStep(ctx, input)
 	case stepWriteSpec:
 		return r.runWriteSpecStep(ctx, input)
 	case stepPublish:
@@ -1934,7 +1942,7 @@ func plannerFailureBoundaryForStep(step PlannerStep) failureclass.Boundary {
 		return failureclass.BoundaryGitHubAPI
 	case stepPrepareWorktree:
 		return failureclass.BoundaryGitRemote
-	case stepWriteSpec:
+	case stepAssessSuitability, stepWriteSpec:
 		return failureclass.BoundaryModelProvider
 	default:
 		return failureclass.BoundaryUnknown

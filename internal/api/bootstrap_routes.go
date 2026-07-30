@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/config"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 const (

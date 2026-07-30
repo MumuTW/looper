@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func TestBootstrapMintRequiresAuth(t *testing.T) {

@@ -3,7 +3,7 @@ package fixer
 import (
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func TestDiscoveryPolicyForProjectReadsCanonicalFixerRegistry(t *testing.T) {

@@ -11,13 +11,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/fixer"
-	"github.com/nexu-io/looper/internal/gatekeeper"
-	projectcatalog "github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/reviewer"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/fixer"
+	"github.com/MumuTW/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/planner"
+	projectcatalog "github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/reviewer"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/worker"
 )
 
 const (
@@ -35,6 +37,8 @@ const (
 	LaneReviewer   Lane = "reviewer"
 	LaneFixer      Lane = "fixer"
 	LaneGatekeeper Lane = "gatekeeper"
+	LanePlanner    Lane = "planner"
+	LaneWorker     Lane = "worker"
 )
 
 type DeliveryRequest struct {
@@ -114,6 +118,14 @@ type TargetedGatekeeper interface {
 	EvaluatePullRequest(context.Context, gatekeeper.EvaluationInput) (gatekeeper.Report, error)
 }
 
+type TargetedPlanner interface {
+	DiscoverIssues(context.Context, planner.DiscoveryInput) (planner.DiscoveryResult, error)
+}
+
+type TargetedWorker interface {
+	DiscoverIssues(context.Context, worker.DiscoveryInput) (worker.DiscoveryResult, error)
+}
+
 type Options struct {
 	Repos              *storage.Repositories
 	Config             config.Config
@@ -121,6 +133,8 @@ type Options struct {
 	Reviewer           TargetedReviewer
 	Fixer              TargetedFixer
 	Gatekeeper         TargetedGatekeeper
+	Planner            TargetedPlanner
+	WorkerDiscovery    TargetedWorker
 	Logger             bootstrap.Logger
 	Now                func() time.Time
 	QueueCapacity      int
@@ -216,6 +230,16 @@ type issueCommentEnvelope struct {
 	} `json:"issue"`
 }
 
+type issueEnvelope struct {
+	Action     string `json:"action"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+	Issue struct {
+		Number int64 `json:"number"`
+	} `json:"issue"`
+}
+
 type pullRequestRef struct {
 	Number int64 `json:"number"`
 }
@@ -242,6 +266,8 @@ type forwarder struct {
 	reviewer           TargetedReviewer
 	fixer              TargetedFixer
 	gatekeeper         TargetedGatekeeper
+	planner            TargetedPlanner
+	workerDiscovery    TargetedWorker
 	logger             bootstrap.Logger
 	now                func() time.Time
 	queueCapacity      int
@@ -302,6 +328,8 @@ func New(options Options) Forwarder {
 		reviewer:           options.Reviewer,
 		fixer:              options.Fixer,
 		gatekeeper:         options.Gatekeeper,
+		planner:            options.Planner,
+		workerDiscovery:    options.WorkerDiscovery,
 		logger:             options.Logger,
 		now:                now,
 		queueCapacity:      queueCapacity,
@@ -722,6 +750,38 @@ func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem)
 			return err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := item.lanes[LanePlanner]; ok {
+		if f.planner == nil {
+			return fmt.Errorf("planner discovery is not configured")
+		}
+		if key.ObjectType != "issue" {
+			return fmt.Errorf("planner cannot discover object type %s", key.ObjectType)
+		}
+		if _, err := f.planner.DiscoverIssues(ctx, planner.DiscoveryInput{
+			ProjectID: key.ProjectID, Repo: key.Repo, Limit: 10,
+		}); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := item.lanes[LaneWorker]; ok {
+		if f.workerDiscovery == nil {
+			return fmt.Errorf("worker discovery is not configured")
+		}
+		if key.ObjectType != "issue" {
+			return fmt.Errorf("worker cannot discover object type %s", key.ObjectType)
+		}
+		if _, err := f.workerDiscovery.DiscoverIssues(ctx, worker.DiscoveryInput{
+			ProjectID: key.ProjectID, Repo: key.Repo, Limit: 10,
+		}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -856,6 +916,24 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 			lanes[LaneFixer] = struct{}{}
 		}
 		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: numbers, action: strings.TrimSpace(envelope.Action), headSHA: strings.TrimSpace(envelope.CheckRun.HeadSHA), lanes: lanes}, true, nil
+	case "issues":
+		var envelope issueEnvelope
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return routedDelivery{}, false, fmt.Errorf("decode issues webhook: %w", err)
+		}
+		switch strings.TrimSpace(envelope.Action) {
+		case "labeled", "unlabeled", "assigned", "unassigned":
+		default:
+			return routedDelivery{}, false, nil
+		}
+		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.Issue.Number <= 0 {
+			return routedDelivery{}, false, errors.New("issues webhook missing repository or number")
+		}
+		lanes := map[Lane]struct{}{
+			LanePlanner: {},
+			LaneWorker:  {},
+		}
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "issue", numbers: []int64{envelope.Issue.Number}, action: strings.TrimSpace(envelope.Action), lanes: lanes}, true, nil
 	default:
 		return routedDelivery{}, false, nil
 	}
@@ -896,6 +974,12 @@ func enabledLanesForProject(policy projectcatalog.RolePolicyView, lanes map[Lane
 	}
 	if _, ok := lanes[LaneGatekeeper]; ok {
 		result[LaneGatekeeper] = struct{}{}
+	}
+	if _, ok := lanes[LanePlanner]; ok && policy.RoleAutoDiscovery(config.CodingRolePlanner) {
+		result[LanePlanner] = struct{}{}
+	}
+	if _, ok := lanes[LaneWorker]; ok && policy.RoleAutoDiscovery(config.CodingRoleWorker) {
+		result[LaneWorker] = struct{}{}
 	}
 	return result
 }

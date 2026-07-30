@@ -20,7 +20,7 @@ func TestBuildManifestCollectsArtifactsAndDerivesDefaults(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "12",
-		Repo:              "nexu-io/looper",
+		Repo:              "MumuTW/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64", "looperd-darwin-arm64"},
 	})
@@ -37,7 +37,7 @@ func TestBuildManifestCollectsArtifactsAndDerivesDefaults(t *testing.T) {
 	if manifest.Artifacts["looper-darwin-arm64"].SHA256 != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("looper sha = %q, want %q", manifest.Artifacts["looper-darwin-arm64"].SHA256, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	}
-	if manifest.Artifacts["looperd-darwin-arm64"].URL != "https://github.com/nexu-io/looper/releases/download/v1.2.3-rc.1/looperd-darwin-arm64" {
+	if manifest.Artifacts["looperd-darwin-arm64"].URL != "https://github.com/MumuTW/looper/releases/download/v1.2.3-rc.1/looperd-darwin-arm64" {
 		t.Fatalf("looperd URL = %q", manifest.Artifacts["looperd-darwin-arm64"].URL)
 	}
 }
@@ -52,7 +52,7 @@ func TestBuildManifestFailsWhenRequiredArtifactMissing(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "12",
-		Repo:              "nexu-io/looper",
+		Repo:              "MumuTW/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64", "looperd-darwin-arm64"},
 	})
@@ -71,7 +71,7 @@ func TestBuildManifestRejectsInvalidTag(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "0007_agent_execution_run_index",
-		Repo:              "nexu-io/looper",
+		Repo:              "MumuTW/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64"},
 	})
@@ -90,7 +90,7 @@ func TestBuildManifestRejectsInvalidChecksum(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "0007_agent_execution_run_index",
-		Repo:              "nexu-io/looper",
+		Repo:              "MumuTW/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64"},
 	})
@@ -100,7 +100,7 @@ func TestBuildManifestRejectsInvalidChecksum(t *testing.T) {
 }
 
 func TestCurrentSchemaVersionUsesLatestEmbeddedMigration(t *testing.T) {
-	if got, want := CurrentSchemaVersion(), "0020_run_seq"; got != want {
+	if got, want := CurrentSchemaVersion(), "0021_worktree_path_unique"; got != want {
 		t.Fatalf("CurrentSchemaVersion() = %q, want %q", got, want)
 	}
 }
@@ -163,7 +163,7 @@ func TestBuildManifestIncludesTarGzArchives(t *testing.T) {
 		Released:          time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
 		APIVersion:        "v1",
 		SchemaVersion:     "12",
-		Repo:              "nexu-io/looper",
+		Repo:              "MumuTW/looper",
 		AssetsDir:         assetsDir,
 		RequiredArtifacts: []string{"looper-darwin-arm64", "looper-darwin-arm64.tar.gz", "looperd-darwin-arm64", "looperd-darwin-arm64.tar.gz"},
 	})
@@ -176,7 +176,7 @@ func TestBuildManifestIncludesTarGzArchives(t *testing.T) {
 		if !ok {
 			t.Fatalf("manifest missing archive artifact %q", name)
 		}
-		if artifact.URL != "https://github.com/nexu-io/looper/releases/download/v1.2.3/"+name {
+		if artifact.URL != "https://github.com/MumuTW/looper/releases/download/v1.2.3/"+name {
 			t.Fatalf("archive %s URL = %q", name, artifact.URL)
 		}
 		if len(artifact.SHA256) != 64 {

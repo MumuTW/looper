@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // The fixer treats the agent's declared `outcome` as the authority for whether a

@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestClaimPhaseRefreshesConfigAfterPublicationBoundary(t *testing.T) {
@@ -311,7 +311,7 @@ func TestCatalogSchedulerPreservesCoordinatorThrottleAcrossConfigSnapshots(t *te
 		if snapshot.input == nil {
 			t.Fatal("catalog scheduler snapshot has no input builder")
 		}
-		result, err := snapshot.input(Services{Repositories: repositories}).Coordinator.DiscoverIssues(context.Background(), coordinatorrole.DiscoveryInput{ProjectID: "looper", Repo: "nexu-io/looper"})
+		result, err := snapshot.input(Services{Repositories: repositories}).Coordinator.DiscoverIssues(context.Background(), coordinatorrole.DiscoveryInput{ProjectID: "looper", Repo: "MumuTW/looper"})
 		if err != nil {
 			t.Fatalf("DiscoverIssues() error = %v", err)
 		}

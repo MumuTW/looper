@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/coordinator/mergewatch"
-	"github.com/nexu-io/looper/internal/disclosure"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/coordinator/mergewatch"
+	"github.com/MumuTW/looper/internal/disclosure"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 var mergeWatchPRURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)

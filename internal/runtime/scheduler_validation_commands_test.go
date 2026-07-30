@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const validationGateDisabledWarning = "worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything"
@@ -33,6 +33,23 @@ func runnerValidationCommands(t *testing.T, runner any) []string {
 		commands = append(commands, field.Index(index).String())
 	}
 	return commands
+}
+
+func runnerProjectValidationCommands(t *testing.T, runner any, projectID string) []string {
+	t.Helper()
+	field := reflect.ValueOf(runner).Elem().FieldByName("validationCommandsByProject")
+	if !field.IsValid() || field.Kind() != reflect.Map {
+		t.Fatalf("%T has no validationCommandsByProject map", runner)
+	}
+	commands := field.MapIndex(reflect.ValueOf(projectID))
+	if !commands.IsValid() {
+		t.Fatalf("%T has no validation policy for project %q", runner, projectID)
+	}
+	result := make([]string, 0, commands.Len())
+	for index := 0; index < commands.Len(); index++ {
+		result = append(result, commands.Index(index).String())
+	}
+	return result
 }
 
 func runnerStringField(t *testing.T, runner any, name string) string {
@@ -107,6 +124,36 @@ func TestBuildDefaultSchedulerHandlersThreadsValidationCommandsIntoWorkerAndFixe
 	}
 	if schedulerLoggerContains(logger, validationGateDisabledWarning) {
 		t.Fatal("scheduler warned about a disabled validation gate while commands are configured")
+	}
+}
+
+func TestBuildDefaultSchedulerHandlersKeepsValidationCommandsProjectScoped(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	vendor := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &vendor
+	cfg.Projects = []config.ProjectRefConfig{
+		{ID: "looper", Validation: &config.ProjectValidationConfig{Commands: []string{" scripts/verify.sh "}}},
+		{ID: "novel", Validation: &config.ProjectValidationConfig{Commands: []string{"pnpm test", "pnpm build"}}},
+		{ID: "fluenx", Validation: &config.ProjectValidationConfig{OptOut: true}},
+	}
+
+	handlers := buildValidationCommandHandlers(t, cfg, &capturingSchedulerLogger{})
+	input := handlers.input(Services{})
+	for _, runner := range []any{input.Worker, input.Fixer} {
+		if got, want := runnerProjectValidationCommands(t, runner, "looper"), []string{"scripts/verify.sh"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("looper commands = %#v, want %#v", got, want)
+		}
+		if got, want := runnerProjectValidationCommands(t, runner, "novel"), []string{"pnpm test", "pnpm build"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("novel commands = %#v, want %#v", got, want)
+		}
+		if got := runnerProjectValidationCommands(t, runner, "fluenx"); len(got) != 0 {
+			t.Fatalf("fluenx commands = %#v, want explicit opt-out", got)
+		}
 	}
 }
 

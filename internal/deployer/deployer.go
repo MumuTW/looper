@@ -10,10 +10,15 @@ package deployer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// ErrCommandNotStarted reports that the deploy command never began — the shell
+// could not be spawned, not that the deploy ran and failed.
+var ErrCommandNotStarted = errors.New("deploy command did not start")
 
 // DefaultTimeoutSeconds bounds one deploy when the project sets none.
 const DefaultTimeoutSeconds = 900
@@ -35,6 +40,10 @@ const (
 	StateInProgress DeploymentState = "in_progress"
 	StateSuccess    DeploymentState = "success"
 	StateFailure    DeploymentState = "failure"
+	// StateInactive is what the forge marks a deployment when a later one
+	// supersedes it. It is the difference between "this commit was deployed once"
+	// and "this commit is what is deployed now".
+	StateInactive DeploymentState = "inactive"
 )
 
 // HeadState is the forge state the decision is made from.
@@ -69,6 +78,11 @@ func Decide(enabled bool, command string, head HeadState, timeout time.Duration,
 		return DecisionDeploy
 	}
 	switch head.State {
+	case StateInactive:
+		// The commit was deployed and then superseded. Reaching the head again means
+		// the branch moved back — a revert or a reset — and what is running is still
+		// the commit that replaced it. Deploying is the whole point of a revert.
+		return DecisionDeploy
 	case StateSuccess, StateFailure:
 		return DecisionUpToDate
 	case StateInProgress, "":
@@ -173,6 +187,13 @@ func Run(ctx context.Context, enabled bool, command string, timeout time.Duratio
 
 	started := time.Now()
 	exitCode, logPath, runErr := deps.RunCommand(ctx, dir)
+	if errors.Is(runErr, ErrCommandNotStarted) {
+		// Nothing ran. Recording a failure would mark the commit permanently acted
+		// on for a transient local condition — the same reasoning that keeps a
+		// materialization failure from being recorded as a failed deploy. The
+		// in_progress claim stands and the abandonment window releases it.
+		return decision, nil, fmt.Errorf("start deploy command for %s: %w", short(head.SHA), runErr)
+	}
 	outcome := Outcome{
 		SHA: head.SHA, PreviousSHA: previousSHA, ExitCode: exitCode,
 		Succeeded: runErr == nil && exitCode == 0, Duration: time.Since(started),

@@ -95,6 +95,9 @@ func TestDecide(t *testing.T) {
 		{name: "abandoned past the window", head: HeadState{SHA: "abc", Deployed: true, State: StateInProgress, StartedAt: now.Add(-10 * time.Minute)}, want: DecisionDeploy},
 		// Without a start time there is nothing to bound, so the commit stays claimed.
 		{name: "unfinished with no start time", head: HeadState{SHA: "abc", Deployed: true, State: StateInProgress}, want: DecisionInProgress},
+		// A superseded deployment means the branch moved back — a revert or a reset —
+		// and what is running is still the commit that replaced it.
+		{name: "superseded then reached again", head: HeadState{SHA: "abc", Deployed: true, State: StateInactive}, want: DecisionDeploy},
 		{name: "unknown state", head: HeadState{SHA: "abc", Deployed: true, State: "queued"}, want: DecisionUpToDate},
 		{name: "no head", head: HeadState{}, want: DecisionSkip},
 	}
@@ -266,6 +269,29 @@ func TestRunDeploysEvenWhenThePreviousCommitCannotBeResolved(t *testing.T) {
 	}
 	if outcome == nil || outcome.PreviousSHA != "" {
 		t.Fatalf("outcome = %+v", outcome)
+	}
+}
+
+// Nothing ran, so recording a failure would mark the commit permanently acted on
+// for a transient local condition.
+func TestRunRecordsNoTerminalStatusWhenTheCommandNeverStarts(t *testing.T) {
+	t.Parallel()
+	rec := &recorder{head: HeadState{SHA: "abc"}, runErr: ErrCommandNotStarted}
+
+	_, outcome, err := run(rec)
+
+	if err == nil {
+		t.Fatal("Run() reported success for a command that never started")
+	}
+	if outcome != nil {
+		t.Fatalf("outcome = %+v, want none", outcome)
+	}
+	// The in_progress claim stands; the abandonment window releases it.
+	if len(rec.states) != 1 || rec.states[0] != StateInProgress {
+		t.Fatalf("states = %v, want only the claim", rec.states)
+	}
+	if len(rec.notified) != 0 {
+		t.Fatalf("notified about a deploy that never ran: %+v", rec.notified)
 	}
 }
 

@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/forge"
-	"github.com/nexu-io/looper/internal/reviewsubmit"
+	"github.com/MumuTW/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/reviewsubmit"
 )
 
 // `looper review submit` is not an operator command and is not in the usage

@@ -17,20 +17,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/domain"
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/notify"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/loops"
-	networkclient "github.com/nexu-io/looper/internal/network/client"
-	"github.com/nexu-io/looper/internal/processidentity"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/webhookforward"
-	"github.com/nexu-io/looper/internal/worker"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/domain"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/notify"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/processidentity"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/webhookforward"
+	"github.com/MumuTW/looper/internal/worker"
 )
 
 type OpenSQLiteCoordinatorFunc func(context.Context, string, storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error)
@@ -123,11 +123,21 @@ type Options struct {
 	OpenSQLiteCoordinator       OpenSQLiteCoordinatorFunc
 	SyncConfiguredProjects      SyncConfiguredProjectsFunc
 	RunSchedulerTick            RunSchedulerTickFunc
-	ReadProcessCommand          ReadProcessCommandFunc
-	ReadProcessStart            ReadProcessStartFunc
-	ReadProcessBootID           ReadProcessBootIDFunc
-	SignalProcess               SignalProcessFunc
-	DeferRecovery               bool
+	// RunSchedulerClaim overrides the claim pass the scheduler pump drives,
+	// independently of RunSchedulerTick in both directions: either can be
+	// injected while the other keeps its default catalog implementation.
+	//
+	// Blind spots, stated for reviewers of tests built on this seam: an
+	// injected claim observes that the pump invoked a pass, not when the
+	// pump chose to fire (ticker/trigger cadence regressions pass through),
+	// and it bypasses the default claim's own internal admission gating,
+	// which only the default implementation exercises.
+	RunSchedulerClaim  RunSchedulerTickFunc
+	ReadProcessCommand ReadProcessCommandFunc
+	ReadProcessStart   ReadProcessStartFunc
+	ReadProcessBootID  ReadProcessBootIDFunc
+	SignalProcess      SignalProcessFunc
+	DeferRecovery      bool
 }
 
 type Services struct {
@@ -170,6 +180,7 @@ type Runtime struct {
 	defaultSchedulerTick   RunSchedulerTickFunc
 	defaultSchedulerClaim  RunSchedulerTickFunc
 	customSchedulerTick    bool
+	customSchedulerClaim   bool
 	readProcessCommand     ReadProcessCommandFunc
 	readProcessStart       ReadProcessStartFunc
 	readProcessBootID      ReadProcessBootIDFunc
@@ -258,6 +269,7 @@ func New(options Options) *Runtime {
 
 	runSchedulerTick := options.RunSchedulerTick
 	customSchedulerTick := runSchedulerTick != nil
+	customSchedulerClaim := options.RunSchedulerClaim != nil
 
 	readProcessCommand := options.ReadProcessCommand
 	if readProcessCommand == nil {
@@ -308,6 +320,8 @@ func New(options Options) *Runtime {
 		syncConfiguredProjects:      syncConfiguredProjects,
 		runSchedulerTick:            runSchedulerTick,
 		customSchedulerTick:         customSchedulerTick,
+		defaultSchedulerClaim:       options.RunSchedulerClaim,
+		customSchedulerClaim:        customSchedulerClaim,
 		readProcessCommand:          readProcessCommand,
 		readProcessStart:            readProcessStart,
 		readProcessBootID:           readProcessBootID,
@@ -1009,17 +1023,26 @@ func (r *Runtime) start(ctx context.Context) error {
 		ActiveExecutions: r.activeExecutions,
 	}
 	schedulerDisabled := false
-	if !r.customSchedulerTick {
+	if !r.customSchedulerTick || !r.customSchedulerClaim {
 		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, &r.configBoundary, r.configPath, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
-		r.defaultSchedulerTick = handlers.tick
-		r.defaultSchedulerClaim = handlers.claim
-		r.webhookForwarder = handlers.webhook
-		r.notificationGateways = handlers.notificationGateways
-		schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
+		if !r.customSchedulerTick {
+			r.defaultSchedulerTick = handlers.tick
+			r.webhookForwarder = handlers.webhook
+			r.notificationGateways = handlers.notificationGateways
+			schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
+		} else if handlers.webhook != nil {
+			// The bundle was built only for its claim; close the eagerly
+			// constructed webhook forwarder it also carries so its workers
+			// do not leak.
+			handlers.webhook.Close()
+		}
+		if !r.customSchedulerClaim {
+			r.defaultSchedulerClaim = handlers.claim
+		}
 	}
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
@@ -1292,6 +1315,11 @@ func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repos
 	materialized, err := projects.MaterializeCatalog(global, records)
 	if err != nil {
 		return fmt.Errorf("materialize runtime project catalog: %w", err)
+	}
+	candidate := config.CloneConfig(global)
+	candidate.Projects = materialized
+	if err := config.ValidateProjectValidationPolicies(candidate); err != nil {
+		return fmt.Errorf("validate runtime project catalog: %w", err)
 	}
 	r.publishProjects(materialized)
 	return nil
@@ -1636,7 +1664,10 @@ func (r *Runtime) executeSchedulerTick(ctx context.Context) {
 	services := r.services
 	tick := r.runSchedulerTick
 	r.mu.RUnlock()
-	if services.Repositories == nil {
+	// The repositories guard protects the default tick, which cannot claim
+	// without storage. An injected tick declares its own dependencies and
+	// runs even before deferred recovery has populated services.
+	if services.Repositories == nil && !r.customSchedulerTick {
 		return
 	}
 	if tick == nil {

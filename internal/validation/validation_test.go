@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/validationcmd"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/validationcmd"
 )
 
 func localValidationRunner(ctx context.Context, options validationcmd.Options) (shell.Result, error) {

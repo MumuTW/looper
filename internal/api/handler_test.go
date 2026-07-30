@@ -19,19 +19,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/daemonbinary"
-	"github.com/nexu-io/looper/internal/domain"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/projects"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/triager"
-	"github.com/nexu-io/looper/internal/version"
-	"github.com/nexu-io/looper/internal/webhookforward"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/daemonbinary"
+	"github.com/MumuTW/looper/internal/domain"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/projects"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/triager"
+	"github.com/MumuTW/looper/internal/version"
+	"github.com/MumuTW/looper/internal/webhookforward"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 type stopLoopResponse struct {
@@ -840,7 +840,7 @@ func TestActiveRunsDefaultExcludesClosedLoopsWithManualInterventionQueue(t *test
 			loopID := "loop_closed_manual_" + closedStatus
 			targetID := "issue:acme/looper:55"
 			lastErrorKind := "non_retryable"
-			lastError := "nexu-io/looper#55 is a pull request, not an issue; worker issue targets must reference an open GitHub issue"
+			lastError := "MumuTW/looper#55 is a pull request, not an issue; worker issue targets must reference an open GitHub issue"
 
 			if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 				t.Fatalf("Projects.Upsert() error = %v", err)
@@ -1469,7 +1469,7 @@ func TestHandlerConfigProjectsComeFromRuntimeCatalog(t *testing.T) {
 	projectService.ListWorktrees = nil
 	repo := "acme/catalog"
 	if _, err := projectService.AddProject(context.Background(), projects.AddInput{
-		ID: "catalog", Name: "Catalog", RepoPath: t.TempDir(), Repo: &repo, SnapshotMode: projects.SnapshotModeOff,
+		ID: "catalog", Name: "Catalog", RepoPath: t.TempDir(), Repo: &repo, Validation: &config.ProjectValidationConfig{OptOut: true}, SnapshotMode: projects.SnapshotModeOff,
 	}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
@@ -2097,7 +2097,7 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 		ProjectsService: fakeProjectService{addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
 			nowISO := fixture.now.UTC().Format(javaScriptISOString)
 			baseBranch := "main"
-			metadataJSON := `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"api"}`
+			metadataJSON := `{"repo":"MumuTW/looper","worktreeRoot":null,"source":"api"}`
 			return projects.AddResult{
 				Project: storage.ProjectRecord{
 					ID:           "looper",
@@ -2115,6 +2115,11 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 				},
 				Warnings: []string{},
 			}, nil
+		}, updateProject: func(context.Context, string, projects.UpdateInput) (storage.ProjectRecord, error) {
+			nowISO := fixture.now.UTC().Format(javaScriptISOString)
+			baseBranch := "main"
+			metadataJSON := `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"api"}`
+			return storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}, nil
 		}},
 		PatchConfig: func(context.Context, ConfigPatchRequest) error {
 			return nil
@@ -2124,7 +2129,7 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 		},
 	})
 
-	for _, routeID := range []string{"healthz.get", "status.get", "config.get", "config.patch", "projects.create"} {
+	for _, routeID := range []string{"healthz.get", "status.get", "config.get", "config.patch", "projects.create", "projects.update"} {
 		t.Run(routeID, func(t *testing.T) {
 			path := "/api/v1/healthz"
 			method := http.MethodGet
@@ -2141,6 +2146,10 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 			case "projects.create":
 				path = "/api/v1/projects"
 				method = http.MethodPost
+				requestBody = strings.NewReader(marshalArtifactRequestBody(t, requestRoutes, routeID))
+			case "projects.update":
+				path = "/api/v1/projects/project_1"
+				method = http.MethodPatch
 				requestBody = strings.NewReader(marshalArtifactRequestBody(t, requestRoutes, routeID))
 			}
 
@@ -2447,6 +2456,67 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	discoveryWarnings, ok := discovery["warnings"].([]any)
 	if !ok || !reflect.DeepEqual(discoveryWarnings, []any{"warn 1", "warn 2"}) {
 		t.Fatalf("discovery.warnings = %#v, want [warn 1 warn 2]", discovery["warnings"])
+	}
+}
+
+func TestHandlerProjectsPatchRepairsRepoWithoutResettingProjectState(t *testing.T) {
+	fixture := newTestFixture(t)
+	// This test asserts the committed transition to pending. Discovery is a
+	// separate post-commit lifecycle job, so suppress it rather than racing its
+	// running/succeeded updates against the state-repair assertion.
+	fixture.runtime.Services().Projects.ScheduleDiscovery = func(func()) {}
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	baseBranch := "develop"
+	metadata := `{"repo":null,"worktreeRoot":"/tmp/worktrees","validation":{"optOut":true},"source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "inert", Name: "Custom Name", RepoPath: "/tmp/inert", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_inert", Seq: 1, ProjectID: "inert", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/v1/projects/inert", bytes.NewReader([]byte(`{"repo":"acme/app"}`)))
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["repo"], "acme/app")
+	assertEqual(t, data["name"], "Custom Name")
+	assertEqual(t, data["baseBranch"], "develop")
+	stored, err := fixture.runtime.Services().Repositories.Projects.GetByID(context.Background(), "inert")
+	if err != nil || stored == nil || stored.MetadataJSON == nil {
+		t.Fatalf("Projects.GetByID() = %#v, %v", stored, err)
+	}
+	if !strings.Contains(*stored.MetadataJSON, `"snapshotMode":"off"`) || !strings.Contains(*stored.MetadataJSON, `"validation":{"optOut":true}`) || !strings.Contains(*stored.MetadataJSON, `"worktreeRoot":"/tmp/worktrees"`) || !strings.Contains(*stored.MetadataJSON, `"status":"pending"`) {
+		t.Fatalf("metadata = %s, want preserved settings and reset discovery", *stored.MetadataJSON)
+	}
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), "loop_inert")
+	if err != nil || loop == nil || loop.Status == "terminated" {
+		t.Fatalf("Loops.GetByID() = %#v, %v; want preserved loop", loop, err)
+	}
+}
+
+func TestHandlerProjectsPatchDistinguishesNullFromOmittedFields(t *testing.T) {
+	fixture := newTestFixture(t)
+	var got projects.UpdateInput
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{
+		updateProject: func(_ context.Context, _ string, input projects.UpdateInput) (storage.ProjectRecord, error) {
+			got = input
+			return storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper"}, nil
+		},
+	}})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/api/v1/projects/project_1", bytes.NewReader([]byte(`{"repo":null}`))))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !got.Repo.Set || got.Repo.Value != nil {
+		t.Fatalf("repo patch = %#v, want explicit clear", got.Repo)
+	}
+	if got.Name.Set || got.BaseBranch.Set || got.WorktreeRoot.Set {
+		t.Fatalf("omitted patch fields = %#v, want unset", got)
 	}
 }
 
@@ -6927,7 +6997,7 @@ func TestActiveRunsDefaultExcludesOlderRunningRunWhenLatestCompleted(t *testing.
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	loopID := "loop_stale_older_running"
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 18, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:184"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(184), Status: "completed", LastRunAt: stringPtr(completedAt), CreatedAt: oldHeartbeat, UpdatedAt: completedAt}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 18, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:MumuTW/looper:184"), Repo: stringPtr("MumuTW/looper"), PRNumber: int64Ptr(184), Status: "completed", LastRunAt: stringPtr(completedAt), CreatedAt: oldHeartbeat, UpdatedAt: completedAt}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stale_old", LoopID: loopID, Status: "running", CurrentStep: stringPtr("discover-pr"), StartedAt: oldHeartbeat, LastHeartbeatAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
@@ -6975,7 +7045,7 @@ func TestActiveRunsDefaultHidesRunningLoopFallbackWhenRunIsStale(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stale_no_activity", Seq: 19, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:184"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(184), Status: "running", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stale_no_activity", Seq: 19, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:MumuTW/looper:184"), Repo: stringPtr("MumuTW/looper"), PRNumber: int64Ptr(184), Status: "running", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stale_no_activity", LoopID: "loop_stale_no_activity", Status: "running", CurrentStep: stringPtr("discover-pr"), StartedAt: oldHeartbeat, LastHeartbeatAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
@@ -7004,7 +7074,7 @@ func TestActiveRunsDefaultExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_stale", Seq: 20, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:184"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(184), Status: "paused", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_stale", Seq: 20, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:MumuTW/looper:184"), Repo: stringPtr("MumuTW/looper"), PRNumber: int64Ptr(184), Status: "paused", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_stale", LoopID: "loop_paused_stale", Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldHeartbeat, LastHeartbeatAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
@@ -7033,7 +7103,7 @@ func TestActiveRunsDefaultExcludesStaleRunningRunWithUnverifiedAgent(t *testing.
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stale_unverified_agent", Seq: 21, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:185"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(185), Status: "running", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stale_unverified_agent", Seq: 21, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:MumuTW/looper:185"), Repo: stringPtr("MumuTW/looper"), PRNumber: int64Ptr(185), Status: "running", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stale_unverified_agent", LoopID: "loop_stale_unverified_agent", Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldHeartbeat, LastHeartbeatAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
@@ -7064,7 +7134,7 @@ func TestActiveRunsFallbackIncludesAgentWithoutPID(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fallback_nil_pid", Seq: 22, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:186"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(186), Status: "running", LastRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fallback_nil_pid", Seq: 22, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:MumuTW/looper:186"), Repo: stringPtr("MumuTW/looper"), PRNumber: int64Ptr(186), Status: "running", LastRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fallback_nil_pid", LoopID: "loop_fallback_nil_pid", Status: "running", CurrentStep: stringPtr("review"), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -7107,7 +7177,7 @@ func TestActiveRunsPrefersVerifiedAgentOverNewerFallback(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_verified_preferred", Seq: 22, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:186"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(186), Status: "running", LastRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_verified_preferred", Seq: 22, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:MumuTW/looper:186"), Repo: stringPtr("MumuTW/looper"), PRNumber: int64Ptr(186), Status: "running", LastRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_verified_preferred", LoopID: "loop_verified_preferred", Status: "running", CurrentStep: stringPtr("review"), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -8338,6 +8408,7 @@ func seedConflictProject(t *testing.T, service *projects.Service) {
 type fakeProjectService struct {
 	list            func(context.Context) ([]storage.ProjectRecord, error)
 	addProject      func(context.Context, projects.AddInput) (projects.AddResult, error)
+	updateProject   func(context.Context, string, projects.UpdateInput) (storage.ProjectRecord, error)
 	removeProject   func(context.Context, string) (storage.ProjectRecord, error)
 	discoverProject func(context.Context, projects.DiscoverInput) (projects.DiscoverResult, error)
 }
@@ -8354,6 +8425,13 @@ func (f fakeProjectService) AddProject(ctx context.Context, input projects.AddIn
 		return f.addProject(ctx, input)
 	}
 	return projects.AddResult{}, nil
+}
+
+func (f fakeProjectService) UpdateProject(ctx context.Context, identifier string, input projects.UpdateInput) (storage.ProjectRecord, error) {
+	if f.updateProject != nil {
+		return f.updateProject(ctx, identifier, input)
+	}
+	return storage.ProjectRecord{}, nil
 }
 
 func (f fakeProjectService) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {
@@ -8450,4 +8528,32 @@ func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testi
 	data := body["data"].(map[string]any)
 	loopStatus := data["loopStatus"].(map[string]any)
 	assertEqual(t, loopStatus["latestRunStatus"], "running")
+}
+
+// projects[].roles.deployer.environment holds the credentials a deploy
+// authenticates with, and this response already withholds daemon.environment for
+// the same reason.
+func TestRedactProjectDeployerSecrets(t *testing.T) {
+	t.Parallel()
+	environment := map[string]string{"DEPLOY_TOKEN": "secret-value"}
+	projects := []config.ProjectRefConfig{{
+		ID: "looper",
+		Roles: &config.PartialRoleConfigs{Deployer: &config.PartialDeployerRoleConfig{
+			Environment: &environment,
+		}},
+	}}
+
+	redacted := redactProjectSecrets(projects)
+
+	if redacted[0].Roles.Deployer.Environment != nil {
+		t.Fatalf("deploy credentials reached the config response: %v", *redacted[0].Roles.Deployer.Environment)
+	}
+	// The slice copy shares the Roles pointer, so redaction must not reach back
+	// into the live configuration.
+	if projects[0].Roles.Deployer.Environment == nil {
+		t.Fatal("redaction mutated the live configuration")
+	}
+	if (*projects[0].Roles.Deployer.Environment)["DEPLOY_TOKEN"] != "secret-value" {
+		t.Fatal("redaction altered the live configuration values")
+	}
 }

@@ -49,6 +49,7 @@ type DaemonMode string
 const (
 	DaemonModeForeground DaemonMode = "foreground"
 	DaemonModeLaunchd    DaemonMode = "launchd"
+	DaemonModeSystemd    DaemonMode = "systemd"
 )
 
 type DaemonRestartPolicy string
@@ -405,6 +406,14 @@ type ProjectNetworkConfig struct {
 	Mode NetworkMode `json:"mode,omitempty"`
 }
 
+// ProjectValidationConfig is the project-owned mechanical publish gate.
+// Commands and OptOut are mutually exclusive: a project either proves its
+// changes with configured commands or visibly declines the gate.
+type ProjectValidationConfig struct {
+	Commands []string `json:"commands,omitempty"`
+	OptOut   bool     `json:"optOut,omitempty"`
+}
+
 type DefaultsConfig struct {
 	BaseBranch         string          `json:"baseBranch"`
 	AllowAutoCommit    bool            `json:"allowAutoCommit"`
@@ -523,10 +532,26 @@ type FixerRoleTriggersConfig struct {
 }
 
 type PlannerRoleConfig struct {
-	AutoDiscovery bool                    `json:"autoDiscovery"`
-	Triggers      IssueRoleTriggersConfig `json:"triggers"`
-	Instructions  string                  `json:"instructions,omitempty"`
-	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
+	AutoDiscovery bool                     `json:"autoDiscovery"`
+	Triggers      IssueRoleTriggersConfig  `json:"triggers"`
+	Escalation    *PlannerEscalationConfig `json:"escalation,omitempty"`
+	Instructions  string                   `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig         `json:"agent,omitempty"`
+}
+
+// PlannerEscalationConfig is operator-authored authority for stopping before
+// spec authoring. Zero values disable each criterion, preserving the historic
+// Planner behaviour unless a project explicitly opts in.
+type PlannerEscalationConfig struct {
+	MaxEstimatedFiles    int  `json:"maxEstimatedFiles,omitempty"`
+	MaxEstimatedPackages int  `json:"maxEstimatedPackages,omitempty"`
+	PublicAPI            bool `json:"publicApi,omitempty"`
+	Config               bool `json:"config,omitempty"`
+	CLI                  bool `json:"cli,omitempty"`
+	Storage              bool `json:"storage,omitempty"`
+	WireFormat           bool `json:"wireFormat,omitempty"`
+	ADRConflict          bool `json:"adrConflict,omitempty"`
+	AuthorityDecision    bool `json:"authorityDecision,omitempty"`
 }
 
 type WorkerRoleConfig struct {
@@ -673,17 +698,18 @@ type GatekeeperRoleConfig struct {
 }
 
 type ProjectRefConfig struct {
-	ID           string               `json:"id"`
-	Name         string               `json:"name"`
-	Provider     string               `json:"provider,omitempty"`
-	Repo         string               `json:"repo,omitempty"`
-	RepoPath     string               `json:"repoPath"`
-	Path         string               `json:"path,omitempty"`
-	BaseBranch   *string              `json:"baseBranch,omitempty"`
-	WorktreeRoot *string              `json:"worktreeRoot,omitempty"`
-	Network      ProjectNetworkConfig `json:"network,omitempty"`
-	Webhook      ProjectWebhookConfig `json:"webhook,omitempty"`
-	Roles        *PartialRoleConfigs  `json:"roles,omitempty"`
+	ID           string                   `json:"id"`
+	Name         string                   `json:"name"`
+	Provider     string                   `json:"provider,omitempty"`
+	Repo         string                   `json:"repo,omitempty"`
+	RepoPath     string                   `json:"repoPath"`
+	Path         string                   `json:"path,omitempty"`
+	BaseBranch   *string                  `json:"baseBranch,omitempty"`
+	WorktreeRoot *string                  `json:"worktreeRoot,omitempty"`
+	Network      ProjectNetworkConfig     `json:"network,omitempty"`
+	Webhook      ProjectWebhookConfig     `json:"webhook,omitempty"`
+	Validation   *ProjectValidationConfig `json:"validation,omitempty"`
+	Roles        *PartialRoleConfigs      `json:"roles,omitempty"`
 }
 
 type ProjectWebhookConfig struct {
@@ -691,18 +717,19 @@ type ProjectWebhookConfig struct {
 }
 
 type PartialProjectRefConfig struct {
-	ID           string                       `json:"id"`
-	Name         string                       `json:"name"`
-	Provider     *string                      `json:"provider,omitempty"`
-	Repo         *string                      `json:"repo,omitempty"`
-	RepoPath     string                       `json:"repoPath"`
-	Path         string                       `json:"path,omitempty"`
-	BaseBranch   *string                      `json:"baseBranch,omitempty"`
-	WorktreeRoot *string                      `json:"worktreeRoot,omitempty"`
-	Network      *PartialProjectNetworkConfig `json:"network,omitempty"`
-	Webhook      *PartialProjectWebhookConfig `json:"webhook,omitempty"`
-	Instructions map[string]string            `json:"instructions,omitempty"`
-	Roles        *PartialRoleConfigs          `json:"roles,omitempty"`
+	ID           string                          `json:"id"`
+	Name         string                          `json:"name"`
+	Provider     *string                         `json:"provider,omitempty"`
+	Repo         *string                         `json:"repo,omitempty"`
+	RepoPath     string                          `json:"repoPath"`
+	Path         string                          `json:"path,omitempty"`
+	BaseBranch   *string                         `json:"baseBranch,omitempty"`
+	WorktreeRoot *string                         `json:"worktreeRoot,omitempty"`
+	Network      *PartialProjectNetworkConfig    `json:"network,omitempty"`
+	Webhook      *PartialProjectWebhookConfig    `json:"webhook,omitempty"`
+	Validation   *PartialProjectValidationConfig `json:"validation,omitempty"`
+	Instructions map[string]string               `json:"instructions,omitempty"`
+	Roles        *PartialRoleConfigs             `json:"roles,omitempty"`
 }
 
 type PartialProjectNetworkConfig struct {
@@ -711,6 +738,11 @@ type PartialProjectNetworkConfig struct {
 
 type PartialProjectWebhookConfig struct {
 	Mode *WebhookMode `json:"mode,omitempty"`
+}
+
+type PartialProjectValidationConfig struct {
+	Commands *[]string `json:"commands,omitempty"`
+	OptOut   *bool     `json:"optOut,omitempty"`
 }
 
 type PartialProviderConfig struct {
@@ -1113,8 +1145,21 @@ type PartialFixerRoleTriggersConfig struct {
 type PartialPlannerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
+	Escalation    *PartialPlannerEscalationConfig `json:"escalation,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
+}
+
+type PartialPlannerEscalationConfig struct {
+	MaxEstimatedFiles    *int  `json:"maxEstimatedFiles,omitempty"`
+	MaxEstimatedPackages *int  `json:"maxEstimatedPackages,omitempty"`
+	PublicAPI            *bool `json:"publicApi,omitempty"`
+	Config               *bool `json:"config,omitempty"`
+	CLI                  *bool `json:"cli,omitempty"`
+	Storage              *bool `json:"storage,omitempty"`
+	WireFormat           *bool `json:"wireFormat,omitempty"`
+	ADRConflict          *bool `json:"adrConflict,omitempty"`
+	AuthorityDecision    *bool `json:"authorityDecision,omitempty"`
 }
 
 type PartialWorkerRoleConfig struct {

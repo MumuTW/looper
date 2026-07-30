@@ -35,8 +35,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/version"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 // requestTimeout bounds a single call. Those are one storage transaction and at

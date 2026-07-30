@@ -13,15 +13,15 @@ import (
 	"syscall"
 	"time"
 
-	looperdapi "github.com/nexu-io/looper/internal/api"
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/dashboard"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/version"
+	looperdapi "github.com/MumuTW/looper/internal/api"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/dashboard"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 func main() {
@@ -43,6 +43,13 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 	if hasVersionArg(args) {
 		_, _ = fmt.Fprintln(stdout, version.Value)
 		return 0
+	}
+
+	// "service" must be the first argument. Accepting it after global flags means
+	// deciding how two flag blocks combine, and the previous attempt reversed their
+	// order — a config flag before the subcommand silently lost to one after it.
+	if len(args) > 0 && args[0] == "service" {
+		return runServiceCommand(context.Background(), args[1:], stdout, stderr, defaultServiceDeps())
 	}
 
 	if hasHelpArg(args) || (len(args) > 0 && args[0] == "help") {
@@ -1267,6 +1274,7 @@ func writeUsage(w io.Writer) {
 
 Usage:
 	looperd [flags]
+	looperd service <install|print|uninstall|status>
 	looperd help
 
 Daemon and HTTP API server for Looper.

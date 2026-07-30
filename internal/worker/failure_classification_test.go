@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
 )
 
 func TestClassifyFailureDoesNotRetryUnknownExternalLookingMessage(t *testing.T) {

@@ -6,18 +6,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/lifecycle"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/network/protocol"
-	"github.com/nexu-io/looper/internal/networkpolicy"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/networkpolicy"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, error) {
@@ -1724,11 +1725,11 @@ func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testi
 
 func TestBuildPullRequestBodyUsesCrossRepoClosingReference(t *testing.T) {
 	t.Parallel()
-	body := buildPullRequestBody(workerInput{Repo: "acme/looper", IssueRepo: "nexu-io/looper", IssueNumber: 27, IssueURL: "https://github.com/nexu-io/looper/issues/27"}, &checkpointPlan{Items: []string{"Add linked issue auto-close support"}}, &checkpointExecution{Summary: "done"})
-	if !strings.Contains(body, "Issue: nexu-io/looper#27") {
+	body := buildPullRequestBody(workerInput{Repo: "acme/looper", IssueRepo: "MumuTW/looper", IssueNumber: 27, IssueURL: "https://github.com/MumuTW/looper/issues/27"}, &checkpointPlan{Items: []string{"Add linked issue auto-close support"}}, &checkpointExecution{Summary: "done"})
+	if !strings.Contains(body, "Issue: MumuTW/looper#27") {
 		t.Fatalf("body = %q, want issue repo reference", body)
 	}
-	if !strings.Contains(body, "Closes nexu-io/looper#27") {
+	if !strings.Contains(body, "Closes MumuTW/looper#27") {
 		t.Fatalf("body = %q, want cross-repo closing reference", body)
 	}
 	if strings.Contains(body, "Closes #27") {
@@ -1738,48 +1739,48 @@ func TestBuildPullRequestBodyUsesCrossRepoClosingReference(t *testing.T) {
 
 func TestBuildPullRequestBodyUsesBareClosingReferenceForSameRepo(t *testing.T) {
 	t.Parallel()
-	body := buildPullRequestBody(workerInput{Repo: "nexu-io/looper", IssueRepo: "nexu-io/looper", IssueNumber: 27}, nil, nil)
+	body := buildPullRequestBody(workerInput{Repo: "MumuTW/looper", IssueRepo: "MumuTW/looper", IssueNumber: 27}, nil, nil)
 	if !strings.Contains(body, "Closes #27") {
 		t.Fatalf("body = %q, want same-repo closing reference", body)
 	}
-	if strings.Contains(body, "Closes nexu-io/looper#27") {
+	if strings.Contains(body, "Closes MumuTW/looper#27") {
 		t.Fatalf("body = %q, want unqualified same-repo closing reference", body)
 	}
 }
 
 func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
 	t.Parallel()
-	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27}, IssueDetail{Number: 27, Title: "Issue title", URL: "https://github.com/nexu-io/looper/issues/27"})
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27}, IssueDetail{Number: 27, Title: "Issue title", URL: "https://github.com/MumuTW/looper/issues/27"})
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want issue repo in prompt", work.Prompt)
 	}
-	if issueRepoFromURL("https://ghe.example.com/nexu-io/looper/issues/27") != "nexu-io/looper" {
+	if issueRepoFromURL("https://ghe.example.com/MumuTW/looper/issues/27") != "MumuTW/looper" {
 		t.Fatal("issueRepoFromURL() should infer issue repo from GitHub Enterprise URLs")
 	}
-	if issueRepoFromURL("https://gitlab.com/nexu-io/looper/-/issues/27") != "" {
+	if issueRepoFromURL("https://gitlab.com/MumuTW/looper/-/issues/27") != "" {
 		t.Fatal("issueRepoFromURL() should ignore non-GitHub hosts")
 	}
-	if issueRepoFromURL("https://github.com/nexu-io/looper/issues/not-a-number") != "" {
+	if issueRepoFromURL("https://github.com/MumuTW/looper/issues/not-a-number") != "" {
 		t.Fatal("issueRepoFromURL() should ignore invalid issue URLs")
 	}
-	if !strings.Contains(buildAgentPullRequestInstruction(work), "Closes nexu-io/looper#27") {
+	if !strings.Contains(buildAgentPullRequestInstruction(work), "Closes MumuTW/looper#27") {
 		t.Fatalf("instruction = %q, want cross-repo closing reference", buildAgentPullRequestInstruction(work))
 	}
 }
 
 func TestHydrateWorkerInputFromIssueUsesSourceIssueURLWhenIssueURLMissing(t *testing.T) {
 	t.Parallel()
-	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27, IssueURL: "https://github.com/nexu-io/looper/issues/27"}, IssueDetail{Number: 27, Title: "Issue title"})
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27, IssueURL: "https://github.com/MumuTW/looper/issues/27"}, IssueDetail{Number: 27, Title: "Issue title"})
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want issue repo inferred from source issue URL", work.Prompt)
 	}
-	if work.IssueURL != "https://github.com/nexu-io/looper/issues/27" {
+	if work.IssueURL != "https://github.com/MumuTW/looper/issues/27" {
 		t.Fatalf("IssueURL = %q, want source issue URL preserved", work.IssueURL)
 	}
 }
@@ -1787,7 +1788,7 @@ func TestHydrateWorkerInputFromIssueUsesSourceIssueURLWhenIssueURLMissing(t *tes
 func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/nexu-io/looper/issues/27"}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/MumuTW/looper/issues/27"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
@@ -1802,8 +1803,8 @@ func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"nexu-io/looper","issueNumber":27,"baseBranch":"main"}`
-	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"nexu-io/looper","issueNumber":27,"baseBranch":"main"}}`
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"MumuTW/looper","issueNumber":27,"baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"MumuTW/looper","issueNumber":27,"baseBranch":"main"}}`
 	loop.MetadataJSON = &loopMetadata
 	queueItem.PayloadJSON = &payload
 
@@ -1814,13 +1815,13 @@ func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 	if len(github.viewIssueCalls) != 1 {
 		t.Fatalf("len(github.viewIssueCalls) = %d, want 1", len(github.viewIssueCalls))
 	}
-	if github.viewIssueCalls[0].Repo != "nexu-io/looper" {
-		t.Fatalf("ViewIssue repo = %q, want nexu-io/looper", github.viewIssueCalls[0].Repo)
+	if github.viewIssueCalls[0].Repo != "MumuTW/looper" {
+		t.Fatalf("ViewIssue repo = %q, want MumuTW/looper", github.viewIssueCalls[0].Repo)
 	}
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("work.IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("work.IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
 	}
 	if strings.Contains(work.Prompt, "Implement issue acme/looper#27") {
@@ -1831,7 +1832,7 @@ func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 func TestResolveWorkerInputFallsBackToWorkerRepoForIssueHydration(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/nexu-io/looper/issues/27"}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/MumuTW/looper/issues/27"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
@@ -1861,10 +1862,10 @@ func TestResolveWorkerInputFallsBackToWorkerRepoForIssueHydration(t *testing.T) 
 	if github.viewIssueCalls[0].Repo != "acme/looper" {
 		t.Fatalf("ViewIssue repo = %q, want worker repo fallback for hydration lookup", github.viewIssueCalls[0].Repo)
 	}
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("work.IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("work.IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
 	}
 }
@@ -1974,8 +1975,8 @@ func TestResolveWorkerInputUsesIssueURLRepoForIssueHydrationLookup(t *testing.T)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/nexu-io/looper/issues/27","baseBranch":"main"}`
-	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/nexu-io/looper/issues/27","baseBranch":"main"}}`
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/MumuTW/looper/issues/27","baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/MumuTW/looper/issues/27","baseBranch":"main"}}`
 	loop.MetadataJSON = &loopMetadata
 	queueItem.PayloadJSON = &payload
 
@@ -1986,13 +1987,13 @@ func TestResolveWorkerInputUsesIssueURLRepoForIssueHydrationLookup(t *testing.T)
 	if len(github.viewIssueCalls) != 1 {
 		t.Fatalf("len(github.viewIssueCalls) = %d, want 1", len(github.viewIssueCalls))
 	}
-	if github.viewIssueCalls[0].Repo != "nexu-io/looper" {
-		t.Fatalf("ViewIssue repo = %q, want nexu-io/looper inferred from issue URL", github.viewIssueCalls[0].Repo)
+	if github.viewIssueCalls[0].Repo != "MumuTW/looper" {
+		t.Fatalf("ViewIssue repo = %q, want MumuTW/looper inferred from issue URL", github.viewIssueCalls[0].Repo)
 	}
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("work.IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("work.IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
 	}
 	if strings.Contains(work.Prompt, "Implement issue acme/looper#27") {
@@ -2651,12 +2652,14 @@ func TestProcessClaimedItemDeterministicValidationFailurePauses(t *testing.T) {
 	github := &fakeGitHubGateway{}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
 	completed := make([]RunCompletedInput, 0, 1)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+	var validatedCommands []string
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(_ context.Context, input ValidationInput) (ValidationResult, error) {
+		validatedCommands = append([]string(nil), input.Commands...)
 		return ValidationResult{Passed: false, Summary: "Validation failed"}, nil
 	}, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
 		completed = append(completed, input)
 		return nil
-	}})
+	}, ValidationCommands: []string{"wrong-global-command"}, ValidationCommandsByProject: map[string][]string{"project_1": {"project-check"}}})
 
 	claim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
 	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
@@ -2668,6 +2671,12 @@ func TestProcessClaimedItemDeterministicValidationFailurePauses(t *testing.T) {
 	}
 	if len(completed) != 1 {
 		t.Fatalf("len(completed) = %d, want terminal completion notification", len(completed))
+	}
+	if !slices.Equal(validatedCommands, []string{"project-check"}) {
+		t.Fatalf("validated commands = %#v, want project-specific command", validatedCommands)
+	}
+	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 {
+		t.Fatalf("push/create PR calls = %d/%d, want failed project validation to block publication", len(git.pushCalls), len(github.createPRCalls))
 	}
 	if len(github.updateIssueCommentCalls) > 0 {
 		body := github.updateIssueCommentCalls[len(github.updateIssueCommentCalls)-1].Body

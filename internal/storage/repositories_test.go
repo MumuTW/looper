@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -44,6 +45,66 @@ func TestAgentExecutionTerminalObservationCannotRegressToActive(t *testing.T) {
 	}
 	if got == nil || got.Status != "completed" || got.EndedAt == nil {
 		t.Fatalf("execution = %#v, want completed terminal observation", got)
+	}
+}
+
+func TestWorktreesAdoptPathRollsBackRetirementWhenAdoptionFails(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-30T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project", Name: "Project", RepoPath: "/tmp/repo", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	attached := WorktreeRecord{ID: "attached", ProjectID: "project", RepoPath: "/tmp/repo", WorktreePath: "/tmp/attached", Branch: "feature/fixer", Status: "active", CreatedAt: now, UpdatedAt: now}
+	shared := WorktreeRecord{ID: "shared", ProjectID: "project", RepoPath: "/tmp/repo", WorktreePath: "/tmp/shared", Branch: "reviewer/pr-42", Status: "active", CreatedAt: now, UpdatedAt: now}
+	for _, record := range []WorktreeRecord{attached, shared} {
+		if err := repos.Worktrees.Upsert(ctx, record); err != nil {
+			t.Fatalf("Worktrees.Upsert(%q) error = %v", record.ID, err)
+		}
+	}
+	if _, err := coordinator.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_shared_path_adoption
+		BEFORE UPDATE ON worktrees WHEN OLD.id = 'shared'
+		BEGIN SELECT RAISE(ABORT, 'adoption blocked'); END;
+	`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	adopting := shared
+	adopting.Branch = "feature/fixer"
+	adopting.UpdatedAt = "2026-07-30T12:01:00.000Z"
+	if err := repos.Worktrees.AdoptPath(ctx, adopting); err == nil || !strings.Contains(err.Error(), "adoption blocked") {
+		t.Fatalf("AdoptPath() error = %v, want blocked adoption", err)
+	}
+	storedAttached, err := repos.Worktrees.GetByID(ctx, attached.ID)
+	if err != nil || storedAttached == nil || storedAttached.Branch != "feature/fixer" {
+		t.Fatalf("attached row after failed adoption = %#v, %v; want original branch", storedAttached, err)
+	}
+	storedShared, err := repos.Worktrees.GetByID(ctx, shared.ID)
+	if err != nil || storedShared == nil || storedShared.Branch != "reviewer/pr-42" {
+		t.Fatalf("shared row after failed adoption = %#v, %v; want original branch", storedShared, err)
+	}
+}
+
+func TestWorktreesGetByPathAcceptsPrivateVarAlias(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-30T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project", Name: "Project", RepoPath: "/tmp/repo", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	record := WorktreeRecord{ID: "private-var", ProjectID: "project", RepoPath: "/tmp/repo", WorktreePath: "/private/var/folders/looper/worktree", Branch: "feature/fixer", Status: "active", CreatedAt: now, UpdatedAt: now}
+	if err := repos.Worktrees.Upsert(ctx, record); err != nil {
+		t.Fatalf("Worktrees.Upsert() error = %v", err)
+	}
+	got, err := repos.Worktrees.GetByPath(ctx, "/var/folders/looper/worktree")
+	if err != nil || got == nil || got.ID != record.ID {
+		t.Fatalf("GetByPath(/var alias) = %#v, %v; want %q", got, err, record.ID)
 	}
 }
 

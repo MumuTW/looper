@@ -17,7 +17,7 @@ interpreter environment here and it does not carry that dependency.
 
 Usage:
   HERMES_HOME=~/.hermes/profiles/looper ./memory_mcp_server.py
-  ./memory_mcp_server.py --selftest
+  HERMES_HOME=~/.hermes/profiles/looper ./memory_mcp_server.py --selftest
 """
 from __future__ import annotations
 
@@ -232,24 +232,22 @@ def call_tool(name: str, args: dict) -> tuple[str, bool]:
     if name not in TOOL_NAMES:
         return json.dumps({"success": False, "error": f"Unknown tool '{name}'."}), True
 
-    problem = _preflight()
-    if problem:
-        return json.dumps({"success": False, "error": problem}, ensure_ascii=False), True
-
-    # Reject rather than coerce: every downstream reader treats "not exactly
-    # 'user'" as the project store, so a near-miss like "users" or "User"
-    # would silently read or write the wrong one while echoing the name back
-    # as if it had been honoured.
-    target = args.get("target") or "memory"
-    if target not in VALID_TARGETS:
+    # Default only when the selector is absent. `or "memory"` would turn an
+    # explicitly supplied but falsy invalid selector ("", false, 0, null)
+    # into a real project-memory mutation.
+    target = args["target"] if "target" in args else "memory"
+    if not isinstance(target, str) or target not in VALID_TARGETS:
         return json.dumps(
             {
                 "success": False,
-                "error": f"Invalid target {target!r}. Must be one of: "
-                + ", ".join(sorted(VALID_TARGETS)),
+                "error": f"Invalid target {target!r}. Must be one of: " + ", ".join(sorted(VALID_TARGETS)),
             },
             ensure_ascii=False,
         ), True
+
+    problem = _preflight()
+    if problem:
+        return json.dumps({"success": False, "error": problem}, ensure_ascii=False), True
 
     try:
         # Rebuilt per call: Hermes's own sessions mutate the same files under a

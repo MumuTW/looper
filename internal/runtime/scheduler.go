@@ -14,29 +14,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/fixer"
-	"github.com/nexu-io/looper/internal/forge"
-	"github.com/nexu-io/looper/internal/gatekeeper"
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/notify"
-	networkclient "github.com/nexu-io/looper/internal/network/client"
-	"github.com/nexu-io/looper/internal/network/protocol"
-	"github.com/nexu-io/looper/internal/networkpolicy"
-	"github.com/nexu-io/looper/internal/planner"
-	"github.com/nexu-io/looper/internal/processcontainment"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/reviewer"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/triager"
-	"github.com/nexu-io/looper/internal/version"
-	"github.com/nexu-io/looper/internal/webhookforward"
-	"github.com/nexu-io/looper/internal/worker"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/fixer"
+	"github.com/MumuTW/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/gatekeeper"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/notify"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/networkpolicy"
+	"github.com/MumuTW/looper/internal/planner"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/reviewer"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/triager"
+	"github.com/MumuTW/looper/internal/version"
+	"github.com/MumuTW/looper/internal/webhookforward"
+	"github.com/MumuTW/looper/internal/worker"
 )
 
 type plannerScheduler interface {
@@ -1570,8 +1570,19 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	claimMu := &sync.Mutex{}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
-	if len(config.ResolveValidationCommands(source.Snapshot())) == 0 && logger != nil {
-		logger.Warn("worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything", nil)
+	initialConfig := source.Snapshot()
+	if logger != nil {
+		if len(initialConfig.Projects) == 0 && !config.HasEffectiveValidationCommands(initialConfig) {
+			logger.Warn("worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything", nil)
+		}
+		for _, project := range initialConfig.Projects {
+			switch {
+			case config.ProjectValidationOptedOut(initialConfig, project.ID):
+				logger.Warn("project explicitly opted out of worker/fixer validation", map[string]any{"projectId": project.ID})
+			case config.ProjectValidationUsesLegacyDefaults(initialConfig, project.ID):
+				logger.Warn("project uses deprecated defaults.validationCommands fallback; migrate to projects[].validation.commands", map[string]any{"projectId": project.ID})
+			}
+		}
 	}
 	// Trusted review proxies are minted per reviewer agent run (bound to that
 	// run's PR). Catalog snapshots reuse claim serialization and notification
@@ -1696,6 +1707,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Now:    now,
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
+			},
+			MergeStrategyForProject: func(projectID string) config.ReviewerAutoMergeStrategy {
+				return config.ProjectRoleConfigs(cfg, projectID).Reviewer.AutoMerge.Strategy
 			},
 			LogWarn: func(msg string, fields map[string]any) {
 				if logger != nil {
@@ -2056,6 +2070,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	validationCommands := config.ResolveValidationCommands(cfg)
+	validationCommandsByProject := config.ResolveProjectValidationCommandsByID(cfg)
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
 		resolved := resolvedFixer
@@ -2071,18 +2086,19 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			fixerAutoDiscovery = false
 		}
 		fixerRunner = fixer.New(fixer.Options{
-			DB:                 coordinator.DB(),
-			Repos:              repos,
-			GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
-			Git:                fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
-			AgentExecutor:      fixerAgentExecutorAdapter{executor: fixerExecutor},
-			Logger:             logger,
-			Now:                now,
-			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
-			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
-			ValidationCommands: validationCommands,
+			DB:                          coordinator.DB(),
+			Repos:                       repos,
+			GitHub:                      fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
+			Git:                         fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
+			AgentExecutor:               fixerAgentExecutorAdapter{executor: fixerExecutor},
+			Logger:                      logger,
+			Now:                         now,
+			AllowAutoCommit:             cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:               cfg.Defaults.AllowAutoPush,
+			AllowRiskyFixes:             cfg.Defaults.AllowRiskyFixes,
+			FixAllPullRequests:          cfg.Defaults.FixAllPullRequests,
+			ValidationCommands:          validationCommands,
+			ValidationCommandsByProject: validationCommandsByProject,
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: fixer.DiscoveryPolicy{
@@ -2141,14 +2157,15 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 			},
-			Git:                workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
-			AgentExecutor:      workerAgentExecutorAdapter{executor: workerExecutor},
-			Logger:             logger,
-			Now:                now,
-			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-			OpenPRStrategy:     cfg.Defaults.OpenPRStrategy,
-			ValidationCommands: validationCommands,
+			Git:                         workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
+			AgentExecutor:               workerAgentExecutorAdapter{executor: workerExecutor},
+			Logger:                      logger,
+			Now:                         now,
+			AllowAutoCommit:             cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:               cfg.Defaults.AllowAutoPush,
+			OpenPRStrategy:              cfg.Defaults.OpenPRStrategy,
+			ValidationCommands:          validationCommands,
+			ValidationCommandsByProject: validationCommandsByProject,
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: worker.DiscoveryPolicy{
@@ -2506,12 +2523,14 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 		runGitHubHITLPoll(ctx, input, project)
 
-		// Deploy last for this project: a commit that just landed should be picked
-		// up by the tick that observed it, but never ahead of discovery.
+		// Deploy asynchronously. A deploy runs an operator command for up to
+		// roles.deployer.timeoutSeconds — fifteen minutes by default — and the tick
+		// is serial, so running it here would stall every other project's discovery
+		// for the duration.
 		if err := admissionRefuseWork(input); err != nil {
 			break
 		}
-		runDeployLane(ctx, input, project, repo)
+		startDeployLane(ctx, input, project, repo)
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and

@@ -12,7 +12,7 @@
 looperd
 ```
 
-Foreground, unsupervised. Surviving logout/reboot is the operator's `launchd` / `systemd` / `tmux` problem — Looper does not install LaunchAgents or manage lifecycle.
+Foreground and unsupervised by default. `looperd service install` writes a launchd agent (macOS) or systemd user unit (Linux) from `daemon.*`, requiring `daemon.mode` to match the platform and `tools.gitPath`/`tools.ghPath` to be configured rather than auto-detected. It refuses `daemon.environment`, `daemon.plistPath`, and an already-installed unit. `service print` shows the unit without writing it; `uninstall` and `status` read no configuration. A per-user service starts at login, not at boot: an unattended macOS machine also needs automatic login, and Linux needs `loginctl enable-linger`.
 
 Managed path `~/.looper/bin/looperd` may still exist from older installs; new installs place `looperd` wherever you put it on `PATH`.
 

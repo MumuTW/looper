@@ -10,7 +10,10 @@
 #   devin mcp add looper-memory -- python3 probe_mcp_server.py   # from the
 #     directory that will be the ACP session cwd — `devin mcp add` writes to a
 #     *local project config* keyed to cwd, so the session must share it.
-#   ./replay_acp.py --cwd "$PWD" --prompt-file <prompt asking for the tool>
+#   ./replay_acp.py --cwd "$PWD" --prompt-file <prompt asking for the tool> \\
+#       --approve-allow-once
+#     (explicit replay-only opt-in: selects only an offered allow_once; every
+#      broader or unknown permission shape remains cancelled)
 #
 # Two attempts failed first, and the failures are the useful part:
 #

@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/intake/telegram"
-	"github.com/nexu-io/looper/internal/outboundguard"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/intake/telegram"
+	"github.com/MumuTW/looper/internal/outboundguard"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func intakeTickInput(t *testing.T, projects []storage.ProjectRecord, cfg *config.Config) defaultSchedulerTickInput {

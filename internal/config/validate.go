@@ -53,6 +53,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	issues := make([]ValidationIssue, 0)
 
 	validateCoreConfig(config, &issues)
+	validatePlannerEscalation(config.Roles.Planner.Escalation, "roles.planner.escalation", &issues)
 
 	if config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
@@ -191,6 +192,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, &project) {
 			validateWebhookTunnelConfig(config.Webhook, "webhook", &issues)
 		}
+		validateProjectValidationConfig(config, project, prefix, false, &issues)
 
 		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
 		validateProjectRoleAgentBindings(project.Roles, prefix+".roles", &issues)
@@ -255,7 +257,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateAgentConfig(config, issues)
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
-	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", issues)
+	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	for i, project := range config.Projects {
 		if project.Roles == nil || project.Roles.Deployer == nil {
@@ -269,9 +271,13 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		if project.Roles == nil || project.Roles.Gatekeeper == nil || project.Roles.Gatekeeper.Trust == nil {
 			continue
 		}
+		reviewerAutoMerge := config.Roles.Reviewer.AutoMerge.Enabled
+		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
+			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
+		}
 		validateGatekeeperRoleConfig(
 			GatekeeperRoleConfig{Trust: *project.Roles.Gatekeeper.Trust},
-			fmt.Sprintf("projects[%d].roles.gatekeeper", i), issues)
+			fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -473,18 +479,23 @@ func validateDeployerRoleConfig(deployerRole DeployerRoleConfig, path string, is
 	validateEnvironmentNames(deployerRole.Environment, path+".environment", issues)
 }
 
-func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, issues *[]ValidationIssue) {
+func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, reviewerAutoMerge bool, issues *[]ValidationIssue) {
 	switch GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(gatekeeper.Trust)))) {
 	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise:
 	case GatekeeperTrustAuto:
-		*issues = append(*issues, ValidationIssue{
-			Path:    path + ".trust",
-			Message: fmt.Sprintf("%q is not implemented yet; Gatekeeper cannot merge. Use %q, and enable roles.reviewer.autoMerge if you want merges today", GatekeeperTrustAuto, GatekeeperTrustAdvise),
-		})
+		// Two merge authorities acting on the same pull request is not a
+		// configuration anyone can reason about: whichever wins the race decides,
+		// and Reviewer's path checks a strictly narrower set of gates.
+		if reviewerAutoMerge {
+			*issues = append(*issues, ValidationIssue{
+				Path:    path + ".trust",
+				Message: fmt.Sprintf("%q cannot be combined with roles.reviewer.autoMerge.enabled: disable one, and prefer Gatekeeper because it also gates on unresolved review threads and requested changes", GatekeeperTrustAuto),
+			})
+		}
 	default:
 		*issues = append(*issues, ValidationIssue{
 			Path:    path + ".trust",
-			Message: fmt.Sprintf("must be one of: %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise),
+			Message: fmt.Sprintf("must be one of: %s, %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto),
 		})
 	}
 }
@@ -513,7 +524,7 @@ func validateHITLConfig(hitl HITLConfig, issues *[]ValidationIssue) {
 
 func validateDaemonConfig(daemon DaemonConfig, issues *[]ValidationIssue) {
 	if !isValidDaemonMode(daemon.Mode) {
-		*issues = append(*issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
+		*issues = append(*issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s", DaemonModeForeground, DaemonModeLaunchd, DaemonModeSystemd)})
 	}
 	validateEnvironmentNames(daemon.Environment, "daemon.environment", issues)
 	if !isValidDaemonRestartPolicy(daemon.RestartPolicy) {
@@ -532,6 +543,53 @@ func validateDaemonConfig(daemon DaemonConfig, issues *[]ValidationIssue) {
 		*issues = append(*issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
 	validateWorktreeCleanupConfig(daemon.WorktreeCleanup, "daemon.worktreeCleanup", issues)
+}
+
+// ValidateProjectValidationPolicies is the startup/catalog/reload gate. Generic
+// config parsing validates any authored policy, but only an authority boundary
+// has enough context to require every materialized project to choose commands
+// or an explicit opt-out.
+func ValidateProjectValidationPolicies(config Config) error {
+	if !CodingRoleAgentConfigured(config, CodingRoleWorker) && !CodingRoleAgentConfigured(config, CodingRoleFixer) {
+		return nil
+	}
+	issues := []ValidationIssue{}
+	for index, project := range config.Projects {
+		validateProjectValidationConfig(config, project, fmt.Sprintf("projects[%d]", index), true, &issues)
+	}
+	if len(issues) > 0 {
+		return &ConfigValidationError{Issues: issues}
+	}
+	return nil
+}
+
+func validateProjectValidationConfig(config Config, project ProjectRefConfig, prefix string, requirePresence bool, issues *[]ValidationIssue) {
+	validation := project.Validation
+	if validation == nil {
+		if requirePresence && len(ResolveValidationCommands(config)) == 0 {
+			*issues = append(*issues, ValidationIssue{
+				Path:    prefix + ".validation",
+				Message: "must configure commands or set optOut=true; defaults.validationCommands is only a legacy migration fallback",
+			})
+		}
+		return
+	}
+
+	if validation.OptOut {
+		if len(validation.Commands) > 0 {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".validation", Message: "cannot set commands when optOut=true"})
+		}
+		return
+	}
+	if len(validation.Commands) == 0 {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".validation.commands", Message: "must contain at least one command or set optOut=true"})
+		return
+	}
+	for index, command := range validation.Commands {
+		if strings.TrimSpace(command) == "" {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s.validation.commands[%d]", prefix, index), Message: "must be a non-empty string"})
+		}
+	}
 }
 
 func validatePackageAndDefaultsConfig(config Config, issues *[]ValidationIssue) {
@@ -875,6 +933,11 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		if roles.Planner.Triggers != nil {
 			validateIssueRoleTriggers(partialIssueRoleTriggers(*roles.Planner.Triggers), prefix+".planner.triggers", issues)
 		}
+		if roles.Planner.Escalation != nil {
+			candidate := PlannerEscalationConfig{}
+			mergePlannerEscalationConfig(&candidate, *roles.Planner.Escalation)
+			validatePlannerEscalation(&candidate, prefix+".planner.escalation", issues)
+		}
 	}
 	if roles.Worker != nil {
 		validateProjectRoleInstruction(prefix+".worker.instructions", "worker", roles.Worker.Instructions, maxInstructionBytes, issues)
@@ -918,6 +981,18 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		if roles.Coordinator.PollInterval != nil && strings.TrimSpace(*roles.Coordinator.PollInterval) == "" {
 			*issues = append(*issues, ValidationIssue{Path: prefix + ".coordinator.pollInterval", Message: "must be a non-empty duration string"})
 		}
+	}
+}
+
+func validatePlannerEscalation(escalation *PlannerEscalationConfig, path string, issues *[]ValidationIssue) {
+	if escalation == nil {
+		return
+	}
+	if escalation.MaxEstimatedFiles < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxEstimatedFiles", Message: "must be an integer >= 0"})
+	}
+	if escalation.MaxEstimatedPackages < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxEstimatedPackages", Message: "must be an integer >= 0"})
 	}
 }
 
@@ -1257,7 +1332,7 @@ func isValidAuthMode(mode AuthMode) bool {
 
 func isValidDaemonMode(mode DaemonMode) bool {
 	switch mode {
-	case DaemonModeForeground, DaemonModeLaunchd:
+	case DaemonModeForeground, DaemonModeLaunchd, DaemonModeSystemd:
 		return true
 	default:
 		return false

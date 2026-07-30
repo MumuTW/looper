@@ -17,25 +17,25 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/specpr"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/lifecycle"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/loops/failureclass"
-	"github.com/nexu-io/looper/internal/network/protocol"
-	"github.com/nexu-io/looper/internal/networkpolicy"
-	"github.com/nexu-io/looper/internal/processcontainment"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/validation"
-	"github.com/nexu-io/looper/internal/worker/workflow"
-	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/specpr"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/networkpolicy"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/validation"
+	"github.com/MumuTW/looper/internal/worker/workflow"
+	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
 const (
@@ -397,6 +397,11 @@ const validationGatedLocalOnlyPrompt = `
 VALIDATION-GATED LOCAL-ONLY EXECUTION:
 Looper's daemon already fetched and prepared the repository state. Tool network access is intentionally disabled. Do not run gh, git fetch/pull/push, access remote URLs, or fail merely because the forge is unavailable. Use the local checkout and the context already supplied in this prompt. Edit, test, and commit locally only; Looper will validate the exact commit and publish it afterward.`
 
+const testFirstDeliveryPrompt = `TEST-FIRST DELIVERY EXPECTATION:
+When feasible, add or update a failing automated test first and confirm it captures the requested behavior. Then write the smallest implementation that makes it pass, and refactor while keeping the suite green.
+Every pull request must state the automated coverage added or updated and the relevant commands run. If automated coverage is not feasible, explain why coverage is not feasible in the final summary so the PR records that exception.
+Repository CI checks must be green before merge.`
+
 type AgentExecution interface {
 	Wait(context.Context) (AgentResult, error)
 	Kill(string) error
@@ -465,6 +470,7 @@ type Options struct {
 	AgentIdleTimeout                time.Duration
 	ClaimTTL                        time.Duration
 	ValidationCommands              []string
+	ValidationCommandsByProject     map[string][]string
 	ValidationRunner                ValidationRunner
 	// ContainmentTracker registers validation shell handles with the Execution
 	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
@@ -545,41 +551,42 @@ type DiscoveryPolicy struct {
 // producing a Pull Request. Stateful: it persists runs in the local SQLite
 // database.
 type Runner struct {
-	db                      *sql.DB
-	repos                   *storage.Repositories
-	github                  GitHubGateway
-	git                     GitGateway
-	agentExecutor           AgentExecutor
-	logger                  bootstrap.Logger
-	now                     func() time.Time
-	agentTimeout            time.Duration
-	agentIdleTimeout        time.Duration
-	claimTTL                time.Duration
-	validationCommands      []string
-	validationRunner        ValidationRunner
-	containmentTracker      processcontainment.LiveTracker
-	allowAutoCommit         bool
-	allowAutoPush           bool
-	githubCLIAvailable      bool
-	githubCLICheck          func(context.Context, string, string) bool
-	openPRStrategy          config.OpenPRStrategy
-	disclosure              config.DisclosureConfig
-	agentRuntime            string
-	agentProfileID          string
-	customInstructions      config.Config
-	projectRoleConfig       *config.Config
-	agentModel              *string
-	retryBaseDelay          time.Duration
-	retryMaxAttempts        int64
-	onAgentExecutionStarted AgentExecutionStartedFunc
-	onRunCompleted          RunCompletedFunc
-	discoveryPolicy         DiscoveryPolicy
-	onQueueItemEnqueued     func()
-	network                 NetworkStatusGateway
-	hitlEnabled             bool
-	hitlNotify              HITLNotifyFunc
-	hitlAnswerTransport     string
-	hitlGitHub              HITLGitHubSettings
+	db                          *sql.DB
+	repos                       *storage.Repositories
+	github                      GitHubGateway
+	git                         GitGateway
+	agentExecutor               AgentExecutor
+	logger                      bootstrap.Logger
+	now                         func() time.Time
+	agentTimeout                time.Duration
+	agentIdleTimeout            time.Duration
+	claimTTL                    time.Duration
+	validationCommands          []string
+	validationCommandsByProject map[string][]string
+	validationRunner            ValidationRunner
+	containmentTracker          processcontainment.LiveTracker
+	allowAutoCommit             bool
+	allowAutoPush               bool
+	githubCLIAvailable          bool
+	githubCLICheck              func(context.Context, string, string) bool
+	openPRStrategy              config.OpenPRStrategy
+	disclosure                  config.DisclosureConfig
+	agentRuntime                string
+	agentProfileID              string
+	customInstructions          config.Config
+	projectRoleConfig           *config.Config
+	agentModel                  *string
+	retryBaseDelay              time.Duration
+	retryMaxAttempts            int64
+	onAgentExecutionStarted     AgentExecutionStartedFunc
+	onRunCompleted              RunCompletedFunc
+	discoveryPolicy             DiscoveryPolicy
+	onQueueItemEnqueued         func()
+	network                     NetworkStatusGateway
+	hitlEnabled                 bool
+	hitlNotify                  HITLNotifyFunc
+	hitlAnswerTransport         string
+	hitlGitHub                  HITLGitHubSettings
 }
 
 type ProcessResult struct {
@@ -807,42 +814,61 @@ func New(options Options) *Runner {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultWorkerReadyTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
 	return &Runner{
-		db:                      options.DB,
-		repos:                   options.Repos,
-		github:                  options.GitHub,
-		git:                     options.Git,
-		agentExecutor:           options.AgentExecutor,
-		logger:                  options.Logger,
-		now:                     now,
-		agentTimeout:            agentTimeout,
-		agentIdleTimeout:        agentIdleTimeout,
-		claimTTL:                claimTTL,
-		validationCommands:      append([]string(nil), options.ValidationCommands...),
-		validationRunner:        options.ValidationRunner,
-		containmentTracker:      options.ContainmentTracker,
-		allowAutoCommit:         options.AllowAutoCommit,
-		allowAutoPush:           options.AllowAutoPush,
-		githubCLIAvailable:      githubCLIAvailable,
-		githubCLICheck:          options.GitHubCLIAutoPROpeningAvailable,
-		openPRStrategy:          strategy,
-		disclosure:              disclosureCfg,
-		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
-		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
-		customInstructions:      customInstructionConfig(options.CustomInstructions),
-		projectRoleConfig:       options.CustomInstructions,
-		agentModel:              cloneStringPtr(options.AgentModel),
-		retryBaseDelay:          retryBaseDelay,
-		retryMaxAttempts:        retryMaxAttempts,
-		onAgentExecutionStarted: options.OnAgentExecutionStarted,
-		onRunCompleted:          options.OnRunCompleted,
-		discoveryPolicy:         policy,
-		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
-		network:                 options.Network,
-		hitlEnabled:             options.HITLEnabled,
-		hitlNotify:              options.HITLNotify,
-		hitlAnswerTransport:     options.HITLAnswerTransport,
-		hitlGitHub:              options.HITLGitHub,
+		db:                          options.DB,
+		repos:                       options.Repos,
+		github:                      options.GitHub,
+		git:                         options.Git,
+		agentExecutor:               options.AgentExecutor,
+		logger:                      options.Logger,
+		now:                         now,
+		agentTimeout:                agentTimeout,
+		agentIdleTimeout:            agentIdleTimeout,
+		claimTTL:                    claimTTL,
+		validationCommands:          append([]string(nil), options.ValidationCommands...),
+		validationCommandsByProject: cloneValidationCommandsByProject(options.ValidationCommandsByProject),
+		validationRunner:            options.ValidationRunner,
+		containmentTracker:          options.ContainmentTracker,
+		allowAutoCommit:             options.AllowAutoCommit,
+		allowAutoPush:               options.AllowAutoPush,
+		githubCLIAvailable:          githubCLIAvailable,
+		githubCLICheck:              options.GitHubCLIAutoPROpeningAvailable,
+		openPRStrategy:              strategy,
+		disclosure:                  disclosureCfg,
+		agentRuntime:                strings.TrimSpace(options.AgentRuntime),
+		agentProfileID:              strings.TrimSpace(options.AgentProfileID),
+		customInstructions:          customInstructionConfig(options.CustomInstructions),
+		projectRoleConfig:           options.CustomInstructions,
+		agentModel:                  cloneStringPtr(options.AgentModel),
+		retryBaseDelay:              retryBaseDelay,
+		retryMaxAttempts:            retryMaxAttempts,
+		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
+		onRunCompleted:              options.OnRunCompleted,
+		discoveryPolicy:             policy,
+		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
+		network:                     options.Network,
+		hitlEnabled:                 options.HITLEnabled,
+		hitlNotify:                  options.HITLNotify,
+		hitlAnswerTransport:         options.HITLAnswerTransport,
+		hitlGitHub:                  options.HITLGitHub,
 	}
+}
+
+func cloneValidationCommandsByProject(source map[string][]string) map[string][]string {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string][]string, len(source))
+	for projectID, commands := range source {
+		cloned[projectID] = append([]string(nil), commands...)
+	}
+	return cloned
+}
+
+func (r *Runner) validationCommandsForProject(projectID string) []string {
+	if commands, ok := r.validationCommandsByProject[projectID]; ok {
+		return commands
+	}
+	return r.validationCommands
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -1676,11 +1702,12 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, agentVendor, derefString(agentModel))
+		validationCommands := r.validationCommandsForProject(input.Project.ID)
+		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, input.Project.ID, work, input.Project.RepoPath), r.disclosure, agentVendor, derefString(agentModel))
 		if err != nil {
 			return checkpoint, err
 		}
-		if len(r.validationCommands) > 0 {
+		if len(validationCommands) > 0 {
 			prompt += validationGatedLocalOnlyPrompt
 		}
 		// HITL (gated): let the agent pause to ask a human, and on resume feed the
@@ -1746,7 +1773,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID,
 			WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 			Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID),
-			RestrictToolNetwork: len(r.validationCommands) > 0,
+			RestrictToolNetwork: len(validationCommands) > 0,
 			UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 		})
 		if err != nil {
@@ -1882,6 +1909,7 @@ func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *worker
 
 func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	validationCommands := r.validationCommandsForProject(input.Project.ID)
 	work, err := requireWork(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -1894,7 +1922,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 	if err != nil {
 		return checkpoint, err
 	}
-	result, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: r.validationCommands})
+	result, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -1909,7 +1937,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 		return checkpoint, err
 	}
 	if reconciled {
-		result, err = r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: r.validationCommands})
+		result, err = r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1952,6 +1980,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 
 func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	validationCommands := r.validationCommandsForProject(input.Project.ID)
 	work, err := requireWork(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -1987,8 +2016,8 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if err != nil {
 		return checkpoint, err
 	}
-	if reconciled && len(r.validationCommands) > 0 {
-		result, validationErr := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: r.validationCommands})
+	if reconciled && len(validationCommands) > 0 {
+		result, validationErr := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 		if validationErr != nil {
 			return checkpoint, validationErr
 		}
@@ -2013,7 +2042,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		result.HeadSHA = inspect.HeadSHA
 		checkpoint.Validation = &result
 	}
-	if len(r.validationCommands) > 0 {
+	if len(validationCommands) > 0 {
 		worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
 		if rootErr != nil {
 			return checkpoint, rootErr
@@ -2066,7 +2095,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if checkpoint.PullRequest == nil {
 			checkpoint.PullRequest = &checkpointPullPR{Number: derefInt64(input.Loop.PRNumber), URL: stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])}
 		}
-		validatedHeadSHA := workerValidatedHeadSHA(checkpoint, r.validationCommands)
+		validatedHeadSHA := workerValidatedHeadSHA(checkpoint, validationCommands)
 		publishedHeadMismatch := validatedHeadSHA != "" && strings.TrimSpace(checkpoint.PullRequest.HeadSHA) != validatedHeadSHA
 		pushedByFallback := false
 		if !checkpoint.Lifecycle.Pushed || publishedHeadMismatch {
@@ -2125,7 +2154,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if rootErr != nil {
 			return checkpoint, rootErr
 		}
-		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(work.Branch, worktree.Branch), LocalHeadSHA: workerValidatedHeadSHA(checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(work.Branch, worktree.Branch), LocalHeadSHA: workerValidatedHeadSHA(checkpoint, validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		prURL := stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])
@@ -2170,7 +2199,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, rootErr
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
-		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(existing.HeadRefName, worktree.Branch), LocalHeadSHA: workerValidatedHeadSHA(checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(existing.HeadRefName, worktree.Branch), LocalHeadSHA: workerValidatedHeadSHA(checkpoint, validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
 				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 			}
@@ -2195,7 +2224,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
 	}
-	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, LocalHeadSHA: workerValidatedHeadSHA(checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, LocalHeadSHA: workerValidatedHeadSHA(checkpoint, validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 		if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
 			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		}
@@ -3302,12 +3331,12 @@ func pullRequestURL(pr *checkpointPullPR) string {
 	return strings.TrimSpace(pr.URL)
 }
 
-func (r *Runner) canAgentCreatePR(ctx context.Context, work workerInput, cwd string) bool {
+func (r *Runner) canAgentCreatePR(ctx context.Context, projectID string, work workerInput, cwd string) bool {
 	return work.ExecutionMode == "create-pr" &&
 		r.openPRStrategy != config.OpenPRStrategyManual &&
 		r.allowAutoPush &&
 		r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, cwd) &&
-		len(r.validationCommands) == 0 &&
+		len(r.validationCommandsForProject(projectID)) == 0 &&
 		r.validationRunner == nil
 }
 
@@ -3679,6 +3708,7 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		}
 		parts = append(parts, strings.Join(lines, "\n"))
 	}
+	parts = append(parts, testFirstDeliveryPrompt)
 	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "worker")
 	if instructionBlock.Text != "" {
 		parts = append(parts, instructionBlock.Text)
@@ -3848,7 +3878,9 @@ func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *che
 		}
 	}
 	if execution != nil && execution.Summary != "" {
-		lines = append(lines, "", "## Agent Summary", execution.Summary)
+		lines = append(lines, "", "## Verification", execution.Summary)
+	} else {
+		lines = append(lines, "", "## Verification", "No agent-supplied verification summary was recorded; document automated coverage or explain why it is not feasible before merge.")
 	}
 	if work.IssueNumber > 0 {
 		lines = append(lines, "", "Issue: "+formatIssueReference(firstNonEmpty(work.IssueRepo, work.Repo), work.IssueNumber))

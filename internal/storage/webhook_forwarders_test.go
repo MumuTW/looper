@@ -19,7 +19,7 @@ func TestWebhookForwardersRepositoryCRUD(t *testing.T) {
 	}
 
 	repo := NewRepositories(coordinator.DB()).WebhookForwarders
-	record := WebhookForwarderRecord{Repo: "nexu-io/looper", PID: 123, ProcessStart: 456, Fingerprint: "abc", Endpoint: "http://127.0.0.1:17310/webhook/forward", Events: "issue_comment,push", GHPath: "/bin/gh", DaemonID: "daemon", SpawnedAt: 1, UpdatedAt: 1}
+	record := WebhookForwarderRecord{Repo: "MumuTW/looper", PID: 123, ProcessStart: 456, Fingerprint: "abc", Endpoint: "http://127.0.0.1:17310/webhook/forward", Events: "issue_comment,push", GHPath: "/bin/gh", DaemonID: "daemon", SpawnedAt: 1, UpdatedAt: 1}
 	if err := repo.Upsert(context.Background(), record); err != nil {
 		t.Fatalf("Upsert() error = %v", err)
 	}
@@ -35,7 +35,7 @@ func TestWebhookForwardersRepositoryCRUD(t *testing.T) {
 	if len(records) != 1 || records[0].PID != 789 || records[0].UpdatedAt != 2 {
 		t.Fatalf("List() = %#v, want updated singleton record", records)
 	}
-	if err := repo.Delete(context.Background(), "nexu-io/looper"); err != nil {
+	if err := repo.Delete(context.Background(), "MumuTW/looper"); err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 	if err := repo.Delete(context.Background(), "nexu-io/missing"); err != nil {

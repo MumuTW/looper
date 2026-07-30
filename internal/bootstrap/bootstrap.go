@@ -11,8 +11,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/processsandbox"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/processsandbox"
 )
 
 type Runtime any
@@ -183,12 +183,19 @@ func Bootstrap(ctx context.Context, options Options) (Result, error) {
 }
 
 func validateSandboxRuntime(cfg config.Config, check func() error) error {
-	if len(config.ResolveValidationCommands(cfg)) == 0 {
+	if err := config.ValidateProjectValidationPolicies(cfg); err != nil {
+		return err
+	}
+	if !config.HasEffectiveValidationCommands(cfg) {
 		return nil
 	}
 	if err := check(); err != nil {
+		path := "projects[].validation.commands"
+		if len(config.ResolveValidationCommands(cfg)) > 0 {
+			path = "defaults.validationCommands"
+		}
 		return &config.ConfigValidationError{Issues: []config.ValidationIssue{{
-			Path:    "defaults.validationCommands",
+			Path:    path,
 			Message: "requires a trusted process sandbox runtime: " + err.Error(),
 		}}}
 	}
