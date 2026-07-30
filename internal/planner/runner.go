@@ -320,6 +320,7 @@ type DiscoveryPolicy struct {
 	RequireAssigneeCurrentUser bool
 }
 
+// Runner is the Planner: a reactive Role that produces a Spec from an Issue.
 type Runner struct {
 	db                      *sql.DB
 	repos                   *storage.Repositories

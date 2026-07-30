@@ -21,34 +21,42 @@ The startup-built, immutable view of active Projects materialized from SQLite re
 _Avoid_: registry, live config projects.
 
 **Planner**:
-A reactive Role that produces a Spec from an Issue.
+Defined at `planner.Runner` in `internal/planner`, whose doc comment carries
+the semantics: a reactive Role producing a Spec from an Issue.
 _Avoid_: designer, architect.
 
 **Triager**:
-An internal proactive Role for the personal GitHub workflow. It consumes new
-and reopened Issue events, persists a structured Triage Report, and projects
-accepted low-risk reports directly into Planner work. It has no configurable
-trigger labels and does not replace Fixer's review-feedback source.
+Defined at `triager.Runner` in `internal/triager`, whose doc comment carries
+the semantics: the internal proactive Role that persists Triage Reports and
+projects accepted low-risk reports into Planner work.
 _Avoid_: coordinator (a separate label/network control-plane role).
 
 **Worker**:
-A reactive Role that implements a Spec or an Issue, producing a Pull Request.
+Defined at `worker.Runner` in `internal/worker`, whose doc comment carries the
+semantics: a reactive Role implementing a Spec or an Issue into a Pull Request.
 _Avoid_: implementer, builder, coder.
 
 **Reviewer**:
-A reactive Role that reviews a Pull Request and posts review comments.
+Defined at `reviewer.Runner` in `internal/reviewer`, whose doc comment carries
+the semantics: a reactive Role reviewing a Pull Request.
 _Avoid_: critic, checker.
 
 **Fixer**:
-A reactive Role that addresses review feedback on a Pull Request.
+Defined at `fixer.Runner` in `internal/fixer`, whose doc comment carries the
+semantics: a reactive Role addressing review feedback on a Pull Request.
 _Avoid_: patcher, responder.
 
 **Merge Gatekeeper**:
-A reactive, agent-free policy Role that re-fetches current Pull Request state and writes an observe-only **Gate report**. It never reviews code, repairs a Pull Request, resolves comments, or merges.
+Defined at `gatekeeper.Runner` in `internal/gatekeeper`, whose doc comment
+carries the semantics: the agent-free policy Role writing observe-only **Gate
+report**s, never reviewing, repairing, resolving, or merging.
 _Avoid_: merger, reviewer, fixer.
 
 **Coordinator**:
-A proactive, LLM-driven Role for the legacy label-mediated intake path that performs Triage on fresh Issues and executes Dispatch. In Network mode, Coordinator is also the control plane for Issue admission, PR review assignment, and exact Node targeting, gated by the Network Lease. The internal Triager stands down while Coordinator is enabled for a Project so the two intake authorities cannot race.
+Defined at `coordinator.Runner` in `internal/coordinator`, whose doc comment
+carries the semantics: the proactive intake Role performing Triage and
+Dispatch, and in Network mode the Lease-gated control plane; the internal
+Triager stands down while it is enabled for a Project.
 _Avoid_: manager, commander, maintainer.
 
 ### Issue lifecycle

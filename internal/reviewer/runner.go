@@ -505,6 +505,8 @@ type DiscoveryPolicy struct {
 	RoutedClaimPolicy         networkpolicy.ProjectPolicy
 }
 
+// Runner is the Reviewer: a reactive Role that reviews a Pull Request and
+// posts review comments.
 type Runner struct {
 	db                      *sql.DB
 	repos                   *storage.Repositories

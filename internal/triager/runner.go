@@ -173,6 +173,11 @@ type Options struct {
 	DecisionLimit  int
 }
 
+// Runner is the Triager: an internal proactive Role for the personal GitHub
+// workflow. It consumes new and reopened Issue events, persists a structured
+// Triage Report, and projects accepted low-risk reports directly into Planner
+// work. It has no configurable trigger labels and does not replace Fixer's
+// review-feedback source.
 type Runner struct {
 	repos          *storage.Repositories
 	github         GitHubGateway
