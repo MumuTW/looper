@@ -139,7 +139,7 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 		Enabled: func(projectID string) bool {
 			return input.TriagerEnabled != nil && input.TriagerEnabled(projectID)
 		},
-		Supported: func(capabilities forge.Capabilities) bool { return capabilities.GitHubCLIPullRequestCreation },
+		Supported: func(capabilities forge.Capabilities) bool { return capabilities.GitHubIssues },
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: &decisionBudget})
 			return result.QueueItems, err

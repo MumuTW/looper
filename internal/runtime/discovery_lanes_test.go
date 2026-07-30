@@ -26,7 +26,8 @@ func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(
 	forgejoCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindForgejo)
 	planeCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindPlane)
 	if byName["triager"].Supported(githubCapabilities) != true ||
-		byName["triager"].Supported(forgejoCapabilities) != false {
+		byName["triager"].Supported(forgejoCapabilities) != false ||
+		byName["triager"].Supported(planeCapabilities) != false {
 		t.Fatal("triager must accept GitHub issues only")
 	}
 	if !byName[config.CodingRoleFixer].Supported(forgejoCapabilities) {
