@@ -123,6 +123,8 @@ func NewRuntimeState() *RuntimeState {
 // admission, PR review assignment, and exact Node targeting, gated by the
 // Network Lease. The internal Triager stands down while Coordinator is
 // enabled for a Project so the two intake authorities cannot race.
+// Stateless: its memory lives entirely in GitHub (labels, marked comments,
+// the event timeline); it owns no private database tables.
 type Runner struct {
 	repos      *storage.Repositories
 	github     GitHubGateway

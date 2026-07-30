@@ -506,7 +506,8 @@ type DiscoveryPolicy struct {
 }
 
 // Runner is the Reviewer: a reactive Role that reviews a Pull Request and
-// posts review comments.
+// posts review comments. Stateful: it persists runs in the local SQLite
+// database.
 type Runner struct {
 	db                      *sql.DB
 	repos                   *storage.Repositories

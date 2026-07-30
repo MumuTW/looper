@@ -223,8 +223,8 @@ boundary.
 ### Testing
 
 **Live sandbox**:
-(Prose-only: test infrastructure convention; see `e2e/` and the sandbox CI
-workflows.)
+(Prose-only: test infrastructure convention; see `internal/e2e/` and the
+sandbox CI workflows.)
 A dedicated remote repository on a real Provider used for live end-to-end tests. It is isolated from product and developer repositories, but still performs real provider mutations.
 _Avoid_: local sandbox, mock sandbox.
 
