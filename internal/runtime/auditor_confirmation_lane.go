@@ -33,7 +33,7 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 	if baseBranch == "" {
 		return fmt.Errorf("auditor project %s has no base branch", project.ID)
 	}
-	headSHA, err := gateway.GetBranchHeadSHA(ctx, branchHeadInput(repo, baseBranch, project.RepoPath))
+	headSHA, err := gateway.GetBranchHeadSHA(ctx, githubinfra.BranchHeadInput{Repo: repo, Branch: baseBranch, CWD: project.RepoPath})
 	if err != nil {
 		return fmt.Errorf("auditor read default branch head for confirmation: %w", err)
 	}
@@ -66,7 +66,7 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 			continue
 		}
 		requestedAt := now().UTC()
-		if err := gateway.RerequestCheckSuite(ctx, rerequestCheckSuiteInput(repo, suiteID, project.RepoPath)); err != nil {
+		if err := gateway.RerequestCheckSuite(ctx, githubinfra.RerequestCheckSuiteInput{Repo: repo, CheckSuiteID: suiteID, CWD: project.RepoPath}); err != nil {
 			return fmt.Errorf("auditor rerequest check suite %d: %w", suiteID, err)
 		}
 		if err := appendAuditorRerunRequest(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, repo, headSHA, suiteID, requestedAt); err != nil {
@@ -75,7 +75,7 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 		return nil
 	}
 
-	checks, err := gateway.ListPullRequestCheckRuns(ctx, pullRequestCheckRunsInput(repo, headSHA, project.RepoPath))
+	checks, err := gateway.ListPullRequestCheckRuns(ctx, githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: headSHA, CWD: project.RepoPath})
 	if err != nil {
 		return fmt.Errorf("auditor read rerequested check suites: %w", err)
 	}
@@ -89,18 +89,6 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 		return err
 	}
 	return appendAuditorConfirmation(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, headSHA, confirmation, decision, now())
-}
-
-func branchHeadInput(repo, branch, cwd string) githubinfra.BranchHeadInput {
-	return githubinfra.BranchHeadInput{Repo: repo, Branch: branch, CWD: cwd}
-}
-
-func pullRequestCheckRunsInput(repo, ref, cwd string) githubinfra.PullRequestCheckRunsInput {
-	return githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: ref, CWD: cwd}
-}
-
-func rerequestCheckSuiteInput(repo string, suiteID int64, cwd string) githubinfra.RerequestCheckSuiteInput {
-	return githubinfra.RerequestCheckSuiteInput{Repo: repo, CheckSuiteID: suiteID, CWD: cwd}
 }
 
 func latestAuditorObservation(events []storage.EventLogRecord, projectID, repo, headSHA string) (storage.EventLogRecord, auditor.FailureObservation, bool, error) {
