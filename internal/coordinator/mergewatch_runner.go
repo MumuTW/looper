@@ -96,7 +96,8 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, repo, cwd string, is
 		baseMarker.NextRetryAt = nil
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, "")
 	case mergewatch.ActionConflict, mergewatch.ActionRedCI:
-		labels := requiredPRTriggerLabels(roles.Fixer.Triggers)
+		fixer := config.EffectiveCodingRoles(roles)[config.CodingRoleFixer]
+		labels := requiredDiscoveryLabels(fixer.Discovery.Labels, fixer.Discovery.LabelMode)
 		if len(labels) > 0 {
 			if err := r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: snapshot.PRNumber, Labels: labels, CWD: cwd}); err != nil {
 				return false, err
@@ -268,19 +269,16 @@ func markerState(marker *mergeWatchComment) *mergewatch.PriorWatchMarker {
 }
 
 func requiredPRTriggerLabels(cfg config.FixerRoleTriggersConfig) []string {
-	if cfg.LabelMode == config.LabelModeAll {
-		return append([]string(nil), cfg.Labels...)
-	}
-	if len(cfg.Labels) == 0 {
-		return nil
-	}
-	return []string{cfg.Labels[0]}
+	return requiredDiscoveryLabels(cfg.Labels, cfg.LabelMode)
 }
 
 func retriageCleanupPatterns(roles config.RoleConfigs, triagedLabel string) []string {
 	patterns := []string{triagedLabel, "dispatch/*"}
-	patterns = append(patterns, requiredTriggerLabels(roles.Planner.Triggers)...)
-	patterns = append(patterns, requiredTriggerLabels(roles.Worker.Triggers)...)
+	registry := config.EffectiveCodingRoles(roles)
+	planner := registry[config.CodingRolePlanner]
+	worker := registry[config.CodingRoleWorker]
+	patterns = append(patterns, requiredDiscoveryLabels(planner.Discovery.Labels, planner.Discovery.LabelMode)...)
+	patterns = append(patterns, requiredDiscoveryLabels(worker.Discovery.Labels, worker.Discovery.LabelMode)...)
 	return patterns
 }
 

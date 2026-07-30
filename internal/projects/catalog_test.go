@@ -59,6 +59,44 @@ func TestCatalogPublishGlobalsPreservesMaterializedProjects(t *testing.T) {
 	}
 }
 
+func TestCatalogPreservesDetachedCanonicalCodingRegistryAcrossPublications(t *testing.T) {
+	t.Parallel()
+
+	worker := config.CodingRoleConfig{
+		Instructions: "canonical worker guidance",
+		Discovery: config.RoleDiscoveryConfig{
+			Enabled: true,
+			Labels:  []string{"canonical"},
+		},
+	}
+	initial := config.Config{Roles: config.RoleConfigs{Coding: map[string]config.CodingRoleConfig{
+		config.CodingRoleWorker: worker,
+	}}}
+	catalog := NewCatalog(initial)
+	initial.Roles.Coding[config.CodingRoleWorker] = config.CodingRoleConfig{}
+	catalog.Publish([]config.ProjectRefConfig{{ID: "database", Repo: "core/database"}})
+
+	snapshot := catalog.Snapshot()
+	got, ok := snapshot.Roles.Coding[config.CodingRoleWorker]
+	if !ok || got.Instructions != worker.Instructions || len(got.Discovery.Labels) != 1 || got.Discovery.Labels[0] != "canonical" {
+		t.Fatalf("Snapshot().Roles.Coding[worker] = %#v, want canonical detached role", got)
+	}
+	snapshot.Roles.Coding[config.CodingRoleWorker] = config.CodingRoleConfig{}
+
+	reloaded := config.CloneConfig(catalog.Snapshot())
+	reloaded.Roles.Coding[config.CodingRoleWorker] = config.CodingRoleConfig{
+		Instructions: "reloaded worker guidance",
+		Discovery:    config.RoleDiscoveryConfig{Enabled: true, Labels: []string{"reloaded"}},
+	}
+	catalog.PublishGlobals(reloaded)
+	reloaded.Roles.Coding[config.CodingRoleWorker] = config.CodingRoleConfig{}
+
+	got = catalog.Snapshot().Roles.Coding[config.CodingRoleWorker]
+	if got.Instructions != "reloaded worker guidance" || len(got.Discovery.Labels) != 1 || got.Discovery.Labels[0] != "reloaded" {
+		t.Fatalf("reloaded Snapshot().Roles.Coding[worker] = %#v", got)
+	}
+}
+
 func TestCatalogPublishPreservesReloadedGlobals(t *testing.T) {
 	t.Parallel()
 

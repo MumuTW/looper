@@ -16,8 +16,117 @@ func ProjectRoleConfigs(cfg Config, projectID string) RoleConfigs {
 	if project.Roles != nil {
 		stripped := stripRoleAgentBindings(*project.Roles)
 		mergeRoleConfigs(&roles, stripped)
+		roles.Coding = projectCodingRoleConfigs(cfg.Roles, stripped)
 	}
 	return roles
+}
+
+// projectCodingRoleConfigs preserves legacy project role overrides after the
+// global registry became the runtime authority. projects[].roles.coding is
+// rejected at load time, so this translates only the existing compatible
+// named overrides onto a copy of the global registry.
+func projectCodingRoleConfigs(global RoleConfigs, partial PartialRoleConfigs) map[string]CodingRoleConfig {
+	registry := cloneCodingRoleRegistry(EffectiveCodingRoles(global))
+	for name, override := range legacyCodingRoleOverrides(partial) {
+		base, ok := registry[name]
+		if !ok {
+			continue
+		}
+		registry[name] = applyPartialCodingRoleConfig(base, override)
+	}
+	return registry
+}
+
+func cloneCodingRoleRegistry(registry map[string]CodingRoleConfig) map[string]CodingRoleConfig {
+	cloned := make(map[string]CodingRoleConfig, len(registry))
+	for name, role := range registry {
+		cloned[name] = cloneCodingRoleConfig(role)
+	}
+	return cloned
+}
+
+// legacyCodingRoleOverrides translates the shared fields of legacy named role
+// sections into registry overlays. Agent bindings reflect the supplied input;
+// project callers pass stripRoleAgentBindings output, so their global-only
+// bindings remain excluded.
+func legacyCodingRoleOverrides(roles PartialRoleConfigs) map[string]PartialCodingRoleConfig {
+	overrides := make(map[string]PartialCodingRoleConfig, 4)
+	if roles.Planner != nil {
+		overrides[CodingRolePlanner] = PartialCodingRoleConfig{
+			Instructions: roles.Planner.Instructions,
+			Agent:        roles.Planner.Agent,
+			Discovery:    partialIssueCodingDiscovery(roles.Planner.AutoDiscovery, roles.Planner.Triggers),
+		}
+	}
+	if roles.Worker != nil {
+		overrides[CodingRoleWorker] = PartialCodingRoleConfig{
+			Instructions: roles.Worker.Instructions,
+			Agent:        roles.Worker.Agent,
+			Discovery:    partialIssueCodingDiscovery(roles.Worker.AutoDiscovery, roles.Worker.Triggers),
+		}
+	}
+	if roles.Reviewer != nil {
+		partial := roles.Reviewer
+		overrides[CodingRoleReviewer] = PartialCodingRoleConfig{
+			Instructions: partial.Instructions,
+			Agent:        partial.Agent,
+			Discovery:    partialReviewerCodingDiscovery(partial.Discovery),
+		}
+	}
+	if roles.Fixer != nil {
+		overrides[CodingRoleFixer] = PartialCodingRoleConfig{
+			Instructions: roles.Fixer.Instructions,
+			Agent:        roles.Fixer.Agent,
+			Discovery:    partialFixerCodingDiscovery(roles.Fixer.AutoDiscovery, roles.Fixer.Triggers),
+		}
+	}
+	return overrides
+}
+
+func partialIssueCodingDiscovery(enabled *bool, triggers *PartialIssueRoleTriggersConfig) *PartialRoleDiscoveryConfig {
+	if enabled == nil && triggers == nil {
+		return nil
+	}
+	discovery := &PartialRoleDiscoveryConfig{Enabled: enabled}
+	if triggers != nil {
+		discovery.Labels = triggers.Labels
+		discovery.LabelMode = triggers.LabelMode
+		discovery.RequireAssigneeCurrentUser = triggers.RequireAssigneeCurrentUser
+		discovery.PlaneAssigneeID = triggers.PlaneAssigneeID
+	}
+	return discovery
+}
+
+func partialReviewerCodingDiscovery(discovery *PartialReviewerRoleDiscoveryConfig) *PartialRoleDiscoveryConfig {
+	if discovery == nil {
+		return nil
+	}
+	result := &PartialRoleDiscoveryConfig{Enabled: discovery.AutoDiscovery}
+	if discovery.Triggers != nil {
+		result.IncludeDrafts = discovery.Triggers.IncludeDrafts
+		result.RequireReviewRequest = discovery.Triggers.RequireReviewRequest
+		result.EnableSelfReview = discovery.Triggers.EnableSelfReview
+		result.Labels = discovery.Triggers.Labels
+		result.LabelMode = discovery.Triggers.LabelMode
+	}
+	return result
+}
+
+func partialFixerCodingDiscovery(enabled *bool, triggers *PartialFixerRoleTriggersConfig) *PartialRoleDiscoveryConfig {
+	if enabled == nil && triggers == nil {
+		return nil
+	}
+	discovery := &PartialRoleDiscoveryConfig{Enabled: enabled}
+	if triggers != nil {
+		discovery.IncludeDrafts = triggers.IncludeDrafts
+		if triggers.AuthorFilter != nil {
+			filter := AuthorFilter(*triggers.AuthorFilter)
+			discovery.AuthorFilter = &filter
+		}
+		discovery.Labels = triggers.Labels
+		discovery.LabelMode = triggers.LabelMode
+	}
+	return discovery
 }
 
 // stripRoleAgentBindings returns a copy of partial with Agent nilled on coding roles.
@@ -56,8 +165,19 @@ func ProjectProviderKind(cfg Config, projectID string) ProviderKind {
 	return resolvedProjectProviderKind(cfg, *project)
 }
 
+// ProjectCodingRoleConfig returns the effective canonical registry entry for a
+// project, including compatible project-level legacy overrides.
+func ProjectCodingRoleConfig(cfg Config, projectID, role string) (CodingRoleConfig, bool) {
+	roles := ProjectRoleConfigs(cfg, projectID)
+	entry, ok := EffectiveCodingRoles(roles)[role]
+	return entry, ok && isCodingRole(role)
+}
+
 func ProjectRoleAutoDiscoveryEnabled(cfg Config, projectID, role string) bool {
 	roles := ProjectRoleConfigs(cfg, projectID)
+	if coding, ok := EffectiveCodingRoles(roles)[role]; ok && isCodingRole(role) {
+		return coding.Discovery.Enabled
+	}
 	switch role {
 	case "coordinator":
 		return roles.Coordinator.Enabled

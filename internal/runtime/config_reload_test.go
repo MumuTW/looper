@@ -36,6 +36,10 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Projects = []config.ProjectRefConfig{{ID: "import-input"}}
+	cfg.Roles.Coding = config.CodingRolesFromLegacy(cfg.Roles)
+	worker := cfg.Roles.Coding[config.CodingRoleWorker]
+	worker.Instructions = "canonical worker guidance"
+	cfg.Roles.Coding[config.CodingRoleWorker] = worker
 	oldVendor := config.AgentVendorCodex
 	cfg.Agent.Vendor = &oldVendor
 	loaded := config.LoadedFileConfig{
@@ -75,6 +79,9 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 	if got.Agent.Vendor == nil || *got.Agent.Vendor != newVendor {
 		t.Fatalf("Config().Agent.Vendor = %#v, want %q", got.Agent.Vendor, newVendor)
 	}
+	if got.Roles.Coding[config.CodingRoleWorker].Instructions != "canonical worker guidance" {
+		t.Fatalf("Config().Roles.Coding[worker] = %#v, want canonical instructions", got.Roles.Coding[config.CodingRoleWorker])
+	}
 	if len(got.Projects) != 1 || got.Projects[0].ID != "database-project" {
 		t.Fatalf("Config().Projects = %#v, want materialized database project", got.Projects)
 	}
@@ -90,6 +97,9 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 	}
 	if operationSnapshot.Agent.Vendor == nil || *operationSnapshot.Agent.Vendor != oldVendor {
 		t.Fatalf("captured operation vendor = %#v, want retained %q", operationSnapshot.Agent.Vendor, oldVendor)
+	}
+	if operationSnapshot.Roles.Coding[config.CodingRoleWorker].Instructions != "canonical worker guidance" {
+		t.Fatalf("captured operation coding role = %#v, want retained canonical instructions", operationSnapshot.Roles.Coding[config.CodingRoleWorker])
 	}
 }
 

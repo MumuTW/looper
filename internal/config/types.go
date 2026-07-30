@@ -598,19 +598,19 @@ type CoordinatorRoleConfig struct {
 }
 
 type RoleConfigs struct {
-	// Coding holds every coding role keyed by role name. The migration onto
-	// it is in progress, so it is not yet the authority for everything it
-	// carries: today the only thing read from it is which roles exist and
-	// each one's Priority, which discoveryLanes uses to build and
-	// order the scheduler's discovery lanes. Discovery filters, per-role
-	// instructions, and agent resolution are still read from the named
-	// fields below, so a value set on Coding.Discovery or Coding.Agent
-	// alone changes nothing.
+	// Coding is the canonical runtime registry for the compiled planner,
+	// worker, reviewer, and fixer roles. Discovery, instructions, agent
+	// resolution, and lane priority read from this map. The named sections
+	// below remain source-compatible inputs and are projected here first.
 	//
-	// Not serialized: while it is still derived from the named fields by
-	// Normalize, emitting it would duplicate them in every config payload
-	// and in the frozen parity fixtures. Once roles are authored directly
-	// as TOML sections this becomes real input and gains a JSON tag.
+	// Normalize overlays TOML-authored roles.coding.<shipped-role> fields on
+	// that projection. Arbitrary names are rejected because no custom runner
+	// exists; gatekeeper remains a compiled policy, outside author control.
+	//
+	// Not serialized: it is derived state, so emitting it would duplicate
+	// the inputs in every config payload and in the frozen parity fixtures.
+	// The authorable input lives on PartialRoleConfigs.Coding, which is
+	// serialized.
 	Coding map[string]CodingRoleConfig `json:"-"`
 
 	Planner     PlannerRoleConfig     `json:"planner"`
@@ -1061,6 +1061,38 @@ type PartialFixerRoleConfig struct {
 	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
 }
 
+// PartialRoleDiscoveryConfig is the authorable form of RoleDiscoveryConfig:
+// every field is a pointer so config layers merge field-by-field and an unset
+// field stays distinguishable from an explicit zero.
+type PartialRoleDiscoveryConfig struct {
+	Enabled   *bool       `json:"enabled,omitempty"`
+	Source    *WorkSource `json:"source,omitempty"`
+	Labels    *[]string   `json:"labels,omitempty"`
+	LabelMode *LabelMode  `json:"labelMode,omitempty"`
+
+	// Issue-source only.
+	RequireAssigneeCurrentUser *bool   `json:"requireAssigneeCurrentUser,omitempty"`
+	PlaneAssigneeID            *string `json:"planeAssigneeId,omitempty"`
+
+	// Pull-request-source only.
+	IncludeDrafts        *bool         `json:"includeDrafts,omitempty"`
+	AuthorFilter         *AuthorFilter `json:"authorFilter,omitempty"`
+	RequireReviewRequest *bool         `json:"requireReviewRequest,omitempty"`
+	EnableSelfReview     *bool         `json:"enableSelfReview,omitempty"`
+}
+
+// PartialCodingRoleConfig is one TOML-authored coding role — a
+// `[roles.coding.<name>]` section. Pointer fields keep "unset" distinct from
+// "explicit zero" so layers merge field-by-field and Normalize can reject a
+// custom role with no priority instead of letting the zero value claim the
+// first lane (see CodingRoleConfig.Priority).
+type PartialCodingRoleConfig struct {
+	Discovery    *PartialRoleDiscoveryConfig `json:"discovery,omitempty"`
+	Instructions *string                     `json:"instructions,omitempty"`
+	Agent        *RoleAgentConfig            `json:"agent,omitempty"`
+	Priority     *int                        `json:"priority,omitempty"`
+}
+
 type PartialCoordinatorTriageDispositionConfig struct {
 	OutOfScopeLabel       *string `json:"outOfScopeLabel,omitempty"`
 	UnclearLabel          *string `json:"unclearLabel,omitempty"`
@@ -1112,11 +1144,17 @@ type PartialCoordinatorRoleConfig struct {
 }
 
 type PartialRoleConfigs struct {
-	Planner     *PartialPlannerRoleConfig     `json:"planner,omitempty"`
-	Reviewer    *PartialReviewerRoleConfig    `json:"reviewer,omitempty"`
-	Fixer       *PartialFixerRoleConfig       `json:"fixer,omitempty"`
-	Worker      *PartialWorkerRoleConfig      `json:"worker,omitempty"`
-	Coordinator *PartialCoordinatorRoleConfig `json:"coordinator,omitempty"`
+	// Coding holds TOML-authored coding-role overlays
+	// (`[roles.coding.<shipped-role>]`). It is global-only:
+	// projects[].roles.coding is rejected. The only accepted names are the
+	// compiled planner, worker, reviewer, and fixer runners; gatekeeper's
+	// compiled policy cannot be overridden.
+	Coding      map[string]PartialCodingRoleConfig `json:"coding,omitempty"`
+	Planner     *PartialPlannerRoleConfig          `json:"planner,omitempty"`
+	Reviewer    *PartialReviewerRoleConfig         `json:"reviewer,omitempty"`
+	Fixer       *PartialFixerRoleConfig            `json:"fixer,omitempty"`
+	Worker      *PartialWorkerRoleConfig           `json:"worker,omitempty"`
+	Coordinator *PartialCoordinatorRoleConfig      `json:"coordinator,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }
