@@ -78,6 +78,19 @@ jobs:
           sudo ln -s ../looper-srt-runtime/bin/srt /usr/local/lib/looper-srt-tools/srt
           echo /usr/local/lib/looper-srt-tools >> "$GITHUB_PATH"
 
+      # The srt trust probe rejects the runtime when any ancestor of the
+      # installation is writable by the daemon user. Some hosted-runner
+      # images ship /usr/local and /usr/local/lib writable by the runner
+      # account (ownership or ACLs vary by image build), which fails the
+      # probe for every PR that lands on such a runner. Pin the ancestor
+      # chain to root-owned, non-group-writable, ACL-free so verify does
+      # not depend on which image the runner pool serves.
+      - name: Harden sandbox runtime ancestors
+        run: |
+          sudo chown root:root /usr/local /usr/local/lib
+          sudo chmod 0755 /usr/local /usr/local/lib
+          sudo setfacl -b /usr/local /usr/local/lib
+
       - name: Test
         env:
           LOOPER_REQUIRE_TRUSTED_SRT: "1"
