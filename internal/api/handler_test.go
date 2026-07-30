@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/daemonbinary"
 	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
@@ -7710,6 +7711,167 @@ func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) te
 	})
 
 	return testFixture{rootDir: rootDir, now: now, config: cfg, runtime: rt}
+}
+
+// TestHandlerLabelsInitProvisionsStandardLabels is the contract test that the
+// label-provisioning entrypoint is reachable from the supported API. Before this
+// route, InitializeLabels had no production caller: StandardLooperLabels was a
+// list nothing consumed, fresh repositories never received looper:worker-ready,
+// and default Worker discovery stayed silent. The injected provisioner stands
+// in for the Gateway so the route is exercised without a real gh.
+func TestHandlerLabelsInitProvisionsStandardLabels(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+
+	var captured githubinfra.InitializeLabelsInput
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		LabelProvisioner: func(ctx context.Context, input githubinfra.InitializeLabelsInput) (githubinfra.LabelInitResult, error) {
+			captured = input
+			return githubinfra.LabelInitResult{
+				Repo:   input.Repo,
+				DryRun: input.DryRun,
+				Labels: []githubinfra.LabelInitItem{
+					{Name: "looper:worker-ready", Status: "created", Color: "0052cc", Description: "Picked up automatically by worker"},
+					{Name: "looper:plan", Status: "skipped", Color: "5319e7", Description: "Picked up automatically by planner"},
+				},
+				Summary: githubinfra.LabelInitSummary{Created: 1, Skipped: 1},
+			}, nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/labels/init", strings.NewReader(`{"repo":"acme/looper"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	if captured.Repo != "acme/looper" || captured.DryRun {
+		t.Fatalf("provisioner input = %#v, want repo=acme/looper dryRun=false", captured)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data, _ := body["data"].(map[string]any)
+	if data == nil {
+		t.Fatalf("response missing data: %s", recorder.Body.String())
+	}
+	if got := data["repo"]; got != "acme/looper" {
+		t.Errorf("data.repo = %v, want acme/looper", got)
+	}
+	summary, _ := data["summary"].(map[string]any)
+	if summary == nil || summary["created"] != float64(1) || summary["skipped"] != float64(1) {
+		t.Errorf("data.summary = %#v, want created=1 skipped=1", summary)
+	}
+	labels, _ := data["labels"].([]any)
+	if len(labels) != 2 {
+		t.Errorf("data.labels len = %d, want 2", len(labels))
+	}
+}
+
+func TestHandlerLabelsInitRejectsEmptyRepo(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		LabelProvisioner: func(context.Context, githubinfra.InitializeLabelsInput) (githubinfra.LabelInitResult, error) {
+			t.Fatal("provisioner must not run for an empty repo")
+			return githubinfra.LabelInitResult{}, nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/labels/init", strings.NewReader(`{"repo":"  "}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHandlerLabelsInitMapsSlugValidationToBadRequest(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		LabelProvisioner: func(context.Context, githubinfra.InitializeLabelsInput) (githubinfra.LabelInitResult, error) {
+			return githubinfra.LabelInitResult{}, fmt.Errorf("invalid GitHub repo: not-a-slug")
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/labels/init", strings.NewReader(`{"repo":"not-a-slug"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a malformed slug (body %s)", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errObj, _ := body["error"].(map[string]any)
+	if errObj == nil || !strings.Contains(fmt.Sprint(errObj["message"]), "invalid GitHub repo") {
+		t.Fatalf("error envelope = %#v, want the slug-validation message", body)
+	}
+}
+
+func TestHandlerLabelsInitRejectsNonPost(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt, LabelProvisioner: func(context.Context, githubinfra.InitializeLabelsInput) (githubinfra.LabelInitResult, error) {
+		t.Fatal("provisioner must not run for a non-POST")
+		return githubinfra.LabelInitResult{}, nil
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/labels/init", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405 (body %s)", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestHandlerLabelsInitDefaultProvisionerDrivesGateway is the end-to-end
+// contract for the production path: with no LabelProvisioner override, the
+// route builds a real Gateway from the config's gh path and drives
+// InitializeLabels through it. The fake GHRun stands in for gh so the contract
+// is exercised without a binary, while still passing through the same Gateway
+// code the daemon runs. A fresh repo (empty label list) must create every
+// standard label, including looper:worker-ready — the exact label the
+// unreachable subsystem was failing to provision.
+func TestHandlerLabelsInitDefaultProvisionerDrivesGateway(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.Tools.GHPath = stringPtr("gh")
+
+	var created []string
+	ghRun := func(_ context.Context, options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case args == "label list --repo acme/looper --limit 1000 --json name,color,description":
+			return shell.Result{Stdout: `[]`}, nil
+		case strings.HasPrefix(args, "label create ") && strings.Contains(args, "--repo acme/looper"):
+			created = append(created, options.Args[2])
+			return shell.Result{Stdout: "{}"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	h := NewHandler(Context{Config: cfg, Runtime: rt, LabelGatewayGHRun: ghRun})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/labels/init", strings.NewReader(`{"repo":"acme/looper"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data, _ := body["data"].(map[string]any)
+	summary, _ := data["summary"].(map[string]any)
+	if summary == nil || summary["created"] != float64(9) || summary["failed"] != float64(0) {
+		t.Fatalf("data.summary = %#v, want created=9 failed=0 (all standard labels provisioned)", summary)
+	}
+	if !slices.Contains(created, "looper:worker-ready") {
+		t.Errorf("created labels = %v, want looper:worker-ready among them", created)
+	}
 }
 
 func startTestRuntime(t *testing.T) (*looperdruntime.Runtime, config.Config) {

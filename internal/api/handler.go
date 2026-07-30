@@ -110,6 +110,14 @@ type Context struct {
 	TakeoverLoop         func(context.Context, string, string) (TakeoverResult, error)
 	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
+	// LabelProvisioner provisions looper's standard GitHub labels on a repository.
+	// Nil falls back to a Gateway built from the live config (see
+	// defaultLabelProvisioner); tests inject a double to exercise the route
+	// without a real gh binary.
+	LabelProvisioner func(context.Context, githubinfra.InitializeLabelsInput) (githubinfra.LabelInitResult, error)
+	// LabelGatewayGHRun overrides the gh runner used by the default provisioner.
+	// Production leaves it nil so the Gateway uses shell.Run.
+	LabelGatewayGHRun func(context.Context, shell.Options) (shell.Result, error)
 	// LookupPullRequest reads a pull request straight from the forge for the
 	// paths that must accept a pull request Looper has never snapshotted. Optional:
 	// when nil, an unsnapshotted pull request stays unresolvable.
@@ -465,6 +473,18 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case apiBasePath + "/reviewer/repair":
 		payload, err := h.buildReviewerRepairRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeSuccess(w, requestID, payload)
+		return
+	case apiBasePath + "/labels/init":
+		payload, err := h.buildLabelsInitResponse(r)
 		if err != nil {
 			var typed apiError
 			if !asAPIError(err, &typed) {
@@ -7653,4 +7673,62 @@ func looperdArtifactName(target string) *string {
 
 	value := "looperd-" + target
 	return &value
+}
+
+// labelsInitRequest is the body of POST /api/v1/labels/init. Repo is the
+// owner/name (or host/owner/name) slug gh addresses via --repo; DryRun plans
+// the label set without mutating GitHub.
+type labelsInitRequest struct {
+	Repo   string `json:"repo"`
+	DryRun bool   `json:"dryRun"`
+}
+
+// buildLabelsInitResponse is the supported entrypoint for label provisioning.
+// StandardLooperLabels and InitializeLabels existed before this route with no
+// production caller, so fresh repositories never received looper:worker-ready
+// and default Worker discovery stayed silent; wiring the call behind the API
+// makes the subsystem live and reachable from `looper labels init`.
+func (h *Handler) buildLabelsInitResponse(r *http.Request) (any, error) {
+	if r.Method != http.MethodPost {
+		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/labels/init")}
+	}
+	body := labelsInitRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	}
+	repo := strings.TrimSpace(body.Repo)
+	if repo == "" {
+		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "repo is required"}
+	}
+
+	provisioner := h.context.LabelProvisioner
+	if provisioner == nil {
+		provisioner = h.defaultLabelProvisioner
+	}
+	result, err := provisioner(r.Context(), githubinfra.InitializeLabelsInput{Repo: repo, DryRun: body.DryRun})
+	if err != nil {
+		// A malformed slug is a client error; everything else (gh unavailable,
+		// label list/create failure, partial mutation failure) is reported as a
+		// server error. InitializeLabels is idempotent, so a re-run after a
+		// partial failure provisions only the labels that did not land.
+		if strings.HasPrefix(err.Error(), "invalid GitHub repo:") {
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
+		}
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	return result, nil
+}
+
+// defaultLabelProvisioner is the production LabelProvisioner: a Gateway built
+// from the live config's gh path. gh is addressed with --repo, so no working
+// directory is required; an empty CWD lets shell.Run inherit the daemon's,
+// matching how the hold-label preflight already invokes gh from this handler.
+func (h *Handler) defaultLabelProvisioner(ctx context.Context, input githubinfra.InitializeLabelsInput) (githubinfra.LabelInitResult, error) {
+	ghPath := strings.TrimSpace(derefString(h.effectiveConfig().Tools.GHPath))
+	ghRun := h.context.LabelGatewayGHRun
+	if ghRun == nil {
+		ghRun = shell.Run
+	}
+	gateway := githubinfra.New(githubinfra.Options{GHPath: ghPath, GHRun: ghRun})
+	return gateway.InitializeLabels(ctx, input)
 }
