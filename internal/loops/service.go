@@ -43,6 +43,11 @@ type TerminateResult struct {
 	CancelledQueueItems int64
 }
 
+type HoldResult struct {
+	Loop                storage.LoopRecord
+	CancelledQueueItems int64
+}
+
 func (s *Service) Create(ctx context.Context, input CreateInput) (storage.LoopRecord, error) {
 	if s.DB == nil || s.Repos == nil || s.Repos.Loops == nil {
 		return storage.LoopRecord{}, fmt.Errorf("loops service is not configured")
@@ -179,7 +184,7 @@ func (s *Service) TransitionStatus(ctx context.Context, loopID string, input Tra
 		// human_takeover: its only non-terminal outgoing edge is handback's
 		// → queued. Every other writer goes through the guarded Upsert and
 		// cannot release the hold.
-		if err := repos.Loops.UpsertReleasingHumanHold(ctx, updated); err != nil {
+		if err := repos.Loops.UpsertChangingHumanHold(ctx, updated); err != nil {
 			return storage.LoopRecord{}, err
 		}
 		return updated, nil
@@ -216,7 +221,7 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 		updated.UpdatedAt = eventlog.NextJavaScriptISOString(now, loop.UpdatedAt)
 		// human_takeover has no → paused edge, so the assertion above already
 		// refused a held loop before this write is reached.
-		if err := repos.Loops.UpsertReleasingHumanHold(ctx, updated); err != nil {
+		if err := repos.Loops.UpsertChangingHumanHold(ctx, updated); err != nil {
 			return PauseResult{}, err
 		}
 		cancelled, err := repos.Queue.CancelByLoop(ctx, loopID, updated.UpdatedAt, reason)
@@ -227,6 +232,63 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 	})
 	if err != nil {
 		return PauseResult{}, err
+	}
+	return result, nil
+}
+
+// Hold parks a loop for a human (`looper takeover`) and cancels its queue item
+// in one transaction, so the loop's target is fenced by a single commit.
+//
+// This is deliberately the *first* write takeover makes, before the in-flight
+// run is stopped. The old order — pause, cancel the queue item, then take over —
+// released the target's shared queue lock while the loop was still merely
+// `paused`, which left a window in which the scheduler could claim a *sibling*
+// loop on the same worktree; the claim predicate can refuse a new claim but
+// cannot revoke one already granted, and takeover kills only the selected loop
+// (#177). Committing the hold first means the claim boundary and the write guard
+// both apply for the whole of the stop that follows.
+//
+// Holding an already-held loop is a no-op success: takeover is a control an
+// operator may reasonably repeat.
+func (s *Service) Hold(ctx context.Context, loopID string, reason *string) (HoldResult, error) {
+	if s.DB == nil || s.Repos == nil || s.Repos.Loops == nil || s.Repos.Queue == nil {
+		return HoldResult{}, fmt.Errorf("loops service is not configured")
+	}
+	now := s.currentTime()
+	result, err := storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (HoldResult, error) {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return HoldResult{}, err
+		}
+		if loop == nil {
+			return HoldResult{}, fmt.Errorf("loop not found: %s", loopID)
+		}
+		currentStatus := domain.LoopStatus(loop.Status)
+		if currentStatus != domain.LoopStatusHumanTakeover {
+			// The transition table is the authority for which statuses a human may
+			// take over from; every non-terminal one is on it.
+			if err := domain.AssertLoopStatusTransition(currentStatus, domain.LoopStatusHumanTakeover); err != nil {
+				return HoldResult{}, err
+			}
+		}
+		updated := *loop
+		updated.Status = string(domain.LoopStatusHumanTakeover)
+		updated.NextRunAt = nil
+		updated.UpdatedAt = eventlog.NextJavaScriptISOString(now, loop.UpdatedAt)
+		if err := repos.Loops.UpsertChangingHumanHold(ctx, updated); err != nil {
+			return HoldResult{}, err
+		}
+		// Same transaction as the status write: the queue lock this releases is
+		// never open while the loop is unheld.
+		cancelled, err := repos.Queue.CancelByLoop(ctx, loopID, updated.UpdatedAt, reason)
+		if err != nil {
+			return HoldResult{}, err
+		}
+		return HoldResult{Loop: updated, CancelledQueueItems: cancelled}, nil
+	})
+	if err != nil {
+		return HoldResult{}, err
 	}
 	return result, nil
 }
@@ -257,7 +319,7 @@ func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) 
 		updated.UpdatedAt = eventlog.NextJavaScriptISOString(now, loop.UpdatedAt)
 		// Terminate is an explicit operator exit and is on human_takeover's
 		// transition list; the assertion above is the authority.
-		if err := repos.Loops.UpsertReleasingHumanHold(ctx, updated); err != nil {
+		if err := repos.Loops.UpsertChangingHumanHold(ctx, updated); err != nil {
 			return TerminateResult{}, err
 		}
 		cancelled, err := repos.Queue.CancelByLoop(ctx, loopID, updated.UpdatedAt, reason)

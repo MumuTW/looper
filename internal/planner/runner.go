@@ -1768,7 +1768,7 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 				// Takeover committed between the list read and this write.
 				if storage.IsLoopHumanHeldError(err) {
-					return loopUpsertResult{record: existing, created: false}, nil
+					return r.heldLoopResult(ctx, existing.ID, false)
 				}
 				return loopUpsertResult{}, err
 			}
@@ -1816,13 +1816,46 @@ func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopReco
 	}
 	updated.UpdatedAt = nowISO
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
-		// Takeover committed between the caller's read and this write.
+		// Takeover committed between the caller's read and this write. Return what
+		// is actually persisted, not the stale pre-takeover record: the caller
+		// decides whether to materialize a queue item from this record's status,
+		// and `existing` still says `queued`.
 		if storage.IsLoopHumanHeldError(err) {
-			return existing, nil
+			held, readErr := r.heldLoopResult(ctx, existing.ID, false)
+			if readErr != nil {
+				return storage.LoopRecord{}, readErr
+			}
+			if held.blocked {
+				// The row is gone; report the hold rather than the stale record so
+				// materialization skips instead of enqueueing against nothing.
+				parked := existing
+				parked.Status = string(domain.LoopStatusHumanTakeover)
+				return parked, nil
+			}
+			return held.record, nil
 		}
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil
+}
+
+// heldLoopResult answers a refused guarded write with what is actually
+// persisted. The refused record is stale by definition — it is the row as it was
+// before takeover (or before handback) committed — and materializeIssue decides
+// whether to create an active queue item from this record's status, so returning
+// the stale `queued` row would enqueue work against a loop a human owns.
+//
+// A failed re-read propagates: only losing the race is routine.
+func (r *Runner) heldLoopResult(ctx context.Context, loopID string, authorityMatch bool) (loopUpsertResult, error) {
+	current, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	if current == nil {
+		// No row to materialize against; blocked is the planner's "skip" result.
+		return loopUpsertResult{blocked: true}, nil
+	}
+	return loopUpsertResult{record: *current, authorityMatch: authorityMatch}, nil
 }
 
 // plannerLoopSkipsMaterialization reports whether discovery must not create or
@@ -1921,10 +1954,24 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current.Status == "terminated" {
 		return *current, nil
 	}
+	// A human-held loop is left exactly as it is, for the same reason a
+	// terminated one is: every mutation this helper applies is a status or
+	// schedule change, which is not the daemon's to make while a human owns the
+	// worktree.
+	if domain.LoopIsHumanHeld(current.Status) {
+		return *current, nil
+	}
 	updated := *current
 	mutate(&updated)
 	updated.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+		if storage.IsLoopHumanHeldError(err) {
+			if persisted, readErr := r.repos.Loops.GetByID(ctx, loop.ID); readErr != nil {
+				return storage.LoopRecord{}, readErr
+			} else if persisted != nil {
+				return *persisted, nil
+			}
+		}
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil

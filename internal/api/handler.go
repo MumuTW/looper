@@ -6239,7 +6239,7 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		// direct /retry is refused above and by the guarded write below.
 		upsertLoop := repos.Loops.Upsert
 		if fromHandback {
-			upsertLoop = repos.Loops.UpsertReleasingHumanHold
+			upsertLoop = repos.Loops.UpsertChangingHumanHold
 		}
 		if err := upsertLoop(ctx, updated); err != nil {
 			return retryResult{}, err

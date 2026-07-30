@@ -98,8 +98,8 @@ func TestPlannerRediscoveryDoesNotOverwriteConcurrentHandback(t *testing.T) {
 	released := *stale
 	released.Status = "queued"
 	released.UpdatedAt = "2026-04-11T12:05:00.000Z"
-	if err := f.repos.Loops.UpsertReleasingHumanHold(ctx, released); err != nil {
-		t.Fatalf("UpsertReleasingHumanHold() error = %v", err)
+	if err := f.repos.Loops.UpsertChangingHumanHold(ctx, released); err != nil {
+		t.Fatalf("UpsertChangingHumanHold() error = %v", err)
 	}
 
 	// The pass now refreshes the loop from its stale snapshot.

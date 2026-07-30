@@ -1035,6 +1035,13 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 	if loopErr != nil {
 		return loopErr
 	}
+	// Held loops are skipped before anything is enqueued: the queue item is
+	// created below and the status write only afterwards, so discovering a held
+	// reviewer any later would leave dormant active work behind.
+	if loopResult.skipped {
+		result.Skipped++
+		return nil
+	}
 	if terminalReviewerLoopReason(loopResult.record) == "failed" {
 		recovered, recoverErr := r.recoverFailedReviewerLoop(ctx, loopResult.record, pr)
 		if recoverErr != nil {
@@ -4734,6 +4741,9 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 type loopUpsertResult struct {
 	record  storage.LoopRecord
 	created bool
+	// skipped means the loop is human-held: discovery must not enqueue for it
+	// and must not treat that as an error.
+	skipped bool
 }
 
 func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, existing *storage.LoopRecord) (loopUpsertResult, error) {
@@ -4751,6 +4761,14 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 	}
 	if existing != nil {
+		// A human holds this PR's worktree. Report it as skipped *here*, before the
+		// caller reaches the enqueue: preserving the status through the metadata
+		// refresh and only failing later at markLoopQueuedForReview left an active
+		// queue item behind for a loop no lane may claim, and returned an error
+		// that aborted the whole discovery pass (#162 round-one regression).
+		if domain.LoopIsHumanHeld(existing.Status) {
+			return loopUpsertResult{record: *existing, created: false, skipped: true}, nil
+		}
 		budgetTerminationReason := deprecatedReviewerLoopBudgetTerminationReason(*existing)
 		if terminalReviewerLoopReason(*existing) != "" && budgetTerminationReason == "" {
 			return loopUpsertResult{record: *existing, created: false}, nil
@@ -4778,6 +4796,12 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 		updated.UpdatedAt = nowISO
 		if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+			// Takeover (or handback) committed between the read above and this
+			// write. Same outcome as the pre-write check: skip this PR, do not fail
+			// the pass, and let the next tick see what persisted.
+			if storage.IsLoopHumanHeldError(err) {
+				return r.humanHeldLoopSkip(ctx, updated.ID)
+			}
 			return loopUpsertResult{}, err
 		}
 		return loopUpsertResult{record: updated, created: false}, nil
@@ -5219,6 +5243,14 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil && current.Status == "terminated" {
 		return *current, nil
 	}
+	// A human-held loop is left exactly as it is, for the same reason a
+	// terminated one is: this helper's mutations all move a loop's status or
+	// scheduling, and neither is the daemon's to decide while a human owns the
+	// worktree. Reporting the persisted record (not an error) keeps a takeover
+	// racing a reviewer turn from failing the turn.
+	if current != nil && domain.LoopIsHumanHeld(current.Status) {
+		return *current, nil
+	}
 	updated := loop
 	if current != nil {
 		updated = *current
@@ -5226,9 +5258,31 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	mutate(&updated)
 	updated.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+		// Lost the race against takeover/handback; the persisted row wins.
+		if storage.IsLoopHumanHeldError(err) {
+			if persisted, readErr := r.repos.Loops.GetByID(ctx, loop.ID); readErr != nil {
+				return storage.LoopRecord{}, readErr
+			} else if persisted != nil {
+				return *persisted, nil
+			}
+		}
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil
+}
+
+// humanHeldLoopSkip reports a human-held loop from what is actually persisted,
+// so discovery skips instead of enqueueing against a stale record. A failed
+// re-read propagates: only losing the race is routine.
+func (r *Runner) humanHeldLoopSkip(ctx context.Context, loopID string) (loopUpsertResult, error) {
+	current, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	if current == nil {
+		return loopUpsertResult{skipped: true}, nil
+	}
+	return loopUpsertResult{record: *current, created: false, skipped: true}, nil
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {

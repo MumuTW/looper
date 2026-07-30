@@ -14,17 +14,17 @@ import (
 
 var ErrQueueItemNotActive = errors.New("queue item not active")
 
-// ErrLoopHumanHeld is returned when a loop write would move a loop out of the
-// status a human holds it in (`looper takeover`). It is the write half of the
-// takeover hold: the claim boundary refuses to hand the loop to a lane, and this
-// refuses to let any blind read-modify-Upsert rewrite the status that boundary
-// keys on. Only the sanctioned release path
-// (LoopsRepository.UpsertReleasingHumanHold, reached from the validated
-// transition service and /handback) may clear it.
+// ErrLoopHumanHeld is returned when a loop write would change whether a human
+// holds the loop (`looper takeover`), in either direction. It is the write half
+// of the takeover hold: the claim boundary refuses to hand the loop to a lane,
+// and this refuses to let any blind read-modify-Upsert author the status that
+// boundary keys on — neither clearing a live hold nor restoring a released one.
+// Only the sanctioned path (LoopsRepository.UpsertChangingHumanHold, reached
+// from the validated transition service and /handback) may move the hold.
 //
 // The check is evaluated inside the writing statement, so a discovery tick that
-// read the loop before takeover committed cannot win the race by writing its
-// stale record afterwards (#162).
+// read the loop before takeover (or before handback) committed cannot win the
+// race by writing its stale record afterwards (#162).
 var ErrLoopHumanHeld = errors.New("loop is held by human takeover")
 
 // IsLoopHumanHeldError reports whether err is the human-takeover write refusal.
@@ -593,10 +593,18 @@ func (r *ProjectsRepository) Archive(ctx context.Context, id string, updatedAt s
 
 type LoopsRepository struct{ q sqliteQuerier }
 
-// Upsert writes a loop row. It refuses, with ErrLoopHumanHeld, to change the
-// status of a loop a human currently holds via `looper takeover`: writes that
-// keep the held status (metadata refreshes) still land, and every other loop is
-// unaffected.
+// Upsert writes a loop row. It refuses, with ErrLoopHumanHeld, any write that
+// would *change whether* a loop is held by a human via `looper takeover` —
+// in either direction. Writes that leave the hold state alone (a metadata
+// refresh on a held loop, any ordinary status change on an unheld one) still
+// land, and every loop that is neither held nor being held is unaffected.
+//
+// The invariant is one boolean, not a list of directions: a blind
+// read-modify-Upsert may never author the answer to "does a human own this
+// worktree?". Guarding only the held→unheld direction (round one) left the
+// mirror image open — a tick that read a held loop, then wrote its preserved
+// human_takeover status back after handback committed, silently restored a hold
+// the operator had already been told was released.
 //
 // This is deliberately the default for all ~50 read-modify-Upsert call sites.
 // #162 was not one lane forgetting a guard, it was a full-row blind write
@@ -606,26 +614,31 @@ func (r *LoopsRepository) Upsert(ctx context.Context, record LoopRecord) error {
 	return r.upsert(ctx, record, false)
 }
 
-// UpsertReleasingHumanHold is the sanctioned exit from a human hold. It is for
-// callers that have already established the authority to release it: the loops
-// service, which applies domain.AssertLoopStatusTransition (whose only
-// non-terminal edge out of human_takeover is handback's → queued), and the
-// /handback API path itself.
-func (r *LoopsRepository) UpsertReleasingHumanHold(ctx context.Context, record LoopRecord) error {
+// UpsertChangingHumanHold is the sanctioned way to take or release a human
+// hold. It is for callers that have already established the authority to do so:
+// the loops service, which applies domain.AssertLoopStatusTransition (the
+// transition table is what decides which statuses may enter human_takeover and
+// that handback's → queued is its only non-terminal exit), and the /handback
+// API path itself.
+func (r *LoopsRepository) UpsertChangingHumanHold(ctx context.Context, record LoopRecord) error {
 	return r.upsert(ctx, record, true)
 }
 
-func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, releaseHumanHold bool) error {
+func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeHumanHold bool) error {
 	// Evaluated in the writing statement, not read-then-write, so a tick that
-	// loaded the loop before takeover committed still loses this race.
+	// loaded the loop before takeover (or before handback) committed cannot win
+	// the race by writing its stale record afterwards.
+	//
+	// `(a) = (b)` compares the two held-ness booleans SQLite yields from each
+	// comparison: the write lands only when it leaves held-ness unchanged.
 	humanHoldGuard := ""
-	if !releaseHumanHold {
+	if !changeHumanHold {
 		humanHoldGuard = `
-		WHERE loops.status != ? OR excluded.status = loops.status`
+		WHERE (loops.status = ?) = (excluded.status = ?)`
 	}
 	args := []any{record.ID, record.Seq, record.ProjectID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.Status, record.ConfigJSON, record.MetadataJSON, record.LastRunAt, record.NextRunAt, record.CreatedAt, record.UpdatedAt}
-	if !releaseHumanHold {
-		args = append(args, string(domain.LoopStatusHumanTakeover))
+	if !changeHumanHold {
+		args = append(args, string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusHumanTakeover))
 	}
 	result, err := r.q.ExecContext(ctx, `
 		INSERT INTO loops (id, seq, project_id, type, target_type, target_id, repo, pr_number, status, config_json, metadata_json, last_run_at, next_run_at, created_at, updated_at)
@@ -648,12 +661,12 @@ func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, release
 	if err != nil {
 		return fmt.Errorf("upsert loop: %w", err)
 	}
-	if !releaseHumanHold {
+	if !changeHumanHold {
 		// Zero rows can only mean the guard rejected the write: an insert always
 		// counts one, and SQLite counts a DO UPDATE even when values are identical.
 		affected, affectedErr := result.RowsAffected()
 		if affectedErr == nil && affected == 0 {
-			return fmt.Errorf("%w: loop %s (wanted status %q); run `looper handback` to release it", ErrLoopHumanHeld, record.ID, record.Status)
+			return r.humanHoldRejection(record)
 		}
 	}
 
@@ -668,6 +681,17 @@ func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, release
 	}
 
 	return nil
+}
+
+// humanHoldRejection names which side of the hold the refused write was on, so
+// the operator-facing conflict says what actually happened instead of always
+// claiming the loop is held. Only runs on the rejection path.
+func (r *LoopsRepository) humanHoldRejection(record LoopRecord) error {
+	held := string(domain.LoopStatusHumanTakeover)
+	if record.Status == held {
+		return fmt.Errorf("%w: loop %s is no longer held by human takeover; refusing to restore the hold from a stale write", ErrLoopHumanHeld, record.ID)
+	}
+	return fmt.Errorf("%w: loop %s (wanted status %q); run `looper handback` to release it", ErrLoopHumanHeld, record.ID, record.Status)
 }
 
 func (r *LoopsRepository) GetByID(ctx context.Context, id string) (*LoopRecord, error) {

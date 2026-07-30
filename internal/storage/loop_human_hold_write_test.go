@@ -26,8 +26,10 @@ func TestLoopUpsertRefusesToReleaseHumanHold(t *testing.T) {
 	held := stale
 	held.Status = "human_takeover"
 	held.UpdatedAt = "2026-07-30T12:01:00.000Z"
-	if err := f.repos.Loops.Upsert(f.ctx, held); err != nil {
-		t.Fatalf("Upsert(takeover) error = %v", err)
+	// Taking the hold goes through the sanctioned path; a blind Upsert may not
+	// author it in either direction.
+	if err := f.repos.Loops.UpsertChangingHumanHold(f.ctx, held); err != nil {
+		t.Fatalf("UpsertChangingHumanHold(takeover) error = %v", err)
 	}
 
 	// The tick now writes its stale record back. Reviving a held loop is exactly
@@ -79,9 +81,9 @@ func TestLoopUpsertAllowsWritesThatKeepTheHold(t *testing.T) {
 	}
 }
 
-// TestLoopUpsertReleasingHumanHoldSucceeds covers the sanctioned exit: the loops
+// TestLoopUpsertChangingHumanHoldSucceeds covers the sanctioned exit: the loops
 // service (which applies domain.AssertLoopStatusTransition) and /handback.
-func TestLoopUpsertReleasingHumanHoldSucceeds(t *testing.T) {
+func TestLoopUpsertChangingHumanHoldSucceeds(t *testing.T) {
 	t.Parallel()
 	f := newHumanHoldFixture(t)
 	held := f.seedPRLoop(t, "loop_held", "fixer", "human_takeover", 41)
@@ -89,8 +91,8 @@ func TestLoopUpsertReleasingHumanHoldSucceeds(t *testing.T) {
 	released := held
 	released.Status = "queued"
 	released.UpdatedAt = "2026-07-30T12:03:00.000Z"
-	if err := f.repos.Loops.UpsertReleasingHumanHold(f.ctx, released); err != nil {
-		t.Fatalf("UpsertReleasingHumanHold() error = %v", err)
+	if err := f.repos.Loops.UpsertChangingHumanHold(f.ctx, released); err != nil {
+		t.Fatalf("UpsertChangingHumanHold() error = %v", err)
 	}
 	got, err := f.repos.Loops.GetByID(f.ctx, held.ID)
 	if err != nil || got == nil || got.Status != "queued" {

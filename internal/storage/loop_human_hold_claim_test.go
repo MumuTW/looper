@@ -115,8 +115,8 @@ func TestHumanTakeoverReleaseRestoresSiblingClaims(t *testing.T) {
 	released := held
 	released.Status = "queued"
 	released.UpdatedAt = "2026-07-30T12:05:00.000Z"
-	if err := f.repos.Loops.UpsertReleasingHumanHold(f.ctx, released); err != nil {
-		t.Fatalf("UpsertReleasingHumanHold() error = %v", err)
+	if err := f.repos.Loops.UpsertChangingHumanHold(f.ctx, released); err != nil {
+		t.Fatalf("UpsertChangingHumanHold() error = %v", err)
 	}
 
 	item, err := f.repos.Queue.ClaimNextOfType(f.ctx, humanHoldNow, "scheduler", "reviewer")

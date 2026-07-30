@@ -1798,6 +1798,14 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if _, quarantined := quarantinedLoopIDs[loop.ID]; quarantined {
 			continue
 		}
+		// A loop a human took over is not the daemon's to recover: recovery's whole
+		// job is deciding what to requeue, normalize or terminate, and every one of
+		// those is a write the hold forbids. Skipping here is also what keeps the
+		// guarded write from turning one held loop into a failed recovery pass for
+		// every other loop (this pass aborts on the first error).
+		if domain.LoopIsHumanHeld(loop.Status) {
+			continue
+		}
 		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
 			return RecoverySummary{}, err
@@ -1861,8 +1869,12 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 					normalizedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 				}
 				normalizedLoop.UpdatedAt = nowISO
-				if err := repositories.Loops.Upsert(ctx, normalizedLoop); err != nil {
+				applied, err := recoveryUpsertLoop(ctx, repositories, normalizedLoop)
+				if err != nil {
 					return RecoverySummary{}, err
+				}
+				if !applied {
+					continue
 				}
 				terminalNormalizedLoopIDs[loop.ID] = struct{}{}
 				latestRunStatus := ""
@@ -1898,8 +1910,12 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			if _, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO); err != nil {
 				return RecoverySummary{}, err
 			}
-			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+			applied, err := recoveryUpsertLoop(ctx, repositories, requeuedLoop)
+			if err != nil {
 				return RecoverySummary{}, err
+			}
+			if !applied {
+				continue
 			}
 			requeuedLoopIDs[loop.ID] = struct{}{}
 			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
@@ -1929,8 +1945,12 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 			}
 			requeuedLoop.UpdatedAt = nowISO
-			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+			applied, err := recoveryUpsertLoop(ctx, repositories, requeuedLoop)
+			if err != nil {
 				return RecoverySummary{}, err
+			}
+			if !applied {
+				continue
 			}
 			requeuedLoopIDs[loop.ID] = struct{}{}
 			recoveredQueueItems, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO)
@@ -2001,8 +2021,12 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		normalizedLoop.NextRunAt = nil
 		normalizedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 		normalizedLoop.UpdatedAt = nowISO
-		if err := repositories.Loops.Upsert(ctx, normalizedLoop); err != nil {
+		applied, err := recoveryUpsertLoop(ctx, repositories, normalizedLoop)
+		if err != nil {
 			return RecoverySummary{}, err
+		}
+		if !applied {
+			continue
 		}
 		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
 			ID:         newRuntimeEventID(),
@@ -2530,8 +2554,12 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 					normalizedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 				}
 				normalizedLoop.UpdatedAt = nowISO
-				if err := repositories.Loops.Upsert(ctx, normalizedLoop); err != nil {
+				applied, err := recoveryUpsertLoop(ctx, repositories, normalizedLoop)
+				if err != nil {
 					return staleRunQueueRepairSummary{}, err
+				}
+				if !applied {
+					return summary, nil
 				}
 			} else if latestQueue.Status == "running" {
 				requeuedLoop := loop
@@ -2544,8 +2572,12 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 				if _, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO); err != nil {
 					return staleRunQueueRepairSummary{}, err
 				}
-				if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+				applied, err := recoveryUpsertLoop(ctx, repositories, requeuedLoop)
+				if err != nil {
 					return staleRunQueueRepairSummary{}, err
+				}
+				if !applied {
+					return summary, nil
 				}
 				summary.LoopsRequeued = 1
 				summary.QueueItemsRequeued = 1
@@ -2561,8 +2593,12 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 			requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 		}
 		requeuedLoop.UpdatedAt = nowISO
-		if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+		applied, err := recoveryUpsertLoop(ctx, repositories, requeuedLoop)
+		if err != nil {
 			return staleRunQueueRepairSummary{}, err
+		}
+		if !applied {
+			return summary, nil
 		}
 		activeQueue, err := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
 		if err != nil {
@@ -2888,10 +2924,11 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 				updated.Status = "paused"
 				updated.NextRunAt = nil
 				updated.UpdatedAt = nowISO
-				if err := repositories.Loops.Upsert(ctx, updated); err != nil {
+				applied, err := recoveryUpsertLoop(ctx, repositories, updated)
+				if err != nil {
 					return false, false, err
 				}
-				did = true
+				did = applied
 			}
 		}
 	}
@@ -2975,6 +3012,30 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 		})
 	}
 	return did || wrote, wrote, nil
+}
+
+// recoveryUpsertLoop applies a recovery-owned loop mutation and reports whether
+// it landed. A loop a human took over between this pass's read and this write is
+// left untouched and reported as not applied, so the caller skips the rest of
+// that loop's recovery.
+//
+// Not applied is not an error. Recovery's writes all requeue, normalize or park
+// a loop, and none of them is the daemon's to make while a human owns the
+// worktree; letting the guarded write's error out of here would abort the whole
+// recovery pass — and with it daemon startup — for every other loop, because one
+// operator ran `looper takeover` at the wrong moment.
+//
+// A skipped status write can leave a queue item this pass already requeued. That
+// is inert: the claim boundary refuses every queue item on a held target, and
+// /handback cancels whatever survived the takeover.
+func recoveryUpsertLoop(ctx context.Context, repositories *storage.Repositories, record storage.LoopRecord) (bool, error) {
+	if err := repositories.Loops.Upsert(ctx, record); err != nil {
+		if storage.IsLoopHumanHeldError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string, maxAttempts int64) error {
@@ -3625,8 +3686,12 @@ func requeueFailedReviewerWithSharedGuards(ctx context.Context, repositories *st
 		}
 	}
 	requeuedLoop := autoRecoveredReviewerLoop(*current, nowISO)
-	if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+	applied, err := recoveryUpsertLoop(ctx, repositories, requeuedLoop)
+	if err != nil {
 		return false, 0, err
+	}
+	if !applied {
+		return false, recoveredQueueItems, nil
 	}
 	return true, recoveredQueueItems, nil
 }
@@ -3882,8 +3947,12 @@ func normalizeTerminalReviewerLoopForRecovery(ctx context.Context, repositories 
 			normalizedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 		}
 		normalizedLoop.UpdatedAt = nowISO
-		if err := repositories.Loops.Upsert(ctx, normalizedLoop); err != nil {
+		applied, err := recoveryUpsertLoop(ctx, repositories, normalizedLoop)
+		if err != nil {
 			return true, false, err
+		}
+		if !applied {
+			return true, false, nil
 		}
 		latestRunStatus := ""
 		if latestRun != nil {

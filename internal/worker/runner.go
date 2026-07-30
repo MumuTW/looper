@@ -2930,7 +2930,15 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	}
 	for _, existing := range existingLoops {
 		if workerLoopTracksIssue(existing, project.ID, repo, issue.Number) {
-			pausedOrCompleted := existing.Status == "paused" || existing.Status == "human_takeover" || existing.Status == "completed" || existing.Status == "awaiting_human"
+			// A human-held loop gets no write at all, not even the metadata merge
+			// below: writing its preserved human_takeover status back would restore
+			// a hold that handback may already have released, and the guarded write
+			// now refuses that — which would have failed the whole discovery pass
+			// for every other issue in the batch.
+			if domain.LoopIsHumanHeld(existing.Status) {
+				return loopUpsertResult{record: existing, skipEnqueue: true}, nil
+			}
+			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed" || existing.Status == "awaiting_human"
 			prLinked := existing.TargetType == "pull_request" || derefInt64(existing.PRNumber) > 0
 			if prLinked {
 				return loopUpsertResult{record: existing, skipEnqueue: true}, nil
@@ -2948,6 +2956,18 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 			}
 			updated.UpdatedAt = nowISO
 			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+				// Takeover (or handback) committed between the list read and this
+				// write. Skip this issue; do not fail the batch.
+				if storage.IsLoopHumanHeldError(err) {
+					persisted, readErr := r.repos.Loops.GetByID(ctx, updated.ID)
+					if readErr != nil {
+						return loopUpsertResult{}, readErr
+					}
+					if persisted == nil {
+						return loopUpsertResult{skipEnqueue: true}, nil
+					}
+					return loopUpsertResult{record: *persisted, skipEnqueue: true}, nil
+				}
 				return loopUpsertResult{}, err
 			}
 			return loopUpsertResult{record: updated}, nil
@@ -3022,6 +3042,12 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil && current.Status == "terminated" {
 		return *current, nil
 	}
+	// Same rule as terminated: while a human holds the loop, its status and
+	// schedule are theirs. Report the persisted record so a takeover racing a
+	// worker turn does not fail the turn.
+	if current != nil && domain.LoopIsHumanHeld(current.Status) {
+		return *current, nil
+	}
 	updated := loop
 	if current != nil {
 		updated = *current
@@ -3029,6 +3055,13 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	mutate(&updated)
 	updated.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+		if storage.IsLoopHumanHeldError(err) {
+			if persisted, readErr := r.repos.Loops.GetByID(ctx, loop.ID); readErr != nil {
+				return storage.LoopRecord{}, readErr
+			} else if persisted != nil {
+				return *persisted, nil
+			}
+		}
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil

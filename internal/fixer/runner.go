@@ -5363,12 +5363,21 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 }
 
 // humanHeldLoopSkip reports the same skipped result as the pre-write check, from
-// the persisted record. It is the landing point for the takeover-versus-discovery
-// race: the guarded write refused the tick's stale record, so the tick reports
-// the loop as held rather than failing the whole discovery pass.
+// the persisted record. It is the landing point for the takeover-versus-handback
+// race in either direction: the guarded write refused the tick's stale record,
+// so the tick reports the loop as skipped rather than failing the whole
+// discovery pass, and the next tick sees whatever actually persisted.
+//
+// A failed re-read is *not* a skip. Losing a race is expected; a canceled
+// context or a SQLite error is not, and reporting one as a successful skip would
+// hide a storage failure behind the same success this PR exists to stop
+// over-reporting. Only a genuinely missing row falls back to an empty skip.
 func (r *Runner) humanHeldLoopSkip(ctx context.Context, loopID string) (loopUpsertResult, error) {
 	current, err := r.repos.Loops.GetByID(ctx, loopID)
-	if err != nil || current == nil {
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	if current == nil {
 		return loopUpsertResult{skipped: true}, nil
 	}
 	return loopUpsertResult{record: *current, created: false, skipped: true}, nil
@@ -6110,6 +6119,13 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil && current.Status == "terminated" {
 		return *current, nil
 	}
+	// A human-held loop is left exactly as it is, for the same reason a
+	// terminated one is: every mutation this helper applies is a status or
+	// schedule change, which is not the daemon's to make while a human owns the
+	// worktree.
+	if current != nil && domain.LoopIsHumanHeld(current.Status) {
+		return *current, nil
+	}
 	updated := loop
 	if current != nil {
 		updated = *current
@@ -6117,6 +6133,13 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	mutate(&updated)
 	updated.UpdatedAt = eventlog.NextJavaScriptISOString(r.now(), updated.UpdatedAt)
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+		if storage.IsLoopHumanHeldError(err) {
+			if persisted, readErr := r.repos.Loops.GetByID(ctx, loop.ID); readErr != nil {
+				return storage.LoopRecord{}, readErr
+			} else if persisted != nil {
+				return *persisted, nil
+			}
+		}
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil

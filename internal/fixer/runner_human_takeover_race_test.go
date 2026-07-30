@@ -2,7 +2,6 @@ package fixer
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"testing"
 
@@ -29,9 +28,10 @@ func TestHumanTakeoverWinsConcurrentDiscoveryTick(t *testing.T) {
 	service := &loops.Service{DB: f.coordinator.DB(), Repos: f.repos, Now: f.now}
 
 	// Repeat so the scheduler has many chances to land the write on either side
-	// of the takeover commit.
+	// of the takeover commit. Every round must commit the takeover: the window
+	// that used to make some rounds unassertable — stop first, park second — is
+	// closed now that the hold is the first write (#177).
 	heldRounds := 0
-	racedTakeovers := 0
 	for i := 0; i < 25; i++ {
 		// Re-arm the loop as an ordinary queued loop before each round.
 		loop, err := f.repos.Loops.GetByID(ctx, f.loopID)
@@ -41,7 +41,7 @@ func TestHumanTakeoverWinsConcurrentDiscoveryTick(t *testing.T) {
 		reset := *loop
 		reset.Status = "queued"
 		reset.NextRunAt = nil
-		if err := f.repos.Loops.UpsertReleasingHumanHold(ctx, reset); err != nil {
+		if err := f.repos.Loops.UpsertChangingHumanHold(ctx, reset); err != nil {
 			t.Fatalf("reset loop error = %v", err)
 		}
 		if _, err := f.repos.Queue.CancelByLoop(ctx, f.loopID, f.nowString, nil); err != nil {
@@ -57,12 +57,9 @@ func TestHumanTakeoverWinsConcurrentDiscoveryTick(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			// The daemon's takeover: stop (which pauses) and then park.
-			if _, err := service.Pause(ctx, f.loopID, nil); err != nil {
-				takeoverErr = err
-				return
-			}
-			_, takeoverErr = service.TransitionStatus(ctx, f.loopID, loops.TransitionInput{Status: domain.LoopStatusHumanTakeover})
+			// The daemon's takeover: the hold is one commit, taken before the run
+			// is stopped, so no concurrent status write can invalidate it.
+			_, takeoverErr = service.Hold(ctx, f.loopID, nil)
 		}()
 		wg.Wait()
 
@@ -72,14 +69,8 @@ func TestHumanTakeoverWinsConcurrentDiscoveryTick(t *testing.T) {
 			t.Fatalf("round %d: DiscoverPullRequests() error = %v, want the hold reported as a skip", i, discoveryErr)
 		}
 		if takeoverErr != nil {
-			// Discovery re-queued the loop between stop and park; takeover as a
-			// whole failed loudly and this round has no hold to assert. That is a
-			// pre-existing ordering hazard in the stop path, not this guard.
-			if !strings.Contains(takeoverErr.Error(), "invalid loop status transition") {
-				t.Fatalf("round %d: takeover error = %v", i, takeoverErr)
-			}
-			racedTakeovers++
-			continue
+			// No skipped rounds: takeover must commit whatever discovery is doing.
+			t.Fatalf("round %d: takeover error = %v, want it to commit against any concurrent tick", i, takeoverErr)
 		}
 		heldRounds++
 
@@ -99,8 +90,8 @@ func TestHumanTakeoverWinsConcurrentDiscoveryTick(t *testing.T) {
 			t.Fatalf("round %d: ListScheduled() = %#v, want nothing claimable while the loop is held", i, scheduled)
 		}
 	}
-	if heldRounds == 0 {
-		t.Fatalf("no round produced a committed takeover (%d raced); the invariant was never exercised", racedTakeovers)
+	if heldRounds != 25 {
+		t.Fatalf("committed takeovers = %d, want all 25 rounds", heldRounds)
 	}
 	assertNoGitMutations(t, f.git)
 }
@@ -136,5 +127,37 @@ func TestDiscoveryStaleWriteCannotReviveHeldLoop(t *testing.T) {
 	}
 	if !skipped.skipped || skipped.record.Status != string(domain.LoopStatusHumanTakeover) {
 		t.Fatalf("humanHeldLoopSkip() = %#v, want a skipped result carrying the held record", skipped)
+	}
+}
+
+// TestHumanHeldLoopSkipPropagatesReadFailure: the guarded write refusing a stale
+// record is routine, but a failed re-read is a storage failure. Converting it
+// into a successful skipped result would report a clean discovery pass with an
+// empty record and hide the failure from retry and error handling — the same
+// class of false success this change exists to remove.
+func TestHumanHeldLoopSkipPropagatesReadFailure(t *testing.T) {
+	t.Parallel()
+	f := newTakeoverHoldFixture(t, false, "interrupted")
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := f.runner.humanHeldLoopSkip(cancelled, f.loopID); err == nil {
+		t.Fatal("humanHeldLoopSkip() error = nil on a cancelled context, want the storage failure propagated")
+	}
+}
+
+// TestHumanHeldLoopSkipReportsMissingRow keeps the fallback meaningful: an
+// intentionally absent loop is a skip, not an error.
+func TestHumanHeldLoopSkipReportsMissingRow(t *testing.T) {
+	t.Parallel()
+	f := newTakeoverHoldFixture(t, false, "interrupted")
+
+	result, err := f.runner.humanHeldLoopSkip(context.Background(), "loop_missing")
+	if err != nil {
+		t.Fatalf("humanHeldLoopSkip() error = %v, want a missing row reported as skipped", err)
+	}
+	if !result.skipped || result.record.ID != "" {
+		t.Fatalf("result = %#v, want an empty skipped result", result)
 	}
 }

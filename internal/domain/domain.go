@@ -106,11 +106,17 @@ var terminalRunStatuses = map[RunStatus]struct{}{
 }
 
 var loopStatusTransitions = map[LoopStatus][]LoopStatus{
-	LoopStatusIdle:          {LoopStatusQueued, LoopStatusPaused, LoopStatusTerminated},
-	LoopStatusQueued:        {LoopStatusRunning, LoopStatusPaused, LoopStatusTerminated},
+	// human_takeover is reachable from every non-terminal status. `looper
+	// takeover` commits the hold as its *first* write, before it stops the
+	// in-flight run, so it must accept whatever status the loop is in when the
+	// operator reaches for it — including a status a discovery tick just wrote
+	// (#177). Requiring paused first is what created a window in which the stop
+	// had landed but the hold had not.
+	LoopStatusIdle:          {LoopStatusQueued, LoopStatusPaused, LoopStatusHumanTakeover, LoopStatusTerminated},
+	LoopStatusQueued:        {LoopStatusRunning, LoopStatusPaused, LoopStatusHumanTakeover, LoopStatusTerminated},
 	LoopStatusRunning:       {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted, LoopStatusWaiting, LoopStatusAwaitingHuman, LoopStatusHumanTakeover, LoopStatusTerminated},
 	LoopStatusPaused:        {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
-	LoopStatusWaiting:       {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusTerminated},
+	LoopStatusWaiting:       {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
 	LoopStatusAwaitingHuman: {LoopStatusRunning, LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
 	// human_takeover releases only via handback (→ queued) or an explicit
 	// stop/terminate. There is deliberately no direct → running edge: a run may

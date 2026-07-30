@@ -7796,8 +7796,10 @@ func prepareLoopRouteForRetry(t *testing.T, rt *looperdruntime.Runtime, loopStat
 	}
 	loop.Status = loopStatus
 	loop.UpdatedAt = nowISO
-	if err := services.Repositories.Loops.Upsert(ctx, *loop); err != nil {
-		t.Fatalf("Loops.Upsert(loop_1) error = %v", err)
+	// Seeding a human_takeover fixture is taking the hold, which no blind Upsert
+	// may do; use the sanctioned write the takeover path itself uses.
+	if err := services.Repositories.Loops.UpsertChangingHumanHold(ctx, *loop); err != nil {
+		t.Fatalf("Loops.UpsertChangingHumanHold(loop_1) error = %v", err)
 	}
 
 	run, err := services.Repositories.Runs.GetByID(ctx, "run_1")

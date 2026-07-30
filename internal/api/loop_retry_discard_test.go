@@ -1236,8 +1236,8 @@ func TestHandlerLoopRetryDiscardRejectsHumanTakeover(t *testing.T) {
 		t.Fatalf("GetByID() = %#v, %v", loop, err)
 	}
 	loop.Status = "human_takeover"
-	if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
-		t.Fatalf("Loops.Upsert(human_takeover) error = %v", err)
+	if err := services.Repositories.Loops.UpsertChangingHumanHold(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.UpsertChangingHumanHold(human_takeover) error = %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3135/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
@@ -1280,8 +1280,8 @@ func TestHandlerHandbackRejectsDiscardWorktreeChanges(t *testing.T) {
 		t.Fatalf("GetByID() = %#v, %v", loop, err)
 	}
 	loop.Status = "human_takeover"
-	if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
-		t.Fatalf("Loops.Upsert(human_takeover) error = %v", err)
+	if err := services.Repositories.Loops.UpsertChangingHumanHold(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.UpsertChangingHumanHold(human_takeover) error = %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3132/handback", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
