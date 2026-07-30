@@ -3,10 +3,10 @@ export const MAX_LOG_CHARS = 500_000;
 export const MAX_LOG_LINES = 5000;
 
 /** Cap snapshot seed before it becomes the buffer. */
-export const MAX_SNAPSHOT_SEED_CHARS = 200_000;
+export const MAX_SNAPSHOT_SEED_CHARS = 200 * 1024;
 
 /** Cap each chunk before append. */
-export const MAX_CHUNK_CHARS = 64_000;
+export const MAX_CHUNK_CHARS = 64 * 1024;
 
 /** Cap raw SSE event data length before JSON parse / append. */
 export const MAX_SSE_EVENT_DATA_CHARS = 256_000;

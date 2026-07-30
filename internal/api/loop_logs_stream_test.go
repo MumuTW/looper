@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -149,6 +150,16 @@ func TestCombinedLoopLogsStreamFallsBackToInlineOutput(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedRunRouteData(t, fixture.runtime)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	missingStdoutPath := filepath.Join(fixture.config.Daemon.LogDir, "loops", "missing.stdout.log")
+	missingStderrPath := filepath.Join(fixture.config.Daemon.LogDir, "loops", "missing.stderr.log")
+	initialOutput, err := json.Marshal(agentOutputPayload{
+		Stdout:        "first\n",
+		StdoutLogPath: missingStdoutPath,
+		StderrLogPath: missingStderrPath,
+	})
+	if err != nil {
+		t.Fatalf("marshal initial output: %v", err)
+	}
 	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
 		ID:         "exec_inline",
 		ProjectID:  stringPtr("project_1"),
@@ -157,7 +168,7 @@ func TestCombinedLoopLogsStreamFallsBackToInlineOutput(t *testing.T) {
 		Vendor:     "codex",
 		Status:     "running",
 		StartedAt:  nowISO,
-		OutputJSON: stringPtr(`{"stdout":"first\\n","stderr":""}`),
+		OutputJSON: stringPtr(string(initialOutput)),
 		CreatedAt:  nowISO,
 		UpdatedAt:  nowISO,
 	}); err != nil {
@@ -176,7 +187,17 @@ func TestCombinedLoopLogsStreamFallsBackToInlineOutput(t *testing.T) {
 		time.Sleep(250 * time.Millisecond)
 		execution, _ := fixture.runtime.Services().Repositories.AgentExecutions.GetByID(context.Background(), "exec_inline")
 		if execution != nil {
-			execution.OutputJSON = stringPtr(`{"stdout":"first\\nsecond\\n","stderr":"warning\\n"}`)
+			nextOutput, marshalErr := json.Marshal(agentOutputPayload{
+				Stdout:        "first\nsecond\n",
+				Stderr:        "warning\n",
+				StdoutLogPath: missingStdoutPath,
+				StderrLogPath: missingStderrPath,
+			})
+			if marshalErr != nil {
+				t.Errorf("marshal next output: %v", marshalErr)
+				return
+			}
+			execution.OutputJSON = stringPtr(string(nextOutput))
 			execution.UpdatedAt = fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
 			_ = fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), *execution)
 		}
@@ -188,14 +209,131 @@ func TestCombinedLoopLogsStreamFallsBackToInlineOutput(t *testing.T) {
 		t.Fatalf("read combined stream: %v", err)
 	}
 	text := string(body)
-	if !strings.Contains(text, `"stream":"stdout"`) || !strings.Contains(text, `"content":"second\\n"`) {
+	if !strings.Contains(text, `"stream":"stdout"`) || !strings.Contains(text, `"content":"second\n"`) {
 		t.Fatalf("stream body = %q, want inline stdout suffix", text)
 	}
-	if !strings.Contains(text, `"stream":"stderr"`) || !strings.Contains(text, `"content":"warning\\n"`) {
+	if !strings.Contains(text, `"stream":"stderr"`) || !strings.Contains(text, `"content":"warning\n"`) {
 		t.Fatalf("stream body = %q, want inline stderr suffix", text)
 	}
 	if !strings.Contains(text, "event: end") {
 		t.Fatalf("stream body = %q, want terminal event", text)
+	}
+}
+
+func TestLoopLogsFileCursorKeepsInlineFallbackWhenPathIsMissing(t *testing.T) {
+	fixture := newTestFixture(t)
+	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	path := filepath.Join(fixture.config.Daemon.LogDir, "loops", "missing.stdout.log")
+	cursor, err := handler.newLoopLogsFileCursor(path, "inline output\n")
+	if err != nil {
+		t.Fatalf("new cursor: %v", err)
+	}
+	if cursor.path != "" {
+		t.Fatalf("cursor path = %q, want empty until a log file exists", cursor.path)
+	}
+	if got := cursor.snapshotContent(); got != "inline output\n" {
+		t.Fatalf("snapshot content = %q, want inline output", got)
+	}
+}
+
+func TestLoopLogsFileCursorResetsForReplaceRotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stdout.log")
+	if err := os.WriteFile(path, []byte("old log\n"), 0o644); err != nil {
+		t.Fatalf("write old log: %v", err)
+	}
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat old log: %v", err)
+	}
+	cursor := loopLogsFileCursor{path: path, offset: oldInfo.Size(), fileInfo: oldInfo}
+	rotated := filepath.Join(dir, "stdout.log.1")
+	if err := os.Rename(path, rotated); err != nil {
+		t.Fatalf("rotate old log: %v", err)
+	}
+	const replacement = "replacement log that is longer than the old log\n"
+	if err := os.WriteFile(path, []byte(replacement), 0o644); err != nil {
+		t.Fatalf("write replacement log: %v", err)
+	}
+	chunk, attempted, err := cursor.readNext(loopLogsFollowMaxChunkBytes)
+	if err != nil {
+		t.Fatalf("read replacement: %v", err)
+	}
+	if !attempted || chunk != replacement {
+		t.Fatalf("rotation chunk = %q attempted=%t, want full replacement", chunk, attempted)
+	}
+}
+
+func TestLoopLogsFileCursorPreservesUTF8AtReadAndSnapshotBoundaries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stdout.log")
+	first := strings.Repeat("a", loopLogsFollowMaxChunkBytes-1) + "界" + "tail"
+	if err := os.WriteFile(path, []byte(first), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	cursor := loopLogsFileCursor{path: path}
+	var joined strings.Builder
+	for {
+		chunk, _, err := cursor.readNext(loopLogsFollowMaxChunkBytes)
+		if err != nil {
+			t.Fatalf("read chunk: %v", err)
+		}
+		if chunk == "" {
+			break
+		}
+		if !utf8.ValidString(chunk) {
+			t.Fatalf("chunk is not valid UTF-8: %q", chunk)
+		}
+		joined.WriteString(chunk)
+	}
+	if got := joined.String(); got != first {
+		t.Fatalf("joined chunk = %q, want %q", got, first)
+	}
+
+	snapshotPath := filepath.Join(dir, "snapshot.log")
+	snapshotSource := strings.Repeat("a", 10) + "界" + strings.Repeat("b", loopLogsFollowSnapshotBytes-2)
+	if err := os.WriteFile(snapshotPath, []byte(snapshotSource), 0o644); err != nil {
+		t.Fatalf("write snapshot log: %v", err)
+	}
+	snapshot, _, _, found, err := readLoopLogsSnapshot(snapshotPath, loopLogsFollowSnapshotBytes)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	if !found || !utf8.ValidString(snapshot) {
+		t.Fatalf("snapshot found=%t validUTF8=%t", found, utf8.ValidString(snapshot))
+	}
+	if strings.HasPrefix(snapshot, "\u008c") || !strings.HasPrefix(snapshot, "b") {
+		t.Fatalf("snapshot begins %q, want complete tail bytes", snapshot[:min(4, len(snapshot))])
+	}
+	inlineTail := tailLogBytes(snapshotSource, loopLogsFollowSnapshotBytes)
+	if !utf8.ValidString(inlineTail) || !strings.HasPrefix(inlineTail, "b") {
+		t.Fatalf("inline tail validUTF8=%t starts %q, want complete tail bytes", utf8.ValidString(inlineTail), inlineTail[:min(4, len(inlineTail))])
+	}
+}
+
+func TestWriteLoopLogsChunkSplitsLargeExecutionSnapshot(t *testing.T) {
+	content := strings.Repeat("x", loopLogsFollowSnapshotBytes)
+	recorder := httptest.NewRecorder()
+	if err := writeLoopLogsChunk(recorder, recorder, loopLogsResponse{}, "stdout", content); err != nil {
+		t.Fatalf("write chunks: %v", err)
+	}
+	var joined strings.Builder
+	for _, event := range strings.Split(recorder.Body.String(), "\n\n") {
+		if !strings.HasPrefix(event, "event: chunk\n") {
+			continue
+		}
+		data := strings.TrimPrefix(strings.SplitN(event, "\n", 2)[1], "data: ")
+		var chunk loopLogsFollowChunkEvent
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			t.Fatalf("decode chunk: %v", err)
+		}
+		if len(chunk.Content) > loopLogsFollowMaxChunkBytes {
+			t.Fatalf("chunk bytes = %d, want <= %d", len(chunk.Content), loopLogsFollowMaxChunkBytes)
+		}
+		joined.WriteString(chunk.Content)
+	}
+	if got := joined.String(); got != content {
+		t.Fatalf("joined content bytes = %d, want %d", len(got), len(content))
 	}
 }
 

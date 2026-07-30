@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexu-io/looper/internal/storage"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
@@ -26,6 +27,7 @@ type loopLogsCombinedState struct {
 type loopLogsFileCursor struct {
 	path       string
 	offset     int64
+	fileInfo   os.FileInfo
 	lastInline string
 	snapshot   string
 }
@@ -173,13 +175,14 @@ func (h *Handler) newLoopLogsFileCursor(path, inline string) (loopLogsFileCursor
 	if strings.TrimSpace(path) == "" || !isPathWithinDirectory(path, h.context.Config.Daemon.LogDir) {
 		return cursor, nil
 	}
-	cursor.path = path
-	content, offset, found, err := readLoopLogsSnapshot(path, loopLogsFollowSnapshotBytes)
+	content, offset, info, found, err := readLoopLogsSnapshot(path, loopLogsFollowSnapshotBytes)
 	if err != nil {
 		return loopLogsFileCursor{}, err
 	}
 	if found {
+		cursor.path = path
 		cursor.offset = offset
+		cursor.fileInfo = info
 		cursor.snapshot = content
 	}
 	return cursor, nil
@@ -293,21 +296,41 @@ func (h *Handler) emitLoopLogsFileChunks(w io.Writer, flusher http.Flusher, resp
 }
 
 func writeLoopLogsChunk(w io.Writer, flusher http.Flusher, response loopLogsResponse, stream, content string) error {
-	if content == "" {
-		return nil
+	for content != "" {
+		chunk, remaining := splitLoopLogsChunk(content, loopLogsFollowMaxChunkBytes)
+		event := loopLogsFollowChunkEvent{Stream: stream, Content: chunk}
+		if response.Run != nil {
+			event.RunID = &response.Run.RunID
+			event.CurrentStep = response.Run.CurrentStep
+		}
+		if response.Agent != nil {
+			event.ExecutionID = &response.Agent.ExecutionID
+			event.Vendor = &response.Agent.Vendor
+			event.PID = response.Agent.PID
+			event.Status = &response.Agent.Status
+		}
+		if err := writeSSEEvent(w, flusher, "chunk", event); err != nil {
+			return err
+		}
+		content = remaining
 	}
-	event := loopLogsFollowChunkEvent{Stream: stream, Content: content}
-	if response.Run != nil {
-		event.RunID = &response.Run.RunID
-		event.CurrentStep = response.Run.CurrentStep
+	return nil
+}
+
+// splitLoopLogsChunk keeps the wire chunk bound in bytes while never splitting
+// a valid UTF-8 rune. File cursors use the same boundary rule before converting
+// raw bytes to strings.
+func splitLoopLogsChunk(content string, maxBytes int) (string, string) {
+	if len(content) <= maxBytes {
+		return content, ""
 	}
-	if response.Agent != nil {
-		event.ExecutionID = &response.Agent.ExecutionID
-		event.Vendor = &response.Agent.Vendor
-		event.PID = response.Agent.PID
-		event.Status = &response.Agent.Status
+	cut := utf8ChunkBoundary([]byte(content), maxBytes)
+	if cut == 0 {
+		// maxBytes is much larger than utf8.UTFMax in production. Retain a
+		// deterministic escape hatch for malformed input and defensive tests.
+		cut = maxBytes
 	}
-	return writeSSEEvent(w, flusher, "chunk", event)
+	return content[:cut], content[cut:]
 }
 
 func (cursor *loopLogsFileCursor) readNext(maxBytes int) (string, bool, error) {
@@ -316,6 +339,12 @@ func (cursor *loopLogsFileCursor) readNext(maxBytes int) (string, bool, error) {
 	}
 	file, err := os.Open(cursor.path)
 	if errors.Is(err, os.ErrNotExist) {
+		// A disappeared file must not suppress the durable inline fallback.
+		// The next state refresh will either reopen a replacement or resume
+		// incremental inline delivery.
+		cursor.path = ""
+		cursor.offset = 0
+		cursor.fileInfo = nil
 		return "", true, nil
 	}
 	if err != nil {
@@ -326,6 +355,12 @@ func (cursor *loopLogsFileCursor) readNext(maxBytes int) (string, bool, error) {
 	if err != nil {
 		return "", true, err
 	}
+	if cursor.fileInfo != nil && !os.SameFile(cursor.fileInfo, info) {
+		// Rename-and-recreate rotation can leave the replacement at the same
+		// size (or larger) than the old file, so size alone is insufficient.
+		cursor.offset = 0
+	}
+	cursor.fileInfo = info
 	if info.Size() < cursor.offset {
 		cursor.offset = 0
 	}
@@ -343,42 +378,75 @@ func (cursor *loopLogsFileCursor) readNext(maxBytes int) (string, bool, error) {
 	if err != nil {
 		return "", true, err
 	}
+	if int64(len(raw)) < info.Size()-cursor.offset {
+		raw = raw[:utf8ChunkBoundary(raw, len(raw))]
+	}
 	cursor.offset += int64(len(raw))
 	return string(raw), true, nil
 }
 
-func readLoopLogsSnapshot(path string, maxBytes int) (string, int64, bool, error) {
+func readLoopLogsSnapshot(path string, maxBytes int) (string, int64, os.FileInfo, bool, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", 0, false, nil
+		return "", 0, nil, false, nil
 	}
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, nil, false, err
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, nil, false, err
 	}
 	start := info.Size() - int64(maxBytes)
 	if start < 0 {
 		start = 0
 	}
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
-		return "", 0, false, err
+		return "", 0, nil, false, err
 	}
 	raw, err := io.ReadAll(io.LimitReader(file, info.Size()-start))
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, nil, false, err
 	}
-	return string(raw), info.Size(), true, nil
+	if start > 0 {
+		raw = trimIncompleteUTF8Prefix(raw)
+	}
+	return string(raw), info.Size(), info, true, nil
+}
+
+func trimIncompleteUTF8Prefix(raw []byte) []byte {
+	for len(raw) > 0 && raw[0]&0xc0 == 0x80 {
+		raw = raw[1:]
+	}
+	return raw
+}
+
+// utf8ChunkBoundary returns a complete-rune prefix no longer than maxBytes.
+// It assumes the input starts at a rune boundary; callers that take a tail
+// first discard leading continuation bytes with trimIncompleteUTF8Prefix.
+func utf8ChunkBoundary(raw []byte, maxBytes int) int {
+	if maxBytes <= 0 {
+		return 0
+	}
+	if len(raw) < maxBytes {
+		return len(raw)
+	}
+	start := maxBytes - 1
+	for start > 0 && raw[start]&0xc0 == 0x80 {
+		start--
+	}
+	if !utf8.FullRune(raw[start:maxBytes]) {
+		return start
+	}
+	return maxBytes
 }
 
 func tailLogBytes(content string, maxBytes int) string {
 	if len(content) <= maxBytes {
 		return content
 	}
-	return content[len(content)-maxBytes:]
+	return string(trimIncompleteUTF8Prefix([]byte(content[len(content)-maxBytes:])))
 }
 
 func logContentAfterKnown(content, known string) string {
