@@ -154,9 +154,13 @@ printf '%s\n' '__LOOPER_RESULT__={"summary":"fake Devin completed"}'
 func TestConfiguredExecutorCancelsDevinProcessGroup(t *testing.T) {
 	startedPath := filepath.Join(t.TempDir(), "started")
 	fakeDevin := filepath.Join(t.TempDir(), "devin")
+	// Publish the marker with a rename so os.Stat cannot observe a created but
+	// empty file, and install the trap before announcing readiness so a Kill
+	// racing the announcement is still handled.
 	script := `#!/bin/sh
-printf 'started\n' > "$STARTED_PATH"
 trap 'exit 0' TERM INT
+printf 'started\n' > "$STARTED_PATH.tmp"
+mv "$STARTED_PATH.tmp" "$STARTED_PATH"
 while :; do sleep 1; done
 `
 	if err := os.WriteFile(fakeDevin, []byte(script), 0o755); err != nil {
@@ -172,14 +176,33 @@ while :; do sleep 1; done
 		ExecutionID:      "devin-cancel",
 		Prompt:           "long task",
 		WorkingDirectory: t.TempDir(),
-		Timeout:          10 * time.Second,
+		// The execution timeout must stay well clear of the readiness deadline
+		// below. If the two can expire together, a slow spawn lets the executor
+		// mark the run "timeout" before the test ever calls Kill, and the
+		// "want killed" assertion fails instead of the run being cancelled.
+		Timeout:          60 * time.Second,
 		GracefulShutdown: 100 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
+	// Any abort before the explicit Kill below — a readiness timeout, a failed
+	// assertion — would otherwise leave the child alive for the full 60s
+	// execution timeout. Containment puts it in its own process group, so it
+	// outlives the test binary and orphans into later tests or a persistent
+	// runner. Safe on the happy path too: Kill is non-blocking and Wait
+	// re-posts its outcome, so a second pair of calls observes the same result.
+	t.Cleanup(func() {
+		_ = run.Kill("test cleanup")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = run.Wait(ctx)
+	})
 
-	deadline := time.Now().Add(2 * time.Second)
+	// Spawning a shell can take well over 2s on a loaded CI runner, so this is
+	// generous — but it stays far below the 60s execution timeout so there is
+	// always room to exercise explicit cancellation after observing readiness.
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		if _, err := os.Stat(startedPath); err == nil {
 			break

@@ -429,8 +429,11 @@ Default runtime artifacts live under `~/.looper/`:
 - `logs/`
 - `worktrees/`
 - `bin/looperd`
-- `looperd.pid`
-- `looperd.state.json`
+
+`looperd.pid` and `looperd.state.json` were written by the `looper daemon`
+supervision CLI, which was removed along with `internal/cliapp`. Nothing reads
+them today; existing installs may still carry stale copies, which are safe to
+delete.
 
 Default storage paths:
 

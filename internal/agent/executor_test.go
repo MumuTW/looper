@@ -1044,6 +1044,21 @@ func TestParseCompletionIgnoresTemplatePlaceholder(t *testing.T) {
 	}
 }
 
+func TestParseCompletionAcceptsMarkerGluedToProse(t *testing.T) {
+	t.Parallel()
+
+	stdout := "All data collected. Let me finalize the todos and produce the result." +
+		CompletionMarkerPrefix + `{"summary":"pushed the fix","git_pr_lifecycle":{"pushed":true,"commit_shas":["212adf88"]}}` + "\n"
+
+	parsed := parseCompletion(stdout, "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "pushed the fix" {
+		t.Fatalf("parseCompletion() = %#v, want parsed mid-line marker", parsed)
+	}
+	if parsed.Lifecycle == nil || !parsed.Lifecycle.Pushed {
+		t.Fatalf("parseCompletion() lifecycle = %#v, want pushed lifecycle recovered", parsed.Lifecycle)
+	}
+}
+
 func TestReadPersistedExecutionLogReadsTailToPreserveCompletionMarker(t *testing.T) {
 	t.Parallel()
 
@@ -1510,15 +1525,20 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if err := coordinator.Close(); err != nil {
 		t.Fatalf("coordinator.Close() error = %v", err)
 	}
-	workDir := t.TempDir()
-	pidPath := filepath.Join(workDir, "agent.pid")
+	// Assert reaping through the containment handle bound during Start, not
+	// through a pid marker the child writes. A marker-based check cannot tell
+	// "reaped before it published its pid" from "containment never confirmed
+	// death" — Start joins that reap failure with ErrExecutionPersistence, so
+	// the earlier assertions still pass and the missing marker would be read as
+	// success. That is precisely the leak this test exists to catch.
+	owner := &trackingOwner{}
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
-		"command": "/bin/sh", "args": []any{"-c", `echo $$ > "$PID_FILE"; trap '' TERM; while true; do sleep 1; done`},
-	}}, Repos: repos, ParamsOwnerVendor: customOwner()})
+		"command": "/bin/sh", "args": []any{"-c", `trap '' TERM; while true; do sleep 1; done`},
+	}}, Repos: repos, ParamsOwnerVendor: customOwner(), Owner: owner})
 
 	handle, err := executor.Start(context.Background(), RunInput{
-		ExecutionID: "agent_initial_persist_failure", WorkingDirectory: workDir, Prompt: "ignored",
-		Timeout: time.Second, Env: map[string]string{"PID_FILE": pidPath},
+		ExecutionID: "agent_initial_persist_failure", WorkingDirectory: t.TempDir(), Prompt: "ignored",
+		Timeout: time.Second,
 	})
 	if err == nil {
 		t.Fatal("Start() error = nil, want initial persistence failure")
@@ -1529,19 +1549,11 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if handle != nil {
 		t.Fatalf("Start() handle = %#v, want nil", handle)
 	}
-	if data, readErr := os.ReadFile(pidPath); readErr == nil {
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if parseErr != nil {
-			t.Fatalf("parse pid: %v", parseErr)
-		}
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		t.Fatalf("spawned process %d survived failed Start", pid)
+	if owner.lease == nil || owner.lease.handle == nil {
+		t.Fatal("owner did not receive a containment handle; cannot verify the child was reaped")
+	}
+	if !owner.lease.handle.ConfirmedDead() {
+		t.Fatalf("containment handle for pid %d is not ConfirmedDead after failed Start", owner.lease.handle.PID())
 	}
 }
 

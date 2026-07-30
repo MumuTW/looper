@@ -5,6 +5,35 @@ import (
 	"testing"
 )
 
+func TestCompletionMarkerPayloadsTakesLastOccurrenceFirst(t *testing.T) {
+	t.Parallel()
+
+	raw := strings.Join([]string{
+		CompletionMarkerPrefix + `{"summary":"first"}`,
+		"prose before the marker." + CompletionMarkerPrefix + `{"summary":"glued"}`,
+		"   ",
+	}, "\n")
+
+	payloads := CompletionMarkerPayloads(raw)
+	want := []string{`{"summary":"glued"}`, `{"summary":"first"}`}
+	if len(payloads) != len(want) {
+		t.Fatalf("CompletionMarkerPayloads() = %#v, want %#v", payloads, want)
+	}
+	for i, payload := range payloads {
+		if payload != want[i] {
+			t.Fatalf("CompletionMarkerPayloads()[%d] = %q, want %q", i, payload, want[i])
+		}
+	}
+}
+
+func TestCompletionMarkerPayloadsReturnsEmptyWithoutMarker(t *testing.T) {
+	t.Parallel()
+
+	if payloads := CompletionMarkerPayloads("no marker here\njust prose\n"); len(payloads) != 0 {
+		t.Fatalf("CompletionMarkerPayloads() = %#v, want empty", payloads)
+	}
+}
+
 func TestAppendCompletionInstruction(t *testing.T) {
 	t.Parallel()
 

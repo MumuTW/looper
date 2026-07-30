@@ -1,0 +1,51 @@
+name: PR Labeler
+
+# pull_request_target runs with a write token, so this job must never check out
+# or execute PR code. actions/labeler reads .github/labeler.yml from the base
+# branch via the API; the github-script step only reads the PR title.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
+        with:
+          sync-labels: true
+
+      - name: Kind label from conventional-commit title
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            // A recognized prefix fully determines the derived kind set, so
+            // stale siblings are removed on title edits. A title with no
+            // conventional prefix is left alone: at that point the kind
+            // labels can no longer be told apart from human-applied ones.
+            const KIND = { fix: 'bug', feat: 'enhancement', docs: 'documentation' };
+            const pr = context.payload.pull_request;
+            const m = pr.title.match(/^(feat|fix|refactor|test|ci|docs|chore)[(:!]/);
+            if (!m) return;
+            const desired = KIND[m[1]];
+            const current = pr.labels.map((l) => l.name);
+            for (const label of Object.values(KIND)) {
+              if (label !== desired && current.includes(label)) {
+                await github.rest.issues.removeLabel({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  name: label,
+                });
+              }
+            }
+            if (desired && !current.includes(desired)) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: pr.number,
+                labels: [desired],
+              });
+            }

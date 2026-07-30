@@ -112,6 +112,20 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 	}
 }
 
+// supportsGitHubIssueDiscovery is the single authority for lanes that discover
+// GitHub issues through the GitHub gateway (triager and coordinator). Plane
+// owns its own task issues and delegates only pull requests to GitHub, so it
+// must not feed these lanes; Forgejo owns its own issues as well.
+//
+// Both lanes used to hand-write this predicate independently, and each picked a
+// different wrong flag (coordinator: GitHubPullRequests; triager:
+// GitHubCLIPullRequestCreation), which is the repeated one-line fix this
+// centralization replaces. The GitHub-issue authority now lives in one place so
+// the lanes cannot drift apart again.
+func supportsGitHubIssueDiscovery(capabilities forge.Capabilities) bool {
+	return capabilities.GitHubIssues
+}
+
 // coordinatorLane is built separately because coordination is not a coding
 // role: it has no agent, no discovery config, and is enabled per project.
 func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
@@ -120,7 +134,7 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 		Priority:  config.PriorityCoordinator,
 		Present:   input.Coordinator != nil,
 		Enabled:   func(projectID string) bool { return coordinatorEnabledForProject(input, projectID) },
-		Supported: func(capabilities forge.Capabilities) bool { return capabilities.GitHubIssues },
+		Supported: supportsGitHubIssueDiscovery,
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 			_, err := input.Coordinator.DiscoverIssues(ctx, coordinator.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
 			return nil, err
@@ -139,7 +153,7 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 		Enabled: func(projectID string) bool {
 			return input.TriagerEnabled != nil && input.TriagerEnabled(projectID)
 		},
-		Supported: func(capabilities forge.Capabilities) bool { return capabilities.GitHubCLIPullRequestCreation },
+		Supported: supportsGitHubIssueDiscovery,
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: &decisionBudget})
 			return result.QueueItems, err

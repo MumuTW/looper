@@ -56,13 +56,15 @@ Default runtime artifacts land in `~/.looper/` (`looper.sqlite`, `backups/`, `lo
 
 ## Local pre-flight (so CI never surprises you)
 
-CI's `verify` job runs, in order: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build`. Two helpers keep you ahead of it:
+CI's `verify` job runs, in order: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build`. A separate `race` job runs the race detector over the focused package set in `scripts/race-packages.txt`. Two helpers keep you ahead of both:
 
 ```bash
 scripts/verify.sh --install-hooks   # one-time per clone: git commits now auto-gofmt
-scripts/verify.sh                   # run the exact CI gates locally before you push
+scripts/verify.sh                   # run CI's verify + race gates locally before you push
 scripts/verify.sh --fix             # gofmt -w first, then run the gates
 ```
+
+The remaining CI jobs (contract/invariant smoke, conditional E2E) run `-run`-filtered subsets of `./internal/e2e`, which `go test ./...` already covers in full — a green `scripts/verify.sh` means CI should be green.
 
 After `--install-hooks`, the tracked `.githooks/pre-commit` reformats and re-stages any Go file you commit, so a formatting slip can't reach CI. It's the single most common way to redden `verify`.
 
@@ -134,7 +136,7 @@ For GitHub live sandbox tests, prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`; `LOOPER_
 
 1. Fork the repo (or branch directly if you have write access).
 2. Make your changes on a feature branch.
-3. Ensure `scripts/verify.sh` is clean (dashboard build + `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build ./...`) — these are exactly what CI's `verify` job runs.
+3. Ensure `scripts/verify.sh` is clean (dashboard build + `gofmt -l .` → `go vet ./...` → `go test ./...` → `go test -race` → `go build ./...`) — these are exactly what CI's `verify` and `race` jobs run.
 4. Open a PR against `main` with:
    - A semantic title (same rules as commits)
    - A short description of the change and motivation

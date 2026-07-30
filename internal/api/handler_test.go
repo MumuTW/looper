@@ -200,6 +200,50 @@ func TestHandlerLoopRetryResetsFixerFailureStreak(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryEscapesManualInterventionFixerCheckpoint(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_escape_manual"
+	loopID := "loop_retry_escape_manual"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 47, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpoint := `{"resumePolicy":"manual_intervention","worktree":{"path":"/tmp/wt-42","branch":"feature/fix-42","preparedAt":"2026-04-11T12:00:00.000Z"},"repair":{"summary":"upstream server_error","parseStatus":"","completedAt":"2026-04-11T12:00:00.000Z"}}`
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_parked", LoopID: loopID, Status: "failed", CurrentStep: stringPtr("resolve_comments"), LastCompletedStep: stringPtr("push"), CheckpointJSON: &checkpoint, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	lastErrorKind := "manual_intervention"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_escape_manual", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:escape_manual", Priority: storage.QueuePriorityFixer, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/47/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	run, err := services.Repositories.Runs.GetByID(context.Background(), "run_parked")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
+	}
+	if !strings.Contains(*run.CheckpointJSON, `"restart_from_discover"`) {
+		t.Fatalf("checkpoint = %s, want resumePolicy restart_from_discover after operator retry", *run.CheckpointJSON)
+	}
+	if strings.Contains(*run.CheckpointJSON, `"manual_intervention"`) {
+		t.Fatalf("checkpoint = %s, want manual_intervention resumePolicy replaced", *run.CheckpointJSON)
+	}
+}
+
 func TestHandlerLoopRetryAllowsManualInterventionQueueItem(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
@@ -5909,18 +5953,15 @@ func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 	}
 	defer response.Body.Close()
 
+	// Append the agent output before marking the run terminal. A poll that
+	// landed between the two writes would see a terminal run with no new
+	// output, emit end, and close the stream without ever sending the chunk.
+	// Writing the output first means any poll that observes the terminal run
+	// has necessarily observed the appended output too, so the chunk is
+	// flushed in the same iteration (see shouldTerminateLoopLogsFollowBeforeChunk).
 	go func() {
 		time.Sleep(250 * time.Millisecond)
-		updatedRun, getRunErr := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_1")
-		if getRunErr != nil || updatedRun == nil {
-			return
-		}
-		run := *updatedRun
 		completedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
-		run.Status = "success"
-		run.EndedAt = &completedAt
-		run.UpdatedAt = completedAt
-		_ = fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), run)
 
 		updatedExec, getExecErr := fixture.runtime.Services().Repositories.AgentExecutions.GetLatestByRunID(context.Background(), "run_1")
 		if getExecErr != nil || updatedExec == nil {
@@ -5932,6 +5973,16 @@ func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 		exec.OutputJSON = stringPtr(`{"stdout":"line1\nline2\n","stderr":""}`)
 		exec.UpdatedAt = completedAt
 		_ = fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), exec)
+
+		updatedRun, getRunErr := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_1")
+		if getRunErr != nil || updatedRun == nil {
+			return
+		}
+		run := *updatedRun
+		run.Status = "success"
+		run.EndedAt = &completedAt
+		run.UpdatedAt = completedAt
+		_ = fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), run)
 	}()
 
 	bodyCh := make(chan []byte, 1)

@@ -1410,7 +1410,37 @@ func (g *Gateway) GetRepositoryPermission(ctx context.Context, input RepositoryP
 	if err != nil {
 		return "", err
 	}
-	return strings.ToLower(strings.TrimSpace(asString(row["permission"]))), nil
+	permission := strings.ToLower(strings.TrimSpace(asString(row["permission"])))
+	// A 200 with no recognized permission value (e.g. "{}") is a semantically
+	// malformed response, not a denial. GitHub's
+	// collaborators/{username}/permission endpoint returns the legacy base
+	// roles admin/write/read/none (maintain is mapped to write, triage to
+	// read); maintain/triage are accepted defensively but never appear in
+	// practice. Surfacing an unrecognized value as an error keeps callers
+	// fail-closed with a diagnostic instead of silently treating a legitimate
+	// maintainer's answer as unauthorized. A 404 (genuine non-collaborator) is
+	// mapped to "" and returned without error above, so the empty string
+	// reaching here is a malformed 200, not a denial.
+	if !isKnownRepositoryPermission(permission) {
+		return "", fmt.Errorf("github: malformed collaborator permission response for %s/%s: %q", repo, input.User, permission)
+	}
+	return permission, nil
+}
+
+// isKnownRepositoryPermission reports whether permission is one of the values
+// GitHub's collaborators/{username}/permission endpoint can return. The
+// documented legacy base roles are admin/write/read/none; maintain and triage
+// are included defensively (the endpoint maps them to write/read, but older
+// GHES surfaces have historically varied). "none" is a valid denial, not
+// malformed: callers route it through RepositoryPermissionAllowsWrite, which
+// returns false for it.
+func isKnownRepositoryPermission(permission string) bool {
+	switch permission {
+	case "admin", "maintain", "write", "triage", "read", "none":
+		return true
+	default:
+		return false
+	}
 }
 
 // RepositoryPermissionAllowsWrite is the shared authority predicate for
