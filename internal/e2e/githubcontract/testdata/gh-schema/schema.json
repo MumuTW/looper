@@ -51,6 +51,11 @@
       "reviews",
       "statusCheckRollup",
       "mergeStateStatus"
+    ],
+    "label list": [
+      "name",
+      "color",
+      "description"
     ]
   }
 }
