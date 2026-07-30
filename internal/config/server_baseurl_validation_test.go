@@ -20,6 +20,8 @@ func TestCanonicalizeServerBaseURL(t *testing.T) {
 		{value: "https://daemon.example/a/b", want: "https://daemon.example/a/b"},
 		{value: "http://[::1]:17310", want: "http://[::1]:17310"},
 		{value: "http://192.168.1.5:17310", want: "http://192.168.1.5:17310"},
+		// The IPv6 zone identifier keeps its case and its %25 escaping.
+		{value: "http://[FE80::1%25ETH0]:17310", want: "http://[fe80::1%25ETH0]:17310"},
 	}
 	for _, tt := range valid {
 		got, err := CanonicalizeServerBaseURL(tt.value)
@@ -47,6 +49,12 @@ func TestCanonicalizeServerBaseURL(t *testing.T) {
 		{value: "http://daemon.example//double", wantMessage: "empty path segments"},
 		{value: "http://daemon.example/a/../b", wantMessage: ". or .. path segments"},
 		{value: "http://daemon.example/./a", wantMessage: ". or .. path segments"},
+		{value: "http://127.0.0.1:99999", wantMessage: "port between 1 and 65535"},
+		{value: "http://127.0.0.1:0", wantMessage: "port between 1 and 65535"},
+		{value: "https://daemon.example/%2e%2e/admin", wantMessage: "percent-encoded"},
+		{value: "https://daemon.example/a%2F%2Fb", wantMessage: "percent-encoded"},
+		{value: "https://daemon.example/a%20b", wantMessage: "percent-encoded"},
+		{value: "http://bücher.example", wantMessage: "IDNA/punycode"},
 	}
 	for _, tt := range invalid {
 		got, err := CanonicalizeServerBaseURL(tt.value)
@@ -85,10 +93,48 @@ func TestValidateAcceptsCanonicalServerBaseURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseURL := "https://daemon.example/looper"
+	token := "secret"
 	cfg.Server.BaseURL = &baseURL
+	cfg.Server.AuthMode = AuthModeLocalToken
+	cfg.Server.LocalToken = &token
 
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("Validate() error = %v, want valid baseUrl accepted", err)
+	}
+}
+
+func TestValidateRequiresTokenAuthForPublicBaseURL(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Server.Host = "127.0.0.1"
+	cfg.Server.AuthMode = AuthModeNone
+	publicBase := "https://looper.example.com"
+	cfg.Server.BaseURL = &publicBase
+
+	err = Validate(cfg)
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %T %v, want *ConfigValidationError", err, err)
+	}
+	assertValidationIssue(t, validationErr, "server.authMode", "none is allowed only when server.baseUrl advertises a loopback authority; use local-token when a proxy, tunnel, or public hostname fronts the daemon")
+
+	// Loopback advertised authority stays fine without a token, and a public
+	// one is accepted once token auth is on.
+	loopbackBase := "http://localhost:8080/looper"
+	cfg.Server.BaseURL = &loopbackBase
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v, want loopback baseUrl accepted with authMode none", err)
+	}
+	token := "secret"
+	cfg.Server.BaseURL = &publicBase
+	cfg.Server.AuthMode = AuthModeLocalToken
+	cfg.Server.LocalToken = &token
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v, want public baseUrl accepted with local-token", err)
 	}
 }
 

@@ -345,8 +345,17 @@ func validateServerConfig(server ServerConfig, issues *[]ValidationIssue) {
 		*issues = append(*issues, ValidationIssue{Path: "server.localToken", Message: "is required when authMode is local-token"})
 	}
 	if server.BaseURL != nil && strings.TrimSpace(*server.BaseURL) != "" {
-		if _, err := CanonicalizeServerBaseURL(*server.BaseURL); err != nil {
+		canonical, err := CanonicalizeServerBaseURL(*server.BaseURL)
+		if err != nil {
 			*issues = append(*issues, ValidationIssue{Path: "server.baseUrl", Message: err.Error()})
+		} else if server.AuthMode == AuthModeNone {
+			// A non-loopback advertised authority means a proxy or tunnel
+			// fronts the daemon; the token-less loopback trust model does not
+			// survive that hop (a local proxy can deliver remote requests with
+			// a loopback peer address and the configured public Host/Origin).
+			if parsed, parseErr := url.Parse(canonical); parseErr == nil && !isLoopbackBindHost(parsed.Hostname()) {
+				*issues = append(*issues, ValidationIssue{Path: "server.authMode", Message: "none is allowed only when server.baseUrl advertises a loopback authority; use local-token when a proxy, tunnel, or public hostname fronts the daemon"})
+			}
 		}
 	}
 }
@@ -575,6 +584,19 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 	if parsed.Host == "" || parsed.Hostname() == "" {
 		return "", errors.New("must include a host")
 	}
+	// Go's transport and browsers send the IDNA/Punycode authority on the
+	// wire, so a stored Unicode host would never match Host/Origin checks.
+	for _, r := range parsed.Hostname() {
+		if r > 127 {
+			return "", errors.New("must use an ASCII host; write internationalized domains in their IDNA/punycode form")
+		}
+	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return "", errors.New("must use a port between 1 and 65535")
+		}
+	}
 	if parsed.User != nil {
 		return "", errors.New("must not include userinfo credentials")
 	}
@@ -586,6 +608,11 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 	}
 
 	path := parsed.EscapedPath()
+	// Percent-escapes would let encoded separators or dot segments slip past
+	// the segment checks below and decode differently behind a proxy.
+	if strings.Contains(path, "%") {
+		return "", errors.New("must not contain percent-encoded path segments")
+	}
 	if path == "/" {
 		path = ""
 	}
@@ -604,7 +631,17 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 		}
 	}
 
-	return scheme + "://" + strings.ToLower(parsed.Host) + path, nil
+	// Lowercase the host but not an IPv6 zone identifier, which is
+	// case-sensitive; url.URL.String restores the zone's %25 escaping that
+	// url.Parse decoded out of Host.
+	host := parsed.Host
+	if zone := strings.Index(host, "%"); zone >= 0 {
+		host = strings.ToLower(host[:zone]) + host[zone:]
+	} else {
+		host = strings.ToLower(host)
+	}
+
+	return (&url.URL{Scheme: scheme, Host: host, Path: path}).String(), nil
 }
 
 func isAbsoluteHTTPURL(value string) bool {

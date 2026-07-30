@@ -519,3 +519,29 @@ func waitForWebhookCondition(t *testing.T, timeout time.Duration, predicate func
 	}
 	t.Fatal("timed out waiting for condition")
 }
+
+func TestWebhookForwardEndpointPreservesBaseURLPathPrefix(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Webhook.Enabled = true
+	gh := "/usr/bin/gh"
+	cfg.Tools.GHPath = &gh
+	base := "http://localhost:8080/looper"
+	cfg.Server.BaseURL = &base
+
+	endpoint, reasons := webhookForwardEndpoint(cfg)
+	if len(reasons) != 0 {
+		t.Fatalf("webhookForwardEndpoint() reasons = %v, want none", reasons)
+	}
+	if endpoint == nil || *endpoint != "http://localhost:8080/looper/webhook/forward" {
+		got := "<nil>"
+		if endpoint != nil {
+			got = *endpoint
+		}
+		t.Fatalf("webhookForwardEndpoint() = %q, want the /looper prefix preserved", got)
+	}
+}
