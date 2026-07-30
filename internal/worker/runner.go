@@ -404,6 +404,8 @@ type AgentResult struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 	PreTimeoutError              string
+	NativeResumeMode             string
+	NativeResumeStatus           string
 }
 
 const validationGatedLocalOnlyPrompt = `
@@ -715,6 +717,8 @@ type checkpointExecution struct {
 	ConfiguredMaxRuntimeSeconds  int64             `json:"configuredMaxRuntimeSeconds,omitempty"`
 	ElapsedRuntimeSeconds        int64             `json:"elapsedRuntimeSeconds,omitempty"`
 	LastProgressAt               string            `json:"lastProgressAt,omitempty"`
+	NativeResumeMode             string            `json:"nativeResumeMode,omitempty"`
+	NativeResumeStatus           string            `json:"nativeResumeStatus,omitempty"`
 	ProgressBeforeTimeout        *worktreeProgress `json:"progressBeforeTimeout,omitempty"`
 	ProgressSnapshotError        string            `json:"progressSnapshotError,omitempty"`
 }
@@ -1134,8 +1138,16 @@ func checkpointExecutionFromAgentResult(result AgentResult, runID, executionID s
 		ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout,
 		TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds,
 		ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt,
+		NativeResumeMode: result.NativeResumeMode, NativeResumeStatus: result.NativeResumeStatus,
 		ProgressSnapshotError: result.PreTimeoutError,
 	}
+}
+
+func (c *workerCheckpoint) recordContinuationResumeMode(result AgentResult) {
+	if c == nil || c.Continuation == nil || strings.TrimSpace(result.NativeResumeMode) == "" {
+		return
+	}
+	c.Continuation.Mode = result.NativeResumeMode
 }
 
 func New(options Options) *Runner {
@@ -2488,6 +2500,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			}
 		}
 		if result.Status != "completed" {
+			checkpoint.recordContinuationResumeMode(result)
 			checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
 			checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
 			if result.PreTimeoutError != "" {
@@ -2536,6 +2549,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 			return checkpoint, err
 		}
+		checkpoint.recordContinuationResumeMode(result)
 		checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
 		checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {

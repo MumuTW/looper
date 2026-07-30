@@ -793,6 +793,9 @@ func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 	if result.Status != "completed" || result.Summary != "resumed" {
 		t.Fatalf("result = %#v, want completed resumed execution", result)
 	}
+	if result.NativeResumeMode != "native_resume" || result.NativeResumeStatus != "started" {
+		t.Fatalf("result native resume = %q/%q, want native_resume/started", result.NativeResumeMode, result.NativeResumeStatus)
+	}
 	argsBytes, err := os.ReadFile(argsPath)
 	if err != nil {
 		t.Fatalf("ReadFile(argsPath) error = %v", err)
@@ -864,6 +867,9 @@ func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 	}
 	if result.Status != "completed" || result.Summary != "checkpoint" {
 		t.Fatalf("result = %#v, want immediate checkpoint fallback completion", result)
+	}
+	if result.NativeResumeMode != "checkpoint_restart" || result.NativeResumeStatus != "fallback_completed" {
+		t.Fatalf("result native resume = %q/%q, want checkpoint_restart/fallback_completed", result.NativeResumeMode, result.NativeResumeStatus)
 	}
 	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_resume_failed")
 	if err != nil {

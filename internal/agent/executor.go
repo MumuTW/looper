@@ -226,6 +226,8 @@ type Result struct {
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
 	PreTimeoutError              string
+	NativeResumeMode             string
+	NativeResumeStatus           string
 	PID                          int
 }
 
@@ -1112,6 +1114,7 @@ func (x *execution) run(ctx context.Context) {
 	}
 	endedAtISO := eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
 	lastProgressAt := x.lastProgressAtISO()
+	_, nativeResumeMode, nativeResumeStatus, _ := x.nativeResumeSnapshot()
 	result := Result{
 		Status:                       status,
 		Summary:                      completion.Summary,
@@ -1131,6 +1134,8 @@ func (x *execution) run(ctx context.Context) {
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               lastProgressAt,
 		PreTimeoutError:              preTimeoutError,
+		NativeResumeMode:             nativeResumeMode,
+		NativeResumeStatus:           nativeResumeStatus,
 		PID:                          x.leaderPID(),
 	}
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
@@ -1402,6 +1407,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 				ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 				ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 				LastProgressAt:               x.lastProgressAtISO(),
+				NativeResumeMode:             "checkpoint_restart",
+				NativeResumeStatus:           "fallback_failed",
 				PID:                          x.leaderPID(),
 			}, errMsg, true, nil
 		}
@@ -1598,6 +1605,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		x.nativeResumeStatus = "fallback_failed"
 	}
 	x.mu.Unlock()
+	_, nativeResumeMode, nativeResumeStatus, _ := x.nativeResumeSnapshot()
 	return Result{
 		Status:                       status,
 		Summary:                      completion.Summary,
@@ -1617,6 +1625,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
 		PreTimeoutError:              preTimeoutError,
+		NativeResumeMode:             nativeResumeMode,
+		NativeResumeStatus:           nativeResumeStatus,
 		PID:                          x.leaderPID(),
 	}, errorMessage, true, nil
 }

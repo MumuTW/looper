@@ -77,6 +77,21 @@ func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestCheckpointExecutionRecordsActualContinuationResumeMode(t *testing.T) {
+	t.Parallel()
+
+	result := AgentResult{Status: "completed", ParseStatus: "parsed", NativeResumeMode: "native_resume", NativeResumeStatus: "started"}
+	execution := checkpointExecutionFromAgentResult(result)
+	if execution.NativeResumeMode != "native_resume" || execution.NativeResumeStatus != "started" {
+		t.Fatalf("execution = %#v, want native resume fields", execution)
+	}
+	checkpoint := workerCheckpoint{Continuation: &checkpointContinuation{Mode: "checkpoint_same_worktree"}}
+	checkpoint.recordContinuationResumeMode(result)
+	if checkpoint.Continuation.Mode != "native_resume" {
+		t.Fatalf("Continuation.Mode = %q, want actual native_resume", checkpoint.Continuation.Mode)
+	}
+}
+
 func TestBackoffDelayCapsInfiniteRetryOverflow(t *testing.T) {
 	t.Parallel()
 
