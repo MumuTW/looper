@@ -28,7 +28,7 @@ it("lists projects and exposes no registration control", async () => {
 
   render(<App />);
   expect(await screen.findByRole("heading", { name: "Projects" })).toBeTruthy();
-  expect(screen.getByText("Looper")).toBeTruthy();
+  expect(await screen.findByRole("cell", { name: "Looper" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Refresh" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: /add|create|register/i })).toBeNull();
 });
