@@ -1,9 +1,12 @@
 name: sandbox-e2e
 
+# Dispatch-only until the sandbox credentials exist. This suite needs a GitHub
+# App (vars.LOOPER_E2E_GITHUB_APP_ID + secrets.LOOPER_E2E_GITHUB_APP_PRIVATE_KEY)
+# and a live sandbox repo; none of them are configured, so every push-triggered
+# run has died at the token-mint step without executing a single assertion.
+# Re-add the push trigger once `gh variable list` / `gh secret list` show the
+# App wired up and a manual dispatch goes green.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:

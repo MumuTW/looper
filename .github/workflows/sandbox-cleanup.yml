@@ -1,8 +1,9 @@
 name: sandbox-cleanup
 
+# Dispatch-only while sandbox-e2e is dormant: with nothing creating sandbox
+# residue, the hourly cron only produced a failing run every hour. Restore the
+# schedule together with the sandbox-e2e push trigger.
 on:
-  schedule:
-    - cron: '17 * * * *'
   workflow_dispatch:
 
 permissions:
