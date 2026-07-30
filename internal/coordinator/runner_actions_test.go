@@ -1105,6 +1105,85 @@ func TestRunnerAutonomousDispatchDeduplicatesRecentAndBacklogCandidates(t *testi
 	}
 }
 
+func TestRunnerAutonomousDispatchRotatesPastBlockedBacklogPage(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Roles.Coordinator.Dependencies.Enabled = true
+		cfg.Scheduler.MaxConcurrentRuns = 1
+	})
+	for issueNumber := int64(1); issueNumber <= 101; issueNumber++ {
+		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
+		if issueNumber <= 100 {
+			fixture.github.blockedBy[issueNumber] = []githubinfra.DependencyIssue{{Number: 1000, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
+		}
+	}
+	fixture.github.details[1000] = githubinfra.IssueDetail{Number: 1000, State: "open"}
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if len(input.Labels) == 0 {
+			return nil
+		}
+		if input.Limit != coordinatorBacklogSummaryLimit {
+			t.Fatalf("backlog summary limit = %d, want %d", input.Limit, coordinatorBacklogSummaryLimit)
+		}
+		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") {
+			return fixture.github.issues
+		}
+		return nil
+	}
+
+	for tick := 1; tick <= 101; tick++ {
+		readsBefore := fixture.github.viewIssueReads
+		if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+			t.Fatalf("DiscoverIssues() tick %d error = %v", tick, err)
+		}
+		if got := fixture.github.viewIssueReads - readsBefore; got != 1 {
+			t.Fatalf("tick %d issue-detail reads = %d, want 1", tick, got)
+		}
+	}
+
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{101})
+}
+
+func TestRunnerBacklogHydrationMatchesAvailableDispatchCapacity(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 5
+	})
+	for issueNumber := int64(1); issueNumber <= 50; issueNumber++ {
+		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
+	}
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if len(input.Labels) == 0 {
+			return nil
+		}
+		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") {
+			return fixture.github.issues
+		}
+		return nil
+	}
+	seedRunningQueueItems(t, fixture, 3)
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	if fixture.github.viewIssueReads != 2 {
+		t.Fatalf("issue-detail reads = %d, want 2 available scheduler slots", fixture.github.viewIssueReads)
+	}
+	if fixture.github.timelineReads != 2 {
+		t.Fatalf("timeline reads = %d, want 2 available scheduler slots", fixture.github.timelineReads)
+	}
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1, 2})
+}
+
 // TestReconfigurePreservesRuntimeStateThrottle verifies that reconfigure
 // carries the previous runner's RuntimeState into the replacement, so the
 // per-project throttle timestamp survives a config-snapshot rebuild. This
@@ -1422,6 +1501,8 @@ type stubCoordinatorGitHub struct {
 	currentLogin             string
 	currentLoginErr          error
 	currentLoginForRepoCalls int
+	viewIssueReads           int
+	timelineReads            int
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(_ context.Context, input githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -1438,6 +1519,7 @@ func (s *stubCoordinatorGitHub) ListOpenPullRequests(context.Context, githubinfr
 	return result, nil
 }
 func (s *stubCoordinatorGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	s.viewIssueReads++
 	return s.details[input.IssueNumber], nil
 }
 func (s *stubCoordinatorGitHub) ViewPullRequest(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
@@ -1490,6 +1572,7 @@ func (s *stubCoordinatorGitHub) GetCurrentUserLoginForRepo(context.Context, stri
 	return "looper", nil
 }
 func (s *stubCoordinatorGitHub) ListIssueTimeline(_ context.Context, input githubinfra.IssueTimelineInput) ([]map[string]any, error) {
+	s.timelineReads++
 	return s.timeline[input.IssueNumber], nil
 }
 func (s *stubCoordinatorGitHub) GetRepositoryPermission(_ context.Context, input githubinfra.RepositoryPermissionInput) (string, error) {
