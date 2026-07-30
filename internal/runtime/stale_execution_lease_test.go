@@ -114,8 +114,7 @@ func TestRuntimeReconcileStaleRunningRunsNeverSettlesExecutionThisDaemonOwns(t *
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
-	release := rt.Services().ActiveExecutions.Register(loopID, runID, executionID, stubAgentExecution{})
-	defer release()
+	bindLiveExecutionForTest(t, rt, loopID, runID, executionID)
 
 	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
 	if err != nil {

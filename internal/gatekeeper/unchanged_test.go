@@ -6,6 +6,7 @@ import (
 	"time"
 
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 func openPullRequestFixture() githubinfra.PullRequestSummary {
@@ -65,7 +66,7 @@ func TestDiscoverPullRequestsReevaluatesWhenTheListPageChanges(t *testing.T) {
 		{name: "head sha", mutate: func(p *githubinfra.PullRequestSummary) { p.HeadSHA = "head-2" }},
 		{name: "updated at", mutate: func(p *githubinfra.PullRequestSummary) { p.UpdatedAt = "2026-07-30T09:30:00Z" }},
 		{name: "review decision", mutate: func(p *githubinfra.PullRequestSummary) { p.ReviewDecision = "CHANGES_REQUESTED" }},
-		{name: "labels", mutate: func(p *githubinfra.PullRequestSummary) { p.Labels = []string{"looper:hold"} }},
+		{name: "labels", mutate: func(p *githubinfra.PullRequestSummary) { p.Labels = []string{labels.HoldGlobal} }},
 		{name: "draft", mutate: func(p *githubinfra.PullRequestSummary) { p.IsDraft = true }},
 		{name: "conflicts", mutate: func(p *githubinfra.PullRequestSummary) { p.HasConflicts = true }},
 		{name: "base branch", mutate: func(p *githubinfra.PullRequestSummary) { p.BaseRefName = "release" }},

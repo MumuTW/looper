@@ -65,6 +65,33 @@ func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
 	}
 }
 
+func TestHandlerHealthzRemainsLiveWhenAdmissionDegradedAndStatusReportsNotReady(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	if err := rt.MarkDegraded("test readiness transition"); err != nil {
+		t.Fatalf("MarkDegraded() error = %v", err)
+	}
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+
+	healthRecorder := httptest.NewRecorder()
+	h.ServeHTTP(healthRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/healthz", nil))
+	if healthRecorder.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want 200; body=%s", healthRecorder.Code, healthRecorder.Body.String())
+	}
+	healthData := parseJSONMap(t, healthRecorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, healthData["healthy"], true)
+
+	statusRecorder := httptest.NewRecorder()
+	h.ServeHTTP(statusRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	if statusRecorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", statusRecorder.Code, statusRecorder.Body.String())
+	}
+	statusData := parseJSONMap(t, statusRecorder.Body.Bytes())["data"].(map[string]any)
+	service := statusData["service"].(map[string]any)
+	scheduler := statusData["scheduler"].(map[string]any)
+	assertEqual(t, service["admissionState"], "degraded")
+	assertEqual(t, scheduler["healthy"], false)
+}
+
 func TestHandlerLoopRetryCreatesReplacementQueueItem(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

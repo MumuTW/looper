@@ -2,13 +2,16 @@ package runtime
 
 import (
 	"context"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -101,8 +104,7 @@ func TestStartupRecoveryQuarantineNotifiesOncePerPass(t *testing.T) {
 	t.Cleanup(func() { rt.Stop("test cleanup") })
 	for _, seq := range []int64{35, 36} {
 		loopID := loopIDForSeq(seq)
-		release := rt.Services().ActiveExecutions.Register(loopID, "run_quarantine_"+loopID, "agent_quarantine_"+loopID, stubAgentExecution{})
-		defer release()
+		bindLiveExecutionForTest(t, rt, loopID, "run_quarantine_"+loopID, "agent_quarantine_"+loopID)
 	}
 	if err := rt.CompleteStartup(context.Background()); err != nil {
 		t.Fatalf("CompleteStartup() error = %v", err)
@@ -182,4 +184,48 @@ func listQuarantineNotifications(t *testing.T, repositories *storage.Repositorie
 		}
 	}
 	return matched
+}
+
+// bindLiveExecutionForTest makes this daemon the genuine owner of a live agent
+// process for loopID, through the production admission → containment-bind path.
+// #254 deleted the handle-less Register seam precisely so tests cannot model an
+// ownership state production never holds; a real bound handle is the authority,
+// so that is what this creates.
+func bindLiveExecutionForTest(t *testing.T, rt *Runtime, loopID, runID, executionID string) {
+	t.Helper()
+
+	registry := rt.Services().ActiveExecutions
+	// Admission is closed while startup recovery is deferred, which is the whole
+	// point of the gate. Production reaches this state the other way round — the
+	// agent was admitted while the daemon was open, and a later recovery pass
+	// sees it still bound — so open the gate for the bind and hand it straight
+	// back to the real projection.
+	registry.SetAllowSpawn(func() error { return nil })
+	defer registry.SetAllowSpawn(rt.AllowClaim)
+
+	lease, err := registry.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID:      loopID,
+		RunID:       runID,
+		ExecutionID: executionID,
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn(%s) error = %v", loopID, err)
+	}
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start() error = %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("Bind() error = %v", err)
+	}
+	if err := lease.BindHandle(handle, func(string) error { return nil }); err != nil {
+		t.Fatalf("BindHandle() error = %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
 }

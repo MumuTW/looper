@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/labels"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
@@ -2107,8 +2109,7 @@ func TestRuntimeReconcileStaleRunningRunsSkipsCurrentDaemonOwnedExecution(t *tes
 			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_live_execution", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_live_execution"), RunID: stringPtr("run_live_execution"), Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":515100,"bootId":"boot-test"}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 			}
-			release := rt.Services().ActiveExecutions.Register("loop_live_execution", "run_live_execution", "exec_live_execution", stubAgentExecution{})
-			defer release()
+			bindLiveExecutionForTest(t, rt, "loop_live_execution", "run_live_execution", "exec_live_execution")
 
 			summary, err := tc.reconcile(rt, context.Background())
 			if err != nil {
@@ -2297,8 +2298,7 @@ func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunOwnedByThisDaemon(t *
 			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_superseded_live", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_superseded_live"), RunID: stringPtr("run_superseded_old"), Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":525200,"bootId":"boot-test"}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 			}
-			release := rt.Services().ActiveExecutions.Register("loop_superseded_live", "run_superseded_old", "exec_superseded_live", stubAgentExecution{})
-			defer release()
+			bindLiveExecutionForTest(t, rt, "loop_superseded_live", "run_superseded_old", "exec_superseded_live")
 
 			summary, err := tc.reconcile(rt, context.Background())
 			if err != nil {
@@ -2434,8 +2434,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 				}
 			}
 			if tc.registerOwned {
-				release := rt.Services().ActiveExecutions.Register(loopID, runID, "exec_multi_a", stubAgentExecution{})
-				defer release()
+				bindLiveExecutionForTest(t, rt, loopID, runID, "exec_multi_a")
 			}
 
 			summary, err := rt.ReconcileStaleRunningRuns(context.Background())
@@ -3714,7 +3713,7 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 		}(), run: baseRun, queue: baseQueue},
 		{name: "ready label checkpoint", loop: baseLoop, run: func() storage.RunRecord {
 			r := baseRun
-			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":["looper:spec-ready"]}`)
+			r.CheckpointJSON = checkpoint(fmt.Sprintf(`"detail":{"state":"OPEN","reviewDecision":"","labels":[%q]}`, labels.SpecReady))
 			return r
 		}(), queue: baseQueue},
 		{name: "missing checkpoint detail", loop: baseLoop, run: func() storage.RunRecord {
@@ -4159,7 +4158,7 @@ func TestShouldAutoRecoverFailedReviewerLoopHonorsRecoveryPolicy(t *testing.T) {
 	}{
 		{name: "draft checkpoint", run: storage.RunRecord{ID: "run_recover_draft", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","isDraft":true,"reviewDecision":"","labels":[]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}},
 		{name: "approved checkpoint", run: storage.RunRecord{ID: "run_recover_approved", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","reviewDecision":"APPROVED","labels":[]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}},
-		{name: "ready label checkpoint", run: storage.RunRecord{ID: "run_recover_ready", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":["looper:spec-ready"]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}},
+		{name: "ready label checkpoint", run: storage.RunRecord{ID: "run_recover_ready", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(fmt.Sprintf(`"detail":{"state":"OPEN","reviewDecision":"","labels":[%q]}`, labels.SpecReady)), Summary: &errorMessage, ErrorMessage: &errorMessage}},
 	}
 	for _, tt := range tests {
 		tt := tt

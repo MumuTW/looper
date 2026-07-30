@@ -465,10 +465,45 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	return result, nil
 }
 
+// haltPreflight is the one read snapshot that establishes whether haltLoop has
+// a running execution to stop. Its reads must finish before Pause, BeginLoopStop,
+// or Terminate: a lookup error is not authority to partially mutate a loop.
+type haltPreflight struct {
+	runsAvailable   bool
+	latestRun       *storage.RunRecord
+	latestExecution *storage.AgentExecutionRecord
+}
+
+func loadHaltPreflight(ctx context.Context, services looperdruntime.Services, loopID string) (haltPreflight, error) {
+	if services.Repositories == nil || services.Repositories.Runs == nil {
+		return haltPreflight{}, nil
+	}
+
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
+	if err != nil {
+		return haltPreflight{}, fmt.Errorf("load latest run before halt: %w", err)
+	}
+	preflight := haltPreflight{runsAvailable: true, latestRun: latestRun}
+	if latestRun == nil || latestRun.Status != "running" || services.Repositories.AgentExecutions == nil {
+		return preflight, nil
+	}
+
+	latestExecution, err := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
+	if err != nil {
+		return haltPreflight{}, fmt.Errorf("load latest agent execution before halt: %w", err)
+	}
+	preflight.latestExecution = latestExecution
+	return preflight, nil
+}
+
 func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc, terminal bool) (any, error) {
 	result := stopLoopResult{Stopped: false, LoopID: loopID, Outcome: stopOutcomePausedOnly}
 	if services.Loops == nil {
 		return nil, fmt.Errorf("loops service is not configured")
+	}
+	preflight, err := loadHaltPreflight(ctx, services, loopID)
+	if err != nil {
+		return nil, err
 	}
 
 	reasonCopy := reason
@@ -554,32 +589,17 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return out, err
 	}
 
-	if services.Repositories == nil || services.Repositories.Runs == nil {
+	if preflight.latestRun == nil || preflight.latestRun.Status != "running" {
+		if preflight.runsAvailable {
+			result.Outcome = stopOutcomeAlreadyFinished
+		}
 		result.ProcessSkipReason = processSkipNoRuns
 		return finish()
 	}
-
-	// Abortable preflight for terminal close: do not BeginLoopStop yet.
-	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
-	if err != nil {
-		return nil, err
-	}
-	if latestRun == nil || latestRun.Status != "running" {
-		result.Outcome = stopOutcomeAlreadyFinished
-		result.ProcessSkipReason = processSkipNoRuns
-		return finish()
-	}
+	latestRun := preflight.latestRun
 	result.RunID = latestRun.ID
 
-	if services.Repositories.AgentExecutions == nil {
-		result.ProcessSkipReason = processSkipNoExecution
-		return finish()
-	}
-
-	latestExecution, err := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
-	if err != nil {
-		return nil, err
-	}
+	latestExecution := preflight.latestExecution
 	if latestExecution == nil {
 		result.ProcessSkipReason = processSkipNoExecution
 		return finish()

@@ -11,6 +11,7 @@ import (
 	"github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/e2e/harness"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -80,14 +81,14 @@ func TestGitHubSandboxDependencyGateScenarios(t *testing.T) {
 		}
 
 		waitForSandboxIssueComment(t, sb, dependent.Number, depGateDispatchFailureMarker)
-		waitForSandboxIssueLabelAbsent(t, sb, dependent.Number, "looper:plan")
+		waitForSandboxIssueLabelAbsent(t, sb, dependent.Number, labels.DefaultPlanTrigger)
 
 		setSandboxIssueState(t, sb, blocker.Number, "closed", "completed")
 		postSandboxIssueComment(t, sb, dependent.Number, "/plan")
 		if _, err := runner.DiscoverIssues(context.Background(), coordinator.DiscoveryInput{ProjectID: "project_1", Repo: sb.Repo}); err != nil {
 			t.Fatalf("DiscoverIssues release path: %v", err)
 		}
-		waitForSandboxIssueLabel(t, sb, dependent.Number, "looper:plan")
+		waitForSandboxIssueLabel(t, sb, dependent.Number, labels.DefaultPlanTrigger)
 	})
 
 	t.Run("GitHub rejects blocked_by cycle creation", func(t *testing.T) {

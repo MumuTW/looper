@@ -161,8 +161,7 @@ func TestStartupRecoveryLeavesCurrentDaemonOwnedExecutionAlone(t *testing.T) {
 	}
 	t.Cleanup(func() { rt.Stop("test cleanup") })
 
-	release := rt.Services().ActiveExecutions.Register(fixture.loopID, fixture.runID, fixture.executionID, stubAgentExecution{})
-	defer release()
+	bindLiveExecutionForTest(t, rt, fixture.loopID, fixture.runID, fixture.executionID)
 	if err := rt.CompleteStartup(context.Background()); err != nil {
 		t.Fatalf("CompleteStartup() error = %v", err)
 	}

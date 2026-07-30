@@ -18,9 +18,11 @@ import (
 // process is the right renewal site — it runs for exactly as long as the
 // process does, and a silent agent that has genuinely stalled is still killed
 // by its own idle timeout.
+// Deliberately not parallel: this test drives a real process and a 50ms write
+// loop, and its neighbours here assert wall-clock budgets (kill escalation must
+// finish inside 500ms). Running it in the serial phase keeps its load off their
+// measurements.
 func TestExecutorRenewsClaimLeaseForASilentLiveExecution(t *testing.T) {
-	t.Parallel()
-
 	ctx := context.Background()
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())

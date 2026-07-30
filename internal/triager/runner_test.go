@@ -9,6 +9,7 @@ import (
 	"time"
 
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -91,7 +92,7 @@ func TestDiscoverIssuesTreatsReopenedIssueAsNewSourceEvent(t *testing.T) {
 func TestDiscoverIssuesHonorsExistingHoldBeforeLLM(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	fixture.github.detail.Labels = []string{"looper:hold"}
+	fixture.github.detail.Labels = []string{labels.HoldGlobal}
 	fixture.llm.responses = []string{eligibleDecisionJSON()}
 
 	result, err := fixture.runner().DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})

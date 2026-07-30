@@ -16,6 +16,12 @@ import (
 )
 
 const (
+	// GateReportEventType is the Gate report: the durable event written by
+	// Merge Gatekeeper recording eligible or blocked, stable reasons and
+	// evidence, and the observed head SHA. It is audit evidence, not merge
+	// authority — a future merge path must rerun every gate immediately
+	// before merging, because holds, reviews, threads, and Project policy can
+	// change without moving the head.
 	GateReportEventType = "pull_request.merge_gate.evaluated"
 	ModeObserveOnly     = "observe_only"
 	StatusEligible      = "eligible"
@@ -147,6 +153,10 @@ type Options struct {
 	PolicyPermitsTarget func(projectID, repo, baseRefName string) bool
 }
 
+// Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
+// re-fetches current Pull Request state and writes an observe-only Gate
+// report. It never reviews code, repairs a Pull Request, resolves comments,
+// or merges.
 type Runner struct {
 	repos               *storage.Repositories
 	github              GitHubGateway
