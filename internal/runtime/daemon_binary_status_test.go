@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/daemonbinary"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/daemonbinary"
 )
 
 func recordedWatcher(t *testing.T, logger *testLogger, content string) (*daemonBinaryWatcher, string) {

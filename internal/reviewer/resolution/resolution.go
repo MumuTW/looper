@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // Thread is one PR review thread as fetched from the forge.

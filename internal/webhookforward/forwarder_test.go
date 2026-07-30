@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/fixer"
-	projectcatalog "github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/reviewer"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/fixer"
+	projectcatalog "github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/reviewer"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // Contract (#580): Forward refuses accept-time enqueue when admission is already closed.

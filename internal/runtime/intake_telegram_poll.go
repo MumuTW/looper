@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/intake/telegram"
-	"github.com/nexu-io/looper/internal/outboundguard"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/intake/telegram"
+	"github.com/MumuTW/looper/internal/outboundguard"
 )
 
 // telegramIntakeHTTPTimeout bounds a Bot API call.

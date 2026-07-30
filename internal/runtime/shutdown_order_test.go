@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/processcontainment"
 )
 
 // Contract (#577): shutdown order is admission → cancel/drain producers →

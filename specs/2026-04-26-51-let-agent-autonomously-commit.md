@@ -1,6 +1,6 @@
 # Issue 51: Agent-managed commit, push, and PR lifecycle
 
-Issue: [nexu-io/looper#51](https://github.com/nexu-io/looper/issues/51)  
+Issue: [MumuTW/looper#51](https://github.com/MumuTW/looper/issues/51)  
 Base branch: `main`
 
 ## Problem
@@ -57,7 +57,7 @@ Agents should leave structured output that `looperd` can parse independent of fr
     "commit_shas": ["..."],
     "pushed": true,
     "pr_number": 123,
-    "pr_url": "https://github.com/nexu-io/looper/pull/123",
+    "pr_url": "https://github.com/MumuTW/looper/pull/123",
     "pr_adopted": false,
     "actions": {
       "commit": "agent",

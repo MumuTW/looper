@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {

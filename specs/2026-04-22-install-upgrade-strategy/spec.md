@@ -78,7 +78,7 @@ Looper 的推荐安装模型调整为：
 推荐用户路径：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MumuTW/looper/main/scripts/install.sh | sh
 looper bootstrap
 ```
 
@@ -273,8 +273,8 @@ manifest 不能依赖“枚举所有 GitHub release 后自己猜最新版本”�
 
 必须提供稳定发现地址，例如：
 
-- `https://github.com/nexu-io/looper/releases/latest/download/manifest.json`
-- `https://github.com/nexu-io/looper/releases/latest/download/manifest.json.minisig`
+- `https://github.com/MumuTW/looper/releases/latest/download/manifest.json`
+- `https://github.com/MumuTW/looper/releases/latest/download/manifest.json.minisig`
 
 若后续引入 `stable` / `beta` channel，则需要为每个 channel 提供独立稳定地址，例如：
 
@@ -361,7 +361,7 @@ CLI 必须拒绝解析 `manifestVersion` 高于自己所支持上限的 manifest
 理想路径：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MumuTW/looper/main/scripts/install.sh | sh
 looper bootstrap
 ```
 

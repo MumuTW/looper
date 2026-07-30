@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/processcontainment"
 )
 
 // TrustedReviewSockEnv is the agent-facing env key for the trusted review-submit

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // Contract: BeginShutdown cancels the scheduler context so in-flight ticks can

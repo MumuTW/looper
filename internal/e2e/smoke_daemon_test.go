@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/e2e/harness"
+	"github.com/MumuTW/looper/internal/e2e/harness"
 )
 
 func TestSmokeLooperdBootsWithDefaultConfig(t *testing.T) {

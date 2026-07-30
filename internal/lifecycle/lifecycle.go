@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/version"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 const (

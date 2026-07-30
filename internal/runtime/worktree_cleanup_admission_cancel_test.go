@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 )
 
 // Contract (#592 review): cleanWorktreeCandidate must not start the remove

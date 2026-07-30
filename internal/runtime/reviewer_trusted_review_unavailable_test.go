@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/reviewer"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/reviewer"
 )
 
 // nativeReviewAdapterConfig is a project that publishes native reviews, so a

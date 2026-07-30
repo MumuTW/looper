@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func openPullRequestFixture() githubinfra.PullRequestSummary {

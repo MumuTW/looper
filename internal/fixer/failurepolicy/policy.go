@@ -5,9 +5,9 @@ import (
 	"errors"
 	"strings"
 
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/loops/failureclass"
-	"github.com/nexu-io/looper/internal/validation"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/validation"
 )
 
 // Decision is the structured output of the fixer failure-policy boundary.

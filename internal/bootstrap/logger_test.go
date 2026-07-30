@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func TestCreateLoggerWritesStructuredJSONAndRoutesStreams(t *testing.T) {

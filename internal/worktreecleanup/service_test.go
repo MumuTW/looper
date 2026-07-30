@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestPlanDryRunAppliesRetentionAndProtectsRuntimeReferences(t *testing.T) {

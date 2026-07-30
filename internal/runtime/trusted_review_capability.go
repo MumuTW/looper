@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/forge"
 )
 
 // trustedReviewCapabilityProbeTimeout bounds the probe because the reviewer

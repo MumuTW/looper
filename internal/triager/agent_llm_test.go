@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/agent"
 )
 
 func TestCompletedAgentMessageRejectsFailedExecution(t *testing.T) {

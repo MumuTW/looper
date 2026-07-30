@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/nexu-io/looper/internal/network/cloud"
-	"github.com/nexu-io/looper/internal/version"
+	"github.com/MumuTW/looper/internal/network/cloud"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 func main() {

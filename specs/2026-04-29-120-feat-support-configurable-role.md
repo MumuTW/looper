@@ -1,6 +1,6 @@
 # Issue 120: Configurable role trigger conditions
 
-Issue: [nexu-io/looper#120](https://github.com/nexu-io/looper/issues/120)
+Issue: [MumuTW/looper#120](https://github.com/MumuTW/looper/issues/120)
 Base branch: `main`
 
 ## Problem

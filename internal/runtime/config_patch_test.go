@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func TestPatchConfigPersistsValidatedFieldsAndPublishesImmediately(t *testing.T) {

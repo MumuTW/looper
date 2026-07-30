@@ -6,9 +6,9 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/fixer/workflow"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/fixer/workflow"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // This file covers the operator-retry escape from a fixer run parked for manual

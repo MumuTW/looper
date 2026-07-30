@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/domain"
 )
 
 var ErrQueueItemNotActive = errors.New("queue item not active")

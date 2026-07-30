@@ -46,8 +46,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 // Owner is a package permitted to write the label values it declares.
@@ -66,8 +66,8 @@ type Owner struct {
 // forming one requires validating a Node name.
 func DefaultOwners() []Owner {
 	return []Owner{
-		{Qualifier: "labels", ImportPath: "github.com/nexu-io/looper/internal/labels", Dir: filepath.Join("internal", "labels")},
-		{Qualifier: "protocol", ImportPath: "github.com/nexu-io/looper/internal/network/protocol", Dir: filepath.Join("internal", "network", "protocol")},
+		{Qualifier: "labels", ImportPath: "github.com/MumuTW/looper/internal/labels", Dir: filepath.Join("internal", "labels")},
+		{Qualifier: "protocol", ImportPath: "github.com/MumuTW/looper/internal/network/protocol", Dir: filepath.Join("internal", "network", "protocol")},
 	}
 }
 

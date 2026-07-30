@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	networkclient "github.com/nexu-io/looper/internal/network/client"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/webhookforward"
+	"github.com/MumuTW/looper/internal/config"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/webhookforward"
 )
 
 func TestRuntimeResumesIncompleteDiscoveryOnlyAfterStartupReady(t *testing.T) {

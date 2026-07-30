@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestFailureStreakRecordingIsIdempotentPerRun(t *testing.T) {

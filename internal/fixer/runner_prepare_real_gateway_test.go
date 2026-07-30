@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	"github.com/nexu-io/looper/internal/storage"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // Contract/invariant integration: real git.Gateway prepare fails on a broken

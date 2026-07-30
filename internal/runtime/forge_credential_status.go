@@ -1,7 +1,7 @@
 package runtime
 
 import (
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // ForgeCredentialDegradedReason is the /status degraded reason emitted when the
