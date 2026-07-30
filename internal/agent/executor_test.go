@@ -308,7 +308,7 @@ func TestBuildCommandEnvAllowsOnlySafeInheritedValuesAndExplicitOverrides(t *tes
 		t.Fatalf("LC_ALL = %q, want inherited locale value", got)
 	}
 	if got := env["LOOPER_CONFIG"]; got != "/custom/looper/config.toml" {
-		t.Fatalf("LOOPER_CONFIG = %q, want custom path for review-submit wrappers", got)
+		t.Fatalf("LOOPER_CONFIG = %q, want custom path for agent-invoked looper commands", got)
 	}
 	if got := env["CONFIG_ONLY"]; got != "true" {
 		t.Fatalf("CONFIG_ONLY = %q, want true", got)
@@ -324,18 +324,6 @@ func TestBuildCommandEnvAllowsOnlySafeInheritedValuesAndExplicitOverrides(t *tes
 	}
 }
 
-func TestBuildCommandEnvStripsTrustedEnvFilePath(t *testing.T) {
-	t.Setenv("PATH", "/safe/bin")
-	t.Setenv(forge.TrustedEnvFileEnv, "/tmp/must-not-leak-to-agent")
-
-	env := envSliceToMap(buildCommandEnv("/tmp/worktree", "hello", map[string]string{
-		forge.TrustedEnvFileEnv: "/tmp/also-must-not-leak",
-	}))
-	if _, ok := env[forge.TrustedEnvFileEnv]; ok {
-		t.Fatalf("%s present in agent env; trusted tokens must use the daemon review proxy, not an agent-readable env file", forge.TrustedEnvFileEnv)
-	}
-}
-
 func TestBuildCommandEnvAllowsTrustedReviewSock(t *testing.T) {
 	t.Setenv("PATH", "/safe/bin")
 	sock := "/tmp/looper-trusted-review.sock"
@@ -344,9 +332,6 @@ func TestBuildCommandEnvAllowsTrustedReviewSock(t *testing.T) {
 	}))
 	if got := env[forge.TrustedReviewSockEnv]; got != sock {
 		t.Fatalf("%s = %q, want capability socket path %q", forge.TrustedReviewSockEnv, got, sock)
-	}
-	if _, ok := env[forge.TrustedEnvFileEnv]; ok {
-		t.Fatalf("%s must not be present alongside the review proxy socket", forge.TrustedEnvFileEnv)
 	}
 }
 

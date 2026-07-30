@@ -276,8 +276,8 @@ type plannerGitHubAdapter struct {
 }
 
 // providerTrustedEnv collects configured provider tokenEnv values from the
-// daemon process environment so the trusted looper shim can inject them into
-// real `looper` child processes without exposing secrets to agent envs.
+// daemon process environment so the review-submit proxy can inject them into
+// its trusted child without exposing secrets to agent envs.
 func providerTrustedEnv(cfg config.Config) map[string]string {
 	env := map[string]string{}
 	for _, provider := range cfg.Providers {
@@ -319,14 +319,14 @@ func trustedReviewChildEnv(cfg config.Config) map[string]string {
 }
 
 // resolveTrustedLooperCLIPath returns the agent-facing looper CLI path, or ""
-// when the configured binary cannot serve as the trusted review-submit wrapper.
+// when the configured binary cannot serve the trusted review-submit capability.
 // tools.looperPath is auto-detected from PATH, so it can name a looper build
 // that predates `review submit`; returning "" routes the reviewer prompt to its
 // fail-closed branch instead of letting a full review run and only fail at
 // publication time.
 //
-// Agents always receive the real configured looper path — never a secret-bearing
-// wrapper path. Provider tokens for `looper review submit` are supplied through
+// Agents always receive the real configured looper path. Provider tokens for
+// `looper review submit` are supplied through
 // a per-run daemon-side trusted review proxy socket bound to the selected PR.
 func resolveTrustedLooperCLIPath(cfg config.Config, logger bootstrap.Logger) string {
 	configured := strings.TrimSpace(derefString(cfg.Tools.LooperPath))
@@ -1071,7 +1071,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		// side instead, and an operator should not need to know which half they
 		// are looking at to search for it.
 		if strings.TrimSpace(a.realLooper) == "" {
-			return nil, errors.New(reviewer.TrustedWrapperUnavailableMessage)
+			return nil, errors.New(reviewer.TrustedReviewCapabilityUnavailableMessage)
 		}
 		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
 		configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
