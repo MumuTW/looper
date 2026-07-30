@@ -701,24 +701,29 @@ type execution struct {
 	lastOutputAt       time.Time
 	lastProgressAt     time.Time
 
-	mu                      sync.Mutex
-	persistMu               sync.Mutex // one ordered writer per execution (#578)
-	terminalPersisted       bool
-	hardPersistReported     bool
-	status                  string
-	stdout                  []byte
-	stderr                  []byte
-	stdoutLogPath           string
-	stderrLogPath           string
-	persistedLogWriteFailed bool
-	heartbeatCount          int64
-	nativeSessionID         string
-	nativeResumeMode        string
-	nativeResumeStatus      string
-	nativeResumeError       string
-	processBirth            processidentity.Birth
-	leaseReleased           bool
-	toolSandbox             *validationcmd.Sandbox
+	mu        sync.Mutex
+	persistMu sync.Mutex // one ordered writer per execution (#578)
+	// lastPersistedHeartbeatCount (under persistMu) is the monotonic gate for
+	// live observations: stdout/stderr handlers snapshot under mu but persist
+	// under persistMu, so an older cumulative snapshot can arrive after a newer
+	// one persisted and must be dropped, not written.
+	lastPersistedHeartbeatCount int64
+	terminalPersisted           bool
+	hardPersistReported         bool
+	status                      string
+	stdout                      []byte
+	stderr                      []byte
+	stdoutLogPath               string
+	stderrLogPath               string
+	persistedLogWriteFailed     bool
+	heartbeatCount              int64
+	nativeSessionID             string
+	nativeResumeMode            string
+	nativeResumeStatus          string
+	nativeResumeError           string
+	processBirth                processidentity.Birth
+	leaseReleased               bool
+	toolSandbox                 *validationcmd.Sandbox
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -1537,15 +1542,10 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 	if x.input.RunID == "" || x.executor.repos == nil || x.executor.repos.Runs == nil {
 		return
 	}
-	ctx := context.Background()
-	run, err := x.executor.repos.Runs.GetByID(ctx, x.input.RunID)
-	if err != nil || run == nil {
-		return
-	}
-	updated := *run
-	updated.LastHeartbeatAt = &nowISO
-	updated.UpdatedAt = nowISO
-	_ = x.executor.repos.Runs.Upsert(ctx, updated)
+	// Targeted forward-only column update: a full-record read/modify/upsert
+	// here could resurrect stale run state captured before a concurrent writer,
+	// and an out-of-order heartbeat must not move liveness evidence backward.
+	_ = x.executor.repos.Runs.TouchHeartbeat(context.Background(), x.input.RunID, nowISO)
 }
 
 // persistStatus writes a live (or initial) observation. One ordered writer per
@@ -1555,6 +1555,13 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 	x.persistMu.Lock()
 	defer x.persistMu.Unlock()
 	if x.terminalPersisted {
+		return nil
+	}
+	// Snapshots are cumulative (bounded output tails plus a heartbeat count
+	// that only grows under mu), so a snapshot older than the last persisted
+	// one carries strictly less information: drop it instead of moving durable
+	// heartbeat/output state backward.
+	if heartbeatCount != nil && *heartbeatCount < x.lastPersistedHeartbeatCount {
 		return nil
 	}
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
@@ -1597,7 +1604,11 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 	if outputJSON != nil {
 		record.OutputJSON = outputJSON
 	}
-	return x.upsertAgentExecutionWithRetry(ctx, record)
+	err := x.upsertAgentExecutionWithRetry(ctx, record)
+	if err == nil && heartbeatCount != nil {
+		x.lastPersistedHeartbeatCount = *heartbeatCount
+	}
+	return err
 }
 
 // persistFinal writes the terminal observation after containment is confirmed

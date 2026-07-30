@@ -948,6 +948,22 @@ func SortRunsLatestFirst(runs []RunRecord) {
 	})
 }
 
+// TouchHeartbeat advances a run's last_heartbeat_at without rewriting the
+// record, and only forward: the fixed-precision ISO-8601 format compares
+// lexicographically in chronological order, so a stale writer cannot move
+// liveness evidence backward and no other column is disturbed.
+func (r *RunsRepository) TouchHeartbeat(ctx context.Context, id, heartbeatAtISO string) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET last_heartbeat_at = ?, updated_at = ?
+		WHERE id = ? AND (last_heartbeat_at IS NULL OR last_heartbeat_at < ?)
+	`, heartbeatAtISO, heartbeatAtISO, id, heartbeatAtISO)
+	if err != nil {
+		return fmt.Errorf("touch run heartbeat: %w", err)
+	}
+	return nil
+}
+
 func (r *RunsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*RunRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE loop_id = ? ORDER BY `+latestRunOrder("runs")+` LIMIT 1`, loopID)
 	record, err := scanRun(row)
