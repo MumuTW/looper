@@ -67,29 +67,37 @@ jobs:
       - name: Reject committed binaries
         run: go run ./tools/check-binaries
 
-      - name: Install process sandbox runtime
+      # The trust probe follows every ancestor and requires every runtime
+      # executable to be non-writable by the daemon user. Keep the full
+      # runtime dependency closure in a dedicated /opt tree rather than
+      # mutating shared runner directories such as /usr or /usr/local.
+      - name: Install trusted process sandbox runtime
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends bubblewrap socat ripgrep
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          sudo npm install --global --prefix /usr/local/lib/looper-srt-runtime @anthropic-ai/sandbox-runtime@0.0.67
-          sudo install -d -m 0555 /usr/local/lib/looper-srt-tools
-          sudo install -m 0555 "$(command -v node)" /usr/local/lib/looper-srt-tools/node
-          sudo ln -s ../looper-srt-runtime/bin/srt /usr/local/lib/looper-srt-tools/srt
-          echo /usr/local/lib/looper-srt-tools >> "$GITHUB_PATH"
+          sudo install -d -o root -g root -m 0755 /opt/looper-srt-runtime /opt/looper-srt-tools
+          sudo npm install --global --prefix /opt/looper-srt-runtime @anthropic-ai/sandbox-runtime@0.0.67
+          sudo install -m 0555 "$(command -v node)" /opt/looper-srt-tools/node
+          sudo install -m 0555 "$(command -v rg)" /opt/looper-srt-tools/rg
+          sudo install -m 0555 "$(command -v bwrap)" /opt/looper-srt-tools/bwrap
+          sudo install -m 0555 "$(command -v socat)" /opt/looper-srt-tools/socat
+          sudo ln -s ../looper-srt-runtime/bin/srt /opt/looper-srt-tools/srt
+          echo /opt/looper-srt-tools >> "$GITHUB_PATH"
 
-      # The srt trust probe rejects the runtime when any ancestor of the
-      # installation is writable by the daemon user. Some hosted-runner
-      # images ship /usr/local and /usr/local/lib writable by the runner
-      # account (ownership or ACLs vary by image build), which fails the
-      # probe for every PR that lands on such a runner. Pin the ancestor
-      # chain to root-owned, non-group-writable, ACL-free so verify does
-      # not depend on which image the runner pool serves.
-      - name: Harden sandbox runtime ancestors
+      # npm can inherit mode bits or ACLs from a runner image. Normalize
+      # only the dedicated tree, then assert access(2) W_OK as the runner
+      # user; the subsequent trusted-SRT tests exercise requireTrustedTree.
+      - name: Verify sandbox runtime is unwritable by the daemon user
         run: |
-          sudo chown root:root /usr/local /usr/local/lib
-          sudo chmod 0755 /usr/local /usr/local/lib
-          sudo setfacl -b /usr/local /usr/local/lib
+          sudo chown -R root:root /opt/looper-srt-runtime /opt/looper-srt-tools
+          sudo chmod -R go-w /opt/looper-srt-runtime /opt/looper-srt-tools
+          sudo setfacl -R -b -k /opt/looper-srt-runtime /opt/looper-srt-tools
+          writable="$(find / /opt /opt/looper-srt-runtime /opt/looper-srt-tools -maxdepth 0 -writable; find /opt/looper-srt-runtime /opt/looper-srt-tools -writable)"
+          if [ -n "$writable" ]; then
+            printf 'srt paths still writable by the daemon user:\n%s\n' "$writable"
+            exit 1
+          fi
 
       - name: Test
         env:
