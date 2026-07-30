@@ -751,7 +751,7 @@ The generated unit is built from configuration you already have:
 | `daemon.logDir` | `looperd.out.log` and `looperd.err.log` land here; the directory is created at install |
 | `daemon.workingDirectory` | The service's working directory |
 | `daemon.environment` | Environment variables passed to the supervised process |
-| `daemon.plistPath` | Overrides where the unit file is written |
+| `daemon.plistPath` | Launchd-only override under `~/Library/LaunchAgents/`; systemd always uses its managed user-unit path |
 
 Because `daemon.environment` is how tokens reach the daemon, the unit is written
 `0600`.
@@ -762,6 +762,12 @@ looperd service install     # write it and load it
 looperd service status      # is the unit installed?
 looperd service uninstall   # unload and remove it
 ```
+
+`install` creates a previously absent unit; it deliberately refuses to overwrite
+one that already exists. Inspect it first, then use `uninstall` followed by
+`install` when you intentionally want to replace it. If the supervisor cannot
+stop a service, `uninstall` reports the failure and retains the unit instead of
+claiming the daemon is gone.
 
 **A per-user service is not always-on.** A LaunchAgent runs only while the user is
 logged in; a systemd user unit does the same unless you run

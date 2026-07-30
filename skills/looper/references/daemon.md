@@ -12,7 +12,13 @@
 looperd
 ```
 
-Foreground and unsupervised by default. `looperd service install` installs a launchd agent (macOS) or systemd user unit (Linux) generated from `daemon.*`; it requires `daemon.mode` to be `launchd` or `systemd` first, and `looperd service print` shows the unit without writing it. A per-user service starts at login, not at boot: for an unattended machine also enable automatic login (macOS) or `loginctl enable-linger` (Linux).
+Foreground and unsupervised by default. `looperd service install` creates a
+previously absent launchd agent (macOS) or systemd user unit (Linux) generated
+from `daemon.*`; it requires `daemon.mode` to be `launchd` or `systemd` first,
+and `looperd service print` shows the unit without writing it. It refuses to
+overwrite an existing unit; inspect it, then explicitly uninstall before
+replacing it. A per-user service starts at login, not at boot: for an unattended
+machine also enable automatic login (macOS) or `loginctl enable-linger` (Linux).
 
 Managed path `~/.looper/bin/looperd` may still exist from older installs; new installs place `looperd` wherever you put it on `PATH`.
 

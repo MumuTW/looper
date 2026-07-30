@@ -37,7 +37,7 @@ func defaultServiceDeps() serviceDeps {
 		},
 		executable: os.Executable,
 		homeDir:    os.UserHomeDir,
-		uid:        os.Getuid,
+		uid:        os.Geteuid,
 		goos:       runtime.GOOS,
 		fs:         daemonservice.OSFS{},
 		run: func(ctx context.Context, name string, args ...string) (string, error) {

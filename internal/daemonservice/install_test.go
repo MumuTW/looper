@@ -131,18 +131,21 @@ func TestInstallCreatesTheLogDirectory(t *testing.T) {
 	}
 }
 
-// bootout fails when nothing is loaded, which is the ordinary first install.
-// Treating that as fatal would make installing impossible on a clean machine.
-func TestInstallToleratesBootoutFailingOnAFreshMachine(t *testing.T) {
+// A fresh install must not unload a same-label service from another unit path.
+// That service is not the requested UnitPath and Install has no authority to
+// replace it.
+func TestInstallDoesNotBootoutAnExistingLabel(t *testing.T) {
 	t.Parallel()
 	plan := launchdPlan(t)
-	runner := &recordingRunner{failOn: map[string]error{"launchctl bootout": errors.New("no such process")}}
+	runner := &recordingRunner{}
 
 	if _, err := Install(context.Background(), plan, newFakeFS(), runner.run); err != nil {
-		t.Fatalf("Install() error = %v, want the initial bootout tolerated", err)
+		t.Fatalf("Install() error = %v", err)
 	}
-	if len(runner.commands) != len(plan.Activate) {
-		t.Fatalf("install stopped early: %v", runner.commands)
+	for _, command := range runner.commands {
+		if strings.HasPrefix(command, "launchctl bootout") {
+			t.Fatalf("Install() unloaded a service outside the requested unit path: %v", runner.commands)
+		}
 	}
 }
 
@@ -153,8 +156,30 @@ func TestInstallFailsWhenActivationFails(t *testing.T) {
 	plan := launchdPlan(t)
 	runner := &recordingRunner{failOn: map[string]error{"launchctl bootstrap": errors.New("Load failed: 5: Input/output error")}}
 
-	if _, err := Install(context.Background(), plan, newFakeFS(), runner.run); err == nil {
+	fs := newFakeFS()
+	if _, err := Install(context.Background(), plan, fs, runner.run); err == nil {
 		t.Fatal("Install() reported success after activation failed")
+	}
+	if _, exists := fs.files[plan.UnitPath]; exists {
+		t.Fatal("Install() left a newly written unit after activation failed")
+	}
+}
+
+func TestInstallRefusesToOverwriteExistingUnit(t *testing.T) {
+	t.Parallel()
+	plan := launchdPlan(t)
+	fs := newFakeFS()
+	fs.files[plan.UnitPath] = []byte("not a Looper unit")
+	runner := &recordingRunner{}
+
+	if _, err := Install(context.Background(), plan, fs, runner.run); err == nil {
+		t.Fatal("Install() overwrote an existing service unit")
+	}
+	if got := string(fs.files[plan.UnitPath]); got != "not a Looper unit" {
+		t.Fatalf("existing unit was changed to %q", got)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("activation ran despite refusing overwrite: %v", runner.commands)
 	}
 }
 
@@ -175,18 +200,18 @@ func TestInstallFailsWhenTheUnitCannotBeWritten(t *testing.T) {
 
 // Uninstalling something that was never loaded must still remove the unit: the
 // caller asked for it gone, and the deactivation error is expected noise.
-func TestUninstallRemovesTheUnitEvenWhenDeactivationFails(t *testing.T) {
+func TestUninstallPreservesTheUnitWhenDeactivationFails(t *testing.T) {
 	t.Parallel()
 	plan := launchdPlan(t)
 	fs := newFakeFS()
 	fs.files[plan.UnitPath] = []byte(plan.Unit)
 	runner := &recordingRunner{failOn: map[string]error{"launchctl bootout": errors.New("no such process")}}
 
-	if _, err := Uninstall(context.Background(), plan, fs, runner.run); err != nil {
-		t.Fatalf("Uninstall() error = %v", err)
+	if _, err := Uninstall(context.Background(), plan, fs, runner.run); err == nil {
+		t.Fatal("Uninstall() reported success after deactivation failed")
 	}
-	if _, exists := fs.files[plan.UnitPath]; exists {
-		t.Fatal("Uninstall() left the unit on disk")
+	if _, exists := fs.files[plan.UnitPath]; !exists {
+		t.Fatal("Uninstall() removed the unit even though deactivation failed")
 	}
 }
 

@@ -93,7 +93,12 @@ To have the machine supervise it instead, set `daemon.mode` in your config and i
 looperd service install
 ```
 
-That writes a launchd agent (macOS) or a systemd user unit (Linux) built from your `daemon.*` configuration, and loads it. `looperd service print` shows the exact unit first, without writing anything; `status` reports whether it is installed, and `uninstall` reverses it.
+That creates a previously absent launchd agent (macOS) or systemd user unit
+(Linux) built from your `daemon.*` configuration, and loads it. `looperd service
+print` shows the exact unit first, without writing anything; `status` reports
+whether it is installed, and `uninstall` stops then removes it. To replace an
+existing unit, inspect it and explicitly uninstall it first; `install` never
+overwrites it.
 
 **A per-user service is not the same as always-on.** A LaunchAgent runs only while the user is logged in, and a systemd user unit does the same unless lingering is enabled (`loginctl enable-linger $USER`). For a machine that must keep working with nobody logged in, enable automatic login as well — otherwise a reboot leaves the daemon stopped until someone signs in.
 

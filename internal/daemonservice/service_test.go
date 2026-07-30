@@ -114,7 +114,7 @@ func TestBuildSystemdPlan(t *testing.T) {
 		t.Fatalf("UnitPath = %q", plan.UnitPath)
 	}
 	for _, want := range []string{
-		"ExecStart=/home/dev/.local/bin/looperd --config /home/dev/.looper/config.toml",
+		`ExecStart="/home/dev/.local/bin/looperd" "--config" "/home/dev/.looper/config.toml"`,
 		"Restart=always",
 		"RestartSec=10",
 		"WantedBy=default.target",
@@ -135,6 +135,16 @@ func TestBuildRejectsRelativeExecutablePath(t *testing.T) {
 
 	if _, err := Build(input); err == nil {
 		t.Fatal("Build() accepted a relative executable path")
+	}
+}
+
+func TestBuildRejectsRootServiceDomain(t *testing.T) {
+	t.Parallel()
+
+	input := testInput("darwin", nil)
+	input.UID = 0
+	if _, err := Build(input); err == nil {
+		t.Fatal("Build() accepted a root-scoped user service")
 	}
 }
 
@@ -227,10 +237,38 @@ func TestBuildQuotesSystemdExecStartArguments(t *testing.T) {
 	}
 }
 
+func TestBuildEscapesSystemdDirectiveValues(t *testing.T) {
+	t.Parallel()
+
+	plan, err := Build(testInput("linux", func(d *config.DaemonConfig) {
+		d.Environment = map[string]string{"TOKEN": "safe\nExecStart=/bin/attacker"}
+		d.WorkingDirectory = "/home/dev\n[Install]"
+		d.LogDir = "/home/dev/logs\nExecStartPre=/bin/attacker"
+	}))
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if strings.Contains(plan.Unit, "\nExecStart=/bin/attacker") || strings.Contains(plan.Unit, "\nExecStartPre=/bin/attacker") {
+		t.Fatalf("systemd value injected a directive:\n%s", plan.Unit)
+	}
+	if !strings.Contains(plan.Unit, `Environment="TOKEN=safe\nExecStart=/bin/attacker"`) {
+		t.Fatalf("environment value was not systemd-escaped:\n%s", plan.Unit)
+	}
+}
+
+func TestBuildRejectsSystemdCustomPlistPath(t *testing.T) {
+	t.Parallel()
+
+	path := "/home/dev/custom/looperd.service"
+	if _, err := Build(testInput("linux", func(d *config.DaemonConfig) { d.PlistPath = &path })); err == nil {
+		t.Fatal("Build() accepted daemon.plistPath for a systemd unit")
+	}
+}
+
 func TestBuildHonoursAnExplicitUnitPath(t *testing.T) {
 	t.Parallel()
 
-	custom := "/home/dev/custom/looperd.plist"
+	custom := "/home/dev/Library/LaunchAgents/looperd-custom.plist"
 	plan, err := Build(testInput("darwin", func(d *config.DaemonConfig) { d.PlistPath = &custom }))
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
@@ -238,7 +276,20 @@ func TestBuildHonoursAnExplicitUnitPath(t *testing.T) {
 	if plan.UnitPath != custom {
 		t.Fatalf("UnitPath = %q, want the configured path", plan.UnitPath)
 	}
-	if !strings.Contains(strings.Join(plan.Activate[1], " "), custom) {
+	if !strings.Contains(strings.Join(plan.Activate[0], " "), custom) {
 		t.Fatalf("bootstrap does not reference the configured path: %v", plan.Activate)
+	}
+}
+
+func TestBuildRejectsLaunchdUnitPathOutsideLaunchAgents(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{"relative.plist", "/home/dev/.ssh/id_rsa"} {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			if _, err := Build(testInput("darwin", func(d *config.DaemonConfig) { d.PlistPath = &path })); err == nil {
+				t.Fatalf("Build() accepted unsafe plist path %q", path)
+			}
+		})
 	}
 }

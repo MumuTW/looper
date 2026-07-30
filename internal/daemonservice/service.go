@@ -96,6 +96,9 @@ func Build(input Input) (Plan, error) {
 	if strings.TrimSpace(input.HomeDir) == "" {
 		return Plan{}, fmt.Errorf("home directory is required")
 	}
+	if input.UID <= 0 {
+		return Plan{}, fmt.Errorf("supervised service installation is user-scoped; refusing uid %d", input.UID)
+	}
 	logDir := strings.TrimSpace(input.Config.LogDir)
 	if logDir == "" {
 		return Plan{}, fmt.Errorf("daemon.logDir is required to install a service")
@@ -113,6 +116,14 @@ func buildLaunchd(input Input, logDir string) (Plan, error) {
 	unitPath := strings.TrimSpace(derefString(input.Config.PlistPath))
 	if unitPath == "" {
 		unitPath = filepath.Join(input.HomeDir, "Library", "LaunchAgents", Label+".plist")
+	} else {
+		if !filepath.IsAbs(unitPath) {
+			return Plan{}, fmt.Errorf("daemon.plistPath must be absolute, got %q", unitPath)
+		}
+		launchAgents := filepath.Join(input.HomeDir, "Library", "LaunchAgents")
+		if !pathWithin(launchAgents, unitPath) {
+			return Plan{}, fmt.Errorf("daemon.plistPath must stay under %s", launchAgents)
+		}
 	}
 	domain := fmt.Sprintf("gui/%d", input.UID)
 	target := domain + "/" + Label
@@ -123,10 +134,9 @@ func buildLaunchd(input Input, logDir string) (Plan, error) {
 		FileMode: 0o600,
 		LogDir:   logDir,
 		Activate: [][]string{
-			// bootout first so install is idempotent: bootstrap fails outright when
-			// the label is already loaded. A not-loaded label makes this a no-op,
-			// which is why its failure is ignored by the installer.
-			{"launchctl", "bootout", target},
+			// Do not boot out an existing label here. Install refuses replacement
+			// of its requested path, and unloading a label from another path would
+			// exceed this command's authority.
 			{"launchctl", "bootstrap", domain, unitPath},
 			{"launchctl", "kickstart", "-k", target},
 		},
@@ -135,10 +145,13 @@ func buildLaunchd(input Input, logDir string) (Plan, error) {
 }
 
 func buildSystemd(input Input, logDir string) (Plan, error) {
-	unitPath := strings.TrimSpace(derefString(input.Config.PlistPath))
-	if unitPath == "" {
-		unitPath = filepath.Join(input.HomeDir, ".config", "systemd", "user", "looperd.service")
+	if strings.TrimSpace(derefString(input.Config.PlistPath)) != "" {
+		// plistPath predates systemd support. systemctl resolves looperd.service
+		// from its user unit search path, so writing a custom path would make
+		// status inspect one file while enable starts another (or none at all).
+		return Plan{}, fmt.Errorf("daemon.plistPath is supported only for launchd; systemd installs use the managed user unit path")
 	}
+	unitPath := filepath.Join(input.HomeDir, ".config", "systemd", "user", "looperd.service")
 	return Plan{
 		Manager:  ManagerSystemd,
 		UnitPath: unitPath,
@@ -206,8 +219,8 @@ func renderSystemdUnit(input Input, logDir string) string {
 
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=simple\n")
-	b.WriteString("ExecStart=" + shellJoin(programArguments(input)) + "\n")
-	b.WriteString("WorkingDirectory=" + input.Config.WorkingDirectory + "\n")
+	b.WriteString("ExecStart=" + systemdJoin(programArguments(input)) + "\n")
+	b.WriteString("WorkingDirectory=" + systemdQuote(input.Config.WorkingDirectory) + "\n")
 	switch input.Config.RestartPolicy {
 	case config.DaemonRestartAlways:
 		b.WriteString("Restart=always\n")
@@ -217,10 +230,10 @@ func renderSystemdUnit(input Input, logDir string) string {
 		b.WriteString("Restart=no\n")
 	}
 	b.WriteString(fmt.Sprintf("RestartSec=%d\n", input.Config.RestartThrottleSeconds))
-	b.WriteString("StandardOutput=append:" + filepath.Join(logDir, "looperd.out.log") + "\n")
-	b.WriteString("StandardError=append:" + filepath.Join(logDir, "looperd.err.log") + "\n")
+	b.WriteString("StandardOutput=" + systemdQuote("append:"+filepath.Join(logDir, "looperd.out.log")) + "\n")
+	b.WriteString("StandardError=" + systemdQuote("append:"+filepath.Join(logDir, "looperd.err.log")) + "\n")
 	for _, key := range sortedEnvironment(input.Config.Environment) {
-		b.WriteString(fmt.Sprintf("Environment=%s=%s\n", key, input.Config.Environment[key]))
+		b.WriteString("Environment=" + systemdQuote(key+"="+input.Config.Environment[key]) + "\n")
 	}
 	b.WriteString("\n[Install]\nWantedBy=default.target\n")
 	return b.String()
@@ -243,17 +256,31 @@ func sortedEnvironment(env map[string]string) []string {
 	return keys
 }
 
-// shellJoin quotes systemd ExecStart arguments. systemd splits on whitespace, so
-// a path containing a space would otherwise become two arguments.
-func shellJoin(args []string) string {
+// systemdJoin quotes every systemd ExecStart argument. Unit files are parsed by
+// systemd rather than a shell, so control characters and quotes must be escaped
+// before a configuration value reaches the unit grammar.
+func systemdJoin(args []string) string {
 	quoted := make([]string, 0, len(args))
 	for _, arg := range args {
-		if strings.ContainsAny(arg, " \t\"\\") {
-			arg = `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(arg) + `"`
-		}
-		quoted = append(quoted, arg)
+		quoted = append(quoted, systemdQuote(arg))
 	}
 	return strings.Join(quoted, " ")
+}
+
+func systemdQuote(value string) string {
+	escaped := strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		"\n", `\n`,
+		"\r", `\r`,
+		"\t", `\t`,
+	).Replace(value)
+	return `"` + escaped + `"`
+}
+
+func pathWithin(root, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func writePlistString(b *strings.Builder, key, value string) {

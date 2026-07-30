@@ -39,11 +39,18 @@ type Result struct {
 	Commands []string
 }
 
-// Install writes the unit and loads it. It is idempotent: reinstalling over an
-// existing service replaces the unit and restarts it.
+// Install writes a previously absent unit and loads it. An existing unit is
+// refused rather than overwritten: the requested config authorizes creating
+// Looper's service, not replacing an unknown service at the same path. Remove
+// the existing unit with the explicit uninstall command before installing again.
 func Install(ctx context.Context, plan Plan, fs FS, run Runner) (Result, error) {
 	if fs == nil {
 		fs = OSFS{}
+	}
+	if _, err := fs.Stat(plan.UnitPath); err == nil {
+		return Result{}, fmt.Errorf("refuse to overwrite existing service unit %s; inspect it or uninstall it explicitly first", plan.UnitPath)
+	} else if !os.IsNotExist(err) {
+		return Result{}, fmt.Errorf("inspect existing service unit %s: %w", plan.UnitPath, err)
 	}
 	// The supervisor redirects output into LogDir and fails to start the daemon
 	// when it does not exist, which surfaces as a service that flaps rather than
@@ -59,7 +66,7 @@ func Install(ctx context.Context, plan Plan, fs FS, run Runner) (Result, error) 
 	}
 
 	result := Result{UnitPath: plan.UnitPath, Manager: plan.Manager}
-	for i, command := range plan.Activate {
+	for _, command := range plan.Activate {
 		if len(command) == 0 {
 			continue
 		}
@@ -68,33 +75,38 @@ func Install(ctx context.Context, plan Plan, fs FS, run Runner) (Result, error) 
 		if err == nil {
 			continue
 		}
-		// The first launchd command is a bootout that clears any previously loaded
-		// label. It fails when nothing is loaded, which is the ordinary
-		// first-install case, so only later commands are treated as fatal.
-		if plan.Manager == ManagerLaunchd && i == 0 {
-			continue
+		if removeErr := fs.Remove(plan.UnitPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			return result, fmt.Errorf("%s: %w (remove failed service unit: %v)", strings.Join(command, " "), err, removeErr)
 		}
-		return result, fmt.Errorf("%s: %w", strings.Join(command, " "), err)
+		return result, fmt.Errorf("%s: %w (removed newly written service unit)", strings.Join(command, " "), err)
 	}
 	return result, nil
 }
 
-// Uninstall unloads the service and removes the unit. A service that is already
-// gone is not an error: the desired end state is what matters.
+// Uninstall unloads the service and then removes its unit. A missing unit is
+// already uninstalled. For an existing unit, a deactivation failure is surfaced
+// and the file is retained: reporting success after a supervisor refused to stop
+// the daemon would leave an untracked process behind.
 func Uninstall(ctx context.Context, plan Plan, fs FS, run Runner) (Result, error) {
 	if fs == nil {
 		fs = OSFS{}
 	}
 	result := Result{UnitPath: plan.UnitPath, Manager: plan.Manager}
+	if _, err := fs.Stat(plan.UnitPath); err != nil {
+		if os.IsNotExist(err) {
+			return result, nil
+		}
+		return result, fmt.Errorf("inspect service unit %s: %w", plan.UnitPath, err)
+	}
 	for _, command := range plan.Deactivate {
 		if len(command) == 0 {
 			continue
 		}
-		// Deactivation failures are expected when the service was never loaded, and
-		// stopping here would leave the unit file behind — the opposite of what the
-		// caller asked for.
-		_, _ = run(ctx, command[0], command[1:]...)
+		_, err := run(ctx, command[0], command[1:]...)
 		result.Commands = append(result.Commands, strings.Join(command, " "))
+		if err != nil {
+			return result, fmt.Errorf("%s: %w", strings.Join(command, " "), err)
+		}
 	}
 	if err := fs.Remove(plan.UnitPath); err != nil && !os.IsNotExist(err) {
 		return result, fmt.Errorf("remove %s: %w", plan.UnitPath, err)
