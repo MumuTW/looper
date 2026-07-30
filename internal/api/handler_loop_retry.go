@@ -264,9 +264,9 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			queueRecord.UpdatedAt = nowISO
 			ok = true
 		} else {
-			built, builtOK, queueErr := buildQueuedLoopQueueRecordCompat(queueLoop, target, nowISO, queueLoop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+			built, builtOK, queueErr := loops.BuildQueuedLoopQueueRecord(queueLoop, target, nowISO, queueLoop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
 			if queueErr != nil {
-				return retryResult{}, queueErr
+				return retryResult{}, mapLoopReactivationError(queueErr, loop.ID)
 			}
 			queueRecord = built
 			ok = builtOK
