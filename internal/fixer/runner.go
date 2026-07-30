@@ -1011,7 +1011,7 @@ const (
 	labelMismatchPauseReason              = "fixer_label_mismatch"
 	failureStreakPauseReason              = "agent_failure_streak"
 	// maxConsecutiveFixerFailures is the default for how many runs in a row may
-	// fail at the same step against the same head/fix-items state before the
+	// fail at the same step against the same fix-items state before the
 	// loop is parked. The queue-item retry layer alone could not stop the
 	// incident where a fixer loop retried 52+ times in 5 hours: every push
 	// minted a new queue item (the dedupe key contains the head SHA), so
@@ -1627,7 +1627,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 }
 
 func (r *Runner) isForgejoProject(projectID string) bool {
-	return r.projectRoleConfig != nil && config.ProjectProviderKind(*r.projectRoleConfig, projectID) == config.ProviderKindForgejo
+	return r.projectRoleConfig != nil && forge.NewResolver(*r.projectRoleConfig).ForProject(projectID).UsesNativePullRequestAPI()
 }
 
 func defaultDiscoveryLimit(limit int) int {
@@ -2277,7 +2277,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "failureKind": string(failure.kind), "currentStep": derefString(run.CurrentStep)}})
 			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.message, "failureKind": string(failure.kind)}})
 			r.logError("fixer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "failureKind": string(failure.kind), "summary": failure.message})
-			// Consecutive-failure circuit breaker: once the same step/head/fix-items
+			// Consecutive-failure circuit breaker: once the same step/fix-items
 			// state has failed r.consecutiveFailureThreshold runs in a row, stop
 			// requeueing and park the loop until discovery sees new feedback.
 			failedQueue, breakerStreak, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
@@ -6575,10 +6575,9 @@ func (r *Runner) recordZeroProgressSuccess(ctx context.Context, loop storage.Loo
 }
 
 // recordFixerFailureStreak counts consecutive failed runs at the same step
-// against the same head/fix-items state and persists the streak in loop
-// metadata. A push changes the head SHA and is treated as new evidence, so
-// the streak resets when the head SHA, the failing step, or the fix-items
-// state changes.
+// against the same fix-items state and persists the streak in loop metadata.
+// A fixer may push a new head before repeatedly failing at the same later step,
+// so head identity is diagnostic rather than continuity authority.
 func (r *Runner) recordFixerFailureStreak(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep) (int, storage.LoopRecord, error) {
 	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
 		current, err := r.repos.Loops.GetByID(ctx, loop.ID)
@@ -6606,7 +6605,7 @@ func (r *Runner) recordFixerFailureStreak(ctx context.Context, loop storage.Loop
 	if current.LastRunID != "" && previous.LastRunID == current.LastRunID {
 		return previous.ConsecutiveCount, loop, nil
 	}
-	if previous.FixItemsStateHash == current.FixItemsStateHash && previous.Step == current.Step && previous.LastHeadSHA == current.LastHeadSHA {
+	if previous.FixItemsStateHash == current.FixItemsStateHash && previous.Step == current.Step {
 		current.ConsecutiveCount = previous.ConsecutiveCount + 1
 	}
 	updatedLoop, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerFailureStreak": current})

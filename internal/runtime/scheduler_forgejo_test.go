@@ -13,6 +13,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/worker"
@@ -152,9 +153,9 @@ func TestForgeRoutingRejectsOverlappingWorktreeRoots(t *testing.T) {
 			{ID: "inner", Provider: "forgejo-two", Repo: "acme/inner", RepoPath: filepath.Join(root, "inner"), WorktreeRoot: &innerRoot},
 		},
 	}
-	_, _, ok, err := forgejoProjectProviderForCWD(&cfg, filepath.Join(innerRoot, "feature"))
+	_, ok, err := forge.NewResolver(cfg).ForLocation("", filepath.Join(innerRoot, "feature"))
 	if err == nil || !strings.Contains(err.Error(), "matches multiple projects") {
-		t.Fatalf("forgejoProjectProviderForCWD() = ok %v, error %v; want ambiguous root rejection", ok, err)
+		t.Fatalf("Resolver.ForLocation() = ok %v, error %v; want ambiguous root rejection", ok, err)
 	}
 }
 
@@ -812,11 +813,12 @@ func TestFixerGitHubAdapterForgejoBoundsUnfilteredDefaultLimit(t *testing.T) {
 }
 
 func TestForgejoSupportsFixerDiscoveryWithoutOpeningCoordinatorLane(t *testing.T) {
-	if !providerSupportsFixerDiscovery(config.ProviderKindForgejo) {
-		t.Fatal("providerSupportsFixerDiscovery(forgejo) = false, want true")
+	capabilities, ok := forge.StaticCapabilities(forge.ProviderKindForgejo)
+	if !ok || !(capabilities.PullRequests || capabilities.GitHubPullRequests) {
+		t.Fatal("Forgejo capabilities do not support fixer discovery")
 	}
-	if providerHasGitHubPullRequests(config.ProviderKindForgejo) {
-		t.Fatal("providerHasGitHubPullRequests(forgejo) = true, coordinator lane must remain disabled")
+	if capabilities.GitHubPullRequests {
+		t.Fatal("Forgejo capabilities expose GitHub pull requests; coordinator lane must remain disabled")
 	}
 }
 

@@ -431,6 +431,77 @@ func TestRestartRequiredChangesGuardsGlobalVendorWhenRolesOverride(t *testing.T)
 	}
 }
 
+func TestRestartRequiredChangesReportsCanonicalRoleModelPath(t *testing.T) {
+	t.Parallel()
+	oldConfig, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	oldConfig.Agent.Params = map[string]any{}
+	roleVendor := AgentVendorCodex
+	oldConfig.Roles.Coding = CodingRolesFromLegacy(oldConfig.Roles)
+	worker := oldConfig.Roles.Coding[CodingRoleWorker]
+	worker.Agent = &RoleAgentConfig{Vendor: &roleVendor, Model: stringPtr("gpt-5")}
+	oldConfig.Roles.Coding[CodingRoleWorker] = worker
+
+	switched := CloneConfig(oldConfig)
+	newVendor := AgentVendorClaudeCode
+	worker = switched.Roles.Coding[CodingRoleWorker]
+	worker.Agent = &RoleAgentConfig{Vendor: &newVendor, Model: stringPtr("gpt-5")}
+	switched.Roles.Coding[CodingRoleWorker] = worker
+
+	if got, want := RestartRequiredChanges(oldConfig, switched), []string{"roles.coding.worker", "roles.coding.worker.agent.model"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical role vendor switch = %#v, want %#v", got, want)
+	}
+}
+
+func TestRestartRequiredChangesPreservesNormalizedLegacyRoleModelPath(t *testing.T) {
+	t.Parallel()
+
+	oldConfig, err := Normalize(t.TempDir(), mustDecodeTOML(t, `
+[roles.worker.agent]
+vendor = "codex"
+model = "gpt-5"
+`))
+	if err != nil {
+		t.Fatalf("Normalize(old) error = %v", err)
+	}
+	newConfig := CloneConfig(oldConfig)
+	newVendor := AgentVendorClaudeCode
+	newConfig.Roles.Worker.Agent.Vendor = &newVendor
+	newConfig.Roles.Coding = CodingRolesFromLegacy(newConfig.Roles)
+
+	if got, want := RestartRequiredChanges(oldConfig, newConfig), []string{"roles.worker.agent.model"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized legacy role vendor switch = %#v, want %#v", got, want)
+	}
+}
+
+func TestRestartRequiredChangesPreservesCanonicalOwnerForEqualRoleModels(t *testing.T) {
+	t.Parallel()
+
+	oldConfig, err := Normalize(t.TempDir(), mustDecodeTOML(t, `
+[roles.worker.agent]
+vendor = "codex"
+model = "gpt-5"
+
+[roles.coding.worker.agent]
+vendor = "codex"
+model = "gpt-5"
+`))
+	if err != nil {
+		t.Fatalf("Normalize(old) error = %v", err)
+	}
+	switched := CloneConfig(oldConfig)
+	newVendor := AgentVendorClaudeCode
+	worker := switched.Roles.Coding[CodingRoleWorker]
+	worker.Agent.Vendor = &newVendor
+	switched.Roles.Coding[CodingRoleWorker] = worker
+
+	if got, want := RestartRequiredChanges(oldConfig, switched), []string{"roles.coding.worker", "roles.coding.worker.agent.model"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("equal dual-authored model switch = %#v, want %#v", got, want)
+	}
+}
+
 func agentVendorPtr(v AgentVendor) *AgentVendor {
 	return &v
 }

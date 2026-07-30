@@ -94,22 +94,11 @@ func LocalFixerWorktreeCheckoutUsable(path string) bool {
 	if err != nil {
 		return false
 	}
-	line := strings.TrimSpace(string(data))
-	if line == "" {
-		return false
-	}
-	const prefix = "gitdir:"
-	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+	gitdir, ok := parseGitdirPointer(path, data)
+	if !ok {
 		// Malformed gitfile: real Git rejects non-gitdir: content as
 		// "invalid gitfile format". Treat as unusable so prepare can recreate.
 		return false
-	}
-	gitdir := strings.TrimSpace(line[len(prefix):])
-	if gitdir == "" {
-		return false
-	}
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(path, gitdir)
 	}
 	// Linked private gitdir must have a syntactically valid HEAD, not merely a
 	// regular file. An empty/corrupt HEAD still makes `git` report "not a git
@@ -151,19 +140,27 @@ func HasMalformedLocalGitHEAD(path string) bool {
 	if err != nil {
 		return false
 	}
-	line := strings.TrimSpace(string(data))
-	const prefix = "gitdir:"
-	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+	gitdir, ok := parseGitdirPointer(path, data)
+	if !ok {
 		return false
-	}
-	gitdir := strings.TrimSpace(line[len(prefix):])
-	if gitdir == "" {
-		return false
-	}
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(path, gitdir)
 	}
 	return localGitHEADMalformed(gitdir)
+}
+
+func parseGitdirPointer(worktreePath string, data []byte) (string, bool) {
+	const prefix = "gitdir: "
+	content := string(data)
+	if !strings.HasPrefix(content, prefix) {
+		return "", false
+	}
+	gitdir := strings.TrimSpace(content[len(prefix):])
+	if gitdir == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(worktreePath, gitdir)
+	}
+	return gitdir, true
 }
 
 // LocalGitRepositoryMetadataUsable is a non-remote integrity probe for a Git
@@ -328,9 +325,9 @@ func ClearUnusableFixerWorktreePath(path string) error {
 	return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, ErrUnusableFixerWorktreePreserved)
 }
 
-// onlyUnusableLocalGitMetadata is true when path holds nothing but a non-usable
-// .git file/dir (and optional nested empties under an ordinary .git dir). Any
-// other entry is treated as possible agent dirt and must be preserved.
+// onlyUnusableLocalGitMetadata is true when path's single entry is a non-usable
+// .git file/dir. Any additional entry is treated as possible agent dirt and
+// must be preserved.
 func onlyUnusableLocalGitMetadata(path string, entries []os.DirEntry) bool {
 	if len(entries) != 1 || entries[0].Name() != ".git" {
 		return false

@@ -612,6 +612,11 @@ type RoleConfigs struct {
 	// The authorable input lives on PartialRoleConfigs.Coding, which is
 	// serialized.
 	Coding map[string]CodingRoleConfig `json:"-"`
+	// codingModelCanonical records whether the effective inline model for a
+	// role was last authored through roles.coding. It is non-serialized source
+	// provenance used only to report an actionable hot-reload restart path when
+	// canonical and legacy authors happened to write the same value.
+	codingModelCanonical map[string]bool
 
 	Planner     PlannerRoleConfig     `json:"planner"`
 	Reviewer    ReviewerRoleConfig    `json:"reviewer"`

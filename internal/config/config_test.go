@@ -379,6 +379,54 @@ func TestPlaneProviderConfigLoadsWorkspaceAndProjectID(t *testing.T) {
 	}
 }
 
+func TestPlaneProjectRejectsCoordinatorWithoutPlaneIssueAdapter(t *testing.T) {
+	t.Parallel()
+	tokenEnv := "PLANE_TOKEN"
+	workspace := "acme"
+	planeProjectID := "plane-project"
+	enabled := true
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{ID: "plane", Kind: providerKindPtr(ProviderKindPlane), TokenEnv: &tokenEnv, Workspace: &workspace, ProjectID: &planeProjectID}},
+		Projects: &[]PartialProjectRefConfig{{
+			ID: "plane", Name: "Plane", Provider: stringPtr("plane"), Repo: stringPtr("acme/code"), RepoPath: "/tmp/plane",
+			Roles: &PartialRoleConfigs{Coordinator: &PartialCoordinatorRoleConfig{Enabled: &enabled}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %v, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[0].roles.coordinator.enabled", "must be false for plane projects; coordinator requires GitHub issue authority")
+}
+
+func TestPlaneProjectRejectsForgejoSummaryCommentPublishMode(t *testing.T) {
+	t.Parallel()
+	tokenEnv := "PLANE_TOKEN"
+	workspace := "acme"
+	planeProjectID := "plane-project"
+	publishMode := ReviewerPublishModeSummaryComment
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{ID: "plane", Kind: providerKindPtr(ProviderKindPlane), TokenEnv: &tokenEnv, Workspace: &workspace, ProjectID: &planeProjectID}},
+		Projects: &[]PartialProjectRefConfig{{
+			ID: "plane", Name: "Plane", Provider: stringPtr("plane"), Repo: stringPtr("acme/code"), RepoPath: "/tmp/plane",
+			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{Behavior: &PartialReviewerConfig{PublishMode: &publishMode}}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %v, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.publishMode", "summary_comment is supported only for forgejo projects")
+}
+
 func TestForgejoExplicitReviewRequestOptInLoads(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")

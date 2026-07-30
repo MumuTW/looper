@@ -16,7 +16,7 @@ func TestValidate_AgentProfilesAndRoleBindings(t *testing.T) {
 		if !asConfigValidationError(err, &validationErr) {
 			t.Fatalf("Validate() error = %v, want ConfigValidationError", err)
 		}
-		assertValidationIssue(t, validationErr, "roles.planner.agent.profile", "references unknown agent profile: missing")
+		assertValidationIssue(t, validationErr, "roles.coding.planner.agent.profile", "references unknown agent profile: missing")
 	})
 
 	t.Run("invalid profile id with dots", func(t *testing.T) {
@@ -104,7 +104,7 @@ func TestValidate_InvalidVendorInProfileAndRoleBinding(t *testing.T) {
 	}
 	wantMsg := agentVendorValidationMessage()
 	assertValidationIssue(t, validationErr, "agent.profiles.bad.vendor", wantMsg)
-	assertValidationIssue(t, validationErr, "roles.worker.agent.vendor", wantMsg)
+	assertValidationIssue(t, validationErr, "roles.coding.worker.agent.vendor", wantMsg)
 }
 
 func asConfigValidationError(err error, target **ConfigValidationError) bool {

@@ -514,6 +514,16 @@ func TestStatusReportsUnknownReviewPublishReadiness(t *testing.T) {
 	}
 }
 
+func TestStatusReportsKnownIncapableReviewPublishReadiness(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Tools: statusToolsView{
+		ReviewPublish: &statusReviewPublishView{Known: true, Reason: "unsupported capability"},
+	}})
+	if got := stdout.String(); got != "review:   publish not ready (unsupported capability)\n" {
+		t.Fatalf("status output = %q, want known-incapable readiness line", got)
+	}
+}
+
 func TestStatusFailsWhenDaemonIsUnreachable(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	address := daemon.server.URL
@@ -568,7 +578,10 @@ func TestStatusReportsDegradedDaemon(t *testing.T) {
 
 func TestProjectListPrintsRegisteredProjects(t *testing.T) {
 	daemon := newFakeDaemon(t)
-	daemon.projects = []map[string]any{{"id": "alpha", "repoPath": "/repos/alpha", "baseBranch": "main"}}
+	daemon.projects = []map[string]any{{
+		"id": "alpha", "repoPath": "/repos/alpha", "baseBranch": "main",
+		"discovery": map[string]any{"status": "failed", "error": "git worktree list failed\nretry needed"},
+	}}
 	configForDaemon(t, daemon.server.URL)
 
 	code, stdout, stderr := runCLI(t, "project", "list")
@@ -577,6 +590,9 @@ func TestProjectListPrintsRegisteredProjects(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "alpha") || !strings.Contains(stdout, "/repos/alpha") {
 		t.Fatalf("stdout = %q, want the project id and path", stdout)
+	}
+	if !strings.Contains(stdout, "discovery=failed: git worktree list failed retry needed") {
+		t.Fatalf("stdout = %q, want persisted discovery failure rendered", stdout)
 	}
 }
 
@@ -929,6 +945,27 @@ func TestProjectDiscoverHonorsCallerCancellation(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("project discovery did not stop after caller cancellation")
+	}
+}
+
+func TestProjectDiscoverPrintsStructuredFailureBeforeReturningError(t *testing.T) {
+	var stdout bytes.Buffer
+	err := printProjectDiscoveryResult(createProjectResponse{
+		projectResponse: projectResponse{ID: "repo"},
+		Discovery: &discoveryResponse{
+			Status:   "failed",
+			Error:    "git worktree list failed",
+			Warnings: []string{"partial discovery"},
+		},
+	}, &stdout)
+	if err == nil || err.Error() != "git worktree list failed" {
+		t.Fatalf("runProjectDiscover() error = %v, want discovery failure", err)
+	}
+	output := stdout.String()
+	for _, want := range []string{"discovery for project repo: failed", "error:      git worktree list failed", "warning:    partial discovery"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("stdout = %q, want %q", output, want)
+		}
 	}
 }
 

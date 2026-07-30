@@ -128,7 +128,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: agentVendorValidationMessage()})
 	}
 	validateAgentProfiles(config.Agent.Profiles, &issues)
-	validateRoleAgentBindings(config, &issues)
 	validateEnvironmentNames(config.Agent.Env, "agent.env", &issues)
 	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", &issues)
 
@@ -297,10 +296,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 	validateInstructions(config, &issues)
 	validateCoordinatorRoleConfig(config.Roles.Coordinator, "roles.coordinator", &issues)
-	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
-	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
-	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
-	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
 	validateCodingRoleRegistry(config, &issues)
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
@@ -467,6 +462,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if providerKind == ProviderKindForgejo {
 			validateForgejoRoleCapabilities(effectiveProjectRoles, prefix, &issues)
+		} else if providerKind == ProviderKindPlane {
+			validatePlaneRoleCapabilities(effectiveProjectRoles, prefix, &issues)
 		} else if effectiveProjectRoles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: "summary_comment is supported only for forgejo projects"})
 		}
@@ -564,12 +561,32 @@ func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[
 	}
 }
 
+func validatePlaneRoleCapabilities(roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
+	if roles.Coordinator.Enabled {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.coordinator.enabled", Message: "must be false for plane projects; coordinator requires GitHub issue authority"})
+	}
+	if roles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: "summary_comment is supported only for forgejo projects"})
+	}
+}
+
 // ValidateForgejoRoleCapabilities rejects role settings that require GitHub-only
 // APIs. Callers should apply the Forgejo project profile before validating so
 // omitted project settings receive provider-compatible defaults.
 func ValidateForgejoRoleCapabilities(roles RoleConfigs, prefix string) error {
 	issues := make([]ValidationIssue, 0)
 	validateForgejoRoleCapabilities(roles, prefix, &issues)
+	if len(issues) == 0 {
+		return nil
+	}
+	return &ConfigValidationError{Issues: issues}
+}
+
+// ValidatePlaneRoleCapabilities rejects role settings that require issue or
+// review-publishing capabilities Plane projects do not provide.
+func ValidatePlaneRoleCapabilities(roles RoleConfigs, prefix string) error {
+	issues := make([]ValidationIssue, 0)
+	validatePlaneRoleCapabilities(roles, prefix, &issues)
 	if len(issues) == 0 {
 		return nil
 	}
@@ -957,22 +974,6 @@ func validateAgentProfiles(profiles map[string]AgentBindingConfig, issues *[]Val
 		if binding.Vendor != nil && !isValidAgentVendor(*binding.Vendor) {
 			*issues = append(*issues, ValidationIssue{Path: path + ".vendor", Message: agentVendorValidationMessage()})
 		}
-	}
-}
-
-func validateRoleAgentBindings(config Config, issues *[]ValidationIssue) {
-	type roleBinding struct {
-		role  string
-		agent *RoleAgentConfig
-	}
-	bindings := []roleBinding{
-		{role: CodingRolePlanner, agent: config.Roles.Planner.Agent},
-		{role: CodingRoleWorker, agent: config.Roles.Worker.Agent},
-		{role: CodingRoleReviewer, agent: config.Roles.Reviewer.Agent},
-		{role: CodingRoleFixer, agent: config.Roles.Fixer.Agent},
-	}
-	for _, binding := range bindings {
-		validateRoleAgentBinding(config, "roles."+binding.role+".agent", binding.agent, issues)
 	}
 }
 

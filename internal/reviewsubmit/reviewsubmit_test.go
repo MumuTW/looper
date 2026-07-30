@@ -991,6 +991,60 @@ func TestReviewSubmitGatewayForConfigUsesCWDMatchedForgejoProject(t *testing.T) 
 	}
 }
 
+func TestReviewSubmitGatewayUsesCanonicalReviewerDiscoveryGates(t *testing.T) {
+	tokenEnv := "LOOPER_TEST_FORGEJO_CANONICAL_REVIEWER_TOKEN"
+	t.Setenv(tokenEnv, "test-token")
+	repoPath := t.TempDir()
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{
+			ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: &tokenEnv,
+		}},
+		Projects: []config.ProjectRefConfig{{
+			ID: "forgejo-acme", Repo: "acme/looper", RepoPath: repoPath, Provider: "forgejo",
+		}},
+		Roles: config.RoleConfigs{
+			Reviewer: config.ReviewerRoleConfig{
+				Discovery: config.ReviewerRoleDiscoveryConfig{
+					Triggers: config.ReviewerRoleTriggersConfig{
+						RequireReviewRequest: true,
+						Labels:               []string{"legacy"},
+						LabelMode:            config.LabelModeAll,
+					},
+				},
+			},
+			Coding: map[string]config.CodingRoleConfig{
+				config.CodingRoleReviewer: {
+					Priority: config.PriorityReviewer,
+					Discovery: config.RoleDiscoveryConfig{
+						Source:               config.WorkSourcePullRequest,
+						RequireReviewRequest: false,
+						Labels:               []string{"canonical-a", "canonical-b"},
+						LabelMode:            config.LabelModeAny,
+					},
+				},
+			},
+		},
+	}
+
+	gateway, err := reviewSubmitGatewayForConfig(cfg, "acme/looper", repoPath, nil)
+	if err != nil {
+		t.Fatalf("reviewSubmitGatewayForConfig() error = %v", err)
+	}
+	forgeGateway, ok := gateway.(forgejoReviewSubmitGateway)
+	if !ok {
+		t.Fatalf("gateway type = %T, want forgejoReviewSubmitGateway", gateway)
+	}
+	if forgeGateway.requireReviewRequest {
+		t.Fatal("requireReviewRequest = true, want canonical false")
+	}
+	if got := strings.Join(forgeGateway.labels, ","); got != "canonical-a,canonical-b" {
+		t.Fatalf("labels = %q, want canonical labels", got)
+	}
+	if forgeGateway.labelMode != config.LabelModeAny {
+		t.Fatalf("labelMode = %q, want %q", forgeGateway.labelMode, config.LabelModeAny)
+	}
+}
+
 func TestReviewSubmitProjectForRepoResolvesAPIManagedForgejoFromSQLite(t *testing.T) {
 	t.Parallel()
 

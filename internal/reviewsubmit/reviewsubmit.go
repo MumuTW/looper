@@ -203,26 +203,24 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 	if err != nil {
 		return nil, err
 	}
-	if matched != nil && config.ResolvedProjectProviderKind(cfg, *matched) == config.ProviderKindForgejo {
-		var provider *config.ProviderConfig
-		for index := range cfg.Providers {
-			if strings.TrimSpace(cfg.Providers[index].ID) == strings.TrimSpace(matched.Provider) {
-				provider = &cfg.Providers[index]
-				break
-			}
-		}
-		if provider == nil {
-			return nil, fmt.Errorf("forgejo provider %q is not configured", matched.Provider)
-		}
-		client, err := forge.NewForgejoClientFromConfig(*provider, matched.Repo)
-		if err != nil {
-			return nil, err
-		}
+	if matched != nil {
 		// Include storage-materialized projects so ProjectRoleConfigs sees
 		// project-specific roles instead of falling back to global defaults.
 		roleCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
-		roles := config.ProjectRoleConfigs(roleCfg, matched.ID)
-		return forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(cfg), requireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), labelMode: roles.Reviewer.Discovery.Triggers.LabelMode}, nil
+		selection, err := forge.NewResolver(roleCfg).ForProjectRef(*matched)
+		if err != nil {
+			return nil, err
+		}
+		if client, native, err := selection.ForgejoClient(); native || err != nil {
+			if err != nil {
+				return nil, err
+			}
+			reviewer, ok := config.ProjectCodingRoleConfig(roleCfg, matched.ID, config.CodingRoleReviewer)
+			if !ok {
+				return nil, fmt.Errorf("reviewer coding role is not configured")
+			}
+			return forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(cfg), requireReviewRequest: reviewer.Discovery.RequireReviewRequest, labels: append([]string(nil), reviewer.Discovery.Labels...), labelMode: reviewer.Discovery.LabelMode}, nil
+		}
 	}
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" {
 		return nil, fmt.Errorf("GitHub CLI (gh) not found; install gh or set --gh-path <path>")

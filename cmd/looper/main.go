@@ -752,6 +752,10 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 	if err != nil {
 		return err
 	}
+	return printProjectDiscoveryResult(result, stdout)
+}
+
+func printProjectDiscoveryResult(result createProjectResponse, stdout io.Writer) error {
 	if result.Discovery == nil {
 		_, _ = fmt.Fprintf(stdout, "discovery for project %s: unknown (daemon did not report discovery status)\n", result.ID)
 		return nil
@@ -766,6 +770,12 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 	}
 	for _, warning := range result.Discovery.Warnings {
 		_, _ = fmt.Fprintf(stdout, "  warning:    %s\n", singleLine(warning))
+	}
+	if result.Discovery.Status == "failed" {
+		if message := strings.TrimSpace(result.Discovery.Error); message != "" {
+			return errors.New(message)
+		}
+		return errors.New("project discovery failed")
 	}
 	return nil
 }
@@ -867,6 +877,12 @@ func describeProject(project projectResponse) string {
 	if project.Archived {
 		line += "\t(archived)"
 	}
+	if project.Discovery != nil && project.Discovery.Status != "" {
+		line += "\tdiscovery=" + project.Discovery.Status
+		if project.Discovery.Error != "" {
+			line += ": " + singleLine(project.Discovery.Error)
+		}
+	}
 	return line
 }
 
@@ -942,6 +958,12 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 				token = "ok"
 			}
 			_, _ = fmt.Fprintf(stdout, "review:   publish ready (%s)\n", token)
+		default:
+			reason := strings.TrimSpace(review.Reason)
+			if reason == "" {
+				reason = "capability reported not capable"
+			}
+			_, _ = fmt.Fprintf(stdout, "review:   publish not ready (%s)\n", singleLine(reason))
 		}
 	}
 
@@ -956,12 +978,13 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 }
 
 type projectResponse struct {
-	ID         string  `json:"id"`
-	Name       string  `json:"name"`
-	RepoPath   string  `json:"repoPath"`
-	BaseBranch string  `json:"baseBranch"`
-	Archived   bool    `json:"archived"`
-	Repo       *string `json:"repo"`
+	ID         string             `json:"id"`
+	Name       string             `json:"name"`
+	RepoPath   string             `json:"repoPath"`
+	BaseBranch string             `json:"baseBranch"`
+	Archived   bool               `json:"archived"`
+	Repo       *string            `json:"repo"`
+	Discovery  *discoveryResponse `json:"discovery"`
 }
 
 type projectsListResponse struct {

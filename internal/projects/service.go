@@ -102,13 +102,14 @@ type DiscoveryState struct {
 }
 
 type Service struct {
-	mutationMu   sync.Mutex
-	projectLocks sync.Map // map[string]*projectOperationLock
-	DB           *sql.DB
-	Repos        *storage.Repositories
-	Logger       bootstrap.Logger
-	Config       config.Config
-	ConfigSource ConfigSource
+	mutationMu     sync.Mutex
+	projectLocksMu sync.Mutex
+	projectLocks   map[string]*projectOperationLock
+	DB             *sql.DB
+	Repos          *storage.Repositories
+	Logger         bootstrap.Logger
+	Config         config.Config
+	ConfigSource   ConfigSource
 	// ConfigBoundary serializes project materialization/commit/publication with
 	// global config validation/publication. It prevents a valid mutation on each
 	// side from combining into an invalid catalog snapshot.
@@ -137,7 +138,10 @@ type Service struct {
 	DiscoveryContext func() context.Context
 }
 
-type projectOperationLock struct{ token chan struct{} }
+type projectOperationLock struct {
+	token chan struct{}
+	refs  int
+}
 
 func newProjectOperationLock() *projectOperationLock {
 	lock := &projectOperationLock{token: make(chan struct{}, 1)}
@@ -165,10 +169,32 @@ func (s *Service) lockProjectOperations(ctx context.Context, ids ...string) (fun
 	}
 	sort.Strings(orderedIDs)
 
+	s.projectLocksMu.Lock()
+	if s.projectLocks == nil {
+		s.projectLocks = make(map[string]*projectOperationLock)
+	}
 	locks := make([]*projectOperationLock, 0, len(orderedIDs))
 	for _, id := range orderedIDs {
-		value, _ := s.projectLocks.LoadOrStore(id, newProjectOperationLock())
-		locks = append(locks, value.(*projectOperationLock))
+		lock := s.projectLocks[id]
+		if lock == nil {
+			lock = newProjectOperationLock()
+			s.projectLocks[id] = lock
+		}
+		lock.refs++
+		locks = append(locks, lock)
+	}
+	s.projectLocksMu.Unlock()
+
+	releaseReferences := func() {
+		s.projectLocksMu.Lock()
+		defer s.projectLocksMu.Unlock()
+		for index, id := range orderedIDs {
+			lock := locks[index]
+			lock.refs--
+			if lock.refs == 0 && s.projectLocks[id] == lock {
+				delete(s.projectLocks, id)
+			}
+		}
 	}
 
 	for index, lock := range locks {
@@ -177,6 +203,7 @@ func (s *Service) lockProjectOperations(ctx context.Context, ids ...string) (fun
 			for releaseIndex := index - 1; releaseIndex >= 0; releaseIndex-- {
 				locks[releaseIndex].token <- struct{}{}
 			}
+			releaseReferences()
 			return nil, ctx.Err()
 		case <-lock.token:
 		}
@@ -186,6 +213,7 @@ func (s *Service) lockProjectOperations(ctx context.Context, ids ...string) (fun
 		for index := len(locks) - 1; index >= 0; index-- {
 			locks[index].token <- struct{}{}
 		}
+		releaseReferences()
 	}, nil
 }
 
@@ -507,8 +535,12 @@ func (s *Service) DiscoverProject(ctx context.Context, input DiscoverInput) (Dis
 		Warnings:               append([]string{}, warnings...),
 	}
 	if worktreeErr != nil || pullRequestErr != nil {
-		discovery.Status = DiscoveryStatusFailed
-		discovery.Error = firstErrorMessage(worktreeErr, pullRequestErr)
+		if discoveryCanceled(worktreeErr, pullRequestErr) {
+			discovery.Status = DiscoveryStatusPending
+		} else {
+			discovery.Status = DiscoveryStatusFailed
+			discovery.Error = firstErrorMessage(worktreeErr, pullRequestErr)
+		}
 		if writeErr := s.writeDiscoveryState(ctx, project, discovery); writeErr != nil {
 			return DiscoverResult{}, writeErr
 		}
@@ -545,6 +577,34 @@ func (s *Service) List(ctx context.Context) ([]storage.ProjectRecord, error) {
 		}
 	}
 	return active, nil
+}
+
+// ResumeIncompleteDiscoveries reschedules work whose persisted pending or running
+// state outlived its process. The runtime calls this once after startup has
+// materialized the project catalog and installed its discovery lifecycle.
+func (s *Service) ResumeIncompleteDiscoveries(ctx context.Context) error {
+	if s == nil || s.Repos == nil || s.Repos.Projects == nil {
+		return fmt.Errorf("projects repository is not configured")
+	}
+	records, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	inputs := make([]DiscoverInput, 0)
+	for _, record := range records {
+		if record.Archived {
+			continue
+		}
+		discovery := DiscoveryStateFromRecord(record)
+		if discovery.Status == DiscoveryStatusRunning || discovery.Status == DiscoveryStatusPending {
+			inputs = append(inputs, DiscoverInput{ProjectID: record.ID, SnapshotMode: discovery.SnapshotMode})
+		}
+	}
+	// Resume the persisted backlog through one lifecycle-owned job. This keeps
+	// restart fan-out bounded without adding another worker pool or persisted
+	// queue; newly registered projects retain their existing async behavior.
+	s.scheduleDiscoveries(inputs)
+	return nil
 }
 
 func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {
@@ -1245,7 +1305,7 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 				return discovered, pending, captured, err
 			}
 			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) || errors.Is(ctxErr, context.DeadlineExceeded) {
-				return discovered, pending, captured, ctxErr
+				return discovered, pending, captured, errors.Join(err, ctxErr)
 			}
 			message := err.Error()
 			if s.Logger != nil {
@@ -1401,10 +1461,17 @@ func worktreeCreatedAt(existing *storage.WorktreeRecord, nowISO string) string {
 }
 
 func (s *Service) scheduleDiscovery(input DiscoverInput) {
+	s.scheduleDiscoveries([]DiscoverInput{input})
+}
+
+func (s *Service) scheduleDiscoveries(inputs []DiscoverInput) {
+	if len(inputs) == 0 {
+		return
+	}
 	if s == nil || s.ScheduleDiscovery == nil {
 		if s != nil && s.Logger != nil {
 			s.Logger.Warn("post-commit project discovery left pending without a lifecycle owner", map[string]any{
-				"projectId": input.ProjectID,
+				"projectId": inputs[0].ProjectID,
 			})
 		}
 		return
@@ -1416,14 +1483,19 @@ func (s *Service) scheduleDiscovery(input DiscoverInput) {
 		}
 	}
 	run := func() {
-		_, err := s.DiscoverProject(ctx, input)
-		if err == nil || s.Logger == nil {
-			return
+		for _, input := range inputs {
+			if ctx.Err() != nil {
+				return
+			}
+			_, err := s.DiscoverProject(ctx, input)
+			if err == nil || s.Logger == nil {
+				continue
+			}
+			s.Logger.Warn("post-commit project discovery failed", map[string]any{
+				"projectId": input.ProjectID,
+				"message":   err.Error(),
+			})
 		}
-		s.Logger.Warn("post-commit project discovery failed", map[string]any{
-			"projectId": input.ProjectID,
-			"message":   err.Error(),
-		})
 	}
 	s.ScheduleDiscovery(run)
 }
@@ -1432,7 +1504,18 @@ func (s *Service) writeDiscoveryState(ctx context.Context, project *storage.Proj
 	if project == nil || s.Repos == nil || s.Repos.Projects == nil {
 		return fmt.Errorf("projects repository is not configured")
 	}
-	metadata := parseMetadata(project.MetadataJSON)
+	// DiscoverProject holds the keyed project-operation lock. Re-read the
+	// authoritative row before each whole-record upsert so metadata committed
+	// before the lock was acquired is not replaced by the caller's stale copy.
+	current, err := s.Repos.Projects.GetByID(context.Background(), project.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return ProjectNotFoundError{Identifier: project.ID}
+	}
+	*project = *current
+	metadata := parseMetadata(current.MetadataJSON)
 	metadata[registrationDiscoveryMetadataKey] = discoveryStateMap(discovery)
 	metadataJSON, err := buildAddProjectMetadataJSON(metadata)
 	if err != nil {
@@ -1543,4 +1626,40 @@ func firstErrorMessage(errs ...error) string {
 		}
 	}
 	return ""
+}
+
+func discoveryCanceled(errs ...error) bool {
+	canceled := false
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		if !onlyContextCanceled(err) {
+			return false
+		}
+		canceled = true
+	}
+	return canceled
+}
+
+func onlyContextCanceled(err error) bool {
+	if err == context.Canceled {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		unwrapped := joined.Unwrap()
+		if len(unwrapped) == 0 {
+			return false
+		}
+		for _, nested := range unwrapped {
+			if !onlyContextCanceled(nested) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return onlyContextCanceled(wrapped.Unwrap())
+	}
+	return false
 }

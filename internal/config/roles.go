@@ -263,9 +263,10 @@ func ValidateRoleDiscovery(pathPrefix string, d RoleDiscoveryConfig) []Validatio
 // early safety validation without treating an overridden legacy instruction as
 // a coding-section error. Keys are normalized with NormalizeRoleName; an empty
 // key is a load-time error rather than a role no one can address.
-func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCodingRoleConfig, map[string]struct{}, []ValidationIssue) {
+func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCodingRoleConfig, map[string]struct{}, map[string]bool, []ValidationIssue) {
 	var authored map[string]PartialCodingRoleConfig
 	var authoredInstructions map[string]struct{}
+	var codingModelCanonical map[string]bool
 	var issues []ValidationIssue
 	for _, partial := range partials {
 		if partial.Roles == nil {
@@ -277,6 +278,12 @@ func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCo
 				authored = make(map[string]PartialCodingRoleConfig)
 			}
 			authored[name] = mergePartialCodingRoleConfig(authored[name], legacy[name])
+			if legacy[name].Agent != nil && legacy[name].Agent.Model != nil {
+				if codingModelCanonical == nil {
+					codingModelCanonical = make(map[string]bool)
+				}
+				codingModelCanonical[name] = false
+			}
 			if legacy[name].Instructions != nil {
 				delete(authoredInstructions, name)
 			}
@@ -309,6 +316,12 @@ func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCo
 				authored = make(map[string]PartialCodingRoleConfig)
 			}
 			authored[name] = mergePartialCodingRoleConfig(authored[name], role)
+			if role.Agent != nil && role.Agent.Model != nil {
+				if codingModelCanonical == nil {
+					codingModelCanonical = make(map[string]bool)
+				}
+				codingModelCanonical[name] = true
+			}
 			if role.Instructions != nil {
 				if authoredInstructions == nil {
 					authoredInstructions = make(map[string]struct{})
@@ -317,7 +330,7 @@ func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCo
 			}
 		}
 	}
-	return authored, authoredInstructions, issues
+	return authored, authoredInstructions, codingModelCanonical, issues
 }
 
 func mergePartialCodingRoleConfig(base, overlay PartialCodingRoleConfig) PartialCodingRoleConfig {

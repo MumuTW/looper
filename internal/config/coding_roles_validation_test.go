@@ -47,6 +47,17 @@ func TestValidateDirectCanonicalRegistryContracts(t *testing.T) {
 	}
 }
 
+func TestValidateIgnoresShadowedLegacyCodingRoleFields(t *testing.T) {
+	t.Parallel()
+	cfg := mustNormalize(t)
+	cfg.Roles.Worker.Triggers.LabelMode = LabelMode("bogus")
+	missingProfile := "missing-profile"
+	cfg.Roles.Worker.Agent = &RoleAgentConfig{Profile: &missingProfile}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v, want canonical roles.coding.worker to shadow stale legacy fields", err)
+	}
+}
+
 func TestValidateRejectsProjectScopedCodingRolesFromDirectConfig(t *testing.T) {
 	t.Parallel()
 	cfg := mustNormalize(t)
