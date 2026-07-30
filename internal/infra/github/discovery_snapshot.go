@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -103,6 +104,30 @@ func (s *DiscoverySnapshot) listReviewRequestedPullRequests(ctx context.Context,
 	s.reviewRequestedPRs[key] = reviewRequestedPullRequestSnapshotEntry{items: clonePullRequestSummaries(prs)}
 	s.mu.Unlock()
 	return limitPullRequests(clonePullRequestSummaries(prs), input.Limit), nil
+}
+
+// Prefetch warms this snapshot's open pull request and open issue pages for one
+// repo, so discovery lanes read them from the snapshot instead of each blocking
+// on its own forge round trip.
+//
+// It is a pure read: it enqueues nothing, claims nothing, and takes no admission
+// decision, which is what makes warming several projects concurrently safe with
+// respect to the scheduler's shutdown contract — unlike running the lanes
+// themselves concurrently.
+//
+// The returned error is for logging only. A failed warm simply leaves the
+// snapshot cold and the lane performs its own fetch, so no behaviour depends on
+// prefetch succeeding.
+func (s *DiscoverySnapshot) Prefetch(ctx context.Context, repo, cwd string) error {
+	if s == nil {
+		return nil
+	}
+	// Keyed on (repo, cwd) exactly as the ensure* helpers are, so a lane calling
+	// with the same pair hits the warm entry rather than refetching.
+	return errors.Join(
+		s.ensureOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd}),
+		s.ensureOpenIssues(ctx, ListOpenIssuesInput{Repo: repo, CWD: cwd}),
+	)
 }
 
 func (s *DiscoverySnapshot) ensureOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) error {

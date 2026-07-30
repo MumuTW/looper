@@ -3421,34 +3421,21 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		now = time.Now
 	}
 
-	// tickMu guards the tick-local aggregates below. Project discovery fans out
-	// across goroutines, so every accumulator these closures touch is shared.
-	// appendErrLocked exists so recordClaim can append under the lock it already
-	// holds instead of re-entering appendErr and deadlocking.
-	var tickMu sync.Mutex
 	errs := make([]error, 0)
-	appendErrLocked := func(err error) {
+	appendErr := func(err error) {
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
-	appendErr := func(err error) {
-		if err == nil {
-			return
-		}
-		tickMu.Lock()
-		defer tickMu.Unlock()
-		appendErrLocked(err)
-	}
-	discoveredRunnableIDs := newRunnableDiscoverySet()
+	discoveredRunnableIDs := make(map[string]struct{})
 	trackRunnableDiscovery := func(queueItems []storage.QueueItemRecord) {
-		discoveredRunnableIDs.add(runnableSchedulerQueueItemIDs(queueItems, now))
+		for _, id := range runnableSchedulerQueueItemIDs(queueItems, now) {
+			discoveredRunnableIDs[id] = struct{}{}
+		}
 	}
 	recordClaim := func(claimedCount, availableSlots int, err error) {
-		tickMu.Lock()
-		defer tickMu.Unlock()
 		claimStats.record(claimedCount, availableSlots)
-		appendErrLocked(err)
+		appendErr(err)
 	}
 	// Liveness quarantine must be revisited on the scheduler's periodic full
 	// tick, independently of capacity. Tying this to availableSlots == 0 strands
@@ -3476,11 +3463,8 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
 	tickDiscoveryState := githubinfra.NewDiscoveryTickState()
-	// snapshotMu guards the snapshot map only. Each project is discovered by a
-	// single goroutine, so entries never collide on a key, but the map itself is
-	// shared across the fan-out. It is deliberately not tickMu: snapshot lookup
-	// sits on the hot path of every lane and must not queue behind error or
-	// claim-stat bookkeeping.
+	// snapshotMu guards the snapshot map: prefetchProjectSnapshots warms several
+	// projects concurrently and each warm allocates its project's snapshot here.
 	var snapshotMu sync.Mutex
 	projectSnapshots := map[string]*githubinfra.DiscoverySnapshot{}
 	projectSnapshot := func(projectID string) *githubinfra.DiscoverySnapshot {
@@ -3501,31 +3485,23 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if input.Config != nil {
 		providers = forge.NewResolver(*input.Config)
 	}
-	// discoverProject runs one project's discovery lanes and its HITL poll.
-	// Returning false means admission closed mid-flight, which stops the fan-out
-	// from starting any further project — the same guarantee the serial `break`
-	// used to give.
-	// Admission coordination across the fan-out. The serial loop enforced "no
-	// later discovery after admission closes" with a `break`; concurrently that
-	// has to be a shared latch every worker consults, and it has to be consulted
-	// at lane granularity rather than only at project entry — otherwise a worker
-	// that entered while admission was open keeps enqueueing through all its
-	// lanes after another worker already saw the close.
-	var (
-		stopMu   sync.Mutex
-		stopTick bool
-	)
-	discoveryHalted := func() bool {
-		stopMu.Lock()
-		defer stopMu.Unlock()
-		return stopTick
-	}
-	haltDiscovery := func() {
-		stopMu.Lock()
-		stopTick = true
-		stopMu.Unlock()
-	}
-	discoverProject := func(project storage.ProjectRecord) bool {
+	// Warm every project's snapshot before the serial walk below. A tick used to
+	// pay each project's forge latency end to end, one after another, so a
+	// multi-repo daemon spent minutes per tick and could not honour its own poll
+	// interval. Overlapping the reads collapses that to roughly the slowest single
+	// fetch.
+	//
+	// Only the reads are concurrent. The lane walk, its enqueues, and every
+	// admission recheck stay exactly as serial as before, because admission's
+	// "no later discovery after close" guarantee comes from the total ordering of
+	// that walk — fanning the walk out breaks it, and no latch can restore it once
+	// two projects' lanes have already started (see #147).
+	prefetchProjectSnapshots(ctx, input, projectsList, providers, projectSnapshot)
+	for _, project := range projectsList {
+		if err := ctx.Err(); err != nil {
+			retErr = errors.Join(append(errs, err)...)
+			return retErr
+		}
 		// Recheck before each project's work-producing lanes so BeginShutdown
 		// during HTTP drain cannot leave a tick that passed the entry gate free
 		// to enqueue discovery/HITL after admission is already stopping.
@@ -3533,22 +3509,18 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			if input.Logger != nil {
 				input.Logger.Debug("scheduler tick stopped mid-flight: admission closed", map[string]any{"error": err.Error(), "projectId": project.ID})
 			}
-			return false
+			break
 		}
 		if project.Archived {
-			return true
+			continue
 		}
 		provider := providers.ForProject(project.ID)
-		repo := repoFromProjectMetadata(project.MetadataJSON)
-		if input.Config != nil {
-			binding, ok := runtimeProjectBinding(*input.Config, project.ID)
-			if !ok {
-				if input.Logger != nil {
-					input.Logger.Debug("scheduler skipped project missing from captured catalog", map[string]any{"projectId": project.ID})
-				}
-				return true
+		repo, inCatalog := schedulerProjectRepo(input, project)
+		if !inCatalog {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler skipped project missing from captured catalog", map[string]any{"projectId": project.ID})
 			}
-			repo = strings.TrimSpace(binding.Repo)
+			continue
 		}
 		var snapshot *githubinfra.DiscoverySnapshot
 		if provider.Capabilities().GitHubCLIPullRequestCreation {
@@ -3558,8 +3530,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			if input.Logger != nil {
 				input.Logger.Warn("scheduler skipped project without repo metadata", map[string]any{"projectId": project.ID})
 			}
-			return true
+			continue
 		}
+		admissionClosed := false
 		for _, lane := range lanes {
 			if !lane.Present {
 				continue
@@ -3576,15 +3549,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				}
 				continue
 			}
-			// Consult the shared latch before this lane's own admission recheck:
-			// another worker may already have observed the close, and this lane must
-			// not start merely because its own recheck has not raced yet.
-			if discoveryHalted() {
-				return false
-			}
 			if err := admissionRefuseWork(input); err != nil {
-				haltDiscovery()
-				return false
+				admissionClosed = true
+				break
 			}
 			label := lane.laneLabel()
 			appendErr(runSchedulerLane(input, label, project.ID, repo, func() error {
@@ -3592,62 +3559,19 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				trackRunnableDiscovery(items)
 				return wrapSchedulerError(label, project.ID, repo, err)
 			}))
-			// Lane-local claim results: the tick-level counters are shared across
-			// the fan-out and are only reachable through recordClaim.
-			laneClaimed, laneSlots, laneErr := executeClaimPhase(ctx, lane.claimPhaseLabel(), input, discoveredRunnableIDs, true)
-			recordClaim(laneClaimed, laneSlots, laneErr)
+			claimedCount, availableSlots, err = executeClaimPhase(ctx, lane.claimPhaseLabel(), input, discoveredRunnableIDs, true)
+			recordClaim(claimedCount, availableSlots, err)
+		}
+		if admissionClosed {
+			break
 		}
 
 		// HITL (github transport): deliver any human answers posted on this
 		// project's awaiting_human PRs so those loops resume.
 		if err := admissionRefuseWork(input); err != nil {
-			return false
+			break
 		}
 		runGitHubHITLPoll(ctx, input, project)
-		return true
-	}
-
-	// Discovery is per-project independent: each project's lanes read that
-	// project's own forge state and enqueue against its own dedupe keys. Walking
-	// projects serially made one tick cost the sum of every project's forge
-	// latency, so a multi-repo daemon spent minutes per tick and could not honour
-	// its own poll interval — discovery starved the claims it exists to feed.
-	//
-	// Claims stay serialized inside executeClaimPhase (ClaimMu/ClaimBoundary), and
-	// the state workers share is either mutex-guarded infra (Gateway,
-	// DiscoveryTickState, DiscoverySnapshot, Logger) or guarded here by tickMu and
-	// snapshotMu.
-	//
-	// Behaviour deltas, both accepted: when slots are scarce, which project's
-	// items win is now completion-ordered rather than catalog-ordered; and joined
-	// tick errors are no longer in catalog order.
-	var discoveryWG sync.WaitGroup
-	slots := make(chan struct{}, schedulerDiscoveryConcurrency(len(projectsList)))
-	ctxCancelled := false
-	for _, project := range projectsList {
-		if err := ctx.Err(); err != nil {
-			appendErr(err)
-			ctxCancelled = true
-			break
-		}
-		if discoveryHalted() {
-			break
-		}
-		slots <- struct{}{}
-		discoveryWG.Add(1)
-		go func(project storage.ProjectRecord) {
-			defer discoveryWG.Done()
-			defer func() { <-slots }()
-			if !discoverProject(project) {
-				haltDiscovery()
-			}
-		}(project)
-	}
-	discoveryWG.Wait()
-	// Every worker has returned, so the aggregates are single-threaded again.
-	if ctxCancelled {
-		retErr = errors.Join(errs...)
-		return retErr
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and
@@ -3687,6 +3611,107 @@ func coordinatorEnabledForProject(input defaultSchedulerTickInput, projectID str
 	return input.CoordinatorEnabled(projectID)
 }
 
+// schedulerProjectRepo resolves the repo a project's discovery reads, with the
+// same precedence the lane walk uses: the captured catalog binding when a config
+// is present, otherwise the project's stored metadata. Shared with the snapshot
+// prefetch so a warm can never key on a different repo than the walk consuming it.
+// inCatalog is false when a config is present but the project is absent from it.
+func schedulerProjectRepo(input defaultSchedulerTickInput, project storage.ProjectRecord) (repo string, inCatalog bool) {
+	repo = repoFromProjectMetadata(project.MetadataJSON)
+	if input.Config != nil {
+		binding, ok := runtimeProjectBinding(*input.Config, project.ID)
+		if !ok {
+			return "", false
+		}
+		repo = strings.TrimSpace(binding.Repo)
+	}
+	return repo, true
+}
+
+// maxSchedulerSnapshotPrefetchConcurrency bounds how many projects a tick warms at
+// once. Warming is forge-API bound, so the cap protects the shared `gh` rate limit
+// and subprocess budget rather than matching core count.
+const maxSchedulerSnapshotPrefetchConcurrency = 4
+
+func schedulerSnapshotPrefetchConcurrency(targets int) int {
+	if targets < 1 {
+		return 1
+	}
+	if targets > maxSchedulerSnapshotPrefetchConcurrency {
+		return maxSchedulerSnapshotPrefetchConcurrency
+	}
+	return targets
+}
+
+// prefetchProjectSnapshots warms every eligible project's discovery snapshot
+// concurrently, so the serial lane walk that follows reads warm pages instead of
+// paying each project's forge latency in sequence.
+//
+// This is deliberately reads-only. Nothing here enqueues, claims, or decides
+// admission, so concurrency cannot affect the shutdown contract the serial walk
+// enforces. Failures are benign and logged, never returned: a cold snapshot just
+// means the lane fetches it itself.
+func prefetchProjectSnapshots(ctx context.Context, input defaultSchedulerTickInput, projects []storage.ProjectRecord, providers forge.Resolver, snapshotFor func(string) *githubinfra.DiscoverySnapshot) {
+	if input.GitHubGateway == nil || snapshotFor == nil || len(projects) < 2 {
+		return
+	}
+	if err := admissionRefuseWork(input); err != nil {
+		return
+	}
+	type prefetchTarget struct {
+		projectID string
+		repo      string
+		cwd       string
+	}
+	targets := make([]prefetchTarget, 0, len(projects))
+	for _, project := range projects {
+		if project.Archived {
+			continue
+		}
+		if !providers.ForProject(project.ID).Capabilities().GitHubCLIPullRequestCreation {
+			continue
+		}
+		repo, inCatalog := schedulerProjectRepo(input, project)
+		if !inCatalog || strings.TrimSpace(repo) == "" {
+			continue
+		}
+		targets = append(targets, prefetchTarget{projectID: project.ID, repo: repo, cwd: project.RepoPath})
+	}
+	// With one target there is no latency to hide: it would warm itself on first
+	// use anyway, and spawning for it only adds a code path.
+	if len(targets) < 2 {
+		return
+	}
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, schedulerSnapshotPrefetchConcurrency(len(targets)))
+	for _, target := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(target prefetchTarget) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			startedAt := time.Now()
+			err := snapshotFor(target.projectID).Prefetch(ctx, target.repo, target.cwd)
+			if input.Logger == nil {
+				return
+			}
+			fields := map[string]any{"projectId": target.projectID, "repo": target.repo, "durationMs": time.Since(startedAt).Milliseconds()}
+			if err != nil {
+				// Logged so a systematically failing warm is visible rather than
+				// silently costing every lane its own round trip.
+				fields["error"] = err.Error()
+				input.Logger.Debug("scheduler snapshot prefetch failed", fields)
+				return
+			}
+			input.Logger.Debug("scheduler snapshot prefetch completed", fields)
+		}(target)
+	}
+	wg.Wait()
+}
+
 func projectDiscoverySnapshotOptions(input defaultSchedulerTickInput, projectID string) githubinfra.DiscoverySnapshotOptions {
 	prLimit := 30
 	issueLimit := 30
@@ -3720,72 +3745,15 @@ func runnableSchedulerQueueItemIDs(queueItems []storage.QueueItemRecord, now fun
 	return ids
 }
 
-// maxSchedulerDiscoveryConcurrency bounds how many projects one tick discovers
-// at once. Discovery is forge-API bound rather than CPU bound, so the cap exists
-// to protect the shared `gh` rate limit and the daemon's subprocess/descriptor
-// budget, not to match core count. It is a constant and not a config field: the
-// only behaviour worth preventing is unbounded fan-out across a large catalog,
-// and a knob nobody has asked for is a config surface to keep in sync forever.
-const maxSchedulerDiscoveryConcurrency = 4
-
-func schedulerDiscoveryConcurrency(projectCount int) int {
-	if projectCount < 1 {
-		return 1
-	}
-	if projectCount > maxSchedulerDiscoveryConcurrency {
-		return maxSchedulerDiscoveryConcurrency
-	}
-	return projectCount
-}
-
-// runnableDiscoverySet is the set of queue items a tick's discovery found
-// immediately runnable. Project discovery fans out across goroutines, so the
-// per-lane writes and the per-claim-phase reads both need guarding. A nil set
-// is a valid empty set, which is what the claim pump and tests pass.
-type runnableDiscoverySet struct {
-	mu  sync.Mutex
-	ids map[string]struct{}
-}
-
-func newRunnableDiscoverySet() *runnableDiscoverySet {
-	return &runnableDiscoverySet{ids: map[string]struct{}{}}
-}
-
-func (s *runnableDiscoverySet) add(ids []string) {
-	if s == nil || len(ids) == 0 {
+func requestWakeForClaimedDiscovery(claimedItems []storage.QueueItemRecord, discoveredRunnableIDs map[string]struct{}, requestWake func()) {
+	if requestWake == nil || len(claimedItems) == 0 || len(discoveredRunnableIDs) == 0 {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ids == nil {
-		s.ids = make(map[string]struct{}, len(ids))
-	}
-	for _, id := range ids {
-		s.ids[id] = struct{}{}
-	}
-}
-
-// containsAny reports whether any claimed item came from this tick's discovery.
-func (s *runnableDiscoverySet) containsAny(claimedItems []storage.QueueItemRecord) bool {
-	if s == nil || len(claimedItems) == 0 {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, item := range claimedItems {
-		if _, ok := s.ids[item.ID]; ok {
-			return true
+		if _, ok := discoveredRunnableIDs[item.ID]; ok {
+			requestWake()
+			return
 		}
-	}
-	return false
-}
-
-func requestWakeForClaimedDiscovery(claimedItems []storage.QueueItemRecord, discovered *runnableDiscoverySet, requestWake func()) {
-	if requestWake == nil {
-		return
-	}
-	if discovered.containsAny(claimedItems) {
-		requestWake()
 	}
 }
 
@@ -3836,7 +3804,7 @@ func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSched
 	return projectsList, true, nil
 }
 
-func executeClaimPhase(ctx context.Context, phase string, input defaultSchedulerTickInput, discoveredRunnableIDs *runnableDiscoverySet, alwaysLog bool) (int, int, error) {
+func executeClaimPhase(ctx context.Context, phase string, input defaultSchedulerTickInput, discoveredRunnableIDs map[string]struct{}, alwaysLog bool) (int, int, error) {
 	if input.ClaimMu != nil {
 		input.ClaimMu.Lock()
 		defer input.ClaimMu.Unlock()

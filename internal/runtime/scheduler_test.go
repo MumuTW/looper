@@ -124,74 +124,6 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 }
 
-// A serial tick costs the sum of every project's forge latency, which is how a
-// multi-repo daemon ended up spending 200s per tick against a 30s poll interval.
-// The barrier below only releases once every project is inside discovery at the
-// same time, so this test blocks until its deadline — rather than passing
-// quietly — if project discovery is ever serialized again.
-func TestRunDefaultSchedulerTickDiscoversProjectsConcurrently(t *testing.T) {
-	t.Parallel()
-
-	workingDir := t.TempDir()
-	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-parallel.sqlite"), t.TempDir())
-	repos := storage.NewRepositories(coordinator.DB())
-	now := time.Date(2026, time.July, 30, 8, 0, 0, 0, time.UTC)
-	nowISO := formatJavaScriptISOString(now)
-	baseBranch := "main"
-	projectIDs := []string{"alpha", "beta", "gamma"}
-	for _, id := range projectIDs {
-		metadata := fmt.Sprintf(`{"repo":"nexu-io/%s"}`, id)
-		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
-			ID: id, Name: id, RepoPath: filepath.Join(workingDir, id), BaseBranch: &baseBranch,
-			MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
-		}); err != nil {
-			t.Fatalf("Projects.Upsert(%s) error = %v", id, err)
-		}
-	}
-
-	inside := make(chan string, len(projectIDs))
-	release := make(chan struct{})
-	plannerRunner := &stubPlannerScheduler{onDiscover: func(input planner.DiscoveryInput) {
-		inside <- input.ProjectID
-		<-release
-	}}
-
-	tickErr := make(chan error, 1)
-	go func() {
-		tickErr <- runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
-			Repos:             repos,
-			Now:               func() time.Time { return now },
-			MaxConcurrentRuns: 1,
-			Planner:           plannerRunner,
-		})
-	}()
-
-	deadline := time.After(10 * time.Second)
-	concurrent := make(map[string]struct{}, len(projectIDs))
-	for len(concurrent) < len(projectIDs) {
-		select {
-		case id := <-inside:
-			concurrent[id] = struct{}{}
-		case <-deadline:
-			close(release)
-			t.Fatalf("projects inside discovery concurrently = %d, want %d; project discovery is serialized", len(concurrent), len(projectIDs))
-		}
-	}
-	close(release)
-
-	select {
-	case err := <-tickErr:
-		if err != nil {
-			t.Fatalf("runDefaultSchedulerTick() error = %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("runDefaultSchedulerTick() did not return after discovery was released")
-	}
-	if len(plannerRunner.discoverCalls) != len(projectIDs) {
-		t.Fatalf("planner discover calls = %d, want one per project", len(plannerRunner.discoverCalls))
-	}
-}
-
 func TestRunDefaultSchedulerTickDefersStaleCatalogBeforeClaimAndDiscovery(t *testing.T) {
 	t.Parallel()
 
@@ -1416,9 +1348,6 @@ type stubPlannerScheduler struct {
 	processedItems []string
 	discoverErr    error
 	processErr     error
-	// onDiscover runs after the call is recorded and outside the stub's lock, so
-	// a test can block inside discovery to observe cross-project concurrency.
-	onDiscover func(planner.DiscoveryInput)
 }
 
 type stubCoordinatorScheduler struct {
@@ -1636,13 +1565,8 @@ func (s *queueStatusCheckingPlannerScheduler) ProcessClaimedQueueItem(context.Co
 func (s *stubPlannerScheduler) DiscoverIssues(_ context.Context, input planner.DiscoveryInput) (planner.DiscoveryResult, error) {
 	s.mu.Lock()
 	s.discoverCalls = append(s.discoverCalls, input)
-	hook := s.onDiscover
-	discoverErr := s.discoverErr
 	s.mu.Unlock()
-	if hook != nil {
-		hook(input)
-	}
-	return planner.DiscoveryResult{}, discoverErr
+	return planner.DiscoveryResult{}, s.discoverErr
 }
 
 func (s *stubPlannerScheduler) ProcessNext(_ context.Context, claimedBy string) (*planner.ProcessResult, error) {
