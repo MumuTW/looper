@@ -413,6 +413,7 @@ export type LoopLogsSnapshot = {
 };
 
 export type LoopLogsChunk = {
+  stream?: "stdout" | "stderr";
   runId?: string | null;
   currentStep?: string | null;
   executionId?: string | null;
@@ -649,7 +650,7 @@ export function handbackLoop(
   );
 }
 
-/** Build path for loop logs SSE follow stream (`follow=1`, optional `stderr=1`). */
+/** Build the combined follow path; stderr=true is legacy compatibility only. */
 export function loopLogsFollowPath(
   selector: string,
   opts?: { stderr?: boolean },
@@ -657,14 +658,16 @@ export function loopLogsFollowPath(
   const params = new URLSearchParams({ follow: "1" });
   if (opts?.stderr) {
     params.set("stderr", "1");
+  } else {
+    params.set("streams", "both");
   }
   return `/api/v1/loops/${encodeURIComponent(selector)}/logs?${params.toString()}`;
 }
 
 /**
- * Open loop logs SSE stream (follow=1).
- * Pass `{ stderr: true }` to follow agent stderr; default follows stdout
- * (server may fall back to stderr when stdout is empty).
+ * Open one loop logs SSE stream carrying typed stdout and stderr chunks.
+ * `{ stderr: true }` remains only for compatibility with the old dual-stream
+ * server contract; the dashboard never opens that second connection.
  * Caller must parse body with sse.ts.
  */
 export async function openLoopLogsStream(

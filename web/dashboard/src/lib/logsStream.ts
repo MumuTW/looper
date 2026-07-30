@@ -100,22 +100,6 @@ export function parseLogsStreamError(rawData: string): LogsStreamErrorEvent {
 }
 
 /**
- * Always open a dedicated `stderr=1` follow alongside the default stream.
- *
- * Default follow tracks stdout unless stdout is empty and stderr already has
- * content (then stderr). That choice is re-evaluated each poll, so an initially
- * stderr-only snapshot later switches to stdout and would drop subsequent
- * stderr appends without a secondary stream. Empty snapshots need the same
- * secondary follow so stderr that appears after stdout locks is not lost.
- */
-export function needsSeparateStderrFollow(_agent?: {
-  stdout?: string | null;
-  stderr?: string | null;
-} | null): boolean {
-  return true;
-}
-
-/**
  * Prefix the first live stderr chunk with the same section header used by the
  * snapshot seed when stderr was empty at connect time.
  */
@@ -126,28 +110,4 @@ export function formatLiveStderrChunk(
   if (!content) return "";
   if (sectionHeaderPresent) return content;
   return `\n--- stderr ---\n${content}`;
-}
-
-/**
- * Bytes present only in the secondary stderr=1 snapshot relative to the
- * primary (default-follow) snapshot already seeded into the logs pane.
- *
- * The server baselines follow chunks from its own snapshot, so any stderr
- * written between the two snapshots would never appear as a chunk unless the
- * client applies this gap from the secondary snapshot event.
- *
- * Mirrors server appendedLogChunk suffix logic when content is append-only.
- */
-export function stderrGapFromSecondarySnapshot(
-  primaryStderr: string,
-  secondaryStderr: string,
-): string {
-  if (!secondaryStderr) return "";
-  if (!primaryStderr) return secondaryStderr;
-  if (secondaryStderr === primaryStderr) return "";
-  if (secondaryStderr.startsWith(primaryStderr)) {
-    return secondaryStderr.slice(primaryStderr.length);
-  }
-  // Non-prefix rewrite (e.g. new execution): surface full secondary content.
-  return secondaryStderr;
 }

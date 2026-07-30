@@ -13,6 +13,8 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/nexu-io/looper/internal/reviewer/publish"
+	"github.com/nexu-io/looper/internal/reviewer/resolution"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -32,7 +34,7 @@ func TestThreadResolutionReplyPassesStampedGitHubPublicationBoundary(t *testing.
 	}})
 
 	policy := config.ReviewerThreadResolutionConfig{Mode: config.ReviewerThreadResolutionModeResolveObjective}
-	body := (&Runner{}).buildThreadResolutionReply(threadID, headSHA, threadResolutionAgentDecision{
+	body := resolution.Reply(threadID, headSHA, threadResolutionAgentDecision{
 		Decision: "objectively_fixed", Evidence: "the nil check is present", Confidence: "high",
 	}, policy)
 	stamper := disclosure.Stamper{Config: config.DisclosureConfig{
@@ -128,7 +130,7 @@ func TestReviewerAutoMergeHappyPathWithFakeGH(t *testing.T) {
 		`"argv":["api","repos/acme/looper/pulls/42/reviews","--method","POST","--input","-","--include"]`,
 		`"argv":["pr","merge","42","--repo","acme/looper","--auto","--squash","--match-head-commit","abc123"]`,
 	)
-	if !strings.Contains(string(logBytes), criteriaVerificationHeading) {
+	if !strings.Contains(string(logBytes), publish.CriteriaVerificationHeading) {
 		t.Fatalf("invocation log missing criteria verification heading:\n%s", string(logBytes))
 	}
 }
@@ -197,7 +199,7 @@ func TestReviewerAutoMergeCriteriaFailWithFakeGH(t *testing.T) {
 	if strings.Contains(string(logBytes), `"argv":["pr","merge","42"`) {
 		t.Fatalf("criteria-fail path unexpectedly enabled auto-merge:\n%s", string(logBytes))
 	}
-	if !strings.Contains(string(logBytes), criteriaFailCommentMarker) && !strings.Contains(string(logBytes), "criteria-fail") {
+	if !strings.Contains(string(logBytes), publish.CriteriaFailMarker) && !strings.Contains(string(logBytes), "criteria-fail") {
 		t.Fatalf("invocation log missing criteria-fail marker:\n%s", string(logBytes))
 	}
 }

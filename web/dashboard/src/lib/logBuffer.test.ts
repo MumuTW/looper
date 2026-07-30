@@ -13,6 +13,11 @@ import {
 } from "./logBuffer";
 
 describe("logBuffer", () => {
+  it("matches the incremental SSE byte budgets for ASCII payloads", () => {
+    expect(MAX_SNAPSHOT_SEED_CHARS).toBe(200 * 1024);
+    expect(MAX_CHUNK_CHARS).toBe(64 * 1024);
+  });
+
   it("capFromEnd keeps the tail", () => {
     expect(capFromEnd("abcdefghij", 5)).toBe("fghij");
     expect(capFromEnd("short", 100)).toBe("short");

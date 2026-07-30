@@ -31,12 +31,10 @@ import {
   type LogsStreamErrorEvent,
   type LogsStreamPhase,
   formatLiveStderrChunk,
-  needsSeparateStderrFollow,
   nextReconnectDelayAfterErrorMs,
   nextReconnectDelayMs,
   parseLogsStreamError,
   resolveLogsStreamStatus,
-  stderrGapFromSecondarySnapshot,
 } from "@/lib/logsStream";
 import { consumeSSE } from "@/lib/sse";
 import { usePolling } from "@/lib/usePolling";
@@ -151,32 +149,8 @@ export function LogsPane({ selector }: { selector: string }) {
       const controller = new AbortController();
       abortRef.current = controller;
       let reconnectSettled = false;
-      let requiresStderrFollow = false;
-      let stdoutSnapshotReady = false;
-      let stderrSnapshotReady = false;
-      let stdoutEnded = false;
-      let stderrEnded = false;
-
-      // A generation is live only when every follow it requires has delivered
-      // its baseline snapshot. Chunks can update retained text but cannot prove
-      // that a lagging stderr follow has caught up.
-      const markLiveWhenReady = () => {
-        if (
-          stdoutSnapshotReady &&
-          (!requiresStderrFollow || stderrSnapshotReady)
-        ) {
-          setPhase("live");
-        }
-      };
-
-      // stdout's end is only terminal when its paired stderr follow has also
-      // ended. A stderr failure after stdout's normal end is still retryable.
-      const markEndedWhenComplete = () => {
-        if (!stdoutEnded || (requiresStderrFollow && !stderrEnded)) return;
-        explicitEndRef.current = true;
-        setEnded(true);
-        setPhase("idle");
-      };
+      let streamEnded = false;
+      let stderrSectionHeaderPresent = false;
 
       const recordStreamError = (streamError: LogsStreamErrorEvent) => {
         streamErrorRef.current = streamError;
@@ -200,15 +174,12 @@ export function LogsPane({ selector }: { selector: string }) {
         }
       };
 
-      const disconnectedStreamError = (
-        err: unknown,
-        stream: "stdout" | "stderr",
-      ): LogsStreamErrorEvent => ({
+      const disconnectedStreamError = (err: unknown): LogsStreamErrorEvent => ({
         code: "STREAM_DISCONNECTED",
         message:
           err instanceof Error
             ? err.message
-            : `${stream} logs stream disconnected`,
+            : "logs stream disconnected",
         retryable: true,
         retryAfterMs: 0,
       });
@@ -246,123 +217,21 @@ export function LogsPane({ selector }: { selector: string }) {
         }, delay);
       };
 
-      const startStderrFollow = (snap: LoopLogsSnapshot) => {
-        // Always open stderr=1. Default follow may track stderr while stdout is
-        // blank then switch to stdout, dropping later stderr without this stream.
-        if (!requiresStderrFollow) return;
-
-        const primaryStderr = snap.agent?.stderr ?? "";
-        let sectionHeaderPresent = Boolean(primaryStderr.trim());
-
-        void (async () => {
-          let secondaryEnded = false;
-          try {
-            const response = await openLoopLogsStream(
-              selector,
-              controller.signal,
-              { stderr: true },
-            );
-            await consumeSSE(
-              response,
-              (event, rawData) => {
-                if (generation !== generationRef.current) return;
-                // Secondary snapshot is the server baseline for later chunks.
-                // Apply any stderr written after the primary seed and before
-                // this connection's snapshot; pure chunks alone miss that gap.
-                if (event === "snapshot") {
-                  try {
-                    const secondary = JSON.parse(rawData) as LoopLogsSnapshot;
-                    const gap = stderrGapFromSecondarySnapshot(
-                      primaryStderr,
-                      secondary.agent?.stderr ?? "",
-                    );
-                    if (gap) {
-                      appendText(
-                        formatLiveStderrChunk(gap, sectionHeaderPresent),
-                      );
-                      sectionHeaderPresent = true;
-                    } else if (secondary.agent?.stderr?.trim()) {
-                      sectionHeaderPresent = true;
-                    }
-                    stderrSnapshotReady = true;
-                    markLiveWhenReady();
-                  } catch {
-                    // Keep primary stream alive; soft-fail malformed stderr only.
-                  }
-                  return;
-                }
-                if (event === "end") {
-                  secondaryEnded = true;
-                  stderrEnded = true;
-                  markEndedWhenComplete();
-                  return;
-                }
-                if (event === "error") {
-                  recordStreamError(decodeStreamError(rawData));
-                  controller.abort();
-                  scheduleReconnect();
-                  return;
-                }
-                if (event !== "chunk") return;
-                try {
-                  const chunk = JSON.parse(rawData) as LoopLogsChunk;
-                  if (typeof chunk.content === "string" && chunk.content) {
-                    appendText(
-                      formatLiveStderrChunk(
-                        chunk.content,
-                        sectionHeaderPresent,
-                      ),
-                    );
-                    sectionHeaderPresent = true;
-                  }
-                } catch {
-                  // Keep primary stream alive; soft-fail malformed stderr only.
-                }
-              },
-              controller.signal,
-            );
-            if (
-              controller.signal.aborted ||
-              generation !== generationRef.current ||
-              secondaryEnded
-            ) {
-              return;
-            }
-            recordStreamError(
-              disconnectedStreamError(undefined, "stderr"),
-            );
-            controller.abort();
-            scheduleReconnect();
-          } catch (err) {
-            if (
-              controller.signal.aborted ||
-              generation !== generationRef.current
-            ) {
-              return;
-            }
-            if (err instanceof Error && err.name === "AbortError") return;
-            if (err instanceof DOMException && err.name === "AbortError") return;
-            recordStreamError(disconnectedStreamError(err, "stderr"));
-            controller.abort();
-            scheduleReconnect();
-          }
-        })();
-      };
-
       void (async () => {
         try {
           const response = await openLoopLogsStream(selector, controller.signal);
           await consumeSSE(
             response,
             (event, rawData) => {
+              if (generation !== generationRef.current) return;
               if (event === "snapshot") {
                 try {
                   const snap = JSON.parse(rawData) as LoopLogsSnapshot;
                   replaceText(seedFromSnapshot(snap));
-                  requiresStderrFollow = needsSeparateStderrFollow(snap.agent);
-                  stdoutSnapshotReady = true;
-                  startStderrFollow(snap);
-                  markLiveWhenReady();
+                  stderrSectionHeaderPresent = Boolean(
+                    snap.agent?.stderr?.trim(),
+                  );
+                  setPhase("live");
                 } catch {
                   setError("Malformed snapshot event (invalid JSON)");
                   setPhase("idle");
@@ -373,9 +242,19 @@ export function LogsPane({ selector }: { selector: string }) {
                 try {
                   const chunk = JSON.parse(rawData) as LoopLogsChunk;
                   if (typeof chunk.content === "string" && chunk.content) {
-                    appendText(chunk.content);
+                    if (chunk.stream === "stderr") {
+                      appendText(
+                        formatLiveStderrChunk(
+                          chunk.content,
+                          stderrSectionHeaderPresent,
+                        ),
+                      );
+                      stderrSectionHeaderPresent = true;
+                    } else {
+                      appendText(chunk.content);
+                    }
                   }
-                  markLiveWhenReady();
+                  setPhase("live");
                 } catch {
                   setError("Malformed chunk event (invalid JSON)");
                   setPhase("idle");
@@ -383,8 +262,10 @@ export function LogsPane({ selector }: { selector: string }) {
                 return;
               }
               if (event === "end") {
-                stdoutEnded = true;
-                markEndedWhenComplete();
+                streamEnded = true;
+                explicitEndRef.current = true;
+                setEnded(true);
+                setPhase("idle");
                 return;
               }
               if (event === "error") {
@@ -399,7 +280,7 @@ export function LogsPane({ selector }: { selector: string }) {
           ) {
             return;
           }
-          if (stdoutEnded) return;
+          if (streamEnded) return;
           setPhase("idle");
           // Unexpected stream end (no explicit end event) → reconnect while visible.
           if (!explicitEndRef.current) {
@@ -414,7 +295,7 @@ export function LogsPane({ selector }: { selector: string }) {
           }
           if (err instanceof Error && err.name === "AbortError") return;
           if (err instanceof DOMException && err.name === "AbortError") return;
-          recordStreamError(disconnectedStreamError(err, "stdout"));
+          recordStreamError(disconnectedStreamError(err));
           if (!explicitEndRef.current) {
             scheduleReconnect();
           }

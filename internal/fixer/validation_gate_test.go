@@ -3,12 +3,14 @@ package fixer
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
+	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/storage"
@@ -229,6 +231,7 @@ func TestRunValidateStepRefreshesReconcileMetadataWhenValidationCommitsCleanly(t
 		Checkpoint: fixerCheckpoint{
 			Detail:           &checkpointDetail{BaseRefName: "main"},
 			Worktree:         &checkpointWorktree{Path: worktree, Branch: "feature/fix", BaseHeadSHA: "base-head"},
+			Lifecycle:        &lifecycle.State{Actions: lifecycle.Actions{Commit: lifecycle.ActionSourceNone}},
 			ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "repair-head", NewCommitSHAs: []string{"repair-head"}, WorkingTreeClean: true, CompletedAt: "2026-07-29T00:00:00Z"},
 		},
 	})
@@ -240,6 +243,9 @@ func TestRunValidateStepRefreshesReconcileMetadataWhenValidationCommitsCleanly(t
 	}
 	if checkpoint.ReconcileCommits == nil || checkpoint.ReconcileCommits.FinalHeadSHA != "validation-head" || !checkpoint.ReconcileCommits.WorkingTreeClean {
 		t.Fatalf("ReconcileCommits = %#v, want refreshed clean validation head", checkpoint.ReconcileCommits)
+	}
+	if checkpoint.Lifecycle == nil || checkpoint.Lifecycle.Actions.Commit != lifecycle.ActionSourceAgent || !slices.Equal(checkpoint.Lifecycle.CommitSHAs, []string{"repair-head", "validation-head"}) {
+		t.Fatalf("Lifecycle = %#v, want validation-created commits attributed to the agent", checkpoint.Lifecycle)
 	}
 }
 

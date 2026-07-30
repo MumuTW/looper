@@ -3933,6 +3933,7 @@ func TestRecoveryInterruptsStaleLatestRunningRunWithoutActivity(t *testing.T) {
 				}
 			}
 			rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+			rt.services.Coordinator = coordinator
 			summary, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now)
 			if err != nil {
 				t.Fatalf("runRecoveryPipeline() error = %v", err)
@@ -5026,6 +5027,7 @@ func TestRecoveryPipelinePartitionsStrandedQueuedLoopsByRunStatus(t *testing.T) 
 	}
 
 	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt.services.Coordinator = coordinator
 	if _, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now); err != nil {
 		t.Fatalf("runRecoveryPipeline() error = %v", err)
 	}

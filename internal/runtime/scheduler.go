@@ -93,6 +93,7 @@ type schedulerAsyncRunner interface {
 type defaultSchedulerTickInput struct {
 	Repos             *storage.Repositories
 	GitHubGateway     *githubinfra.Gateway
+	GitGateway        *gitinfra.Gateway
 	Logger            bootstrap.Logger
 	Now               func() time.Time
 	MaxConcurrentRuns int
@@ -132,6 +133,9 @@ type defaultSchedulerTickInput struct {
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
+	// OnDeployFinished, when set, reports a completed deploy so the person who
+	// asked for the change learns it shipped.
+	OnDeployFinished func(context.Context, DeployNotification)
 }
 
 type defaultSchedulerHandlers struct {
@@ -1690,6 +1694,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Repos:  repos,
 			GitHub: githubGateway,
 			Now:    now,
+			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
+				return gatekeeperTrustForProject(cfg, projectID)
+			},
+			LogWarn: func(msg string, fields map[string]any) {
+				if logger != nil {
+					logger.Warn(msg, fields)
+				}
+			},
 			PolicyPermitsTarget: func(projectID, repo, baseRefName string) bool {
 				project, ok := runtimeProjectBinding(cfg, projectID)
 				if !ok {
@@ -2183,6 +2195,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		return defaultSchedulerTickInput{
 			Repos:                services.Repositories,
 			GitHubGateway:        githubGateway,
+			GitGateway:           gitGateway,
 			Logger:               logger,
 			Now:                  now,
 			MaxConcurrentRuns:    cfg.Scheduler.MaxConcurrentRuns,
@@ -2213,6 +2226,25 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			WorkerDiscoveryEnabled:   boolPtr(workerConfigured && view.AnyProjectRoleAutoDiscovery("worker")),
 			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
+			OnDeployFinished: func(ctx context.Context, notification DeployNotification) {
+				level := "info"
+				if !notification.Outcome.Succeeded {
+					level = "action_required"
+				}
+				notificationGateway.Notify(ctx, notify.SystemNotificationPayload{
+					ID:         fmt.Sprintf("deploy-%d", notification.Outcome.DeploymentID),
+					ProjectID:  notification.ProjectID,
+					Level:      level,
+					Title:      notification.Title(),
+					Subtitle:   notification.Subtitle(),
+					Body:       notification.Body(),
+					EntityType: "deployment",
+					EntityID:   notification.Outcome.SHA,
+					// One notification per deployment: a retried status write must not
+					// produce a second ping for the same deploy.
+					DedupeKey: fmt.Sprintf("deploy:%s:%s", notification.Repo, notification.Outcome.SHA),
+				})
+			},
 		}
 	}
 
@@ -2369,8 +2401,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		return nil
 	}
 
-	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
-	recordClaim(claimedCount, availableSlots, err)
 	tickDiscoveryState := githubinfra.NewDiscoveryTickState()
 	projectSnapshots := map[string]*githubinfra.DiscoverySnapshot{}
 	projectSnapshot := func(projectID string) *githubinfra.DiscoverySnapshot {
@@ -2384,6 +2414,31 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		projectSnapshots[projectID] = snapshot
 		return snapshot
 	}
+	// A queued worker can otherwise be claimed by the independent claim pump
+	// before discovery observes that its issue closed. Settle against a fresh
+	// issue page first; the helper holds the claim boundary through its authority
+	// read and atomic retirement.
+	for _, project := range projectsList {
+		if project.Archived {
+			continue
+		}
+		repo, inCatalog := schedulerProjectRepo(input, project)
+		if !inCatalog || repo == "" {
+			continue
+		}
+		if err := admissionRefuseWork(input); err != nil {
+			return nil
+		}
+		settleErr := settleQueuedWorkerIssueTargets(ctx, input.Repos, projectSnapshot(project.ID), input.ClaimBoundary, project.ID, repo, formatJavaScriptISOString(now()), func(msg string, fields map[string]any) {
+			if input.Logger != nil {
+				input.Logger.Debug(msg, fields)
+			}
+		})
+		appendErr(settleErr)
+	}
+
+	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
+	recordClaim(claimedCount, availableSlots, err)
 	lanes := discoveryLanes(input)
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
@@ -2450,6 +2505,13 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			break
 		}
 		runGitHubHITLPoll(ctx, input, project)
+
+		// Deploy last for this project: a commit that just landed should be picked
+		// up by the tick that observed it, but never ahead of discovery.
+		if err := admissionRefuseWork(input); err != nil {
+			break
+		}
+		runDeployLane(ctx, input, project, repo)
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and

@@ -15,6 +15,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer/publish"
 	"github.com/nexu-io/looper/internal/fixer/workflow"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
@@ -6783,6 +6784,31 @@ func TestBuildFixerReplyBodyHandlesMissingAuthorAndCommit(t *testing.T) {
 	}
 }
 
+func TestShouldBlockResolveWithoutFixUsesReconcileProgress(t *testing.T) {
+	t.Parallel()
+
+	comment := []FixItem{{Type: "comment"}}
+	cases := []struct {
+		name      string
+		reconcile *checkpointReconcileCommits
+		want      bool
+	}{
+		{name: "unknown base cannot prove progress", reconcile: &checkpointReconcileCommits{FinalHeadSHA: "head"}, want: true},
+		{name: "equal heads are a no-op", reconcile: &checkpointReconcileCommits{BaseHeadSHA: "head", FinalHeadSHA: "head"}, want: true},
+		{name: "moved head is progress", reconcile: &checkpointReconcileCommits{BaseHeadSHA: "base", FinalHeadSHA: "head"}, want: false},
+		{name: "explicit commit evidence is progress", reconcile: &checkpointReconcileCommits{NewCommitSHAs: []string{"head"}}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			checkpoint := fixerCheckpoint{Push: &checkpointPush{}, ReconcileCommits: tc.reconcile}
+			if got := shouldBlockResolveWithoutFix(checkpoint, comment, false); got != tc.want {
+				t.Fatalf("shouldBlockResolveWithoutFix(%#v) = %t, want %t", tc.reconcile, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBuildFixerReplyBodyPrefersAgentExplanationOverGenericQuote(t *testing.T) {
 	t.Parallel()
 	got := buildFixerReplyBody(FixItem{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Summary: "Original review comment that should be hidden"}, "abcdef1", "Replaced strings.Title with cases.Title and added empty-string coverage in foo_test.go.")
@@ -7591,13 +7617,13 @@ func TestProcessClaimedItemUsesAgentExplanationInReplyBody(t *testing.T) {
 
 func TestBuildFixerSummaryCommentBodyIncludesMarkerAndItems(t *testing.T) {
 	t.Parallel()
-	items := []fixerSummaryItem{
-		{FixItem: FixItem{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Path: "internal/foo.go", Line: 12, URL: "https://example/threads/t1"}, Status: "resolved", Explanation: "Replaced strings.Title with cases.Title.", ReplyState: "sent"},
-		{FixItem: FixItem{Type: "comment", ID: "c2", ThreadID: "t2", Author: "bob", Path: "internal/bar.go", URL: "https://example/threads/t2"}, Status: "failed", ReplyState: "failed"},
-		{FixItem: FixItem{Type: "check", Name: "ci"}, Status: "check"},
+	items := []publish.Item{
+		{Kind: "comment", Author: "alice", Path: "internal/foo.go", Line: 12, ThreadURL: "https://example/threads/t1", Status: "resolved", Explanation: "Replaced strings.Title with cases.Title.", ReplyState: "sent"},
+		{Kind: "comment", Author: "bob", Path: "internal/bar.go", ThreadURL: "https://example/threads/t2", Status: "failed", ReplyState: "failed"},
+		{Kind: "check", Name: "ci", Status: "check"},
 	}
-	got := buildFixerSummaryCommentBody("acme/looper", 42, "abcdef1234567", "abcdef1234567", items)
-	if !strings.Contains(got, fixerRoundSummaryMarker("abcdef1234567")) {
+	got := publish.Body("abcdef1234567", "abcdef1234567", items)
+	if !strings.Contains(got, publish.Marker("abcdef1234567")) {
 		t.Fatalf("body missing round marker:\n%s", got)
 	}
 	if !strings.Contains(got, "abcdef1") {
@@ -7624,7 +7650,7 @@ func TestFindExistingFixerSummaryCommentIDMatchesTrustedComment(t *testing.T) {
 	t.Parallel()
 	detail := &checkpointDetail{IssueComments: []map[string]any{
 		{"id": float64(101), "body": "unrelated comment"},
-		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nLooper fixer round complete\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
+		{"id": float64(202), "body": publish.Marker("abcdef1234567") + "\nLooper fixer round complete\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
 	}}
 	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
@@ -7638,8 +7664,8 @@ func TestFindExistingFixerSummaryCommentIDMatchesTrustedComment(t *testing.T) {
 func TestFindExistingFixerSummaryCommentIDSkipsUntrustedMarker(t *testing.T) {
 	t.Parallel()
 	detail := &checkpointDetail{IssueComments: []map[string]any{
-		{"id": float64(101), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nspoofed marker", "author": map[string]any{"login": "someone-else"}},
-		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary", "author": map[string]any{"login": "looper"}},
+		{"id": float64(101), "body": publish.Marker("abcdef1234567") + "\nspoofed marker", "author": map[string]any{"login": "someone-else"}},
+		{"id": float64(202), "body": publish.Marker("abcdef1234567") + "\nreal summary", "author": map[string]any{"login": "looper"}},
 	}}
 	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
@@ -7650,8 +7676,8 @@ func TestFindExistingFixerSummaryCommentIDSkipsUntrustedMarker(t *testing.T) {
 func TestFindExistingFixerSummaryCommentIDSkipsStampedCommentFromOtherAuthor(t *testing.T) {
 	t.Parallel()
 	detail := &checkpointDetail{IssueComments: []map[string]any{
-		{"id": float64(101), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nspoofed marker\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "someone-else"}},
-		{"id": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
+		{"id": float64(101), "body": publish.Marker("abcdef1234567") + "\nspoofed marker\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "someone-else"}},
+		{"id": float64(202), "body": publish.Marker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
 	}}
 	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
@@ -7662,7 +7688,7 @@ func TestFindExistingFixerSummaryCommentIDSkipsStampedCommentFromOtherAuthor(t *
 func TestFindExistingFixerSummaryCommentIDParsesStringID(t *testing.T) {
 	t.Parallel()
 	detail := &checkpointDetail{IssueComments: []map[string]any{
-		{"id": "202", "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
+		{"id": "202", "body": publish.Marker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
 	}}
 	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
@@ -7673,7 +7699,7 @@ func TestFindExistingFixerSummaryCommentIDParsesStringID(t *testing.T) {
 func TestFindExistingFixerSummaryCommentIDParsesGraphQLIDFromURL(t *testing.T) {
 	t.Parallel()
 	detail := &checkpointDetail{IssueComments: []map[string]any{
-		{"id": "IC_kwDOExample", "url": "https://github.com/acme/looper/pull/42#issuecomment-202", "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
+		{"id": "IC_kwDOExample", "url": "https://github.com/acme/looper/pull/42#issuecomment-202", "body": publish.Marker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
 	}}
 	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
@@ -7684,7 +7710,7 @@ func TestFindExistingFixerSummaryCommentIDParsesGraphQLIDFromURL(t *testing.T) {
 func TestFindExistingFixerSummaryCommentIDUsesDatabaseID(t *testing.T) {
 	t.Parallel()
 	detail := &checkpointDetail{IssueComments: []map[string]any{
-		{"id": "IC_kwDOExample", "databaseId": float64(202), "body": fixerRoundSummaryMarker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
+		{"id": "IC_kwDOExample", "databaseId": float64(202), "body": publish.Marker("abcdef1234567") + "\nreal summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}},
 	}}
 	id, _ := findExistingFixerSummaryCommentID(detail, "abcdef1234567", "looper")
 	if id != 202 {
@@ -7750,7 +7776,7 @@ func TestProcessClaimedItemPostsRoundSummaryComment(t *testing.T) {
 	if !strings.Contains(body, "Capped loop bound") {
 		t.Fatalf("summary body missing agent explanation:\n%s", body)
 	}
-	if !strings.Contains(body, fixerRoundSummaryMarker("new-head")) {
+	if !strings.Contains(body, publish.Marker("new-head")) {
 		t.Fatalf("summary body missing round marker:\n%s", body)
 	}
 	if !strings.Contains(body, "@alice") {
@@ -7767,7 +7793,7 @@ func TestPublishRoundSummaryCommentUpdatesExistingSummaryFromGraphQLID(t *testin
 	github := &fakeGitHubGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 	checkpoint := fixerCheckpoint{
-		Detail:           &checkpointDetail{IssueComments: []map[string]any{{"id": "IC_kwDOExample", "url": "https://github.com/acme/looper/pull/42#issuecomment-202", "body": fixerRoundSummaryMarker("new-head") + "\nold summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}}}},
+		Detail:           &checkpointDetail{IssueComments: []map[string]any{{"id": "IC_kwDOExample", "url": "https://github.com/acme/looper/pull/42#issuecomment-202", "body": publish.Marker("new-head") + "\nold summary\n\n<!-- looper:stamp v=1 -->", "author": map[string]any{"login": "looper"}}}},
 		Push:             &checkpointPush{Pushed: true, HeadSHA: "new-head", Evidence: &fixEvidence{Valid: true, HeadSHA: "new-head", FixItemsHash: "fix-items-hash", Source: "fallback_push", ProducedNewCommits: true}},
 		ReconcileCommits: &checkpointReconcileCommits{FinalHeadSHA: "new-head", NewCommitSHAs: []string{"new-head"}},
 		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{FixItemID: "c1", ThreadID: "t1", Status: "resolved", ReplyState: "sent"}}},
@@ -8072,7 +8098,7 @@ func TestPublishRoundSummaryCommentPostsForAgentEvidenceWithoutLocalNewCommits(t
 	if len(github.createIssueComments) != 1 {
 		t.Fatalf("createIssueComments calls = %d, want 1", len(github.createIssueComments))
 	}
-	if !strings.Contains(github.createIssueComments[0].Body, fixerRoundSummaryMarker("agent-head")) {
+	if !strings.Contains(github.createIssueComments[0].Body, publish.Marker("agent-head")) {
 		t.Fatalf("summary body = %q, want adopted evidence head marker", github.createIssueComments[0].Body)
 	}
 }

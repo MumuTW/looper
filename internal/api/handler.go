@@ -42,14 +42,17 @@ import (
 )
 
 const (
-	requestIDHeaderName        = "x-request-id"
-	apiBasePath                = "/api/v1"
-	webhookForwardPath         = "/webhook/forward"
-	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
-	loopLogsFollowPollInterval = 200 * time.Millisecond
-	loopLogsFollowRetryAfter   = time.Second
-	activeRunHeartbeatTTL      = 30 * time.Minute
-	webhookListenerPath        = "/webhook/forward"
+	requestIDHeaderName             = "x-request-id"
+	apiBasePath                     = "/api/v1"
+	webhookForwardPath              = "/webhook/forward"
+	javaScriptISOString             = "2006-01-02T15:04:05.000Z"
+	loopLogsFollowPollInterval      = 200 * time.Millisecond
+	loopLogsFollowStatePollInterval = time.Second
+	loopLogsFollowRetryAfter        = time.Second
+	loopLogsFollowMaxChunkBytes     = 64 * 1024
+	loopLogsFollowSnapshotBytes     = 200 * 1024
+	activeRunHeartbeatTTL           = 30 * time.Minute
+	webhookListenerPath             = "/webhook/forward"
 )
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
@@ -112,6 +115,12 @@ type Context struct {
 	// paths that must accept a pull request Looper has never snapshotted. Optional:
 	// when nil, an unsnapshotted pull request stays unresolvable.
 	LookupPullRequest func(ctx context.Context, repo string, prNumber int64, cwd string) (PullRequestTarget, error)
+	// LookupIssueOccupancy reads an issue's forge-side occupancy (open/closed
+	// state plus open pull requests that reference it) for the dispatch-time
+	// check that refuses to hand out work someone else is already doing.
+	// Optional: when nil, dispatch keeps the local-only occupancy check from
+	// #319 and does not call the forge.
+	LookupIssueOccupancy func(ctx context.Context, repo string, issueNumber int64, cwd string) (IssueOccupancy, error)
 }
 
 // PullRequestTarget is the minimum a caller needs to decide whether a pull
@@ -146,6 +155,9 @@ type Handler struct {
 	// before the requeue transaction so tests can inject a TX-time conflict
 	// after the sticky stop gate was already cleared.
 	retryAfterClearStopGateHook func(loopID string)
+	// loopLogsFollowObserve is test-only instrumentation for enforcing the
+	// stream's query/read budgets without coupling tests to SQLite internals.
+	loopLogsFollowObserve func(loopLogsFollowObservation)
 }
 
 // effectiveConfig returns the live config when ConfigSnapshot is wired, else
@@ -656,6 +668,7 @@ type apiError struct {
 }
 
 type loopLogsFollowChunkEvent struct {
+	Stream      string  `json:"stream,omitempty"`
 	RunID       *string `json:"runId,omitempty"`
 	CurrentStep *string `json:"currentStep,omitempty"`
 	ExecutionID *string `json:"executionId,omitempty"`
@@ -3869,6 +3882,9 @@ func (h *Handler) streamLoopLogsRoute(w http.ResponseWriter, r *http.Request, pa
 		return err
 	}
 
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("streams")), "both") {
+		return h.streamLoopLogsCombined(w, r, requestID, loop)
+	}
 	return h.streamLoopLogs(w, r, requestID, loop, queryBool(r.URL.Query(), "stderr"))
 }
 
@@ -4411,6 +4427,17 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		}
 	}
 
+	// Forge-side occupancy for an issue target: refuse when the issue is closed
+	// or an open pull request already references it, so Looper does not duplicate
+	// work someone else is already doing. force overrides, matching the local
+	// occupancy check from #319. When the forge lookup is not configured (tests,
+	// embeddings without forge access) the local check keeps working unchanged.
+	if issueNumber != nil && !derefBool(body.Force) && h.context.LookupIssueOccupancy != nil {
+		if err := h.refuseOccupiedIssueTarget(r.Context(), project, *repo, *issueNumber); err != nil {
+			return workerCreateResponse{}, err
+		}
+	}
+
 	workerPayload := struct {
 		Title       string  `json:"title"`
 		Prompt      *string `json:"prompt"`
@@ -4682,6 +4709,45 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 		return nil
 	}
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+}
+
+// refuseOccupiedIssueTarget asks the forge whether the issue is still open and
+// whether any open pull request already references it, and refuses dispatch
+// when either is true. The caller gates this on force=false and a configured
+// LookupIssueOccupancy, so a force override or a forge-unreachable process
+// keeps the local-only occupancy check from #319 working unchanged.
+func (h *Handler) refuseOccupiedIssueTarget(ctx context.Context, project storage.ProjectRecord, repo string, issueNumber int64) error {
+	occupancy, err := h.context.LookupIssueOccupancy(ctx, repo, issueNumber, project.RepoPath)
+	if err != nil {
+		if IsIssueLookupNotFound(err) {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Issue %s#%d not found; refresh target before manual loop create", repo, issueNumber)}
+		}
+		// A transient forge outage must not hard-fail dispatch: the local check
+		// still prevents self-collision, and prepare-work re-validates on claim.
+		return nil
+	}
+	if !occupancy.Occupied() {
+		return nil
+	}
+	reference := fmt.Sprintf("%s#%d", repo, issueNumber)
+	if occupancy.IsPullRequest {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s is a pull request, not an issue; rerun with --force to bypass", reference)}
+	}
+	if strings.TrimSpace(occupancy.State) != "" && !strings.EqualFold(strings.TrimSpace(occupancy.State), "open") {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s is %s; rerun with --force to bypass", reference, strings.ToLower(occupancy.State))}
+	}
+	if len(occupancy.OpenPullRequests) > 0 {
+		pr := occupancy.OpenPullRequests[0]
+		prReference := fmt.Sprintf("#%d", pr.Number)
+		if strings.TrimSpace(pr.Repo) != "" {
+			prReference = fmt.Sprintf("%s#%d", pr.Repo, pr.Number)
+		}
+		if strings.TrimSpace(pr.URL) != "" {
+			prReference += " (" + pr.URL + ")"
+		}
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s already has an open pull request %s; rerun with --force to bypass", reference, prReference)}
+	}
+	return nil
 }
 
 func derefBool(value *bool) bool {
@@ -6319,9 +6385,19 @@ func (h *Handler) buildRunLogsResponse(ctx context.Context, runID string) (loopL
 }
 
 func (h *Handler) buildLogsResponseForRun(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord) (loopLogsResponse, error) {
+	response, _, err := h.buildLogsStateForRun(ctx, loop, run, true)
+	return response, err
+}
+
+// buildLogsStateForRun is the single query/projection path for log snapshots
+// and incremental follow metadata. Followers pass readPersisted=false so a
+// state refresh never rereads the bounded log history; their file cursors own
+// incremental bytes instead.
+func (h *Handler) buildLogsStateForRun(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, readPersisted bool) (loopLogsResponse, agentOutputPayload, error) {
 	services := h.context.Runtime.Services()
 	var runPayload *loopLogsRunResponse
 	var agentPayload *loopLogsAgentPayload
+	var output agentOutputPayload
 	if run != nil {
 		runPayload = &loopLogsRunResponse{
 			RunID:        run.ID,
@@ -6335,10 +6411,14 @@ func (h *Handler) buildLogsResponseForRun(ctx context.Context, loop storage.Loop
 
 		latestAgent, agentErr := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, run.ID)
 		if agentErr != nil {
-			return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: agentErr.Error()}
+			return loopLogsResponse{}, agentOutputPayload{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: agentErr.Error()}
 		}
 		if latestAgent != nil {
-			stdout, stderr := parseAgentOutput(h.context.Config.Daemon.LogDir, latestAgent.OutputJSON)
+			output = decodeAgentOutput(latestAgent.OutputJSON)
+			stdout, stderr := output.Stdout, output.Stderr
+			if readPersisted {
+				stdout, stderr = materializeAgentOutput(h.context.Config.Daemon.LogDir, output)
+			}
 			agentPayload = &loopLogsAgentPayload{
 				ExecutionID:     latestAgent.ID,
 				Vendor:          latestAgent.Vendor,
@@ -6357,7 +6437,7 @@ func (h *Handler) buildLogsResponseForRun(ctx context.Context, loop storage.Loop
 		}
 	}
 
-	return loopLogsResponse{Seq: loop.Seq, LoopID: loop.ID, LoopType: loop.Type, LoopStatus: loop.Status, Run: runPayload, Agent: agentPayload}, nil
+	return loopLogsResponse{Seq: loop.Seq, LoopID: loop.ID, LoopType: loop.Type, LoopStatus: loop.Status, Run: runPayload, Agent: agentPayload}, output, nil
 }
 
 func serializeLoop(loop storage.LoopRecord) loopResponse {
@@ -7170,19 +7250,25 @@ func mapLoopCreateError(err error) error {
 
 const maxPersistedAgentLogReadBytes = 16 * 1024 * 1024
 
-func parseAgentOutput(logDir string, outputJSON *string) (string, string) {
+type agentOutputPayload struct {
+	Stdout        string `json:"stdout"`
+	Stderr        string `json:"stderr"`
+	StdoutLogPath string `json:"stdoutLogPath"`
+	StderrLogPath string `json:"stderrLogPath"`
+}
+
+func decodeAgentOutput(outputJSON *string) agentOutputPayload {
 	if outputJSON == nil || strings.TrimSpace(*outputJSON) == "" {
-		return "", ""
+		return agentOutputPayload{}
 	}
-	var payload struct {
-		Stdout        string `json:"stdout"`
-		Stderr        string `json:"stderr"`
-		StdoutLogPath string `json:"stdoutLogPath"`
-		StderrLogPath string `json:"stderrLogPath"`
-	}
+	var payload agentOutputPayload
 	if err := json.Unmarshal([]byte(*outputJSON), &payload); err != nil {
-		return "", ""
+		return agentOutputPayload{}
 	}
+	return payload
+}
+
+func materializeAgentOutput(logDir string, payload agentOutputPayload) (string, string) {
 	if content, ok := readAgentOutputLog(logDir, payload.StdoutLogPath); ok {
 		payload.Stdout = content
 	}

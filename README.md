@@ -82,7 +82,7 @@ looper project add /absolute/path/to/your/local/repo
 looper status                                          # config, daemon, projects
 ```
 
-`looper project add` posts to the running daemon, so the project is live immediately. The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` do the same thing, and are where the options the CLI does not expose (explicit id, base branch) live. An explicit `provider` binding is not one of them: it is file-managed, so declare it in `[[projects]]` and restart the daemon.
+`looper project add` posts to the running daemon, so the project is live immediately. `POST /api/v1/projects` is the supported alternative when you need options the CLI does not expose (such as an explicit id or base branch). The dashboard at `http://127.0.0.1:17310/dashboard/` lists registered projects and opens their filtered loops; it does not register projects. An explicit `provider` binding is file-managed, so declare it in `[[projects]]` and restart the daemon.
 
 Once the daemon is healthy and GitHub credentials are configured (`gh auth status`), loops start from the forge itself: label an issue and assign it, and `looperd`'s discovery picks it up. The CLI controls loops the daemon already owns:
 

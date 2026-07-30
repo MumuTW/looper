@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/labels"
@@ -16,6 +17,12 @@ import (
 )
 
 const (
+	// reportVersion is 2 because Report.Mode changed meaning: it now carries the
+	// project's configured trust level, spelled as in configuration, where version 1
+	// always wrote the literal "observe_only". Readers must branch on Version rather
+	// than assume a spelling — that no consumer reads Mode today does not make the
+	// persisted format free to redefine in place.
+	//
 	// GateReportEventType is the Gate report: the durable event written by
 	// Merge Gatekeeper recording eligible or blocked, stable reasons and
 	// evidence, and the observed head SHA. It is audit evidence, not merge
@@ -23,10 +30,9 @@ const (
 	// before merging, because holds, reviews, threads, and Project policy can
 	// change without moving the head.
 	GateReportEventType = "pull_request.merge_gate.evaluated"
-	ModeObserveOnly     = "observe_only"
 	StatusEligible      = "eligible"
 	StatusBlocked       = "blocked"
-	reportVersion       = 1
+	reportVersion       = 2
 
 	// DefaultDiscoveryPullRequestLimit is how many open pull requests this lane
 	// lists when the caller sets no limit. Exported because the scheduler sizes its
@@ -144,6 +150,11 @@ type GitHubGateway interface {
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error)
 	GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error)
+	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
+	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
+	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
+	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
+	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
 }
 
 type Options struct {
@@ -151,6 +162,10 @@ type Options struct {
 	GitHub              GitHubGateway
 	Now                 func() time.Time
 	PolicyPermitsTarget func(projectID, repo, baseRefName string) bool
+	// TrustForProject reports a project's merge-authority level. Nil means every
+	// project stays at observe, which is also the configured default.
+	TrustForProject func(projectID string) config.GatekeeperTrustLevel
+	LogWarn         func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -164,6 +179,8 @@ type Runner struct {
 	github              GitHubGateway
 	now                 func() time.Time
 	policyPermitsTarget func(projectID, repo, baseRefName string) bool
+	trustForProject     func(projectID string) config.GatekeeperTrustLevel
+	logWarn             func(msg string, fields map[string]any)
 }
 
 func New(options Options) *Runner {
@@ -175,7 +192,10 @@ func New(options Options) *Runner {
 	if policy == nil {
 		policy = func(string, string, string) bool { return true }
 	}
-	return &Runner{repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy}
+	return &Runner{
+		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
+		trustForProject: options.TrustForProject, logWarn: options.LogWarn,
+	}
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -248,7 +268,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 
 	report := Report{
-		Version: reportVersion, Mode: ModeObserveOnly, Status: StatusBlocked,
+		Version: reportVersion, Status: StatusBlocked,
 		ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber,
 		ExpectedHeadSHA: input.ExpectedHeadSHA, RequiresFreshRevalidation: true,
 		Reasons: []Reason{}, Evidence: Evidence{RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{}},
@@ -394,6 +414,21 @@ func (r *Runner) persistProviderBlock(ctx context.Context, report Report, code R
 	return r.persist(ctx, report)
 }
 
+// trustFor reports a project's configured merge-authority level, defaulting to
+// observe when nothing is configured.
+func (r *Runner) trustFor(projectID string) config.GatekeeperTrustLevel {
+	if r == nil || r.trustForProject == nil {
+		return config.GatekeeperTrustObserve
+	}
+	level := config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(r.trustForProject(projectID)))))
+	switch level {
+	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
+		return level
+	default:
+		return config.GatekeeperTrustObserve
+	}
+}
+
 func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	sortReasons(report.Reasons)
 	report.Eligible = len(report.Reasons) == 0
@@ -402,6 +437,22 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	} else {
 		report.Status = StatusBlocked
 	}
+	// Mode is stamped here rather than by the caller: it is the input to the
+	// comment lifecycle below, so a path that built a report without it would
+	// silently strand an owned comment.
+	report.Mode = string(r.trustFor(report.ProjectID))
+
+	// Decide what the owned comment needs before this report replaces the previous
+	// one in the log, and while no forge call has been made.
+	action := verdictActionNone
+	previous, err := r.latestReport(ctx, report.Repo, report.PRNumber)
+	if err != nil {
+		// Not knowing the previous state means not knowing whether an owned comment
+		// is stranded, so fail rather than guess.
+		return Report{}, err
+	}
+	action = decideVerdictAction(r.trustFor(report.ProjectID), previous, report)
+
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
 	projectID := report.ProjectID
@@ -410,6 +461,14 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		Payload: report, CreatedAt: r.now(),
 	}); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	}
+	// The owned comment is reconciled after the durable report: the report is the
+	// record, the comment is a convenience for whoever is deciding. A forge that
+	// refuses the write must not discard an evaluation already stored.
+	if err := r.applyVerdict(ctx, action, report); err != nil && r.logWarn != nil {
+		r.logWarn("gatekeeper: could not reconcile the verdict comment", map[string]any{
+			"repo": report.Repo, "pr": report.PRNumber, "action": string(action), "error": err.Error(),
+		})
 	}
 	return report, nil
 }

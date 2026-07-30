@@ -430,7 +430,7 @@ Provider rules:
 
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`. A configured `forgejo` or `plane` kind is rejected with an explicit unsupported-provider error — both were removed and are never reinterpreted as a supported provider.
-- **Upgrading from a config that used a removed provider:** delete the `[[providers]]` entry and any `[[projects]]` bound to it before starting the new daemon. A project registered through the dashboard or `POST /api/v1/projects` (`source = "api"`) survives in SQLite independently of the config file, and startup fails while it references a provider the config no longer declares. Because the daemon is down, its own DELETE endpoint cannot repair it; the startup error names the `sqlite3` statement that removes the stored row.
+- **Upgrading from a config that used a removed provider:** delete the `[[providers]]` entry and any `[[projects]]` bound to it before starting the new daemon. A project registered through `POST /api/v1/projects` (`source = "api"`) survives in SQLite independently of the config file, and startup fails while it references a provider the config no longer declares. The dashboard lists projects but does not create them. Because the daemon is down, its own DELETE endpoint cannot repair it; the startup error names the `sqlite3` statement that removes the stored row.
 - `providers[].baseUrl` is optional and, when set, must be a `github.com` URL (`github.com`, `www.github.com`, or `api.github.com`). It does not point Looper at a host — the `gh` gateway resolves its own — so a non-github.com value would configure a target Looper cannot drive and is rejected at startup rather than failing later at publish time.
 - `providers[].tokenEnv` names an environment variable, **not the credential the GitHub gateway uses.** Planner, worker, reviewer, fixer, webhook, and discovery calls all authenticate through ambient `gh` auth (`gh auth login`). The named variable is copied unchanged from the daemon environment into trusted `looper review submit` child processes and nowhere else.
 - A project bound to a provider requires both `provider` and a repo (`owner/name`); a binding without a repo is rejected. The project HTTP API can register a local `repoPath` against a running daemon, but provider bindings themselves are file-managed. Already-started work retains its previous catalog snapshot.
@@ -726,6 +726,133 @@ botTokenEnv = "TELEGRAM_BOT_TOKEN"
 allowedUserIds = [123456789]
 defaultProjectId = "looper"
 ```
+
+## Merge Gatekeeper trust level (`roles.gatekeeper.trust`)
+
+Merge Gatekeeper evaluates every open pull request against merge policy —
+required checks, review state, **unresolved review threads**, hold labels,
+mergeability, project policy — and writes a durable Gate report. The trust level
+decides what it may do with that judgement.
+
+| Level | Behaviour |
+| --- | --- |
+| `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
+| `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
+| `auto` | Would let Gatekeeper merge. **Not implemented** — configuration rejects it. |
+
+`auto` is rejected rather than accepted and ignored on purpose: a merge authority
+that silently behaves one level below what was configured is the worst possible
+failure for this setting.
+
+```toml
+[roles.gatekeeper]
+trust = "advise"
+```
+
+Project overrides use `projects[].roles.gatekeeper.trust`.
+
+### The owned comment and its lifecycle
+
+At `advise` Looper owns exactly one comment on each pull request, identified by
+its marker **and** its author, so a human quoting the marker is never rewritten.
+
+| Transition | What happens |
+| --- | --- |
+| First verdict | The comment is created |
+| Verdict changed | The comment is updated in place |
+| Verdict unchanged | **Nothing at all** — no write, and no read either |
+| Demoted to `observe` | The comment is retired: its body is replaced with a withdrawal notice, once |
+| Duplicates found | The oldest survives and is updated; the rest are deleted |
+
+"Unchanged means no read" is the part that matters on a busy repository. Whether
+a verdict changed is decided from the previous Gate report in the local event log,
+so a quiet pull request costs no forge calls — scanning the discussion to discover
+there is nothing to do would cost a comment page per pull request per tick.
+
+Retirement keeps the marker, so promoting back to `advise` reuses the same comment
+instead of leaving a withdrawn one and adding a second. Duplicate reconciliation
+picks the oldest comment id, which every evaluator computes identically — two
+Looper instances racing therefore converge instead of leaving two contradictory
+verdicts.
+
+The verdict states the head it was evaluated at and says plainly that anything
+changing afterwards invalidates it. That is not decoration: holds, reviews,
+threads, and policy can all change without moving the head, which is why the Gate
+report is audit evidence rather than merge authority.
+
+### Relationship to `roles.reviewer.autoMerge`
+
+These are two different merge stories, and today they coexist: Reviewer's
+auto-merge opts a PR into GitHub's native auto-merge on its own approval, while
+Gatekeeper only observes or advises. Reviewer's path checks a narrower set of
+conditions — notably **not** unresolved review threads or requested changes.
+[#116](https://github.com/MumuTW/looper/issues/116) consolidates both behind this
+ladder and retires `roles.reviewer.autoMerge`; until `auto` exists, Reviewer's
+setting remains the only way Looper merges anything.
+
+## Deploy on merge (`roles.deployer`)
+
+When a project's base branch moves, the deployer runs one configured command
+**against a checkout of that exact commit** and reports the result. It is
+agent-free: Looper does not interpret the command, judge success beyond its exit
+status, or roll anything back.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.deployer.enabled` | Enables the lane | `false` |
+| `roles.deployer.command` | Run with `/bin/sh -c` from the materialized checkout | — (required when enabled) |
+| `roles.deployer.timeoutSeconds` | Bounds one deploy, and how long an unfinished one holds its commit | `900` |
+| `roles.deployer.environment` | Extra environment for the command | none |
+
+Project overrides use `projects[].roles.deployer.*`, which is the common case: a
+deploy command differs per repository. Configuration is validated at startup —
+enabling deploys with no command fails immediately rather than on the first merge.
+
+### Exact-commit materialization
+
+The command does **not** run in the project's own checkout. That directory holds
+whatever it happens to hold — another branch, stale contents, uncommitted edits —
+so running there and then recording the remote commit as deployed would make the
+deployment record untrue.
+
+Instead Looper fetches the exact commit, creates a detached worktree at it,
+verifies `HEAD` really is that commit, runs the command there, and removes the
+worktree afterwards. The checkout path is derived from the commit, so a retry
+after an interruption repairs the same directory rather than accumulating new
+ones.
+
+### What counts as already deployed
+
+**GitHub Deployments are the authority**, under the `looper` environment — the
+same preference for forge-native state as the dependency gate (ADR-0004) and
+auto-merge (ADR-0005).
+
+| State | Action |
+| --- | --- |
+| No deployment | Deploy |
+| `success` | Nothing |
+| `failure` | **Nothing.** A deploy that fails tends to keep failing; retrying every tick turns one broken deploy into a stream. Re-running is your call |
+| `in_progress`, within the window | Nothing — a deploy is running |
+| `in_progress`, past twice the timeout | Deploy. The daemon that claimed it is gone, and refusing forever would strand the commit |
+
+The deployment is created and immediately marked `in_progress` **before** the
+command runs. Without that claim an interrupted deploy is indistinguishable from
+one that never started. The abandonment window is the one case where Looper acts
+on a record it did not finish writing, so it is bounded explicitly.
+
+Because the unit of work is a commit rather than a pull request, several PRs
+merging together produce **one** deploy of the resulting head.
+
+### Output handling
+
+A deploy command's output is the most credential-dense text this daemon handles:
+tokens, signed URLs, connection strings. It is therefore written to a `0600` file
+under `daemon.logDir/deploys/` and **never** placed in the notification body or
+the deployment status description, both of which are published. The notification
+carries the exit code, a compare link, and the log path.
+
+Compare links use the repository's own host, so an enterprise install links to its
+own domain rather than github.com.
 
 ## Project override rules
 

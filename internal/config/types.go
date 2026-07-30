@@ -627,6 +627,49 @@ type RoleConfigs struct {
 	Fixer       FixerRoleConfig       `json:"fixer"`
 	Worker      WorkerRoleConfig      `json:"worker"`
 	Coordinator CoordinatorRoleConfig `json:"coordinator"`
+	Gatekeeper  GatekeeperRoleConfig  `json:"gatekeeper"`
+	Deployer    DeployerRoleConfig    `json:"deployer"`
+}
+
+// DeployerRoleConfig configures the agent-free Role that runs a project's deploy
+// command against the exact commit it reports as deployed.
+type DeployerRoleConfig struct {
+	Enabled bool `json:"enabled"`
+	// Command is run with /bin/sh -c from a checkout of the deployed commit. It is
+	// arbitrary local execution by design — the same trust the daemon already
+	// extends to the agent CLIs it runs — and only a commit reaching the base
+	// branch triggers it.
+	Command string `json:"command,omitempty"`
+	// TimeoutSeconds bounds one deploy. Empty defaults to 900. It also bounds how
+	// long an unfinished deploy holds its commit before being treated as abandoned.
+	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`
+	// Environment is added to the deploy command's environment. Values, not names:
+	// a deploy usually needs credentials the daemon itself has no use for.
+	Environment map[string]string `json:"environment,omitempty"`
+}
+
+// GatekeeperTrustLevel is how much merge authority Merge Gatekeeper holds for a
+// project. It is a ladder, not a switch: a level is reached by explicit operator
+// promotion and never promotes itself.
+type GatekeeperTrustLevel string
+
+const (
+	// GatekeeperTrustObserve writes a Gate report and nothing else. The default
+	// for every project.
+	GatekeeperTrustObserve GatekeeperTrustLevel = "observe"
+	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
+	// the pull request, so a human can decide without redoing the judgement.
+	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
+	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible. Not yet
+	// implemented; config validation rejects it rather than accepting a value that
+	// would silently behave as advise.
+	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
+)
+
+// GatekeeperRoleConfig configures the agent-free Merge Gatekeeper.
+type GatekeeperRoleConfig struct {
+	// Trust is the merge authority level. Empty defaults to observe.
+	Trust GatekeeperTrustLevel `json:"trust,omitempty"`
 }
 
 type ProjectRefConfig struct {
@@ -1181,6 +1224,17 @@ type PartialCoordinatorRoleConfig struct {
 	MergeWatch   *PartialCoordinatorMergeWatchConfig   `json:"mergeWatch,omitempty"`
 }
 
+type PartialDeployerRoleConfig struct {
+	Enabled        *bool              `json:"enabled,omitempty"`
+	Command        *string            `json:"command,omitempty"`
+	TimeoutSeconds *int               `json:"timeoutSeconds,omitempty"`
+	Environment    *map[string]string `json:"environment,omitempty"`
+}
+
+type PartialGatekeeperRoleConfig struct {
+	Trust *GatekeeperTrustLevel `json:"trust,omitempty"`
+}
+
 type PartialRoleConfigs struct {
 	// Coding holds TOML-authored coding-role overlays
 	// (`[roles.coding.<shipped-role>]`). It is global-only:
@@ -1193,6 +1247,8 @@ type PartialRoleConfigs struct {
 	Fixer       *PartialFixerRoleConfig            `json:"fixer,omitempty"`
 	Worker      *PartialWorkerRoleConfig           `json:"worker,omitempty"`
 	Coordinator *PartialCoordinatorRoleConfig      `json:"coordinator,omitempty"`
+	Gatekeeper  *PartialGatekeeperRoleConfig       `json:"gatekeeper,omitempty"`
+	Deployer    *PartialDeployerRoleConfig         `json:"deployer,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }
