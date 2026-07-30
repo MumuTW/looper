@@ -146,9 +146,6 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		},
 		GitHubHealth: rt.GitHubHealth,
 		Runtime:      rt,
-		ReconcileStaleRuns: func(ctx context.Context) (looperdruntime.StaleRunReconcileSummary, error) {
-			return rt.ReconcileStaleRunningRuns(ctx)
-		},
 		StopLoop: func(ctx context.Context, loopID, reason string) (any, error) {
 			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},

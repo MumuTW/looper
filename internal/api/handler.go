@@ -99,9 +99,8 @@ type Context struct {
 	// DaemonBinaryStatus reports whether the daemon's own executable file still
 	// holds the image it is running. Optional: when nil, /status reports the
 	// binary identity as unknown rather than as unchanged.
-	DaemonBinaryStatus  func() daemonbinary.Status
-	GitHubHealth        func(context.Context) looperdruntime.GitHubHealth
-	ReconcileStaleRuns  func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
+	DaemonBinaryStatus func() daemonbinary.Status
+	GitHubHealth       func(context.Context) looperdruntime.GitHubHealth
 	StopLoop           func(context.Context, string, string) (any, error)
 	CloseLoop          func(context.Context, string, string) (any, error)
 	StopAll            func(context.Context, string) (any, error)
