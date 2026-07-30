@@ -3292,6 +3292,9 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 					return
 				}
 			}
+			if claim.targetLeaseKey != "" {
+				processCtx = loops.WithTargetLeaseCapability(processCtx, loops.TargetLeaseCapability{Key: claim.targetLeaseKey, OwnerToken: claim.targetLeaseToken})
+			}
 			runErr := processFn(processCtx)
 			if lease != nil {
 				// Finalize-before-release: only drop ownership after durable
