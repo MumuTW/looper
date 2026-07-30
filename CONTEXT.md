@@ -158,7 +158,7 @@ One Reviewer pass over a Pull Request that produces a Reviewer Summary. A later 
 _Avoid_: review thread lifecycle, resolve cycle.
 
 **Review Item ID**:
-A Reviewer-assigned stable identifier for one semantic review issue in a Reviewer Summary, unique within a single Pull Request's summary history. Reviewer reuses the same Review Item ID while the semantic issue remains the same; it creates a new ID only when the issue is split, merged, or materially redefined. Fixer cites Review Item IDs when reporting attempted fixes; it does not infer item identity from files, line numbers, or text similarity.
+Defined by `forge.ReviewItemID` in `internal/forge/summary_protocol.go`. The identity contract lives on the type, not here — this entry exists to reserve the term and its bans.
 _Avoid_: item id, comment id, line id.
 
 **Review Item Status**:
