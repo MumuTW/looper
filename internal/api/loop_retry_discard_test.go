@@ -803,7 +803,11 @@ func TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop(t *testing.T) {
 			repo := "acme/looper"
 			prNumber := int64(42)
 			prTarget := "pr:acme/looper:42"
-			if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+			writeLoop := services.Repositories.Loops.Upsert
+			if tc.siblingStatus == "human_takeover" {
+				writeLoop = services.Repositories.Loops.UpsertChangingHumanHold
+			}
+			if err := writeLoop(context.Background(), storage.LoopRecord{
 				ID: "loop_sibling_" + tc.name, Seq: 3141, ProjectID: projectID,
 				Type: tc.siblingType, TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber,
 				Status: tc.siblingStatus, CreatedAt: nowISO, UpdatedAt: nowISO,
@@ -1236,7 +1240,7 @@ func TestHandlerLoopRetryDiscardRejectsHumanTakeover(t *testing.T) {
 		t.Fatalf("GetByID() = %#v, %v", loop, err)
 	}
 	loop.Status = "human_takeover"
-	if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
+	if err := services.Repositories.Loops.UpsertChangingHumanHold(context.Background(), *loop); err != nil {
 		t.Fatalf("Loops.Upsert(human_takeover) error = %v", err)
 	}
 
@@ -1280,7 +1284,7 @@ func TestHandlerHandbackRejectsDiscardWorktreeChanges(t *testing.T) {
 		t.Fatalf("GetByID() = %#v, %v", loop, err)
 	}
 	loop.Status = "human_takeover"
-	if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
+	if err := services.Repositories.Loops.UpsertChangingHumanHold(context.Background(), *loop); err != nil {
 		t.Fatalf("Loops.Upsert(human_takeover) error = %v", err)
 	}
 

@@ -3125,6 +3125,48 @@ func TestTakeoverLoopFiltersCrossVendorResumeParams(t *testing.T) {
 	}
 }
 
+func TestHandlerHandbackPersistsResumeMetadataWhileHumanTakeoverIsHeld(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	seedLoopRouteData(t, rt)
+	prepareLoopRouteForRetry(t, rt, "human_takeover")
+
+	nowISO := "2026-04-11T12:01:00.000Z"
+	sessionID := "session-handback-held"
+	if err := rt.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:              "agent_exec_handback_held",
+		ProjectID:       stringPtr("project_1"),
+		LoopID:          stringPtr("loop_1"),
+		Vendor:          "codex",
+		Status:          "completed",
+		NativeSessionID: &sessionID,
+		StartedAt:       nowISO,
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: cfg, Runtime: rt, Now: func() time.Time {
+		return time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC)
+	}})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_1/handback", strings.NewReader(`{"mode":"auto"}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	loop, err := rt.Services().Repositories.Loops.GetByID(context.Background(), "loop_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID(loop_1) = %#v, %v", loop, err)
+	}
+	if loop.Status != string(domain.LoopStatusQueued) {
+		t.Fatalf("loop status = %q, want queued", loop.Status)
+	}
+	if loop.MetadataJSON == nil || !strings.Contains(*loop.MetadataJSON, sessionID) {
+		t.Fatalf("loop metadata = %#v, want persisted takeover resume session", loop.MetadataJSON)
+	}
+}
+
 func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 	routes := loadResponseArtifact(t)
 	requestArtifact := loadRequestArtifact(t)
@@ -7952,10 +7994,13 @@ func prepareLoopRouteForRetry(t *testing.T, rt *looperdruntime.Runtime, loopStat
 	}
 	loop.Status = loopStatus
 	loop.UpdatedAt = nowISO
-	if err := services.Repositories.Loops.Upsert(ctx, *loop); err != nil {
+	writeLoop := services.Repositories.Loops.Upsert
+	if loopStatus == "human_takeover" {
+		writeLoop = services.Repositories.Loops.UpsertChangingHumanHold
+	}
+	if err := writeLoop(ctx, *loop); err != nil {
 		t.Fatalf("Loops.Upsert(loop_1) error = %v", err)
 	}
-
 	run, err := services.Repositories.Runs.GetByID(ctx, "run_1")
 	if err != nil || run == nil {
 		t.Fatalf("Runs.GetByID(run_1) = %#v, %v", run, err)

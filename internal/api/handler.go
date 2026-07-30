@@ -5680,7 +5680,7 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 			}
 			loop.MetadataJSON = &meta
 			loop.UpdatedAt = nowISO
-			if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+			if err := repos.Loops.UpsertChangingHumanHold(ctx, *loop); err != nil {
 				return struct{}{}, err
 			}
 		}
@@ -6280,7 +6280,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		}
 
 		updated := queueLoop
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		writeLoop := repos.Loops.Upsert
+		if loop.Status == string(domain.LoopStatusHumanTakeover) {
+			writeLoop = repos.Loops.UpsertChangingHumanHold
+		}
+		if err := writeLoop(ctx, updated); err != nil {
 			return retryResult{}, err
 		}
 		persisted, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord)
