@@ -24,11 +24,19 @@
 #
 # Backend evidence and known gaps: docs/research/hermes-devin-acp-spike.md
 
-# Strict mode only when executed. When sourced, `set -e` would leak into the
-# caller's interactive shell and kill it on the next failing command.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  SOURCED=0
+  # Strict mode only when executed. When sourced, `set -e` would leak into the
+  # caller's interactive shell and kill it on the next failing command.
   set -euo pipefail
+else
+  SOURCED=1
 fi
+
+FORCE=0
+# Absolute, so the printed commands stay valid after the reader cd's into the
+# disposable directory the safety note tells them to use.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 HERMES_ROOT="${HERMES_ROOT:-$HOME/.hermes}"
 LOOPER_HERMES_PROFILE="${LOOPER_HERMES_PROFILE:-looper}"
@@ -47,13 +55,51 @@ if [ -z "$LOOPER_ALLOWED_TOOLS" ]; then
   done
 fi
 
+# Writes $1 from stdin, but never over an existing file: profile config.yaml
+# and .env hold the user's own provider credentials and settings, and this
+# script does not own them. An existing file is left alone and reported, or
+# backed up first when --force was passed.
+write_profile_file() {
+  local path="$1" label="$2" content
+  content="$(cat)"
+
+  if [ ! -e "$path" ]; then
+    printf '%s' "$content" > "$path"
+    echo "  wrote $label"
+    return 0
+  fi
+
+  if [ "$(cat "$path")" = "$content" ]; then
+    echo "  $label already current"
+    return 0
+  fi
+
+  if [ "$FORCE" -eq 1 ]; then
+    local backup="$path.bak-$(date +%Y%m%d_%H%M%S)"
+    cp "$path" "$backup"
+    printf '%s' "$content" > "$path"
+    echo "  replaced $label (previous contents saved to $(basename "$backup"))"
+    return 0
+  fi
+
+  echo "  SKIPPED $label — it already exists and differs from the template." >&2
+  echo "    Left untouched; it may hold your own credentials or settings." >&2
+  echo "    Merge by hand, or re-run with --force to replace it after a backup." >&2
+  SKIPPED=1
+  return 0
+}
+
 bootstrap() {
+  SKIPPED=0
   if [ ! -d "$LOOPER_HERMES_HOME" ]; then
-    hermes profile create "$LOOPER_HERMES_PROFILE" --no-alias \
+    # Anchor creation at the configured root, or a custom HERMES_ROOT would
+    # create the profile under Hermes's default home and leave the path this
+    # script then writes to nonexistent.
+    HERMES_HOME="$HERMES_ROOT" hermes profile create "$LOOPER_HERMES_PROFILE" --no-alias \
       --description "Looper repo profile: Devin ACP backend, repo-scoped memory"
   fi
 
-  cat > "$LOOPER_HERMES_HOME/config.yaml" <<YAML
+  write_profile_file "$LOOPER_HERMES_HOME/config.yaml" "config.yaml" <<YAML
 model:
   default: copilot-acp
   provider: copilot-acp
@@ -67,7 +113,7 @@ memory:
   user_profile_enabled: true
 YAML
 
-  cat > "$LOOPER_HERMES_HOME/.env" <<ENV
+  write_profile_file "$LOOPER_HERMES_HOME/.env" ".env" <<ENV
 # Devin CLI as the ACP model backend. Hermes's copilot-acp provider speaks
 # generic ACP v1; these two vars repoint it at \`devin acp\` with no patch.
 HERMES_COPILOT_ACP_COMMAND=devin
@@ -80,38 +126,60 @@ HERMES_COPILOT_ACP_ARGS=acp --model $LOOPER_DEVIN_MODEL
 HERMES_ACP_ALLOWED_MCP_TOOLS=$LOOPER_ALLOWED_TOOLS
 ENV
 
-  echo "Bootstrapped Hermes profile '$LOOPER_HERMES_PROFILE' at $LOOPER_HERMES_HOME"
+  echo "Hermes profile '$LOOPER_HERMES_PROFILE' at $LOOPER_HERMES_HOME"
   echo "Model backend: devin acp --model $LOOPER_DEVIN_MODEL"
   echo "Memory lives in $LOOPER_HERMES_HOME/memories/ (separate from your default profile)"
+  if [ "$SKIPPED" -eq 1 ]; then
+    echo
+    echo "One or more files were left as-is (see above) — the profile may not"
+    echo "be configured for the Devin backend until you reconcile them."
+  fi
   echo
   echo "Memory WRITES additionally need, once each:"
-  echo "  tools/hermes-devin/apply-hermes-patch.sh          # carried Hermes patch"
-  echo "  devin mcp add hermes-memory -- \\"
-  echo "    $PWD/tools/hermes-devin/memory_mcp_server.py    # run from your repo root"
-  echo "Without both, recall still works and writes silently no-op."
+  echo "  $REPO_ROOT/tools/hermes-devin/apply-hermes-patch.sh"
+  echo "  devin mcp add $LOOPER_MCP_SERVER \\"
+  echo "    -e HERMES_HOME=$LOOPER_HERMES_HOME \\"
+  echo "    -- $REPO_ROOT/tools/hermes-devin/memory_mcp_server.py"
+  echo "Run the devin command from the directory your sessions will use as cwd;"
+  echo "it writes a cwd-keyed local project config. Without both, recall still"
+  echo "works and writes silently no-op."
 }
 
-case "${1:-}" in
-  --bootstrap)
-    bootstrap
-    exit 0
-    ;;
-  --print)
-    echo "$LOOPER_HERMES_HOME"
-    exit 0
-    ;;
-  "")
-    ;;
-  *)
-    echo "unknown argument: $1" >&2
-    exit 2
-    ;;
-esac
+# When sourced, $@ is the CALLER's argument list unless the caller passed
+# arguments to `source` explicitly. Parsing it would let an unrelated caller
+# argument select a mode here — and `exit` would terminate the caller's shell
+# rather than this script. So only parse when executed.
+if [ "$SOURCED" -eq 0 ]; then
+  case "${1:-}" in
+    --bootstrap) ;;
+    --force)     FORCE=1 ;;
+    --print)     echo "$LOOPER_HERMES_HOME"; exit 0 ;;
+    --help|-h)
+      echo "usage: hermes-profile.sh [--bootstrap [--force] | --print]"
+      echo "       source hermes-profile.sh    # export HERMES_HOME for this shell"
+      exit 0
+      ;;
+    "")
+      echo "Nothing to do when executed without a flag." >&2
+      echo "Did you mean:  source ${BASH_SOURCE[0]}" >&2
+      exit 2
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+  if [ "${2:-}" = "--force" ]; then
+    FORCE=1
+  fi
+  bootstrap
+  exit 0
+fi
 
 if [ ! -d "$LOOPER_HERMES_HOME" ]; then
   echo "Hermes profile '$LOOPER_HERMES_PROFILE' does not exist." >&2
-  echo "Run: scripts/hermes-profile.sh --bootstrap" >&2
-  return 1 2>/dev/null || exit 1
+  echo "Run: $REPO_ROOT/scripts/hermes-profile.sh --bootstrap" >&2
+  return 1
 fi
 
 export HERMES_HOME="$LOOPER_HERMES_HOME"

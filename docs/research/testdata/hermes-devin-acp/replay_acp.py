@@ -10,9 +10,15 @@ This is the probe behind docs/research/hermes-devin-acp-spike.md. It exists so
 the protocol, token, and error-code claims in that document can be re-derived
 rather than taken on trust.
 
-SAFETY: the ACP server is launched with --cwd pointed at a directory you pass
-in. Hermes's shim answers fs/write_text_file by writing directly inside that
-cwd with no permission round-trip, so point it at a disposable directory.
+SCOPE: this deliberately does NOT implement the fs/read_text_file and
+fs/write_text_file handlers that Hermes services, and so declares no fs client
+capability. It is a protocol and permission-flow probe, not a stand-in for the
+shim's filesystem behavior — a prompt that drives the backend to read or write
+files will diverge from what Hermes would do. Read the shim itself for that.
+
+SAFETY: the ACP server is both launched in, and told to use, the --cwd you
+pass. Devin runs its own native tools in its own loop, and nothing here
+sandboxes it, so point this at a disposable directory.
 
 Usage:
   ./replay_acp.py --cwd /path/to/disposable/dir
@@ -23,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import subprocess
 import sys
@@ -46,6 +53,13 @@ def main() -> int:
     ap.add_argument("--show-thoughts", action="store_true")
     args = ap.parse_args()
 
+    # Resolve before use: a relative --cwd would otherwise mean one thing to
+    # Popen and another to whatever reads the session/new value.
+    cwd = os.path.realpath(os.path.expanduser(args.cwd))
+    if not os.path.isdir(cwd):
+        print(f"--cwd is not a directory: {cwd}", file=sys.stderr)
+        return 2
+
     cmd = [args.command, "acp"]
     if args.agent_type:
         cmd += ["--agent-type", args.agent_type]
@@ -65,6 +79,10 @@ def main() -> int:
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        # Launch in the disposable directory too, not just declare it in
+        # session/new: the server's own startup, config discovery, and any
+        # native process it spawns are rooted here.
+        cwd=cwd,
     )
 
     inbox: "queue.Queue[dict]" = queue.Queue()
@@ -154,13 +172,16 @@ def main() -> int:
             "initialize",
             {
                 "protocolVersion": 1,
-                "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
+                # No fs capability: this probe does not implement those
+                # handlers, and advertising them would invite requests it
+                # would then wrongly answer with -32601 (see SCOPE above).
+                "clientCapabilities": {},
                 "clientInfo": {"name": "hermes-agent", "title": "Hermes Agent", "version": "0.0.0"},
             },
         )
         print("initialize OK:", json.dumps(init, ensure_ascii=False)[:400])
 
-        session = request("session/new", {"cwd": args.cwd, "mcpServers": []}) or {}
+        session = request("session/new", {"cwd": cwd, "mcpServers": []}) or {}
         sid = session.get("sessionId")
         print("session/new OK:", json.dumps(session, ensure_ascii=False)[:400])
         if not sid:

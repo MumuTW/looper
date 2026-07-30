@@ -318,14 +318,15 @@ neither Hermes nor `devin acp` is configured here with a sandbox or network
 boundary.
 
 ```bash
-cd "$(mktemp -d)"
+REPO="$PWD"; cd "$(mktemp -d)"
 export HERMES_COPILOT_ACP_COMMAND=devin
 export HERMES_COPILOT_ACP_ARGS="acp --model glm-5-2"
 hermes --provider copilot-acp -m copilot-acp
 ```
 
-To re-derive the protocol claims without running Hermes at all:
+To re-derive the protocol claims without running Hermes at all (`$REPO` from
+above, since the recipe left you in the disposable directory):
 
 ```bash
-docs/research/testdata/hermes-devin-acp/replay_acp.py --cwd "$(mktemp -d)"
+"$REPO"/docs/research/testdata/hermes-devin-acp/replay_acp.py --cwd "$PWD"
 ```
