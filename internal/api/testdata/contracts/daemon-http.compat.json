@@ -342,6 +342,22 @@
       "routeSpecificStatuses": [400, 409, 500]
     },
     {
+      "id": "projects.update",
+      "method": "PATCH",
+      "path": "/api/v1/projects/project_1",
+      "fixture": "projects-enabled",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "repo": "nexu-io/looper"
+        }
+      },
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404, 409, 500]
+    },
+    {
       "id": "runs.list",
       "method": "GET",
       "path": "/api/v1/runs?loopId=loop_1",

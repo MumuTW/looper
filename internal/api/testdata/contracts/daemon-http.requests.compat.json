@@ -90,6 +90,19 @@
       }
     },
     {
+      "id": "projects.update",
+      "method": "PATCH",
+      "path": "/api/v1/projects/project_1",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "repo": "nexu-io/looper"
+        }
+      }
+    },
+    {
       "id": "loop.retry",
       "method": "POST",
       "path": "/api/v1/loops/loop_1/retry",

@@ -2068,6 +2068,7 @@ type activeRunWorktree struct {
 type projectService interface {
 	List(context.Context) ([]storage.ProjectRecord, error)
 	AddProject(context.Context, projects.AddInput) (projects.AddResult, error)
+	UpdateProject(context.Context, string, projects.UpdateInput) (storage.ProjectRecord, error)
 	RemoveProject(context.Context, string) (storage.ProjectRecord, error)
 	DiscoverProject(context.Context, projects.DiscoverInput) (projects.DiscoverResult, error)
 }
@@ -2147,6 +2148,9 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 
 	if discoverRoute {
 		return h.buildProjectDiscoverResponse(r, service, identifier)
+	}
+	if r.Method == http.MethodPatch {
+		return h.buildUpdateProjectResponse(r, service, identifier)
 	}
 
 	if r.Method != http.MethodDelete {
@@ -7475,6 +7479,63 @@ type createProjectRequest struct {
 	Repo         *string `json:"repo"`
 	Provider     *string `json:"provider"`
 	SnapshotMode *string `json:"snapshotMode"`
+}
+
+type updateProjectStringField struct {
+	Set   bool
+	Value *string
+}
+
+func (f *updateProjectStringField) UnmarshalJSON(raw []byte) error {
+	f.Set = true
+	if string(raw) == "null" {
+		f.Value = nil
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	f.Value = &value
+	return nil
+}
+
+type updateProjectRequest struct {
+	Repo         updateProjectStringField `json:"repo"`
+	Name         updateProjectStringField `json:"name"`
+	BaseBranch   updateProjectStringField `json:"baseBranch"`
+	WorktreeRoot updateProjectStringField `json:"worktreeRoot"`
+}
+
+func updateProjectField(field updateProjectStringField) projects.UpdateStringField {
+	return projects.UpdateStringField{Set: field.Set, Value: field.Value}
+}
+
+func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectService, identifier string) (any, error) {
+	body := updateProjectRequest{}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return nil, *aerr
+	}
+	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
+		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
+		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
+	})
+	if err != nil {
+		var notFound projects.ProjectNotFoundError
+		var ambiguous projects.AmbiguousProjectIdentifierError
+		var validation projects.ProjectValidationError
+		switch {
+		case errors.As(err, &notFound):
+			return nil, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", notFound.Identifier)}
+		case errors.As(err, &ambiguous):
+			return nil, apiError{code: pkgapi.ErrorCodeProjectAmbiguous, status: http.StatusConflict, message: err.Error()}
+		case errors.As(err, &validation):
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
+		default:
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+	}
+	return serializeProject(updated, h.context.Config, h.context.Config.Defaults.BaseBranch), nil
 }
 
 func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectService) (createProjectResponse, error) {

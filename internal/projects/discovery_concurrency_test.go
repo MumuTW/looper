@@ -150,6 +150,52 @@ func TestServiceSyncConfiguredKeepsDiscoveryStateWrittenWhileWaitingForProjectLo
 	}
 }
 
+func TestServiceUpdateProjectRereadsMetadataAfterProjectLock(t *testing.T) {
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	nowISO := currentISO(func() time.Time { return now })
+	baseBranch := "main"
+	before := `{"repo":null,"source":"api","registrationDiscovery":{"status":"running","snapshotMode":"off"}}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &before, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }, ScheduleDiscovery: func(func()) {}}
+	unlock, err := service.lockProjectOperations(context.Background(), "looper")
+	if err != nil {
+		t.Fatalf("lockProjectOperations() error = %v", err)
+	}
+	updated := make(chan error, 1)
+	repo := "acme/looper"
+	go func() {
+		_, err := service.UpdateProject(context.Background(), "looper", UpdateInput{Repo: UpdateStringField{Set: true, Value: &repo}})
+		updated <- err
+	}()
+
+	// This models a discovery completion that writes while PATCH is waiting for
+	// the keyed project lock. A whole-record update must not put this metadata
+	// back to the stale pre-lock snapshot.
+	during := `{"repo":null,"source":"api","concurrentDiscovery":"preserved","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &during, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(concurrent discovery) error = %v", err)
+	}
+	unlock()
+	if err := <-updated; err != nil {
+		t.Fatalf("UpdateProject() error = %v", err)
+	}
+	stored, err := repos.Projects.GetByID(context.Background(), "looper")
+	if err != nil || stored == nil {
+		t.Fatalf("Projects.GetByID() = %#v, %v", stored, err)
+	}
+	metadata := parseMetadata(stored.MetadataJSON)
+	if metadata["concurrentDiscovery"] != "preserved" {
+		t.Fatalf("metadata = %#v, want concurrent discovery metadata preserved", metadata)
+	}
+	if metadataString(metadata, "repo") != repo {
+		t.Fatalf("metadata repo = %q, want %q", metadataString(metadata, "repo"), repo)
+	}
+}
+
 func TestWriteDiscoveryStatePreservesCurrentProjectMetadata(t *testing.T) {
 	coordinator := openCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
