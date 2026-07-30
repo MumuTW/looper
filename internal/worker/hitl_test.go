@@ -353,3 +353,101 @@ func TestEnsureDraftPRForAskDoesNotPublishFailedValidation(t *testing.T) {
 		t.Fatalf("failed validation published draft: pushes=%d prs=%d", len(git.pushCalls), len(github.createPRCalls))
 	}
 }
+
+func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
+	t.Parallel()
+
+	writeSentinel := func(t *testing.T, content string) string {
+		t.Helper()
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, ".looper"), 0o755); err != nil {
+			t.Fatalf("MkdirAll error = %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, hitlSentinelRelPath), []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile error = %v", err)
+		}
+		return dir
+	}
+	assertQuarantined := func(t *testing.T, dir, wantContent string) {
+		t.Helper()
+		quarantined := filepath.Join(dir, hitlSentinelRelPath+hitlSentinelQuarantineSuffix)
+		raw, err := os.ReadFile(quarantined)
+		if err != nil {
+			t.Fatalf("quarantined evidence unreadable: %v", err)
+		}
+		if string(raw) != wantContent {
+			t.Fatalf("quarantined evidence = %q, want original content preserved", raw)
+		}
+		if _, err := os.Stat(filepath.Join(dir, hitlSentinelRelPath)); !os.IsNotExist(err) {
+			t.Fatal("original sentinel still present; quarantine must move it out of the consume path")
+		}
+	}
+
+	t.Run("truncated JSON fails closed with evidence quarantined", func(t *testing.T) {
+		dir := writeSentinel(t, `{"question":"delete prod?`)
+		ask, err := consumeAskSentinel(dir)
+		if err == nil || ask != nil {
+			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
+		}
+		if !strings.Contains(err.Error(), "not valid JSON") || !strings.Contains(err.Error(), hitlSentinelQuarantineSuffix) {
+			t.Fatalf("error = %v, want JSON diagnostic naming the quarantined path", err)
+		}
+		assertQuarantined(t, dir, `{"question":"delete prod?`)
+	})
+
+	t.Run("schema without question fails closed", func(t *testing.T) {
+		dir := writeSentinel(t, `{"options":["a","b"]}`)
+		ask, err := consumeAskSentinel(dir)
+		if err == nil || ask != nil {
+			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
+		}
+		if !strings.Contains(err.Error(), "no question") {
+			t.Fatalf("error = %v, want no-question diagnostic", err)
+		}
+		assertQuarantined(t, dir, `{"options":["a","b"]}`)
+	})
+
+	t.Run("unreadable sentinel fails closed without deleting evidence", func(t *testing.T) {
+		dir := writeSentinel(t, `{"question":"q"}`)
+		path := filepath.Join(dir, hitlSentinelRelPath)
+		if err := os.Chmod(path, 0o000); err != nil {
+			t.Fatalf("Chmod error = %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+		ask, err := consumeAskSentinel(dir)
+		if err == nil || ask != nil {
+			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
+		}
+		if !strings.Contains(err.Error(), "cannot be read") {
+			t.Fatalf("error = %v, want read diagnostic", err)
+		}
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("evidence missing after read failure: %v", statErr)
+		}
+	})
+
+	t.Run("oversized sentinel fails closed", func(t *testing.T) {
+		dir := writeSentinel(t, `{"question":"`+strings.Repeat("x", maxAskSentinelBytes)+`"}`)
+		ask, err := consumeAskSentinel(dir)
+		if err == nil || ask != nil {
+			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
+		}
+		if !strings.Contains(err.Error(), "limit") {
+			t.Fatalf("error = %v, want size diagnostic", err)
+		}
+	})
+
+	t.Run("valid ask still consumed, absent still no-question", func(t *testing.T) {
+		dir := writeSentinel(t, `{"question":"Redis or Postgres?","options":["redis","postgres"]}`)
+		ask, err := consumeAskSentinel(dir)
+		if err != nil || ask == nil || ask.Question != "Redis or Postgres?" {
+			t.Fatalf("consumeAskSentinel = (%#v, %v), want the parsed ask", ask, err)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, hitlSentinelRelPath)); !os.IsNotExist(statErr) {
+			t.Fatal("valid sentinel must be consumed")
+		}
+		if again, err := consumeAskSentinel(dir); err != nil || again != nil {
+			t.Fatalf("second consumeAskSentinel = (%#v, %v), want (nil, nil)", again, err)
+		}
+	})
+}
