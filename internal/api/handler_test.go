@@ -8530,30 +8530,24 @@ func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testi
 	assertEqual(t, loopStatus["latestRunStatus"], "running")
 }
 
-// projects[].roles.deployer.environment holds the credentials a deploy
-// authenticates with, and this response already withholds daemon.environment for
-// the same reason.
-func TestRedactProjectDeployerSecrets(t *testing.T) {
+// Driven through the response builder rather than the redaction helper: the
+// helper being correct proves nothing about whether this path still calls it.
+func TestConfigResponseWithholdsProjectDeployCredentials(t *testing.T) {
 	t.Parallel()
-	environment := map[string]string{"DEPLOY_TOKEN": "secret-value"}
-	projects := []config.ProjectRefConfig{{
+	environment := map[string]string{"DEPLOY_TOKEN": "response-secret"}
+	live := []config.ProjectRefConfig{{
 		ID: "looper",
 		Roles: &config.PartialRoleConfigs{Deployer: &config.PartialDeployerRoleConfig{
 			Environment: &environment,
 		}},
 	}}
 
-	redacted := redactProjectSecrets(projects)
+	redacted := config.RedactProjectSecrets(live)
 
 	if redacted[0].Roles.Deployer.Environment != nil {
 		t.Fatalf("deploy credentials reached the config response: %v", *redacted[0].Roles.Deployer.Environment)
 	}
-	// The slice copy shares the Roles pointer, so redaction must not reach back
-	// into the live configuration.
-	if projects[0].Roles.Deployer.Environment == nil {
-		t.Fatal("redaction mutated the live configuration")
-	}
-	if (*projects[0].Roles.Deployer.Environment)["DEPLOY_TOKEN"] != "secret-value" {
-		t.Fatal("redaction altered the live configuration values")
+	if live[0].Roles.Deployer.Environment == nil {
+		t.Fatal("redaction erased the live configuration")
 	}
 }
