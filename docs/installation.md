@@ -68,7 +68,7 @@ vendor = "claude-code"
 [defaults]
 baseBranch = "main"
 
-# Optional: import projects at daemon startup. Prefer the dashboard or
+# Optional: import projects at daemon startup. Prefer `looper project add` or
 # POST /api/v1/projects for projects you want to manage without restart.
 # [[projects]]
 # id = "my-app"
@@ -92,10 +92,9 @@ Keep it running — every `looper` control verb talks to it. Nothing restarts it
 With the daemon up, register a local git repository root either:
 
 - with `looper project add /absolute/path/to/repo`, then `looper project list` to confirm, or
-- through the local operator dashboard (served by `looperd` under `/dashboard/`), or
 - with `POST /api/v1/projects` and a JSON body like `{"repoPath":"/absolute/path/to/repo"}`.
 
-`looper project add` is the API call with the mistakes checked first. It asks the client machine's `git` for the repository root and refuses anything that is not one — a subdirectory, a broken or empty `.git`, a bare repository — and it refuses both a checkout that is already registered and a directory name that would derive an existing project's id (`/work/acme/api` after `/work/other/api`). The daemon normalizes and checks the derived id atomically, so concurrent adds cannot rebind the first project. Setting an explicit id, name, base branch, or worktree root is available on the API and the dashboard, not on the CLI; an explicit id is the way past a derived-id collision. A `provider` binding is not available on any of them — it is file-managed, so declare it in `[[projects]]` and restart the daemon.
+`looper project add` is the API call with the mistakes checked first. It asks the client machine's `git` for the repository root and refuses anything that is not one — a subdirectory, a broken or empty `.git`, a bare repository — and it refuses both a checkout that is already registered and a directory name that would derive an existing project's id (`/work/acme/api` after `/work/other/api`). The daemon normalizes and checks the derived id atomically, so concurrent adds cannot rebind the first project. Setting an explicit id, name, base branch, or worktree root is available on the API, not on the CLI. The dashboard only lists projects and opens their filtered loops. A `provider` binding is not available on the CLI or API — it is file-managed, so declare it in `[[projects]]` and restart the daemon.
 
 Registration completes as soon as the project is validated, committed, and published. Worktree and pull request discovery then runs as post-commit work in the daemon — even on a repository with many open pull requests `looper project add` returns immediately, reporting discovery as pending. Discovery status is stored on the project record; if it fails, retry it with `looper project discover <id>` (or `POST /api/v1/projects/{id}/discover`) without re-registering the project.
 
@@ -110,8 +109,10 @@ In another shell, confirm the daemon answers:
 ```bash
 curl -sS "http://127.0.0.1:17310/api/v1/healthz"   # liveness (storage up)
 curl -sS "http://127.0.0.1:17310/api/v1/status"    # ops readiness (admission, review publish, quarantine debt)
-# or open the dashboard URL printed in the looperd logs / your browser on that host:port
+looper dashboard                                      # open the URL it prints
 ```
+
+With `server.authMode=local-token`, give the command the matching selected config or export `LOOPER_TOKEN`; it prints a short-lived one-shot URL and never places the long-lived token in the URL.
 
 `healthz` only means the process and storage are up. Use `/status` (or `looper status`) when you care whether reviewer publishing is enabled and whether quarantined orphan runs are still outstanding.
 

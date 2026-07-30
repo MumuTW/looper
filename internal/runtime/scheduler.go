@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -378,15 +377,6 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 	return forge.StartTrustedReviewProxy(resolvedLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy, tracker)
 }
 
-func appendLabels(label string, labels []string) []string {
-	result := make([]string, 0, len(labels)+1)
-	if label = strings.TrimSpace(label); label != "" {
-		result = append(result, label)
-	}
-	result = append(result, labels...)
-	return result
-}
-
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
@@ -646,79 +636,6 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 		return reviewer.ReviewMarkerResult{}, err
 	}
 	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin, Body: marker.Body, InlineCommentBodies: append([]string(nil), marker.InlineCommentBodies...)}, nil
-}
-
-var runtimeReviewMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
-
-type runtimeReviewIdempotencyMarker struct {
-	ID      string
-	Head    string
-	Outcome string
-}
-
-func findRuntimeReviewIdempotencyMarker(body string, marker string) (runtimeReviewIdempotencyMarker, bool) {
-	marker = strings.TrimSpace(marker)
-	for _, parsedMarker := range parseRuntimeReviewIdempotencyMarkers(body) {
-		if marker == "" || parsedMarker.matches(marker) {
-			return parsedMarker, true
-		}
-	}
-	return runtimeReviewIdempotencyMarker{}, false
-}
-
-func parseRuntimeReviewIdempotencyMarkers(body string) []runtimeReviewIdempotencyMarker {
-	matches := runtimeReviewMarkerRE.FindAllStringSubmatch(body, -1)
-	markers := make([]runtimeReviewIdempotencyMarker, 0, len(matches))
-	for _, match := range matches {
-		if len(match) != 2 {
-			continue
-		}
-		fields := parseRuntimeReviewMarkerFields(match[1])
-		parsedMarker := runtimeReviewIdempotencyMarker{ID: fields["id"], Head: fields["head"], Outcome: fields["outcome"]}
-		if parsedMarker.ID == "" || parsedMarker.Head == "" || !runtimeValidReviewMarkerOutcome(parsedMarker.Outcome) {
-			continue
-		}
-		markers = append(markers, parsedMarker)
-	}
-	return markers
-}
-
-func parseRuntimeReviewMarkerFields(segment string) map[string]string {
-	fields := map[string]string{}
-	for _, field := range strings.Fields(segment) {
-		key, value, ok := strings.Cut(field, "=")
-		if !ok {
-			continue
-		}
-		fields[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
-	}
-	return fields
-}
-
-func (m runtimeReviewIdempotencyMarker) matches(marker string) bool {
-	fields := parseRuntimeReviewMarkerFields(strings.TrimPrefix(marker, "looper:review"))
-	if id := fields["id"]; id != "" && id != m.ID {
-		return false
-	}
-	if idPrefix := fields["id_prefix"]; idPrefix != "" && !strings.HasPrefix(m.ID, idPrefix) {
-		return false
-	}
-	if head := fields["head"]; head != "" && head != m.Head {
-		return false
-	}
-	if outcome := fields["outcome"]; outcome != "" && outcome != m.Outcome {
-		return false
-	}
-	return strings.HasPrefix(marker, "looper:review") || strings.Contains(marker, "id=") || strings.Contains(marker, "head=") || strings.Contains(marker, "outcome=")
-}
-
-func runtimeValidReviewMarkerOutcome(outcome string) bool {
-	switch outcome {
-	case "clean", "non_blocking", "blocking", "actionable":
-		return true
-	default:
-		return false
-	}
 }
 
 func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input reviewer.IssueCommentInput) (reviewer.IssueCommentResult, error) {
@@ -1739,10 +1656,6 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		return runIndependentClaimPass(ctx, attachClaimGate(snapshot.input(services), services))
 	}
 	return handlers
-}
-
-func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
-	return buildDefaultSchedulerHandlersWithOptions(cfg, "", logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil, newSchedulerNotificationGatewayFactory(), coordinatorrole.NewRuntimeState())
 }
 
 func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState) defaultSchedulerHandlers {
@@ -2805,29 +2718,6 @@ type ownedQueueClaim struct {
 // exercised without racing SQLite QueryRowContext cancellation.
 var testAfterClaimHook func(item *storage.QueueItemRecord, err error) (*storage.QueueItemRecord, error)
 
-// allowedQueueTypesFromRunners returns queue item types that have a non-nil
-// runner processor. Prefer claimTypeSetsFromInput for claim filtering: that
-// path further splits live-configured roles from sticky-snapshot-only roles.
-func allowedQueueTypesFromRunners(input defaultSchedulerTickInput) []string {
-	types := make([]string, 0, 5)
-	if input.Planner != nil {
-		types = append(types, "planner")
-	}
-	if input.Reviewer != nil {
-		types = append(types, "reviewer")
-	}
-	if input.Fixer != nil {
-		types = append(types, "fixer")
-	}
-	if input.Worker != nil {
-		types = append(types, "worker")
-	}
-	if input.Snapshotter != nil {
-		types = append(types, "snapshot")
-	}
-	return types
-}
-
 // claimTypeSetsFromInput partitions claimable queue types:
 //   - unrestricted: live agent configured (or Config unset in unit tests), claim any item
 //   - stickySnapshotOnly: runner present but live ResolveAgent fails; claim only when the
@@ -3199,16 +3089,6 @@ func dispatchOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, inpu
 	return errors.Join(runErr, priorErr)
 }
 
-// dispatchClaimedQueueItems is retained for tests that build bare claim slices
-// without operation leases.
-func dispatchClaimedQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput, priorErr error) error {
-	owned := make([]ownedQueueClaim, 0, len(queueItems))
-	for _, item := range queueItems {
-		owned = append(owned, ownedQueueClaim{item: item})
-	}
-	return dispatchOwnedQueueClaims(ctx, owned, input, priorErr)
-}
-
 // schedulerLoopParked reports whether a claimed queue item's loop was parked
 // (human takeover / paused) — a state the scheduler may observe AFTER the claim
 // due to a race, and must then decline to run.
@@ -3226,14 +3106,6 @@ func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, inpu
 	default:
 		return false
 	}
-}
-
-func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {
-	owned := make([]ownedQueueClaim, 0, len(queueItems))
-	for _, item := range queueItems {
-		owned = append(owned, ownedQueueClaim{item: item})
-	}
-	return runOwnedQueueClaims(ctx, owned, input)
 }
 
 func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input defaultSchedulerTickInput) error {

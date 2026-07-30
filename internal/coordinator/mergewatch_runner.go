@@ -269,10 +269,6 @@ func markerState(marker *mergeWatchComment) *mergewatch.PriorWatchMarker {
 	return &copy
 }
 
-func requiredPRTriggerLabels(cfg config.FixerRoleTriggersConfig) []string {
-	return requiredDiscoveryLabels(cfg.Labels, cfg.LabelMode)
-}
-
 func retriageCleanupPatterns(roles config.RoleConfigs, triagedLabel string) []string {
 	patterns := []string{triagedLabel, "dispatch/*"}
 	registry := config.EffectiveCodingRoles(roles)

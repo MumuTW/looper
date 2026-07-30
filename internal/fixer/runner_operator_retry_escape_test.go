@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/fixer/workflow"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -107,7 +108,7 @@ func TestOperatorRetryEscapesManualInterventionCheckpoint(t *testing.T) {
 	if loops.ShouldRestartFromDiscover("failed", preCheckpoint.ResumePolicy) {
 		t.Fatalf("pre-retry ShouldRestartFromDiscover = true, want false for manual_intervention policy")
 	}
-	nextStep := nextFixerStep(stepPush)
+	nextStep := workflow.Next(stepPush)
 	if preResumeErr := validateFixerResumeCheckpoint(nextStep, preCheckpoint); preResumeErr == nil {
 		t.Fatalf("pre-retry validateFixerResumeCheckpoint(%s) = nil, want re-park on invalid repair", nextStep)
 	}

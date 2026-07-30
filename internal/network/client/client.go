@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -118,7 +119,7 @@ func (c *Client) request(ctx context.Context, method, path, token string, body a
 		var payload map[string]any
 		_ = json.NewDecoder(response.Body).Decode(&payload)
 		if message, ok := payload["message"].(string); ok && strings.TrimSpace(message) != "" {
-			return fmt.Errorf(message)
+			return errors.New(message)
 		}
 		return fmt.Errorf("request failed with status %d", response.StatusCode)
 	}

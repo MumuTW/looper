@@ -82,7 +82,7 @@ looper project add /absolute/path/to/your/local/repo
 looper status                                          # config, daemon, projects
 ```
 
-`looper project add` posts to the running daemon, so the project is live immediately. The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` do the same thing, and are where the options the CLI does not expose (explicit id, base branch) live. An explicit `provider` binding is not one of them: it is file-managed, so declare it in `[[projects]]` and restart the daemon.
+`looper project add` posts to the running daemon, so the project is live immediately. `POST /api/v1/projects` is the supported alternative when you need options the CLI does not expose (such as an explicit id or base branch). The dashboard at `http://127.0.0.1:17310/dashboard/` lists registered projects and opens their filtered loops; it does not register projects. An explicit `provider` binding is file-managed, so declare it in `[[projects]]` and restart the daemon.
 
 Once the daemon is healthy and GitHub credentials are configured (`gh auth status`), loops start from the forge itself: label an issue and assign it, and `looperd`'s discovery picks it up. The CLI controls loops the daemon already owns:
 
@@ -207,7 +207,7 @@ Global flags, accepted before or after the verb: `--config <path>`, `--host <hos
 
 There is one more command that is not for operators: `looper review submit`, which publishes a reviewer agent's pull request review. Reviewer agents reach it through a wrapper the daemon writes; run directly it has no provider credentials and fails.
 
-**Not in the CLI.** Bootstrap, managed daemon install/start, plan/review/work, ps/logs/jump, provider/webhook/network administration, and upgrade lived in the CLI that was removed. Loop inspection is available through the dashboard and the daemon's HTTP API; install and supervise `looperd` yourself.
+**Not in the CLI.** General bootstrap, managed daemon install/start, plan/review/work, ps/logs/jump, provider/webhook/network administration, and upgrade lived in the CLI that was removed. `looper dashboard` only mints and prints a browser login URL; loop inspection remains in the dashboard and the daemon's HTTP API. Install and supervise `looperd` yourself.
 
 ## Configuration
 
@@ -218,7 +218,7 @@ There is one more command that is not for operators: `looper review submit`, whi
 - All role-specific config lives under `roles.<role>`; canonical reviewer behavior lives under `roles.reviewer.behavior.*`
 - Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path
 - `agent.vendor` is required to run loops (no default)
-- If `server.authMode=local-token`, set `server.localToken` and export `LOOPER_TOKEN` for the CLI
+- If `server.authMode=local-token`, set `server.localToken`; run `LOOPER_TOKEN=… looper dashboard` (or let the CLI read the same configured token), then open the one-shot URL it prints
 
 Every field, env var, CLI flag, validation rule, and troubleshooting note lives in **[docs/configuration.md](docs/configuration.md)**.
 

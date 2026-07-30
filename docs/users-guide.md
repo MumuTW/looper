@@ -24,7 +24,7 @@ If the project is not registered yet:
 looper project add /absolute/path/to/repo
 ```
 
-That path must be the repository root — the directory containing `.git`. For advanced registration, `POST /api/v1/projects` accepts the same `repoPath` plus optional `id`, `baseBranch`, and `provider` fields. The dashboard only lists registered projects; it does not create them.
+That path must be the repository root — the directory containing `.git`. For advanced registration, `POST /api/v1/projects` accepts the same `repoPath` plus optional `id`, `name`, `baseBranch`, `worktreeRoot`, `repo`, and `snapshotMode` fields. The dashboard only lists registered projects; it does not create them. Provider bindings are config-file-only: declare the complete project under `[[projects]]` and restart the daemon.
 
 Webhook mode is configured in the config file (`webhook.mode` and per-project overrides). Observe health with `GET /api/v1/webhook/status` or the dashboard. Clearing stale GitHub CLI forwarder hooks is a manual `gh api` operation after you confirm the dry-run payload — there is no `looper webhook cleanup`.
 
@@ -542,14 +542,25 @@ Today:
 
 Looper uses `gh` for GitHub access, so `gh auth status` should succeed before planner / reviewer / fixer / worker workflows run under `looperd`.
 
-If the daemon is configured with `server.authMode=local-token`, CLI control verbs need a matching token (`server.localToken` / `LOOPER_TOKEN` depending on how you invoke the client).
+If the daemon is configured with `server.authMode=local-token`, CLI requests need a matching token. `LOOPER_TOKEN` overrides `server.localToken` through normal environment precedence for whichever Looper process receives it; it is never written back to the config file.
 
 Example:
 
 ```bash
 export LOOPER_TOKEN=replace-me
-curl -sS "http://127.0.0.1:17310/api/v1/status"
+looper dashboard
+# Open the one-shot /dashboard/?code=… URL printed above.
 ```
+
+For a copy/paste-only flow without the helper, mint the same one-shot code explicitly (the response is a JSON envelope), then append its `data.code` value to `/dashboard/?code=`:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer $LOOPER_TOKEN" \
+  "http://127.0.0.1:17310/api/v1/dashboard/bootstrap/code"
+```
+
+Codes are short-lived and single-use. The browser exchanges the code for a token kept in session storage; the long-lived token is never placed in the URL.
 
 This is separate from GitHub authentication.
 

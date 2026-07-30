@@ -56,7 +56,7 @@ Default runtime artifacts land in `~/.looper/` (`looper.sqlite`, `backups/`, `lo
 
 ## Local pre-flight (so CI never surprises you)
 
-CI's `verify` job runs, in order: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build`. A separate `race` job runs the race detector over the focused package set in `scripts/race-packages.txt`. Two helpers keep you ahead of both:
+CI's `verify` job runs, in order: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → production-only `staticcheck` → `go test ./...` → `go build`. A separate `race` job runs the race detector over the focused package set in `scripts/race-packages.txt`. Two helpers keep you ahead of both:
 
 ```bash
 scripts/verify.sh --install-hooks   # one-time per clone: git commits now auto-gofmt
@@ -128,7 +128,7 @@ For GitHub live sandbox tests, prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`; `LOOPER_
 
 1. Fork the repo (or branch directly if you have write access).
 2. Make your changes on a feature branch.
-3. Ensure `scripts/verify.sh` is clean (dashboard build + `gofmt -l .` → `go vet ./...` → `go test ./...` → `go test -race` → `go build ./...`) — these are exactly what CI's `verify` and `race` jobs run.
+3. Ensure `scripts/verify.sh` is clean (dashboard build + `gofmt -l .` → `go vet ./...` → production-only `staticcheck` → `go test ./...` → `go test -race` → `go build ./...`) — these are exactly what CI's `verify` and `race` jobs run.
 4. Open a PR against `main` with:
    - A semantic title (same rules as commits)
    - A short description of the change and motivation

@@ -9,11 +9,13 @@ Use this skill when an agent needs to install, configure, start, check, operate,
 
 > **The CLI is tiny, and installation is manual.** The whole operator surface is:
 >
-> `looper init|status|project add|project list|project discover|start|pause|retry|stop|close|takeover|handback|respond|version`
+> `looper init|status|dashboard|project add|project list|project discover|start|pause|retry|stop|close|takeover|handback|respond|version`
 >
 > plus machine-only `looper review submit` (never suggest it to a user). Global flags (`--config`, `--host`, `--port`) work before or after the verb. A **selector** is a loop sequence number or a loop id — never a pull request URL.
 >
 > There is **no** `bootstrap`, `daemon install|start|…`, `upgrade`, `config show`, `webhook`/`provider`/`network` administration, or `ps`/`logs`/`jump`/`plan`/`review`/`work`. Those lived in the CLI removed ahead of the role-model rewrite. Do anything else by editing the config file, through the dashboard (`/dashboard/`), through the daemon's HTTP API, or with the user's process manager — never invent a `looper` verb.
+
+`looper dashboard` prints a URL; it does not start the daemon or control a browser. In `local-token` mode, set `LOOPER_TOKEN` to the token accepted by looperd (or select the same config file) and open the short-lived one-shot URL immediately.
 
 Webhook mode is configured in the config file and observed at `GET /api/v1/webhook/status` or on the dashboard. Stale GitHub CLI forwarder hooks have to be removed with `gh api` by hand after the user confirms.
 
@@ -125,7 +127,7 @@ looper project list
 
 The path must be a git repository **root** — `looper project add` asks the client machine's `git` (`rev-parse --show-toplevel`) and refuses a subdirectory, a directory with a broken or empty `.git`, or a bare repository, naming the real root when it finds one. It also refuses a checkout already registered. The daemon normalizes and checks a path-only request's derived id atomically, so a directory name that would reuse an active project id (`/work/acme/api` after `/work/other/api`) is rejected even when adds race. Always pass an absolute path, and confirm it with the user rather than guessing.
 
-The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` register the same way, and are where the fields the CLI does not expose (explicit id, name, base branch, worktree root) live — use them when you need an explicit id to sidestep a derived-id collision. `provider` is not one of those fields: an explicit binding is rejected there and belongs in `[[projects]]`.
+`POST /api/v1/projects` is where the fields the CLI does not expose (explicit id, name, base branch, worktree root) live — use it when you need an explicit id to sidestep a derived-id collision. The dashboard only lists registered projects and opens their filtered loops; it does not register projects. `provider` is not an API field: an explicit binding is rejected there and belongs in `[[projects]]`.
 
 `project add` returns as soon as the project is validated, committed, and published — even on a repository with many open pull requests. Worktree/PR discovery runs as post-commit work in the daemon and is reported as pending; its status lives on the project record, and a failed discovery is retried with `looper project discover <id>` (or `POST /api/v1/projects/{id}/discover`), never by re-registering.
 
@@ -171,7 +173,7 @@ Inspect loops in the dashboard or via `GET /api/v1/loops`. Worktree path for a d
 ## Anti-patterns
 
 - Reaching for `looper bootstrap`, `daemon start`, `ps`, `logs`, `plan`, `review`, `work`, `jump`
-- Passing `looper project add` a subdirectory instead of the repository root, or expecting it to take an id / base branch / provider — those are API and dashboard fields
+- Passing `looper project add` a subdirectory instead of the repository root, or expecting it to take an id / base branch / provider — id and base branch are API fields; provider is config-file-only
 - Running `looper project add` for a project with an explicit provider binding, then adding it to the config file — that combination stops `looperd` from starting
 - Telling a user to run `looper review submit`
 - Using a PR URL as a selector

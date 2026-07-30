@@ -7,6 +7,7 @@
 | `looper version` | Print CLI version |
 | `looper init` | Write a commented starter config to the selected path. Refuses to overwrite; prints the path. The only verb that needs no daemon. |
 | `looper status` | Report the selected config file and whether it loaded, daemon reachability and health, and registered projects. Non-zero exit when the config fails to load or the daemon is unreachable. |
+| `looper dashboard` | Print the dashboard URL. Under `local-token`, authenticate with the selected config token or its `LOOPER_TOKEN` environment override and mint a short-lived one-shot login URL. |
 | `looper project add <path>` | Register a git repository **root** with the running daemon. Refuses a non-root path or an already-registered checkout. Discovery runs as post-commit work. |
 | `looper project list` | List registered projects |
 | `looper project discover <id>` | Retry post-commit worktree/PR discovery for a registered project. |
@@ -50,6 +51,6 @@ Argument parsing, which decides whether a command reaches the daemon at all:
 | --- | --- |
 | `looper bootstrap` | `looper init`, edit the config, install and run `looperd`, `looper project add` |
 | `looper daemon start` | `looperd` (foreground) or user's process manager |
-| `looper project add --id/--repo/--base-branch …` | The CLI verb takes a path only; the other fields are dashboard / `POST /api/v1/projects` |
+| `looper project add --id/--repo/--base-branch …` | The CLI verb takes a path only; supported advanced fields belong to `POST /api/v1/projects` (the dashboard lists projects only) |
 | `looper ps` / `logs` / `jump` | Dashboard / API; worktree path from dirty-retry dialog |
 | `looper plan` / `review` / `work` | Label/assign on the forge; daemon discovery claims the work |

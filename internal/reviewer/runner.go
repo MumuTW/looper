@@ -17,7 +17,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -108,45 +107,6 @@ const (
 )
 
 var retryAfterPattern = regexp.MustCompile(`(?i)retry-after\s*[:=]\s*(\d+)`)
-
-var reviewerDiscoveryLocks = newDiscoveryLockSet()
-
-type discoveryLockSet struct {
-	mu    sync.Mutex
-	locks map[string]*discoveryLockRef
-}
-
-type discoveryLockRef struct {
-	mu   sync.Mutex
-	refs int
-}
-
-func newDiscoveryLockSet() *discoveryLockSet {
-	return &discoveryLockSet{locks: map[string]*discoveryLockRef{}}
-}
-
-func (s *discoveryLockSet) With(key string, fn func() error) error {
-	s.mu.Lock()
-	ref := s.locks[key]
-	if ref == nil {
-		ref = &discoveryLockRef{}
-		s.locks[key] = ref
-	}
-	ref.refs++
-	s.mu.Unlock()
-
-	ref.mu.Lock()
-	defer ref.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		ref.refs--
-		if ref.refs == 0 {
-			delete(s.locks, key)
-		}
-		s.mu.Unlock()
-	}()
-	return fn()
-}
 
 type PullRequestSummary struct {
 	Number             int64
@@ -1142,18 +1102,6 @@ func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo stri
 
 }
 
-func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {
-	currentLogin := ""
-	if r.discoveryPolicy.RequireReviewRequest {
-		login, err := r.github.GetCurrentUserLogin(ctx, repo, cwd)
-		if err != nil {
-			return nil, err
-		}
-		currentLogin = normalizeLogin(login)
-	}
-	return r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, r.discoveryPolicy, currentLogin)
-}
-
 func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context, repo, cwd string, limit int, policy DiscoveryPolicy, currentLogin string) ([]PullRequestSummary, error) {
 	labels := prQueryLabels(policy.Labels)
 	if policy.MatchAnyTrigger && policy.RequireReviewRequest && strings.TrimSpace(currentLogin) != "" && len(labels) > 0 && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
@@ -1269,10 +1217,6 @@ func defaultDiscoveryLimit(limit int) int {
 		return 30
 	}
 	return limit
-}
-
-func (r *Runner) prEligibleForDiscovery(pr PullRequestSummary, currentLogin string) bool {
-	return prEligibleForDiscovery(pr, currentLogin, r.discoveryPolicy)
 }
 
 func prEligibleForDiscovery(pr PullRequestSummary, currentLogin string, policy DiscoveryPolicy) bool {
@@ -3980,17 +3924,6 @@ func cleanReviewNoopSummary(summary string) bool {
 	return strings.HasPrefix(normalized, "no actionable findings")
 }
 
-func pendingCommentOnlyOutcome(pending pendingReviewCheckpoint) string {
-	if pending.CleanNoop {
-		return "clean"
-	}
-	outcome := normalizeCommentOnlyOutcome(pending.Outcome)
-	if outcome == "" {
-		return "non_blocking"
-	}
-	return outcome
-}
-
 func normalizeCommentOnlyOutcome(outcome string) string {
 	switch strings.ToLower(strings.TrimSpace(outcome)) {
 	case "clean", "blocking", "non_blocking":
@@ -4007,15 +3940,16 @@ func reviewCompletionOutcome(result AgentResult) string {
 	if strings.TrimSpace(result.Stderr) != "" {
 		raw += "\n" + result.Stderr
 	}
-	for _, payload := range agent.CompletionMarkerPayloads(raw) {
-		var parsed map[string]any
-		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-			return ""
-		}
-		outcome, _ := parsed["outcome"].(string)
-		return outcome
+	payloads := agent.CompletionMarkerPayloads(raw)
+	if len(payloads) == 0 {
+		return ""
 	}
-	return ""
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(payloads[0]), &parsed); err != nil {
+		return ""
+	}
+	outcome, _ := parsed["outcome"].(string)
+	return outcome
 }
 
 func cleanApprovedReviewMarker(found ReviewMarkerResult) bool {
@@ -4083,10 +4017,6 @@ func pendingReviewEvent(pending pendingReviewCheckpoint) ReviewEvent {
 
 func hasPendingReviewMarkerMiss(checkpoint reviewerCheckpoint) bool {
 	return checkpoint.PendingReview != nil && checkpoint.PendingReview.MarkerVerificationMisses > 0
-}
-
-func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
-	return r.allowedReviewEventsForPolicy(r.reviewEvents)
 }
 
 func (r *Runner) allowedReviewEventsForPolicy(policy config.ReviewerReviewEventsConfig) []ReviewEvent {
@@ -4841,10 +4771,6 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	return updated, nil
 }
 
-func (r *Runner) classifyFailure(err error) *loopError {
-	return r.classifyFailureForProject("", err)
-}
-
 func (r *Runner) classifyFailureForProject(projectID string, err error) *loopError {
 	return r.classifyFailureForProjectAndBoundary(projectID, err, failureclass.BoundaryUnknown)
 }
@@ -4900,10 +4826,6 @@ func reviewerFailureKind(kind failureclass.Kind) QueueFailureKind {
 	}
 }
 
-func (r *Runner) isTransientExternalFailure(err error) bool {
-	return r.isTransientExternalFailureForProject("", err)
-}
-
 func (r *Runner) isTransientExternalFailureForProject(projectID string, err error) bool {
 	if err == nil {
 		return false
@@ -4922,19 +4844,11 @@ func (r *Runner) isTransientExternalFailureForProject(projectID string, err erro
 	return false
 }
 
-func (r *Runner) isEnhancedTransientFailure(err error) bool {
-	return r.isEnhancedTransientFailureForPolicy(r.retryPolicyForProject(""), err)
-}
-
 func (r *Runner) isEnhancedTransientFailureForPolicy(policy config.ReviewerRetryConfig, err error) bool {
 	if err == nil {
 		return false
 	}
 	return r.isEnhancedTransientMessageForPolicy(policy, err.Error()) || config.ReviewerRetryMessageMatches(policy, githubinfra.ErrorMessage(err))
-}
-
-func (r *Runner) isEnhancedTransientMessage(message string) bool {
-	return r.isEnhancedTransientMessageForPolicy(r.retryPolicyForProject(""), message)
 }
 
 func (r *Runner) isEnhancedTransientMessageForPolicy(policy config.ReviewerRetryConfig, message string) bool {
@@ -6022,13 +5936,6 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 		return ""
 	}
 	return storage.PullRequestLockKey(*item.ProjectID, *item.Repo, *item.PRNumber)
-}
-
-func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
-	cfg, _ := config.Normalize("")
-	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false)
-	return prompt
 }
 
 func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewerCheckpoint, scope config.ReviewerScope) string {

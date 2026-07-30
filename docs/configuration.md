@@ -111,7 +111,7 @@ Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `ins
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
-The dashboard is a curated field-level editor, not a raw file editor. Environment- and CLI-owned fields are read-only. `agent.env` values are write-only (only key names are returned), while `server.localToken`, `daemon.environment`, and `agent.params` remain file-only. Projects remain under the Projects API and SQLite authority. When token authentication is not configured, `server.host` must be `localhost` or a literal loopback IP; wildcard, LAN, public, reverse-proxy, and custom-hostname binds require `local-token`. This startup rule avoids treating a loopback reverse proxy as proof that the original caller was local. As defense in depth, `PATCH /api/v1/config` still accepts only direct requests whose peer and Host authority are loopback and rejects proxy-forwarding headers; in `local-token` mode it requires the normal token authentication.
+The dashboard is a curated field-level editor, not a raw file editor. Environment- and CLI-owned fields are read-only. `agent.env` values are write-only (only key names are returned), while `server.localToken` (or `LOOPER_TOKEN`), `daemon.environment`, and `agent.params` remain outside dashboard editing. Projects remain under the Projects API and SQLite authority. When token authentication is not configured, `server.host` must be `localhost` or a literal loopback IP; wildcard, LAN, public, reverse-proxy, and custom-hostname binds require `local-token`. This startup rule avoids treating a loopback reverse proxy as proof that the original caller was local. As defense in depth, `PATCH /api/v1/config` still accepts only direct requests whose peer and Host authority are loopback and rejects proxy-forwarding headers; in `local-token` mode it requires the normal token authentication.
 
 Every dashboard read includes the revision of the exact file generation that produced its published values, and every patch must submit that revision. The revision check and a final identity/mode/byte check catch changes present before that final check, including a newer generation not yet accepted by the reload loop. The writer then uses a crash-safe atomic rename. Portable filesystems do not offer a conditional compare-and-rename, so an external editor racing in the tiny interval between the final check and rename can still be replaced; avoid simultaneous manual and dashboard writes. A successful patch preserves the selected TOML/YAML/JSON format, unknown top-level extension sections and their native scalar values, and ordinary permission bits, but serialization can canonicalize comments, quoting, key/table order, and other lexical formatting; ACLs and extended filesystem metadata are not guaranteed to survive atomic replacement. Dashboard patching refuses a symlinked config path; edit the symlink target directly instead.
 
@@ -430,7 +430,7 @@ Provider rules:
 
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`. A configured `forgejo` or `plane` kind is rejected with an explicit unsupported-provider error — both were removed and are never reinterpreted as a supported provider.
-- **Upgrading from a config that used a removed provider:** delete the `[[providers]]` entry and any `[[projects]]` bound to it before starting the new daemon. A project registered through the dashboard or `POST /api/v1/projects` (`source = "api"`) survives in SQLite independently of the config file, and startup fails while it references a provider the config no longer declares. Because the daemon is down, its own DELETE endpoint cannot repair it; the startup error names the `sqlite3` statement that removes the stored row.
+- **Upgrading from a config that used a removed provider:** delete the `[[providers]]` entry and any `[[projects]]` bound to it before starting the new daemon. A project registered through `POST /api/v1/projects` (`source = "api"`) survives in SQLite independently of the config file, and startup fails while it references a provider the config no longer declares. The dashboard lists projects but does not create them. Because the daemon is down, its own DELETE endpoint cannot repair it; the startup error names the `sqlite3` statement that removes the stored row.
 - `providers[].baseUrl` is optional and, when set, must be a `github.com` URL (`github.com`, `www.github.com`, or `api.github.com`). It does not point Looper at a host — the `gh` gateway resolves its own — so a non-github.com value would configure a target Looper cannot drive and is rejected at startup rather than failing later at publish time.
 - `providers[].tokenEnv` names an environment variable, **not the credential the GitHub gateway uses.** Planner, worker, reviewer, fixer, webhook, and discovery calls all authenticate through ambient `gh` auth (`gh auth login`). The named variable is copied unchanged from the daemon environment into trusted `looper review submit` child processes and nowhere else.
 - A project bound to a provider requires both `provider` and a repo (`owner/name`); a binding without a repo is rejected. The project HTTP API can register a local `repoPath` against a running daemon, but provider bindings themselves are file-managed. Already-started work retains its previous catalog snapshot.
@@ -1216,6 +1216,7 @@ Examples:
 ```bash
 LOOPER_CONFIG="$HOME/custom-looper/config.toml" \
 LOOPER_PORT=4321 \
+LOOPER_TOKEN=replace-me \
 LOOPER_ROLES_REVIEWER_DISCOVERY_TRIGGERS_ENABLE_SELF_REVIEW=true \
 looperd
 ```
@@ -1255,7 +1256,7 @@ looperd \
 5. Start the daemon with your installed `looperd` (or `go run ./cmd/looperd` while developing)
 6. Run `looper config show` to inspect the effective config
 
-If you enable `server.authMode=local-token`, also export `LOOPER_TOKEN` before using the CLI.
+If you enable `server.authMode=local-token`, set `server.localToken` in the selected config or export `LOOPER_TOKEN`. The environment value has normal precedence over the file value for that process and is never persisted. Run `looper dashboard` and open the one-shot URL it prints to establish a browser session without putting the long-lived token in the URL.
 
 ## Troubleshooting
 

@@ -201,9 +201,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewPullRequest() error = %v", err)
 	}
-	login, err := gateway.GetCurrentUserLogin(context.Background(), "")
+	login, err := gateway.GetCurrentUserLoginForRepo(context.Background(), "", "")
 	if err != nil {
-		t.Fatalf("GetCurrentUserLogin() error = %v", err)
+		t.Fatalf("GetCurrentUserLoginForRepo() error = %v", err)
 	}
 
 	if got := prs[0].Number; got != 42 {
@@ -1860,25 +1860,32 @@ func TestGatewayIsAuthenticatedTracksGHAuthStatus(t *testing.T) {
 	}
 }
 
-func TestGatewayGetCurrentUserLoginReturnsEmptyForIntegrationTokens(t *testing.T) {
+// An integration token cannot call `api user`. The lookup recovers the login
+// through the GraphQL viewer query rather than reporting an empty identity,
+// which would silently disable every current-user gate downstream.
+func TestGatewayGetCurrentUserLoginFallsBackToViewerForIntegrationTokens(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
-		if strings.Join(options.Args, " ") == "api user --jq .login" {
+		args := strings.Join(options.Args, " ")
+		if args == "api user --jq .login" {
 			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
 			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
 		}
-		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		if strings.HasPrefix(args, "api graphql -f query=query { viewer { login } }") {
+			return shell.Result{Stdout: `{"data":{"viewer":{"login":"integration-bot"}}}`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", args)
 		return shell.Result{}, nil
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	login, err := gateway.GetCurrentUserLogin(context.Background(), "")
+	login, err := gateway.GetCurrentUserLoginForRepo(context.Background(), "", "")
 	if err != nil {
-		t.Fatalf("GetCurrentUserLogin() error = %v", err)
+		t.Fatalf("GetCurrentUserLoginForRepo() error = %v", err)
 	}
-	if login != "" {
-		t.Fatalf("GetCurrentUserLogin() = %q, want empty login for integration token", login)
+	if login != "integration-bot" {
+		t.Fatalf("GetCurrentUserLoginForRepo() = %q, want the viewer-query login", login)
 	}
 }
 

@@ -46,6 +46,9 @@ func newQuarantineSettlementFixture(t *testing.T, loopStatus string, processAliv
 		Config: cfg,
 		Logger: &testLogger{},
 		Now:    func() time.Time { return now },
+		RunSchedulerTick: func(context.Context, Services) error {
+			return nil
+		},
 		ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
 			if !processAlive || pid != int(quarantinedPID) {
 				return "", nil
@@ -150,9 +153,9 @@ func TestQuarantineSettlementRetiresOperatorDisposedExecution(t *testing.T) {
 		t.Fatalf("debt before settlement = %#v, want zero for an operator-disposed loop", before)
 	}
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 1 {
 		t.Fatalf("SettledExecutions = %d, want 1 (summary %#v)", summary.QuarantineSettlement.SettledExecutions, summary.QuarantineSettlement)
@@ -206,9 +209,9 @@ func TestQuarantineSettlementRetainsLiveExecutionAsDebt(t *testing.T) {
 
 	fixture := newQuarantineSettlementFixture(t, "queued", true)
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 0 {
 		t.Fatalf("SettledExecutions = %d, want 0 while the process is observed live", summary.QuarantineSettlement.SettledExecutions)
@@ -245,9 +248,9 @@ func TestQuarantineSettlementKeepsParkedLoopAsDebt(t *testing.T) {
 		t.Fatalf("debt before settlement = %#v, want 1 execution and 1 running run", before)
 	}
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 0 {
 		t.Fatalf("SettledExecutions = %d, want 0 while the loop is still parked", summary.QuarantineSettlement.SettledExecutions)
@@ -271,9 +274,9 @@ func TestQuarantineSettlementKeepsHumanTakeoverAsDebt(t *testing.T) {
 
 	fixture := newQuarantineSettlementFixture(t, "human_takeover", false)
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 0 {
 		t.Fatalf("SettledExecutions = %d, want 0 for a loop parked on a human", summary.QuarantineSettlement.SettledExecutions)
@@ -290,9 +293,9 @@ func TestQuarantineSettlementRetiresStoppedLoop(t *testing.T) {
 
 	fixture := newQuarantineSettlementFixture(t, "terminated", false)
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 1 {
 		t.Fatalf("SettledExecutions = %d, want 1 for a terminated loop", summary.QuarantineSettlement.SettledExecutions)

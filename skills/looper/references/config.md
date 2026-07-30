@@ -81,7 +81,7 @@ The dashboard provides curated field-level controls rather than a raw config edi
 
 - environment- or CLI-overridden fields are visible but read-only because those higher-precedence layers remain authoritative
 - `agent.env` values are write-only: the dashboard shows configured key names and supports set/replace/remove, but the API never returns values
-- `server.localToken`, `daemon.environment`, and arbitrary `agent.params` remain file-only
+- `server.localToken` (or its `LOOPER_TOKEN` environment override), `daemon.environment`, and arbitrary `agent.params` remain outside dashboard editing
 - projects remain managed by the Projects API and SQLite catalog, not the generic Configuration page
 - each config read returns the revision captured with its published values; each patch submits it and repeats an identity/mode/byte check immediately before atomic rename, catching changes present before that final check
 - portable filesystems leave a tiny final-check-to-rename race, so do not combine simultaneous manual and dashboard writes
@@ -163,7 +163,7 @@ Provider validation notes:
 - `baseUrl`, when set, must be a `github.com` URL. It feeds repository identity only and does not point Looper at a host, so a GHES URL is rejected at startup rather than accepted and failed at publish time.
 - `tokenEnv` names an env var copied into trusted `looper review submit` children only. Normal GitHub calls use ambient `gh` auth.
 - A project with an explicit `provider` must also set `repo`; a binding without one is rejected.
-- A project bound to a provider requires a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add`, the dashboard, or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup.
+- A project bound to a provider requires a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add` or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup. The dashboard lists projects but does not create them.
 - Two projects whose repository identities collide are rejected case-insensitively. Every provider resolves to github.com, so the same `owner/name` is a duplicate however many provider ids it is split across.
 
 ## Role model guidance
