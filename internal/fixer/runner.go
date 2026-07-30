@@ -1285,8 +1285,17 @@ func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind,
 	}
 }
 
-// parseFixerBlockedFailureKind accepts only the three kinds the fixer prompt
-// offers, so a blocked repair cannot smuggle in an arbitrary classification.
+// parseFixerBlockedFailureKind bounds a blocked repair to the classifications
+// Looper actually acts on, so it cannot smuggle in an arbitrary one.
+//
+// The prompt advertises only retryable_transient and manual_intervention.
+// retryable_after_resume stays accepted rather than rejected: it is a valid kind
+// elsewhere in the runner, and an agent that reports it should not have its block
+// downgraded to a contract failure. It is not advertised because a repair-step
+// block resumes identically to retryable_transient — NormalizeResumePolicy only
+// applies a kind-derived policy when none is set, and a resumed checkpoint always
+// carries advance_from_checkpoint — so offering it would promise a re-prepared
+// environment that this path does not deliver.
 func parseFixerBlockedFailureKind(raw string) (QueueFailureKind, bool) {
 	switch QueueFailureKind(strings.ToLower(strings.TrimSpace(raw))) {
 	case FailureManualIntervention:

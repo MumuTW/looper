@@ -3,6 +3,7 @@ package fixer
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -211,5 +212,26 @@ func TestRunRepairStepReplaysAfterRejectedOutcome(t *testing.T) {
 				t.Fatal("runRepairStep advanced on the stored checkpoint, want the repair replayed")
 			}
 		})
+	}
+}
+
+// TestFixerPromptOffersOnlyHonoredFailureKinds pins the prompt to the kinds this
+// path actually acts on. A repair-step block resumes identically for both
+// retryable kinds, so advertising retryable_after_resume would promise a
+// re-prepared environment that does not happen. It stays accepted on input.
+func TestFixerPromptOffersOnlyHonoredFailureKinds(t *testing.T) {
+	t.Parallel()
+	prompt := agent.AppendFixerCompletionInstruction("repair the pr")
+	if strings.Contains(prompt, "retryable_after_resume") {
+		t.Fatalf("prompt offers retryable_after_resume, which a repair-step block does not honor:\n%s", prompt)
+	}
+	for _, needle := range []string{"retryable_transient", "manual_intervention"} {
+		if !strings.Contains(prompt, needle) {
+			t.Fatalf("prompt = %q, want %q offered", prompt, needle)
+		}
+	}
+	// Still accepted so a reporting agent is not downgraded to a contract failure.
+	if kind, ok := parseFixerBlockedFailureKind("retryable_after_resume"); !ok || kind != FailureRetryableAfterResume {
+		t.Fatalf("parseFixerBlockedFailureKind(retryable_after_resume) = (%q, %v), want it still accepted", kind, ok)
 	}
 }
