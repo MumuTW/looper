@@ -244,8 +244,17 @@ func hasEmptyPathSegment(path string) bool {
 // reported at their field path; object and map values are reported at their
 // changed leaves.
 func RestartRequiredChanges(oldConfig Config, newConfig Config) []string {
-	oldValue := configJSONValue(oldConfig)
-	newValue := configJSONValue(newConfig)
+	changes, err := RestartRequiredChangesChecked(oldConfig, newConfig)
+	if err != nil {
+		// Legacy callers use a non-empty result as a fail-closed restart gate.
+		// Runtime reload uses RestartRequiredChangesChecked so it can retain and
+		// report the concrete comparison error.
+		return []string{"<config-comparison-error>"}
+	}
+	return changes
+}
+
+func restartRequiredChangesFromJSON(oldConfig Config, newConfig Config, oldValue any, newValue any) []string {
 	changed := make([]string, 0)
 	diffConfigJSON("", oldValue, newValue, &changed)
 
@@ -446,18 +455,13 @@ func resolvedModelBindingPath(cfg Config, role string) string {
 	return path
 }
 
-// CloneConfig returns a complete detached copy. Config is a JSON configuration
-// model, so a non-JSON-representable value in an interface field is a
-// programming error rather than a recoverable runtime condition.
+// CloneConfig returns a complete detached copy without routing through JSON.
+// Agent params are intentionally free-form and may contain values that a
+// programmatic config source can represent but encoding/json cannot. Cloning is
+// an isolation boundary, not validation, so it must not crash the daemon merely
+// because a later comparison or persistence boundary will reject such a value.
 func CloneConfig(source Config) Config {
-	raw, err := json.Marshal(source)
-	if err != nil {
-		panic(fmt.Sprintf("clone config: %v", err))
-	}
-	var cloned Config
-	if err := json.Unmarshal(raw, &cloned); err != nil {
-		panic(fmt.Sprintf("clone config: %v", err))
-	}
+	cloned := cloneConfigReflect(reflect.ValueOf(source), make(map[configCloneVisit]reflect.Value)).Interface().(Config)
 	// Roles.Coding is derived runtime state and intentionally omitted from the
 	// JSON payload above. Keep it detached but intact: dropping an authored
 	// overlay here would make config snapshots silently fall back to legacy
@@ -474,21 +478,115 @@ func CloneConfig(source Config) Config {
 	return cloned
 }
 
-func configJSONValue(value Config) any {
+type configCloneVisit struct {
+	typeOf  reflect.Type
+	pointer uintptr
+}
+
+func cloneConfigReflect(source reflect.Value, visited map[configCloneVisit]reflect.Value) reflect.Value {
+	if !source.IsValid() {
+		return source
+	}
+	switch source.Kind() {
+	case reflect.Interface:
+		if source.IsNil() {
+			return reflect.Zero(source.Type())
+		}
+		cloned := cloneConfigReflect(source.Elem(), visited)
+		result := reflect.New(source.Type()).Elem()
+		result.Set(cloned)
+		return result
+	case reflect.Pointer:
+		if source.IsNil() {
+			return reflect.Zero(source.Type())
+		}
+		visit := configCloneVisit{typeOf: source.Type(), pointer: source.Pointer()}
+		if cloned, ok := visited[visit]; ok {
+			return cloned
+		}
+		result := reflect.New(source.Type().Elem())
+		visited[visit] = result
+		result.Elem().Set(cloneConfigReflect(source.Elem(), visited))
+		return result
+	case reflect.Map:
+		if source.IsNil() {
+			return reflect.Zero(source.Type())
+		}
+		visit := configCloneVisit{typeOf: source.Type(), pointer: source.Pointer()}
+		if cloned, ok := visited[visit]; ok {
+			return cloned
+		}
+		result := reflect.MakeMapWithSize(source.Type(), source.Len())
+		visited[visit] = result
+		iterator := source.MapRange()
+		for iterator.Next() {
+			result.SetMapIndex(cloneConfigReflect(iterator.Key(), visited), cloneConfigReflect(iterator.Value(), visited))
+		}
+		return result
+	case reflect.Slice:
+		if source.IsNil() {
+			return reflect.Zero(source.Type())
+		}
+		visit := configCloneVisit{typeOf: source.Type(), pointer: source.Pointer()}
+		if cloned, ok := visited[visit]; ok {
+			return cloned
+		}
+		result := reflect.MakeSlice(source.Type(), source.Len(), source.Cap())
+		visited[visit] = result
+		for i := 0; i < source.Len(); i++ {
+			result.Index(i).Set(cloneConfigReflect(source.Index(i), visited))
+		}
+		return result
+	case reflect.Array:
+		result := reflect.New(source.Type()).Elem()
+		for i := 0; i < source.Len(); i++ {
+			result.Index(i).Set(cloneConfigReflect(source.Index(i), visited))
+		}
+		return result
+	case reflect.Struct:
+		result := reflect.New(source.Type()).Elem()
+		result.Set(source)
+		for i := 0; i < source.NumField(); i++ {
+			if result.Field(i).CanSet() && source.Type().Field(i).IsExported() {
+				result.Field(i).Set(cloneConfigReflect(source.Field(i), visited))
+			}
+		}
+		return result
+	default:
+		return source
+	}
+}
+
+// RestartRequiredChangesChecked is the recoverable comparison boundary used by
+// runtime reload. It keeps the previous config authoritative when a
+// programmatic candidate contains a value encoding/json cannot compare.
+func RestartRequiredChangesChecked(oldConfig Config, newConfig Config) ([]string, error) {
+	oldValue, err := configJSONValue(oldConfig)
+	if err != nil {
+		return nil, err
+	}
+	newValue, err := configJSONValue(newConfig)
+	if err != nil {
+		return nil, err
+	}
+	return restartRequiredChangesFromJSON(oldConfig, newConfig, oldValue, newValue), nil
+}
+
+func configJSONValue(value Config) (any, error) {
 	raw, err := json.Marshal(value)
 	if err != nil {
-		panic(fmt.Sprintf("compare config: %v", err))
+		return nil, fmt.Errorf("compare config: %w", err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var decoded any
 	if err := decoder.Decode(&decoded); err != nil {
-		panic(fmt.Sprintf("compare config: %v", err))
+		return nil, fmt.Errorf("compare config: %w", err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		panic("compare config: unexpected trailing JSON value")
+		return nil, fmt.Errorf("compare config: unexpected trailing JSON value: %w", err)
 	}
-	return decoded
+	return decoded, nil
 }
 
 func diffConfigJSON(path string, oldValue any, newValue any, changed *[]string) {

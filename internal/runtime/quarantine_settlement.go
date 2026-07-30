@@ -207,17 +207,16 @@ func (r *Runtime) settleQuarantinedExecution(ctx context.Context, repositories *
 	if classification.PID > 0 {
 		payload["pid"] = classification.PID
 	}
-	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-		ID:          newRuntimeEventID(),
-		EventType:   recoveryExecutionQuarantineRetiredEventType,
-		ProjectID:   execution.ProjectID,
-		LoopID:      execution.LoopID,
-		RunID:       execution.RunID,
-		EntityType:  stringPtr("agent_execution"),
-		EntityID:    stringPtr(execution.ID),
-		PayloadJSON: mustMarshalJSON(payload),
-		CreatedAt:   nowISO,
-	}); err != nil {
+	if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
+		ID:         newRuntimeEventID(),
+		EventType:  recoveryExecutionQuarantineRetiredEventType,
+		ProjectID:  execution.ProjectID,
+		LoopID:     execution.LoopID,
+		RunID:      execution.RunID,
+		EntityType: stringPtr("agent_execution"),
+		EntityID:   stringPtr(execution.ID),
+		CreatedAt:  nowISO,
+	}, payload); err != nil {
 		return settledRuns, events, err
 	}
 	events++

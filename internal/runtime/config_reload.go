@@ -185,7 +185,10 @@ func (r *Runtime) ReloadConfig(ctx context.Context) error {
 }
 
 func (r *Runtime) applyLoadedConfigLocked(loaded config.LoadedFileConfig, now time.Time) error {
-	restartRequired := config.RestartRequiredChanges(r.loadedConfig.Config, loaded.Config)
+	restartRequired, err := config.RestartRequiredChangesChecked(r.loadedConfig.Config, loaded.Config)
+	if err != nil {
+		return r.rejectConfigReloadLocked("invalid", nil, fmt.Errorf("compare effective configuration: %w", err))
+	}
 	if len(restartRequired) > 0 {
 		sort.Strings(restartRequired)
 		return r.rejectConfigReloadLocked("restart_required", restartRequired, nil)
@@ -357,7 +360,14 @@ func (r *Runtime) PatchConfig(ctx context.Context, patch ConfigPatch) error {
 	if err != nil {
 		return &ConfigPatchError{Kind: "validation", Message: err.Error(), Err: err}
 	}
-	if rejected := config.RestartRequiredChanges(r.loadedConfig.Config, candidate.Config); len(rejected) > 0 {
+	rejected, compareErr := config.RestartRequiredChangesChecked(r.loadedConfig.Config, candidate.Config)
+	if compareErr != nil {
+		now := r.now().UTC()
+		r.configReloadStatus.LastAttemptAt = timePointer(now)
+		reloadErr := r.rejectConfigReloadLocked("invalid", nil, fmt.Errorf("compare effective configuration: %w", compareErr))
+		return &ConfigPatchError{Kind: "validation", Message: reloadErr.Error(), Paths: paths, Err: reloadErr}
+	}
+	if len(rejected) > 0 {
 		sort.Strings(rejected)
 		kind, message := configRestartRejection(rejected)
 		return &ConfigPatchError{Kind: kind, Message: message, Paths: rejected}

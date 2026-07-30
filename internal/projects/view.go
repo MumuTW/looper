@@ -1,8 +1,6 @@
 package projects
 
 import (
-	"encoding/json"
-	"fmt"
 	"strings"
 
 	"github.com/MumuTW/looper/internal/config"
@@ -140,65 +138,15 @@ func providerByID(cfg config.Config, providerID string) (config.ProviderConfig, 
 }
 
 func cloneProjectRefConfig(source config.ProjectRefConfig) config.ProjectRefConfig {
-	encoded, err := json.Marshal(source)
-	if err != nil {
-		panic(fmt.Sprintf("clone project view: %v", err))
-	}
-	var cloned config.ProjectRefConfig
-	if err := json.Unmarshal(encoded, &cloned); err != nil {
-		panic(fmt.Sprintf("clone project view: %v", err))
-	}
-	return cloned
+	cloned := config.CloneConfig(config.Config{Projects: []config.ProjectRefConfig{source}})
+	return cloned.Projects[0]
 }
 
 func cloneProviderConfig(source config.ProviderConfig) config.ProviderConfig {
-	encoded, err := json.Marshal(source)
-	if err != nil {
-		panic(fmt.Sprintf("clone provider view: %v", err))
-	}
-	var cloned config.ProviderConfig
-	if err := json.Unmarshal(encoded, &cloned); err != nil {
-		panic(fmt.Sprintf("clone provider view: %v", err))
-	}
-	return cloned
+	cloned := config.CloneConfig(config.Config{Providers: []config.ProviderConfig{source}})
+	return cloned.Providers[0]
 }
 
 func cloneRoleConfigs(source config.RoleConfigs) config.RoleConfigs {
-	encoded, err := json.Marshal(source)
-	if err != nil {
-		panic(fmt.Sprintf("clone role policy view: %v", err))
-	}
-	var cloned config.RoleConfigs
-	if err := json.Unmarshal(encoded, &cloned); err != nil {
-		panic(fmt.Sprintf("clone role policy view: %v", err))
-	}
-	if len(source.Coding) > 0 {
-		cloned.Coding = make(map[string]config.CodingRoleConfig, len(source.Coding))
-		for name, role := range source.Coding {
-			cloned.Coding[name] = cloneCodingRoleConfig(role)
-		}
-	}
-	return cloned
-}
-
-func cloneCodingRoleConfig(source config.CodingRoleConfig) config.CodingRoleConfig {
-	cloned := source
-	cloned.Discovery.Labels = append([]string(nil), source.Discovery.Labels...)
-	if source.Agent != nil {
-		agent := config.RoleAgentConfig{}
-		if source.Agent.Profile != nil {
-			profile := *source.Agent.Profile
-			agent.Profile = &profile
-		}
-		if source.Agent.Vendor != nil {
-			vendor := *source.Agent.Vendor
-			agent.Vendor = &vendor
-		}
-		if source.Agent.Model != nil {
-			model := *source.Agent.Model
-			agent.Model = &model
-		}
-		cloned.Agent = &agent
-	}
-	return cloned
+	return config.CloneConfig(config.Config{Roles: source}).Roles
 }
