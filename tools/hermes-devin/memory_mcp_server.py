@@ -139,6 +139,7 @@ TOOLS = [
 ]
 
 TOOL_NAMES = {t["name"] for t in TOOLS}
+VALID_TARGETS = {"memory", "user"}
 
 
 def log(msg: str) -> None:
@@ -235,7 +236,21 @@ def call_tool(name: str, args: dict) -> tuple[str, bool]:
     if problem:
         return json.dumps({"success": False, "error": problem}, ensure_ascii=False), True
 
+    # Reject rather than coerce: every downstream reader treats "not exactly
+    # 'user'" as the project store, so a near-miss like "users" or "User"
+    # would silently read or write the wrong one while echoing the name back
+    # as if it had been honoured.
     target = args.get("target") or "memory"
+    if target not in VALID_TARGETS:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Invalid target {target!r}. Must be one of: "
+                + ", ".join(sorted(VALID_TARGETS)),
+            },
+            ensure_ascii=False,
+        ), True
+
     try:
         # Rebuilt per call: Hermes's own sessions mutate the same files under a
         # file lock, so a cached store would hand back stale entries.

@@ -37,7 +37,7 @@ PATCH_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/acp-permission-allowli
 # sha256 of the exact upstream file this patch was generated against, and of
 # the result of applying it. Anything else means "do not touch".
 STOCK_SHA="03190fcd4f9c985cab5cbaa90f7391cad8122148d7d300a81da8be0c2189c4bf"
-PATCHED_SHA="142ac84e4a7022b4609d28a83445997d45b9aa0d3cf6a68ebbb6a9c5ba9b3ea7"
+PATCHED_SHA="4ec44e3260a9d86bba91e19a3dd8dc1d9f793e341855df19fd876b122bac1517"
 
 die() { echo "$*" >&2; exit 1; }
 
@@ -86,6 +86,15 @@ do_apply() {
     unknown) refuse_unknown ;;
   esac
 
+  # An existing .orig is not ours to overwrite: it may be the only copy of a
+  # shim the operator customized, left by an earlier manual patch or a failed
+  # recovery. Side-step to a timestamped name rather than clobbering it.
+  if [ -e "$BACKUP" ]; then
+    BACKUP="$TARGET.orig-$(date +%Y%m%d_%H%M%S)"
+    echo "note: $TARGET.orig already exists and was left untouched;"
+    echo "      this run's backup goes to $(basename "$BACKUP")"
+  fi
+
   cp -p "$TARGET" "$BACKUP"
   patch -p1 -s -d "$HERMES_INSTALL_DIR" < "$PATCH_FILE" || {
     cp -p "$BACKUP" "$TARGET"
@@ -118,7 +127,9 @@ do_revert() {
   [ "$(target_state)" = "stock" ] || die "revert did not restore the expected upstream file: $TARGET"
 
   echo "✓ reverted: $TARGET"
-  [ -f "$BACKUP" ] && echo "  backup left in place: $BACKUP"
+  for b in "$TARGET".orig "$TARGET".orig-*; do
+    [ -e "$b" ] && echo "  backup left in place: $b"
+  done
   return 0
 }
 
