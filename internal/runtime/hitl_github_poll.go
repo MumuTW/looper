@@ -247,33 +247,23 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	defer unlock()
 
 	loop, err := repos.Loops.GetByID(ctx, loopID)
-	if err != nil || loop == nil {
+	if err != nil || loop == nil || loop.Status != "awaiting_human" {
 		return err
-	}
-	if loop.Status != "awaiting_human" {
-		return nil
 	}
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
 	defer unlockTarget()
-	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-	if !ok {
-		return nil
+	result, err := loops.RecordHITLAnswer(ctx, repos, loops.HITLAnswerInput{LoopID: loopID, Answer: answer, NowISO: nowISO, RequireExistingAsk: true})
+	if err != nil || !result.Applied {
+		return err
 	}
 	// GitHub answers are admitted only after author allowlist/repository-write
 	// checks above. That authenticated answer is the authority to consume the
 	// exact staged malformed gate identity; changed evidence remains parked.
+	ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
 	if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
 		return fmt.Errorf("consume malformed HITL gate evidence: %w", err)
 	}
-	ask.Answer = answer
-	ask.Status = "answered"
-	ask.AnsweredAt = nowISO
-	meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-	if werr != nil {
-		return werr
-	}
-	updated := *loop
-	updated.MetadataJSON = &meta
+	updated := result.Loop
 	updated.Status = "running"
 	updated.NextRunAt = &nowISO
 	updated.UpdatedAt = nowISO
