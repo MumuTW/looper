@@ -757,12 +757,13 @@ func marshalTrustedReviewConfigSnapshot(source config.Config) ([]byte, error) {
 	snapshot.Daemon.Environment = nil
 	// roles.deployer.environment holds the credentials a deploy needs, globally and
 	// per project. It is the same class of secret as daemon.environment above.
+	//
+	// The per-project values need copying first. `snapshot := source` copies the
+	// slice header, so the projects share a backing array and their Roles pointers
+	// are the same objects — clearing through them would erase the operator's real
+	// deploy credentials and break every later deploy, not just hide them here.
 	snapshot.Roles.Deployer.Environment = nil
-	for i := range snapshot.Projects {
-		if snapshot.Projects[i].Roles != nil && snapshot.Projects[i].Roles.Deployer != nil {
-			snapshot.Projects[i].Roles.Deployer.Environment = nil
-		}
-	}
+	snapshot.Projects = redactedProjects(source.Projects)
 
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {
@@ -1051,4 +1052,26 @@ func (e *proxyExitError) ExitCode() int {
 		return 1
 	}
 	return e.code
+}
+
+// redactedProjects copies projects with their deploy credentials removed,
+// leaving the configuration it was given untouched.
+//
+// The copy has to reach through Roles: a slice copy shares its backing array, so
+// clearing Environment through the copy would erase the operator's real deploy
+// credentials rather than withholding them from this snapshot.
+func redactedProjects(projects []config.ProjectRefConfig) []config.ProjectRefConfig {
+	redacted := append([]config.ProjectRefConfig{}, projects...)
+	for i := range redacted {
+		roles := redacted[i].Roles
+		if roles == nil || roles.Deployer == nil || roles.Deployer.Environment == nil {
+			continue
+		}
+		deployer := *roles.Deployer
+		deployer.Environment = nil
+		clonedRoles := *roles
+		clonedRoles.Deployer = &deployer
+		redacted[i].Roles = &clonedRoles
+	}
+	return redacted
 }
