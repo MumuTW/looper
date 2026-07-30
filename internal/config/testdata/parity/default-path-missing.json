@@ -154,6 +154,10 @@
       },
       "intake": {},
       "roles": {
+        "auditor": {
+          "enabled": false,
+          "windowMinutes": 60
+        },
         "coordinator": {
           "enabled": false,
           "pollInterval": "5m",
