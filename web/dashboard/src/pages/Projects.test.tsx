@@ -5,7 +5,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "@/App";
 import { ProjectsPage } from "@/pages/Projects";
@@ -64,7 +64,7 @@ function renderProjects(initialPath = "/projects") {
               <Route path="/projects" element={<ProjectsPage />} />
               <Route
                 path="/loops"
-                element={<div data-testid="loops-route">loops</div>}
+                element={<RouteProbe />}
               />
             </Routes>
           </ProjectFilterProvider>
@@ -72,6 +72,10 @@ function renderProjects(initialPath = "/projects") {
       </ToastProvider>
     </MemoryRouter>,
   );
+}
+
+function RouteProbe() {
+  return <div data-testid="loops-route">{useLocation().pathname}</div>;
 }
 
 afterEach(() => {
@@ -161,7 +165,7 @@ describe("ProjectsPage", { timeout: 30_000 }, () => {
     fireEvent.click(row.closest("tr")!);
 
     await waitFor(() => {
-      expect(screen.getByTestId("loops-route")).toBeTruthy();
+      expect(screen.getByTestId("loops-route").textContent).toBe("/loops");
     });
     expect(localStorage.getItem("looper.dashboard.projectFilter")).toBe("project_1");
 });

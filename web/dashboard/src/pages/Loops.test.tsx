@@ -6,7 +6,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LoopsPage } from "@/pages/Loops";
 import { DashboardDataProvider } from "@/lib/DashboardDataContext";
@@ -126,7 +126,7 @@ function renderLoops(initialPath = "/loops") {
               <Route path="/loops" element={<LoopsPage />} />
               <Route
                 path="/loops/:selector"
-                element={<div data-testid="loops-route">loops</div>}
+                element={<RouteProbe />}
               />
             </Routes>
           </ProjectFilterProvider>
@@ -134,6 +134,10 @@ function renderLoops(initialPath = "/loops") {
       </ToastProvider>
     </MemoryRouter>,
   );
+}
+
+function RouteProbe() {
+  return <div data-testid="loops-route">{useLocation().pathname}</div>;
 }
 
 afterEach(() => {
@@ -322,7 +326,7 @@ describe("LoopsPage", { timeout: 30_000 }, () => {
     fireEvent.click(row.closest("tr")!);
 
     await waitFor(() => {
-      expect(screen.getByTestId("loops-route")).toBeTruthy();
+      expect(screen.getByTestId("loops-route").textContent).toBe("/loops/7");
     });
   });
 
@@ -335,7 +339,8 @@ describe("LoopsPage", { timeout: 30_000 }, () => {
           items: [loopFixture({ status: stopped ? "paused" : "running" })],
           total: 1,
         }),
-      stop: () => {
+      stop: (selector) => {
+        expect(selector).toBe("7");
         stopped = true;
         return response({ stopped: true, loopId: "loop_7" });
       },
@@ -345,6 +350,12 @@ describe("LoopsPage", { timeout: 30_000 }, () => {
 
     // The running loop is joined to its active run, so Stop is enabled.
     expect(await screen.findByText("acme/looper#7")).toBeTruthy();
+    const activeRunsCallsBeforeStop = fetchMock.mock.calls.filter(
+      ([input]) => String(input) === "/api/v1/runs/active",
+    ).length;
+    const loopsCallsBeforeStop = fetchMock.mock.calls.filter(
+      ([input]) => String(input).startsWith("/api/v1/loops"),
+    ).length;
     // The row status chip is an authority field, distinct from the "running"
     // option in the status filter dropdown.
     const row = screen.getByText("acme/looper#7").closest("tr")!;
@@ -355,13 +366,18 @@ describe("LoopsPage", { timeout: 30_000 }, () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Stop" }));
 
     await waitFor(() => {
-      expect(screen.getByText("paused")).toBeTruthy();
+      const row = screen.getByText("acme/looper#7").closest("tr")!;
+      expect(within(row).getByText("paused")).toBeTruthy();
     });
-    expect(
-      fetchMock.mock.calls.some(([input]) => String(input) === "/api/v1/runs/active"),
-    ).toBe(true);
-    expect(
-      fetchMock.mock.calls.some(([input]) => String(input).startsWith("/api/v1/loops")),
-    ).toBe(true);
+    await waitFor(() => {
+      const activeRunsCallsAfterStop = fetchMock.mock.calls.filter(
+        ([input]) => String(input) === "/api/v1/runs/active",
+      ).length;
+      const loopsCallsAfterStop = fetchMock.mock.calls.filter(
+        ([input]) => String(input).startsWith("/api/v1/loops"),
+      ).length;
+      expect(activeRunsCallsAfterStop).toBeGreaterThan(activeRunsCallsBeforeStop);
+      expect(loopsCallsAfterStop).toBeGreaterThan(loopsCallsBeforeStop);
+    });
   });
 });

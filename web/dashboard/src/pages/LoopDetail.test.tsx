@@ -131,13 +131,11 @@ const endSSE = "event: end\ndata: {}\n\n";
 type StreamOpts = { stderr?: boolean };
 
 /**
- * Default dual-SSE mock: a fresh stream instance per call (a Response body can
- * only be read once), with the stderr follow staying open so it never races the
- * primary stream's terminal state. needsSeparateStderrFollow() always opens a
- * stderr follow, so every test must serve both streams.
+ * Default stream mock: a fresh stream instance per call (a Response body can
+ * only be read once). The current logs endpoint follows a single stream.
  *
- * openLoopLogsStream is called as (selector, signal, opts) — the stderr flag
- * lives on the third argument, not the first.
+ * The optional third argument remains available to fixture variants that need
+ * to model stderr chunks.
  */
 function defaultStreams(
   primary: string,
@@ -272,7 +270,7 @@ describe("LoopDetailPage", { timeout: 30_000 }, () => {
     });
     // Header shows the loop seq; the back link returns to the loops list.
     expect(screen.getByRole("heading", { name: /#42/ })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "← Loops" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "← Loops" }).getAttribute("href")).toBe("/loops");
     // Metadata authority fields.
     expect(screen.getByText("project_1")).toBeTruthy();
     expect(screen.getByText("acme/looper")).toBeTruthy();
@@ -290,6 +288,10 @@ describe("LoopDetailPage", { timeout: 30_000 }, () => {
     // Logs pane is wired to the route selector and shows the streamed content.
     expect(screen.getByText(/agent stdout seed/)).toBeTruthy();
     expect(screen.getByText(/appended chunk/)).toBeTruthy();
+    await waitFor(() => {
+      expect(apiMocks.openLoopLogsStream).toHaveBeenCalledTimes(1);
+      expect(apiMocks.openLoopLogsStream.mock.calls.map(([selector]) => selector)).toEqual(["42"]);
+    });
   });
 
   it("presents a terminal status when the stdout stream ends normally", async () => {
@@ -382,6 +384,7 @@ describe("LoopDetailPage", { timeout: 30_000 }, () => {
         return response(stopped ? { items: [] } : { items: [activeRun] });
       }
       if (url.includes("/runs/active/") && url.endsWith("/stop") && init?.method === "POST") {
+        expect(url).toBe("/api/v1/runs/active/42/stop");
         stopped = true;
         return response({ stopped: true, loopId: "loop_1" });
       }
@@ -398,6 +401,9 @@ describe("LoopDetailPage", { timeout: 30_000 }, () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     });
+    const activeRunsCallsBeforeStop = fetchMock.mock.calls.filter(
+      ([input]) => String(input) === "/api/v1/runs/active",
+    ).length;
 
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
     await screen.findByRole("dialog");
@@ -407,8 +413,11 @@ describe("LoopDetailPage", { timeout: 30_000 }, () => {
     await waitFor(() => {
       expect(screen.getAllByText("paused").length).toBeGreaterThan(0);
     });
-    expect(
-      fetchMock.mock.calls.some(([input]) => String(input) === "/api/v1/runs/active"),
-    ).toBe(true);
+    await waitFor(() => {
+      const activeRunsCallsAfterStop = fetchMock.mock.calls.filter(
+        ([input]) => String(input) === "/api/v1/runs/active",
+      ).length;
+      expect(activeRunsCallsAfterStop).toBeGreaterThan(activeRunsCallsBeforeStop);
+    });
   });
 });

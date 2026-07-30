@@ -6,7 +6,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OverviewPage } from "@/pages/Overview";
 import { DashboardDataProvider } from "@/lib/DashboardDataContext";
@@ -100,7 +100,7 @@ function statusFixture(overrides: Partial<StatusData> = {}): StatusData {
       healthy: true,
       queuedItems: 1,
       runningItems: 2,
-      activeRuns: 2,
+      activeRuns: 3,
       totalRuns: 10,
       failedItems: 0,
     },
@@ -158,7 +158,7 @@ function renderOverview(initialPath = "/") {
               />
               <Route
                 path="/loops/:selector"
-                element={<div data-testid="loops-route">loops</div>}
+                element={<RouteProbe />}
               />
             </Routes>
           </ProjectFilterProvider>
@@ -166,6 +166,10 @@ function renderOverview(initialPath = "/") {
       </ToastProvider>
     </MemoryRouter>,
   );
+}
+
+function RouteProbe() {
+  return <div data-testid="loops-route">{useLocation().pathname}</div>;
 }
 
 afterEach(() => {
@@ -231,9 +235,10 @@ describe("OverviewPage", { timeout: 30_000 }, () => {
     expect(screen.getByText("managed")).toBeTruthy();
     // Scheduler card authority fields.
     expect(screen.getByText("Active runs")).toBeTruthy();
-    // 2 active runs from the fixture, surfaced under the "Active runs" label.
-    const activeRunsRow = screen.getByText("Active runs").closest("dl");
-    expect(activeRunsRow?.textContent).toContain("2");
+    // Keep the active-run count distinct from the running-item count and scope
+    // it to the exact scheduler row.
+    const activeRunsRow = screen.getByText("Active runs").parentElement;
+    expect(within(activeRunsRow!).getByText("3")).toBeTruthy();
     // Loops card totals (summed across roles).
     const loopsCard = screen.getByText("running").closest("dl");
     expect(loopsCard?.textContent).toContain("2");
@@ -314,7 +319,7 @@ describe("OverviewPage", { timeout: 30_000 }, () => {
     fireEvent.click(row.closest("tr")!);
 
     await waitFor(() => {
-      expect(screen.getByTestId("loops-route")).toBeTruthy();
+      expect(screen.getByTestId("loops-route").textContent).toBe("/loops/7");
     });
   });
 
@@ -327,8 +332,10 @@ describe("OverviewPage", { timeout: 30_000 }, () => {
 
     // Scheduler card surfaces the failure with a retry affordance.
     expect(await screen.findByText(/Failed to load status/)).toBeTruthy();
-    // Loops card reports the status failure rather than stale totals.
-    expect(screen.getByText("Unavailable (status failed)")).toBeTruthy();
+    // Scope this authority state to Loops: Triage also degrades on status
+    // failures and has the same copy.
+    const loopsCard = screen.getByRole("heading", { name: "Loops" }).closest("section")!;
+    expect(within(loopsCard).getByText("Unavailable (status failed)")).toBeTruthy();
   });
 
   it("refreshes the running loops list after a destructive stop mutation", async () => {
@@ -338,7 +345,8 @@ describe("OverviewPage", { timeout: 30_000 }, () => {
         response(
           stopped ? { items: [] } : { items: [activeRunFixture()] },
         ),
-      stop: () => {
+      stop: (selector) => {
+        expect(selector).toBe("7");
         stopped = true;
         return response({ stopped: true, loopId: "loop_7" });
       },
@@ -347,6 +355,9 @@ describe("OverviewPage", { timeout: 30_000 }, () => {
     renderOverview();
 
     expect(await screen.findByText("acme/looper#42")).toBeTruthy();
+    const activeRunsCallsBeforeStop = fetchMock.mock.calls.filter(
+      ([input]) => String(input) === "/api/v1/runs/active",
+    ).length;
 
     // Open the stop confirmation from the running row's action bar.
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
@@ -356,9 +367,11 @@ describe("OverviewPage", { timeout: 30_000 }, () => {
     await waitFor(() => {
       expect(screen.getByText("No running loops")).toBeTruthy();
     });
-    // The post-mutation refresh re-fetched the active runs endpoint.
-    expect(
-      fetchMock.mock.calls.some(([input]) => String(input) === "/api/v1/runs/active"),
-    ).toBe(true);
+    await waitFor(() => {
+      const activeRunsCallsAfterStop = fetchMock.mock.calls.filter(
+        ([input]) => String(input) === "/api/v1/runs/active",
+      ).length;
+      expect(activeRunsCallsAfterStop).toBeGreaterThan(activeRunsCallsBeforeStop);
+    });
   });
 });
