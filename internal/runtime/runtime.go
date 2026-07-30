@@ -918,7 +918,12 @@ func (r *Runtime) start(ctx context.Context) error {
 	// Every project is GitHub, so the gateway is always needed. GHPath may be
 	// empty here; startup validation is what reports a missing gh, not a nil
 	// gateway.
-	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), RequireCredential: true, Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+	if r.webhook != nil {
+		// Long-lived webhook children need their pipes before Start. Bind them to
+		// the same mutable gateway so config reload rotates every daemon gh path.
+		r.webhook.setGitHubGateway(githubGateway)
+	}
 	projectService := &projects.Service{
 		DB:             coordinator.DB(),
 		Repos:          repositories,

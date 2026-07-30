@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/url"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -68,35 +68,37 @@ type webhookForwarderStartResult struct {
 type webhookForwarderStarter func(context.Context, webhookForwarderCommand) (webhookForwarderStartResult, error)
 
 type webhookForwarderCommand struct {
-	Path   string
-	Repo   string
-	URL    string
-	Events []string
-	Env    map[string]string
+	Path    string
+	Repo    string
+	URL     string
+	Events  []string
+	Process *exec.Cmd
 }
 
 type webhookForwarderManagerOptions struct {
-	Config       config.Config
-	Logger       bootstrap.Logger
-	Now          func() time.Time
-	StartProcess webhookForwarderStarter
-	BackoffBase  time.Duration
-	BackoffMax   time.Duration
-	TailLimit    int
-	Sleep        func(context.Context, time.Duration) error
-	StopTimeout  time.Duration
+	Config        config.Config
+	GitHubGateway *githubinfra.Gateway
+	Logger        bootstrap.Logger
+	Now           func() time.Time
+	StartProcess  webhookForwarderStarter
+	BackoffBase   time.Duration
+	BackoffMax    time.Duration
+	TailLimit     int
+	Sleep         func(context.Context, time.Duration) error
+	StopTimeout   time.Duration
 }
 
 type webhookForwarderManager struct {
-	config       config.Config
-	logger       bootstrap.Logger
-	now          func() time.Time
-	startProcess webhookForwarderStarter
-	backoffBase  time.Duration
-	backoffMax   time.Duration
-	tailLimit    int
-	sleep        func(context.Context, time.Duration) error
-	stopTimeout  time.Duration
+	config        config.Config
+	githubGateway *githubinfra.Gateway
+	logger        bootstrap.Logger
+	now           func() time.Time
+	startProcess  webhookForwarderStarter
+	backoffBase   time.Duration
+	backoffMax    time.Duration
+	tailLimit     int
+	sleep         func(context.Context, time.Duration) error
+	stopTimeout   time.Duration
 
 	syncMu         sync.Mutex
 	mu             sync.RWMutex
@@ -123,6 +125,10 @@ func newWebhookForwarderManager(options webhookForwarderManagerOptions) *webhook
 	if startProcess == nil {
 		startProcess = startWebhookForwarderProcess
 	}
+	githubGateway := options.GitHubGateway
+	if githubGateway == nil {
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(options.Config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(options.Config), RequireCredential: true})
+	}
 	backoffBase := options.BackoffBase
 	if backoffBase <= 0 {
 		backoffBase = time.Second
@@ -145,16 +151,17 @@ func newWebhookForwarderManager(options webhookForwarderManagerOptions) *webhook
 	}
 
 	manager := &webhookForwarderManager{
-		config:       options.Config,
-		logger:       options.Logger,
-		now:          now,
-		startProcess: startProcess,
-		backoffBase:  backoffBase,
-		backoffMax:   backoffMax,
-		tailLimit:    tailLimit,
-		sleep:        sleep,
-		stopTimeout:  stopTimeout,
-		forwarders:   map[string]*managedWebhookForwarder{},
+		config:        options.Config,
+		githubGateway: githubGateway,
+		logger:        options.Logger,
+		now:           now,
+		startProcess:  startProcess,
+		backoffBase:   backoffBase,
+		backoffMax:    backoffMax,
+		tailLimit:     tailLimit,
+		sleep:         sleep,
+		stopTimeout:   stopTimeout,
+		forwarders:    map[string]*managedWebhookForwarder{},
 	}
 	manager.endpoint, manager.initialReasons = webhookForwardEndpoint(options.Config)
 	return manager
@@ -304,17 +311,19 @@ func (m *webhookForwarderManager) superviseForwarder(ctx context.Context, forwar
 		if m.endpoint != nil {
 			endpoint = *m.endpoint
 		}
-		env := config.DaemonGitHubCredentialEnv(m.config)
-		if len(env) == 0 {
-			m.markForwarderError(forwarder, "start failed: daemon has no configured GitHub credential", true)
+		args := []string{"webhook", "forward", "--repo=" + forwarder.repo, "--events=" + strings.Join(webhookForwarderEvents, ","), "--url=" + endpoint}
+		hostname, _ := splitTunnelRepoHostname(forwarder.repo)
+		process, err := m.githubGateway.DaemonCommand(ctx, hostname, args...)
+		if err != nil {
+			m.markForwarderError(forwarder, "start failed: "+err.Error(), true)
 			return
 		}
 		startResult, err := m.startProcess(ctx, webhookForwarderCommand{
-			Path:   strings.TrimSpace(derefString(m.config.Tools.GHPath)),
-			Repo:   forwarder.repo,
-			URL:    endpoint,
-			Events: webhookForwarderEvents,
-			Env:    env,
+			Path:    strings.TrimSpace(derefString(m.config.Tools.GHPath)),
+			Repo:    forwarder.repo,
+			URL:     endpoint,
+			Events:  webhookForwarderEvents,
+			Process: process,
 		})
 		if err != nil {
 			m.markForwarderError(forwarder, fmt.Sprintf("start failed: %s", err.Error()), false)
@@ -677,21 +686,10 @@ func (f *managedWebhookForwarder) setProcess(process webhookForwarderProcess) {
 }
 
 func startWebhookForwarderProcess(ctx context.Context, command webhookForwarderCommand) (webhookForwarderStartResult, error) {
-	if len(command.Env) == 0 {
-		return webhookForwarderStartResult{}, fmt.Errorf("daemon has no configured GitHub credential")
+	if command.Process == nil {
+		return webhookForwarderStartResult{}, fmt.Errorf("daemon GitHub command is unavailable")
 	}
-	args := []string{
-		"webhook",
-		"forward",
-		"--repo=" + command.Repo,
-		"--events=" + strings.Join(command.Events, ","),
-		"--url=" + command.URL,
-	}
-	cmd := exec.CommandContext(ctx, command.Path, args...)
-	cmd.Env = os.Environ()
-	for key, value := range command.Env {
-		cmd.Env = append(cmd.Env, key+"="+value)
-	}
+	cmd := command.Process
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return webhookForwarderStartResult{}, err

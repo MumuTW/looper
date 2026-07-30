@@ -99,6 +99,7 @@ func TestWebhookForwarderManagerStartsUniqueReposAndRetainsTail(t *testing.T) {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Webhook.Enabled = true
+	cfg.Agent.Env = map[string]string{"GH_TOKEN": "token"}
 	ghPath := "/resolved/gh"
 	cfg.Tools.GHPath = &ghPath
 
@@ -209,8 +210,8 @@ func TestWebhookForwarderManagerPassesDaemonCredentialEnv(t *testing.T) {
 	}})
 	m.Sync(context.Background(), []storage.ProjectRecord{{ID: "p", MetadataJSON: stringPtr(`{"repo":"acme/repo"}`)}})
 	t.Cleanup(m.Stop)
-	if command := <-got; command.Env["GH_TOKEN"] != "token" {
-		t.Fatalf("GH_TOKEN = %q", command.Env["GH_TOKEN"])
+	if command := <-got; !containsEnv(command.Process.Env, "GH_TOKEN=token") {
+		t.Fatalf("child env = %q, want GH_TOKEN", command.Process.Env)
 	}
 }
 
@@ -283,6 +284,7 @@ func TestWebhookForwarderManagerRespawnsAndStopsRemovedRepo(t *testing.T) {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Webhook.Enabled = true
+	cfg.Agent.Env = map[string]string{"GH_TOKEN": "token"}
 	ghPath := "/resolved/gh"
 	cfg.Tools.GHPath = &ghPath
 
@@ -356,6 +358,7 @@ func TestWebhookForwarderManagerResetsBackoffAfterSuccessfulStart(t *testing.T) 
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Webhook.Enabled = true
+	cfg.Agent.Env = map[string]string{"GH_TOKEN": "token"}
 	ghPath := "/resolved/gh"
 	cfg.Tools.GHPath = &ghPath
 
@@ -417,6 +420,7 @@ func TestRuntimeStartDegradesWebhookWithoutFailingStartup(t *testing.T) {
 	}
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
 	cfg.Webhook.Enabled = true
+	cfg.Agent.Env = map[string]string{"GH_TOKEN": "token"}
 	cfg.Server.Host = "0.0.0.0"
 	ghPath := "/resolved/gh"
 	cfg.Tools.GHPath = &ghPath

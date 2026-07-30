@@ -52,6 +52,46 @@ func TestGatewayRequireCredentialRejectsWrongHostTokenFamily(t *testing.T) {
 	}
 }
 
+func TestGatewayDaemonCommandUsesOnlyTheTargetHostCredential(t *testing.T) {
+	t.Setenv("GH_TOKEN", "ambient-public")
+	t.Setenv("GH_ENTERPRISE_TOKEN", "ambient-enterprise")
+	g := New(Options{Env: map[string]string{
+		"GH_TOKEN":            "configured-public",
+		"GH_ENTERPRISE_TOKEN": "configured-enterprise",
+	}, RequireCredential: true})
+
+	command, err := g.DaemonCommand(context.Background(), "ghe.example.test", "webhook", "forward")
+	if err != nil {
+		t.Fatalf("DaemonCommand() error = %v", err)
+	}
+	if !containsEnvironment(command.Env, "GH_ENTERPRISE_TOKEN=configured-enterprise") || containsEnvironmentPrefix(command.Env, "GH_TOKEN=") {
+		t.Fatalf("child env = %q, want only configured GHES credential", command.Env)
+	}
+
+	g.UpdateCredentialEnv(map[string]string{"GH_TOKEN": "rotated-public"})
+	if _, err := g.DaemonCommand(context.Background(), "ghe.example.test", "webhook", "forward"); !errors.Is(err, ErrCredentialUnavailable) {
+		t.Fatalf("GHES DaemonCommand() error = %v, want ErrCredentialUnavailable after rotation", err)
+	}
+}
+
+func containsEnvironment(env []string, want string) bool {
+	for _, entry := range env {
+		if entry == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEnvironmentPrefix(env []string, prefix string) bool {
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestGatewayAuthHealthReportsActualLoginAndCoreRateFromOneCall(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	calls := 0

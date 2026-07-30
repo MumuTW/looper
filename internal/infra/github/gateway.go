@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,11 +89,14 @@ type Options struct {
 	RequireCredential bool
 	// AuthHealthCacheTTL bounds how often operator health spends one authenticated
 	// core request to obtain the actual login and response rate-limit headers.
-	AuthHealthCacheTTL     time.Duration
-	Now                    func() time.Time
-	DiscoveryCacheTTL      time.Duration
-	GHRun                  func(context.Context, shell.Options) (shell.Result, error)
-	GitRun                 func(context.Context, shell.Options) (shell.Result, error)
+	AuthHealthCacheTTL time.Duration
+	Now                func() time.Time
+	DiscoveryCacheTTL  time.Duration
+	GHRun              func(context.Context, shell.Options) (shell.Result, error)
+	GitRun             func(context.Context, shell.Options) (shell.Result, error)
+	// CommandContext is a narrow test seam for long-lived gh children. Normal
+	// daemon construction leaves it nil and uses exec.CommandContext.
+	CommandContext         func(context.Context, string, ...string) *exec.Cmd
 	ReviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
@@ -115,6 +120,7 @@ type Gateway struct {
 	discoveryIssueCache    map[string]discoveryIssueListCacheEntry
 	ghRun                  func(context.Context, shell.Options) (shell.Result, error)
 	gitRun                 func(context.Context, shell.Options) (shell.Result, error)
+	commandContext         func(context.Context, string, ...string) *exec.Cmd
 	reviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
@@ -737,6 +743,10 @@ func New(options Options) *Gateway {
 	if gitRun == nil {
 		gitRun = shell.Run
 	}
+	commandContext := options.CommandContext
+	if commandContext == nil {
+		commandContext = exec.CommandContext
+	}
 	authHealthCacheTTL := options.AuthHealthCacheTTL
 	if authHealthCacheTTL <= 0 {
 		authHealthCacheTTL = defaultAuthHealthTTL
@@ -757,6 +767,7 @@ func New(options Options) *Gateway {
 		discoveryIssueCache:    map[string]discoveryIssueListCacheEntry{},
 		ghRun:                  ghRun,
 		gitRun:                 gitRun,
+		commandContext:         commandContext,
 		reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic,
 	}
 }
@@ -3732,6 +3743,34 @@ func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) 
 	return g.runGhWithTimeout(ctx, cwd, stdin, defaultGhCommandTimeout, args...)
 }
 
+// DaemonCommand prepares a daemon-owned gh child under the same credential
+// admission and environment authority as Gateway API calls. Long-lived gh
+// commands (such as webhook forwarders) need their pipes before Start, so they
+// cannot use runGh; this is their only supported preparation path.
+//
+// hostname identifies the target GitHub host. It is explicit rather than
+// inferred from argv because gh webhook commands use --repo=<host/owner/repo>,
+// while ordinary Gateway calls use --hostname.
+func (g *Gateway) DaemonCommand(ctx context.Context, hostname string, args ...string) (*exec.Cmd, error) {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		hostname = "github.com"
+	}
+
+	g.authHealthMu.Lock()
+	credential := githubCredentialForHost(g.credentialEnv, hostname)
+	requireCredential := g.requireCredential
+	ghPath := g.ghPath
+	g.authHealthMu.Unlock()
+	if requireCredential && len(credential) == 0 {
+		return nil, fmt.Errorf("%w; set agent.env.GH_TOKEN or export GH_TOKEN for looperd", ErrCredentialUnavailable)
+	}
+
+	cmd := g.commandContext(ctx, ghPath, args...)
+	cmd.Env = daemonChildEnvironment(credential)
+	return cmd, nil
+}
+
 // mergeIntoProcessEnv materializes a full child environment from the parent
 // process environment plus overrides. shell.Options.Env replaces the child
 // environment wholesale, so a partial map would strip PATH/HOME from gh.
@@ -3746,6 +3785,9 @@ func mergeIntoProcessEnv(overrides map[string]string) map[string]string {
 		if !ok || key == "" {
 			continue
 		}
+		if isGitHubTokenEnvKey(key) {
+			continue
+		}
 		merged[key] = value
 	}
 	for key, value := range overrides {
@@ -3758,11 +3800,42 @@ func mergeIntoProcessEnv(overrides map[string]string) map[string]string {
 	return merged
 }
 
+// daemonChildEnvironment is the exec.Cmd counterpart of mergeIntoProcessEnv.
+// It deliberately removes every ambient GitHub token before applying the
+// target-host credential selected by githubCredentialForHost; otherwise a
+// detached daemon can silently authenticate with the wrong host family.
+func daemonChildEnvironment(overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return nil
+	}
+	merged := mergeIntoProcessEnv(overrides)
+	keys := make([]string, 0, len(merged))
+	for key := range merged {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+merged[key])
+	}
+	return env
+}
+
+func isGitHubTokenEnvKey(key string) bool {
+	for _, tokenKey := range config.GitHubTokenEnvKeys {
+		if key == tokenKey {
+			return true
+		}
+	}
+	return false
+}
+
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
 	g.authHealthMu.Lock()
 	credential := githubCredentialForHost(g.credentialEnv, hostnameFromGHArgs(args))
+	requireCredential := g.requireCredential
 	g.authHealthMu.Unlock()
-	if g.requireCredential && len(credential) == 0 {
+	if requireCredential && len(credential) == 0 {
 		return shell.Result{}, fmt.Errorf("%w; set agent.env.GH_TOKEN or export GH_TOKEN for looperd", ErrCredentialUnavailable)
 	}
 	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: mergeIntoProcessEnv(credential), Stdin: stdin, Timeout: timeout})

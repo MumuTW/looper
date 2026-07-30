@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
 )
@@ -52,10 +52,7 @@ type webhookTunnelGitHubClient interface {
 	DeleteHook(ctx context.Context, repo string, id int64) error
 }
 
-type ghWebhookTunnelClient struct {
-	ghPath string
-	env    map[string]string
-}
+type ghWebhookTunnelClient struct{ gateway *githubinfra.Gateway }
 
 func (c ghWebhookTunnelClient) GetHook(ctx context.Context, repo string, id int64) (webhookTunnelGitHubHook, bool, error) {
 	result, err := c.run(ctx, repo, []string{"api", fmt.Sprintf("repos/%s/hooks/%d", splitRepoPath(repo), id)})
@@ -132,19 +129,16 @@ func webhookHookMutationBody(url string, secret string, events []string, active 
 }
 
 func (c ghWebhookTunnelClient) run(ctx context.Context, repo string, args []string) ([]byte, error) {
-	if strings.TrimSpace(c.ghPath) == "" {
+	if c.gateway == nil {
 		return nil, errors.New("gh is not configured or could not be resolved")
 	}
-	if len(c.env) == 0 {
-		return nil, errors.New("daemon has no configured GitHub credential")
-	}
-	if host, _ := splitTunnelRepoHostname(repo); host != "" {
+	host, _ := splitTunnelRepoHostname(repo)
+	if host != "" {
 		args = append(args, "--hostname", host)
 	}
-	cmd := exec.CommandContext(ctx, c.ghPath, args...)
-	cmd.Env = os.Environ()
-	for key, value := range c.env {
-		cmd.Env = append(cmd.Env, key+"="+value)
+	cmd, err := c.gateway.DaemonCommand(ctx, host, args...)
+	if err != nil {
+		return nil, err
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -516,7 +510,7 @@ func (w *webhookRuntime) tunnelGitHubClient() webhookTunnelGitHubClient {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.tunnelClient == nil {
-		w.tunnelClient = ghWebhookTunnelClient{ghPath: w.ghPath, env: config.DaemonGitHubCredentialEnv(w.cfg)}
+		w.tunnelClient = ghWebhookTunnelClient{gateway: w.githubGateway}
 	}
 	return w.tunnelClient
 }

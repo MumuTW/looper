@@ -233,6 +233,22 @@ func TestWebhookRuntimeForwarderOverlaysCredentialEnv(t *testing.T) {
 	}
 }
 
+func TestWebhookRuntimeSharesRotatedGatewayWithTunnelChildren(t *testing.T) {
+	rt := newWebhookRuntime(config.Config{Agent: config.AgentConfig{Env: map[string]string{"GH_TOKEN": "old"}}}, &testLogger{}, time.Now)
+	gateway := rt.daemonGitHubGateway()
+	if client, ok := rt.tunnelGitHubClient().(ghWebhookTunnelClient); !ok || client.gateway != gateway {
+		t.Fatalf("tunnel client = %#v, want shared daemon gateway", rt.tunnelGitHubClient())
+	}
+	gateway.UpdateCredentialEnv(map[string]string{"GH_TOKEN": "rotated"})
+	command, err := gateway.DaemonCommand(context.Background(), "github.com", "webhook", "forward")
+	if err != nil {
+		t.Fatalf("DaemonCommand() error = %v", err)
+	}
+	if !containsEnv(command.Env, "GH_TOKEN=rotated") || containsEnv(command.Env, "GH_TOKEN=old") {
+		t.Fatalf("child env = %#v, want rotated gateway credential", command.Env)
+	}
+}
+
 func containsEnv(env []string, want string) bool {
 	for _, value := range env {
 		if value == want {

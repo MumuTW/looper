@@ -16,6 +16,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -105,6 +106,7 @@ type webhookRuntime struct {
 	logger             bootstrap.Logger
 	now                func() time.Time
 	ghPath             string
+	githubGateway      *githubinfra.Gateway
 	status             WebhookStatus
 	stopCh             chan struct{}
 	forwarderStopCh    map[string]chan struct{}
@@ -148,7 +150,7 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 		Forwarders:                  []WebhookForwarderState{},
 		TunnelHooks:                 []WebhookTunnelState{},
 	}
-	rt := &webhookRuntime{cfg: cfg, logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), status: status, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{}, allowedTunnelRepos: map[string]struct{}{}, daemonID: newDaemonID(), probe: defaultProcessProbe{}}
+	rt := &webhookRuntime{cfg: cfg, logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), githubGateway: newWebhookDaemonGateway(cfg), status: status, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{}, allowedTunnelRepos: map[string]struct{}{}, daemonID: newDaemonID(), probe: defaultProcessProbe{}}
 	if !cfg.Webhook.Enabled {
 		return rt
 	}
@@ -159,6 +161,49 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 		rt.addDegradedReason("gh is not configured or could not be resolved")
 	}
 	return rt
+}
+
+func (w *webhookRuntime) setGitHubGateway(gateway *githubinfra.Gateway) {
+	if w == nil || gateway == nil {
+		return
+	}
+	w.mu.Lock()
+	w.githubGateway = gateway
+	if _, ok := w.tunnelClient.(ghWebhookTunnelClient); ok {
+		w.tunnelClient = nil
+	}
+	w.mu.Unlock()
+}
+
+func (w *webhookRuntime) daemonGitHubGateway() *githubinfra.Gateway {
+	if w == nil {
+		return nil
+	}
+	w.mu.RLock()
+	gateway := w.githubGateway
+	w.mu.RUnlock()
+	if gateway != nil {
+		return gateway
+	}
+	// A handful of focused lifecycle tests construct webhookRuntime directly.
+	// Keep their child creation under the same Gateway authority as production.
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.githubGateway == nil {
+		w.githubGateway = newWebhookDaemonGateway(w.cfg)
+	}
+	return w.githubGateway
+}
+
+func newWebhookDaemonGateway(cfg config.Config) *githubinfra.Gateway {
+	return githubinfra.New(githubinfra.Options{
+		GHPath:            derefString(cfg.Tools.GHPath),
+		Env:               config.DaemonGitHubCredentialEnv(cfg),
+		RequireCredential: true,
+		CommandContext: func(_ context.Context, path string, args ...string) *exec.Cmd {
+			return execCommand(path, args...)
+		},
+	})
 }
 
 func (w *webhookRuntime) updateConfig(cfg config.Config) {
@@ -807,15 +852,16 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			return
 		}
 
-		env := config.DaemonGitHubCredentialEnv(w.cfg)
-		if len(env) == 0 {
-			w.recordForwarderError(repo, stopCh, "daemon has no configured GitHub credential", true)
+		gateway := w.daemonGitHubGateway()
+		if gateway == nil {
+			w.recordForwarderError(repo, stopCh, "daemon GitHub gateway is unavailable", true)
 			return
 		}
-		cmd := execCommand(state.Command[0], state.Command[1:]...)
-		cmd.Env = os.Environ()
-		for key, value := range env {
-			cmd.Env = append(cmd.Env, key+"="+value)
+		hostname, _ := splitTunnelRepoHostname(state.Repo)
+		cmd, err := gateway.DaemonCommand(context.Background(), hostname, state.Command[1:]...)
+		if err != nil {
+			w.recordForwarderError(repo, stopCh, err.Error(), true)
+			return
 		}
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
@@ -1224,9 +1270,9 @@ func appendTail(lines []string, line string, limit int) []string {
 	return append([]string{}, lines[len(lines)-limit:]...)
 }
 
-var execCommand = exec.Command
-
 var webhookForwarderStartedHook func()
+
+var execCommand = exec.Command
 
 var osFindProcess = func(pid int) (*os.Process, error) {
 	return os.FindProcess(pid)
