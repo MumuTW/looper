@@ -1223,17 +1223,11 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []reply
 // without coupling fixer code to internal/agent's parser. It returns the JSON
 // payload after the final __LOOPER_RESULT__= line, or "" if absent.
 func extractCompletionMarkerPayload(combined string) string {
-	prefix := agent.CompletionMarkerPrefix
-	lines := strings.Split(combined, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, prefix) {
-			payload := strings.TrimPrefix(line, prefix)
-			if isTemplateCompletionPayload(payload) {
-				continue
-			}
-			return payload
+	for _, payload := range agent.CompletionMarkerPayloads(combined) {
+		if isTemplateCompletionPayload(payload) {
+			continue
 		}
+		return payload
 	}
 	return ""
 }

@@ -4191,13 +4191,7 @@ func reviewCompletionOutcome(result AgentResult) string {
 	if strings.TrimSpace(result.Stderr) != "" {
 		raw += "\n" + result.Stderr
 	}
-	lines := strings.Split(raw, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(line, agent.CompletionMarkerPrefix) {
-			continue
-		}
-		payload := strings.TrimPrefix(line, agent.CompletionMarkerPrefix)
+	for _, payload := range agent.CompletionMarkerPayloads(raw) {
 		var parsed map[string]any
 		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
 			return ""
@@ -4214,13 +4208,7 @@ func parseReviewerCommentOnlyCompletion(result AgentResult) (reviewerCommentOnly
 	if strings.TrimSpace(result.Stderr) != "" {
 		raw += "\n" + result.Stderr
 	}
-	lines := strings.Split(raw, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(line, agent.CompletionMarkerPrefix) {
-			continue
-		}
-		payload := strings.TrimPrefix(line, agent.CompletionMarkerPrefix)
+	for _, payload := range agent.CompletionMarkerPayloads(raw) {
 		if err := json.Unmarshal([]byte(payload), &completion); err != nil {
 			return reviewerCommentOnlyCompletion{}, fmt.Errorf("parse reviewer comment-only completion: %w", err)
 		}

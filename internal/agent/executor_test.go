@@ -1044,6 +1044,21 @@ func TestParseCompletionIgnoresTemplatePlaceholder(t *testing.T) {
 	}
 }
 
+func TestParseCompletionAcceptsMarkerGluedToProse(t *testing.T) {
+	t.Parallel()
+
+	stdout := "All data collected. Let me finalize the todos and produce the result." +
+		CompletionMarkerPrefix + `{"summary":"pushed the fix","git_pr_lifecycle":{"pushed":true,"commit_shas":["212adf88"]}}` + "\n"
+
+	parsed := parseCompletion(stdout, "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "pushed the fix" {
+		t.Fatalf("parseCompletion() = %#v, want parsed mid-line marker", parsed)
+	}
+	if parsed.Lifecycle == nil || !parsed.Lifecycle.Pushed {
+		t.Fatalf("parseCompletion() lifecycle = %#v, want pushed lifecycle recovered", parsed.Lifecycle)
+	}
+}
+
 func TestReadPersistedExecutionLogReadsTailToPreserveCompletionMarker(t *testing.T) {
 	t.Parallel()
 

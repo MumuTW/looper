@@ -2637,33 +2637,28 @@ func tickerChan(ticker *time.Ticker) <-chan time.Time {
 
 func parseCompletion(stdout, stderr string) completionParse {
 	raw := stdout + "\n" + stderr
-	lines := strings.Split(raw, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, CompletionMarkerPrefix) {
-			payload := strings.TrimPrefix(line, CompletionMarkerPrefix)
-			var parsed map[string]any
-			if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-				return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
-			}
-			result := completionParse{
-				ParseStatus:      "parsed",
-				CompletionSignal: CompletionMarkerPrefix,
-				Artifacts:        asStringSlice(parsed["artifacts"]),
-				ChangedFiles:     asStringSlice(parsed["changedFiles"]),
-				Commits:          asStringSlice(parsed["commits"]),
-			}
-			if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
-				result.Lifecycle = state
-			}
-			if summary, ok := parsed["summary"].(string); ok {
-				result.Summary = summary
-			}
-			if isTemplateCompletion(result, parsed) {
-				continue
-			}
-			return result
+	for _, payload := range CompletionMarkerPayloads(raw) {
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+			return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
 		}
+		result := completionParse{
+			ParseStatus:      "parsed",
+			CompletionSignal: CompletionMarkerPrefix,
+			Artifacts:        asStringSlice(parsed["artifacts"]),
+			ChangedFiles:     asStringSlice(parsed["changedFiles"]),
+			Commits:          asStringSlice(parsed["commits"]),
+		}
+		if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
+			result.Lifecycle = state
+		}
+		if summary, ok := parsed["summary"].(string); ok {
+			result.Summary = summary
+		}
+		if isTemplateCompletion(result, parsed) {
+			continue
+		}
+		return result
 	}
 	return completionParse{ParseStatus: "missing"}
 }
