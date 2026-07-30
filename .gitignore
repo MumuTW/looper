@@ -9,8 +9,12 @@ dist/
 internal/dashboard/assets/**
 !internal/dashboard/assets/.gitkeep
 *.test
+# Bare `go build` output for each cmd/ entrypoint. This list can only ever cover
+# names we thought of; scripts/check-tracked-binaries.sh is what actually stops
+# an artifact from being committed.
 /looper
 /looperd
+/loopernet
 specs/change/active
 task.md
 e2e/.env*

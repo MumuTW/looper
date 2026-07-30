@@ -50,6 +50,9 @@ jobs:
           test -f ../../internal/dashboard/assets/.production
           test -f ../../internal/dashboard/assets/index.html
 
+      - name: Check for committed binaries
+        run: scripts/check-tracked-binaries.sh
+
       - name: Check formatting
         run: |
           unformatted="$(gofmt -l .)"

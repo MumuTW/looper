@@ -6,6 +6,14 @@
 # Kept bash-3.2 compatible (macOS default bash) — no mapfile/readarray.
 set -euo pipefail
 
+# Refuse committed build artifacts before they reach a branch. CI runs the same
+# check over the whole tree; this is the fast local half, and it only sees the
+# files staged right now.
+repo_root="$(git rev-parse --show-toplevel)"
+if [ -x "$repo_root/scripts/check-tracked-binaries.sh" ]; then
+  "$repo_root/scripts/check-tracked-binaries.sh" --staged
+fi
+
 # Only the Go files staged for this commit.
 staged="$(git diff --cached --name-only --diff-filter=ACM -- '*.go')"
 [ -z "$staged" ] && exit 0
