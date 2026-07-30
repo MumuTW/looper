@@ -372,7 +372,6 @@ type WorktreeCleanupConfig struct {
 
 type PackageConfig struct {
 	Distribution               string `json:"distribution"`
-	AutoUpgradeEnabled         bool   `json:"autoUpgradeEnabled"`
 	AutoMigrateOnStartup       bool   `json:"autoMigrateOnStartup"`
 	RequireBackupBeforeMigrate bool   `json:"requireBackupBeforeMigrate"`
 }
@@ -902,7 +901,6 @@ type PartialWorktreeCleanupConfig struct {
 
 type PartialPackageConfig struct {
 	Distribution               *string `json:"distribution,omitempty"`
-	AutoUpgradeEnabled         *bool   `json:"autoUpgradeEnabled,omitempty"`
 	AutoMigrateOnStartup       *bool   `json:"autoMigrateOnStartup,omitempty"`
 	RequireBackupBeforeMigrate *bool   `json:"requireBackupBeforeMigrate,omitempty"`
 }

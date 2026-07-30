@@ -1015,10 +1015,6 @@ func mergePackageConfig(config *PackageConfig, partial PartialPackageConfig) {
 		config.Distribution = *partial.Distribution
 	}
 
-	if partial.AutoUpgradeEnabled != nil {
-		config.AutoUpgradeEnabled = *partial.AutoUpgradeEnabled
-	}
-
 	if partial.AutoMigrateOnStartup != nil {
 		config.AutoMigrateOnStartup = *partial.AutoMigrateOnStartup
 	}
