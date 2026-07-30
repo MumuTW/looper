@@ -54,7 +54,7 @@ func TestValidateCompletedRepairCheckpointAcceptsParsedResults(t *testing.T) {
 	t.Parallel()
 
 	repair := &checkpointRepair{ParseStatus: "parsed", Summary: "gh: could not connect to api.github.com"}
-	if err := validateCompletedRepairCheckpoint(repair); err != nil {
+	if err := validateCompletedRepairCheckpoint(repair, nil); err != nil {
 		t.Fatalf("validateCompletedRepairCheckpoint() = %v, want nil for a parsed result", err)
 	}
 }
