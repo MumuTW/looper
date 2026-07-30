@@ -35,7 +35,7 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	// shared role settings and roles.coding.* wins. Across layers, the normal
 	// config precedence holds: a later legacy env or CLI override must be able
 	// to replace an earlier file-backed roles.coding.* value.
-	authored, authoredInstructions, issues := collectAuthoredCodingRoles(normalizedLayers...)
+	authored, authoredInstructions, codingModelCanonical, issues := collectAuthoredCodingRoles(normalizedLayers...)
 	if len(issues) > 0 {
 		return Config{}, &ConfigValidationError{Issues: issues}
 	}
@@ -50,6 +50,7 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		return Config{}, &ConfigValidationError{Issues: issues}
 	}
 	config.Roles.Coding = codingRoles
+	config.Roles.codingModelCanonical = codingModelCanonical
 
 	return config, nil
 }

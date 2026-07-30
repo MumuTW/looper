@@ -476,6 +476,32 @@ model = "gpt-5"
 	}
 }
 
+func TestRestartRequiredChangesPreservesCanonicalOwnerForEqualRoleModels(t *testing.T) {
+	t.Parallel()
+
+	oldConfig, err := Normalize(t.TempDir(), mustDecodeTOML(t, `
+[roles.worker.agent]
+vendor = "codex"
+model = "gpt-5"
+
+[roles.coding.worker.agent]
+vendor = "codex"
+model = "gpt-5"
+`))
+	if err != nil {
+		t.Fatalf("Normalize(old) error = %v", err)
+	}
+	switched := CloneConfig(oldConfig)
+	newVendor := AgentVendorClaudeCode
+	worker := switched.Roles.Coding[CodingRoleWorker]
+	worker.Agent.Vendor = &newVendor
+	switched.Roles.Coding[CodingRoleWorker] = worker
+
+	if got, want := RestartRequiredChanges(oldConfig, switched), []string{"roles.coding.worker", "roles.coding.worker.agent.model"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("equal dual-authored model switch = %#v, want %#v", got, want)
+	}
+}
+
 func agentVendorPtr(v AgentVendor) *AgentVendor {
 	return &v
 }

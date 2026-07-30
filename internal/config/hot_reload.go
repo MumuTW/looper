@@ -436,8 +436,9 @@ func resolvedModelBindingPath(cfg Config, role string) string {
 		}
 	}
 	if binding != nil && binding.Model != nil {
+		canonicalOwner, ownerKnown := cfg.Roles.codingModelCanonical[role]
 		legacyBinding := CodingRolesFromLegacy(cfg.Roles)[role].Agent
-		if legacyBinding == nil || legacyBinding.Model == nil || *legacyBinding.Model != *binding.Model {
+		if canonicalOwner || (!ownerKnown && (legacyBinding == nil || legacyBinding.Model == nil || *legacyBinding.Model != *binding.Model)) {
 			path = "roles.coding." + role + ".agent.model"
 		} else {
 			path = "roles." + role + ".agent.model"
@@ -464,6 +465,12 @@ func CloneConfig(source Config) Config {
 	// named fields and break the canonical-registry contract.
 	if source.Roles.Coding != nil {
 		cloned.Roles.Coding = cloneCodingRoleRegistry(source.Roles.Coding)
+	}
+	if source.Roles.codingModelCanonical != nil {
+		cloned.Roles.codingModelCanonical = make(map[string]bool, len(source.Roles.codingModelCanonical))
+		for role, canonical := range source.Roles.codingModelCanonical {
+			cloned.Roles.codingModelCanonical[role] = canonical
+		}
 	}
 	return cloned
 }
