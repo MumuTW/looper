@@ -3421,21 +3421,34 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		now = time.Now
 	}
 
+	// tickMu guards the tick-local aggregates below. Project discovery fans out
+	// across goroutines, so every accumulator these closures touch is shared.
+	// appendErrLocked exists so recordClaim can append under the lock it already
+	// holds instead of re-entering appendErr and deadlocking.
+	var tickMu sync.Mutex
 	errs := make([]error, 0)
-	appendErr := func(err error) {
+	appendErrLocked := func(err error) {
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
-	discoveredRunnableIDs := make(map[string]struct{})
-	trackRunnableDiscovery := func(queueItems []storage.QueueItemRecord) {
-		for _, id := range runnableSchedulerQueueItemIDs(queueItems, now) {
-			discoveredRunnableIDs[id] = struct{}{}
+	appendErr := func(err error) {
+		if err == nil {
+			return
 		}
+		tickMu.Lock()
+		defer tickMu.Unlock()
+		appendErrLocked(err)
+	}
+	discoveredRunnableIDs := newRunnableDiscoverySet()
+	trackRunnableDiscovery := func(queueItems []storage.QueueItemRecord) {
+		discoveredRunnableIDs.add(runnableSchedulerQueueItemIDs(queueItems, now))
 	}
 	recordClaim := func(claimedCount, availableSlots int, err error) {
+		tickMu.Lock()
+		defer tickMu.Unlock()
 		claimStats.record(claimedCount, availableSlots)
-		appendErr(err)
+		appendErrLocked(err)
 	}
 	// Liveness quarantine must be revisited on the scheduler's periodic full
 	// tick, independently of capacity. Tying this to availableSlots == 0 strands
@@ -3463,11 +3476,19 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
 	tickDiscoveryState := githubinfra.NewDiscoveryTickState()
+	// snapshotMu guards the snapshot map only. Each project is discovered by a
+	// single goroutine, so entries never collide on a key, but the map itself is
+	// shared across the fan-out. It is deliberately not tickMu: snapshot lookup
+	// sits on the hot path of every lane and must not queue behind error or
+	// claim-stat bookkeeping.
+	var snapshotMu sync.Mutex
 	projectSnapshots := map[string]*githubinfra.DiscoverySnapshot{}
 	projectSnapshot := func(projectID string) *githubinfra.DiscoverySnapshot {
 		if input.GitHubGateway == nil {
 			return nil
 		}
+		snapshotMu.Lock()
+		defer snapshotMu.Unlock()
 		if snapshot, ok := projectSnapshots[projectID]; ok {
 			return snapshot
 		}
@@ -3480,11 +3501,11 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if input.Config != nil {
 		providers = forge.NewResolver(*input.Config)
 	}
-	for _, project := range projectsList {
-		if err := ctx.Err(); err != nil {
-			retErr = errors.Join(append(errs, err)...)
-			return retErr
-		}
+	// discoverProject runs one project's discovery lanes and its HITL poll.
+	// Returning false means admission closed mid-flight, which stops the fan-out
+	// from starting any further project — the same guarantee the serial `break`
+	// used to give.
+	discoverProject := func(project storage.ProjectRecord) bool {
 		// Recheck before each project's work-producing lanes so BeginShutdown
 		// during HTTP drain cannot leave a tick that passed the entry gate free
 		// to enqueue discovery/HITL after admission is already stopping.
@@ -3492,10 +3513,10 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			if input.Logger != nil {
 				input.Logger.Debug("scheduler tick stopped mid-flight: admission closed", map[string]any{"error": err.Error(), "projectId": project.ID})
 			}
-			break
+			return false
 		}
 		if project.Archived {
-			continue
+			return true
 		}
 		provider := providers.ForProject(project.ID)
 		repo := repoFromProjectMetadata(project.MetadataJSON)
@@ -3505,7 +3526,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				if input.Logger != nil {
 					input.Logger.Debug("scheduler skipped project missing from captured catalog", map[string]any{"projectId": project.ID})
 				}
-				continue
+				return true
 			}
 			repo = strings.TrimSpace(binding.Repo)
 		}
@@ -3517,9 +3538,8 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			if input.Logger != nil {
 				input.Logger.Warn("scheduler skipped project without repo metadata", map[string]any{"projectId": project.ID})
 			}
-			continue
+			return true
 		}
-		admissionClosed := false
 		for _, lane := range lanes {
 			if !lane.Present {
 				continue
@@ -3537,8 +3557,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				continue
 			}
 			if err := admissionRefuseWork(input); err != nil {
-				admissionClosed = true
-				break
+				return false
 			}
 			label := lane.laneLabel()
 			appendErr(runSchedulerLane(input, label, project.ID, repo, func() error {
@@ -3546,19 +3565,73 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				trackRunnableDiscovery(items)
 				return wrapSchedulerError(label, project.ID, repo, err)
 			}))
-			claimedCount, availableSlots, err = executeClaimPhase(ctx, lane.claimPhaseLabel(), input, discoveredRunnableIDs, true)
-			recordClaim(claimedCount, availableSlots, err)
-		}
-		if admissionClosed {
-			break
+			// Lane-local claim results: the tick-level counters are shared across
+			// the fan-out and are only reachable through recordClaim.
+			laneClaimed, laneSlots, laneErr := executeClaimPhase(ctx, lane.claimPhaseLabel(), input, discoveredRunnableIDs, true)
+			recordClaim(laneClaimed, laneSlots, laneErr)
 		}
 
 		// HITL (github transport): deliver any human answers posted on this
 		// project's awaiting_human PRs so those loops resume.
 		if err := admissionRefuseWork(input); err != nil {
-			break
+			return false
 		}
 		runGitHubHITLPoll(ctx, input, project)
+		return true
+	}
+
+	// Discovery is per-project independent: each project's lanes read that
+	// project's own forge state and enqueue against its own dedupe keys. Walking
+	// projects serially made one tick cost the sum of every project's forge
+	// latency, so a multi-repo daemon spent minutes per tick and could not honour
+	// its own poll interval — discovery starved the claims it exists to feed.
+	//
+	// Claims stay serialized inside executeClaimPhase (ClaimMu/ClaimBoundary), and
+	// the state workers share is either mutex-guarded infra (Gateway,
+	// DiscoveryTickState, DiscoverySnapshot, Logger) or guarded here by tickMu and
+	// snapshotMu.
+	//
+	// Behaviour deltas, both accepted: when slots are scarce, which project's
+	// items win is now completion-ordered rather than catalog-ordered; and joined
+	// tick errors are no longer in catalog order.
+	var (
+		discoveryWG sync.WaitGroup
+		stopMu      sync.Mutex
+		stopTick    bool
+	)
+	tickStopped := func() bool {
+		stopMu.Lock()
+		defer stopMu.Unlock()
+		return stopTick
+	}
+	slots := make(chan struct{}, schedulerDiscoveryConcurrency(len(projectsList)))
+	ctxCancelled := false
+	for _, project := range projectsList {
+		if err := ctx.Err(); err != nil {
+			appendErr(err)
+			ctxCancelled = true
+			break
+		}
+		if tickStopped() {
+			break
+		}
+		slots <- struct{}{}
+		discoveryWG.Add(1)
+		go func(project storage.ProjectRecord) {
+			defer discoveryWG.Done()
+			defer func() { <-slots }()
+			if !discoverProject(project) {
+				stopMu.Lock()
+				stopTick = true
+				stopMu.Unlock()
+			}
+		}(project)
+	}
+	discoveryWG.Wait()
+	// Every worker has returned, so the aggregates are single-threaded again.
+	if ctxCancelled {
+		retErr = errors.Join(errs...)
+		return retErr
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and
@@ -3631,15 +3704,72 @@ func runnableSchedulerQueueItemIDs(queueItems []storage.QueueItemRecord, now fun
 	return ids
 }
 
-func requestWakeForClaimedDiscovery(claimedItems []storage.QueueItemRecord, discoveredRunnableIDs map[string]struct{}, requestWake func()) {
-	if requestWake == nil || len(claimedItems) == 0 || len(discoveredRunnableIDs) == 0 {
+// maxSchedulerDiscoveryConcurrency bounds how many projects one tick discovers
+// at once. Discovery is forge-API bound rather than CPU bound, so the cap exists
+// to protect the shared `gh` rate limit and the daemon's subprocess/descriptor
+// budget, not to match core count. It is a constant and not a config field: the
+// only behaviour worth preventing is unbounded fan-out across a large catalog,
+// and a knob nobody has asked for is a config surface to keep in sync forever.
+const maxSchedulerDiscoveryConcurrency = 4
+
+func schedulerDiscoveryConcurrency(projectCount int) int {
+	if projectCount < 1 {
+		return 1
+	}
+	if projectCount > maxSchedulerDiscoveryConcurrency {
+		return maxSchedulerDiscoveryConcurrency
+	}
+	return projectCount
+}
+
+// runnableDiscoverySet is the set of queue items a tick's discovery found
+// immediately runnable. Project discovery fans out across goroutines, so the
+// per-lane writes and the per-claim-phase reads both need guarding. A nil set
+// is a valid empty set, which is what the claim pump and tests pass.
+type runnableDiscoverySet struct {
+	mu  sync.Mutex
+	ids map[string]struct{}
+}
+
+func newRunnableDiscoverySet() *runnableDiscoverySet {
+	return &runnableDiscoverySet{ids: map[string]struct{}{}}
+}
+
+func (s *runnableDiscoverySet) add(ids []string) {
+	if s == nil || len(ids) == 0 {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ids == nil {
+		s.ids = make(map[string]struct{}, len(ids))
+	}
+	for _, id := range ids {
+		s.ids[id] = struct{}{}
+	}
+}
+
+// containsAny reports whether any claimed item came from this tick's discovery.
+func (s *runnableDiscoverySet) containsAny(claimedItems []storage.QueueItemRecord) bool {
+	if s == nil || len(claimedItems) == 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, item := range claimedItems {
-		if _, ok := discoveredRunnableIDs[item.ID]; ok {
-			requestWake()
-			return
+		if _, ok := s.ids[item.ID]; ok {
+			return true
 		}
+	}
+	return false
+}
+
+func requestWakeForClaimedDiscovery(claimedItems []storage.QueueItemRecord, discovered *runnableDiscoverySet, requestWake func()) {
+	if requestWake == nil {
+		return
+	}
+	if discovered.containsAny(claimedItems) {
+		requestWake()
 	}
 }
 
@@ -3690,7 +3820,7 @@ func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSched
 	return projectsList, true, nil
 }
 
-func executeClaimPhase(ctx context.Context, phase string, input defaultSchedulerTickInput, discoveredRunnableIDs map[string]struct{}, alwaysLog bool) (int, int, error) {
+func executeClaimPhase(ctx context.Context, phase string, input defaultSchedulerTickInput, discoveredRunnableIDs *runnableDiscoverySet, alwaysLog bool) (int, int, error) {
 	if input.ClaimMu != nil {
 		input.ClaimMu.Lock()
 		defer input.ClaimMu.Unlock()
