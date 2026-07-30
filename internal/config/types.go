@@ -846,8 +846,6 @@ type DeployerRoleConfig struct {
 	Environment map[string]string `json:"environment,omitempty"`
 }
 
-}
-
 type ProjectRefConfig struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -1498,9 +1496,8 @@ type PartialRoleConfigs struct {
 	Coordinator *PartialCoordinatorRoleConfig      `json:"coordinator,omitempty"`
 	// Gatekeeper is deprecated parse-only compatibility; it has no runtime
 	// authority and is not projected into RoleConfigs.
-	Gatekeeper  *DeprecatedGatekeeperRoleConfig    `json:"gatekeeper,omitempty"`
-	Deployer    *PartialDeployerRoleConfig         `json:"deployer,omitempty"`
-	Escalator   *PartialEscalatorRoleConfig        `json:"escalator,omitempty"`
+	Gatekeeper *DeprecatedGatekeeperRoleConfig `json:"gatekeeper,omitempty"`
+	Deployer   *PartialDeployerRoleConfig      `json:"deployer,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }

@@ -291,18 +291,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
-		// When the previous report is waiting on a current-head review, check
-		// the local event log cheaply before deciding to skip. This avoids a
-		// full forge evaluation every tick for PRs that may never receive a
-		// Reviewer review (unrequested, self-authored), while still observing
-		// a review the moment its durable event appears.
-		reviewEvidenceAppeared := false
-		if hasPrevious && previous.SourceFingerprint == fingerprint && reportAwaitsCurrentHeadReview(previous) {
-			if evidence, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, pullRequest.Number, pullRequest.HeadSHA); err == nil && evidence.CurrentHeadValid {
-				reviewEvidenceAppeared = true
+		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now()); ok {
+			if err := r.retireLegacyVerdictComments(ctx, reused, input.CWD); err != nil {
+				return result, err
 			}
-		}
-		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now(), convergenceRevisions[entityID], reviewEvidenceAppeared); ok {
 			result.Skipped++
 			result.Reports = append(result.Reports, reused)
 			continue
@@ -432,6 +424,9 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		},
 		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
 		SourceFingerprint: input.SourceFingerprint,
+	}
+	if err := r.retireLegacyVerdictComments(ctx, report, input.CWD); err != nil {
+		return Report{}, err
 	}
 	viewInput := githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD}
 	detail, err := r.github.ViewPullRequestForGatekeeper(ctx, viewInput)

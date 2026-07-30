@@ -420,18 +420,17 @@ func TestAutoGatekeeperRefusesToReportSuccessWithoutProtectedContext(t *testing.
 }
 
 type fakeGatekeeperGitHub struct {
-	openPullRequests []githubinfra.PullRequestSummary
-	detail           githubinfra.PullRequestDetail
-	mergeable        githubinfra.PullRequestDetail
-	protection       githubinfra.BranchProtection
-	checks           githubinfra.PullRequestCheckRuns
-	threads          []githubinfra.ReviewThread
-	reviews          []githubinfra.ReviewSummary
-	reviewsErr       error
-	finalHeadSHA     string
-	finalBaseSHA     string
-	protectionErr    error
-	commentsErr      error
+	openPullRequests   []githubinfra.PullRequestSummary
+	detail             githubinfra.PullRequestDetail
+	mergeable          githubinfra.PullRequestDetail
+	protection         githubinfra.BranchProtection
+	checks             githubinfra.PullRequestCheckRuns
+	threads            []githubinfra.ReviewThread
+	finalHeadSHA       string
+	protectionErr      error
+	currentUserLogin   string
+	comments           []githubinfra.CommentInfo
+	updateCommentCalls []githubinfra.UpdateIssueCommentInput
 	// perPullRequestCalls counts the forge round trips that only a full evaluation
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
@@ -480,6 +479,24 @@ func (f *fakeGatekeeperGitHub) FindReviewMarker(_ context.Context, input githubi
 func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubinfra.CommitStatusInput) error {
 	f.statusCalls = append(f.statusCalls, input)
 	return f.statusErr
+}
+
+func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
+	return f.currentUserLogin, nil
+}
+
+func (f *fakeGatekeeperGitHub) ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
+	return append([]githubinfra.CommentInfo(nil), f.comments...), nil
+}
+
+func (f *fakeGatekeeperGitHub) UpdateIssueComment(_ context.Context, input githubinfra.UpdateIssueCommentInput) error {
+	f.updateCommentCalls = append(f.updateCommentCalls, input)
+	for i := range f.comments {
+		if f.comments[i].ID == input.CommentID {
+			f.comments[i].Body = input.Body
+		}
+	}
+	return nil
 }
 
 func reasonCodes(reasons []Reason) []ReasonCode {
