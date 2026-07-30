@@ -59,6 +59,9 @@ const (
 	ReasonCodexReviewMissing       ReasonCode = "codex_review_missing"
 	ReasonUnresolvedReviewThread   ReasonCode = "unresolved_review_thread"
 	ReasonReviewerConvergence      ReasonCode = "reviewer_convergence_blocked"
+	ReasonCodexReviewRequired      ReasonCode = "codex_review_required"
+	ReasonCodexReviewBlocked       ReasonCode = "codex_review_blocked"
+	ReasonGatekeeperCheckRequired  ReasonCode = "gatekeeper_check_not_required"
 	ReasonProjectPolicyDenied      ReasonCode = "project_policy_denied"
 	ReasonHold                     ReasonCode = "hold"
 	ReasonDiffBudgetExceeded       ReasonCode = "diff_budget_exceeded"
@@ -120,6 +123,7 @@ type Evidence struct {
 	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
 	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
 	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
+	CodexReviewOutcome           string                       `json:"codexReviewOutcome,omitempty"`
 	ReviewProvenance             ReviewProvenance             `json:"reviewProvenance,omitempty"`
 }
 
@@ -201,8 +205,15 @@ type GitHubGateway interface {
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
+	FindReviewMarker(context.Context, githubinfra.VerifyReviewMarkerInput) (githubinfra.ReviewMarkerResult, error)
+	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
 	MergePullRequest(context.Context, githubinfra.EnableAutoMergeInput) error
 }
+
+// RequiredStatusContext is the GitHub status context an operator adds to branch
+// protection when promoting Gatekeeper to auto. GitHub branch protection is the
+// merge authority; this runner reports policy for one commit.
+const RequiredStatusContext = "Looper Gatekeeper"
 
 type Options struct {
 	Repos               *storage.Repositories
@@ -590,6 +601,15 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 			requiredCheckRules = append(requiredCheckRules, githubinfra.RequiredCheckRule{Context: name})
 		}
 	}
+	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto {
+		if !containsRequiredCheck(report.Evidence.RequiredChecks, RequiredStatusContext) {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonGatekeeperCheckRequired, Subject: RequiredStatusContext})
+		}
+		// The Gatekeeper status is this evaluation's output, not an input. Reading
+		// its prior value would turn the first run on a new SHA into a permanent
+		// self-failure instead of letting this run publish the replacement.
+		requiredCheckRules = withoutRequiredCheck(requiredCheckRules, RequiredStatusContext)
+	}
 	checkReasons, checkEvidence := evaluateRequiredChecks(requiredCheckRules, checks)
 	report.Reasons = append(report.Reasons, checkReasons...)
 	report.Evidence.Checks = checkEvidence
@@ -628,6 +648,28 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		report.Evidence.ReviewerConvergence = &convergenceEvidence
 		if reviewerConvergenceBlocks(convergenceEvidence) {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonReviewerConvergence, Subject: reviewerConvergenceReasonSubject(convergenceEvidence)})
+		}
+	}
+
+	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto {
+		login, loginErr := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
+		if loginErr != nil || strings.TrimSpace(login) == "" {
+			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_reviewer_identity")
+		}
+		marker, markerErr := r.github.FindReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{
+			Repo: input.Repo, PRNumber: input.PRNumber,
+			Marker:              "looper:review id_prefix=reviewer: head=" + report.ObservedHeadSHA,
+			AllowedReviewEvents: []string{"COMMENT", "APPROVE", "REQUEST_CHANGES"},
+			AuthorLogin:         login, AllowCleanComment: true, CWD: input.CWD,
+		})
+		if markerErr != nil {
+			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
+		}
+		report.Evidence.CodexReviewOutcome = strings.ToLower(strings.TrimSpace(marker.Outcome))
+		if !marker.Found {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewRequired, Subject: "current_head"})
+		} else if report.Evidence.CodexReviewOutcome == "blocking" || report.Evidence.CodexReviewOutcome == "actionable" {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
 		}
 	}
 
@@ -840,7 +882,53 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 			"repo": report.Repo, "pr": report.PRNumber, "action": string(action), "error": err.Error(),
 		})
 	}
+	if !confirming && r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && strings.TrimSpace(report.ObservedHeadSHA) != "" {
+		state, description := gatekeeperCommitStatus(report)
+		if err := r.github.SetCommitStatus(ctx, githubinfra.CommitStatusInput{
+			Repo: report.Repo, SHA: report.ObservedHeadSHA, Context: RequiredStatusContext,
+			State: state, Description: description, CWD: r.projectCWD(ctx, report.ProjectID),
+		}); err != nil {
+			return Report{}, fmt.Errorf("publish gatekeeper commit status: %w", err)
+		}
+	}
 	return report, nil
+}
+
+func gatekeeperCommitStatus(report Report) (string, string) {
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonCodexReviewRequired {
+			return "pending", "Waiting for Codex review of this commit"
+		}
+	}
+	if report.Eligible {
+		return "success", "Current-head Codex review and merge gates passed"
+	}
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonProviderStateUnavailable || reason.Code == ReasonProviderStateAmbiguous {
+			return "error", "Gatekeeper could not verify current merge state"
+		}
+	}
+	return "failure", "Gatekeeper found blocking merge state"
+}
+
+func containsRequiredCheck(checks []string, want string) bool {
+	for _, check := range checks {
+		if strings.EqualFold(strings.TrimSpace(check), strings.TrimSpace(want)) {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []githubinfra.RequiredCheckRule {
+	out := make([]githubinfra.RequiredCheckRule, 0, len(rules))
+	for _, rule := range rules {
+		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) {
+			continue
+		}
+		out = append(out, rule)
+	}
+	return out
 }
 
 func evaluateRequiredChecks(required []githubinfra.RequiredCheckRule, checks githubinfra.PullRequestCheckRuns) ([]Reason, []CheckEvidence) {

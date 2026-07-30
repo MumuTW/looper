@@ -848,34 +848,18 @@ decides what it may do with that judgement.
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
 | `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Gatekeeper merges what it judges eligible, after re-establishing that judgement immediately beforehand. |
+| `auto` | Requires a completed Looper/Codex review for the current head, then publishes the `Looper Gatekeeper` status for that exact SHA. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
 
-### What `auto` does before merging
-
-An eligible verdict is not a licence. Holds, reviews, threads, and project policy
-can all change without moving the head, so a Gate report is only ever a statement
-about the moment it was made.
-
-At `auto`, Gatekeeper therefore **re-runs the complete evaluation** immediately
-before merging and proceeds only if it still passes against the same head. A
-cheaper head comparison would miss exactly the changes that invariant names. The
-merge itself passes `--match-head-commit`, so the forge refuses if anything was
-pushed in between — the decision cannot be applied to a commit it was not made
-about.
-
-Every attempt is recorded, refusals included, with the gates that blocked the
-confirming pass. The merge is immediate rather than handed to GitHub's
-auto-merge: auto-merge applies the decision later, by which time the evaluation
-behind it is stale.
-
-`auto` cannot be combined with `roles.reviewer.autoMerge.enabled`. Two merge
-authorities on one pull request is not a configuration anyone can reason about —
-whichever wins the race decides, and Reviewer's path checks a strictly narrower
-set of gates.
+`auto` has one required external authority: GitHub branch protection must require
+the `Looper Gatekeeper` status context on the target branch. The status is the
+enforcement point for both direct merges and Mergify's branch-protection queue
+injection; the local Gate report remains audit evidence only. If protection does
+not require that context, Gatekeeper publishes a failing status rather than
+claiming the PR is eligible.
 
 ```toml
 [roles.gatekeeper]
-trust = "advise"
+trust = "auto"
 ```
 
 Project overrides use `projects[].roles.gatekeeper.trust`.
@@ -911,13 +895,11 @@ report is audit evidence rather than merge authority.
 
 ### Relationship to `roles.reviewer.autoMerge`
 
-These are two different merge stories, and today they coexist: Reviewer's
-auto-merge opts a PR into GitHub's native auto-merge on its own approval, while
-Gatekeeper only observes or advises. Reviewer's path checks a narrower set of
-conditions — notably **not** unresolved review threads or requested changes.
-[#116](https://github.com/MumuTW/looper/issues/116) consolidates both behind this
-ladder and retires `roles.reviewer.autoMerge`; until `auto` exists, Reviewer's
-setting remains the only way Looper merges anything.
+These are two different responsibilities. Reviewer can opt a PR into GitHub's
+native auto-merge, while `Gatekeeper = auto` supplies the externally enforced
+status that prevents GitHub or Mergify from completing a merge until the exact
+head has a completed Codex review and every other Gatekeeper condition passes.
+Reviewer approval alone is therefore insufficient once the status is required.
 
 ## Merge Gatekeeper diff budget (`roles.gatekeeper.diffBudget`)
 

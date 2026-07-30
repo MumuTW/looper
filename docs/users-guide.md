@@ -323,6 +323,11 @@ Configuration lives under `roles.reviewer.autoMerge.*`, with the usual `projects
 
 When auto-merge is enabled and the PR is in scope, Reviewer verifies every acceptance-criteria checkbox against the diff before it submits APPROVE. The approval body includes a per-criterion evidence section pointing at files and lines. If every criterion passes, Reviewer calls `gh pr merge --auto`; GitHub branch protection remains the authority for whether the PR actually merges.
 
+For current-head Codex-review enforcement, set `roles.gatekeeper.trust = "auto"`
+and require the `Looper Gatekeeper` status in the target branch's protection
+rule. Gatekeeper binds the status to the current commit: a push has no inherited
+success status, so GitHub and Mergify wait until Codex reviews that new head.
+
 Comment markers used by this flow:
 
 - `<!-- looper:reviewer:criteria-fail -->` — Reviewer found at least one acceptance criterion without satisfying evidence in the diff and returned the linked Issue to re-Triage

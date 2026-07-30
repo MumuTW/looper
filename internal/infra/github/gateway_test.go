@@ -2830,6 +2830,34 @@ func TestGatewayViewPullRequestMergeWatchReportsAuthor(t *testing.T) {
 	}
 }
 
+func TestGatewaySetCommitStatus(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if args := strings.Join(options.Args, " "); args != "api repos/acme/looper/statuses/abc123 --method POST -f state=pending -f context=Looper Gatekeeper -f description=Waiting for Codex review of this commit" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.SetCommitStatus(context.Background(), CommitStatusInput{Repo: "acme/looper", SHA: "abc123", Context: "Looper Gatekeeper", State: "pending", Description: "Waiting for Codex review of this commit"}); err != nil {
+		t.Fatalf("SetCommitStatus() error = %v", err)
+	}
+}
+
+func TestGatewaySetCommitStatusRejectsInvalidInput(t *testing.T) {
+	t.Parallel()
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: func(context.Context, shell.Options) (shell.Result, error) {
+		t.Fatal("unexpected gh call")
+		return shell.Result{}, nil
+	}})
+	if err := gateway.SetCommitStatus(context.Background(), CommitStatusInput{Repo: "acme/looper", Context: "Looper Gatekeeper", State: "success"}); err == nil {
+		t.Fatal("SetCommitStatus() error = nil, want missing SHA error")
+	}
+	if err := gateway.SetCommitStatus(context.Background(), CommitStatusInput{Repo: "acme/looper", SHA: "abc", Context: "Looper Gatekeeper", State: "unknown"}); err == nil {
+		t.Fatal("SetCommitStatus() error = nil, want invalid state error")
+	}
+}
 func TestGatewayCloseIssueRejectsUnknownStateReason(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

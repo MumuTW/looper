@@ -536,17 +536,7 @@ func validateDeployerRoleConfig(deployerRole DeployerRoleConfig, path string, is
 func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, reviewerAutoMerge bool, issues *[]ValidationIssue) {
 	validateGatekeeperDiffBudget(gatekeeper.DiffBudget, path+".diffBudget", issues)
 	switch GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(gatekeeper.Trust)))) {
-	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise:
-	case GatekeeperTrustAuto:
-		// Two merge authorities acting on the same pull request is not a
-		// configuration anyone can reason about: whichever wins the race decides,
-		// and Reviewer's path checks a strictly narrower set of gates.
-		if reviewerAutoMerge {
-			*issues = append(*issues, ValidationIssue{
-				Path:    path + ".trust",
-				Message: fmt.Sprintf("%q cannot be combined with roles.reviewer.autoMerge.enabled: disable one, and prefer Gatekeeper because it also gates on unresolved review threads and requested changes", GatekeeperTrustAuto),
-			})
-		}
+	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto:
 	default:
 		*issues = append(*issues, ValidationIssue{
 			Path:    path + ".trust",
