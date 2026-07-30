@@ -136,8 +136,9 @@ method), whose doc comment carries the semantics: the tracked Issues whose
 
 **Acceptance criterion**:
 Defined at `internal/reviewer/criteria.AcceptanceCriterion`, whose doc comment
-carries the semantics: one checkbox item Reviewer's auto-merge gate verifies
-against diff evidence before APPROVE.
+carries the semantics: one item (checkbox by convention, plain bullets also
+accepted) Reviewer's auto-merge gate verifies against diff evidence before
+APPROVE.
 
 **Auto-merge scope**:
 Defined at `config.ReviewerAutoMergeScopeLooperOnly` in `internal/config`,
