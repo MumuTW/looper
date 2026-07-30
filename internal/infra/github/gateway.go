@@ -382,6 +382,19 @@ type IssueCommentResult struct {
 	URL string
 }
 
+type CreateIssueInput struct {
+	Repo   string
+	Title  string
+	Body   string
+	Labels []string
+	CWD    string
+}
+
+type CreateIssueResult struct {
+	Number int64
+	URL    string
+}
+
 type UpdateIssueCommentInput struct {
 	Repo      string
 	CommentID int64
@@ -1287,6 +1300,43 @@ func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInpu
 		return IssueCommentResult{}, err
 	}
 	return IssueCommentResult{ID: asInt64(row["id"]), URL: asString(row["html_url"])}, nil
+}
+
+// CreateIssue opens a new Issue. Intake uses it to turn a chat message into the
+// forge record that the existing Triager → Planner lanes discover; nothing here
+// classifies or routes the Issue.
+func (g *Gateway) CreateIssue(ctx context.Context, input CreateIssueInput) (CreateIssueResult, error) {
+	title := strings.TrimSpace(input.Title)
+	if title == "" {
+		return CreateIssueResult{}, fmt.Errorf("issue title is required")
+	}
+	if err := outboundguard.Validate(
+		outboundguard.Field{Name: "issue title", Text: title},
+		outboundguard.Field{Name: "issue body", Text: input.Body},
+	); err != nil {
+		return CreateIssueResult{}, err
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues", repo), "--method", "POST", "-f", "title=" + title, "-f", "body=" + input.Body}
+	for _, label := range input.Labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		args = append(args, "-f", "labels[]="+label)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return CreateIssueResult{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return CreateIssueResult{}, err
+	}
+	return CreateIssueResult{Number: asInt64(row["number"]), URL: asString(row["html_url"])}, nil
 }
 
 func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {

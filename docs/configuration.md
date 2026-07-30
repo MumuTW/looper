@@ -107,7 +107,7 @@ Profile and role agent vendor/model fields are hot-safe curated identity fields:
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -710,6 +710,84 @@ Reviewer auto-merge lives under `roles.reviewer.autoMerge.*`:
 Project-level overrides use the same shape under `projects[].roles.reviewer.autoMerge.*`.
 
 When `roles.reviewer.autoMerge.enabled = true`, Looper performs a repo-aware startup validation pass: the project must have a known GitHub repo, GitHub auto-merge must be enabled for that repo, the configured strategy must be allowed, and — if `requireBranchProtection=true` — the effective base branch must exist with required checks enabled.
+
+## Telegram intake
+
+Telegram intake lets you open work from a chat instead of the forge UI. A plain
+message becomes a GitHub Issue; Triager and Planner then handle it exactly as
+they would an Issue you filed by hand. **Intake does not start a loop by itself**
+— without Triager enabled for the project, the Issue simply sits there until you
+label and assign it the usual way. Intake makes no routing or classification
+decision of its own — it does not rewrite, expand, or label the request, because
+judging whether a request is specific enough is Triager's job and paraphrasing
+here would hide your original wording from that judgement.
+
+| Path | Purpose | Default | Valid values | Validation |
+| --- | --- | --- | --- | --- |
+| `intake.telegram.enabled` | Enables the Telegram intake poll lane | `false` | `true`, `false` | When `true`, the fields below are required |
+| `intake.telegram.botTokenEnv` | Env var **name** holding the @BotFather token | — | environment-variable name | Required when enabled; a pasted token value is rejected because it is not a valid env name |
+| `intake.telegram.allowedUserIds` | Telegram user ids permitted to open work | — | non-zero integers | Required and non-empty when enabled |
+| `intake.telegram.defaultProjectId` | Project a message with no `#` prefix goes to | — | a registered project id | Required when enabled |
+| `intake.telegram.chatId` | Chat that receives outbound HITL asks | — | numeric id or `@username` | Required when `hitl.answerTransport = "telegram"` |
+
+Intake polls inside the scheduler tick, so a message is picked up within one
+`scheduler.pollIntervalSeconds` (30s by default). There is deliberately no
+long-poll knob: the tick is serial, so waiting on Telegram would hold every
+discovery lane hostage for the duration of the wait.
+
+There is deliberately no "allow all users" switch. An unrestricted intake bot
+lets anyone who finds the bot handle queue agent runs against your repositories.
+
+### Routing a message to a project
+
+A message goes to `defaultProjectId` unless it starts with `#<projectId>`:
+
+```
+sweeper 沒有回收任何 worktree          → defaultProjectId
+#novel 第三章的段落間距壞了            → project "novel"
+```
+
+An unknown project id is **rejected with a reply**, not silently redirected to
+the default — a typo must not file work against the wrong repository.
+
+### Answering a mid-run question in Telegram
+
+Set `hitl.answerTransport = "telegram"` (which requires `intake.telegram.enabled`
+and a `chatId`). When an agent pauses to ask, the question is posted to that chat
+and **replying to that message** resumes the loop. Replies are threaded by
+message id, so several loops can be waiting at once without their answers
+crossing. A reply to any other message in the chat is treated as new work rather
+than a lost answer.
+
+The ask is plain text with no inline keyboard: a button press would need a
+separate `callback_query` lane, and a typed reply already carries strictly more
+than a button can — including "neither, do X instead".
+
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+2. Export it under the name you configured, e.g. `export TELEGRAM_BOT_TOKEN=…`,
+   and make sure the daemon's environment has it.
+3. Find your numeric user id (message [@userinfobot](https://t.me/userinfobot)),
+   and the chat id if asks should land somewhere other than your DM.
+4. Configure and restart `looperd` — all `intake.*` fields are restart-bound.
+
+```toml
+[intake.telegram]
+enabled = true
+botTokenEnv = "TELEGRAM_BOT_TOKEN"
+allowedUserIds = [123456789]
+defaultProjectId = "looper"
+chatId = "123456789"
+
+[hitl]
+enabled = true
+answerTransport = "telegram"
+```
+
+Intake is GitHub-only: it opens the Issue through the same `gh` credentials the
+rest of the daemon uses, against the repo bound to the project in the captured
+catalog.
 
 ## Project override rules
 

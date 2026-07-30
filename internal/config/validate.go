@@ -321,7 +321,8 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateWebhookConfig(config, issues)
 	validateAgentConfig(config, issues)
 	validateLoggingAndNotificationConfig(config, issues)
-	validateHITLConfig(config.HITL, issues)
+	validateHITLConfig(config.HITL, config.Intake, issues)
+	validateIntakeConfig(config.Intake, issues)
 	validateDaemonConfig(config.Daemon, issues)
 	validatePackageAndDefaultsConfig(config, issues)
 }
@@ -437,7 +438,7 @@ func validateLoggingAndNotificationConfig(config Config, issues *[]ValidationIss
 	}
 }
 
-func validateHITLConfig(hitl HITLConfig, issues *[]ValidationIssue) {
+func validateHITLConfig(hitl HITLConfig, intake IntakeConfig, issues *[]ValidationIssue) {
 	switch strings.ToLower(strings.TrimSpace(hitl.AnswerTransport)) {
 	case "", "github", "respond":
 	case "feishu":
@@ -454,8 +455,41 @@ func validateHITLConfig(hitl HITLConfig, issues *[]ValidationIssue) {
 		if strings.TrimSpace(hitl.Feishu.EventInboxTokenEnv) == "" {
 			*issues = append(*issues, ValidationIssue{Path: "hitl.feishu.eventInboxTokenEnv", Message: "is required when hitl.answerTransport is feishu"})
 		}
+	case "telegram":
+		// The Telegram HITL transport sends asks through the intake bot and routes
+		// replies with the intake allowlist, so it cannot run without intake.
+		if intake.Telegram == nil || !intake.Telegram.Enabled {
+			*issues = append(*issues, ValidationIssue{Path: "intake.telegram.enabled", Message: "must be true when hitl.answerTransport is telegram"})
+		} else if strings.TrimSpace(intake.Telegram.ChatID) == "" {
+			// Intake itself can answer in whatever chat a message arrived from, but an
+			// ask is outbound with no incoming message to reply to.
+			*issues = append(*issues, ValidationIssue{Path: "intake.telegram.chatId", Message: "is required when hitl.answerTransport is telegram"})
+		}
 	default:
-		*issues = append(*issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be one of: github, feishu, respond"})
+		*issues = append(*issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be one of: github, feishu, telegram, respond"})
+	}
+}
+
+func validateIntakeConfig(intake IntakeConfig, issues *[]ValidationIssue) {
+	tg := intake.Telegram
+	if tg == nil || !tg.Enabled {
+		return
+	}
+	if strings.TrimSpace(tg.BotTokenEnv) == "" {
+		*issues = append(*issues, ValidationIssue{Path: "intake.telegram.botTokenEnv", Message: "is required when intake.telegram.enabled is true"})
+	} else if !environmentNamePattern.MatchString(strings.TrimSpace(tg.BotTokenEnv)) {
+		*issues = append(*issues, ValidationIssue{Path: "intake.telegram.botTokenEnv", Message: "must be a valid environment-variable name"})
+	}
+	if len(tg.AllowedUserIDs) == 0 {
+		*issues = append(*issues, ValidationIssue{Path: "intake.telegram.allowedUserIds", Message: "must list at least one Telegram user id when intake.telegram.enabled is true"})
+	}
+	for i, id := range tg.AllowedUserIDs {
+		if id == 0 {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("intake.telegram.allowedUserIds[%d]", i), Message: "must be a non-zero Telegram user id"})
+		}
+	}
+	if strings.TrimSpace(tg.DefaultProjectID) == "" {
+		*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: "is required when intake.telegram.enabled is true"})
 	}
 }
 

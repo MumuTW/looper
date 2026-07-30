@@ -3327,6 +3327,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
+		if strings.EqualFold(strings.TrimSpace(cfg.HITL.AnswerTransport), "telegram") {
+			return sendTelegramHITLAsk(ctx, &cfg, repos, now, ask)
+		}
 		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
 			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
 			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
@@ -3705,6 +3708,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	// deliver any answers for this looper's awaiting loops.
 	if err := admissionRefuseWork(input); err == nil {
 		runFeishuHITLPoll(ctx, input)
+	}
+
+	// Intake (telegram): drain one batch of chat updates — new work becomes an
+	// Issue, a reply to an ask goes back to the loop that asked.
+	if err := admissionRefuseWork(input); err == nil {
+		runTelegramIntakePoll(ctx, input)
 	}
 
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)

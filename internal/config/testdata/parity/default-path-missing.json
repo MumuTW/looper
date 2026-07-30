@@ -153,6 +153,7 @@
       "hitl": {
         "enabled": false
       },
+      "intake": {},
       "roles": {
         "coordinator": {
           "enabled": false,

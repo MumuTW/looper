@@ -713,6 +713,7 @@ type Config struct {
 	Defaults      DefaultsConfig     `json:"defaults"`
 	Instructions  InstructionsConfig `json:"instructions"`
 	HITL          HITLConfig         `json:"hitl"`
+	Intake        IntakeConfig       `json:"intake"`
 	Roles         RoleConfigs        `json:"roles"`
 	Providers     []ProviderConfig   `json:"providers,omitempty"`
 	Projects      []ProjectRefConfig `json:"projects"`
@@ -734,6 +735,31 @@ type HITLConfig struct {
 	AnswerTransport string            `json:"answerTransport,omitempty"`
 	GitHub          *HITLGitHubConfig `json:"github,omitempty"`
 	Feishu          *HITLFeishuConfig `json:"feishu,omitempty"`
+}
+
+// IntakeConfig gates the chat-side entry points that let a person open work
+// without touching the forge UI. Intake never runs a Role itself: it creates the
+// Issue and lets the existing Triager → Planner lanes do the thinking.
+type IntakeConfig struct {
+	Telegram *TelegramIntakeConfig `json:"telegram,omitempty"`
+}
+
+// TelegramIntakeConfig configures the Telegram Bot API intake lane. Credentials
+// are env var NAMES, never values.
+type TelegramIntakeConfig struct {
+	Enabled bool `json:"enabled"`
+	// BotTokenEnv names the env var holding the @BotFather bot token.
+	BotTokenEnv string `json:"botTokenEnv,omitempty"`
+	// AllowedUserIDs restricts who may open work. Required and non-empty: an
+	// unrestricted intake bot lets any stranger who finds the bot queue agent runs
+	// against your repositories.
+	AllowedUserIDs []int64 `json:"allowedUserIds,omitempty"`
+	// DefaultProjectID receives a message that names no project. A message may
+	// override it with a leading "#<projectId>" token.
+	DefaultProjectID string `json:"defaultProjectId,omitempty"`
+	// ChatID is where outbound asks are delivered. Empty means asks are only
+	// answered in whatever chat the intake message came from.
+	ChatID string `json:"chatId,omitempty"`
 }
 
 // HITLFeishuConfig tunes the Feishu HITL transport (answers come back via the
@@ -994,6 +1020,19 @@ type PartialInstructionsConfig struct {
 	MaxBytes *int  `json:"maxBytes,omitempty"`
 }
 
+type PartialIntakeConfig struct {
+	Telegram *PartialTelegramIntakeConfig `json:"telegram,omitempty"`
+}
+
+type PartialTelegramIntakeConfig struct {
+	Enabled            *bool    `json:"enabled,omitempty"`
+	BotTokenEnv        *string  `json:"botTokenEnv,omitempty"`
+	AllowedUserIDs     *[]int64 `json:"allowedUserIds,omitempty"`
+	DefaultProjectID   *string  `json:"defaultProjectId,omitempty"`
+	ChatID             *string  `json:"chatId,omitempty"`
+	PollTimeoutSeconds *int     `json:"pollTimeoutSeconds,omitempty"`
+}
+
 type PartialHITLConfig struct {
 	Enabled         *bool                    `json:"enabled,omitempty"`
 	AnswerTransport *string                  `json:"answerTransport,omitempty"`
@@ -1199,6 +1238,7 @@ type PartialConfig struct {
 	LegacyReviewer *PartialReviewerConfig     `json:"reviewer,omitempty"`
 	Instructions   *PartialInstructionsConfig `json:"instructions,omitempty"`
 	HITL           *PartialHITLConfig         `json:"hitl,omitempty"`
+	Intake         *PartialIntakeConfig       `json:"intake,omitempty"`
 	Roles          *PartialRoleConfigs        `json:"roles,omitempty"`
 	Providers      *[]PartialProviderConfig   `json:"providers,omitempty"`
 	Projects       *[]PartialProjectRefConfig `json:"projects,omitempty"`

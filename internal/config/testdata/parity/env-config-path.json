@@ -387,7 +387,8 @@
       },
       "hitl": {
         "enabled": false
-      }
+      },
+      "intake": {}
     },
     "metadata": {
       "configPath": "__TMP__/configs/env-selected.json",

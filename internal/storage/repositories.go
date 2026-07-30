@@ -62,6 +62,8 @@ type Repositories struct {
 	WebhookForwarders    *WebhookForwardersRepository
 	WebhookTunnelHooks   *WebhookTunnelHooksRepository
 	FeishuThreads        *FeishuThreadsRepository
+	TelegramThreads      *TelegramThreadsRepository
+	TelegramIntake       *TelegramIntakeRepository
 }
 
 func NewRepositories(q sqliteQuerier) *Repositories {
@@ -79,6 +81,8 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		WebhookForwarders:    &WebhookForwardersRepository{q: q},
 		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
 		FeishuThreads:        &FeishuThreadsRepository{q: q},
+		TelegramThreads:      &TelegramThreadsRepository{q: q},
+		TelegramIntake:       &TelegramIntakeRepository{q: q},
 	}
 }
 
@@ -406,6 +410,71 @@ func (r *FeishuThreadsRepository) LoopByRoot(ctx context.Context, rootMessageID 
 		return "", fmt.Errorf("feishu thread loop by root: %w", err)
 	}
 	return loopID, nil
+}
+
+// TelegramThreadsRepository maps the Telegram message that carried a loop's HITL
+// ask to that loop, in both directions.
+type TelegramThreadsRepository struct{ q sqliteQuerier }
+
+// Upsert records that askMessageID in chatID is the ask message for loopID.
+func (r *TelegramThreadsRepository) Upsert(ctx context.Context, chatID, askMessageID, loopID, createdAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO telegram_threads (chat_id, ask_message_id, loop_id, created_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(chat_id, ask_message_id) DO UPDATE SET
+			loop_id=excluded.loop_id
+	`, chatID, askMessageID, loopID, createdAt)
+	if err != nil {
+		return fmt.Errorf("upsert telegram thread: %w", err)
+	}
+	return nil
+}
+
+// LoopByMessage returns the loop a reply target belongs to, or "" when unknown.
+func (r *TelegramThreadsRepository) LoopByMessage(ctx context.Context, chatID, askMessageID string) (string, error) {
+	var loopID string
+	err := r.q.QueryRowContext(ctx, `SELECT loop_id FROM telegram_threads WHERE chat_id = ? AND ask_message_id = ?`, chatID, askMessageID).Scan(&loopID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("telegram thread loop by message: %w", err)
+	}
+	return loopID, nil
+}
+
+// TelegramIntakeRepository persists the Telegram intake update cursor so a crash
+// between processing and confirming a batch cannot replay it.
+type TelegramIntakeRepository struct{ q sqliteQuerier }
+
+// LastUpdateID returns the highest processed update_id, or 0 when intake has not
+// run yet.
+func (r *TelegramIntakeRepository) LastUpdateID(ctx context.Context) (int64, error) {
+	var value int64
+	err := r.q.QueryRowContext(ctx, `SELECT last_update_id FROM telegram_intake_cursor WHERE id = 1`).Scan(&value)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("telegram intake cursor: %w", err)
+	}
+	return value, nil
+}
+
+// AdvanceUpdateID moves the cursor forward. Never moves it backwards, so an
+// out-of-order write cannot resurrect already-processed updates.
+func (r *TelegramIntakeRepository) AdvanceUpdateID(ctx context.Context, updateID int64, updatedAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO telegram_intake_cursor (id, last_update_id, updated_at)
+		VALUES (1, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			last_update_id=MAX(telegram_intake_cursor.last_update_id, excluded.last_update_id),
+			updated_at=excluded.updated_at
+	`, updateID, updatedAt)
+	if err != nil {
+		return fmt.Errorf("advance telegram intake cursor: %w", err)
+	}
+	return nil
 }
 
 type EventsRepository struct{ q sqliteQuerier }
