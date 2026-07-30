@@ -64,6 +64,41 @@ content appear in them, and each capture was reread before check-in to
 confirm that. Everything else is verbatim. Re-run the script to reproduce
 (token counts and cache hit rates will differ run to run).
 
+### Why these captures are checked in (trade-off)
+
+These replay captures are a new persisted evidence record, so per the
+repo's design rule they answer two questions:
+
+- **Delete them six months from now — what breaks?** The protocol, token,
+  error-code, and tool-loop claims below lose their auditable basis. A
+  reader could not re-derive whether Devin still returns `end_turn` with
+  real usage, still emits the `-32601`-rejected `_cognition.ai/*` methods,
+  or still owns the tool loop; the doc would revert to unverified operator
+  notes — exactly the state the first review blocker on this PR rejected.
+  They also pin wire shapes that are not documented upstream (e.g.
+  `session/request_permission` carries no tool name; bare-JSON tool calls
+  parse via the shim's fallback regex), so deleting them loses the only
+  record of those defects.
+- **What do they still not catch?** They are point-in-time against
+  `devin 3000.3.22` / Hermes `v0.19.0 (2026.7.20)`. They do not catch drift
+  on either side after capture — a release that changes a wire shape
+  silently invalidates them with no signal here. They also do not cover
+  behavior the probe does not exercise: the probe deliberately declares no
+  `fs` capability, so filesystem write behavior is described in the safety
+  section but not captured as an artifact, and the per-turn respawn cost
+  and rolling rate limit are observed in prose, not replayed.
+
+A live-only probe (re-run on demand, nothing checked in) needs a live
+authenticated Devin account and a working Hermes install at the pinned
+versions; a reviewer or future maintainer without those cannot audit the
+claims at all. A fail-loud probe alone — the default-mode assertions
+`replay_acp.py` now makes — guards future re-runs but records nothing
+about the versions it was first run against, so it cannot answer "what did
+this used to do?" when something later breaks. The checked-in capture is
+the immutable evidence; the probe plus its assertions is the
+reproducibility guard. Both are needed, which is why neither alone was
+sufficient.
+
 1. **Raw handshake replay** (`replay-default-agent.txt`):
    `initialize` returned protocol v1 with
    `cognition.ai/*` meta capabilities; `session/new` returned a session with
@@ -203,9 +238,13 @@ it just wrote. Verify externally.
   only in Devin's ATIF/usage side.
 - Tool calling is prompt-level emulation (`<tool_call>` blocks), not native
   function calling; expect occasional malformed-call retries.
-- Devin's own agent persona wraps the model. Permission requests from
-  Devin-side tools are auto-denied by Hermes, so Devin cannot act on its
-  own, but its system prompt still colors responses.
+- Devin's own agent persona wraps the model. Hermes auto-denies
+  `session/request_permission` requests, but that denial is not a
+  containment boundary: in the default agent type Devin also runs its own
+  native tools inside its own loop, which Hermes does not mediate at all
+  and which did write files during this spike (see the tool-loop finding).
+  Only permission-gated calls are blocked; unmediated native actions still
+  land, and the persona still colors responses.
 - `glm-5-2` free tier is an observation at capture time, not a durable
   promise (see `devin-cli-3000.3.22.md`); rerun
   `devin models list --format json` before relying on it.
