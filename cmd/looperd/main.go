@@ -166,7 +166,8 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		TriggerSchedulerTick: func() {
 			rt.TriggerSchedulerTick()
 		},
-		LookupPullRequest: looperdapi.NewGatewayPullRequestLookup(deps.Config, time.Now),
+		DaemonBinaryStatus: rt.DaemonBinaryStatus,
+		LookupPullRequest:  looperdapi.NewGatewayPullRequestLookup(deps.Config, time.Now),
 	})
 	root := looperdapi.NewRootHandler(apiHandler, dashboard.Handler())
 	server := looperdapi.NewServer(deps.Config, root, deps.Logger)
@@ -467,14 +468,25 @@ func closeLoop(ctx context.Context, services looperdruntime.Services, loopID, re
 // reports the failure with the hold already committed. That is the safe residue
 // to leave behind: the loop is fenced, `looper handback` releases it, and the
 // operator is told the agent could not be reached rather than being told the
-// worktree is theirs.
+// worktree is theirs. The residue is only safe if it is *reported*: the result
+// carries HoldCommitted on the error return so the API renders a partial failure
+// naming the parked loop, the cancelled queue item, and `looper handback`.
 func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (looperdapi.TakeoverResult, error) {
 	result := looperdapi.TakeoverResult{LoopID: loopID}
 	if services.Loops == nil {
 		return result, fmt.Errorf("loops service is not configured")
 	}
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
-		if execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil {
+		execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+		if err != nil {
+			// A failed lookup is not "no execution": stopping now would park
+			// the loop without the session id, vendor, and worktree a human
+			// needs to resume the exact session. Abort before any lifecycle
+			// mutation; a genuinely absent execution (nil, no error) still
+			// takes over with empty ownership fields.
+			return result, fmt.Errorf("load latest agent execution before takeover: %w", err)
+		}
+		if execution != nil {
 			result.Vendor = execution.Vendor
 			if execution.NativeSessionID != nil {
 				result.SessionID = strings.TrimSpace(*execution.NativeSessionID)
@@ -491,6 +503,10 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	if _, err := services.Loops.Hold(ctx, loopID, &reason); err != nil {
 		return result, err
 	}
+	// From here the hold and the queue-item cancel are durable. Every later
+	// return — including the failure one — must carry that fact so the API can
+	// report a partial failure instead of a bare error.
+	result.HoldCommitted = true
 	stopped, err := stopHeldLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess)
 	if err != nil {
 		return result, err

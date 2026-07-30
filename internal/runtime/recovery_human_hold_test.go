@@ -124,3 +124,111 @@ func TestRecoveryUpsertLoopReportsAHeldLoopAsNotApplied(t *testing.T) {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want the loop still held", persisted, err)
 	}
 }
+
+// Stale-run reconciliation's requeue is not one write, it is a loop write
+// followed by a multi-statement queue repair. recoveryUpsertLoop only guards the
+// first: a takeover that commits *after* the loop write cancels the loop's queue
+// item, and the repair then publishes a replacement one for a loop the human now
+// owns. The claim predicate keeps that item dormant, so nothing runs — but it is
+// durable state contradicting the hold, and it is the exact blocker
+// assertLoopRetryPreconditions rejects on, so leaving it there puts a landmine
+// under the operator's release path. Unlike the cleanup races deferred to #210,
+// both halves here are durable writes on the same rows, so the window closes
+// rather than narrows.
+func TestStaleRunRepairAbandonsRequeueWhenTakeoverCommitsMidRepair(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, "")
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	oldISO := formatJavaScriptISOString(now.Add(-time.Hour))
+
+	projectID := "project_1"
+	loopID := "loop_reconciled"
+	targetID := projectID
+	if err := repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := repositories.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	latestRun := &storage.RunRecord{ID: "run_reconciled", LoopID: loopID, Status: "interrupted", StartedAt: oldISO, EndedAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := repositories.Runs.Upsert(ctx, *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repositories.Queue.Upsert(ctx, storage.QueueItemRecord{
+		ID: "queue_reconciled", ProjectID: &projectID, LoopID: &loopID, Type: "worker",
+		TargetType: "project", TargetID: targetID, DedupeKey: "worker:project_1:loop_reconciled",
+		Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: oldISO,
+		MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	// The takeover transaction, committed in the window the fix closes: the hold
+	// lands and the loop's queue item is cancelled, exactly as looperd's
+	// Loops.Hold does.
+	takeoverOnce := false
+	rt.staleRepairAfterLoopWriteHook = func(id string) {
+		if takeoverOnce || id != loopID {
+			return
+		}
+		takeoverOnce = true
+		held, err := repositories.Loops.GetByID(ctx, loopID)
+		if err != nil || held == nil {
+			t.Errorf("Loops.GetByID(%s) = (%#v, %v)", loopID, held, err)
+			return
+		}
+		held.Status = "human_takeover"
+		held.NextRunAt = nil
+		held.UpdatedAt = nowISO
+		if err := repositories.Loops.UpsertChangingHumanHold(ctx, *held); err != nil {
+			t.Errorf("UpsertChangingHumanHold() error = %v", err)
+			return
+		}
+		reason := "Taken over by a human via looper takeover"
+		if _, err := repositories.Queue.CancelByLoop(ctx, loopID, nowISO, &reason); err != nil {
+			t.Errorf("Queue.CancelByLoop() error = %v", err)
+		}
+	}
+
+	summary, err := rt.repairStaleRunQueueState(ctx, repositories, loop, latestRun, false, nowISO)
+	if err != nil {
+		t.Fatalf("repairStaleRunQueueState() error = %v", err)
+	}
+	if !takeoverOnce {
+		t.Fatal("the takeover hook never fired; the test did not reach the requeue path it claims to cover")
+	}
+	if summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
+		t.Fatalf("summary = %#v, want no requeue reported: the human owns the loop", summary)
+	}
+
+	persisted, err := repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", persisted, err)
+	}
+	if persisted.Status != "human_takeover" {
+		t.Fatalf("loop status = %q, want human_takeover preserved", persisted.Status)
+	}
+	// The assertion that matters for the operator: nothing active is left behind.
+	// An active queue item here is precisely what assertLoopRetryPreconditions
+	// refuses, so this is the state /handback would have had to clean up.
+	active, err := repositories.Queue.FindActiveByLoopID(ctx, loopID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if active != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() = %#v, want nothing active against a held loop", active)
+	}
+}

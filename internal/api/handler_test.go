@@ -21,6 +21,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/daemonbinary"
 	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/labels"
@@ -1142,7 +1143,7 @@ func TestStatusDegradedReasonsIncludesKnownDisabledPublishWithoutLooperPath(t *t
 	reasons := statusDegradedReasons(looperdruntime.ReviewPublishReadiness{
 		Known:              true,
 		PublishingDisabled: true,
-	}, looperdruntime.ForgeCredentialReadiness{}, looperdruntime.OutstandingQuarantineDebt{}, nil)
+	}, looperdruntime.ForgeCredentialReadiness{}, looperdruntime.OutstandingQuarantineDebt{}, nil, daemonbinary.Status{})
 	if got := strings.Join(reasons, ","); got != "review_publish_disabled" {
 		t.Fatalf("statusDegradedReasons() = %q, want review_publish_disabled", got)
 	}
@@ -1154,6 +1155,7 @@ func TestStatusDegradedReasonsIncludesMissingForgeCredential(t *testing.T) {
 		looperdruntime.ForgeCredentialReadiness{GitHubProjects: true},
 		looperdruntime.OutstandingQuarantineDebt{},
 		nil,
+		daemonbinary.Status{},
 	)
 	if got := strings.Join(reasons, ","); got != looperdruntime.ForgeCredentialDegradedReason {
 		t.Fatalf("statusDegradedReasons() = %q, want %q", got, looperdruntime.ForgeCredentialDegradedReason)
@@ -1166,9 +1168,96 @@ func TestStatusDegradedReasonsIncludesUnavailableQuarantineDebt(t *testing.T) {
 		looperdruntime.ForgeCredentialReadiness{},
 		looperdruntime.OutstandingQuarantineDebt{},
 		errors.New("sqlite temporarily unavailable"),
+		daemonbinary.Status{},
 	)
 	if got := strings.Join(reasons, ","); got != "quarantine_debt_unavailable" {
 		t.Fatalf("statusDegradedReasons() = %q, want quarantine_debt_unavailable", got)
+	}
+}
+
+// A daemon whose binary was replaced under it keeps serving happily on the old
+// image, so /status is the only place the divergence can show up (#154).
+func TestHandlerStatusReportsSwappedDaemonBinary(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+
+	swapped := daemonbinary.Status{
+		Known:         true,
+		Path:          "/Users/operator/.looper/bin/looperd",
+		RunningSHA256: "59055eeb00000000000000000000000000000000000000000000000000000000",
+		OnDiskSHA256:  "d6af10e900000000000000000000000000000000000000000000000000000000",
+		Swapped:       true,
+		Reason:        "daemon executable was replaced while running",
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{
+		Config:             cfg,
+		Runtime:            rt,
+		DaemonBinaryStatus: func() daemonbinary.Status { return swapped },
+	}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var envelope struct {
+		Data struct {
+			Service struct {
+				DegradedReasons []string `json:"degradedReasons"`
+				Binary          struct {
+					Identity daemonbinary.Status `json:"identity"`
+				} `json:"binary"`
+			} `json:"service"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	payload := envelope.Data
+	if !slices.Contains(payload.Service.DegradedReasons, daemonbinary.SwappedDegradedReason) {
+		t.Fatalf("degradedReasons = %v, want %q", payload.Service.DegradedReasons, daemonbinary.SwappedDegradedReason)
+	}
+	if payload.Service.Binary.Identity != swapped {
+		t.Fatalf("binary.identity = %#v, want %#v", payload.Service.Binary.Identity, swapped)
+	}
+}
+
+// With no reporter wired the daemon cannot see a swap; it must report that,
+// not the reassuring answer.
+func TestHandlerStatusReportsUnknownBinaryIdentityWithoutReporter(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var envelope struct {
+		Data struct {
+			Service struct {
+				DegradedReasons []string `json:"degradedReasons"`
+				Binary          struct {
+					Identity daemonbinary.Status `json:"identity"`
+				} `json:"binary"`
+			} `json:"service"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	payload := envelope.Data
+
+	identity := payload.Service.Binary.Identity
+	if identity.Known || identity.Swapped {
+		t.Fatalf("binary.identity = %#v, want unknown and unswapped", identity)
+	}
+	if identity.Reason == "" {
+		t.Fatal("binary.identity.reason is empty, want an explanation that detection is unavailable")
+	}
+	if slices.Contains(payload.Service.DegradedReasons, daemonbinary.SwappedDegradedReason) {
+		t.Fatalf("degradedReasons = %v, want no swap claim when identity is unknown", payload.Service.DegradedReasons)
 	}
 }
 

@@ -493,7 +493,7 @@ Typical usage (stripped CLI + dashboard):
 - Worktree cleanup runs on the daemon schedule (`daemon.worktreeCleanup`); no CLI verb
 - `looper stop <selector>`: stop an active loop
 - `looper pause` / `retry` / `takeover` / `handback` / `respond`: remaining control surface
-- `looper takeover <selector>` parks one loop: no new claim is granted on its target, its run is stopped, and its worktree is kept out of cleanup until `looper handback`. It does **not** stop a loop already running on the same checkout, and `looper retry --discard-worktree-changes` can still reset that checkout — see [DESIGN-human-takeover.md](DESIGN-human-takeover.md#what-the-hold-actually-covers)
+- `looper takeover <selector>` parks one loop until `looper handback`. Guaranteed: no new claim is granted on its target, its run is stopped, and no daemon write can take it out of `human_takeover`. Best-effort only: cleanup reads the hold before it deletes, so a sweep already past that read can still remove the worktree (#210). It does **not** stop a loop already running on the same checkout, and `looper retry --discard-worktree-changes` can still reset that checkout — see [DESIGN-human-takeover.md](DESIGN-human-takeover.md#what-the-hold-actually-covers)
 - After sleep/wake, restart `looperd` if loops look stuck
 
 ## 15. Minimal end-to-end example

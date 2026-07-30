@@ -903,6 +903,16 @@ type daemonStatusResponse struct {
 type statusServiceView struct {
 	DegradedReasons []string           `json:"degradedReasons"`
 	Recovery        statusRecoveryView `json:"recovery"`
+	Binary          statusBinaryView   `json:"binary"`
+}
+
+type statusBinaryView struct {
+	Identity statusBinaryIdentityView `json:"identity"`
+}
+
+type statusBinaryIdentityView struct {
+	Swapped bool   `json:"swapped"`
+	Reason  string `json:"reason"`
 }
 
 type statusRecoveryView struct {
@@ -975,6 +985,16 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 			}
 			_, _ = fmt.Fprintf(stdout, "review:   publish not ready (%s)\n", singleLine(reason))
 		}
+	}
+
+	// A replaced binary is invisible in every other line: the daemon is healthy,
+	// on the old image, and will switch builds at the next restart (#154).
+	if identity := status.Service.Binary.Identity; identity.Swapped {
+		reason := strings.TrimSpace(identity.Reason)
+		if reason == "" {
+			reason = "on-disk looperd no longer matches the running image"
+		}
+		_, _ = fmt.Fprintf(stdout, "binary:   %s\n", singleLine(reason))
 	}
 
 	outstanding := status.Service.Recovery.Outstanding

@@ -43,18 +43,22 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary) string {
 	}, "\x1f")
 }
 
-// checkReasonCodes are the gate reasons whose truth lives in check-run state
-// rather than on the pull request itself. A pending check turning green, or a
-// missing check appearing, changes the gate without changing anything the list
-// page can see, so a report carrying one of these is never skipped.
+// checkReasonCodes are the gate reasons that resolve on their own, without
+// anything changing on the pull request. A pending check turning green or a
+// missing check appearing changes the gate while every field the list page can
+// see stays identical, so detecting it promptly requires re-evaluating.
 //
-// ReasonCheckFailed is included even though a failed check is usually terminal:
-// re-runs flip it back to passing with no visible change to the pull request.
+// Failed and cancelled checks are deliberately absent, and measurement is why. On
+// a live daemon 18 of 19 open pull requests carried required_check_failed at any
+// moment, so treating it as volatile made almost nothing skippable and cost most
+// of this optimisation's value. Unlike a pending check, a failed one does not fix
+// itself: it changes on a re-run, and a re-run that accompanies a push moves the
+// head SHA and is caught by the fingerprint anyway. The only missed case is a
+// manual re-run with no push, which the maxSkipAge ceiling bounds — a cheap price
+// on an observe-only report.
 var checkReasonCodes = map[ReasonCode]struct{}{
-	ReasonCheckMissing:   {},
-	ReasonCheckPending:   {},
-	ReasonCheckFailed:    {},
-	ReasonCheckCancelled: {},
+	ReasonCheckMissing: {},
+	ReasonCheckPending: {},
 }
 
 func reportAwaitsCheckState(report Report) bool {

@@ -3,9 +3,11 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -108,6 +110,169 @@ func TestWorkerDoesNotAttachOldVendorSessionsAfterVendorChange(t *testing.T) {
 		t.Fatalf("cross-vendor mailbox session = %q, want fresh session", got)
 	}
 }
+
+func TestWorkerInboxAcknowledgementPreservesConcurrentMessageForNextTurn(t *testing.T) {
+	for _, initialMessages := range []int{0, 20} {
+		t.Run("initial_inbox_"+strconv.Itoa(initialMessages), func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			ctx := context.Background()
+			loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+			if err != nil || loop == nil {
+				t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+			}
+			for i := 0; i < initialMessages; i++ {
+				meta, appendErr := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: "before", Text: fmt.Sprintf("before-%d", i)})
+				if appendErr != nil {
+					t.Fatalf("AppendHumanMessage() error = %v", appendErr)
+				}
+				loop.MetadataJSON = &meta
+			}
+			if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+
+			agent := &blockingAgentExecutor{started: make(chan struct{}), release: make(chan struct{})}
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now,
+				GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: t.TempDir(), Branch: "looper/inbox", BaseBranch: "main"}},
+				AgentExecutor: agent, HITLEnabled: true, AllowAutoCommit: true,
+			})
+			claim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "worker-1", "worker")
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
+			}
+			finished := make(chan error, 1)
+			go func() {
+				_, runErr := runner.ProcessClaimedItem(ctx, *claim)
+				finished <- runErr
+			}()
+			<-agent.started
+
+			appendHumanMessageForWorkerTest(t, ctx, fixture.repos, fixture.nowISO(), "loop_worker_1", "late instruction")
+			close(agent.release)
+			if err := <-finished; err != nil {
+				t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+			}
+
+			loop, err = fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+			if err != nil || loop == nil || loop.Status != "queued" {
+				t.Fatalf("loop after first turn = (%#v, %v), want queued", loop, err)
+			}
+			inbox := loops.ReadHumanInbox(loop.MetadataJSON)
+			if len(inbox) != 1 || inbox[0].Text != "late instruction" {
+				t.Fatalf("inbox after first turn = %#v, want only late instruction", inbox)
+			}
+			queue, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+			if err != nil || queue == nil || queue.Status != "queued" {
+				t.Fatalf("queue after first turn = (%#v, %v), want queued", queue, err)
+			}
+
+			next, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "worker-2", "worker")
+			if err != nil || next == nil {
+				t.Fatalf("ClaimNextOfType(next) = (%#v, %v)", next, err)
+			}
+			if _, err := runner.ProcessClaimedItem(ctx, *next); err != nil {
+				t.Fatalf("ProcessClaimedItem(next) error = %v", err)
+			}
+			if len(agent.starts) != 2 || !strings.Contains(agent.starts[1].Prompt, "late instruction") {
+				t.Fatalf("agent starts = %#v, want second prompt containing late instruction", agent.starts)
+			}
+		})
+	}
+}
+
+func TestSuspendForHumanAcknowledgesOnlyPromptInboxSnapshot(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: "before", Text: "prompt message"})
+	if err != nil {
+		t.Fatalf("AppendHumanMessage() error = %v", err)
+	}
+	loop.MetadataJSON = &meta
+	loop.Status = "running"
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	drained := loops.ReadHumanInbox(&meta)
+	appendHumanMessageForWorkerTest(t, ctx, fixture.repos, nowISO, loop.ID, "late message")
+
+	queue, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v)", queue, err)
+	}
+	queue.Status = "running"
+	if err := fixture.repos.Queue.Upsert(ctx, *queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_suspend_inbox", LoopID: loop.ID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(ctx, loop.ProjectID)
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true, HITLAnswerTransport: "feishu"})
+	if _, err := runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: *queue}, run, workerCheckpoint{}, &awaitingHumanError{question: "Continue?", drainedInbox: drained}); err != nil {
+		t.Fatalf("suspendForHuman() error = %v", err)
+	}
+	updated, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() after suspend = (%#v, %v)", updated, err)
+	}
+	inbox := loops.ReadHumanInbox(updated.MetadataJSON)
+	if len(inbox) != 1 || inbox[0].Text != "late message" {
+		t.Fatalf("inbox after suspend = %#v, want only late message", inbox)
+	}
+}
+
+func appendHumanMessageForWorkerTest(t *testing.T, ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) {
+	t.Helper()
+	unlock := loops.LockLoopRequeue(loopID)
+	defer unlock()
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
+	if err != nil {
+		t.Fatalf("AppendHumanMessage() error = %v", err)
+	}
+	loop.MetadataJSON = &meta
+	loop.UpdatedAt = nowISO
+	if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+}
+
+type blockingAgentExecutor struct {
+	started chan struct{}
+	release chan struct{}
+	starts  []AgentRunInput
+}
+
+func (a *blockingAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
+	a.starts = append(a.starts, input)
+	if len(a.starts) == 1 {
+		close(a.started)
+		return blockingAgentExecution{release: a.release}, nil
+	}
+	return fakeAgentExecution{result: AgentResult{Status: "completed", Summary: "done", ParseStatus: "parsed"}}, nil
+}
+
+type blockingAgentExecution struct{ release <-chan struct{} }
+
+func (a blockingAgentExecution) Wait(context.Context) (AgentResult, error) {
+	<-a.release
+	return AgentResult{Status: "completed", Summary: "done", ParseStatus: "parsed"}, nil
+}
+
+func (blockingAgentExecution) Kill(string) error { return nil }
 
 func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 	fixture := newRunnerFixture(t)
@@ -515,5 +680,256 @@ func TestDetectHumanAskParksOnSentinelFailure(t *testing.T) {
 	var le *loopError
 	if !errors.As(awaitErr, &le) || le.kind != FailureManualIntervention {
 		t.Fatalf("detectHumanAsk error = %#v, want loopError with manual_intervention: a retryable kind auto-requeues and the retry, finding the sentinel quarantined, would publish the gated work", awaitErr)
+	}
+}
+
+func TestSuspendForHumanAbortsOnMalformedMetadataInsteadOfStranding(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID error = %v", err)
+	}
+	malformed := `{"worktreeId":"wt-1","hitl":{`
+	loop.Status = "running"
+	loop.MetadataJSON = &malformed
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID error = %v", err)
+	}
+	queueItem.Status = "running"
+	if err := fixture.repos.Queue.Upsert(ctx, *queueItem); err != nil {
+		t.Fatalf("Queue.Upsert error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID error = %v", err)
+	}
+
+	runner := New(Options{
+		DB:                  fixture.coordinator.DB(),
+		Repos:               fixture.repos,
+		Logger:              fixture.logger,
+		Now:                 fixture.now,
+		HITLEnabled:         true,
+		HITLAnswerTransport: "feishu",
+		HITLNotify: func(_ context.Context, n HITLAskNotification) error {
+			return nil
+		},
+	})
+
+	awaiting := &awaitingHumanError{question: "Which datastore?", sessionID: "sess-xyz", executionID: "agent-1", vendor: "codex"}
+	_, err = runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: *queueItem}, run, workerCheckpoint{}, awaiting)
+	if err == nil {
+		t.Fatal("suspendForHuman error = nil, want persist-ask failure: parking without a stored ask strands the loop")
+	}
+	if !errors.Is(err, loops.ErrMalformedLoopMetadata) {
+		t.Fatalf("suspendForHuman error = %v, want ErrMalformedLoopMetadata", err)
+	}
+
+	// The loop must not have transitioned to awaiting_human, its malformed
+	// metadata must be intact for diagnosis, and the queue item untouched.
+	got, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || got == nil {
+		t.Fatalf("Loops.GetByID error = %v", err)
+	}
+	if got.Status == "awaiting_human" {
+		t.Fatal("loop status = awaiting_human, want suspension aborted")
+	}
+	if got.MetadataJSON == nil || *got.MetadataJSON != malformed {
+		t.Fatalf("loop metadata = %v, want the malformed value preserved verbatim", got.MetadataJSON)
+	}
+	q, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+	if err != nil || q == nil {
+		t.Fatalf("Queue.GetByID error = %v", err)
+	}
+	if q.Status != "running" {
+		t.Fatalf("queue item status = %q, want running (not cancelled)", q.Status)
+	}
+
+	// The run must be closed as failed so the retried claim resumes it instead
+	// of starting a duplicate while this one stays active forever.
+	gotRun, err := fixture.repos.Runs.GetByID(ctx, "run_worker_1")
+	if err != nil || gotRun == nil {
+		t.Fatalf("Runs.GetByID error = %v", err)
+	}
+	if gotRun.Status != "failed" {
+		t.Fatalf("run status = %q, want failed after aborted suspension", gotRun.Status)
+	}
+}
+
+func TestMergeLoopMetadataJSONRejectsMalformedCurrentValue(t *testing.T) {
+	t.Parallel()
+
+	malformed := `{"prUrl":`
+	got, err := mergeLoopMetadataJSON(&malformed, map[string]any{"prUrl": "https://example.com/pr/1"})
+	if err == nil {
+		t.Fatalf("mergeLoopMetadataJSON(malformed) = %q, want error: merging over a corrupt value erases durable state", got)
+	}
+	if !errors.Is(err, loops.ErrMalformedLoopMetadata) {
+		t.Fatalf("mergeLoopMetadataJSON(malformed) error = %v, want ErrMalformedLoopMetadata", err)
+	}
+
+	valid := `{"worker":{"lastRun":"r1"}}`
+	out, err := mergeLoopMetadataJSON(&valid, map[string]any{"prUrl": "https://example.com/pr/1"})
+	if err != nil {
+		t.Fatalf("mergeLoopMetadataJSON(valid) error = %v", err)
+	}
+	if !strings.Contains(out, `"worker"`) || !strings.Contains(out, `"prUrl"`) {
+		t.Fatalf("mergeLoopMetadataJSON(valid) = %q, want existing keys preserved and update applied", out)
+	}
+}
+
+// corruptingAgentExecutor writes the ask sentinel into the worktree and
+// corrupts the loop's stored metadata mid-run, simulating concurrent
+// corruption that lands between claim time and suspension.
+type corruptingAgentExecutor struct {
+	inner   fakeAgentExecutor
+	repos   *storage.Repositories
+	loopID  string
+	corrupt string
+}
+
+func (c *corruptingAgentExecutor) Start(ctx context.Context, input AgentRunInput) (AgentExecution, error) {
+	askPath := filepath.Join(input.WorkingDirectory, hitlSentinelRelPath)
+	if err := os.MkdirAll(filepath.Dir(askPath), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(askPath, []byte(`{"question":"Which datastore?"}`), 0o644); err != nil {
+		return nil, err
+	}
+	loop, err := c.repos.Loops.GetByID(ctx, c.loopID)
+	if err != nil || loop == nil {
+		return nil, err
+	}
+	corrupted := c.corrupt
+	loop.MetadataJSON = &corrupted
+	if err := c.repos.Loops.Upsert(ctx, *loop); err != nil {
+		return nil, err
+	}
+	return c.inner.Start(ctx, input)
+}
+
+// The aborted-suspension contract through the outer lifecycle: queue recovery
+// must run and the run must end failed, so the NEXT claim resumes it instead
+// of creating a second run while the first stays active.
+func TestProcessClaimedQueueItemRecoversWhenSuspensionAborts(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+
+	worktreePath := filepath.Join(t.TempDir(), "wt")
+	git := &fakeGitGateway{
+		createResult: CreateWorktreeResult{WorktreePath: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head", WorktreeID: "worktree_1"},
+	}
+	agent := &corruptingAgentExecutor{
+		repos:   fixture.repos,
+		loopID:  "loop_worker_1",
+		corrupt: `{"worktreeId":"wt-1","hitl":{`,
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent,
+		Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true,
+		HITLEnabled: true, HITLAnswerTransport: "feishu",
+		HITLNotify: func(context.Context, HITLAskNotification) error { return nil },
+	})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(ctx, *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v, want recovered failure result", err)
+	}
+	if result == nil || result.Status != "failed" {
+		t.Fatalf("result = %#v, want failed after aborted suspension", result)
+	}
+
+	// The loop must not be parked awaiting a nonexistent ask.
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	if loop.Status == "awaiting_human" {
+		t.Fatal("loop parked awaiting_human with no stored ask")
+	}
+
+	// Exactly one run exists and it is failed (resumable), and the queue item
+	// was reconciled by recovery rather than left running.
+	runs, err := fixture.repos.Runs.ListByLoop(ctx, "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Runs.ListByLoop() error = %v", err)
+	}
+	if len(runs) != 1 || runs[0].Status != "failed" {
+		t.Fatalf("runs = %#v, want exactly one failed (resumable) run", runs)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(ctx, claim.ID)
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v)", queueItem, err)
+	}
+	if queueItem.Status == "running" {
+		t.Fatalf("queue item status = running, want reconciled by recovery (got %#v)", queueItem)
+	}
+
+	// Repair the metadata and reprocess: the failed run must be RESUMED, not
+	// duplicated.
+	repaired := `{"worktreeId":"wt-1"}`
+	loop.MetadataJSON = &repaired
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert(repaired) error = %v", err)
+	}
+	agent.corrupt = repaired // second pass leaves metadata valid
+	loop.Status = "queued"
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert(requeue loop) error = %v", err)
+	}
+	queueItem.Status = "queued"
+	queueItem.AvailableAt = fixture.nowISO()
+	queueItem.Attempts = 0
+	if err := fixture.repos.Queue.Upsert(ctx, *queueItem); err != nil {
+		t.Fatalf("Queue.Upsert(requeue) error = %v", err)
+	}
+	claim2, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim2 == nil {
+		t.Fatalf("second ClaimNextOfType() = (%#v, %v)", claim2, err)
+	}
+	result2, err := runner.ProcessClaimedQueueItem(ctx, *claim2)
+	if err != nil {
+		t.Fatalf("second ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result2 == nil || result2.Status != "awaiting_human" {
+		t.Fatalf("second result = %#v, want awaiting_human once metadata is repaired", result2)
+	}
+	runs, err = fixture.repos.Runs.ListByLoop(ctx, "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Runs.ListByLoop() error = %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("runs after reprocess = %d, want the failed run plus its continuation", len(runs))
+	}
+	// No zombie: every run is terminal-or-resumable, none left running.
+	for _, run := range runs {
+		if run.Status == "running" {
+			t.Fatalf("run %s left running after reprocess: %#v", run.ID, run)
+		}
+	}
+	loop, err = fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop status after repaired suspension = %q, want awaiting_human", loop.Status)
+	}
+	if _, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok {
+		t.Fatal("no HITL ask stored after repaired suspension")
 	}
 }

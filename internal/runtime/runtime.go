@@ -20,7 +20,6 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
@@ -205,7 +204,7 @@ type Runtime struct {
 	projectCatalog              *projects.Catalog
 	githubGateway               *githubinfra.Gateway
 	webhook                     *webhookRuntime
-	webhookDaemonLock           *daemonLock
+	databaseDaemonLock          *storage.DatabaseLock
 	webhookForwarder            WebhookForwarder
 	notificationGateways        *schedulerNotificationGatewayFactory
 	networkManager              runtimeNetworkManager
@@ -217,6 +216,15 @@ type Runtime struct {
 	// this flag is not a mutation/claim gate.
 	ownershipAcquired bool
 	admission         *Admission
+	// daemonBinary answers whether the executable file this daemon was launched
+	// from still holds the image it is running (#154).
+	daemonBinary *daemonBinaryWatcher
+
+	// staleRepairAfterLoopWriteHook is test-only: invoked immediately after
+	// stale-run reconciliation's requeue write to the loop lands and before the
+	// queue repair that follows, so a test can commit a takeover inside the exact
+	// window abandonRequeueIfTakenOver closes.
+	staleRepairAfterLoopWriteHook func(loopID string)
 
 	// shutdownDrainErr is set by BeginShutdown when producer/handle drain fails.
 	// Stop retains SQLite when non-nil (ADR-0015 / #577).
@@ -317,6 +325,7 @@ func New(options Options) *Runtime {
 		projectCatalog:              projectCatalog,
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
 		admission:                   NewAdmission(),
+		daemonBinary:                newDaemonBinaryWatcher(options.Logger),
 	}
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
@@ -457,6 +466,7 @@ func (r *Runtime) Stop(reason string) {
 				r.logger.Warn("looperd runtime close failed", map[string]any{"error": err.Error()})
 			}
 		}
+		r.releaseDatabaseDaemonLock()
 
 		close(r.shutdownCh)
 
@@ -813,16 +823,21 @@ func (r *Runtime) RefreshWebhookForwarders() error {
 func (r *Runtime) stopWebhookRuntime() {
 	r.mu.RLock()
 	webhook := r.webhook
-	lock := r.webhookDaemonLock
 	r.mu.RUnlock()
 	if webhook != nil {
 		webhook.Stop()
 	}
+}
+
+func (r *Runtime) releaseDatabaseDaemonLock() {
+	r.mu.RLock()
+	lock := r.databaseDaemonLock
+	r.mu.RUnlock()
 	if lock != nil {
 		_ = lock.Release()
 		r.mu.Lock()
-		if r.webhookDaemonLock == lock {
-			r.webhookDaemonLock = nil
+		if r.databaseDaemonLock == lock {
+			r.databaseDaemonLock = nil
 		}
 		r.mu.Unlock()
 	}
@@ -836,26 +851,26 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	r.mu.RUnlock()
 
+	// Record which executable this process actually loaded before anything can
+	// replace it. Later checks compare against this, not against a re-read.
+	if r.daemonBinary != nil {
+		r.daemonBinary.record()
+	}
+
 	backupDir := ""
 	if r.config.Storage.BackupDir != nil {
 		backupDir = *r.config.Storage.BackupDir
 	}
 
-	var lock *daemonLock
-	var err error
-	if r.config.Webhook.Enabled {
-		lockPath := webhookForwarderLockPath(r.config.Storage.DBPath)
-		lock, err = acquireDaemonLock(lockPath, r.webhook.daemonID, r.now())
-		if err != nil {
-			if r.logger != nil {
-				holder, _ := os.ReadFile(lockPath)
-				r.logger.Warn("webhook.daemon.lock_failed", map[string]any{"path": lockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
-			}
-			return err
-		}
+	lock, err := storage.AcquireDatabaseLock(r.config.Storage.DBPath, storage.DatabaseLockExclusive)
+	if err != nil {
 		if r.logger != nil {
-			r.logger.Info("webhook.daemon.lock_acquired", map[string]any{"path": lockPath})
+			r.logger.Warn("runtime.database.lock_failed", map[string]any{"error": err.Error()})
 		}
+		return err
+	}
+	if r.logger != nil {
+		r.logger.Info("runtime.database.lock_acquired", map[string]any{"mode": storage.DatabaseLockExclusive})
 	}
 
 	coordinator, err := r.openSQLiteCoordinator(ctx, r.config.Storage.DBPath, storage.SQLiteCoordinatorOptions{
@@ -881,6 +896,14 @@ func (r *Runtime) start(ctx context.Context) error {
 		}
 	}()
 
+	// Validate schema compatibility on every boot, regardless of whether
+	// migration application is enabled, so a downgraded or mixed-version binary
+	// cannot initialize repositories and run against a newer schema it cannot
+	// prove it understands. Migration application remains conditional below.
+	if err := coordinator.MigrationRunner().ValidateCompatibility(ctx); err != nil {
+		return err
+	}
+
 	if r.config.Package.AutoMigrateOnStartup {
 		_, err = coordinator.MigrationRunner().RunPending(ctx, storage.RunPendingOptions{
 			RequireBackup: r.config.Package.RequireBackupBeforeMigrate,
@@ -888,14 +911,17 @@ func (r *Runtime) start(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if err := lock.Downgrade(); err != nil {
+			return fmt.Errorf("downgrade database migration lock to shared: %w", err)
+		}
 	}
 
 	repositories := storage.NewRepositories(coordinator.DB())
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
-	var githubGateway *githubinfra.Gateway
-	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
-		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
-	}
+	// Every project is GitHub, so the gateway is always needed. GHPath may be
+	// empty here; startup validation is what reports a missing gh, not a nil
+	// gateway.
+	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	projectService := &projects.Service{
 		DB:             coordinator.DB(),
 		Repos:          repositories,
@@ -971,13 +997,6 @@ func (r *Runtime) start(ctx context.Context) error {
 		return err
 	}
 	r.config = r.projectCatalog.Snapshot()
-	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
-		if githubGateway == nil {
-			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
-		}
-	} else {
-		githubGateway = nil
-	}
 	// Fail loud, not silent: without a credential the daemon's own gh children
 	// fall back to anonymous requests that GitHub rate-limits per IP, which
 	// surfaces later as unexplained transient forge failures.
@@ -1015,7 +1034,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
-	r.webhookDaemonLock = lock
+	r.databaseDaemonLock = lock
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 	resourcesPublished = true
@@ -1240,16 +1259,6 @@ func defaultSchedulerAgentsConfigured(cfg config.Config) bool {
 // scheduler-enabled so import does not fall back to full synchronous capture.
 func asyncSnapshotQueueEnabled(customSchedulerTick bool, cfg config.Config) bool {
 	return customSchedulerTick || defaultSchedulerAgentsConfigured(cfg)
-}
-
-func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
-	providers := forge.NewResolver(cfg)
-	for _, project := range cfg.Projects {
-		if providers.ForProject(project.ID).Capabilities().GitHubPullRequests {
-			return true
-		}
-	}
-	return len(cfg.Projects) == 0
 }
 
 func runtimeProjectBinding(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
@@ -1639,6 +1648,12 @@ func (r *Runtime) executeSchedulerTick(ctx context.Context) {
 	}
 	if tick == nil {
 		return
+	}
+
+	// One stat per tick unless the file moved. Keeps a swap loud in the log
+	// without waiting for an operator to run `looper status`.
+	if r.daemonBinary != nil {
+		r.daemonBinary.Status()
 	}
 
 	if err := tick(ctx, services); err != nil && r.logger != nil {
@@ -2700,6 +2715,11 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 				if !applied {
 					return summary, nil
 				}
+				if abandoned, err := abandonRequeueIfTakenOver(ctx, repositories, loop.ID, nowISO); err != nil {
+					return staleRunQueueRepairSummary{}, err
+				} else if abandoned {
+					return staleRunQueueRepairSummary{}, nil
+				}
 				summary.LoopsRequeued = 1
 				summary.QueueItemsRequeued = 1
 				return summary, nil
@@ -2720,6 +2740,9 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 		}
 		if !applied {
 			return summary, nil
+		}
+		if r.staleRepairAfterLoopWriteHook != nil {
+			r.staleRepairAfterLoopWriteHook(loop.ID)
 		}
 		activeQueue, err := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
 		if err != nil {
@@ -2754,6 +2777,15 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 				return staleRunQueueRepairSummary{}, err
 			}
 			summary.QueueItemsCancelled += cancelledDuplicates
+		}
+		// The queue repair above is several statements past the loop write, and a
+		// takeover that commits inside that span cancels the item this pass then
+		// replaces. Re-read before reporting a requeue, and take the replacement
+		// back out.
+		if abandoned, err := abandonRequeueIfTakenOver(ctx, repositories, loop.ID, nowISO); err != nil {
+			return staleRunQueueRepairSummary{}, err
+		} else if abandoned {
+			return staleRunQueueRepairSummary{}, nil
 		}
 		summary.LoopsRequeued = 1
 		summary.QueueItemsRequeued = requeuedCount + createdQueue
@@ -3149,6 +3181,37 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 // A skipped status write can leave a queue item this pass already requeued. That
 // is inert: the claim boundary refuses every queue item on a held target, and
 // /handback cancels whatever survived the takeover.
+// abandonRequeueIfTakenOver is the closing half of recoveryUpsertLoop's guard.
+//
+// recoveryUpsertLoop refuses a requeue whose loop was *already* held. It cannot
+// see a takeover that commits in the window after that write succeeds, and the
+// queue repair that follows is several statements long: the takeover cancels the
+// loop's queue item, then reconciliation finds none active and creates a
+// replacement one for a loop the human now owns. The claim predicate leaves that
+// item dormant, so nothing runs — but it is durable state that contradicts the
+// hold, and the reconciliation summary reports work it did not really schedule.
+//
+// Unlike the cleanup paths (#210), this is fixable here rather than narrowed:
+// both the observation and the repair are durable writes against the same rows,
+// so re-reading the loop and cancelling what this pass just published leaves no
+// residue — there is no filesystem mutation racing in between.
+//
+// Reports whether the requeue was abandoned.
+func abandonRequeueIfTakenOver(ctx context.Context, repositories *storage.Repositories, loopID, nowISO string) (bool, error) {
+	current, err := repositories.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return false, err
+	}
+	if current == nil || !domain.LoopIsHumanHeld(current.Status) {
+		return false, nil
+	}
+	reason := "Cancelled stale-run reconciliation requeue: the loop was taken over by a human mid-repair"
+	if _, err := repositories.Queue.CancelByLoop(ctx, loopID, nowISO, &reason); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func recoveryUpsertLoop(ctx context.Context, repositories *storage.Repositories, record storage.LoopRecord) (bool, error) {
 	if err := repositories.Loops.Upsert(ctx, record); err != nil {
 		if storage.IsLoopHumanHeldError(err) {

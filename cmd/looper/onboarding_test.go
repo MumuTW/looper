@@ -1028,3 +1028,31 @@ func TestStatusOmitsQuarantineRosterWhenEmpty(t *testing.T) {
 		t.Fatalf("status output = %q, want the counter line alone", got)
 	}
 }
+
+// Contract: a replaced daemon binary is named on its own line, because every
+// other line of `looper status` looks healthy while it is happening (#154).
+func TestStatusReportsSwappedDaemonBinary(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		DegradedReasons: []string{"daemon_binary_swapped"},
+		Binary: statusBinaryView{Identity: statusBinaryIdentityView{
+			Swapped: true,
+			Reason:  "daemon executable /Users/o/.looper/bin/looperd was replaced while running (running image 59055eeb0000, on disk d6af10e90000)",
+		}},
+	}})
+	want := "binary:   daemon executable /Users/o/.looper/bin/looperd was replaced while running (running image 59055eeb0000, on disk d6af10e90000)\n" +
+		"degraded: daemon_binary_swapped\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("status output =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestStatusOmitsBinaryLineWhenUnchanged(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		Binary: statusBinaryView{Identity: statusBinaryIdentityView{Swapped: false}},
+	}})
+	if got := stdout.String(); got != "" {
+		t.Fatalf("status output = %q, want nothing for an unchanged binary", got)
+	}
+}

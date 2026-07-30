@@ -30,3 +30,29 @@ func TestHumanInboxAppendReadClearCap(t *testing.T) {
 		t.Fatal("inbox not cleared")
 	}
 }
+
+func TestClearHumanInboxMessagesAcknowledgesOnlyDrainedIDs(t *testing.T) {
+	base := `{"worker":{"title":"x"}}`
+	m, _ := AppendHumanMessage(&base, HumanMessage{ID: "drained-1", At: "t1", Text: "m1"})
+	m, _ = AppendHumanMessage(&m, HumanMessage{ID: "drained-2", At: "t2", Text: "m2"})
+	drained := ReadHumanInbox(&m)
+
+	// Fill past the cap while the agent is running. The drained messages are
+	// evicted, but the just-arrived messages must not be acknowledged by count.
+	for i := 0; i < humanInboxCap+1; i++ {
+		m, _ = AppendHumanMessage(&m, HumanMessage{ID: string(rune('a' + i)), At: "late", Text: string(rune('a' + i))})
+	}
+	m2, err := ClearHumanInboxMessages(&m, drained)
+	if err != nil {
+		t.Fatalf("ClearHumanInboxMessages error = %v", err)
+	}
+	got := ReadHumanInbox(&m2)
+	if len(got) != humanInboxCap || got[0].Text != "b" {
+		t.Fatalf("after acknowledgement: %+v, want all capped late messages", got)
+	}
+
+	unchanged, err := ClearHumanInboxMessages(&m2, nil)
+	if err != nil || unchanged != m2 {
+		t.Fatalf("zero-drain acknowledgement = (%q, %v), want unchanged metadata", unchanged, err)
+	}
+}

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -218,4 +219,44 @@ func TestTakeoverMessageReportsFencedRun(t *testing.T) {
 
 func contains(haystack, needle string) bool {
 	return len(needle) == 0 || bytes.Contains([]byte(haystack), []byte(needle))
+}
+
+// The operator-visible half of the same thing: a stop failure must not be
+// rendered as a plain failure while the loop sits parked. The response has to
+// name the committed hold, the cancelled queue item, and the command that
+// releases them.
+func TestTakeoverStopFailureReportsCommittedHold(t *testing.T) {
+	fixture := newTestFixture(t)
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		TakeoverLoop: func(_ context.Context, loopID, _ string) (TakeoverResult, error) {
+			return TakeoverResult{
+					LoopID: loopID, Vendor: "codex", SessionID: "session_1", WorktreePath: "/tmp/wt",
+					HoldCommitted: true,
+				},
+				errors.New("agent live containment handle is missing")
+		},
+	})
+
+	_, err := h.takeoverLoop(context.Background(), "loop_1")
+	if err == nil {
+		t.Fatal("takeoverLoop() error = nil, want the stop failure surfaced")
+	}
+	var typed apiError
+	if !asAPIError(err, &typed) {
+		t.Fatalf("takeoverLoop() error = %v, want a structured apiError", err)
+	}
+	for _, want := range []string{"human_takeover", "queue item was cancelled", "looper handback loop_1", "containment handle is missing"} {
+		if !contains(typed.message, want) {
+			t.Fatalf("message = %q, want it to contain %q", typed.message, want)
+		}
+	}
+	partial, ok := typed.details.(takeoverPartialFailure)
+	if !ok {
+		t.Fatalf("details = %#v, want takeoverPartialFailure", typed.details)
+	}
+	if !partial.HoldCommitted || !partial.QueueCancelled || partial.RecoveryCommand != "looper handback loop_1" {
+		t.Fatalf("details = %#v, want the committed state and recovery command named", partial)
+	}
 }

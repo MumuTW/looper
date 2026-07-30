@@ -23,7 +23,6 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/labels"
@@ -585,13 +584,6 @@ type Runner struct {
 	hitlGitHub              HITLGitHubSettings
 }
 
-func (r *Runner) providerSelectionForProject(projectID string) forge.Selection {
-	if r == nil || r.projectRoleConfig == nil {
-		return forge.NewResolver(config.Config{}).ForProject(projectID)
-	}
-	return forge.NewResolver(*r.projectRoleConfig).ForProject(projectID)
-}
-
 type ProcessResult struct {
 	LoopID            string
 	RunID             string
@@ -918,7 +910,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		if requiredTargetLabel != "" && !hasLabel(issue.Labels, requiredTargetLabel) {
+		if requiredTargetLabel != "" && !labels.Has(issue.Labels, requiredTargetLabel) {
 			result.Skipped++
 			continue
 		}
@@ -1234,6 +1226,41 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if checkpoint.SkipReason != "" {
 		status = "skipped"
 	}
+	// A message can arrive after the execute step acknowledged its prompt
+	// snapshot but before this queue item completes. Serialize finalization with
+	// enqueue so a message linearized while the loop is running gets another turn
+	// instead of being stranded on a completed loop.
+	continueWithInbox := false
+	if r.hitlEnabled {
+		unlock := loops.LockLoopRequeue(loop.ID)
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			unlock()
+			return ProcessResult{}, err
+		}
+		continueWithInbox = fresh != nil && len(loops.ReadHumanInbox(fresh.MetadataJSON)) > 0
+		if continueWithInbox {
+			nowISO := r.nowISO()
+			if _, err := r.repos.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO); err != nil {
+				unlock()
+				return ProcessResult{}, err
+			}
+			if _, err := r.updateLoop(ctx, *fresh, func(updated *storage.LoopRecord) {
+				updated.Status = "queued"
+				updated.LastRunAt = stringPtr(nowISO)
+				updated.NextRunAt = stringPtr(nowISO)
+			}); err != nil {
+				unlock()
+				return ProcessResult{}, err
+			}
+		}
+		unlock()
+	}
+	if continueWithInbox {
+		r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &checkpoint, issueClaimStatusRunning, summary)
+		r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
+	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		if errors.Is(err, storage.ErrQueueItemNotActive) {
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
@@ -1529,6 +1556,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 			branch = buildWorkerBranchName(work, input.Loop.ID)
 		}
 	}
+	if _, err := loops.DecodeMetadataObjectForWrite(input.Loop.MetadataJSON); err != nil {
+		return checkpoint, fmt.Errorf("validate worktree metadata before create: %w", err)
+	}
 	created, err := r.git.CreateWorktree(ctx, CreateWorktreeInput{
 		ProjectID:         input.Project.ID,
 		RepoPath:          input.Project.RepoPath,
@@ -1559,8 +1589,13 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 		baseBranch = work.BaseBranch
 	}
 	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"worktreeId": worktreeID, "worktreePath": created.WorktreePath, "branch": created.Branch, "baseBranch": baseBranch})
-	if err == nil {
-		_, _ = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) })
+	if err != nil {
+		// Continuing without the persisted worktree keys would run the agent
+		// in a worktree the loop's durable state cannot account for.
+		return checkpoint, fmt.Errorf("record worktree metadata: %w", err)
+	}
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+		return checkpoint, fmt.Errorf("record worktree metadata: %w", err)
 	}
 	checkpoint.Worktree = &checkpointWorktree{ID: worktreeID, Path: created.WorktreePath, Branch: created.Branch, BaseBranch: baseBranch, HeadSHA: created.HeadSHA}
 	checkpoint.Lifecycle = lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy("worker", work.ExecutionMode == "create-pr"), created.Branch, baseBranch)
@@ -1695,6 +1730,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err != nil {
 		return checkpoint, err
 	}
+	var inboxDrained []loops.HumanMessage
 	if !executionCompleted {
 		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
@@ -1747,6 +1783,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				if nativeSessionID == "" {
 					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID, agentVendor)
 				}
+				inboxDrained = append([]loops.HumanMessage(nil), inbox...)
 			}
 		}
 		executionID := eventlog.NewEventID("agent")
@@ -1786,6 +1823,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			if awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, executionID); awaitErr != nil {
 				return checkpoint, awaitErr
 			} else if awaiting != nil {
+				awaiting.drainedInbox = inboxDrained
 				return checkpoint, awaiting
 			}
 		}
@@ -1812,8 +1850,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// the turn, never before — so a failed/timed-out turn re-reads the answer on
 		// retry, while a successful one never re-injects it on a later run.
 		if r.hitlEnabled {
-			r.markHumanAnswerConsumed(ctx, &input.Loop)
-			r.clearHumanInbox(ctx, &input.Loop)
+			r.acknowledgeHumanInbox(ctx, &input.Loop, inboxDrained)
 		}
 		r.markTakeoverResumeConsumed(ctx, &input.Loop)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
@@ -2176,7 +2213,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
-	if r.providerSelectionForProject(input.Project.ID).Capabilities().GitHubCLIPullRequestCreation && !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
+	if !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
 		message := fmt.Sprintf("GitHub CLI unavailable; PR opening is manual for worker %s", input.Loop.ID)
 		checkpoint.SkipReason = message
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
@@ -2524,6 +2561,15 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	startStep := stepPrepareWork
 	resumedCheckpoint := checkpoint
+	// A completed run normally begins a fresh worker lifecycle. The one exception
+	// is a free-text message accepted while it was running: retain the durable
+	// worktree/session context, but rerun the agent and validation steps so that
+	// message is actually delivered to the agent.
+	if latestRun != nil && latestRun.Status == "success" && len(loops.ReadHumanInbox(loop.MetadataJSON)) > 0 {
+		resumedCheckpoint.Execution = nil
+		resumedCheckpoint.Validation = nil
+		resumedCheckpoint.SkipReason = ""
+	}
 	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
 		if restartFromDiscover {
 			startStep = stepPrepareWork
@@ -2904,9 +2950,12 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 				updated.NextRunAt = &nowISO
 			}
 			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(existing.MetadataJSON), work)})
-			if err == nil {
-				updated.MetadataJSON = &metadataJSON
+			if err != nil {
+				// Do not revive/requeue a loop whose durable state could not
+				// be recorded.
+				return loopUpsertResult{}, fmt.Errorf("merge worker discovery metadata: %w", err)
 			}
+			updated.MetadataJSON = &metadataJSON
 			updated.UpdatedAt = nowISO
 			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 				// Takeover (or handback) committed between the list read and this
@@ -3700,7 +3749,6 @@ func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPl
 }
 
 func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock, error) {
-	providerCapabilities := forge.NewResolver(instructionConfig).ForProject(projectID).Capabilities()
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
 		parts = append(parts, fmt.Sprintf("Continue implementing on existing pull request %s#%d.", work.Repo, work.PRNumber))
@@ -3733,7 +3781,7 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		parts = append(parts, instructionBlock.Text)
 	}
 	if allowAgentPRCreation {
-		parts = append(parts, buildAgentPullRequestInstruction(work, providerCapabilities.GitHubCLIPullRequestCreation))
+		parts = append(parts, buildAgentPullRequestInstruction(work))
 		parts = append(parts, "Make the necessary code changes, validate them, and ensure the branch and pull request are left in a consistent state.")
 		parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
 	} else {
@@ -3763,15 +3811,12 @@ func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, discl
 	}, "\n")
 }
 
-func buildAgentPullRequestInstruction(work workerInput, githubCLIRequired bool) string {
+func buildAgentPullRequestInstruction(work workerInput) string {
 	parts := []string{
-		"When the implementation is ready and validation passes, create the pull request yourself using the configured provider tooling.",
+		"When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself.",
 		"Before creating a PR, check whether one already exists for the current branch and avoid duplicates.",
 		"Write a concise, accurate PR title and a structured body that explains the actual changes and why they were made.",
 		fmt.Sprintf("Target base branch: %s.", work.BaseBranch),
-	}
-	if githubCLIRequired {
-		parts[0] = "When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself."
 	}
 	if work.IssueNumber > 0 {
 		parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
@@ -4077,18 +4122,9 @@ func includesLogin(values []string, target string) bool {
 	return false
 }
 
-func hasLabel(labels []string, target string) bool {
-	for _, label := range labels {
-		if strings.EqualFold(strings.TrimSpace(label), target) {
-			return true
-		}
-	}
-	return false
-}
-
 func shouldClaimWorkerIssue(issue IssueSummary, login string, policy DiscoveryPolicy) bool {
 	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		if !labelsMatch(issue.Labels, policy.Labels, policy.LabelMode) {
+		if !config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode) {
 			return false
 		}
 		decision := networkpolicy.EvaluateWorker(policy.RoutedClaimPolicy, issue.Labels, issue.AssigneeUsers)
@@ -4097,7 +4133,7 @@ func shouldClaimWorkerIssue(issue IssueSummary, login string, policy DiscoveryPo
 	if policy.RequireAssigneeCurrentUser && !includesLogin(issue.Assignees, login) {
 		return false
 	}
-	return labelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+	return config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
 }
 
 func safeIssueQueryLabel(labels []string) string {
@@ -4219,28 +4255,13 @@ func uniqueNonEmptyLabels(labels []string) []string {
 	return result
 }
 
-func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
-	if len(required) == 0 {
-		return true
-	}
-	if mode == config.LabelModeAny {
-		for _, label := range required {
-			if hasLabel(labels, label) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, label := range required {
-		if !hasLabel(labels, label) {
-			return false
-		}
-	}
-	return true
-}
-
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
-	metadata := parseJSONObject(current)
+	// Loop metadata mutations share the strict decoder: a malformed stored
+	// value blocks the merge instead of being replaced with only the updates.
+	metadata, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	for key, value := range updates {
 		metadata[key] = value
 	}

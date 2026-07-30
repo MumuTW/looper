@@ -144,6 +144,7 @@ type awaitingHumanError struct {
 	recommendedOption string
 	consequences      map[string]string
 	confidence        string
+	drainedInbox      []loops.HumanMessage
 }
 
 func (e *awaitingHumanError) Error() string { return "worker paused awaiting human decision" }
@@ -212,9 +213,20 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor 
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
-// clearHumanInbox drops the loop's drained human messages after a successful turn
-// so they are not re-injected on a later run. No-op when the inbox is empty.
-func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) {
+// acknowledgeHumanInbox records a completed turn's answer and removes exactly
+// the inbox snapshot it received. It shares the enqueue lock so neither update
+// can overwrite a concurrent message append.
+func (r *Runner) acknowledgeHumanInbox(ctx context.Context, loop *storage.LoopRecord, drained []loops.HumanMessage) {
+	unlock := loops.LockLoopRequeue(loop.ID)
+	defer unlock()
+	r.markHumanAnswerConsumed(ctx, loop)
+	r.clearHumanInbox(ctx, loop, drained)
+}
+
+// clearHumanInbox drops only the loop's drained human-message snapshot after a
+// successful turn, leaving any later appends for the next turn. Caller holds
+// loops.LockLoopRequeue(loop.ID).
+func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord, drained []loops.HumanMessage) {
 	if r.repos == nil || r.repos.Loops == nil {
 		return
 	}
@@ -222,10 +234,10 @@ func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) 
 	if err != nil || fresh == nil {
 		return
 	}
-	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
+	if len(drained) == 0 || len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
 		return
 	}
-	meta, werr := loops.ClearHumanInbox(fresh.MetadataJSON)
+	meta, werr := loops.ClearHumanInboxMessages(fresh.MetadataJSON, drained)
 	if werr != nil {
 		return
 	}
@@ -367,6 +379,18 @@ func (r *Runner) latestAgentSession(ctx context.Context, loopID string) (string,
 // queue item (so /respond can requeue it), ends the run as interrupted
 // (resumable from the checkpoint), and sends the ask-card. Only reached when
 // hitl.enabled is true.
+// abortSuspension unwinds a suspension that could not persist its ask: the
+// run is ended as failed (createRunContext resumes failed/interrupted runs;
+// a run left running would make the retried claim start a duplicate from
+// prepare-work while the stale run stays active) and the cause is surfaced.
+func (r *Runner) abortSuspension(ctx context.Context, run storage.RunRecord, checkpoint workerCheckpoint, cause error) (ProcessResult, error) {
+	wrapped := fmt.Errorf("persist HITL ask before suspension: %w", cause)
+	if _, err := r.completeRun(ctx, run, "failed", "", wrapped.Error(), checkpoint); err != nil {
+		return ProcessResult{}, errors.Join(wrapped, err)
+	}
+	return ProcessResult{}, wrapped
+}
+
 func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run storage.RunRecord, checkpoint workerCheckpoint, awaiting *awaitingHumanError) (ProcessResult, error) {
 	nowISO := r.nowISO()
 	ask := loops.HITLAsk{
@@ -382,6 +406,13 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		Consequences:      awaiting.consequences,
 		Confidence:        awaiting.confidence,
 	}
+	// Preflight the strict metadata decode before ANY GitHub side effects: a
+	// malformed value would otherwise let deliverAskToGitHub publish a branch,
+	// draft PR, question comment, and label whose ask can never be stored —
+	// and queue retries would keep publishing unanswerable comments.
+	if _, err := loops.DecodeMetadataObjectForWrite(input.Loop.MetadataJSON); err != nil {
+		return r.abortSuspension(ctx, run, checkpoint, err)
+	}
 	// GitHub transport (default): post the question on a (draft) PR before parking,
 	// so the ask metadata carries the PR + comment id the answer-poll lane needs.
 	// Best-effort — the loop still parks awaiting_human if delivery fails.
@@ -392,13 +423,21 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			})
 		}
 	}
+	var askWriteErr error
+	unlock := loops.LockLoopRequeue(input.Loop.ID)
+	defer unlock()
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
-			updated.MetadataJSON = &meta
+		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask)
+		if werr != nil {
+			// Without a stored ask the response paths can never resume this
+			// loop; abort the whole suspension instead of parking it stranded.
+			askWriteErr = werr
+			return
 		}
-		// The agent re-asked after reading the queued human messages, so they're
-		// consumed — clear the inbox so they aren't re-injected on the next resume.
-		if meta, werr := loops.ClearHumanInbox(updated.MetadataJSON); werr == nil {
+		updated.MetadataJSON = &meta
+		// The agent re-asked after reading this snapshot. A message delivered while
+		// the ask was published did not reach that turn and must stay queued.
+		if meta, werr := loops.ClearHumanInboxMessages(updated.MetadataJSON, awaiting.drainedInbox); werr == nil {
 			updated.MetadataJSON = &meta
 		}
 		updated.Status = "awaiting_human"
@@ -406,6 +445,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
+	}
+	if askWriteErr != nil {
+		return r.abortSuspension(ctx, run, checkpoint, askWriteErr)
 	}
 	reason := "worker suspended awaiting human decision"
 	if _, err := r.repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {

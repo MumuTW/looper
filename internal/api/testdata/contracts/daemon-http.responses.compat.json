@@ -81,7 +81,12 @@
               "supportedTargets": [
                 "darwin-arm64",
                 "linux-amd64"
-              ]
+              ],
+              "identity": {
+                "known": false,
+                "swapped": false,
+                "reason": "daemon executable identity was not recorded at startup; a binary swap cannot be detected"
+              }
             }
           },
           "storage": {
@@ -983,7 +988,7 @@
           "runStopped": false,
           "supported": true,
           "resumeCommand": "cd /tmp/worktrees/loop_1 && codex resume session_fixture_1",
-          "message": "no run was in flight; the loop is parked in human_takeover, so no new claim is granted on its target and its worktree is kept out of cleanup until you run `looper handback`. A loop already running on the same checkout is not stopped, and `looper retry --discard-worktree-changes` can still reset it."
+          "message": "no run was in flight; the loop is parked in human_takeover until you run `looper handback`. Guaranteed: no new claim is granted on its target, and no daemon write can take it out of human_takeover. Best-effort only: cleanup reads the hold before it deletes, so a sweep already past that read can still remove the worktree (#210). Not covered: a loop already running on the same checkout is not stopped, and `looper retry --discard-worktree-changes` can still reset it."
         },
         "requestId": "fixture-request-id"
       }
