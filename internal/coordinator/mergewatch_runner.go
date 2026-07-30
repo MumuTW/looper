@@ -274,7 +274,7 @@ func requiredPRTriggerLabels(cfg config.FixerRoleTriggersConfig) []string {
 }
 
 func retriageCleanupPatterns(roles config.RoleConfigs, triagedLabel string) []string {
-	patterns := []string{triagedLabel, "dispatch/*"}
+	patterns := []string{triagedLabel, labels.DispatchPlan, labels.DispatchImplement, "dispatch/*"}
 	registry := config.EffectiveCodingRoles(roles)
 	planner := registry[config.CodingRolePlanner]
 	worker := registry[config.CodingRoleWorker]

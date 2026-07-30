@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
@@ -113,6 +115,9 @@ func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
 		for i := range projects {
 			projects[i].Path = ""
 			projects[i].Instructions = nil
+			if projects[i].LabelPrefix == nil || *projects[i].LabelPrefix == "" {
+				projects[i].LabelPrefix = stringPtr(labels.Prefix)
+			}
 			if projects[i].Roles != nil && projects[i].Roles.Reviewer != nil {
 				projects[i].Roles.Reviewer.AutoDiscovery = nil
 				projects[i].Roles.Reviewer.Triggers = nil

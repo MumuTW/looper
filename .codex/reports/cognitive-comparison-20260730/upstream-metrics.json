@@ -1,0 +1,4812 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-30T14:58:34.598724+00:00",
+  "root": "/private/tmp/looper-upstream.OpobZn",
+  "discovery": "git",
+  "totals": {
+    "files": 597,
+    "lines": 265771,
+    "nonblank_lines": 244916,
+    "source_files": 285,
+    "test_files": 312
+  },
+  "size_bands": {
+    "up_to_300": 434,
+    "301_to_500": 63,
+    "501_to_1000": 41,
+    "over_1000": 59
+  },
+  "lines_by_extension": {
+    ".go": 249622,
+    ".tsx": 9115,
+    ".ts": 4729,
+    ".sql": 1276,
+    ".sh": 644,
+    ".js": 229,
+    ".css": 96,
+    ".html": 60
+  },
+  "largest_files": [
+    {
+      "path": "internal/reviewer/runner_test.go",
+      "extension": ".go",
+      "lines": 10507,
+      "nonblank_lines": 9820,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner.go",
+      "extension": ".go",
+      "lines": 8882,
+      "nonblank_lines": 8405,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/handler_test.go",
+      "extension": ".go",
+      "lines": 8025,
+      "nonblank_lines": 7289,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_test.go",
+      "extension": ".go",
+      "lines": 7884,
+      "nonblank_lines": 7360,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/handler.go",
+      "extension": ".go",
+      "lines": 7718,
+      "nonblank_lines": 7121,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/runner.go",
+      "extension": ".go",
+      "lines": 7287,
+      "nonblank_lines": 6859,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/app_test.go",
+      "extension": ".go",
+      "lines": 5744,
+      "nonblank_lines": 5253,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/scheduler.go",
+      "extension": ".go",
+      "lines": 5074,
+      "nonblank_lines": 4793,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worker/runner_test.go",
+      "extension": ".go",
+      "lines": 5072,
+      "nonblank_lines": 4753,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/runtime_test.go",
+      "extension": ".go",
+      "lines": 4815,
+      "nonblank_lines": 4430,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worker/runner.go",
+      "extension": ".go",
+      "lines": 4382,
+      "nonblank_lines": 4120,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/gateway.go",
+      "extension": ".go",
+      "lines": 4150,
+      "nonblank_lines": 3859,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/config_test.go",
+      "extension": ".go",
+      "lines": 4040,
+      "nonblank_lines": 3593,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/runtime.go",
+      "extension": ".go",
+      "lines": 3911,
+      "nonblank_lines": 3653,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/repositories.go",
+      "extension": ".go",
+      "lines": 3242,
+      "nonblank_lines": 2901,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/gateway_test.go",
+      "extension": ".go",
+      "lines": 2780,
+      "nonblank_lines": 2622,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/executor.go",
+      "extension": ".go",
+      "lines": 2665,
+      "nonblank_lines": 2501,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/repositories_test.go",
+      "extension": ".go",
+      "lines": 2532,
+      "nonblank_lines": 2281,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/planner/runner.go",
+      "extension": ".go",
+      "lines": 2471,
+      "nonblank_lines": 2304,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/runner_actions_test.go",
+      "extension": ".go",
+      "lines": 2328,
+      "nonblank_lines": 2151,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/runner.go",
+      "extension": ".go",
+      "lines": 2112,
+      "nonblank_lines": 1981,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/normalize.go",
+      "extension": ".go",
+      "lines": 2057,
+      "nonblank_lines": 1859,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/loop_retry_discard_test.go",
+      "extension": ".go",
+      "lines": 2047,
+      "nonblank_lines": 1870,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/daemon_runtime_test.go",
+      "extension": ".go",
+      "lines": 1937,
+      "nonblank_lines": 1806,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/pages/Config.tsx",
+      "extension": ".tsx",
+      "lines": 1910,
+      "nonblank_lines": 1837,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/scheduler_test.go",
+      "extension": ".go",
+      "lines": 1899,
+      "nonblank_lines": 1696,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/upgrade_test.go",
+      "extension": ".go",
+      "lines": 1891,
+      "nonblank_lines": 1751,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/planner/runner_test.go",
+      "extension": ".go",
+      "lines": 1833,
+      "nonblank_lines": 1704,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/notify/gateway.go",
+      "extension": ".go",
+      "lines": 1803,
+      "nonblank_lines": 1656,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/executor_test.go",
+      "extension": ".go",
+      "lines": 1715,
+      "nonblank_lines": 1559,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/load.go",
+      "extension": ".go",
+      "lines": 1695,
+      "nonblank_lines": 1567,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/config_commands.go",
+      "extension": ".go",
+      "lines": 1666,
+      "nonblank_lines": 1573,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/upgrade.go",
+      "extension": ".go",
+      "lines": 1596,
+      "nonblank_lines": 1469,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/git/gateway_test.go",
+      "extension": ".go",
+      "lines": 1580,
+      "nonblank_lines": 1422,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/pages/Config.test.tsx",
+      "extension": ".tsx",
+      "lines": 1572,
+      "nonblank_lines": 1469,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/git/gateway.go",
+      "extension": ".go",
+      "lines": 1520,
+      "nonblank_lines": 1354,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/daemon_runtime.go",
+      "extension": ".go",
+      "lines": 1514,
+      "nonblank_lines": 1374,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/bootstrap.go",
+      "extension": ".go",
+      "lines": 1470,
+      "nonblank_lines": 1360,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/looperd/main_test.go",
+      "extension": ".go",
+      "lines": 1448,
+      "nonblank_lines": 1333,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/projects/service_test.go",
+      "extension": ".go",
+      "lines": 1447,
+      "nonblank_lines": 1315,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook.go",
+      "extension": ".go",
+      "lines": 1428,
+      "nonblank_lines": 1345,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/json_output.go",
+      "extension": ".go",
+      "lines": 1379,
+      "nonblank_lines": 1220,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/bootstrap_test.go",
+      "extension": ".go",
+      "lines": 1359,
+      "nonblank_lines": 1262,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/validate.go",
+      "extension": ".go",
+      "lines": 1312,
+      "nonblank_lines": 1178,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/looperd/main.go",
+      "extension": ".go",
+      "lines": 1229,
+      "nonblank_lines": 1143,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/active_executions.go",
+      "extension": ".go",
+      "lines": 1220,
+      "nonblank_lines": 1145,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/cmd/fake-gh/main.go",
+      "extension": ".go",
+      "lines": 1212,
+      "nonblank_lines": 1156,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_runtime_test.go",
+      "extension": ".go",
+      "lines": 1187,
+      "nonblank_lines": 1077,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/configForm.ts",
+      "extension": ".ts",
+      "lines": 1187,
+      "nonblank_lines": 1101,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/projects/service.go",
+      "extension": ".go",
+      "lines": 1185,
+      "nonblank_lines": 1085,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/human_output.go",
+      "extension": ".go",
+      "lines": 1177,
+      "nonblank_lines": 1082,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/review_submit.go",
+      "extension": ".go",
+      "lines": 1165,
+      "nonblank_lines": 1097,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/review_submit_test.go",
+      "extension": ".go",
+      "lines": 1165,
+      "nonblank_lines": 1071,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/forgejo.go",
+      "extension": ".go",
+      "lines": 1165,
+      "nonblank_lines": 1069,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/types.go",
+      "extension": ".go",
+      "lines": 1120,
+      "nonblank_lines": 958,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/scheduler_forgejo_test.go",
+      "extension": ".go",
+      "lines": 1100,
+      "nonblank_lines": 1042,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/webhookforward/forwarder_test.go",
+      "extension": ".go",
+      "lines": 1088,
+      "nonblank_lines": 986,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/trusted_review_proxy.go",
+      "extension": ".go",
+      "lines": 1032,
+      "nonblank_lines": 980,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/loop_diagnostics_commands.go",
+      "extension": ".go",
+      "lines": 1015,
+      "nonblank_lines": 962,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/takeover.go",
+      "extension": ".go",
+      "lines": 993,
+      "nonblank_lines": 904,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/app.go",
+      "extension": ".go",
+      "lines": 955,
+      "nonblank_lines": 895,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrate_test.go",
+      "extension": ".go",
+      "lines": 933,
+      "nonblank_lines": 795,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/webhook_commands.go",
+      "extension": ".go",
+      "lines": 928,
+      "nonblank_lines": 881,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/webhookforward/forwarder.go",
+      "extension": ".go",
+      "lines": 887,
+      "nonblank_lines": 835,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/pages/LoopDetail.tsx",
+      "extension": ".tsx",
+      "lines": 862,
+      "nonblank_lines": 805,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_tunnel.go",
+      "extension": ".go",
+      "lines": 816,
+      "nonblank_lines": 766,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/cloud/service_test.go",
+      "extension": ".go",
+      "lines": 785,
+      "nonblank_lines": 715,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/resolve_comments_scenarios_test.go",
+      "extension": ".go",
+      "lines": 751,
+      "nonblank_lines": 731,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/forgejo_sandbox_test.go",
+      "extension": ".go",
+      "lines": 742,
+      "nonblank_lines": 699,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/plane.go",
+      "extension": ".go",
+      "lines": 731,
+      "nonblank_lines": 675,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/configForm.test.ts",
+      "extension": ".ts",
+      "lines": 711,
+      "nonblank_lines": 676,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/forgejo_test.go",
+      "extension": ".go",
+      "lines": 704,
+      "nonblank_lines": 648,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/scheduler_forgejo_native_test.go",
+      "extension": ".go",
+      "lines": 702,
+      "nonblank_lines": 664,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_forwarder.go",
+      "extension": ".go",
+      "lines": 699,
+      "nonblank_lines": 645,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/RecoveryCard.tsx",
+      "extension": ".tsx",
+      "lines": 697,
+      "nonblank_lines": 661,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/api.ts",
+      "extension": ".ts",
+      "lines": 688,
+      "nonblank_lines": 619,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/cloud/service.go",
+      "extension": ".go",
+      "lines": 685,
+      "nonblank_lines": 642,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/worktree_cleanup.go",
+      "extension": ".go",
+      "lines": 657,
+      "nonblank_lines": 614,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/loop_retry_discard.go",
+      "extension": ".go",
+      "lines": 651,
+      "nonblank_lines": 618,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/github_sandbox_test.go",
+      "extension": ".go",
+      "lines": 640,
+      "nonblank_lines": 600,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/pages/Overview.tsx",
+      "extension": ".tsx",
+      "lines": 631,
+      "nonblank_lines": 605,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/health.go",
+      "extension": ".go",
+      "lines": 614,
+      "nonblank_lines": 565,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/webhook_commands_test.go",
+      "extension": ".go",
+      "lines": 613,
+      "nonblank_lines": 569,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/containment.go",
+      "extension": ".go",
+      "lines": 609,
+      "nonblank_lines": 559,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/provider_commands.go",
+      "extension": ".go",
+      "lines": 600,
+      "nonblank_lines": 573,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worker/hitl.go",
+      "extension": ".go",
+      "lines": 595,
+      "nonblank_lines": 561,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/config_reload.go",
+      "extension": ".go",
+      "lines": 588,
+      "nonblank_lines": 548,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/notify/gateway_feishu_app_test.go",
+      "extension": ".go",
+      "lines": 562,
+      "nonblank_lines": 513,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/network_commands.go",
+      "extension": ".go",
+      "lines": 555,
+      "nonblank_lines": 528,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/daemon_supervision.go",
+      "extension": ".go",
+      "lines": 552,
+      "nonblank_lines": 524,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/db_test.go",
+      "extension": ".go",
+      "lines": 542,
+      "nonblank_lines": 451,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/loop_diagnostics_commands_test.go",
+      "extension": ".go",
+      "lines": 539,
+      "nonblank_lines": 486,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/trusted_review_proxy_test.go",
+      "extension": ".go",
+      "lines": 539,
+      "nonblank_lines": 506,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/shell/runner.go",
+      "extension": ".go",
+      "lines": 534,
+      "nonblank_lines": 494,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/takeover_test.go",
+      "extension": ".go",
+      "lines": 526,
+      "nonblank_lines": 468,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_forwarder_test.go",
+      "extension": ".go",
+      "lines": 521,
+      "nonblank_lines": 465,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/LoopActionBar.tsx",
+      "extension": ".tsx",
+      "lines": 514,
+      "nonblank_lines": 492,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/discovery_snapshot.go",
+      "extension": ".go",
+      "lines": 506,
+      "nonblank_lines": 456,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/mergewatch_runner.go",
+      "extension": ".go",
+      "lines": 503,
+      "nonblank_lines": 474,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/RecoveryCard.test.tsx",
+      "extension": ".tsx",
+      "lines": 501,
+      "nonblank_lines": 455,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/repair.go",
+      "extension": ".go",
+      "lines": 499,
+      "nonblank_lines": 466,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/pages/Loops.tsx",
+      "extension": ".tsx",
+      "lines": 493,
+      "nonblank_lines": 468,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/tea.go",
+      "extension": ".go",
+      "lines": 485,
+      "nonblank_lines": 453,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/lifecycle/lifecycle.go",
+      "extension": ".go",
+      "lines": 474,
+      "nonblank_lines": 446,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/shell/runner_test.go",
+      "extension": ".go",
+      "lines": 472,
+      "nonblank_lines": 441,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention.go",
+      "extension": ".go",
+      "lines": 469,
+      "nonblank_lines": 443,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/worktree_cleanup_test.go",
+      "extension": ".go",
+      "lines": 469,
+      "nonblank_lines": 428,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/hot_reload.go",
+      "extension": ".go",
+      "lines": 468,
+      "nonblank_lines": 441,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/run_stats_commands.go",
+      "extension": ".go",
+      "lines": 452,
+      "nonblank_lines": 419,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/runner_integration_test.go",
+      "extension": ".go",
+      "lines": 441,
+      "nonblank_lines": 409,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/diffanchor/diffanchor.go",
+      "extension": ".go",
+      "lines": 437,
+      "nonblank_lines": 409,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/bootstrap/bootstrap_test.go",
+      "extension": ".go",
+      "lines": 434,
+      "nonblank_lines": 385,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/hot_reload_test.go",
+      "extension": ".go",
+      "lines": 428,
+      "nonblank_lines": 384,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/handler_hitl_test.go",
+      "extension": ".go",
+      "lines": 416,
+      "nonblank_lines": 380,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/operation_lease.go",
+      "extension": ".go",
+      "lines": 409,
+      "nonblank_lines": 376,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/review_anchors_test.go",
+      "extension": ".go",
+      "lines": 406,
+      "nonblank_lines": 371,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/daemon_install_test.go",
+      "extension": ".go",
+      "lines": 400,
+      "nonblank_lines": 358,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/cmd/fake-agent/main.go",
+      "extension": ".go",
+      "lines": 397,
+      "nonblank_lines": 375,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/loop_requeue_lock_test.go",
+      "extension": ".go",
+      "lines": 387,
+      "nonblank_lines": 355,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/download_test.go",
+      "extension": ".go",
+      "lines": 386,
+      "nonblank_lines": 348,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/invariant_worktree_test.go",
+      "extension": ".go",
+      "lines": 385,
+      "nonblank_lines": 377,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/discovery_snapshot_test.go",
+      "extension": ".go",
+      "lines": 384,
+      "nonblank_lines": 355,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/cloud/http.go",
+      "extension": ".go",
+      "lines": 380,
+      "nonblank_lines": 352,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreecleanup/service.go",
+      "extension": ".go",
+      "lines": 377,
+      "nonblank_lines": 349,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/githubcontract/contract_test.go",
+      "extension": ".go",
+      "lines": 374,
+      "nonblank_lines": 352,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/runner_integration_test.go",
+      "extension": ".go",
+      "lines": 369,
+      "nonblank_lines": 333,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/loop_retry_discard_test.go",
+      "extension": ".go",
+      "lines": 364,
+      "nonblank_lines": 347,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_tunnel_adoption_test.go",
+      "extension": ".go",
+      "lines": 362,
+      "nonblank_lines": 324,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/review_anchors.go",
+      "extension": ".go",
+      "lines": 359,
+      "nonblank_lines": 337,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/projects/catalog_test.go",
+      "extension": ".go",
+      "lines": 358,
+      "nonblank_lines": 317,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/repair_test.go",
+      "extension": ".go",
+      "lines": 357,
+      "nonblank_lines": 321,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/outboundguard/guard.go",
+      "extension": ".go",
+      "lines": 353,
+      "nonblank_lines": 327,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/dispatch/dispatch.go",
+      "extension": ".go",
+      "lines": 352,
+      "nonblank_lines": 318,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/network_members_test.go",
+      "extension": ".go",
+      "lines": 350,
+      "nonblank_lines": 321,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/bootstrap/bootstrap.go",
+      "extension": ".go",
+      "lines": 349,
+      "nonblank_lines": 298,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/service.go",
+      "extension": ".go",
+      "lines": 348,
+      "nonblank_lines": 315,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/scheduler_config_reload_test.go",
+      "extension": ".go",
+      "lines": 348,
+      "nonblank_lines": 326,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrate.go",
+      "extension": ".go",
+      "lines": 345,
+      "nonblank_lines": 282,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/safety_floor_shutdown_test.go",
+      "extension": ".go",
+      "lines": 343,
+      "nonblank_lines": 305,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/depgraph/depgraph.go",
+      "extension": ".go",
+      "lines": 342,
+      "nonblank_lines": 307,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/summary_protocol.go",
+      "extension": ".go",
+      "lines": 341,
+      "nonblank_lines": 312,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/triage/triage.go",
+      "extension": ".go",
+      "lines": 340,
+      "nonblank_lines": 306,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/dependency_gate_sandbox_test.go",
+      "extension": ".go",
+      "lines": 337,
+      "nonblank_lines": 303,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreecleanup/service_test.go",
+      "extension": ".go",
+      "lines": 337,
+      "nonblank_lines": 290,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_lifecycle.go",
+      "extension": ".go",
+      "lines": 336,
+      "nonblank_lines": 309,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/client/manager.go",
+      "extension": ".go",
+      "lines": 331,
+      "nonblank_lines": 311,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/config_patch_test.go",
+      "extension": ".go",
+      "lines": 331,
+      "nonblank_lines": 307,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/browser_guard.go",
+      "extension": ".go",
+      "lines": 327,
+      "nonblank_lines": 303,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/protocol/protocol.go",
+      "extension": ".go",
+      "lines": 326,
+      "nonblank_lines": 294,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/format_roundtrip_test.go",
+      "extension": ".go",
+      "lines": 325,
+      "nonblank_lines": 295,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/file_format.go",
+      "extension": ".go",
+      "lines": 324,
+      "nonblank_lines": 304,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/shutdown_order_test.go",
+      "extension": ".go",
+      "lines": 321,
+      "nonblank_lines": 290,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/provider_bootstrap_test.go",
+      "extension": ".go",
+      "lines": 320,
+      "nonblank_lines": 301,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/daemon_install.go",
+      "extension": ".go",
+      "lines": 319,
+      "nonblank_lines": 275,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/forgejocontract/contract_test.go",
+      "extension": ".go",
+      "lines": 318,
+      "nonblank_lines": 299,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/defaults.go",
+      "extension": ".go",
+      "lines": 317,
+      "nonblank_lines": 299,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/field_patch.go",
+      "extension": ".go",
+      "lines": 316,
+      "nonblank_lines": 294,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runs/service.go",
+      "extension": ".go",
+      "lines": 316,
+      "nonblank_lines": 295,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/hitl_github_poll.go",
+      "extension": ".go",
+      "lines": 314,
+      "nonblank_lines": 295,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/tea_test.go",
+      "extension": ".go",
+      "lines": 309,
+      "nonblank_lines": 288,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/domain/domain.go",
+      "extension": ".go",
+      "lines": 307,
+      "nonblank_lines": 268,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/helpers_test.go",
+      "extension": ".go",
+      "lines": 307,
+      "nonblank_lines": 279,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worker/hitl_test.go",
+      "extension": ".go",
+      "lines": 303,
+      "nonblank_lines": 280,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/notify/human_attention.go",
+      "extension": ".go",
+      "lines": 297,
+      "nonblank_lines": 276,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/executor_snapshot_test.go",
+      "extension": ".go",
+      "lines": 296,
+      "nonblank_lines": 270,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_forgejo_native_resolve_test.go",
+      "extension": ".go",
+      "lines": 296,
+      "nonblank_lines": 278,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/admission.go",
+      "extension": ".go",
+      "lines": 294,
+      "nonblank_lines": 272,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/dashboard_command_test.go",
+      "extension": ".go",
+      "lines": 293,
+      "nonblank_lines": 271,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/review_anchor.go",
+      "extension": ".go",
+      "lines": 286,
+      "nonblank_lines": 266,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/LoopActionBar.test.tsx",
+      "extension": ".tsx",
+      "lines": 286,
+      "nonblank_lines": 256,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/agent_resolve_test.go",
+      "extension": ".go",
+      "lines": 285,
+      "nonblank_lines": 254,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/field_patch_test.go",
+      "extension": ".go",
+      "lines": 285,
+      "nonblank_lines": 261,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0004_worker_project_target.sql",
+      "extension": ".sql",
+      "lines": 283,
+      "nonblank_lines": 265,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/disclosure/disclosure_test.go",
+      "extension": ".go",
+      "lines": 280,
+      "nonblank_lines": 254,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/containment_test.go",
+      "extension": ".go",
+      "lines": 279,
+      "nonblank_lines": 262,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/progress.go",
+      "extension": ".go",
+      "lines": 277,
+      "nonblank_lines": 246,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_forgejo_discovery_test.go",
+      "extension": ".go",
+      "lines": 277,
+      "nonblank_lines": 258,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/operation_lease_test.go",
+      "extension": ".go",
+      "lines": 277,
+      "nonblank_lines": 253,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/handler_recovery_surface_test.go",
+      "extension": ".go",
+      "lines": 275,
+      "nonblank_lines": 256,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/worktree_commands_test.go",
+      "extension": ".go",
+      "lines": 274,
+      "nonblank_lines": 245,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/hitl.go",
+      "extension": ".go",
+      "lines": 274,
+      "nonblank_lines": 257,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention_recovery_shutdown_contract_test.go",
+      "extension": ".go",
+      "lines": 274,
+      "nonblank_lines": 253,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/startup_recovery_classification_test.go",
+      "extension": ".go",
+      "lines": 273,
+      "nonblank_lines": 256,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/agent_snapshot_test.go",
+      "extension": ".go",
+      "lines": 271,
+      "nonblank_lines": 239,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/worktree_cleanup_admission_cancel_test.go",
+      "extension": ".go",
+      "lines": 269,
+      "nonblank_lines": 241,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/runner_owner_token_prepare_failure_test.go",
+      "extension": ".go",
+      "lines": 268,
+      "nonblank_lines": 253,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/bootstrap/logger_test.go",
+      "extension": ".go",
+      "lines": 267,
+      "nonblank_lines": 220,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_unusable_worktree_test.go",
+      "extension": ".go",
+      "lines": 267,
+      "nonblank_lines": 247,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/review_submit_contract_helpers_test.go",
+      "extension": ".go",
+      "lines": 266,
+      "nonblank_lines": 251,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_tunnel_reconcile_test.go",
+      "extension": ".go",
+      "lines": 266,
+      "nonblank_lines": 236,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/testdata/schema/sqlite-schema.snapshot.sql",
+      "extension": ".sql",
+      "lines": 266,
+      "nonblank_lines": 242,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/codex_jsonl.go",
+      "extension": ".go",
+      "lines": 264,
+      "nonblank_lines": 248,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/provider_remote_test.go",
+      "extension": ".go",
+      "lines": 264,
+      "nonblank_lines": 249,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/containment_runtime_test.go",
+      "extension": ".go",
+      "lines": 263,
+      "nonblank_lines": 238,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_stop_boundary_test.go",
+      "extension": ".go",
+      "lines": 262,
+      "nonblank_lines": 232,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/bootstrap_test.go",
+      "extension": ".go",
+      "lines": 260,
+      "nonblank_lines": 229,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/config_routes_test.go",
+      "extension": ".go",
+      "lines": 259,
+      "nonblank_lines": 236,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/hitl_test.go",
+      "extension": ".go",
+      "lines": 258,
+      "nonblank_lines": 247,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_tunnel_server_test.go",
+      "extension": ".go",
+      "lines": 258,
+      "nonblank_lines": 222,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/run_stats_commands_test.go",
+      "extension": ".go",
+      "lines": 256,
+      "nonblank_lines": 239,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "scripts/install.sh",
+      "extension": ".sh",
+      "lines": 255,
+      "nonblank_lines": 216,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/bootstrap/logger.go",
+      "extension": ".go",
+      "lines": 253,
+      "nonblank_lines": 202,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_dirty_adopt_helpers_test.go",
+      "extension": ".go",
+      "lines": 253,
+      "nonblank_lines": 228,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/config_migrate_paths_test.go",
+      "extension": ".go",
+      "lines": 252,
+      "nonblank_lines": 226,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/queue_commands_test.go",
+      "extension": ".go",
+      "lines": 249,
+      "nonblank_lines": 238,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/agent_spawn_stop_gate_test.go",
+      "extension": ".go",
+      "lines": 248,
+      "nonblank_lines": 228,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/agent_spawn_bind_drain_test.go",
+      "extension": ".go",
+      "lines": 245,
+      "nonblank_lines": 221,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_forgejo_native_test.go",
+      "extension": ".go",
+      "lines": 244,
+      "nonblank_lines": 221,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/notify/gateway_webhook_test.go",
+      "extension": ".go",
+      "lines": 243,
+      "nonblank_lines": 209,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/dashboard/embed.go",
+      "extension": ".go",
+      "lines": 242,
+      "nonblank_lines": 214,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/looper/main_test.go",
+      "extension": ".go",
+      "lines": 241,
+      "nonblank_lines": 206,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/dashboard_url_test.go",
+      "extension": ".go",
+      "lines": 241,
+      "nonblank_lines": 219,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/executor_persist_ownership_test.go",
+      "extension": ".go",
+      "lines": 237,
+      "nonblank_lines": 221,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_prepare_recovery_test.go",
+      "extension": ".go",
+      "lines": 237,
+      "nonblank_lines": 226,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/review_anchor_test.go",
+      "extension": ".go",
+      "lines": 235,
+      "nonblank_lines": 212,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/client/manager_test.go",
+      "extension": ".go",
+      "lines": 233,
+      "nonblank_lines": 213,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/prompt_commands.go",
+      "extension": ".go",
+      "lines": 232,
+      "nonblank_lines": 214,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/provider_binding_test.go",
+      "extension": ".go",
+      "lines": 232,
+      "nonblank_lines": 219,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/agent_spawn_bound_drain_test.go",
+      "extension": ".go",
+      "lines": 232,
+      "nonblank_lines": 212,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/hitl_feishu_poll.go",
+      "extension": ".go",
+      "lines": 232,
+      "nonblank_lines": 217,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/netadmin_commands.go",
+      "extension": ".go",
+      "lines": 231,
+      "nonblank_lines": 220,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/config_reload_test.go",
+      "extension": ".go",
+      "lines": 231,
+      "nonblank_lines": 210,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/safety_floor_scheduler_test.go",
+      "extension": ".go",
+      "lines": 231,
+      "nonblank_lines": 214,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/db.go",
+      "extension": ".go",
+      "lines": 231,
+      "nonblank_lines": 187,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/failureclass/failureclass.go",
+      "extension": ".go",
+      "lines": 229,
+      "nonblank_lines": 206,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/failureclass/failureclass_test.go",
+      "extension": ".go",
+      "lines": 229,
+      "nonblank_lines": 210,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/criteria/criteria.go",
+      "extension": ".go",
+      "lines": 227,
+      "nonblank_lines": 198,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/projects/service_provider_test.go",
+      "extension": ".go",
+      "lines": 224,
+      "nonblank_lines": 206,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/runner_owner_token_lock_resume_test.go",
+      "extension": ".go",
+      "lines": 224,
+      "nonblank_lines": 211,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/admission_test.go",
+      "extension": ".go",
+      "lines": 223,
+      "nonblank_lines": 201,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/daemon_client_test.go",
+      "extension": ".go",
+      "lines": 222,
+      "nonblank_lines": 187,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/agent_spawn_rebind_test.go",
+      "extension": ".go",
+      "lines": 222,
+      "nonblank_lines": 207,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/browser_guard_test.go",
+      "extension": ".go",
+      "lines": 219,
+      "nonblank_lines": 183,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/usePolling.test.tsx",
+      "extension": ".tsx",
+      "lines": 219,
+      "nonblank_lines": 193,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/auto_merge_e2e_test.go",
+      "extension": ".go",
+      "lines": 218,
+      "nonblank_lines": 203,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "deploy/feishu-inbox-worker/worker.js",
+      "extension": ".js",
+      "lines": 217,
+      "nonblank_lines": 201,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/diffanchor/diffanchor_test.go",
+      "extension": ".go",
+      "lines": 217,
+      "nonblank_lines": 195,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/config_parity_test.go",
+      "extension": ".go",
+      "lines": 216,
+      "nonblank_lines": 177,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/trusted_env.go",
+      "extension": ".go",
+      "lines": 216,
+      "nonblank_lines": 201,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/projects/catalog.go",
+      "extension": ".go",
+      "lines": 216,
+      "nonblank_lines": 200,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/runner_prepare_real_gateway_test.go",
+      "extension": ".go",
+      "lines": 215,
+      "nonblank_lines": 197,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/prompt_commands_test.go",
+      "extension": ".go",
+      "lines": 214,
+      "nonblank_lines": 190,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/operation_lease_post_bind_stop_test.go",
+      "extension": ".go",
+      "lines": 214,
+      "nonblank_lines": 200,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreecleanup/cleanup.go",
+      "extension": ".go",
+      "lines": 214,
+      "nonblank_lines": 196,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/layout/Shell.tsx",
+      "extension": ".tsx",
+      "lines": 214,
+      "nonblank_lines": 200,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/config_migrate_preview_test.go",
+      "extension": ".go",
+      "lines": 213,
+      "nonblank_lines": 195,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/safety_floor_recovery_test.go",
+      "extension": ".go",
+      "lines": 213,
+      "nonblank_lines": 200,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_dirty_adopt_test.go",
+      "extension": ".go",
+      "lines": 212,
+      "nonblank_lines": 199,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worker/runner_recover_real_gateway_test.go",
+      "extension": ".go",
+      "lines": 211,
+      "nonblank_lines": 198,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/format.ts",
+      "extension": ".ts",
+      "lines": 211,
+      "nonblank_lines": 201,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/dashboard_command.go",
+      "extension": ".go",
+      "lines": 210,
+      "nonblank_lines": 186,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/projects/reviewer_automerge_validation_test.go",
+      "extension": ".go",
+      "lines": 209,
+      "nonblank_lines": 189,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/usePolling.ts",
+      "extension": ".ts",
+      "lines": 209,
+      "nonblank_lines": 188,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/queue_commands.go",
+      "extension": ".go",
+      "lines": 207,
+      "nonblank_lines": 192,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/trusted_review_config_test.go",
+      "extension": ".go",
+      "lines": 207,
+      "nonblank_lines": 193,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/release/manifest.go",
+      "extension": ".go",
+      "lines": 207,
+      "nonblank_lines": 179,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/health_test.go",
+      "extension": ".go",
+      "lines": 206,
+      "nonblank_lines": 192,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/golden_test.go",
+      "extension": ".go",
+      "lines": 200,
+      "nonblank_lines": 185,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/logs_follow.go",
+      "extension": ".go",
+      "lines": 200,
+      "nonblank_lines": 187,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/summary_protocol_test.go",
+      "extension": ".go",
+      "lines": 200,
+      "nonblank_lines": 175,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/trusted_review_proxy_limits_test.go",
+      "extension": ".go",
+      "lines": 200,
+      "nonblank_lines": 189,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_publish_stop_contract_test.go",
+      "extension": ".go",
+      "lines": 200,
+      "nonblank_lines": 179,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_prepare_terminal_preserve_test.go",
+      "extension": ".go",
+      "lines": 199,
+      "nonblank_lines": 184,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/operation_lease_external_cancel_test.go",
+      "extension": ".go",
+      "lines": 199,
+      "nonblank_lines": 183,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/release/manifest_test.go",
+      "extension": ".go",
+      "lines": 197,
+      "nonblank_lines": 178,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/operation_lease_recover_test.go",
+      "extension": ".go",
+      "lines": 197,
+      "nonblank_lines": 179,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreesafety/checkout.go",
+      "extension": ".go",
+      "lines": 196,
+      "nonblank_lines": 186,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/review_anchors_submit_test.go",
+      "extension": ".go",
+      "lines": 195,
+      "nonblank_lines": 185,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_tunnel_test.go",
+      "extension": ".go",
+      "lines": 195,
+      "nonblank_lines": 166,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/daemon.go",
+      "extension": ".go",
+      "lines": 194,
+      "nonblank_lines": 183,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/review_anchors_helpers_test.go",
+      "extension": ".go",
+      "lines": 193,
+      "nonblank_lines": 177,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/agent_role_normalize_test.go",
+      "extension": ".go",
+      "lines": 191,
+      "nonblank_lines": 175,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/git/reserved_review_scratch_test.go",
+      "extension": ".go",
+      "lines": 191,
+      "nonblank_lines": 171,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/config_projection_test.go",
+      "extension": ".go",
+      "lines": 190,
+      "nonblank_lines": 176,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_prepare_real_gateway_corrupt_test.go",
+      "extension": ".go",
+      "lines": 190,
+      "nonblank_lines": 173,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/notify/gateway_test.go",
+      "extension": ".go",
+      "lines": 190,
+      "nonblank_lines": 164,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreesafety/fixer_owner_test.go",
+      "extension": ".go",
+      "lines": 190,
+      "nonblank_lines": 173,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/non_mutating_http_test.go",
+      "extension": ".go",
+      "lines": 189,
+      "nonblank_lines": 170,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/disclosure/disclosure.go",
+      "extension": ".go",
+      "lines": 188,
+      "nonblank_lines": 168,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/scheduler_forgejo_tea_test.go",
+      "extension": ".go",
+      "lines": 188,
+      "nonblank_lines": 173,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/webhook_commands_tunnel_management_test.go",
+      "extension": ".go",
+      "lines": 185,
+      "nonblank_lines": 169,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/agent_spawn_ownership_test.go",
+      "extension": ".go",
+      "lines": 184,
+      "nonblank_lines": 170,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/executor_role_params_test.go",
+      "extension": ".go",
+      "lines": 183,
+      "nonblank_lines": 166,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/criteria/criteria_test.go",
+      "extension": ".go",
+      "lines": 183,
+      "nonblank_lines": 169,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_publish_contract_test.go",
+      "extension": ".go",
+      "lines": 183,
+      "nonblank_lines": 161,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/value_sources.go",
+      "extension": ".go",
+      "lines": 182,
+      "nonblank_lines": 171,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/tea_transport_test.go",
+      "extension": ".go",
+      "lines": 182,
+      "nonblank_lines": 172,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/operation_lease_cancel_finalize_test.go",
+      "extension": ".go",
+      "lines": 182,
+      "nonblank_lines": 165,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/review_submit_contract_failclosed_test.go",
+      "extension": ".go",
+      "lines": 177,
+      "nonblank_lines": 161,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/errors.go",
+      "extension": ".go",
+      "lines": 177,
+      "nonblank_lines": 162,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention_recovery_startup_contract_test.go",
+      "extension": ".go",
+      "lines": 177,
+      "nonblank_lines": 161,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/version/version_test.go",
+      "extension": ".go",
+      "lines": 177,
+      "nonblank_lines": 147,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/service_test.go",
+      "extension": ".go",
+      "lines": 176,
+      "nonblank_lines": 155,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/download.go",
+      "extension": ".go",
+      "lines": 175,
+      "nonblank_lines": 163,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/forge_keys_test.go",
+      "extension": ".go",
+      "lines": 175,
+      "nonblank_lines": 163,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/webhook_config_test.go",
+      "extension": ".go",
+      "lines": 174,
+      "nonblank_lines": 159,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/runner_owner_token_thread_resolution_test.go",
+      "extension": ".go",
+      "lines": 174,
+      "nonblank_lines": 162,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/version/buildflags_test.go",
+      "extension": ".go",
+      "lines": 174,
+      "nonblank_lines": 146,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_prepare_real_gateway_test.go",
+      "extension": ".go",
+      "lines": 173,
+      "nonblank_lines": 164,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/worktree_cleanup_admission_test.go",
+      "extension": ".go",
+      "lines": 173,
+      "nonblank_lines": 153,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/sse.ts",
+      "extension": ".ts",
+      "lines": 173,
+      "nonblank_lines": 159,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/semver.go",
+      "extension": ".go",
+      "lines": 172,
+      "nonblank_lines": 157,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/webhook_commands_tunnel_status_test.go",
+      "extension": ".go",
+      "lines": 172,
+      "nonblank_lines": 155,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/dashboard/embed_test.go",
+      "extension": ".go",
+      "lines": 171,
+      "nonblank_lines": 147,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/domain/domain_test.go",
+      "extension": ".go",
+      "lines": 171,
+      "nonblank_lines": 155,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/plane_test.go",
+      "extension": ".go",
+      "lines": 170,
+      "nonblank_lines": 157,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/pages/Projects.tsx",
+      "extension": ".tsx",
+      "lines": 170,
+      "nonblank_lines": 163,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/smoke_daemon_test.go",
+      "extension": ".go",
+      "lines": 167,
+      "nonblank_lines": 158,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/runner_owner_token_dirty_claim_test.go",
+      "extension": ".go",
+      "lines": 166,
+      "nonblank_lines": 157,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/loop_retry_stop_gate_test.go",
+      "extension": ".go",
+      "lines": 165,
+      "nonblank_lines": 153,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/safety_floor_scheduler_dispatch_test.go",
+      "extension": ".go",
+      "lines": 165,
+      "nonblank_lines": 155,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/format.test.ts",
+      "extension": ".ts",
+      "lines": 165,
+      "nonblank_lines": 144,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/non_mutating_coverage_test.go",
+      "extension": ".go",
+      "lines": 164,
+      "nonblank_lines": 148,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/outboundguard/guard_test.go",
+      "extension": ".go",
+      "lines": 162,
+      "nonblank_lines": 155,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/daemon_client.go",
+      "extension": ".go",
+      "lines": 161,
+      "nonblank_lines": 134,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/recovery_classification.go",
+      "extension": ".go",
+      "lines": 161,
+      "nonblank_lines": 148,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/git.go",
+      "extension": ".go",
+      "lines": 160,
+      "nonblank_lines": 148,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/feedback.go",
+      "extension": ".go",
+      "lines": 159,
+      "nonblank_lines": 140,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/dispatch/autonomous_test.go",
+      "extension": ".go",
+      "lines": 155,
+      "nonblank_lines": 139,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/networkpolicy/policy.go",
+      "extension": ".go",
+      "lines": 155,
+      "nonblank_lines": 138,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/lifecycle/lifecycle_test.go",
+      "extension": ".go",
+      "lines": 154,
+      "nonblank_lines": 138,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/fake_gh.go",
+      "extension": ".go",
+      "lines": 151,
+      "nonblank_lines": 139,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/depgraph/depgraph_test.go",
+      "extension": ".go",
+      "lines": 150,
+      "nonblank_lines": 142,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/reviewer_repair.go",
+      "extension": ".go",
+      "lines": 149,
+      "nonblank_lines": 139,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_lifecycle_test.go",
+      "extension": ".go",
+      "lines": 149,
+      "nonblank_lines": 130,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/config_patch_fs_test.go",
+      "extension": ".go",
+      "lines": 148,
+      "nonblank_lines": 138,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/looperd/stop_admission_preflight_test.go",
+      "extension": ".go",
+      "lines": 146,
+      "nonblank_lines": 130,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_prepare_real_gateway_helpers_test.go",
+      "extension": ".go",
+      "lines": 146,
+      "nonblank_lines": 136,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/containment_runtime_retry_test.go",
+      "extension": ".go",
+      "lines": 146,
+      "nonblank_lines": 135,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/operation_lease_ambiguous_claim_test.go",
+      "extension": ".go",
+      "lines": 146,
+      "nonblank_lines": 134,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/looperd/config_api_bridge_test.go",
+      "extension": ".go",
+      "lines": 145,
+      "nonblank_lines": 138,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/worker_reuse_stop_gate_test.go",
+      "extension": ".go",
+      "lines": 145,
+      "nonblank_lines": 131,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/fake_gh_test.go",
+      "extension": ".go",
+      "lines": 144,
+      "nonblank_lines": 138,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreesafety/fixer_owner.go",
+      "extension": ".go",
+      "lines": 143,
+      "nonblank_lines": 137,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention_recovery_rescan_contract_test.go",
+      "extension": ".go",
+      "lines": 142,
+      "nonblank_lines": 128,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/value_sources_test.go",
+      "extension": ".go",
+      "lines": 141,
+      "nonblank_lines": 130,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/agent_snapshot.go",
+      "extension": ".go",
+      "lines": 140,
+      "nonblank_lines": 132,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/config_commands_test.go",
+      "extension": ".go",
+      "lines": 139,
+      "nonblank_lines": 125,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/binaries.go",
+      "extension": ".go",
+      "lines": 139,
+      "nonblank_lines": 127,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_dirty_adopt_rediscovery_test.go",
+      "extension": ".go",
+      "lines": 139,
+      "nonblank_lines": 131,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/safety_floor_shutdown_recovery_test.go",
+      "extension": ".go",
+      "lines": 139,
+      "nonblank_lines": 124,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "pkg/api/envelope.go",
+      "extension": ".go",
+      "lines": 139,
+      "nonblank_lines": 130,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/recovery.test.ts",
+      "extension": ".ts",
+      "lines": 138,
+      "nonblank_lines": 129,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/discovery_fingerprint.go",
+      "extension": ".go",
+      "lines": 137,
+      "nonblank_lines": 128,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/containment_helpers_test.go",
+      "extension": ".go",
+      "lines": 137,
+      "nonblank_lines": 127,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/bootstrap_routes.go",
+      "extension": ".go",
+      "lines": 136,
+      "nonblank_lines": 118,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/loop_start_stop_gate_test.go",
+      "extension": ".go",
+      "lines": 136,
+      "nonblank_lines": 124,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/safety_floor_admission_test.go",
+      "extension": ".go",
+      "lines": 136,
+      "nonblank_lines": 122,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreesafety/safety_test.go",
+      "extension": ".go",
+      "lines": 136,
+      "nonblank_lines": 120,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/looperd/stop_admission_missing_handle_test.go",
+      "extension": ".go",
+      "lines": 134,
+      "nonblank_lines": 122,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention_awaiting_contract_test.go",
+      "extension": ".go",
+      "lines": 134,
+      "nonblank_lines": 122,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/bootstrap/config_reload_dependencies_test.go",
+      "extension": ".go",
+      "lines": 133,
+      "nonblank_lines": 127,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/git/reserved_review_scratch.go",
+      "extension": ".go",
+      "lines": 133,
+      "nonblank_lines": 122,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/worktree_cleanup_admission_start_event_test.go",
+      "extension": ".go",
+      "lines": 133,
+      "nonblank_lines": 118,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/theme.ts",
+      "extension": ".ts",
+      "lines": 133,
+      "nonblank_lines": 120,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/types.go",
+      "extension": ".go",
+      "lines": 132,
+      "nonblank_lines": 112,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/client/client.go",
+      "extension": ".go",
+      "lines": 132,
+      "nonblank_lines": 118,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/review_submit_contract_test.go",
+      "extension": ".go",
+      "lines": 131,
+      "nonblank_lines": 118,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/agent_resolve.go",
+      "extension": ".go",
+      "lines": 131,
+      "nonblank_lines": 118,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/looperd/stop_admission_sticky_test.go",
+      "extension": ".go",
+      "lines": 130,
+      "nonblank_lines": 115,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/criteria/default_verifier.go",
+      "extension": ".go",
+      "lines": 130,
+      "nonblank_lines": 118,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/forgejo_native_review_test.go",
+      "extension": ".go",
+      "lines": 129,
+      "nonblank_lines": 122,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreesafety/checkout_test.go",
+      "extension": ".go",
+      "lines": 129,
+      "nonblank_lines": 117,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/notify/human_attention_claim_test.go",
+      "extension": ".go",
+      "lines": 128,
+      "nonblank_lines": 116,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/actions.test.ts",
+      "extension": ".ts",
+      "lines": 127,
+      "nonblank_lines": 112,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/dispatch/human_test.go",
+      "extension": ".go",
+      "lines": 126,
+      "nonblank_lines": 111,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreesafety/safety.go",
+      "extension": ".go",
+      "lines": 126,
+      "nonblank_lines": 113,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/config.go",
+      "extension": ".go",
+      "lines": 124,
+      "nonblank_lines": 116,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_dirty_adopt_gates_test.go",
+      "extension": ".go",
+      "lines": 123,
+      "nonblank_lines": 117,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/requeue_guard.go",
+      "extension": ".go",
+      "lines": 122,
+      "nonblank_lines": 112,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/theme.test.ts",
+      "extension": ".ts",
+      "lines": 122,
+      "nonblank_lines": 106,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/sse.test.ts",
+      "extension": ".ts",
+      "lines": 121,
+      "nonblank_lines": 107,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/agent_profiles_validate_test.go",
+      "extension": ".go",
+      "lines": 120,
+      "nonblank_lines": 108,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0001_init.sql",
+      "extension": ".sql",
+      "lines": 120,
+      "nonblank_lines": 108,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/admission_gate_test.go",
+      "extension": ".go",
+      "lines": 119,
+      "nonblank_lines": 102,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_publish_helpers_test.go",
+      "extension": ".go",
+      "lines": 119,
+      "nonblank_lines": 106,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/DataTable.tsx",
+      "extension": ".tsx",
+      "lines": 119,
+      "nonblank_lines": 115,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/bootstrap_codes.go",
+      "extension": ".go",
+      "lines": 117,
+      "nonblank_lines": 104,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/runner_prepare_real_gateway_helpers_test.go",
+      "extension": ".go",
+      "lines": 117,
+      "nonblank_lines": 107,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/App.tsx",
+      "extension": ".tsx",
+      "lines": 116,
+      "nonblank_lines": 110,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/browser_guard_public_test.go",
+      "extension": ".go",
+      "lines": 115,
+      "nonblank_lines": 97,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/embedded_migrations.go",
+      "extension": ".go",
+      "lines": 115,
+      "nonblank_lines": 92,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/vite.config.ts",
+      "extension": ".ts",
+      "lines": 115,
+      "nonblank_lines": 107,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/labels.go",
+      "extension": ".go",
+      "lines": 114,
+      "nonblank_lines": 102,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention_terminal_contract_test.go",
+      "extension": ".go",
+      "lines": 114,
+      "nonblank_lines": 102,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/mergewatch/mergewatch.go",
+      "extension": ".go",
+      "lines": 113,
+      "nonblank_lines": 102,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention_manual_contract_test.go",
+      "extension": ".go",
+      "lines": 113,
+      "nonblank_lines": 104,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/logsStream.test.ts",
+      "extension": ".ts",
+      "lines": 112,
+      "nonblank_lines": 102,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/forgejo_sandbox_config_test.go",
+      "extension": ".go",
+      "lines": 110,
+      "nonblank_lines": 102,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/worktree_commands.go",
+      "extension": ".go",
+      "lines": 109,
+      "nonblank_lines": 101,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention_recovery_quarantine_contract_test.go",
+      "extension": ".go",
+      "lines": 109,
+      "nonblank_lines": 100,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/netadmin_commands_test.go",
+      "extension": ".go",
+      "lines": 108,
+      "nonblank_lines": 103,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/runner_owner_token_restore_failure_test.go",
+      "extension": ".go",
+      "lines": 108,
+      "nonblank_lines": 98,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/assertions.go",
+      "extension": ".go",
+      "lines": 107,
+      "nonblank_lines": 99,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runs/service_test.go",
+      "extension": ".go",
+      "lines": 107,
+      "nonblank_lines": 94,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/scheduler_notification_reload_test.go",
+      "extension": ".go",
+      "lines": 107,
+      "nonblank_lines": 101,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0016_queue_infinite_retry_attempts.sql",
+      "extension": ".sql",
+      "lines": 107,
+      "nonblank_lines": 102,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/looperd/stop_all_admission_gate_test.go",
+      "extension": ".go",
+      "lines": 106,
+      "nonblank_lines": 96,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/eventlog/eventlog.go",
+      "extension": ".go",
+      "lines": 106,
+      "nonblank_lines": 95,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/discovery_fingerprint_test.go",
+      "extension": ".go",
+      "lines": 106,
+      "nonblank_lines": 99,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/runner_prepare_real_gateway_recovery_test.go",
+      "extension": ".go",
+      "lines": 105,
+      "nonblank_lines": 97,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/worktree_cleanup_admission_pass_cancel_test.go",
+      "extension": ".go",
+      "lines": 105,
+      "nonblank_lines": 93,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/operation_lease_finalize_test.go",
+      "extension": ".go",
+      "lines": 104,
+      "nonblank_lines": 94,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/grok_build_test.go",
+      "extension": ".go",
+      "lines": 103,
+      "nonblank_lines": 99,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/webhook_config_snapshot_test.go",
+      "extension": ".go",
+      "lines": 103,
+      "nonblank_lines": 88,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/ConfirmDialog.tsx",
+      "extension": ".tsx",
+      "lines": 103,
+      "nonblank_lines": 98,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/takeover_test.go",
+      "extension": ".go",
+      "lines": 102,
+      "nonblank_lines": 89,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/hitl.go",
+      "extension": ".go",
+      "lines": 100,
+      "nonblank_lines": 92,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/toast.tsx",
+      "extension": ".tsx",
+      "lines": 99,
+      "nonblank_lines": 86,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/config_auth_test.go",
+      "extension": ".go",
+      "lines": 98,
+      "nonblank_lines": 92,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/agent_spawn_executor_ownership_test.go",
+      "extension": ".go",
+      "lines": 98,
+      "nonblank_lines": 90,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/provider_remote.go",
+      "extension": ".go",
+      "lines": 96,
+      "nonblank_lines": 89,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/reviewer_retry.go",
+      "extension": ".go",
+      "lines": 96,
+      "nonblank_lines": 90,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/worktree_cleanup_admission_inflight_test.go",
+      "extension": ".go",
+      "lines": 96,
+      "nonblank_lines": 85,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/index.css",
+      "extension": ".css",
+      "lines": 96,
+      "nonblank_lines": 84,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/instructions.go",
+      "extension": ".go",
+      "lines": 95,
+      "nonblank_lines": 88,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/notify/human_attention_transport_test.go",
+      "extension": ".go",
+      "lines": 95,
+      "nonblank_lines": 85,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/network_config_test.go",
+      "extension": ".go",
+      "lines": 92,
+      "nonblank_lines": 84,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/fake_agent_test.go",
+      "extension": ".go",
+      "lines": 92,
+      "nonblank_lines": 88,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "pkg/api/envelope_test.go",
+      "extension": ".go",
+      "lines": 92,
+      "nonblank_lines": 75,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/codex_jsonl_test.go",
+      "extension": ".go",
+      "lines": 91,
+      "nonblank_lines": 84,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/server.go",
+      "extension": ".go",
+      "lines": 91,
+      "nonblank_lines": 74,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/config_reload_redaction_test.go",
+      "extension": ".go",
+      "lines": 91,
+      "nonblank_lines": 81,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "scripts/uninstall.sh",
+      "extension": ".sh",
+      "lines": 91,
+      "nonblank_lines": 79,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/DashboardDataContext.tsx",
+      "extension": ".tsx",
+      "lines": 91,
+      "nonblank_lines": 82,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/logsStream.ts",
+      "extension": ".ts",
+      "lines": 91,
+      "nonblank_lines": 84,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/recovery.ts",
+      "extension": ".ts",
+      "lines": 91,
+      "nonblank_lines": 82,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/config_decode_test.go",
+      "extension": ".go",
+      "lines": 90,
+      "nonblank_lines": 84,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention_failure_contract_test.go",
+      "extension": ".go",
+      "lines": 90,
+      "nonblank_lines": 82,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/recovery_classification_test.go",
+      "extension": ".go",
+      "lines": 90,
+      "nonblank_lines": 82,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/embedded_migrations_test.go",
+      "extension": ".go",
+      "lines": 90,
+      "nonblank_lines": 74,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/operation_lease_stop_test.go",
+      "extension": ".go",
+      "lines": 89,
+      "nonblank_lines": 80,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/webhook_tunnel_hooks.go",
+      "extension": ".go",
+      "lines": 89,
+      "nonblank_lines": 80,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/automerge/automerge.go",
+      "extension": ".go",
+      "lines": 88,
+      "nonblank_lines": 75,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/project_roles.go",
+      "extension": ".go",
+      "lines": 87,
+      "nonblank_lines": 82,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/protocol/protocol_test.go",
+      "extension": ".go",
+      "lines": 85,
+      "nonblank_lines": 81,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "tools/release-manifest/main.go",
+      "extension": ".go",
+      "lines": 85,
+      "nonblank_lines": 76,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/ProjectFilterContext.tsx",
+      "extension": ".tsx",
+      "lines": 85,
+      "nonblank_lines": 75,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/forge/plane_live_e2e_test.go",
+      "extension": ".go",
+      "lines": 84,
+      "nonblank_lines": 76,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/containment_bind_test.go",
+      "extension": ".go",
+      "lines": 84,
+      "nonblank_lines": 76,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/takeover_commands.go",
+      "extension": ".go",
+      "lines": 82,
+      "nonblank_lines": 76,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/group_live_linux.go",
+      "extension": ".go",
+      "lines": 82,
+      "nonblank_lines": 77,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/projects/reviewer_automerge_validation.go",
+      "extension": ".go",
+      "lines": 82,
+      "nonblank_lines": 75,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/human_attention_contract_helpers_test.go",
+      "extension": ".go",
+      "lines": 81,
+      "nonblank_lines": 74,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/root_handler_test.go",
+      "extension": ".go",
+      "lines": 80,
+      "nonblank_lines": 70,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/project_id.go",
+      "extension": ".go",
+      "lines": 79,
+      "nonblank_lines": 62,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0011_sweeper_cases_proposals.sql",
+      "extension": ".sql",
+      "lines": 79,
+      "nonblank_lines": 76,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0006_loop_seq_handles.sql",
+      "extension": ".sql",
+      "lines": 77,
+      "nonblank_lines": 70,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/version/buildflags.go",
+      "extension": ".go",
+      "lines": 77,
+      "nonblank_lines": 70,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "scripts/takeover.sh",
+      "extension": ".sh",
+      "lines": 77,
+      "nonblank_lines": 64,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/LoopTypeBadge.tsx",
+      "extension": ".tsx",
+      "lines": 77,
+      "nonblank_lines": 72,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/runner_test.go",
+      "extension": ".go",
+      "lines": 76,
+      "nonblank_lines": 65,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/inbox.go",
+      "extension": ".go",
+      "lines": 75,
+      "nonblank_lines": 67,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0002_integrations.sql",
+      "extension": ".sql",
+      "lines": 75,
+      "nonblank_lines": 70,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "skills/looper/scripts/check.sh",
+      "extension": ".sh",
+      "lines": 75,
+      "nonblank_lines": 63,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/webhook_forwarders.go",
+      "extension": ".go",
+      "lines": 74,
+      "nonblank_lines": 67,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/mixed_schema.go",
+      "extension": ".go",
+      "lines": 73,
+      "nonblank_lines": 69,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/tools.go",
+      "extension": ".go",
+      "lines": 73,
+      "nonblank_lines": 58,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/specpr/specpr.go",
+      "extension": ".go",
+      "lines": 72,
+      "nonblank_lines": 61,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/webhook_tunnel_hooks_test.go",
+      "extension": ".go",
+      "lines": 71,
+      "nonblank_lines": 63,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/milestone.go",
+      "extension": ".go",
+      "lines": 70,
+      "nonblank_lines": 63,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/hitl_github_poll_test.go",
+      "extension": ".go",
+      "lines": 68,
+      "nonblank_lines": 65,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/provider_remote_test.go",
+      "extension": ".go",
+      "lines": 65,
+      "nonblank_lines": 56,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/hitl_test.go",
+      "extension": ".go",
+      "lines": 64,
+      "nonblank_lines": 56,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0005_planner_issue_target.sql",
+      "extension": ".sql",
+      "lines": 64,
+      "nonblank_lines": 59,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/looper/main.go",
+      "extension": ".go",
+      "lines": 63,
+      "nonblank_lines": 52,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/notify/human_attention_system_notification_test.go",
+      "extension": ".go",
+      "lines": 63,
+      "nonblank_lines": 56,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/takeover.go",
+      "extension": ".go",
+      "lines": 63,
+      "nonblank_lines": 57,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/grok_build_test.go",
+      "extension": ".go",
+      "lines": 62,
+      "nonblank_lines": 54,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/reviewer_automerge_test.go",
+      "extension": ".go",
+      "lines": 61,
+      "nonblank_lines": 54,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/fake_agent.go",
+      "extension": ".go",
+      "lines": 60,
+      "nonblank_lines": 53,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/version/version.go",
+      "extension": ".go",
+      "lines": 59,
+      "nonblank_lines": 52,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/actions.ts",
+      "extension": ".ts",
+      "lines": 59,
+      "nonblank_lines": 54,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/root.go",
+      "extension": ".go",
+      "lines": 57,
+      "nonblank_lines": 53,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/execution_persistence_degrade_test.go",
+      "extension": ".go",
+      "lines": 57,
+      "nonblank_lines": 51,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/spawn_owner.go",
+      "extension": ".go",
+      "lines": 56,
+      "nonblank_lines": 47,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/repository_identity.go",
+      "extension": ".go",
+      "lines": 56,
+      "nonblank_lines": 50,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/triage/triage_guards_test.go",
+      "extension": ".go",
+      "lines": 56,
+      "nonblank_lines": 50,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/CopyButton.tsx",
+      "extension": ".tsx",
+      "lines": 56,
+      "nonblank_lines": 52,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/agent_llm.go",
+      "extension": ".go",
+      "lines": 54,
+      "nonblank_lines": 49,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0013_active_queue_dedupe.sql",
+      "extension": ".sql",
+      "lines": 54,
+      "nonblank_lines": 52,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "scripts/refresh-gh-fixtures.sh",
+      "extension": ".sh",
+      "lines": 54,
+      "nonblank_lines": 49,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/mergewatch/mergewatch_test.go",
+      "extension": ".go",
+      "lines": 53,
+      "nonblank_lines": 50,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/cmd/fake-agent/main_test.go",
+      "extension": ".go",
+      "lines": 53,
+      "nonblank_lines": 48,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/policy_test.go",
+      "extension": ".go",
+      "lines": 53,
+      "nonblank_lines": 45,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/client/state.go",
+      "extension": ".go",
+      "lines": 53,
+      "nonblank_lines": 46,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "scripts/verify.sh",
+      "extension": ".sh",
+      "lines": 53,
+      "nonblank_lines": 46,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/logBuffer.ts",
+      "extension": ".ts",
+      "lines": 53,
+      "nonblank_lines": 45,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/loopernet/main.go",
+      "extension": ".go",
+      "lines": 52,
+      "nonblank_lines": 48,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/network_gateway.go",
+      "extension": ".go",
+      "lines": 52,
+      "nonblank_lines": 44,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/forgejo_mirror_inventory_test.go",
+      "extension": ".go",
+      "lines": 52,
+      "nonblank_lines": 45,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/hitl_feishu_poll_test.go",
+      "extension": ".go",
+      "lines": 52,
+      "nonblank_lines": 49,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/PullRequestLink.tsx",
+      "extension": ".tsx",
+      "lines": 52,
+      "nonblank_lines": 51,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/coordinator/triage/triage_decisions_test.go",
+      "extension": ".go",
+      "lines": 51,
+      "nonblank_lines": 44,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/failure_classification_test.go",
+      "extension": ".go",
+      "lines": 51,
+      "nonblank_lines": 44,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/automerge/automerge_test.go",
+      "extension": ".go",
+      "lines": 51,
+      "nonblank_lines": 45,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/webhook_forwarders_test.go",
+      "extension": ".go",
+      "lines": 51,
+      "nonblank_lines": 47,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/policy.go",
+      "extension": ".go",
+      "lines": 50,
+      "nonblank_lines": 42,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/requeue_guard_test.go",
+      "extension": ".go",
+      "lines": 50,
+      "nonblank_lines": 46,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/specpr/specpr_test.go",
+      "extension": ".go",
+      "lines": 49,
+      "nonblank_lines": 43,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/criteria/default_verifier_test.go",
+      "extension": ".go",
+      "lines": 48,
+      "nonblank_lines": 41,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/ConfirmDialog.test.ts",
+      "extension": ".ts",
+      "lines": 48,
+      "nonblank_lines": 45,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/layout/ThemeToggle.tsx",
+      "extension": ".tsx",
+      "lines": 48,
+      "nonblank_lines": 46,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/forgejocontract/mirror_inventory_test.go",
+      "extension": ".go",
+      "lines": 47,
+      "nonblank_lines": 39,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/network/cloud/config.go",
+      "extension": ".go",
+      "lines": 47,
+      "nonblank_lines": 43,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/networkpolicy/policy_test.go",
+      "extension": ".go",
+      "lines": 47,
+      "nonblank_lines": 40,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/forge_keys.go",
+      "extension": ".go",
+      "lines": 47,
+      "nonblank_lines": 43,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/projectFilter.ts",
+      "extension": ".ts",
+      "lines": 47,
+      "nonblank_lines": 43,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/sqlite_driver_test.go",
+      "extension": ".go",
+      "lines": 46,
+      "nonblank_lines": 38,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/logBuffer.test.ts",
+      "extension": ".ts",
+      "lines": 45,
+      "nonblank_lines": 39,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0003_scheduler_queue.sql",
+      "extension": ".sql",
+      "lines": 43,
+      "nonblank_lines": 42,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/deprecations.go",
+      "extension": ".go",
+      "lines": 42,
+      "nonblank_lines": 34,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/temp_home.go",
+      "extension": ".go",
+      "lines": 42,
+      "nonblank_lines": 38,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/git/remote_parse_test.go",
+      "extension": ".go",
+      "lines": 42,
+      "nonblank_lines": 37,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/artifacts.go",
+      "extension": ".go",
+      "lines": 41,
+      "nonblank_lines": 36,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/scheduler_trusted_review_proxy_test.go",
+      "extension": ".go",
+      "lines": 40,
+      "nonblank_lines": 36,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/PullRequestLink.test.tsx",
+      "extension": ".tsx",
+      "lines": 40,
+      "nonblank_lines": 35,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "deploy/onboarding/build-bundle.sh",
+      "extension": ".sh",
+      "lines": 39,
+      "nonblank_lines": 34,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/AttemptsCell.tsx",
+      "extension": ".tsx",
+      "lines": 39,
+      "nonblank_lines": 38,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/cliapp/semver_test.go",
+      "extension": ".go",
+      "lines": 38,
+      "nonblank_lines": 34,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0008_one_running_run_per_loop.sql",
+      "extension": ".sql",
+      "lines": 38,
+      "nonblank_lines": 36,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/ui/button.tsx",
+      "extension": ".tsx",
+      "lines": 36,
+      "nonblank_lines": 32,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/worktree.ts",
+      "extension": ".ts",
+      "lines": 36,
+      "nonblank_lines": 33,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/github_sandbox_config_test.go",
+      "extension": ".go",
+      "lines": 34,
+      "nonblank_lines": 31,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/config_test.go",
+      "extension": ".go",
+      "lines": 34,
+      "nonblank_lines": 31,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worker/failure_classification_test.go",
+      "extension": ".go",
+      "lines": 33,
+      "nonblank_lines": 28,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/inbox_test.go",
+      "extension": ".go",
+      "lines": 32,
+      "nonblank_lines": 30,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/loop_requeue_lock.go",
+      "extension": ".go",
+      "lines": 31,
+      "nonblank_lines": 26,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/index.html",
+      "extension": ".html",
+      "lines": 31,
+      "nonblank_lines": 31,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/milestone_test.go",
+      "extension": ".go",
+      "lines": 30,
+      "nonblank_lines": 28,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/ui/card.tsx",
+      "extension": ".tsx",
+      "lines": 30,
+      "nonblank_lines": 28,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/dashboard/fallback/index.html",
+      "extension": ".html",
+      "lines": 29,
+      "nonblank_lines": 29,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/takeover_test.go",
+      "extension": ".go",
+      "lines": 29,
+      "nonblank_lines": 27,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/grok_build_test.go",
+      "extension": ".go",
+      "lines": 27,
+      "nonblank_lines": 24,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/ports.go",
+      "extension": ".go",
+      "lines": 26,
+      "nonblank_lines": 22,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/planner/failure_classification_test.go",
+      "extension": ".go",
+      "lines": 24,
+      "nonblank_lines": 20,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/projectFilter.test.ts",
+      "extension": ".ts",
+      "lines": 24,
+      "nonblank_lines": 20,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/prompt_test.go",
+      "extension": ".go",
+      "lines": 23,
+      "nonblank_lines": 20,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/sqlite_errors.go",
+      "extension": ".go",
+      "lines": 22,
+      "nonblank_lines": 18,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/PanelError.tsx",
+      "extension": ".tsx",
+      "lines": 22,
+      "nonblank_lines": 21,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/lib/api.logsPath.test.ts",
+      "extension": ".ts",
+      "lines": 22,
+      "nonblank_lines": 19,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/doc.go",
+      "extension": ".go",
+      "lines": 21,
+      "nonblank_lines": 21,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/main.tsx",
+      "extension": ".tsx",
+      "lines": 20,
+      "nonblank_lines": 17,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "tools/print-version-json/main.go",
+      "extension": ".go",
+      "lines": 19,
+      "nonblank_lines": 15,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/prompt.go",
+      "extension": ".go",
+      "lines": 18,
+      "nonblank_lines": 15,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/temp_home_test.go",
+      "extension": ".go",
+      "lines": 18,
+      "nonblank_lines": 16,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/live_tracker.go",
+      "extension": ".go",
+      "lines": 18,
+      "nonblank_lines": 17,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/api_test.go",
+      "extension": ".go",
+      "lines": 15,
+      "nonblank_lines": 13,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "deploy/feishu-inbox-worker/schema.sql",
+      "extension": ".sql",
+      "lines": 13,
+      "nonblank_lines": 13,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/grok_build_test.go",
+      "extension": ".go",
+      "lines": 13,
+      "nonblank_lines": 10,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runtime/grok_build_test.go",
+      "extension": ".go",
+      "lines": 13,
+      "nonblank_lines": 10,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/components/StatusChip.tsx",
+      "extension": ".tsx",
+      "lines": 13,
+      "nonblank_lines": 12,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/main_test.go",
+      "extension": ".go",
+      "lines": 12,
+      "nonblank_lines": 9,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0014_webhook_forwarders.sql",
+      "extension": ".sql",
+      "lines": 12,
+      "nonblank_lines": 12,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0015_webhook_tunnel_hooks.sql",
+      "extension": ".sql",
+      "lines": 12,
+      "nonblank_lines": 12,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0018_feishu_threads.sql",
+      "extension": ".sql",
+      "lines": 12,
+      "nonblank_lines": 11,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "tools/go-build-flags/main.go",
+      "extension": ".go",
+      "lines": 12,
+      "nonblank_lines": 9,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/public/theme-init.js",
+      "extension": ".js",
+      "lines": 12,
+      "nonblank_lines": 12,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/cmd/fake-osascript/main.go",
+      "extension": ".go",
+      "lines": 11,
+      "nonblank_lines": 9,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/queue_priorities.go",
+      "extension": ".go",
+      "lines": 11,
+      "nonblank_lines": 9,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/main_test.go",
+      "extension": ".go",
+      "lines": 10,
+      "nonblank_lines": 8,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "cmd/loopernet/main_test.go",
+      "extension": ".go",
+      "lines": 9,
+      "nonblank_lines": 7,
+      "is_test": true,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/processcontainment/group_live_other.go",
+      "extension": ".go",
+      "lines": 9,
+      "nonblank_lines": 7,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0010_agent_native_resume.sql",
+      "extension": ".sql",
+      "lines": 7,
+      "nonblank_lines": 6,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/doc.go",
+      "extension": ".go",
+      "lines": 6,
+      "nonblank_lines": 6,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0017_remove_sweeper_storage.sql",
+      "extension": ".sql",
+      "lines": 5,
+      "nonblank_lines": 4,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/sqlite_driver.go",
+      "extension": ".go",
+      "lines": 5,
+      "nonblank_lines": 3,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0009_runs_latest_created_at_index.sql",
+      "extension": ".sql",
+      "lines": 4,
+      "nonblank_lines": 3,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/agent/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/api/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/app/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/bootstrap/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/config/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/domain/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/eventlog/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/fixer/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/git/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/github/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/infra/worktree/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/loops/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/planner/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/projects/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/reviewer/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/runs/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/scheduler/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0007_agent_execution_run_index.sql",
+      "extension": ".sql",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0012_sweeper_proposal_raw_result.sql",
+      "extension": ".sql",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/version/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/worktreecleanup/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "pkg/api/doc.go",
+      "extension": ".go",
+      "lines": 2,
+      "nonblank_lines": 2,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/doc.go",
+      "extension": ".go",
+      "lines": 1,
+      "nonblank_lines": 1,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/forgejocontract/doc.go",
+      "extension": ".go",
+      "lines": 1,
+      "nonblank_lines": 1,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/githubcontract/doc.go",
+      "extension": ".go",
+      "lines": 1,
+      "nonblank_lines": 1,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/e2e/harness/doc.go",
+      "extension": ".go",
+      "lines": 1,
+      "nonblank_lines": 1,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "internal/storage/migrations/0019_run_agent_snapshot.sql",
+      "extension": ".sql",
+      "lines": 1,
+      "nonblank_lines": 1,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    },
+    {
+      "path": "web/dashboard/src/vite-env.d.ts",
+      "extension": ".ts",
+      "lines": 1,
+      "nonblank_lines": 1,
+      "is_test": false,
+      "is_generated_or_vendor": false
+    }
+  ],
+  "notes": [
+    "Counts are physical lines, not logical statements.",
+    "Generated/vendor detection is heuristic and must be reviewed before conclusions.",
+    "File size is an investigation signal, not a quality score."
+  ]
+}

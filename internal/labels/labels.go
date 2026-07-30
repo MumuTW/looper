@@ -70,9 +70,19 @@ const (
 // AwaitingHuman marks work parked for human input. Looper-owned.
 const AwaitingHuman = "looper:awaiting-human"
 
-// Holds. A hold is a human veto: HoldGlobal stops every Role on the item, and
-// the per-role holds stop exactly one. Looper applies none of these itself —
-// they are read-only authority as far as Looper is concerned.
+// Dispatch authority.
+//
+// Dispatch labels signal Coordinator intent and are applied to issues that pass
+// admission. The bare "dispatch/" form is recognized on read for backward
+// compatibility but is never written — new writes use the "looper:dispatch:*"
+// namespaced form.
+const (
+	DispatchPlan      = "looper:dispatch:plan"
+	DispatchImplement = "looper:dispatch:implement"
+)
+
+// LegacyDispatchPrefix is the deprecated prefix still recognized on read.
+const LegacyDispatchPrefix = "dispatch/"
 const (
 	HoldGlobal   = "looper:hold"
 	HoldWorker   = "looper:hold:worker"

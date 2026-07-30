@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 const jsISOStringLayout = "2006-01-02T15:04:05.000Z"
@@ -230,7 +232,7 @@ func AllowedComplexities() []string {
 }
 
 func AllowedDispatches() []string {
-	return []string{"dispatch/plan", "dispatch/implement"}
+	return []string{labels.DispatchPlan, labels.DispatchImplement, "dispatch/plan", "dispatch/implement"}
 }
 
 func parseDecision(raw string, cfg Config) (Decision, error) {
@@ -242,7 +244,7 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 	if comment == "" {
 		return Decision{}, fmt.Errorf("comment is required")
 	}
-	clear := []string{"kind/*", "area/*", "complexity/*", "dispatch/*", cfg.OutOfScopeLabel, cfg.UnclearLabel}
+	clear := []string{"kind/*", "area/*", "complexity/*", "dispatch/*", labels.DispatchPlan, labels.DispatchImplement, cfg.OutOfScopeLabel, cfg.UnclearLabel}
 	switch Disposition(strings.TrimSpace(output.Disposition)) {
 	case DispositionValid:
 		kind, err := requireExactlyOne(output.Labels.Kind, AllowedKinds())

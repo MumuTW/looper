@@ -188,6 +188,13 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if !isValidNetworkMode(project.Network.Mode) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: fmt.Sprintf("must be one of: %s, %s", NetworkModeOff, NetworkModeRouted)})
 		}
+		if project.LabelPrefix != nil {
+			if labelPrefix := strings.TrimSpace(*project.LabelPrefix); labelPrefix == "" {
+				issues = append(issues, ValidationIssue{Path: prefix + ".labelPrefix", Message: "must be a non-empty string when configured"})
+			} else if !strings.HasSuffix(labelPrefix, ":") {
+				issues = append(issues, ValidationIssue{Path: prefix + ".labelPrefix", Message: "must end with ':' (e.g. 'looper:')"})
+			}
+		}
 		if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, &project) {
 			validateWebhookTunnelConfig(config.Webhook, "webhook", &issues)
 		}

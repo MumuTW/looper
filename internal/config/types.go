@@ -634,6 +634,7 @@ type ProjectRefConfig struct {
 	Repo         string               `json:"repo,omitempty"`
 	RepoPath     string               `json:"repoPath"`
 	Path         string               `json:"path,omitempty"`
+	LabelPrefix  *string              `json:"labelPrefix,omitempty"`
 	BaseBranch   *string              `json:"baseBranch,omitempty"`
 	WorktreeRoot *string              `json:"worktreeRoot,omitempty"`
 	Network      ProjectNetworkConfig `json:"network,omitempty"`
@@ -652,6 +653,7 @@ type PartialProjectRefConfig struct {
 	Repo         *string                      `json:"repo,omitempty"`
 	RepoPath     string                       `json:"repoPath"`
 	Path         string                       `json:"path,omitempty"`
+	LabelPrefix  *string                      `json:"labelPrefix,omitempty"`
 	BaseBranch   *string                      `json:"baseBranch,omitempty"`
 	WorktreeRoot *string                      `json:"worktreeRoot,omitempty"`
 	Network      *PartialProjectNetworkConfig `json:"network,omitempty"`

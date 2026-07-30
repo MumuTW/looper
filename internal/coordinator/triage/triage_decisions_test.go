@@ -12,11 +12,11 @@ func (f fixtureLLM) Complete(context.Context, Request) (string, error) { return 
 
 func TestDecideValidDisposition(t *testing.T) {
 	t.Parallel()
-	decision := Decide(context.Background(), fixtureLLM{raw: `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["dispatch/plan"]}}`}, Input{Issue: Issue{Title: "Coordinator bug", CreatedAt: time.Now().UTC().Format(time.RFC3339)}, Config: testConfig(), Now: time.Now().UTC()})
+	decision := Decide(context.Background(), fixtureLLM{raw: `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["looper:dispatch:plan"]}}`}, Input{Issue: Issue{Title: "Coordinator bug", CreatedAt: time.Now().UTC().Format(time.RFC3339)}, Config: testConfig(), Now: time.Now().UTC()})
 	if decision.NoOp {
 		t.Fatal("Decide() returned no-op for valid output")
 	}
-	if got, want := decision.ApplyLabels, []string{"kind/bug", "area/coordinator", "complexity/m", "dispatch/plan", "triaged"}; len(got) != len(want) {
+	if got, want := decision.ApplyLabels, []string{"kind/bug", "area/coordinator", "complexity/m", "looper:dispatch:plan", "triaged"}; len(got) != len(want) {
 		t.Fatalf("ApplyLabels len = %d, want %d", len(got), len(want))
 	}
 	if !decision.MarkTriaged {

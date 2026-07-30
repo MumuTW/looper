@@ -8,12 +8,12 @@ import (
 
 func TestDecideFailsClosedOnMalformedOutput(t *testing.T) {
 	t.Parallel()
-	decision := Decide(context.Background(), fixtureLLM{raw: `{"disposition":"valid","comment":"bad","labels":{"dispatch":["dispatch/plan","dispatch/implement"]}}`}, Input{Issue: Issue{Title: "Bad", CreatedAt: time.Now().UTC().Format(time.RFC3339)}, Config: testConfig(), Now: time.Now().UTC()})
+	decision := Decide(context.Background(), fixtureLLM{raw: `{"disposition":"valid","comment":"bad","labels":{"dispatch":["looper:dispatch:plan","looper:dispatch:implement"]}}`}, Input{Issue: Issue{Title: "Bad", CreatedAt: time.Now().UTC().Format(time.RFC3339)}, Config: testConfig(), Now: time.Now().UTC()})
 	if !decision.NoOp {
 		t.Fatalf("Decide() = %#v, want no-op on strict parse failure", decision)
 	}
 
-	decision = Decide(context.Background(), fixtureLLM{raw: `{"disposition":"valid","comment":"bad","labels":{"kind":["kind/unknown"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["dispatch/plan"]}}`}, Input{Issue: Issue{Title: "Bad", CreatedAt: time.Now().UTC().Format(time.RFC3339)}, Config: testConfig(), Now: time.Now().UTC()})
+	decision = Decide(context.Background(), fixtureLLM{raw: `{"disposition":"valid","comment":"bad","labels":{"kind":["kind/unknown"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["looper:dispatch:plan"]}}`}, Input{Issue: Issue{Title: "Bad", CreatedAt: time.Now().UTC().Format(time.RFC3339)}, Config: testConfig(), Now: time.Now().UTC()})
 	if !decision.NoOp {
 		t.Fatal("Decide() should fail closed on unknown label kind")
 	}

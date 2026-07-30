@@ -13,8 +13,10 @@ const (
 	ModeHumanGated = "human-gated"
 	ModeAutonomous = "autonomous"
 
-	DispatchPlan      = "dispatch/plan"
-	DispatchImplement = "dispatch/implement"
+	DispatchPlan      = "looper:dispatch:plan"
+	DispatchImplement = "looper:dispatch:implement"
+
+	LegacyDispatchPrefix = "dispatch/"
 
 	ReactionSuccess = "+1"
 	ReactionFailure = "confused"
@@ -77,7 +79,7 @@ func humanNeedsDependencyGate(issue Issue, cfg Config) bool {
 		return false
 	}
 	dispatchLabel, ok := singleDispatchLabel(issue.Labels)
-	if !ok || dispatchLabel != commandDispatchLabel(command) {
+	if !ok || normalizeDispatchLabel(dispatchLabel) != commandDispatchLabel(command) {
 		return false
 	}
 	triggerLabels := triggerLabelsForDispatch(dispatchLabel, cfg)
@@ -120,7 +122,8 @@ func decideHumanGated(issue Issue, cfg Config, graph *depgraph.DependencyGraph) 
 	if !ok {
 		return fail(action, "Coordinator can't dispatch because triage did not set a dispatch label.")
 	}
-	if dispatchLabel != commandDispatchLabel(command) {
+	// Normalize legacy "dispatch/*" to namespaced form for comparison.
+	if normalizeDispatchLabel(dispatchLabel) != commandDispatchLabel(command) {
 		return fail(action, "Coordinator can't dispatch because the slash command does not match triage.")
 	}
 
@@ -246,7 +249,8 @@ func isAllowedUser(comment Comment, allowedUsers []string) bool {
 func singleDispatchLabel(labels []string) (string, bool) {
 	match := ""
 	for _, label := range labels {
-		if !strings.HasPrefix(label, "dispatch/") {
+		// Recognize both new "looper:dispatch:*" and legacy "dispatch/*" labels.
+		if !strings.HasPrefix(label, "dispatch/") && !strings.HasPrefix(label, "looper:dispatch:") {
 			continue
 		}
 		if match != "" {
@@ -258,10 +262,11 @@ func singleDispatchLabel(labels []string) (string, bool) {
 }
 
 func triggerLabelsForDispatch(dispatchLabel string, cfg Config) []string {
+	// Normalize legacy "dispatch/*" forms so both old and new labels resolve.
 	switch dispatchLabel {
-	case DispatchPlan:
+	case DispatchPlan, "dispatch/plan":
 		return compactLabels(cfg.PlannerTriggerLabels)
-	case DispatchImplement:
+	case DispatchImplement, "dispatch/implement":
 		return compactLabels(cfg.WorkerTriggerLabels)
 	default:
 		return nil
@@ -297,6 +302,19 @@ func commandDispatchLabel(command string) string {
 		return DispatchImplement
 	default:
 		return ""
+	}
+}
+
+// normalizeDispatchLabel converts legacy "dispatch/*" labels to the namespaced
+// form. Used by callers that compare dispatch labels across the codebase.
+func normalizeDispatchLabel(label string) string {
+	switch label {
+	case "dispatch/plan":
+		return DispatchPlan
+	case "dispatch/implement":
+		return DispatchImplement
+	default:
+		return label
 	}
 }
 
