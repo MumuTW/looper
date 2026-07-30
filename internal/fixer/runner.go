@@ -1111,6 +1111,37 @@ func (checkpoint *fixerCheckpoint) refreshOutcomeProgress() {
 	checkpoint.Outcome.PartialSuccess = checkpoint.Outcome.PrimaryFailure != nil && (progress.CommitProduced || progress.Pushed || progress.RepliesSent > 0 || progress.ThreadsResolved > 0)
 }
 
+// mergeProgressFrom preserves durable effects that executeStep produced but
+// persistStepCompleted failed to durably store. The deferred failure path
+// reloads the last successfully persisted checkpoint (the pre-step state) via
+// getLatestCheckpoint, which predates those effects; without this merge a run
+// whose resolve-comments sent a reply or resolved a thread but then failed its
+// completion write would report zero progress and no partial success even
+// though the remote mutation occurred. Only progress-bearing fields are
+// overlaid, and only when the in-memory version is at least as recent as the
+// reloaded one, so concurrent persisted state is not regressed.
+func (checkpoint *fixerCheckpoint) mergeProgressFrom(inMemory fixerCheckpoint) {
+	if inMemory.ReconcileCommits != nil && (checkpoint.ReconcileCommits == nil || inMemory.ReconcileCommits.CompletedAt >= checkpoint.ReconcileCommits.CompletedAt) {
+		checkpoint.ReconcileCommits = inMemory.ReconcileCommits
+	}
+	if inMemory.Push != nil && (checkpoint.Push == nil || inMemory.Push.PushedAt >= checkpoint.Push.PushedAt) {
+		checkpoint.Push = inMemory.Push
+	}
+	if inMemory.ResolvedComments != nil && (checkpoint.ResolvedComments == nil || latestResolvedCommentUpdatedAt(inMemory.ResolvedComments.Items) >= latestResolvedCommentUpdatedAt(checkpoint.ResolvedComments.Items)) {
+		checkpoint.ResolvedComments = inMemory.ResolvedComments
+	}
+}
+
+func latestResolvedCommentUpdatedAt(items []checkpointResolvedComment) string {
+	latest := ""
+	for _, item := range items {
+		if strings.TrimSpace(item.UpdatedAt) > latest {
+			latest = strings.TrimSpace(item.UpdatedAt)
+		}
+	}
+	return latest
+}
+
 func (checkpoint fixerCheckpoint) outcomeEvidenceInCurrentRun(observedAt string) bool {
 	baseline := firstNonEmpty(checkpoint.RunStartedAt, checkpoint.RunPreStartAt)
 	if baseline == "" {
@@ -2362,6 +2393,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		failure := r.classifyFailure(retErr)
 		latest := r.getLatestCheckpoint(context.Background(), run, checkpoint)
+		// executeStep may have produced durable effects (e.g. resolve-comments
+		// sent a reply) that persistStepCompleted then failed to store.
+		// getLatestCheckpoint reloads the last persisted (pre-step) checkpoint,
+		// so merge the in-memory progress before recording the failure, or the
+		// completed run would report zero progress for effects that occurred.
+		latest.mergeProgressFrom(checkpoint)
 		failedStep := asFixerStep(derefString(persisted.CurrentStep))
 		if failedStep == "" {
 			failedStep = resumedRun.StartStep

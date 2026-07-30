@@ -153,3 +153,57 @@ func TestRecordTerminalCleanupPreservesConcurrentResumePolicy(t *testing.T) {
 		t.Fatalf("durable Outcome = %#v, want merged cleanup secondary alongside primary", durable.Outcome)
 	}
 }
+
+func TestMergeProgressFromPreservesInMemoryEffectsAfterCompletionWriteFailure(t *testing.T) {
+	t.Parallel()
+
+	// The deferred failure path reloads the last persisted (pre-step) checkpoint
+	// via getLatestCheckpoint. executeStep already produced durable effects
+	// (resolve-comments sent a reply and resolved a thread, a commit was
+	// reconciled) that persistStepCompleted then failed to store. Without
+	// mergeProgressFrom the reloaded checkpoint would report zero progress.
+	runStartedAt := "2026-07-30T12:00:00.000Z"
+	inMemory := fixerCheckpoint{
+		RunStartedAt: runStartedAt,
+		ReconcileCommits: &checkpointReconcileCommits{
+			NewCommitSHAs: []string{"commit-1"},
+			CompletedAt:   "2026-07-30T12:00:05.000Z",
+		},
+		Push: &checkpointPush{Pushed: true, PushedAt: "2026-07-30T12:00:06.000Z"},
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{
+			{FixItemID: "c1", ThreadID: "t1", Status: "resolved", ReplyState: "sent", UpdatedAt: "2026-07-30T12:00:07.000Z"},
+		}},
+	}
+	// Reloaded checkpoint predates the step (no progress fields yet).
+	reloaded := fixerCheckpoint{RunStartedAt: runStartedAt}
+	reloaded.mergeProgressFrom(inMemory)
+	reloaded.recordFailure(stepResolveComments, &loopError{message: "persist completion failed", kind: FailureRetryableTransient})
+	reloaded.refreshOutcomeProgress()
+
+	if reloaded.Outcome == nil || reloaded.Outcome.PrimaryFailure == nil {
+		t.Fatalf("Outcome = %#v, want primary failure recorded", reloaded.Outcome)
+	}
+	if !reloaded.Outcome.PartialSuccess {
+		t.Fatalf("Outcome = %#v, want partial success for effects that occurred", reloaded.Outcome)
+	}
+	if !reloaded.Outcome.Progress.CommitProduced || !reloaded.Outcome.Progress.Pushed || reloaded.Outcome.Progress.RepliesSent != 1 || reloaded.Outcome.Progress.ThreadsResolved != 1 {
+		t.Fatalf("Outcome.Progress = %#v, want merged in-memory durable progress", reloaded.Outcome.Progress)
+	}
+}
+
+func TestMergeProgressFromDoesNotRegressConcurrentPersistedProgress(t *testing.T) {
+	t.Parallel()
+
+	// A concurrent persisted checkpoint with more recent progress must not be
+	// regressed by an older in-memory checkpoint.
+	reloaded := fixerCheckpoint{
+		ReconcileCommits: &checkpointReconcileCommits{NewCommitSHAs: []string{"newer"}, CompletedAt: "2026-07-30T12:00:10.000Z"},
+	}
+	older := fixerCheckpoint{
+		ReconcileCommits: &checkpointReconcileCommits{NewCommitSHAs: []string{"older"}, CompletedAt: "2026-07-30T12:00:05.000Z"},
+	}
+	reloaded.mergeProgressFrom(older)
+	if reloaded.ReconcileCommits.CompletedAt != "2026-07-30T12:00:10.000Z" {
+		t.Fatalf("ReconcileCommits = %#v, want concurrent newer progress preserved", reloaded.ReconcileCommits)
+	}
+}
