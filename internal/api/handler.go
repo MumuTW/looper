@@ -4439,6 +4439,22 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		requestedIssueTarget = &domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
 	}
 
+	// Issue 319: refuse dispatch when a fixer/reviewer loop already holds
+	// the issue. Must run BEFORE requirePullRequestTarget so 409 wins over
+	// the gh-dependent "refresh target" 400.
+	if requestedIssueTarget != nil && !derefBool(body.Force) {
+		if collision, checkErr := h.findIssueCollisionLoop(r.Context(), services.Repositories, projectID, *requestedIssueTarget); checkErr != nil {
+			return workerCreateResponse{}, checkErr
+		} else if collision != nil {
+			return workerCreateResponse{}, apiError{
+				code:    pkgapi.ErrorCodeProjectAmbiguous,
+				status:  http.StatusConflict,
+				message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", *issueNumber, collision.Type, collision.ID),
+				details: map[string]any{"occupiedBy": map[string]any{"loopId": collision.ID, "loopType": collision.Type}},
+			}
+		}
+	}
+
 	effectivePRNumber := (*int64)(nil)
 	if prNumber != nil {
 		resolved, resolveErr := h.requirePullRequestTarget(r.Context(), requirePullRequestTargetInput{ProjectID: projectID, Repo: *repo, PRNumber: *prNumber})
