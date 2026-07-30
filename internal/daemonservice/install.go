@@ -66,6 +66,7 @@ func Install(ctx context.Context, plan Plan, fs FS, run Runner) (Result, error) 
 	}
 
 	result := Result{UnitPath: plan.UnitPath, Manager: plan.Manager}
+	activationStarted := false
 	for _, command := range plan.Activate {
 		if len(command) == 0 {
 			continue
@@ -73,14 +74,37 @@ func Install(ctx context.Context, plan Plan, fs FS, run Runner) (Result, error) 
 		_, err := run(ctx, command[0], command[1:]...)
 		result.Commands = append(result.Commands, strings.Join(command, " "))
 		if err == nil {
+			activationStarted = true
 			continue
 		}
+		rollbackErr := rollbackActivation(ctx, plan, run, activationStarted)
 		if removeErr := fs.Remove(plan.UnitPath); removeErr != nil && !os.IsNotExist(removeErr) {
-			return result, fmt.Errorf("%s: %w (remove failed service unit: %v)", strings.Join(command, " "), err, removeErr)
+			return result, fmt.Errorf("%s: %w (rollback: %v; remove failed service unit: %v)", strings.Join(command, " "), err, rollbackErr, removeErr)
+		}
+		if rollbackErr != nil {
+			return result, fmt.Errorf("%s: %w (rollback: %v; removed newly written service unit)", strings.Join(command, " "), err, rollbackErr)
 		}
 		return result, fmt.Errorf("%s: %w (removed newly written service unit)", strings.Join(command, " "), err)
 	}
 	return result, nil
+}
+
+// rollbackActivation compensates a partially successful install before its unit
+// is removed. Without this, launchctl bootstrap can succeed and kickstart can
+// fail, leaving a live daemon whose unit file has just been deleted.
+func rollbackActivation(ctx context.Context, plan Plan, run Runner, activationStarted bool) error {
+	if !activationStarted {
+		return nil
+	}
+	for _, command := range plan.Deactivate {
+		if len(command) == 0 {
+			continue
+		}
+		if _, err := run(ctx, command[0], command[1:]...); err != nil {
+			return fmt.Errorf("%s: %w", strings.Join(command, " "), err)
+		}
+	}
+	return nil
 }
 
 // Uninstall unloads the service and then removes its unit. A missing unit is

@@ -165,6 +165,23 @@ func TestInstallFailsWhenActivationFails(t *testing.T) {
 	}
 }
 
+func TestInstallRollsBackPartiallyActivatedService(t *testing.T) {
+	t.Parallel()
+	plan := launchdPlan(t)
+	fs := newFakeFS()
+	runner := &recordingRunner{failOn: map[string]error{"launchctl kickstart": errors.New("kickstart failed")}}
+
+	if _, err := Install(context.Background(), plan, fs, runner.run); err == nil {
+		t.Fatal("Install() reported success after kickstart failed")
+	}
+	if _, exists := fs.files[plan.UnitPath]; exists {
+		t.Fatal("Install() left the unit after a partially activated failure")
+	}
+	if !containsCommand(runner.commands, "launchctl bootout") {
+		t.Fatalf("Install() did not unload its partially activated service: %v", runner.commands)
+	}
+}
+
 func TestInstallRefusesToOverwriteExistingUnit(t *testing.T) {
 	t.Parallel()
 	plan := launchdPlan(t)
@@ -238,4 +255,13 @@ func TestInstalledReportsUnitPresence(t *testing.T) {
 	if !Installed(plan, fs) {
 		t.Fatal("Installed() = false after install")
 	}
+}
+
+func containsCommand(commands []string, prefix string) bool {
+	for _, command := range commands {
+		if strings.HasPrefix(command, prefix) {
+			return true
+		}
+	}
+	return false
 }
