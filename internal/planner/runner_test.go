@@ -1819,6 +1819,8 @@ type fakeGitGateway struct {
 	commitResult  CommitResult
 	createCalls   []CreateWorktreeInput
 	inspectCalls  []InspectHeadInput
+	refreshResult RefreshWorktreeResult
+	refreshCalls  []RefreshWorktreeInput
 	commitCalls   []CommitInput
 	pushCalls     []PushInput
 }
@@ -1855,6 +1857,11 @@ func (f *fakeGitGateway) InspectHead(_ context.Context, input InspectHeadInput) 
 	}
 	f.inspectIndex++
 	return f.inspectResult, nil
+}
+
+func (f *fakeGitGateway) RefreshWorktree(_ context.Context, input RefreshWorktreeInput) (RefreshWorktreeResult, error) {
+	f.refreshCalls = append(f.refreshCalls, input)
+	return f.refreshResult, nil
 }
 
 func (f *fakeGitGateway) Commit(_ context.Context, input CommitInput) (CommitResult, error) {

@@ -891,6 +891,20 @@ func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.Inspec
 	return planner.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
 }
 
+func (a plannerGitAdapter) RefreshWorktree(ctx context.Context, input planner.RefreshWorktreeInput) (planner.RefreshWorktreeResult, error) {
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{
+		RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath,
+		Branch: input.BaseBranch, Remote: "origin",
+	})
+	if err != nil {
+		return planner.RefreshWorktreeResult{}, err
+	}
+	if !result.Clean {
+		return planner.RefreshWorktreeResult{}, fmt.Errorf("planner worktree is not clean before refresh")
+	}
+	return planner.RefreshWorktreeResult{HeadSHA: result.HeadSHA}, nil
+}
+
 func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
 	message := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).CommitMessage(input.Message, "planner")
 	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})

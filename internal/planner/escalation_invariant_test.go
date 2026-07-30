@@ -250,6 +250,33 @@ func TestPlannerReassessesWhenIssueChangedWhileAwaitingHuman(t *testing.T) {
 	}
 }
 
+// TestPlannerReassessesWhenBaseChangesWhileAwaitingHuman ensures the human is
+// never asked to authorize an assessment made against an older repository.
+func TestPlannerReassessesWhenBaseChangesWhileAwaitingHuman(t *testing.T) {
+	t.Parallel()
+	harness := newEscalationHarness(t, true,
+		AgentResult{Status: "completed", Stdout: escalatingAssessmentJSON},
+		AgentResult{Status: "completed", Stdout: benignAssessmentJSON},
+		AgentResult{Status: "completed", Summary: "wrote spec"},
+	)
+	harness.git.inspectResult.HeadSHA = "base-before"
+	if processed := harness.process(t); processed.Status != "awaiting_human" {
+		t.Fatalf("first process = %#v", processed)
+	}
+	harness.answerEscalation(t, "proceed")
+	harness.git.refreshResult.HeadSHA = "base-after"
+
+	if processed := harness.process(t); processed.Status != "success" {
+		t.Fatalf("resumed process = %#v", processed)
+	}
+	if len(harness.executor.starts) != 3 {
+		t.Fatalf("agent turns = %d, want reassessment then spec after base drift", len(harness.executor.starts))
+	}
+	if len(harness.git.refreshCalls) != 1 {
+		t.Fatalf("worktree refreshes = %d, want one before applying the authorization", len(harness.git.refreshCalls))
+	}
+}
+
 func supersededResolutionRecorded(t *testing.T, harness *escalationHarness) bool {
 	t.Helper()
 	events, err := harness.fixture.repos.Events.ListByEntity(context.Background(), "loop", harness.loopID)

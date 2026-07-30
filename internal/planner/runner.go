@@ -222,6 +222,15 @@ type InspectHeadResult struct {
 	ChangedFiles          []string
 }
 
+type RefreshWorktreeInput struct {
+	RepoPath     string
+	WorktreeRoot string
+	WorktreePath string
+	BaseBranch   string
+}
+
+type RefreshWorktreeResult struct{ HeadSHA string }
+
 type CommitInput struct {
 	RepoPath        string
 	WorktreeRoot    string
@@ -236,6 +245,7 @@ type CommitResult struct{ CommitSHA string }
 type GitGateway interface {
 	CreateWorktree(context.Context, CreateWorktreeInput) (CreateWorktreeResult, error)
 	InspectHead(context.Context, InspectHeadInput) (InspectHeadResult, error)
+	RefreshWorktree(context.Context, RefreshWorktreeInput) (RefreshWorktreeResult, error)
 	Commit(context.Context, CommitInput) (CommitResult, error)
 	Push(context.Context, PushInput) error
 }
@@ -411,11 +421,12 @@ type checkpointIssue struct {
 }
 
 type checkpointWorktree struct {
-	ID         string `json:"id,omitempty"`
-	Path       string `json:"path,omitempty"`
-	Branch     string `json:"branch,omitempty"`
-	BaseBranch string `json:"baseBranch,omitempty"`
-	SpecPath   string `json:"specPath,omitempty"`
+	ID          string `json:"id,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Branch      string `json:"branch,omitempty"`
+	BaseBranch  string `json:"baseBranch,omitempty"`
+	BaseHeadSHA string `json:"baseHeadSHA,omitempty"`
+	SpecPath    string `json:"specPath,omitempty"`
 }
 
 // checkpointScope carries the pre-spec scope assessment and, once a human has
@@ -1132,9 +1143,11 @@ func (r *Runner) runAssessScopeStep(ctx context.Context, input stepInput) (plann
 	if err != nil {
 		return checkpoint, err
 	}
-	if err := r.verifyAssessmentLeftWorktreeClean(ctx, input, worktree); err != nil {
+	baseHeadSHA, err := r.verifyAssessmentLeftWorktreeClean(ctx, input, worktree)
+	if err != nil {
 		return checkpoint, err
 	}
+	worktree.BaseHeadSHA = baseHeadSHA
 	criteria := evaluateEscalationPolicy(policy, assessment)
 	checkpoint.Scope = &checkpointScope{Assessed: true, Assessment: &assessment, Criteria: criteria, Escalated: len(criteria) > 0}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -1193,22 +1206,22 @@ func (r *Runner) escalationErrorFromCheckpoint(input stepInput, policy Escalatio
 // on proves both the working tree and the branch head are untouched — the exact
 // two inputs that step consumes — and a mismatch fails loudly with its own
 // reason instead of being silently adopted.
-func (r *Runner) verifyAssessmentLeftWorktreeClean(ctx context.Context, input stepInput, worktree *checkpointWorktree) error {
+func (r *Runner) verifyAssessmentLeftWorktreeClean(ctx context.Context, input stepInput, worktree *checkpointWorktree) (string, error) {
 	if r.git == nil {
-		return nil
+		return "", nil
 	}
 	worktreeRoot, err := plannerWorktreeRoot(input.Project)
 	if err != nil {
-		return err
+		return "", err
 	}
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: worktree.BaseBranch})
 	if err != nil {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return "", &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if !inspect.HasUncommittedChanges && len(inspect.NewCommitSHAs) == 0 {
-		return nil
+		return inspect.HeadSHA, nil
 	}
-	return &loopError{
+	return "", &loopError{
 		message: fmt.Sprintf("Planner scope assessment modified its worktree (uncommittedChanges=%t, newCommits=%d, changedFiles=%s); refusing to carry those changes into the spec PR", inspect.HasUncommittedChanges, len(inspect.NewCommitSHAs), strings.Join(inspect.ChangedFiles, ", ")),
 		kind:    FailureManualIntervention,
 	}
@@ -1230,6 +1243,25 @@ func (r *Runner) applyEscalationAnswer(ctx context.Context, input stepInput, che
 		return checkpoint, false, err
 	}
 	checkpoint = refreshed
+	if worktree := checkpoint.Worktree; r.git != nil && worktree != nil && worktree.BaseHeadSHA != "" {
+		worktreeRoot, err := plannerWorktreeRoot(input.Project)
+		if err != nil {
+			return checkpoint, false, err
+		}
+		refreshedWorktree, err := r.git.RefreshWorktree(ctx, RefreshWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseBranch: worktree.BaseBranch})
+		if err != nil {
+			return checkpoint, false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if refreshedWorktree.HeadSHA != "" && refreshedWorktree.HeadSHA != worktree.BaseHeadSHA {
+			worktree.BaseHeadSHA = refreshedWorktree.HeadSHA
+			checkpoint.Scope = &checkpointScope{Resolution: &checkpointEscalationResolution{Answer: strings.TrimSpace(ask.Answer), AnsweredAt: ask.AnsweredAt, Superseded: true, Reason: "repository base branch changed while awaiting the human decision"}}
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepAssessScope, checkpoint); err != nil {
+				return checkpoint, false, wrapRetryableAfterResume(err)
+			}
+			updated, err := r.flushEscalationResolution(ctx, input, checkpoint)
+			return updated, false, err
+		}
+	}
 	// An automatic discovery authorization is conditional on the current Issue
 	// still matching the discovery policy. A human answer cannot revive an
 	// Issue whose routing label or assignment was removed while it waited.

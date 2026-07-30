@@ -100,6 +100,10 @@ func (*contractPlannerGit) InspectHead(context.Context, planner.InspectHeadInput
 	return planner.InspectHeadResult{HeadSHA: "abc123", NewCommitSHAs: []string{"abc123"}}, nil
 }
 
+func (*contractPlannerGit) RefreshWorktree(context.Context, planner.RefreshWorktreeInput) (planner.RefreshWorktreeResult, error) {
+	return planner.RefreshWorktreeResult{HeadSHA: "abc123"}, nil
+}
+
 func (*contractPlannerGit) Commit(context.Context, planner.CommitInput) (planner.CommitResult, error) {
 	return planner.CommitResult{CommitSHA: "abc123"}, nil
 }
