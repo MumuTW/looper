@@ -129,7 +129,18 @@ func TestNonMutatingCoverageDegradedPausesClaimPump(t *testing.T) {
 	backupDir := filepath.Join(workingDir, "backups")
 	cfg.Storage.BackupDir = &backupDir
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, DeferRecovery: true})
+	var armed atomic.Bool
+	var claimCalls atomic.Int64
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, DeferRecovery: true,
+		// The pump also drives this claim on its initial and ticker passes;
+		// counting starts only once the test arms it after stopping the loop,
+		// keeping the exact-count assertions deterministic under -race.
+		RunSchedulerClaim: func(context.Context, Services) error {
+			if armed.Load() {
+				claimCalls.Add(1)
+			}
+			return nil
+		}})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -142,14 +153,7 @@ func TestNonMutatingCoverageDegradedPausesClaimPump(t *testing.T) {
 	// stub so this test deterministically exercises the exact pass used by the
 	// pump instead of racing an unrelated initial/ticker invocation under -race.
 	rt.stopSchedulerLoop()
-
-	var claimCalls atomic.Int64
-	rt.mu.Lock()
-	rt.defaultSchedulerClaim = func(context.Context, Services) error {
-		claimCalls.Add(1)
-		return nil
-	}
-	rt.mu.Unlock()
+	armed.Store(true)
 
 	rt.executeSchedulerClaimPass(context.Background())
 	if claimCalls.Load() != 1 {

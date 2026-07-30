@@ -123,11 +123,21 @@ type Options struct {
 	OpenSQLiteCoordinator       OpenSQLiteCoordinatorFunc
 	SyncConfiguredProjects      SyncConfiguredProjectsFunc
 	RunSchedulerTick            RunSchedulerTickFunc
-	ReadProcessCommand          ReadProcessCommandFunc
-	ReadProcessStart            ReadProcessStartFunc
-	ReadProcessBootID           ReadProcessBootIDFunc
-	SignalProcess               SignalProcessFunc
-	DeferRecovery               bool
+	// RunSchedulerClaim overrides the claim pass the scheduler pump drives,
+	// independently of RunSchedulerTick in both directions: either can be
+	// injected while the other keeps its default catalog implementation.
+	//
+	// Blind spots, stated for reviewers of tests built on this seam: an
+	// injected claim observes that the pump invoked a pass, not when the
+	// pump chose to fire (ticker/trigger cadence regressions pass through),
+	// and it bypasses the default claim's own internal admission gating,
+	// which only the default implementation exercises.
+	RunSchedulerClaim  RunSchedulerTickFunc
+	ReadProcessCommand ReadProcessCommandFunc
+	ReadProcessStart   ReadProcessStartFunc
+	ReadProcessBootID  ReadProcessBootIDFunc
+	SignalProcess      SignalProcessFunc
+	DeferRecovery      bool
 }
 
 type Services struct {
@@ -170,6 +180,7 @@ type Runtime struct {
 	defaultSchedulerTick   RunSchedulerTickFunc
 	defaultSchedulerClaim  RunSchedulerTickFunc
 	customSchedulerTick    bool
+	customSchedulerClaim   bool
 	readProcessCommand     ReadProcessCommandFunc
 	readProcessStart       ReadProcessStartFunc
 	readProcessBootID      ReadProcessBootIDFunc
@@ -258,6 +269,7 @@ func New(options Options) *Runtime {
 
 	runSchedulerTick := options.RunSchedulerTick
 	customSchedulerTick := runSchedulerTick != nil
+	customSchedulerClaim := options.RunSchedulerClaim != nil
 
 	readProcessCommand := options.ReadProcessCommand
 	if readProcessCommand == nil {
@@ -308,6 +320,8 @@ func New(options Options) *Runtime {
 		syncConfiguredProjects:      syncConfiguredProjects,
 		runSchedulerTick:            runSchedulerTick,
 		customSchedulerTick:         customSchedulerTick,
+		defaultSchedulerClaim:       options.RunSchedulerClaim,
+		customSchedulerClaim:        customSchedulerClaim,
 		readProcessCommand:          readProcessCommand,
 		readProcessStart:            readProcessStart,
 		readProcessBootID:           readProcessBootID,
@@ -1009,17 +1023,26 @@ func (r *Runtime) start(ctx context.Context) error {
 		ActiveExecutions: r.activeExecutions,
 	}
 	schedulerDisabled := false
-	if !r.customSchedulerTick {
+	if !r.customSchedulerTick || !r.customSchedulerClaim {
 		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, &r.configBoundary, r.configPath, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
-		r.defaultSchedulerTick = handlers.tick
-		r.defaultSchedulerClaim = handlers.claim
-		r.webhookForwarder = handlers.webhook
-		r.notificationGateways = handlers.notificationGateways
-		schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
+		if !r.customSchedulerTick {
+			r.defaultSchedulerTick = handlers.tick
+			r.webhookForwarder = handlers.webhook
+			r.notificationGateways = handlers.notificationGateways
+			schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
+		} else if handlers.webhook != nil {
+			// The bundle was built only for its claim; close the eagerly
+			// constructed webhook forwarder it also carries so its workers
+			// do not leak.
+			handlers.webhook.Close()
+		}
+		if !r.customSchedulerClaim {
+			r.defaultSchedulerClaim = handlers.claim
+		}
 	}
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)

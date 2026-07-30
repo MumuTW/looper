@@ -3100,6 +3100,40 @@ func TestRuntimeStartBeginsSchedulerPolling(t *testing.T) {
 	}
 }
 
+// Contract: the claim pump remains on its default catalog path when a caller
+// replaces only the full scheduler tick; both construction seams are independent.
+func TestRuntimeCustomSchedulerTickKeepsDefaultClaimPass(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+
+	rt := New(Options{
+		Config:        cfg,
+		Logger:        &testLogger{},
+		DeferRecovery: true,
+		RunSchedulerTick: func(context.Context, Services) error {
+			return nil
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+	if rt.defaultSchedulerClaim == nil {
+		t.Fatal("defaultSchedulerClaim = nil with custom tick and nil claim, want catalog claim pass")
+	}
+	if err := rt.CompleteStartup(context.Background()); err != nil {
+		t.Fatalf("CompleteStartup() error = %v", err)
+	}
+}
+
 func TestRuntimeTriggerSchedulerTickRunsImmediatelyWithoutWaitingForPolling(t *testing.T) {
 	t.Parallel()
 
