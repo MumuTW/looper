@@ -88,9 +88,10 @@ do_apply() {
 
   # An existing .orig is not ours to overwrite: it may be the only copy of a
   # shim the operator customized, left by an earlier manual patch or a failed
-  # recovery. Side-step to a timestamped name rather than clobbering it.
+  # recovery. Side-step to an atomically unique timestamped name rather than
+  # clobbering it: a timestamp alone still collides under automated retries.
   if [ -e "$BACKUP" ]; then
-    BACKUP="$TARGET.orig-$(date +%Y%m%d_%H%M%S)"
+    BACKUP="$(mktemp "${TARGET}.orig-$(date +%Y%m%d_%H%M%S).XXXXXX")"
     echo "note: $TARGET.orig already exists and was left untouched;"
     echo "      this run's backup goes to $(basename "$BACKUP")"
   fi

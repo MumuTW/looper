@@ -25,6 +25,16 @@
 #
 # Backend evidence and known gaps: docs/research/hermes-devin-acp-spike.md
 
+# A shebang is ignored when this file is sourced. Check before expanding
+# BASH_SOURCE, otherwise zsh/dash reports a cryptic "bad substitution" before
+# it can show the portable --print alternative documented above.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "scripts/hermes-profile.sh must be sourced from Bash." >&2
+  echo "For zsh, fish, dash, or another shell, run:" >&2
+  echo "  export HERMES_HOME=\"\$(scripts/hermes-profile.sh --print)\"" >&2
+  return 2 2>/dev/null || exit 2
+fi
+
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   SOURCED=0
   # Strict mode only when executed. When sourced, `set -e` would leak into the

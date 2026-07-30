@@ -50,6 +50,9 @@ jobs:
           test -f ../../internal/dashboard/assets/.production
           test -f ../../internal/dashboard/assets/index.html
 
+      - name: Test Hermes/Devin helpers
+        run: python3 -m unittest discover -s tools/hermes-devin -p 'test_*.py'
+
       - name: Check formatting
         run: |
           unformatted="$(gofmt -l .)"
