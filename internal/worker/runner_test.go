@@ -1718,6 +1718,51 @@ func TestVerifyTimeoutProgressAfterTerminationRejectsDrift(t *testing.T) {
 	}
 }
 
+func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T) {
+	t.Parallel()
+
+	before := worktreeProgress{
+		HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content",
+	}
+	for _, tc := range []struct {
+		name  string
+		after worktreeProgress
+		want  bool
+	}{
+		{
+			name:  "preserves identical content and status at the same head",
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content"},
+			want:  true,
+		},
+		{
+			name:  "rejects content replacement with unchanged status",
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "replacement-content"},
+			want:  false,
+		},
+		{
+			name:  "rejects partial disappearance",
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, StagedFiles: []string{"tracked.go"}, ChangedFileCount: 1, DiffFingerprint: "remaining-status", ContentFingerprint: "remaining-content"},
+			want:  false,
+		},
+		{
+			name:  "rejects unrelated clean head even when content happens to match",
+			after: worktreeProgress{HeadSHA: "unrelated-head", Branch: "feature/test", ContentFingerprint: "before-content"},
+			want:  false,
+		},
+		{
+			name:  "accepts a clean descendant containing the recorded contents",
+			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "before-content", HeadDescendsFromCompare: true},
+			want:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := preservesWorktreeProgress(before, tc.after); got != tc.want {
+				t.Fatalf("preservesWorktreeProgress() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRewindCheckpointForExecuteRetryPreservesTimeoutSnapshot(t *testing.T) {
 	t.Parallel()
 	progress := &worktreeProgress{HeadSHA: "head", Branch: "feature/test", DiffFingerprint: "status"}

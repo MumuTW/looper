@@ -137,7 +137,7 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	if err != nil {
 		t.Fatalf("Commit() error = %v", err)
 	}
-	inspectAfterCommit, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath, BaseRef: prepared.HeadSHA})
+	inspectAfterCommit, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath, BaseRef: prepared.HeadSHA, ContentPaths: inspectBeforeCommitContentChange.ChangedFiles, CompareHeadSHA: inspectBeforeCommitContentChange.HeadSHA})
 	if err != nil {
 		t.Fatalf("InspectHead(after) error = %v", err)
 	}
@@ -160,17 +160,23 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	if got := inspectBeforeCommit.UntrackedFiles; len(got) != 1 || got[0] != "timeout-progress.txt" {
 		t.Fatalf("InspectHead(before).UntrackedFiles = %#v, want [timeout-progress.txt]", got)
 	}
-	if inspectBeforeCommit.DiffFingerprint == "" {
-		t.Fatal("InspectHead(before).DiffFingerprint = empty, want status fingerprint")
+	if inspectBeforeCommit.ContentFingerprint == "" {
+		t.Fatal("InspectHead(before).ContentFingerprint = empty, want content fingerprint")
 	}
-	if inspectBeforeCommitContentChange.DiffFingerprint != inspectBeforeCommit.DiffFingerprint {
-		t.Fatalf("status fingerprint changed after content-only update: before=%q after=%q", inspectBeforeCommit.DiffFingerprint, inspectBeforeCommitContentChange.DiffFingerprint)
+	if inspectBeforeCommitContentChange.ContentFingerprint == inspectBeforeCommit.ContentFingerprint {
+		t.Fatalf("content fingerprint unchanged after content-only update: before=%q after=%q", inspectBeforeCommit.ContentFingerprint, inspectBeforeCommitContentChange.ContentFingerprint)
 	}
 	if commitResult.CommitSHA == "" {
 		t.Fatal("Commit().CommitSHA = empty, want value")
 	}
 	if inspectAfterCommit.HasUncommittedChanges {
 		t.Fatalf("InspectHead(after).HasUncommittedChanges = true, want false")
+	}
+	if !inspectAfterCommit.HeadDescendsFromCompare {
+		t.Fatal("InspectHead(after).HeadDescendsFromCompare = false, want committed successor")
+	}
+	if inspectAfterCommit.ContentFingerprint != inspectBeforeCommitContentChange.ContentFingerprint {
+		t.Fatalf("content fingerprint after commit = %q, want pre-commit content %q", inspectAfterCommit.ContentFingerprint, inspectBeforeCommitContentChange.ContentFingerprint)
 	}
 	if len(inspectAfterCommit.NewCommitSHAs) != 1 {
 		t.Fatalf("InspectHead(after).NewCommitSHAs = %#v, want 1 entry", inspectAfterCommit.NewCommitSHAs)
