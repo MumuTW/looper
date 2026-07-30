@@ -146,7 +146,7 @@ func (l *operationLease) BindClaim(item storage.QueueItemRecord) (OperationPermi
 	if item.LoopID != nil {
 		loopID = *item.LoopID
 	}
-	stopping := loopID != "" && r.stoppingLoops[loopID] > 0
+	stopping := loopID != "" && r.stoppingLoops[loopID] != nil
 	cancelled := l.ctx != nil && l.ctx.Err() != nil
 	if closing || stopping || cancelled {
 		delete(r.pendingOps, l.id)

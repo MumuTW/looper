@@ -235,3 +235,129 @@ func TestPersistFinalSurfacesTerminalConflict(t *testing.T) {
 		t.Fatalf("durable status = %#v, want killed", got)
 	}
 }
+
+// A stdout snapshot built before a newer stderr snapshot can reach persistence
+// after it; the persist gate must drop the stale snapshot so durable heartbeat
+// count, heartbeat time, and output JSON never move backward.
+func TestPersistStatusDropsStaleSnapshotAfterNewerOnePersisted(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorCodex}, Repos: repos})
+	x := &execution{
+		executor:       executor,
+		executionID:    "agent_stale_snapshot",
+		input:          RunInput{WorkingDirectory: t.TempDir(), Prompt: "x"},
+		startedAtISO:   "2026-07-18T00:00:00.000Z",
+		maxOutputBytes: defaultMaxOutputBytes,
+		process:        exec.Command("/bin/true"),
+	}
+	if err := x.persistStatus(context.Background(), "running", nil, nil, nil); err != nil {
+		t.Fatalf("initial persistStatus error = %v", err)
+	}
+
+	// Deterministically reversed persistence order: the newer cumulative
+	// snapshot (count 2) lands first, then the older one (count 1) arrives.
+	newerAt := "2026-07-18T00:00:02.000Z"
+	newerOut := `{"stdout":"chunk-1chunk-2","stderr":""}`
+	newerCount := int64(2)
+	if err := x.persistStatus(context.Background(), "running", &newerCount, &newerAt, &newerOut); err != nil {
+		t.Fatalf("persistStatus(newer) error = %v", err)
+	}
+	olderAt := "2026-07-18T00:00:01.000Z"
+	olderOut := `{"stdout":"chunk-1","stderr":""}`
+	olderCount := int64(1)
+	if err := x.persistStatus(context.Background(), "running", &olderCount, &olderAt, &olderOut); err != nil {
+		t.Fatalf("persistStatus(older) error = %v", err)
+	}
+
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_stale_snapshot")
+	if err != nil || record == nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record.HeartbeatCount != 2 {
+		t.Fatalf("HeartbeatCount = %d, want 2: stale snapshot moved durable state backward", record.HeartbeatCount)
+	}
+	if record.LastHeartbeatAt == nil || *record.LastHeartbeatAt != newerAt {
+		t.Fatalf("LastHeartbeatAt = %v, want %q", record.LastHeartbeatAt, newerAt)
+	}
+	if record.OutputJSON == nil || *record.OutputJSON != newerOut {
+		t.Fatalf("OutputJSON = %v, want newer cumulative snapshot retained", record.OutputJSON)
+	}
+}
+
+// A stale-by-count observation can still carry a fresher status sample: kill
+// lands after the newer snapshot persisted, and the older callback is the last
+// writer of the drain. The transition must survive with the newer snapshot's
+// heartbeat/output values retained.
+func TestPersistStatusStaleSnapshotStillCarriesCancellingTransition(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorCodex}, Repos: repos})
+	x := &execution{
+		executor:       executor,
+		executionID:    "agent_stale_cancelling",
+		input:          RunInput{WorkingDirectory: t.TempDir(), Prompt: "x"},
+		startedAtISO:   "2026-07-18T00:00:00.000Z",
+		maxOutputBytes: defaultMaxOutputBytes,
+		process:        exec.Command("/bin/true"),
+	}
+	newerAt := "2026-07-18T00:00:02.000Z"
+	newerOut := `{"stdout":"chunk-1chunk-2","stderr":""}`
+	newerCount := int64(2)
+	if err := x.persistStatus(context.Background(), "running", &newerCount, &newerAt, &newerOut); err != nil {
+		t.Fatalf("persistStatus(newer running) error = %v", err)
+	}
+
+	olderAt := "2026-07-18T00:00:01.000Z"
+	olderOut := `{"stdout":"chunk-1","stderr":""}`
+	olderCount := int64(1)
+	if err := x.persistStatus(context.Background(), "cancelling", &olderCount, &olderAt, &olderOut); err != nil {
+		t.Fatalf("persistStatus(older cancelling) error = %v", err)
+	}
+
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_stale_cancelling")
+	if err != nil || record == nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record.Status != "cancelling" {
+		t.Fatalf("Status = %q, want cancelling: the lifecycle transition was lost with the stale snapshot", record.Status)
+	}
+	if record.HeartbeatCount != 2 || record.LastHeartbeatAt == nil || *record.LastHeartbeatAt != newerAt {
+		t.Fatalf("heartbeat = (%d, %v), want the retained newer snapshot (2, %q)", record.HeartbeatCount, record.LastHeartbeatAt, newerAt)
+	}
+	if record.OutputJSON == nil || *record.OutputJSON != newerOut {
+		t.Fatalf("OutputJSON = %v, want the retained newer snapshot", record.OutputJSON)
+	}
+
+	// A later stale running sample must not downgrade cancelling.
+	if err := x.persistStatus(context.Background(), "running", &olderCount, &olderAt, &olderOut); err != nil {
+		t.Fatalf("persistStatus(stale running after cancelling) error = %v", err)
+	}
+	record, err = repos.AgentExecutions.GetByID(context.Background(), "agent_stale_cancelling")
+	if err != nil || record == nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record.Status != "cancelling" {
+		t.Fatalf("Status after stale running sample = %q, want cancelling retained", record.Status)
+	}
+
+	// A NEWER-count callback that sampled running before the kill (preempted
+	// between snapshot and persist) must not downgrade cancelling either; its
+	// fresher output still lands.
+	newestAt := "2026-07-18T00:00:03.000Z"
+	newestOut := `{"stdout":"chunk-1chunk-2chunk-3","stderr":""}`
+	newestCount := int64(3)
+	if err := x.persistStatus(context.Background(), "running", &newestCount, &newestAt, &newestOut); err != nil {
+		t.Fatalf("persistStatus(newer running after cancelling) error = %v", err)
+	}
+	record, err = repos.AgentExecutions.GetByID(context.Background(), "agent_stale_cancelling")
+	if err != nil || record == nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record.Status != "cancelling" {
+		t.Fatalf("Status after newer running sample = %q, want cancelling retained: one-way transition", record.Status)
+	}
+	if record.HeartbeatCount != 3 || record.OutputJSON == nil || *record.OutputJSON != newestOut {
+		t.Fatalf("heartbeat/output = (%d, %v), want the newest snapshot retained under cancelling", record.HeartbeatCount, record.OutputJSON)
+	}
+}

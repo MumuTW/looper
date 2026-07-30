@@ -106,6 +106,18 @@ type Context struct {
 	TakeoverLoop         func(context.Context, string, string) (TakeoverResult, error)
 	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
+	// LookupPullRequest reads a pull request straight from the forge for the
+	// paths that must accept a pull request Looper has never snapshotted. Optional:
+	// when nil, an unsnapshotted pull request stays unresolvable.
+	LookupPullRequest func(ctx context.Context, repo string, prNumber int64, cwd string) (PullRequestTarget, error)
+}
+
+// PullRequestTarget is the minimum a caller needs to decide whether a pull
+// request can be handed to a Role: that it exists, and that it is still open.
+type PullRequestTarget struct {
+	Number int64
+	State  string
+	Merged bool
 }
 
 // TakeoverResult is what a takeover yields: the native session id + worktree +
@@ -1402,9 +1414,10 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	artifactName := looperdArtifactName(currentTarget)
 
 	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.effectiveConfig())
+	forgeCredential := looperdruntime.ForgeCredentialReadinessFor(h.effectiveConfig())
 	outstanding, debtErr := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
 	recovery := h.recoveryWithOutstanding(outstanding)
-	degradedReasons := statusDegradedReasons(reviewPublish, outstanding, debtErr)
+	degradedReasons := statusDegradedReasons(reviewPublish, forgeCredential, outstanding, debtErr)
 
 	return statusResponse{
 		Service: statusService{
@@ -1702,10 +1715,13 @@ func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.Outstanding
 	return normalized
 }
 
-func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error) []string {
+func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, forgeCredential looperdruntime.ForgeCredentialReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error) []string {
 	var reasons []string
 	if reviewPublish.Known && reviewPublish.PublishingDisabled {
 		reasons = append(reasons, "review_publish_disabled")
+	}
+	if forgeCredential.Degraded() {
+		reasons = append(reasons, looperdruntime.ForgeCredentialDegradedReason)
 	}
 	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {
 		reasons = append(reasons, "quarantine_orphan_debt")
@@ -1822,6 +1838,9 @@ type loopResponse struct {
 	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
 	LastFailureKind   *string `json:"lastFailureKind,omitempty"`
 	LastFailureReason *string `json:"lastFailureReason,omitempty"`
+	// Outcome is the latest run's derived outcome, so a loop view shows what that
+	// run actually accomplished rather than only that it failed.
+	Outcome *fixer.FixerRunOutcome `json:"outcome,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -1919,6 +1938,9 @@ type runResponse struct {
 	EndedAt           *string `json:"endedAt"`
 	CreatedAt         string  `json:"createdAt"`
 	UpdatedAt         string  `json:"updatedAt"`
+	// Outcome is derived at read time rather than stored, so runs recorded before
+	// the fixer wrote outcomes still report their failure story.
+	Outcome *fixer.FixerRunOutcome `json:"outcome,omitempty"`
 }
 
 type activeRunsListResponse struct {
@@ -3410,6 +3432,9 @@ func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemR
 	if view == nil {
 		return
 	}
+	if latestRun != nil {
+		view.Outcome = fixer.DeriveRunOutcome(*latestRun)
+	}
 	if latestQueue != nil {
 		attempts := latestQueue.Attempts
 		maxAttempts := latestQueue.MaxAttempts
@@ -4299,21 +4324,20 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	specPath := normalizeOptionalString(body.SpecPath)
 	prNumber := normalizePositiveInt64Ptr(body.PRNumber)
 	issueNumber := normalizePositiveInt64Ptr(body.IssueNumber)
-	modeCount := 0
-	if prNumber != nil {
-		modeCount++
+	// prNumber and issueNumber are alternative targets and stay exclusive.
+	// prompt/specPath are the whole input for a project-target worker, but only a
+	// refinement for a pull-request worker: resolveWorkerInput prefers an explicit
+	// specPath over the one parsed out of the PR body, and a PR whose body carries
+	// no spec-path marker is otherwise undispatchable. Issue mode keeps the
+	// exclusivity because Planner is what supplies the spec there.
+	if prNumber != nil && issueNumber != nil {
+		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "worker accepts exactly one target: prNumber or issueNumber"}
 	}
-	if issueNumber != nil {
-		modeCount++
-	}
-	if prompt != nil || specPath != nil {
-		modeCount++
-	}
-	if modeCount == 0 {
-		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "prompt or specPath is required unless prNumber or issueNumber is provided"}
-	}
-	if modeCount > 1 {
+	if issueNumber != nil && (prompt != nil || specPath != nil) {
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "worker accepts exactly one input mode: prompt/specPath, prNumber, or issueNumber"}
+	}
+	if prNumber == nil && issueNumber == nil && prompt == nil && specPath == nil {
+		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "prompt or specPath is required unless prNumber or issueNumber is provided"}
 	}
 
 	project, err := h.resolveWorkerProject(r.Context(), resolveWorkerProjectInput{
@@ -4651,7 +4675,7 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if ghPath == "" {
 		return nil
 	}
-	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, GHRun: shell.Run})
+	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, Env: config.DaemonGitHubCredentialEnv(h.context.Config), GHRun: shell.Run})
 	labels := []string(nil)
 	switch target.TargetType {
 	case domain.LoopTargetTypeIssue:
@@ -5153,12 +5177,67 @@ func (h *Handler) requirePullRequestTarget(ctx context.Context, input requirePul
 		return 0, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 	if snapshot == nil {
-		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", input.Repo, input.PRNumber)}
+		// Snapshots are written by Reviewer and by project discovery, and neither
+		// has to have run before a human decides this pull request needs Worker.
+		// Missing snapshot means "not seen yet", not "does not exist", so ask the
+		// forge rather than refusing work that is perfectly dispatchable.
+		return h.resolveUnsnapshottedPullRequestTarget(ctx, *project, input)
 	}
 	if snapshot.ProjectID != input.ProjectID {
 		return 0, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", input.Repo, input.PRNumber, input.ProjectID)}
 	}
+	// A snapshot captured while open does not prove the pull request is still
+	// open: project discovery only writes open PRs and never refreshes a
+	// snapshot after closure, so a stale-open snapshot would otherwise queue an
+	// expensive Worker run that pushes commits onto a closed or merged PR. The
+	// forge is the authority for current state; refresh it before accepting.
+	// When no lookup is configured, fall back to the snapshot's recorded state
+	// so a process without forge access keeps its previous behavior.
+	if h.context.LookupPullRequest != nil {
+		target, lookupErr := h.context.LookupPullRequest(ctx, input.Repo, input.PRNumber, project.RepoPath)
+		return h.acceptFreshPullRequestTarget(input, target, lookupErr)
+	}
+	if isOpen, known, stateErr := h.getPlannerPullRequestOpenState(ctx, input.ProjectID, input.Repo, input.PRNumber); stateErr == nil && known && !isOpen {
+		return 0, closedPullRequestTargetError(input.Repo, input.PRNumber)
+	}
 	return snapshot.PRNumber, nil
+}
+
+// resolveUnsnapshottedPullRequestTarget answers the same question as its caller
+// for a pull request Looper has no snapshot of. LookupPullRequest is optional;
+// without it an unsnapshotted pull request stays unresolvable, which is the
+// behavior every caller had before the forge fallback existed.
+func (h *Handler) resolveUnsnapshottedPullRequestTarget(ctx context.Context, project storage.ProjectRecord, input requirePullRequestTargetInput) (int64, error) {
+	if h.context.LookupPullRequest == nil {
+		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", input.Repo, input.PRNumber)}
+	}
+	target, err := h.context.LookupPullRequest(ctx, input.Repo, input.PRNumber, project.RepoPath)
+	return h.acceptFreshPullRequestTarget(input, target, err)
+}
+
+// acceptFreshPullRequestTarget turns a fresh forge lookup into the resolved PR
+// number or an API error. Only a classified "does not exist" result is a 404;
+// any other lookup failure is a retryable server error so a transient forge
+// outage is not reported as a permanently missing target. A PR the forge
+// confirms closed or merged is rejected before work is queued.
+func (h *Handler) acceptFreshPullRequestTarget(input requirePullRequestTargetInput, target PullRequestTarget, err error) (int64, error) {
+	if err != nil {
+		if IsPullRequestLookupNotFound(err) {
+			return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d (%s)", input.Repo, input.PRNumber, err.Error())}
+		}
+		return 0, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("Pull request lookup failed: %s#%d (%s)", input.Repo, input.PRNumber, err.Error())}
+	}
+	if target.Number <= 0 {
+		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", input.Repo, input.PRNumber)}
+	}
+	if target.Merged || (strings.TrimSpace(target.State) != "" && !strings.EqualFold(strings.TrimSpace(target.State), "open")) {
+		return 0, closedPullRequestTargetError(input.Repo, input.PRNumber)
+	}
+	return target.Number, nil
+}
+
+func closedPullRequestTargetError(repo string, prNumber int64) error {
+	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Pull request %s#%d is not open", repo, prNumber)}
 }
 
 type findPlannerLoopForIssueInput struct {
@@ -6353,6 +6432,7 @@ func serializeRun(run storage.RunRecord) runResponse {
 		EndedAt:           run.EndedAt,
 		CreatedAt:         run.CreatedAt,
 		UpdatedAt:         run.UpdatedAt,
+		Outcome:           fixer.DeriveRunOutcome(run),
 	}
 }
 

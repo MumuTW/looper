@@ -1142,15 +1142,28 @@ func TestStatusDegradedReasonsIncludesKnownDisabledPublishWithoutLooperPath(t *t
 	reasons := statusDegradedReasons(looperdruntime.ReviewPublishReadiness{
 		Known:              true,
 		PublishingDisabled: true,
-	}, looperdruntime.OutstandingQuarantineDebt{}, nil)
+	}, looperdruntime.ForgeCredentialReadiness{}, looperdruntime.OutstandingQuarantineDebt{}, nil)
 	if got := strings.Join(reasons, ","); got != "review_publish_disabled" {
 		t.Fatalf("statusDegradedReasons() = %q, want review_publish_disabled", got)
+	}
+}
+
+func TestStatusDegradedReasonsIncludesMissingForgeCredential(t *testing.T) {
+	reasons := statusDegradedReasons(
+		looperdruntime.ReviewPublishReadiness{},
+		looperdruntime.ForgeCredentialReadiness{GitHubProjects: true},
+		looperdruntime.OutstandingQuarantineDebt{},
+		nil,
+	)
+	if got := strings.Join(reasons, ","); got != looperdruntime.ForgeCredentialDegradedReason {
+		t.Fatalf("statusDegradedReasons() = %q, want %q", got, looperdruntime.ForgeCredentialDegradedReason)
 	}
 }
 
 func TestStatusDegradedReasonsIncludesUnavailableQuarantineDebt(t *testing.T) {
 	reasons := statusDegradedReasons(
 		looperdruntime.ReviewPublishReadiness{},
+		looperdruntime.ForgeCredentialReadiness{},
 		looperdruntime.OutstandingQuarantineDebt{},
 		errors.New("sqlite temporarily unavailable"),
 	)

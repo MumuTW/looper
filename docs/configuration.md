@@ -749,6 +749,11 @@ host = "127.0.0.1"
 port = 17310
 authMode = "local-token"
 localToken = "replace-me"
+# Optional; set when a reverse proxy, tunnel, or TLS terminator sits in front
+# of the daemon. Must be a canonical absolute http(s) URL with a host — no
+# path prefix, credentials, query, or fragment — and any trailing slash is
+# normalized away.
+# baseUrl = "https://looper.example.com"
 
 [daemon]
 mode = "foreground"
@@ -1273,7 +1278,7 @@ Defaults:
 - `daemon.worktreeCleanup.interval = "24h"`
 - `daemon.worktreeCleanup.retentionDays = 7`
 - `daemon.worktreeCleanup.maxPerTick = 10`
-- `daemon.worktreeCleanup.includeOrphans = false`
+- `daemon.worktreeCleanup.includeOrphans = true` — a worktree record that no loop, run, or queue item references is still gated by `retentionDays`, because the planner ages every candidate by its own `createdAt`/`updatedAt`. Set this to `false` only to keep unreferenced worktrees indefinitely; the sweeper then reclaims almost nothing, since the reference graph drops old worktrees as loops move on.
 - `daemon.worktreeCleanup.dryRun = false`
 
 To disable automatic cleanup:
