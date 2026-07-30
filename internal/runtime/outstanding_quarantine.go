@@ -74,11 +74,14 @@ func CountOutstandingQuarantineDebt(ctx context.Context, repositories *storage.R
 	if len(quarantinedAtByExecutionID) == 0 {
 		return debt, nil
 	}
-	// Evidence is not a condition. Once an operator has disposed of the loop
-	// through an existing verb, the quarantine is history and the settlement
-	// pass is about to retire the row; counting it until then would report a
-	// resolved incident as live debt (#150). The loops load in the one bulk
-	// query the roster already needed, so the query shape is unchanged.
+	// The counter deliberately reads nothing but "still active, and quarantine
+	// evidence exists". Settlement is what decides an execution is history, and
+	// a settled execution leaves ListActive, so anything still counted here is
+	// either parked on a human or retained because its process is still live —
+	// both real debt. An earlier revision filtered by loop status here as well,
+	// which silently dropped the live-process case from /status precisely when
+	// it most needed to be visible; the settlement pass is the single decision
+	// point instead.
 	loopsByID, err := quarantinedLoopsByID(ctx, repositories, activeExecutions, quarantinedAtByExecutionID)
 	if err != nil {
 		return OutstandingQuarantineDebt{}, err
@@ -92,11 +95,6 @@ func CountOutstandingQuarantineDebt(ctx context.Context, repositories *storage.R
 			continue
 		}
 		loopID := strings.TrimSpace(derefString(execution.LoopID))
-		// An execution with no loop row keeps counting: there is no disposition
-		// to read, so the safe reading is that the work is still outstanding.
-		if loop, known := loopsByID[loopID]; loopID != "" && known && !quarantineParkedLoopStatus(loop.Status) {
-			continue
-		}
 		debt.QuarantinedActiveExecutions++
 		if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
 			quarantinedRunIDs[strings.TrimSpace(*execution.RunID)] = struct{}{}

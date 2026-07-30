@@ -324,21 +324,50 @@ Mutations stay closed until classification finishes (#575/#580).
 The escape hatch above was named but never mechanised, so quarantine was a state
 with a by-design entrance and no exit: `retry` / `stop` / `close` requeue or
 terminate the loop without touching `agent_executions`, leaving the row active
-forever and the daemon permanently `degraded`. That is closed by
-`runtime.settleDisposedQuarantine`, whose Authority is the operator's existing
-verb — a durable loop disposition already recorded in SQLite — and never a PID
-probe:
+forever and the daemon permanently `degraded`.
 
-- a loop still at `paused` / `human_takeover` keeps counting as debt no matter
-  what its PID does, because nothing has been decided about it;
-- a loop the operator retried, stopped, or closed has its quarantine evidence
-  retired, and its execution moves to `quarantine_settled` — deliberately *not*
-  one of the `durableTerminalExecution` statuses, so settling never reads as
-  confirmed-dead Authority for any later classification;
-- an execution whose process still matches is retained as debt even after
-  disposition, so a live agent can never be accounted away;
+Worse, the exit was not merely missing but self-blocking. Quarantine parks the
+loop at `paused` *and* leaves its run at `running`, while
+`assertLoopRetryPreconditions` refuses any retry whose loop has a running run —
+so the remedy `looper status` prints could never succeed on the very loops it
+printed it for. Settlement therefore has two entry points, and the operator one
+is what breaks that cycle:
+
+- `runtime.SettleQuarantineForLoop` runs inline in the operator verb being
+  served, before replacement work is published. Its Authority is the human act
+  itself, so it does not wait for the loop to leave `paused` — it is what lets
+  the loop leave `paused`. Running before the queue item is published also keeps
+  the settled run durable before any claim can race it onto
+  `idx_runs_one_running_per_loop`.
+- `runtime.settleDisposedQuarantine` is the periodic backstop for evidence whose
+  loop already moved on by some other path. Its provenance is recorded as
+  `loop_disposed`, not as an operator act: `completed` / `failed` are also
+  written autonomously by Roles, and the audit trail should not claim a human
+  did something a Role did.
+
+Both share the same refusals, and neither consults a PID probe for Authority:
+
+- a loop still at `paused` / `human_takeover` is never settled by the backstop,
+  no matter what its PID does, because nothing has decided anything about it;
+- an execution whose process still matches is retained even on an explicit
+  operator verb, so a live agent can never be accounted away — the operator's
+  retry then fails loudly instead;
+- a run is never closed while any execution on it — including a sibling this
+  pass is not settling — probes live, since closing it would free
+  `idx_runs_one_running_per_loop` alongside a demonstrably live agent;
+- settled executions move to `quarantine_settled`, deliberately *not* one of the
+  `durableTerminalExecution` statuses, so settling never reads as confirmed-dead
+  Authority for any later classification;
+- the execution write, the run closure, and both events commit in one
+  transaction, because a partial write would drop the row out of `ListActive` —
+  where no later pass would reconsider it — while leaving the run `running` and
+  the audit trail incomplete;
 - settlement writes a `looperd.recovery.execution_quarantine_retired` event
   beside the original quarantine event, and kills nothing.
+
+The debt counter reads only "still active, with quarantine evidence". It does
+not second-guess settlement by filtering on loop status: settlement is the single
+decision point, and a settled row leaves `ListActive` on its own.
 
 This adds no new operator command and no new inference layer; it makes the verbs
 that already exist finish the job the ADR assumed they would.

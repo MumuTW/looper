@@ -144,15 +144,16 @@ func TestQuarantineSettlementRetiresOperatorDisposedExecution(t *testing.T) {
 	t.Parallel()
 
 	fixture := newQuarantineSettlementFixture(t, "queued", false)
-	// The loop is already disposed, so the counter stops reporting it even
-	// before the settlement pass rewrites the rows.
-	if before := fixture.debt(t); before.QuarantinedActiveExecutions != 0 || before.QuarantinedRunningRuns != 0 {
-		t.Fatalf("debt before settlement = %#v, want zero for an operator-disposed loop", before)
+	// The counter reports the row until settlement actually retires it: the
+	// counter reads only "still active with quarantine evidence", so that
+	// settlement stays the single decision point.
+	if before := fixture.debt(t); before.QuarantinedActiveExecutions != 1 {
+		t.Fatalf("debt before settlement = %#v, want the row still counted", before)
 	}
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 1 {
 		t.Fatalf("SettledExecutions = %d, want 1 (summary %#v)", summary.QuarantineSettlement.SettledExecutions, summary.QuarantineSettlement)
@@ -206,9 +207,9 @@ func TestQuarantineSettlementRetainsLiveExecutionAsDebt(t *testing.T) {
 
 	fixture := newQuarantineSettlementFixture(t, "queued", true)
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 0 {
 		t.Fatalf("SettledExecutions = %d, want 0 while the process is observed live", summary.QuarantineSettlement.SettledExecutions)
@@ -245,9 +246,9 @@ func TestQuarantineSettlementKeepsParkedLoopAsDebt(t *testing.T) {
 		t.Fatalf("debt before settlement = %#v, want 1 execution and 1 running run", before)
 	}
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 0 {
 		t.Fatalf("SettledExecutions = %d, want 0 while the loop is still parked", summary.QuarantineSettlement.SettledExecutions)
@@ -271,9 +272,9 @@ func TestQuarantineSettlementKeepsHumanTakeoverAsDebt(t *testing.T) {
 
 	fixture := newQuarantineSettlementFixture(t, "human_takeover", false)
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 0 {
 		t.Fatalf("SettledExecutions = %d, want 0 for a loop parked on a human", summary.QuarantineSettlement.SettledExecutions)
@@ -290,14 +291,166 @@ func TestQuarantineSettlementRetiresStoppedLoop(t *testing.T) {
 
 	fixture := newQuarantineSettlementFixture(t, "terminated", false)
 
-	summary, err := fixture.runtime.ReconcileStaleRunningRuns(context.Background())
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.QuarantineSettlement.SettledExecutions != 1 {
 		t.Fatalf("SettledExecutions = %d, want 1 for a terminated loop", summary.QuarantineSettlement.SettledExecutions)
 	}
 	if debt := fixture.debt(t); debt.QuarantinedActiveExecutions != 0 || debt.QuarantinedRunningRuns != 0 {
 		t.Fatalf("debt = %#v, want zero after the loop was stopped", debt)
+	}
+}
+
+// The deadlock #285's reviewer found: quarantine parks the loop at paused and
+// leaves its run at running, and assertLoopRetryPreconditions refuses any retry
+// whose loop has a running run. Without an operator-authority path the loop can
+// never leave paused, so the periodic backstop never fires and the retry the
+// status line advertises can never succeed.
+func TestSettleQuarantineForLoopUnblocksParkedLoopWithRunningRun(t *testing.T) {
+	t.Parallel()
+
+	fixture := newQuarantineSettlementFixture(t, "paused", false)
+
+	// The periodic backstop deliberately declines: the loop is still parked.
+	backstop, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
+	}
+	if backstop.QuarantineSettlement.SettledExecutions != 0 {
+		t.Fatalf("backstop SettledExecutions = %d, want 0 while parked", backstop.QuarantineSettlement.SettledExecutions)
+	}
+	run, err := fixture.repos.Runs.GetByID(context.Background(), fixture.runID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.Status != "running" {
+		t.Fatalf("run status = %q, want the retry blocker still present before the operator acts", run.Status)
+	}
+
+	summary, err := fixture.runtime.SettleQuarantineForLoop(context.Background(), fixture.loopID, SettlementByOperatorRetry)
+	if err != nil {
+		t.Fatalf("SettleQuarantineForLoop() error = %v", err)
+	}
+	if summary.SettledExecutions != 1 || summary.SettledRuns != 1 {
+		t.Fatalf("summary = %#v, want 1 execution and 1 run settled on operator authority", summary)
+	}
+
+	run, err = fixture.repos.Runs.GetByID(context.Background(), fixture.runID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.Status == "running" {
+		t.Fatalf("run status = %q, want the run closed so assertLoopRetryPreconditions can pass", run.Status)
+	}
+	if debt := fixture.debt(t); debt.QuarantinedActiveExecutions != 0 || debt.QuarantinedRunningRuns != 0 {
+		t.Fatalf("debt = %#v, want zero after the operator disposed of the loop", debt)
+	}
+	if len(*fixture.signaled) != 0 {
+		t.Fatalf("SignalProcess called for pids %v; settlement must not kill processes", *fixture.signaled)
+	}
+}
+
+// An operator asking to retry does not make a running agent go away. The verb
+// must not settle a live execution, so the retry fails loudly instead.
+func TestSettleQuarantineForLoopRefusesLiveExecution(t *testing.T) {
+	t.Parallel()
+
+	fixture := newQuarantineSettlementFixture(t, "paused", true)
+
+	summary, err := fixture.runtime.SettleQuarantineForLoop(context.Background(), fixture.loopID, SettlementByOperatorRetry)
+	if err != nil {
+		t.Fatalf("SettleQuarantineForLoop() error = %v", err)
+	}
+	if summary.SettledExecutions != 0 || summary.LiveExecutionsRetained != 1 {
+		t.Fatalf("summary = %#v, want the live execution retained, not settled", summary)
+	}
+	run, err := fixture.repos.Runs.GetByID(context.Background(), fixture.runID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.Status != "running" {
+		t.Fatalf("run status = %q, want the run left running so retry still refuses", run.Status)
+	}
+}
+
+// A disposed loop whose process is still live must stay visible in /status.
+// The counter previously filtered on loop status alone, which hid exactly the
+// condition settlement was retaining the row to report.
+func TestOutstandingDebtKeepsLiveExecutionOnDisposedLoop(t *testing.T) {
+	t.Parallel()
+
+	fixture := newQuarantineSettlementFixture(t, "queued", true)
+
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
+	}
+	if summary.QuarantineSettlement.LiveExecutionsRetained != 1 {
+		t.Fatalf("LiveExecutionsRetained = %d, want 1", summary.QuarantineSettlement.LiveExecutionsRetained)
+	}
+
+	debt := fixture.debt(t)
+	if debt.QuarantinedActiveExecutions != 1 || debt.QuarantinedRunningRuns != 1 {
+		t.Fatalf("debt = %#v, want the retained live execution still reported as debt", debt)
+	}
+	if len(debt.Loops) != 1 || debt.Loops[0].LoopID != fixture.loopID {
+		t.Fatalf("debt roster = %#v, want the loop listed so an operator can see it", debt.Loops)
+	}
+}
+
+// Two active executions share one run; one probes live and one does not.
+// Settling the uncertain sibling must not close their shared run, because that
+// frees idx_runs_one_running_per_loop for replacement work while a live agent
+// is demonstrably still running under it.
+func TestQuarantineSettlementRetainsRunWithLiveSiblingExecution(t *testing.T) {
+	t.Parallel()
+
+	fixture := newQuarantineSettlementFixture(t, "queued", true)
+	ctx := context.Background()
+
+	// The fixture's execution is the live sibling. Add an uncertain one on the
+	// same run: a PID the probe reports as gone.
+	deadPID := int64(6666)
+	siblingID := "exec_settlement_sibling"
+	projectID := "project_settlement"
+	loopID := fixture.loopID
+	runID := fixture.runID
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{
+		ID: siblingID, ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
+		PID: &deadPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`),
+		MetadataJSON: stringPtr(`{"processIdentity":{"startTime":666600,"bootId":"boot-test"}}`),
+		StartedAt:    fixture.nowISO, CreatedAt: fixture.nowISO, UpdatedAt: fixture.nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	entityType := "agent_execution"
+	entityID := siblingID
+	if err := fixture.repos.Events.Append(ctx, storage.EventLogRecord{
+		ID: "event_quarantined_sibling", EventType: recoveryExecutionQuarantinedEventType,
+		ProjectID: &projectID, LoopID: &loopID, RunID: &runID,
+		EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{}`, CreatedAt: fixture.nowISO,
+	}); err != nil {
+		t.Fatalf("Events.Append() error = %v", err)
+	}
+
+	summary, err := fixture.runtime.reconcileLiveStaleRunningRuns(ctx)
+	if err != nil {
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
+	}
+	if summary.QuarantineSettlement.SettledExecutions != 1 {
+		t.Fatalf("SettledExecutions = %d, want only the uncertain sibling settled", summary.QuarantineSettlement.SettledExecutions)
+	}
+	if summary.QuarantineSettlement.SettledRuns != 0 {
+		t.Fatalf("SettledRuns = %d, want 0 while a live sibling still holds the run", summary.QuarantineSettlement.SettledRuns)
+	}
+
+	run, err := fixture.repos.Runs.GetByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	if run.Status != "running" {
+		t.Fatalf("run status = %q, want the run retained for the live sibling", run.Status)
 	}
 }
