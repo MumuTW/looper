@@ -4334,6 +4334,43 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	return serializeLoop(record), nil
 }
 
+func (h *Handler) findIssueCollisionLoop(ctx context.Context, repos *storage.Repositories, projectID string, target domain.LoopTarget) (*collisionInfo, error) {
+	loops, err := repos.Loops.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Construct the expected issue target ID for matching.
+	issueTargetID := fmt.Sprintf("issue:%s:%d", target.Repo, target.IssueNumber)
+
+	for _, loop := range loops {
+		// Only active loops count as collisions.
+		if !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+			continue
+		}
+		// Must be in the same project.
+		if loop.ProjectID != projectID {
+			continue
+		}
+		// Skip planner and worker — they're the normal upstream/downstream.
+		loopType := domain.LoopType(loop.Type)
+		if loopType == domain.LoopTypePlanner || loopType == domain.LoopTypeWorker {
+			continue
+		}
+		// Check direct issue target match.
+		if loop.TargetType == string(domain.LoopTargetTypeIssue) && loop.TargetID != nil && *loop.TargetID == issueTargetID {
+			return &collisionInfo{ID: loop.ID, Type: loop.Type}, nil
+		}
+	}
+
+	return nil, nil
+}
+
+type collisionInfo struct {
+	ID   string
+	Type string
+}
+
 func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateResponse, error) {
 	if r.Method != http.MethodPost {
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/workers")}
@@ -4549,6 +4586,22 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			return services.ActiveExecutions.RestoreLoopStop(reuseStopGateLoopID)
 		}
 		return nil
+	}
+
+	// Issue 319: refuse dispatch when a fixer/reviewer loop already holds
+	// the issue (or its pull request). Excludes planner/worker (normal
+	// handoff) and non-active states. force overrides.
+	if issueNumber != nil && requestedIssueTarget != nil && !derefBool(body.Force) {
+		if collision, checkErr := h.findIssueCollisionLoop(r.Context(), services.Repositories, projectID, *requestedIssueTarget); checkErr != nil {
+			return workerCreateResponse{}, checkErr
+		} else if collision != nil {
+			return workerCreateResponse{}, apiError{
+				code:    pkgapi.ErrorCodeProjectAmbiguous,
+				status:  http.StatusConflict,
+				message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", *issueNumber, collision.Type, collision.ID),
+				details: map[string]any{"occupiedBy": map[string]any{"loopId": collision.ID, "loopType": collision.Type}},
+			}
+		}
 	}
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
