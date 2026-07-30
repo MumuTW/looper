@@ -1,0 +1,69 @@
+{
+  "method": {
+    "cognitive_complexity": "gocognit v1.2.1, production Go only (test files excluded)",
+    "line_distribution": "tracked production Go files, physical lines; test/generated/vendor files excluded",
+    "current_revision": "342b9f85fcba74026912ce092c533e971f20d824",
+    "fork_baseline_revision": "a7a2423842357d4a328de9d3cd75118e3d851c5a",
+    "issue_95_pre_revision": "a491bf7e3a2e3cddc251195b93242645a9c3dc6c",
+    "issue_95_post_revision": "7f124b06e6685d620b42e03f34ae1a258da9cbdf"
+  },
+  "fork_baseline": {
+    "functions": 7550,
+    "cognitive_total": 52178,
+    "cognitive_average": 6.91,
+    "cognitive_median": 4,
+    "cognitive_p90": 14,
+    "cognitive_p95": 21,
+    "cognitive_max": 234,
+    "functions_over_15": 639,
+    "functions_over_25": 244,
+    "functions_over_50": 63,
+    "functions_over_100": 17,
+    "production_go_files": 210,
+    "production_go_lines": 116884,
+    "file_line_median": 175,
+    "file_line_p90": 1229,
+    "file_line_p95": 2112,
+    "file_bands": {
+      "up_to_300": 128,
+      "301_to_500": 31,
+      "501_to_1000": 19,
+      "over_1000": 32
+    }
+  },
+  "current_main": {
+    "functions": 7043,
+    "cognitive_total": 47287,
+    "cognitive_average": 6.71,
+    "cognitive_median": 4,
+    "cognitive_p90": 14,
+    "cognitive_p95": 20,
+    "cognitive_max": 181,
+    "functions_over_15": 575,
+    "functions_over_25": 226,
+    "functions_over_50": 64,
+    "functions_over_100": 12,
+    "production_go_files": 221,
+    "production_go_lines": 105952,
+    "file_line_median": 139,
+    "file_line_p90": 1188,
+    "file_line_p95": 2039,
+    "file_bands": {
+      "up_to_300": 155,
+      "301_to_500": 27,
+      "501_to_1000": 15,
+      "over_1000": 24
+    }
+  },
+  "issue_95_delta": {
+    "functions": -110,
+    "cognitive_total": -573,
+    "functions_over_15": -7,
+    "functions_over_25": -2,
+    "functions_over_50": 0,
+    "functions_over_100": 0,
+    "production_go_files": -1,
+    "production_go_lines": -1896,
+    "file_line_p95": -42
+  }
+}

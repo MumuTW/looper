@@ -1,0 +1,149 @@
+{
+  "title": "Looper Complexity and Line Distribution Comparison",
+  "repository": {
+    "name": "MumuTW/looper",
+    "path": "/Users/johnson/dev/mine/looper",
+    "revision": "342b9f85fcba74026912ce092c533e971f20d824",
+    "scope": "Production Go cognitive complexity and physical line distribution only, compared with fork baseline a7a24238",
+    "generated_at": "2026-07-31T01:00:27+08:00"
+  },
+  "summary": {
+    "verdict": "Current main is smaller and has a lower aggregate cognitive-complexity burden than the fork baseline, while its extreme tail remains concentrated in fixer and recovery orchestration.",
+    "strengths": [
+      "Production Go lines fell from 116,884 to 105,952 (-9.4%) despite the production file count increasing from 210 to 221.",
+      "Total cognitive complexity fell from 52,178 to 47,287 (-9.4%); maximum complexity fell from 234 to 181.",
+      "Files over 1,000 lines fell from 32 to 24, and functions over complexity 100 fell from 17 to 12.",
+      "Issue #95 alone removed 110 production functions, 573 cognitive-complexity points, and 1,896 production Go lines."
+    ],
+    "risks": [
+      "The current maximum remains very high: fixer Runner.ProcessClaimedItem is 181 and Runtime.runRecoveryPipeline is 178.",
+      "The count above complexity 50 is essentially flat versus the fork baseline (64 versus 63), so improvement is strongest in breadth rather than the extreme tail."
+    ],
+    "limitations": [
+      "This is a metrics-only comparison; correctness, security, testability, and architectural authority were not reassessed.",
+      "gocognit and physical line counts are investigation signals, not proof that a function or file should be split.",
+      "The original working tree changed concurrently; all measurements use frozen immutable snapshots and exclude untracked files."
+    ]
+  },
+  "dimensions": [
+    {
+      "id": "correctness",
+      "name": "Correctness and reliability",
+      "weight": 20,
+      "status": "not_assessed",
+      "confidence": "low",
+      "summary": "Outside the requested metrics-only scope.",
+      "evidence": []
+    },
+    {
+      "id": "understandability",
+      "name": "Understandability",
+      "weight": 15,
+      "status": "not_assessed",
+      "confidence": "low",
+      "summary": "Complexity and size were measured, but no qualitative score is inferred from metrics alone.",
+      "evidence": []
+    },
+    {
+      "id": "maintainability",
+      "name": "Maintainability",
+      "weight": 15,
+      "status": "not_assessed",
+      "confidence": "low",
+      "summary": "The distribution improved, but ownership and change-surface evidence was not re-audited.",
+      "evidence": []
+    },
+    {
+      "id": "design",
+      "name": "Design and modularity",
+      "weight": 15,
+      "status": "not_assessed",
+      "confidence": "low",
+      "summary": "Outside the requested metrics-only scope.",
+      "evidence": []
+    },
+    {
+      "id": "testability",
+      "name": "Testability and verification",
+      "weight": 15,
+      "status": "not_assessed",
+      "confidence": "low",
+      "summary": "Outside the requested metrics-only scope.",
+      "evidence": []
+    },
+    {
+      "id": "security",
+      "name": "Security",
+      "weight": 10,
+      "status": "not_assessed",
+      "confidence": "low",
+      "summary": "Outside the requested metrics-only scope.",
+      "evidence": []
+    },
+    {
+      "id": "performance",
+      "name": "Performance and resource use",
+      "weight": 5,
+      "status": "not_assessed",
+      "confidence": "low",
+      "summary": "Outside the requested metrics-only scope.",
+      "evidence": []
+    },
+    {
+      "id": "operability",
+      "name": "Operability and consistency",
+      "weight": 5,
+      "status": "not_assessed",
+      "confidence": "low",
+      "summary": "Outside the requested metrics-only scope.",
+      "evidence": []
+    }
+  ],
+  "root_causes": [],
+  "findings": [
+    {
+      "id": "CQ-001",
+      "title": "Characterize the remaining orchestration tail before further decomposition",
+      "severity": "info",
+      "confidence": "high",
+      "category": "maintainability",
+      "file": "internal/fixer/runner.go",
+      "line": 2142,
+      "symptoms": [
+        "Runner.ProcessClaimedItem has cognitive complexity 181",
+        "Runtime.runRecoveryPipeline has cognitive complexity 178",
+        "64 production functions remain above complexity 50"
+      ],
+      "evidence": "The aggregate and size distributions improved, but the extreme cognitive-complexity tail did not materially shrink.",
+      "impact": "Changes in orchestration-heavy paths may still require broad reasoning even though dead code and oversized-file counts declined.",
+      "recommendation": "Use impact and authority tracing before opening cleanup work; issue #271 already covers the recovery hotspot.",
+      "status": "opportunity"
+    }
+  ],
+  "checks": [
+    {
+      "command": "gocognit v1.2.1 -json <frozen snapshot>",
+      "status": "passed",
+      "summary": "Measured 7,043 current and 7,550 baseline production Go functions."
+    },
+    {
+      "command": "collect_metrics.py <frozen snapshot>",
+      "status": "passed",
+      "summary": "Collected tracked source inventory for both immutable revisions."
+    },
+    {
+      "command": "git merge-base origin/main upstream/main",
+      "status": "passed",
+      "summary": "Resolved fork baseline a7a2423842357d4a328de9d3cd75118e3d851c5a."
+    }
+  ],
+  "priorities": [
+    {
+      "horizon": "Next",
+      "items": [
+        "Use issue #271 to trace recovery authority before reducing runRecoveryPipeline complexity.",
+        "Only open a fixer cleanup issue after mapping the impact surface of Runner.ProcessClaimedItem."
+      ]
+    }
+  ]
+}

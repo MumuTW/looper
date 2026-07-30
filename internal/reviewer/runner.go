@@ -668,7 +668,7 @@ func New(options Options) *Runner {
 	}
 	loopConfig := options.LoopConfig
 	if loopConfig == (config.ReviewerLoopConfig{}) {
-		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 0, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
+		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 0, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true, ConvergenceUnproductiveRounds: 3, StuckItemAttempts: 4, SeverityFloor: "non_blocking", AbsoluteRoundCeiling: 40}
 	}
 	scope := options.Scope
 	if scope == "" {
@@ -5711,6 +5711,26 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 		} else {
 			loopMeta["identicalOutputCount"] = 1
 		}
+
+		// Convergence bounding: track semantic progress, not just round count.
+		productive := fp != previous
+		if productive {
+			loopMeta["consecutiveUnproductiveRounds"] = 0
+			loopMeta["lastProductiveAt"] = r.nowISO()
+		} else {
+			unproductive := intFromAny(loopMeta["consecutiveUnproductiveRounds"]) + 1
+			loopMeta["consecutiveUnproductiveRounds"] = unproductive
+			if r.loopConfig.ConvergenceUnproductiveRounds > 0 && unproductive >= r.loopConfig.ConvergenceUnproductiveRounds {
+				loopMeta["terminationReason"] = "convergence_stall"
+				loopMeta["status"] = "terminated"
+			}
+		}
+		// Absolute backstop: terminate if round ceiling reached.
+		if r.loopConfig.AbsoluteRoundCeiling > 0 && iterations+1 >= r.loopConfig.AbsoluteRoundCeiling {
+			loopMeta["terminationReason"] = "absolute_ceiling"
+			loopMeta["status"] = "terminated"
+		}
+
 		loopMeta["lastOutputFingerprint"] = fp
 		fingerprints, _ := loopMeta["publishedFindingFingerprints"].([]any)
 		if !containsAnyString(fingerprints, fp) {
