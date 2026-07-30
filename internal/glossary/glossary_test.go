@@ -1,310 +1,54 @@
 package glossary
 
-import (
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"os"
-	"path"
-	"path/filepath"
-	"regexp"
-	"sort"
-	"strings"
-	"testing"
-)
+import "testing"
 
-// repoRoot is two levels up from internal/glossary.
 const repoRoot = "../.."
 
-// externalPackageQualifiers lists package names CONTEXT.md may reference that
-// are not part of this repository. It is empty today and deliberately explicit:
-// an unknown qualifier is a typo far more often than a new external reference,
-// so the check denies by default and this is the visible escape hatch.
-var externalPackageQualifiers = map[string]struct{}{}
-
-// adrReference matches an ADR citation loosely so that a malformed one such as
-// ADR-00010 is caught here rather than silently matching its first four digits.
-// RE2 has no lookahead, so the token is captured whole and checked below.
-// Both spellings are in use: ADR filenames and headings say "ADR 0005" while
-// prose says "ADR-0005". Recognising only one leaves citations in the other
-// spelling unvalidated, so "ADR 9999" would pass by not being seen at all.
-var adrReference = regexp.MustCompile(`ADR[-\s]([0-9A-Za-z]+)`)
-
-// exactlyFourDigits guards a captured ADR token and an ADR filename prefix.
-var exactlyFourDigits = regexp.MustCompile(`^[0-9]{4}$`)
-
-// codePointer matches a backticked package-qualified exported identifier, such
-// as `forge.ReviewItemID`. The shape is deliberately strict so that the many
-// other backticked strings in CONTEXT.md — config keys (roles.planner.triggers),
-// event names (triage.report), GitHub fields (blocked_by), label values — are
-// not mistaken for code references. Anything not matching is simply not
-// checked; this test guards against rot, it does not require completeness.
-var codePointer = regexp.MustCompile("`([a-z][a-z0-9_]*)\\.([A-Z][A-Za-z0-9_]*)`")
-
-// packagePath matches a backticked repository path, such as `internal/labels`
-// or `internal/disclosure/disclosure.go`. The capture runs to the closing
-// backtick rather than stopping at the characters a path usually contains, so
-// that a reference carrying a suffix — an anchor, a stray bracket — is checked
-// and fails, instead of not matching at all and being silently skipped.
-var packagePath = regexp.MustCompile("`([A-Za-z0-9_.-]+(?:/[^`]*)?)`")
-
-// repoRootEntries is what a backticked reference is checked against, read from
-// the repository rather than listed here: a path under docs or tools can rot
-// exactly like one under internal, a root file such as AGENTS.md is referenced
-// with no slash at all, and a new top-level entry should not need this test
-// edited to be covered.
-func repoRootEntries(t *testing.T) (map[string]struct{}, map[string]struct{}) {
-	t.Helper()
-	entries, err := os.ReadDir(repoRoot)
-	if err != nil {
-		t.Fatalf("read repo root: %v", err)
-	}
-	names := map[string]struct{}{}
-	extensions := map[string]struct{}{}
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
-		names[entry.Name()] = struct{}{}
-		if !entry.IsDir() {
-			if extension := path.Ext(entry.Name()); extension != "" {
-				extensions[extension] = struct{}{}
-			}
-		}
-	}
-	return names, extensions
-}
-
-func contextDoc(t *testing.T) string {
-	t.Helper()
-	body, err := os.ReadFile(filepath.Join(repoRoot, "CONTEXT.md"))
-	if err != nil {
-		t.Fatalf("read CONTEXT.md: %v", err)
-	}
-	return string(body)
-}
-
-// An ADR citation that resolves to no file sends a reader looking for a
-// rationale that is not there, and gives no hint whether the decision was
-// renumbered, superseded, or never written down.
 func TestContextADRReferencesResolve(t *testing.T) {
 	t.Parallel()
-
-	entries, err := os.ReadDir(filepath.Join(repoRoot, "docs", "adr"))
+	findings, err := CheckADRReferences(repoRoot)
 	if err != nil {
-		t.Fatalf("read docs/adr: %v", err)
+		t.Fatalf("CheckADRReferences() error = %v", err)
 	}
-	present := map[string]string{}
-	for _, entry := range entries {
-		// Only a regular .md file is a decision record. A directory or asset
-		// carrying a numeric prefix would otherwise satisfy a citation that has
-		// no rationale behind it.
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
-			continue
-		}
-		number, _, found := strings.Cut(entry.Name(), "-")
-		if !found || !exactlyFourDigits.MatchString(number) {
-			continue
-		}
-		if existing, duplicate := present[number]; duplicate {
-			t.Errorf("ADR number %s is used by two files: %s and %s", number, existing, entry.Name())
-		}
-		present[number] = entry.Name()
-
-		// The filename prefix is the authority for the number only when the
-		// document agrees. A file named 0018-new-decision.md whose heading
-		// declares "# ADR-0017" leaves two documents visibly numbered 0017
-		// while the duplicate check above stays green, and a CONTEXT.md
-		// citation resolves to a filename whose body claims a different
-		// number. When a heading carries an ADR number, it must match.
-		if heading, ok := adrHeadingNumber(filepath.Join(repoRoot, "docs", "adr", entry.Name())); ok && heading != number {
-			t.Errorf("ADR file %s is numbered %s in its filename but %s in its heading", entry.Name(), number, heading)
-		}
-	}
-
-	for _, match := range adrReference.FindAllStringSubmatch(contextDoc(t), -1) {
-		cited := match[1]
-		if !exactlyFourDigits.MatchString(cited) {
-			t.Errorf("CONTEXT.md cites %s, which is not a four-digit ADR number", match[0])
-			continue
-		}
-		if _, ok := present[cited]; !ok {
-			t.Errorf("CONTEXT.md cites %s, but docs/adr has no such ADR", match[0])
-		}
+	for _, finding := range findings {
+		t.Errorf("%s", finding)
 	}
 }
 
-// adrHeadingNumber reads an ADR document's first Markdown heading and reports
-// the ADR number it declares, if any. Headings such as "# Coordinator is
-// stateless" carry no number and are reported as not present; "# ADR-0012: ..."
-// and "# ADR 0005: ..." report "0012" and "0005".
-func adrHeadingNumber(path string) (string, bool) {
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return "", false
-	}
-	// Capture the whole token rather than the first four digits. "ADR-00160"
-	// would otherwise report 0016 and match a file named 0016-…, leaving a
-	// misnumbered heading to agree with its filename by truncation.
-	headingRe := regexp.MustCompile(`ADR[- ]([0-9A-Za-z]+)`)
-	for _, line := range strings.Split(string(body), "\n") {
-		if strings.HasPrefix(line, "#") {
-			if m := headingRe.FindStringSubmatch(line); m != nil {
-				return m[1], true
-			}
-			return "", false
-		}
-	}
-	return "", false
-}
-
-// A glossary entry that points at a repository path is only as good as the
-// path.
-func TestContextPackagePathsResolve(t *testing.T) {
+func TestContextPathsResolve(t *testing.T) {
 	t.Parallel()
-
-	entries, rootExtensions := repoRootEntries(t)
-	for _, match := range packagePath.FindAllStringSubmatch(contextDoc(t), -1) {
-		reference := match[1]
-		top, hasSlash := "", strings.Contains(reference, "/")
-		top, _, _ = strings.Cut(reference, "/")
-		if !hasSlash {
-			// A root file is referenced with no slash, which makes it look
-			// exactly like the config keys and event names CONTEXT.md also
-			// backticks (triage.report, network.mode). Distinguish by
-			// extension, taken from the repository's own root files, so a
-			// typo in `AGENTS.md` is caught while `triage.report` is not
-			// mistaken for a file.
-			extension := path.Ext(reference)
-			if _, isRootExtension := rootExtensions[extension]; !isRootExtension {
-				continue
-			}
-		} else if _, isRepoReference := entries[top]; !isRepoReference {
-			// Not a repository reference — CONTEXT.md also backticks forge
-			// routes and config paths that look path-shaped.
-			continue
-		}
-		// A reference is a claim about repository content, so it has to stay
-		// inside the repository: `docs/../../../etc/passwd` names a real file
-		// on some machines and no repository content anywhere.
-		if reference != path.Clean(reference) || strings.HasPrefix(path.Clean(reference), "..") {
-			t.Errorf("CONTEXT.md references %q, which does not name repository content", reference)
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(repoRoot, filepath.FromSlash(reference))); err != nil {
-			t.Errorf("CONTEXT.md references %q, which does not exist", reference)
-		}
+	findings, err := CheckPaths(repoRoot)
+	if err != nil {
+		t.Fatalf("CheckPaths() error = %v", err)
+	}
+	for _, finding := range findings {
+		t.Errorf("%s", finding)
 	}
 }
 
-// The load-bearing one. Entries say "defined by forge.ReviewItemID" instead of
-// restating the definition, so a rename that misses CONTEXT.md turns the entry
-// into a confident lie. This makes that a build failure.
 func TestContextCodePointersResolve(t *testing.T) {
 	t.Parallel()
-
-	byName := packagesByName(t)
-	for _, match := range codePointer.FindAllStringSubmatch(contextDoc(t), -1) {
-		pkg, ident := match[1], match[2]
-		if _, external := externalPackageQualifiers[pkg]; external {
-			continue
-		}
-		candidates := byName[pkg]
-		switch len(candidates) {
-		case 0:
-			// Denying by default is the point. A mistyped qualifier such as
-			// `protcol.ParseTargetLabel` is exactly the stale pointer this test
-			// exists to catch; skipping it would leave the primary guarantee
-			// unenforced.
-			t.Errorf("CONTEXT.md references %s.%s, but no package in this repository is named %q; fix the reference or add %q to externalPackageQualifiers", pkg, ident, pkg, pkg)
-		case 1:
-			if _, ok := candidates[0].idents[ident]; !ok {
-				t.Errorf("CONTEXT.md references %s.%s, but %s declares no such identifier", pkg, ident, candidates[0].path)
-			}
-		default:
-			paths := make([]string, 0, len(candidates))
-			for _, candidate := range candidates {
-				paths = append(paths, candidate.path)
-			}
-			sort.Strings(paths)
-			t.Errorf("CONTEXT.md references %s.%s, but %q is ambiguous across %s; name the path instead of the bare package", pkg, ident, pkg, strings.Join(paths, " and "))
-		}
+	findings, err := CheckCodePointers(repoRoot)
+	if err != nil {
+		t.Fatalf("CheckCodePointers() error = %v", err)
+	}
+	for _, finding := range findings {
+		t.Errorf("%s", finding)
 	}
 }
 
-type declaredPackage struct {
-	path   string
-	idents map[string]struct{}
-}
-
-// packagesByName groups packages by declared name while keeping their paths
-// distinct. Pooling identifiers by name alone would let a pointer resolve
-// against the wrong package — internal/api and pkg/api are both named api — so
-// an ambiguous qualifier is reported rather than quietly satisfied by either.
-func packagesByName(t *testing.T) map[string][]declaredPackage {
-	t.Helper()
-
-	byDir := map[string]*declaredPackage{}
-	nameByDir := map[string]string{}
-	for _, root := range []string{"internal", "cmd", "pkg"} {
-		err := filepath.WalkDir(filepath.Join(repoRoot, root), func(path string, entry os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-				return nil
-			}
-			file, parseErr := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
-			if parseErr != nil {
-				return nil
-			}
-			dir := filepath.Dir(path)
-			if byDir[dir] == nil {
-				rel, relErr := filepath.Rel(repoRoot, dir)
-				if relErr != nil {
-					rel = dir
-				}
-				byDir[dir] = &declaredPackage{path: filepath.ToSlash(rel), idents: map[string]struct{}{}}
-				nameByDir[dir] = file.Name.Name
-			}
-			for _, name := range topLevelNames(file) {
-				byDir[dir].idents[name] = struct{}{}
-			}
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("walk %s: %v", root, err)
+// Ordinary prose must not be read as a citation. A check that fails CI on
+// correct text gets suppressed rather than obeyed.
+func TestADRCitationIgnoresProse(t *testing.T) {
+	t.Parallel()
+	for _, prose := range []string{"ADR-related", "ADR-driven design", "the ADR\nrationale"} {
+		if match := adrCitation.FindStringSubmatch(prose); match != nil {
+			t.Errorf("%q was read as a citation of %q", prose, match[1])
 		}
 	}
-
-	out := map[string][]declaredPackage{}
-	for dir, pkg := range byDir {
-		name := nameByDir[dir]
-		out[name] = append(out[name], *pkg)
-	}
-	return out
-}
-
-func topLevelNames(file *ast.File) []string {
-	names := []string{}
-	for _, decl := range file.Decls {
-		switch d := decl.(type) {
-		case *ast.FuncDecl:
-			if d.Recv == nil {
-				names = append(names, d.Name.Name)
-			}
-		case *ast.GenDecl:
-			for _, spec := range d.Specs {
-				switch s := spec.(type) {
-				case *ast.TypeSpec:
-					names = append(names, s.Name.Name)
-				case *ast.ValueSpec:
-					for _, name := range s.Names {
-						names = append(names, name.Name)
-					}
-				}
-			}
+	for _, citation := range []string{"ADR-0001", "ADR 0005", "ADR-00160"} {
+		if adrCitation.FindStringSubmatch(citation) == nil {
+			t.Errorf("%q was not recognised as a citation", citation)
 		}
 	}
-	return names
 }
