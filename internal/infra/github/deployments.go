@@ -7,7 +7,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/nexu-io/looper/internal/outboundguard"
+	"github.com/MumuTW/looper/internal/outboundguard"
 )
 
 // DeploymentEnvironment is the environment Looper records its deploys under. It

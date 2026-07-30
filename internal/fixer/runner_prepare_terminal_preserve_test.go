@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestCleanupFixerWorktreeIfTerminalSkipsUnpreparedWorktree(t *testing.T) {

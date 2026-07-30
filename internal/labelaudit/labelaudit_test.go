@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 const repoRoot = "../.."
@@ -105,7 +105,7 @@ func TestScanRejectsAmbiguousOwnership(t *testing.T) {
 
 	duplicated := append(DefaultOwners(), Owner{
 		Qualifier:  "impostor",
-		ImportPath: "github.com/nexu-io/looper/internal/labelaudit/testdata/impostor",
+		ImportPath: "github.com/MumuTW/looper/internal/labelaudit/testdata/impostor",
 		Dir:        filepath.Join("internal", "labelaudit", "testdata", "impostor"),
 	})
 
@@ -139,7 +139,7 @@ func TestScanProtectsOwnerConstantsDefinedByExpression(t *testing.T) {
 
 	owner := Owner{
 		Qualifier:  "impostor",
-		ImportPath: "github.com/nexu-io/looper/internal/labelaudit/testdata/impostor",
+		ImportPath: "github.com/MumuTW/looper/internal/labelaudit/testdata/impostor",
 		Dir:        filepath.Join("internal", "labelaudit", "testdata", "impostor"),
 	}
 	violations, err := ScanWith(Config{

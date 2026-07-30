@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 func TestValidateConfigPatchRequest(t *testing.T) {

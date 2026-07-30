@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/processsandbox"
+	"github.com/MumuTW/looper/internal/processsandbox"
 )
 
 const permissionProfile = "looper-validation"

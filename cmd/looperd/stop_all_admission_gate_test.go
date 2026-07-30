@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/agent"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 )
 
 // stopAll fallback after Pause failure must not leave a sticky loop stop gate:

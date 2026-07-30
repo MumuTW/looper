@@ -3,8 +3,8 @@ package workflow_test
 import (
 	"testing"
 
-	"github.com/nexu-io/looper/internal/loops/policy"
-	"github.com/nexu-io/looper/internal/reviewer/workflow"
+	"github.com/MumuTW/looper/internal/loops/policy"
+	"github.com/MumuTW/looper/internal/reviewer/workflow"
 )
 
 func TestSequence(t *testing.T) {

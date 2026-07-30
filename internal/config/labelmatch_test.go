@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func TestLabelsMatch(t *testing.T) {

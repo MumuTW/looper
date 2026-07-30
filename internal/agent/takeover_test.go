@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func codexCfg() ExecutorConfig  { v := config.AgentVendorCodex; return ExecutorConfig{Vendor: v} }

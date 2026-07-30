@@ -87,9 +87,9 @@ jobs:
       # not depend on which image the runner pool serves.
       - name: Harden sandbox runtime ancestors
         run: |
-          sudo chown root:root /usr/local /usr/local/lib
-          sudo chmod 0755 /usr/local /usr/local/lib
-          sudo setfacl -b /usr/local /usr/local/lib
+          sudo chown root:root / /usr /usr/local /usr/local/lib
+          sudo chmod 0755 / /usr /usr/local /usr/local/lib
+          sudo setfacl -b / /usr /usr/local /usr/local/lib
 
       - name: Test
         env:

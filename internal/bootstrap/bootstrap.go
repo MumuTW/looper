@@ -11,8 +11,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/processsandbox"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/processsandbox"
 )
 
 type Runtime any

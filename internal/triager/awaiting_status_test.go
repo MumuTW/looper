@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/planner"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/planner"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // Status must project the existing triage lifecycle rather than recording a

@@ -8,7 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/infra/shell"
 )
 
 // reservedReviewerScratchBaseName matches disposable reviewer submit scratch only.

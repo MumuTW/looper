@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/MumuTW/looper/internal/reviewer/criteria"
 )
 
 // Comment markers are dedup keys: postStampedPRCommentIfMissing scans PR

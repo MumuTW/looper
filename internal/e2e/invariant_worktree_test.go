@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/e2e/harness"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/e2e/harness"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestInvariantWorkerUsesIsolatedWorktreeAndLeavesUserRepoClean(t *testing.T) {

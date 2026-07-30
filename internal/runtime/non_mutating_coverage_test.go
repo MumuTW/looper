@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // Contract (#580): starting and degraded refuse the full work-producing tick
@@ -35,7 +35,7 @@ func TestNonMutatingCoverageTickPausesUnderStartingAndDegraded(t *testing.T) {
 			now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
 			nowISO := formatJavaScriptISOString(now)
 			baseBranch := "main"
-			projectMetadata := `{"repo":"nexu-io/looper"}`
+			projectMetadata := `{"repo":"MumuTW/looper"}`
 			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
 				ID: "looper", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"),
 				BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO,

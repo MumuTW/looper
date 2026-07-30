@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestGatewayRejectsRepoPathAsMutationWorktree(t *testing.T) {

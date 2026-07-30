@@ -1,6 +1,6 @@
 # Issue 51: Agent-managed commit, push, and PR lifecycle
 
-Issue: [nexu-io/looper#51](https://github.com/nexu-io/looper/issues/51)  
+Issue: [nexu-io/looper#51](https://github.com/nexu-io/looper/issues/51)
 Base branch: `main`
 
 ## Problem

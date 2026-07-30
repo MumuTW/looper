@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 const dashboardBootstrapCodePath = "/api/v1/dashboard/bootstrap/code"

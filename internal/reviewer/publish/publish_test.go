@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/MumuTW/looper/internal/reviewer/criteria"
 )
 
 // The markers are dedup keys scanned for verbatim in existing PR comments;

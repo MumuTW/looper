@@ -3,8 +3,8 @@ package runtime
 import (
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/forge"
 )
 
 // ReviewPublishReadiness is the operator-facing view of whether the daemon can

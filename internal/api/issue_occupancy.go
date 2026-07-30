@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/infra/github"
 )
 
 // errIssueNotFound is the classified sentinel returned by the production

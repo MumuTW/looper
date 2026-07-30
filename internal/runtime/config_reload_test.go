@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	networkclient "github.com/nexu-io/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/config"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
 )
 
 type recordingNetworkManager struct {

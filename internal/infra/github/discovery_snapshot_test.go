@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/infra/shell"
 )
 
 func TestDiscoverySnapshotCachesPerProjectDataAndTickLoginByCWD(t *testing.T) {

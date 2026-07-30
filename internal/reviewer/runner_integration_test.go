@@ -7,15 +7,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/e2e/harness"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/reviewer/criteria"
-	"github.com/nexu-io/looper/internal/reviewer/publish"
-	"github.com/nexu-io/looper/internal/reviewer/resolution"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/e2e/harness"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/reviewer/criteria"
+	"github.com/MumuTW/looper/internal/reviewer/publish"
+	"github.com/MumuTW/looper/internal/reviewer/resolution"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestThreadResolutionReplyPassesStampedGitHubPublicationBoundary(t *testing.T) {
