@@ -703,11 +703,17 @@ type execution struct {
 
 	mu        sync.Mutex
 	persistMu sync.Mutex // one ordered writer per execution (#578)
-	// lastPersistedHeartbeatCount (under persistMu) is the monotonic gate for
-	// live observations: stdout/stderr handlers snapshot under mu but persist
-	// under persistMu, so an older cumulative snapshot can arrive after a newer
-	// one persisted and must be dropped, not written.
+	// lastPersisted* (under persistMu) form the monotonic gate for live
+	// observations: stdout/stderr handlers snapshot under mu but persist under
+	// persistMu, so an older cumulative snapshot can arrive after a newer one
+	// persisted and must not overwrite it. Status is sampled at persist-call
+	// time — independent of the snapshot — so a stale-by-count observation can
+	// still carry the one-way running→cancelling transition, which is then
+	// written with the retained newer snapshot values.
 	lastPersistedHeartbeatCount int64
+	lastPersistedHeartbeatAt    string
+	lastPersistedOutputJSON     *string
+	lastPersistedStatus         string
 	terminalPersisted           bool
 	hardPersistReported         bool
 	status                      string
@@ -1560,9 +1566,20 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 	// Snapshots are cumulative (bounded output tails plus a heartbeat count
 	// that only grows under mu), so a snapshot older than the last persisted
 	// one carries strictly less information: drop it instead of moving durable
-	// heartbeat/output state backward.
+	// heartbeat/output state backward. The exception is a fresher status
+	// sample: the heartbeat count orders output snapshots but is not the
+	// authority for the independently sampled lifecycle status, so a
+	// running→cancelling transition is written with the retained newer
+	// snapshot values instead of being lost for the rest of the drain.
 	if heartbeatCount != nil && *heartbeatCount < x.lastPersistedHeartbeatCount {
-		return nil
+		if status != "cancelling" || x.lastPersistedStatus == "cancelling" {
+			return nil
+		}
+		retainedCount := x.lastPersistedHeartbeatCount
+		retainedAt := x.lastPersistedHeartbeatAt
+		heartbeatCount = &retainedCount
+		heartbeatAt = &retainedAt
+		outputJSON = x.lastPersistedOutputJSON
 	}
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
 		return nil
@@ -1605,8 +1622,15 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 		record.OutputJSON = outputJSON
 	}
 	err := x.upsertAgentExecutionWithRetry(ctx, record)
-	if err == nil && heartbeatCount != nil {
-		x.lastPersistedHeartbeatCount = *heartbeatCount
+	if err == nil {
+		x.lastPersistedStatus = status
+		if heartbeatCount != nil {
+			x.lastPersistedHeartbeatCount = *heartbeatCount
+			x.lastPersistedHeartbeatAt = *heartbeatAt
+		}
+		if outputJSON != nil {
+			x.lastPersistedOutputJSON = outputJSON
+		}
 	}
 	return err
 }
