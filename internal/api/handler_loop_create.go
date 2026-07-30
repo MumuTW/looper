@@ -228,9 +228,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 
 		shouldQueue := ((domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatus == domain.LoopStatusQueued) || (domain.LoopType(loopType) == domain.LoopTypePlanner && (candidateStatus == domain.LoopStatusRunning || candidateStatus == domain.LoopStatusQueued))
 		if shouldQueue {
-			queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(record, target, nowISO, metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+			queueRecord, ok, queueErr := loops.BuildQueuedLoopQueueRecord(record, target, nowISO, metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
 			if queueErr != nil {
-				return storage.LoopRecord{}, queueErr
+				return storage.LoopRecord{}, mapLoopReactivationError(queueErr, record.ID)
 			}
 			if ok {
 				existingQueue, findErr := transactionRepos.Queue.FindActiveByDedupe(r.Context(), queueRecord.DedupeKey)
@@ -898,9 +898,9 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 						return storage.LoopRecord{}, err
 					}
 				} else {
-					queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(loop, target, nowISO, loop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+					queueRecord, ok, queueErr := loops.BuildQueuedLoopQueueRecord(loop, target, nowISO, loop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
 					if queueErr != nil {
-						return storage.LoopRecord{}, queueErr
+						return storage.LoopRecord{}, mapLoopReactivationError(queueErr, loop.ID)
 					}
 					if ok {
 						if force {
@@ -1171,9 +1171,9 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 			return storage.LoopRecord{}, upsertErr
 		}
 
-		queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(record, target, nowISO, &metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+		queueRecord, ok, queueErr := loops.BuildQueuedLoopQueueRecord(record, target, nowISO, &metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
 		if queueErr != nil {
-			return storage.LoopRecord{}, queueErr
+			return storage.LoopRecord{}, mapLoopReactivationError(queueErr, record.ID)
 		}
 		if !ok {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "failed to build planner queue item"}
