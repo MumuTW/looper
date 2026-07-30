@@ -20,8 +20,6 @@ const (
 // window. Its touched files and reproduction evidence come from authoritative
 // forge and reproduction records, not inference from an agent summary.
 type MergeCandidate struct {
-	ProjectID              string
-	Repo                   string
 	PRNumber               int64
 	HeadSHA                string
 	MergedAt               time.Time
