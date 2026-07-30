@@ -992,7 +992,18 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair, worktree *check
 		firstNonEmpty(repair.ParseStatus, "missing"),
 	)
 	if worktree != nil && worktree.Path != "" && worktree.CleanedAt == "" {
-		message += "; worktree preserved at " + worktree.Path
+		// Path != "" and an empty CleanedAt only prove Looper did not record
+		// cleanup; they do not prove the worktree still exists on disk (external
+		// deletion, daemon restart with an old checkpoint, or an agent removing
+		// its working directory can all leave a stale path). Verify the local
+		// path before claiming preservation, and otherwise describe the recorded
+		// path so the operator is not told recovery evidence was preserved at a
+		// nonexistent location.
+		if _, statErr := os.Stat(worktree.Path); statErr == nil {
+			message += "; worktree preserved at " + worktree.Path
+		} else {
+			message += "; recorded worktree path " + worktree.Path
+		}
 	}
 	if summary := strings.TrimSpace(repair.Summary); summary != "" {
 		message += ". Agent summary: " + summary
@@ -5437,6 +5448,43 @@ func restartLatestRunFromDiscover(ctx context.Context, repos *storage.Repositori
 	return repos.Runs.Upsert(ctx, updated)
 }
 
+// MarkManualInterventionRunRestartFromDiscover rewrites the latest failed fixer
+// run's checkpoint to restart_from_discover when it is parked for manual
+// intervention. Operator retry is the explicit authority that escapes a parked
+// manual-intervention checkpoint (for example a missing or invalid repair
+// completion result recorded at resolve-comments or recheck): without this,
+// createRunContext resumes at the same downstream step and
+// validateFixerResumeCheckpoint parks it again, so even a retry after manually
+// recovering or discarding the worktree can never reach repair or discovery.
+// Runs that are not failed or are not parked for manual recovery are left
+// untouched so createRunContext's natural resume logic still applies. The
+// boolean reports whether a checkpoint was rewritten.
+func MarkManualInterventionRunRestartFromDiscover(ctx context.Context, repos *storage.Repositories, loopID, updatedAt string) (bool, error) {
+	if repos == nil || repos.Runs == nil {
+		return false, nil
+	}
+	latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loopID)
+	if err != nil {
+		return false, err
+	}
+	if latestRun == nil || latestRun.Status != "failed" {
+		return false, nil
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		return false, nil
+	}
+	checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+	updated := *latestRun
+	encoded := mustMarshalJSON(checkpoint)
+	updated.CheckpointJSON = &encoded
+	updated.UpdatedAt = updatedAt
+	if err := repos.Runs.Upsert(ctx, updated); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (r *Runner) resumePausedNoopResolveLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string) (bool, storage.LoopRecord, error) {
 	if loop.Status != "paused" || r.repos == nil || r.repos.Runs == nil {
 		return false, loop, nil
@@ -5899,6 +5947,15 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 }
 
 func (r *Runner) failQueueItemWithBreaker(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep, failure *loopError) (*storage.QueueItemRecord, int, error) {
+	// Manual-intervention failures are already terminal and park the loop for
+	// human recovery. They must not count toward the consecutive-failure
+	// breaker: tripping it would clean the preserved worktree and enqueue a
+	// rediscovery handoff that rewrites the checkpoint back to discover,
+	// destroying the very recovery evidence this state is meant to retain.
+	if failure.kind == FailureManualIntervention {
+		failedQueue, err := r.failQueueItemTerminal(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts+1)
+		return failedQueue, 0, err
+	}
 	streak, streakLoop, err := r.recordFixerFailureStreak(ctx, loop, queueItem, runID, checkpoint, step)
 	if err != nil {
 		return nil, 0, err
@@ -6944,6 +7001,19 @@ func previousFixerStep(step FixerStep) FixerStep {
 func validateFixerResumeCheckpoint(startStep FixerStep, checkpoint fixerCheckpoint) error {
 	switch startStep {
 	case stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck:
+		// Resuming at any step after repair requires the structured completion
+		// result as the authority for reconcile/validate/push/resolve decisions.
+		// A legacy or interrupted run may record LastCompletedStep as repair or
+		// later while its checkpoint has no repair object; a wholly absent
+		// repair record is the strongest form of the missing contract parked
+		// here, so reject it before downstream steps can commit, push, or mutate
+		// review threads without the declared-authoritative result.
+		if checkpoint.Repair == nil {
+			return &loopError{
+				message: "Fixer resume checkpoint is missing the completed repair record; automatic retry paused for manual recovery",
+				kind:    FailureManualIntervention,
+			}
+		}
 		return validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree)
 	default:
 		return nil

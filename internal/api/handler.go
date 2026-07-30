@@ -26,6 +26,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer"
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
@@ -6088,6 +6089,16 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 				return retryResult{}, metadataErr
 			}
 			queueLoop.MetadataJSON = metadataJSON
+			// An explicit operator retry must escape a fixer run parked for manual
+			// intervention (e.g. a missing/invalid repair completion result). Without
+			// rewriting the checkpoint, createRunContext resumes at the same
+			// downstream step and validateFixerResumeCheckpoint parks it again, so
+			// retry can never reach repair or discovery. Marking restart_from_discover
+			// is the supported recovery transition; runs not parked for manual
+			// recovery are left untouched.
+			if _, err := fixer.MarkManualInterventionRunRestartFromDiscover(ctx, repos, loop.ID, nowISO); err != nil {
+				return retryResult{}, err
+			}
 		}
 		var queueRecord storage.QueueItemRecord
 		var ok bool
