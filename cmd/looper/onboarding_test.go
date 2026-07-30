@@ -38,6 +38,21 @@ type fakeDaemon struct {
 	createBody   map[string]any
 	createStatus int
 	createError  string
+	// createDelay stands in for the worktree and pull request discovery the
+	// daemon runs after it has already committed the project.
+	createDelay time.Duration
+
+	// Optional /api/v1/status fields for ops-readiness lines on `looper status`.
+	looperPath                  string
+	includeReviewPublish        bool
+	reviewKnown                 bool
+	reviewCapable               bool
+	reviewCapability            string
+	reviewPublishingDisabled    bool
+	reviewReason                string
+	quarantinedActiveExecutions int
+	quarantinedRunningRuns      int
+	degradedReasons             []string
 }
 
 func newFakeDaemon(t *testing.T) *fakeDaemon {
@@ -48,6 +63,30 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		switch {
 		case r.URL.Path == "/api/v1/healthz" && r.Method == http.MethodGet:
 			writeEnvelope(w, http.StatusOK, map[string]any{"healthy": daemon.healthy})
+		case r.URL.Path == "/api/v1/status" && r.Method == http.MethodGet:
+			tools := map[string]any{"looperPath": daemon.looperPath}
+			if daemon.includeReviewPublish {
+				tools["reviewPublish"] = map[string]any{
+					"known":              daemon.reviewKnown,
+					"capable":            daemon.reviewCapable,
+					"capability":         daemon.reviewCapability,
+					"publishingDisabled": daemon.reviewPublishingDisabled,
+					"reason":             daemon.reviewReason,
+				}
+			}
+			writeEnvelope(w, http.StatusOK, map[string]any{
+				"service": map[string]any{
+					"healthy":         daemon.healthy,
+					"degradedReasons": daemon.degradedReasons,
+					"recovery": map[string]any{
+						"outstanding": map[string]any{
+							"quarantinedActiveExecutions": daemon.quarantinedActiveExecutions,
+							"quarantinedRunningRuns":      daemon.quarantinedRunningRuns,
+						},
+					},
+				},
+				"tools": tools,
+			})
 		case r.URL.Path == "/api/v1/projects" && r.Method == http.MethodGet:
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": daemon.projects})
 		case r.URL.Path == "/api/v1/projects" && r.Method == http.MethodPost:
@@ -421,6 +460,54 @@ func TestStatusReportsConfigDaemonAndProjects(t *testing.T) {
 		t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
 	}
 	for _, want := range []string{path, "(ok)", "reachable, healthy", "projects: 2", "alpha", "/repos/alpha", "beta", "(archived)"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("status output missing %q\n%s", want, stdout)
+		}
+	}
+}
+
+func TestStatusReportsReviewPublishAndOrphanDebt(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	daemon.looperPath = "/opt/old-looper"
+	daemon.includeReviewPublish = true
+	daemon.reviewKnown = true
+	daemon.reviewPublishingDisabled = true
+	daemon.reviewReason = "`looper review capability` failed: exit status 1"
+	daemon.quarantinedActiveExecutions = 2
+	daemon.quarantinedRunningRuns = 2
+	daemon.degradedReasons = []string{"review_publish_disabled", "quarantine_orphan_debt"}
+	configForDaemon(t, daemon.server.URL)
+
+	code, stdout, stderr := runCLI(t, "status")
+	if code != 0 {
+		t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
+	}
+	for _, want := range []string{
+		"publishing disabled",
+		"/opt/old-looper",
+		"quarantinedActiveExecutions=2",
+		"quarantinedRunningRuns=2",
+		"review_publish_disabled",
+		"quarantine_orphan_debt",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("status output missing %q\n%s", want, stdout)
+		}
+	}
+}
+
+func TestStatusReportsUnknownReviewPublishReadiness(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	daemon.looperPath = "/opt/looper"
+	daemon.includeReviewPublish = true
+	daemon.reviewReason = "capability has not been probed yet"
+	configForDaemon(t, daemon.server.URL)
+
+	code, stdout, stderr := runCLI(t, "status")
+	if code != 0 {
+		t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
+	}
+	for _, want := range []string{"publish readiness unknown", "capability has not been probed yet", "/opt/looper"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("status output missing %q\n%s", want, stdout)
 		}

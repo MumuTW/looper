@@ -101,7 +101,9 @@ looperd
 Foreground only; nothing supervises it. Keep it running. Health check:
 
 ```bash
-curl -sS "http://127.0.0.1:17310/api/v1/healthz"
+curl -sS "http://127.0.0.1:17310/api/v1/healthz"  # liveness
+curl -sS "http://127.0.0.1:17310/api/v1/status"   # ops readiness (review publish, quarantine debt)
+looper status
 ```
 
 ### Step 5 — Register a project

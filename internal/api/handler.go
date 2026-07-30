@@ -961,10 +961,15 @@ type statusService struct {
 	DaemonMode config.DaemonMode     `json:"daemonMode"`
 	// AdmissionState is the single live admission Authority (ADR-0015 R1).
 	// HTTP mutations and scheduler claims open only when this is "ready".
-	AdmissionState string       `json:"admissionState"`
-	StartedAt      *string      `json:"startedAt,omitempty"`
-	Recovery       any          `json:"recovery"`
-	Binary         statusBinary `json:"binary"`
+	AdmissionState string  `json:"admissionState"`
+	StartedAt      *string `json:"startedAt,omitempty"`
+	// Recovery mixes the one-shot startup snapshot with live outstanding
+	// quarantine/orphan debt under recovery.outstanding.
+	Recovery any `json:"recovery"`
+	// DegradedReasons lists sticky ops signals (review publish disabled,
+	// quarantine orphan debt). Empty when none apply.
+	DegradedReasons []string     `json:"degradedReasons,omitempty"`
+	Binary          statusBinary `json:"binary"`
 }
 
 type statusBinary struct {
@@ -1092,6 +1097,10 @@ type statusTools struct {
 	Git       bool `json:"git"`
 	GH        bool `json:"gh"`
 	Osascript bool `json:"osascript"`
+	// LooperPath is the configured tools.looperPath used for review publish.
+	LooperPath string `json:"looperPath,omitempty"`
+	// ReviewPublish surfaces capability-probe readiness for reviewer publishing.
+	ReviewPublish looperdruntime.ReviewPublishReadiness `json:"reviewPublish"`
 }
 
 func (h *Handler) handleConfigRoute(w http.ResponseWriter, r *http.Request, requestID string) {
@@ -1367,15 +1376,24 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	installDir := filepath.Join(homeDirOrEmpty(), ".looper", "bin")
 	artifactName := looperdArtifactName(currentTarget)
 
+	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.context.Config)
+	outstanding, err := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
+	if err != nil {
+		return statusResponse{}, err
+	}
+	recovery := h.recoveryWithOutstanding(outstanding)
+	degradedReasons := statusDegradedReasons(reviewPublish, outstanding)
+
 	return statusResponse{
 		Service: statusService{
-			Healthy:        storageState.OK,
-			Version:        version.Current().Version,
-			Build:          version.Current().Metadata,
-			DaemonMode:     h.context.Config.Daemon.Mode,
-			AdmissionState: h.admissionStateString(),
-			StartedAt:      h.startedAtISO(),
-			Recovery:       h.recoverySummary(),
+			Healthy:         storageState.OK,
+			Version:         version.Current().Version,
+			Build:           version.Current().Metadata,
+			DaemonMode:      h.context.Config.Daemon.Mode,
+			AdmissionState:  h.admissionStateString(),
+			StartedAt:       h.startedAtISO(),
+			Recovery:        recovery,
+			DegradedReasons: degradedReasons,
 			Binary: statusBinary{
 				Name:             "looperd",
 				Path:             daemonExecutablePath(),
@@ -1429,9 +1447,11 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			OsascriptEnabled: h.context.Config.Notifications.Osascript.Enabled,
 		},
 		Tools: statusTools{
-			Git:       hasValue(h.context.Config.Tools.GitPath),
-			GH:        hasValue(h.context.Config.Tools.GHPath),
-			Osascript: hasValue(h.context.Config.Tools.OsascriptPath),
+			Git:           hasValue(h.context.Config.Tools.GitPath),
+			GH:            hasValue(h.context.Config.Tools.GHPath),
+			Osascript:     hasValue(h.context.Config.Tools.OsascriptPath),
+			LooperPath:    reviewPublish.LooperPath,
+			ReviewPublish: reviewPublish,
 		},
 		Providers: h.buildProviderHealth(ctx),
 	}, nil
@@ -1633,6 +1653,42 @@ func normalizeRecoverySummary(summary looperdruntime.RecoverySummary) map[string
 	}
 
 	return normalized
+}
+
+func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.OutstandingQuarantineDebt) any {
+	recovery := h.recoverySummary()
+	normalized, ok := recovery.(map[string]any)
+	if !ok {
+		if recovery == nil {
+			normalized = map[string]any{}
+		} else {
+			// Preserve non-map recovery payloads from test doubles.
+			return map[string]any{
+				"snapshot":    recovery,
+				"outstanding": outstanding,
+			}
+		}
+	} else {
+		// Copy so we do not mutate a shared recovery map.
+		copied := make(map[string]any, len(normalized)+1)
+		for key, value := range normalized {
+			copied[key] = value
+		}
+		normalized = copied
+	}
+	normalized["outstanding"] = outstanding
+	return normalized
+}
+
+func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt) []string {
+	var reasons []string
+	if reviewPublish.Known && reviewPublish.PublishingDisabled && strings.TrimSpace(reviewPublish.LooperPath) != "" {
+		reasons = append(reasons, "review_publish_disabled")
+	}
+	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {
+		reasons = append(reasons, "quarantine_orphan_debt")
+	}
+	return reasons
 }
 
 type projectsListResponse struct {

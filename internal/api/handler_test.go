@@ -997,6 +997,111 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, reviewer["waiting"], float64(1))
 	assertEqual(t, reviewer["terminated"], float64(1))
 	assertEqual(t, reviewer["stopped"], float64(1))
+
+	tools := data["tools"].(map[string]any)
+	reviewPublish, ok := tools["reviewPublish"].(map[string]any)
+	if !ok {
+		t.Fatalf("tools.reviewPublish missing: %#v", tools)
+	}
+	if _, ok := reviewPublish["publishingDisabled"].(bool); !ok {
+		t.Fatalf("tools.reviewPublish.publishingDisabled missing: %#v", reviewPublish)
+	}
+	recovery := service["recovery"].(map[string]any)
+	outstanding, ok := recovery["outstanding"].(map[string]any)
+	if !ok {
+		t.Fatalf("service.recovery.outstanding missing: %#v", recovery)
+	}
+	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(0))
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
+}
+
+func TestHandlerStatusSurfacesUnknownReviewPublishWithoutProbing(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	incapable := filepath.Join(t.TempDir(), "old-looper")
+	probeLog := filepath.Join(t.TempDir(), "probe-log")
+	if err := os.WriteFile(incapable, []byte("#!/bin/sh\necho probe > "+probeLog+"\necho unknown >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(looper) error = %v", err)
+	}
+	cfg.Tools.LooperPath = &incapable
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	service := data["service"].(map[string]any)
+	tools := data["tools"].(map[string]any)
+	assertEqual(t, tools["looperPath"], incapable)
+	reviewPublish := tools["reviewPublish"].(map[string]any)
+	assertEqual(t, reviewPublish["publishingDisabled"], true)
+	assertEqual(t, reviewPublish["capable"], false)
+	assertEqual(t, reviewPublish["known"], false)
+	assertEqual(t, reviewPublish["reason"], "capability has not been probed yet")
+	if _, err := os.Stat(probeLog); !os.IsNotExist(err) {
+		t.Fatalf("GET status executed capability probe: Stat(%q) error = %v, want not exist", probeLog, err)
+	}
+	reasons, _ := service["degradedReasons"].([]any)
+	if strings.Contains(fmt.Sprintf("%v", reasons), "review_publish_disabled") {
+		t.Fatalf("degradedReasons = %#v, unknown readiness must not be reported as disabled", reasons)
+	}
+}
+
+func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
+	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
+		options.ReadProcessCommand = func(context.Context, int) (string, error) { return "", nil }
+	})
+	rt, cfg := fixture.runtime, fixture.config
+	repos := rt.Services().Repositories
+	oldISO := fixture.now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	projectID := "project_reconcile_status"
+	loopID := "loop_reconcile_status"
+	runID := "run_reconcile_status"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Reconcile", RepoPath: fixture.rootDir, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("work"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reconcile_status", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "worker:reconcile-status", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: oldISO, StartedAt: &oldISO, MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	pid := int64(9191)
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "execution_reconcile_status", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(fixture.rootDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+	}
+	if summary.QuarantinedExecutions != 1 {
+		t.Fatalf("summary = %#v, want one quarantined execution", summary)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	service := data["service"].(map[string]any)
+	outstanding := service["recovery"].(map[string]any)["outstanding"].(map[string]any)
+	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(1))
+	// Quarantine deliberately leaves uncertain execution/run evidence active;
+	// this counter exists to surface the resulting active-runs inflation.
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
+	if !strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
+		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
+	}
+	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "running" {
+		t.Fatalf("run after reconcile = %#v, %v; want running quarantine evidence", run, err)
+	}
 }
 
 func TestHandlerStatusIncludesRedactedForgejoProviderHealth(t *testing.T) {

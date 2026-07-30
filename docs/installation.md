@@ -107,9 +107,12 @@ Projects registered through the API take effect immediately. Projects listed und
 In another shell, confirm the daemon answers:
 
 ```bash
-curl -sS "http://127.0.0.1:17310/api/v1/healthz"
+curl -sS "http://127.0.0.1:17310/api/v1/healthz"   # liveness (storage up)
+curl -sS "http://127.0.0.1:17310/api/v1/status"    # ops readiness (admission, review publish, quarantine debt)
 # or open the dashboard URL printed in the looperd logs / your browser on that host:port
 ```
+
+`healthz` only means the process and storage are up. Use `/status` (or `looper status`) when you care whether reviewer publishing is enabled and whether quarantined orphan runs are still outstanding.
 
 Then exercise a control verb against a known loop once one exists:
 
