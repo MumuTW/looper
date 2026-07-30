@@ -9,6 +9,9 @@
   - `go vet ./...`
   - `go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 -tests=false -checks='U1000,SA1006,SA4004,SA4006' ./...`
   - `go test ./...`
+- `go build` / `go run` are Go-only development paths and may serve the
+  dashboard fallback from a clean checkout. Use `scripts/build-looperd.sh` for
+  a distributable daemon with the production dashboard embedded.
 
 ## Repo structure
 
@@ -28,7 +31,7 @@
 ## Conventions
 
 - Build output lives in `dist/`; do not edit generated files.
-- CI (`.github/workflows/ci.yml`) `verify` runs on PR updates: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → production-only staticcheck → `go test ./...` → `go build ./...`.
+- CI (`.github/workflows/ci.yml`) `verify` runs on PR updates: dashboard (`pnpm install`/`test`/`build` + artifact checks) → `gofmt -l .` → `go vet ./...` → production-only staticcheck → `go test ./...` → `go build ./...` → embedded-dashboard binary contract.
 - Commit messages and PR titles must use semantic prefixes, for example `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`, or `ci:`.
 
 ## Review guidelines

@@ -64,8 +64,9 @@ curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/install.
 #    it would have added. Skip only if ~/.local/bin is already on PATH.
 export PATH="$HOME/.local/bin:$PATH"
 
-# 3. Daemon — same release's looperd-<target>.tar.gz onto PATH, or:
-#    go build -o ~/.local/bin/looperd ./cmd/looperd
+# 3. Daemon — same release's looperd-<target>.tar.gz onto PATH, or build a
+#    checkout with its production dashboard:
+#    scripts/build-looperd.sh --output ~/.local/bin/looperd
 
 # 4. Config — writes a commented ~/.looper/config.toml, never overwrites one
 looper init

@@ -103,6 +103,8 @@ jobs:
           looper_build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           export LOOPER_BUILD_TIMESTAMP="$looper_build_timestamp"
           go build -ldflags "$(go run ./tools/go-build-flags)" ./...
+          scripts/build-looperd.sh --assets-ready --output dist/looperd-ci
+          go run ./tools/verify-looperd-dashboard --binary dist/looperd-ci
 
   race:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false

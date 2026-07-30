@@ -98,9 +98,11 @@ if [ "${#race_packages[@]}" -eq 0 ]; then
 fi
 go test -race -count=1 "${race_packages[@]}"
 
-step "go build (release ldflags)"
+step "go build (release ldflags + embedded dashboard contract)"
 LOOPER_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 LOOPER_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
   go build -ldflags "$(go run ./tools/go-build-flags)" ./...
+scripts/build-looperd.sh --assets-ready --output dist/looperd-verify
+go run ./tools/verify-looperd-dashboard --binary dist/looperd-verify
 
 printf '\n\033[32m✓ passed — matches CI'"'"'s verify + race jobs\033[0m\n'
