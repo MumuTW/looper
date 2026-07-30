@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -30,8 +29,8 @@ func (h *Handler) buildReviewerRepairRouteResponse(r *http.Request) (reviewer.Re
 		}
 	}
 	var request reviewerRepairRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		return reviewer.RepairResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid repair request: %v", err)}
+	if aerr := decodeJSONMutationBody(r, &request, true); aerr != nil {
+		return reviewer.RepairResult{}, *aerr
 	}
 	input := reviewer.RepairInput{
 		ProjectID: strings.TrimSpace(request.ProjectID),
