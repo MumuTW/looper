@@ -5063,8 +5063,12 @@ func TestRecoveryPipelinePartitionsStrandedQueuedLoopsByRunStatus(t *testing.T) 
 	}
 
 	// Stranded queued loop whose latest run was interrupted: resumable work,
-	// first pass requeues and provisions a recovery queue item.
-	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stranded_resumable", Seq: 9102, ProjectID: "project_1", Type: "worker", TargetType: "project", Status: "queued", NextRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	// first pass requeues and provisions a recovery queue item. The loop
+	// carries the target and worker metadata the worker API records, so the
+	// provisioned item is executable work, and its NextRunAt is stale so the
+	// refresh to the recovery timestamp is observable.
+	staleISO := formatJavaScriptISOString(now.Add(-time.Hour))
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stranded_resumable", Seq: 9102, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:77"), Repo: stringPtr("acme/looper"), Status: "queued", NextRunAt: stringPtr(staleISO), MetadataJSON: stringPtr(`{"worker":{"title":"Resume migration","prompt":"Finish the migration","repo":"acme/looper","baseBranch":"main"}}`), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert(resumable) error = %v", err)
 	}
 	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stranded_resumable", LoopID: "loop_stranded_resumable", Status: "interrupted", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -5094,14 +5098,21 @@ func TestRecoveryPipelinePartitionsStrandedQueuedLoopsByRunStatus(t *testing.T) 
 	if containsEventType(doneEvents, "looperd.recovery.loop_requeued") {
 		t.Fatalf("done events = %#v, want no first-pass requeue", doneEvents)
 	}
+	doneQueue, err := repositories.Queue.GetLatestByLoopID(context.Background(), "loop_stranded_done")
+	if err != nil {
+		t.Fatalf("Queue.GetLatestByLoopID(done) error = %v", err)
+	}
+	if doneQueue != nil && (doneQueue.Status == "queued" || doneQueue.Status == "running") {
+		t.Fatalf("done queue item = %#v, want no active work provisioned for a finished loop", doneQueue)
+	}
 
 	// Resumable side: requeued by the first pass with a provisioned queue item.
 	resumable, err := repositories.Loops.GetByID(context.Background(), "loop_stranded_resumable")
 	if err != nil || resumable == nil {
 		t.Fatalf("Loops.GetByID(resumable) = (%#v, %v)", resumable, err)
 	}
-	if resumable.Status != "queued" || resumable.NextRunAt == nil {
-		t.Fatalf("resumable loop = status %q nextRunAt %v, want requeued", resumable.Status, resumable.NextRunAt)
+	if resumable.Status != "queued" || resumable.NextRunAt == nil || *resumable.NextRunAt != nowISO {
+		t.Fatalf("resumable loop = status %q nextRunAt %v, want requeued with the stale schedule refreshed to %q", resumable.Status, resumable.NextRunAt, nowISO)
 	}
 	resumableEvents, err := repositories.Events.ListByEntity(context.Background(), "loop", "loop_stranded_resumable")
 	if err != nil {
@@ -5119,5 +5130,21 @@ func TestRecoveryPipelinePartitionsStrandedQueuedLoopsByRunStatus(t *testing.T) 
 	}
 	if latestQueue == nil || latestQueue.Status != "queued" {
 		t.Fatalf("latest queue item = %#v, want a provisioned queued recovery item", latestQueue)
+	}
+	// The provisioned item must be executable work: the worker target and
+	// metadata seeded on the loop survive into the queue item, so a claim
+	// resumes the migration instead of failing on an empty target.
+	if latestQueue.TargetID != "issue:acme/looper:77" || derefString(latestQueue.Repo) != "acme/looper" {
+		t.Fatalf("latest queue item target = (%q, %q), want the loop's issue target and repo preserved", latestQueue.TargetID, derefString(latestQueue.Repo))
+	}
+	var payload map[string]any
+	if latestQueue.PayloadJSON == nil {
+		t.Fatalf("latest queue item = %#v, want the worker metadata carried as payload", latestQueue)
+	}
+	if err := json.Unmarshal([]byte(*latestQueue.PayloadJSON), &payload); err != nil {
+		t.Fatalf("payload unmarshal error = %v", err)
+	}
+	if payload["repo"] != "acme/looper" || payload["prompt"] != "Finish the migration" {
+		t.Fatalf("payload = %#v, want the seeded worker repo and prompt preserved", payload)
 	}
 }
