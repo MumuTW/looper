@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/planner"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 // Status must project the existing triage lifecycle rather than recording a
@@ -22,11 +23,18 @@ func TestAwaitingConfirmationStatusProjectsOnlyUnresolvedReports(t *testing.T) {
 	confirmed := statusAwaitingReport("confirmed", 42, now.Add(-2*time.Hour))
 	routed := statusAwaitingReport("routed", 43, now.Add(-time.Hour))
 	retired := statusAwaitingReport("retired", 44, now.Add(-30*time.Minute))
+	archived := Report{
+		Version: 2, IdempotencyKey: "archived", ProjectID: "project_archived", Repo: "acme/archived", IssueNumber: 46,
+		Policy: PolicyDecision{Action: ActionAwaitHuman}, CreatedAt: now.Add(-45 * time.Minute).Format(time.RFC3339Nano),
+	}
 	nonAwaiting := Report{
 		Version: 2, IdempotencyKey: "routable", ProjectID: "project_1", Repo: "acme/looper", IssueNumber: 45,
 		Policy: PolicyDecision{Action: ActionRoutePlanner}, CreatedAt: now.Add(-4 * time.Hour).Format(time.RFC3339Nano),
 	}
-	for _, report := range []Report{pending, confirmed, routed, retired, nonAwaiting} {
+	if err := fixture.repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: archived.ProjectID, Name: "Archived", RepoPath: t.TempDir(), Archived: true, CreatedAt: archived.CreatedAt, UpdatedAt: archived.CreatedAt}); err != nil {
+		t.Fatalf("upsert archived project: %v", err)
+	}
+	for _, report := range []Report{pending, confirmed, routed, retired, archived, nonAwaiting} {
 		if err := runner.persistReport(ctx, report); err != nil {
 			t.Fatalf("persist report %q: %v", report.IdempotencyKey, err)
 		}

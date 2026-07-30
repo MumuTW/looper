@@ -22,6 +22,7 @@ import {
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import {
   formatAge,
+  formatDurationSeconds,
   formatAttempts,
   truncateReason,
 } from "@/lib/format";
@@ -524,7 +525,7 @@ export function OverviewPage({
                     className="m-0 mt-1 mono text-[12px] text-[var(--text-muted)]"
                     key={`${source.projectId ?? ""}:${source.repo ?? ""}:${source.issueNumber ?? ""}`}
                   >
-                    {source.repo ?? "—"}#{source.issueNumber ?? "—"} · waiting {formatAge(source.createdAt)}
+                    {source.repo ?? "—"}#{source.issueNumber ?? "—"} · waiting {formatDurationSeconds(source.ageSeconds)}
                   </p>
                 ),
               )}

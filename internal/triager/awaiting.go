@@ -123,8 +123,18 @@ type awaitingConfirmationState struct {
 // which reports need attention.
 func AwaitingConfirmationStatus(ctx context.Context, repositories *storage.Repositories, now time.Time) (AwaitingConfirmationSummary, error) {
 	summary := AwaitingConfirmationSummary{Sources: []AwaitingConfirmationSource{}}
-	if repositories == nil || repositories.Events == nil {
+	if repositories == nil || repositories.Events == nil || repositories.Projects == nil {
 		return summary, fmt.Errorf("triager repositories are not configured")
+	}
+	projects, err := repositories.Projects.List(ctx)
+	if err != nil {
+		return summary, fmt.Errorf("list projects for triage status: %w", err)
+	}
+	activeProjectIDs := make(map[string]struct{}, len(projects))
+	for _, project := range projects {
+		if !project.Archived {
+			activeProjectIDs[project.ID] = struct{}{}
+		}
 	}
 	events, err := repositories.Events.ListByEntityTypeAndEventTypes(ctx, reportEntityType, []string{
 		ReportEventType,
@@ -184,6 +194,9 @@ func AwaitingConfirmationStatus(ctx context.Context, repositories *storage.Repos
 	}
 	for _, state := range states {
 		if state.report == nil || state.confirmed || state.projected || state.retired || state.report.Policy.Action != ActionAwaitHuman {
+			continue
+		}
+		if _, active := activeProjectIDs[state.report.ProjectID]; !active {
 			continue
 		}
 		createdAt, err := time.Parse(time.RFC3339Nano, state.report.CreatedAt)

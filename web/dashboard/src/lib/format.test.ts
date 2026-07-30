@@ -1,5 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { formatAttempts, truncateReason } from "./format";
+import { formatAttempts, formatDurationSeconds, truncateReason } from "./format";
+
+describe("formatDurationSeconds", () => {
+  it("formats a daemon-provided duration without consulting the browser clock", () => {
+    expect(formatDurationSeconds(0)).toBe("0s");
+    expect(formatDurationSeconds(59)).toBe("59s");
+    expect(formatDurationSeconds(26 * 60)).toBe("26m");
+    expect(formatDurationSeconds(3 * 60 * 60)).toBe("3h");
+    expect(formatDurationSeconds(49 * 60 * 60)).toBe("2d");
+  });
+
+  it("handles absent, invalid, and future values safely", () => {
+    expect(formatDurationSeconds(undefined)).toBe("—");
+    expect(formatDurationSeconds(Number.NaN)).toBe("—");
+    expect(formatDurationSeconds(-1)).toBe("0s");
+  });
+});
 
 describe("formatAttempts", () => {
   it("formats current/max including unlimited -1", () => {

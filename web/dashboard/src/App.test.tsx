@@ -133,5 +133,7 @@ describe("triage confirmation status", () => {
     expect(screen.getByText("2")).toBeTruthy();
     expect(screen.getByText(/acme\/looper#42/)).toBeTruthy();
     expect(screen.getByText(/acme\/looper#43/)).toBeTruthy();
+    expect(screen.getByText(/waiting 1h/)).toBeTruthy();
+    expect(screen.getByText(/waiting 15m/)).toBeTruthy();
   });
 });
