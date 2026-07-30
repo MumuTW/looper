@@ -591,11 +591,18 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 			return "", errors.New("must use an ASCII host; write internationalized domains in their IDNA/punycode form")
 		}
 	}
+	// A wildcard advertised address is not dialable; the CLI's wildcard-to-
+	// loopback mapping applies only to the bind host, never to baseUrl.
+	if ip := net.ParseIP(parsed.Hostname()); ip != nil && ip.IsUnspecified() {
+		return "", errors.New("must not use an unspecified (wildcard) host such as 0.0.0.0 or ::")
+	}
+	portNumber := 0
 	if port := parsed.Port(); port != "" {
 		number, err := strconv.Atoi(port)
 		if err != nil || number < 1 || number > 65535 {
 			return "", errors.New("must use a port between 1 and 65535")
 		}
+		portNumber = number
 	}
 	if parsed.User != nil {
 		return "", errors.New("must not include userinfo credentials")
@@ -639,6 +646,16 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 		host = strings.ToLower(host[:zone]) + host[zone:]
 	} else {
 		host = strings.ToLower(host)
+	}
+	// Rewrite the port from its parsed integer and drop scheme defaults, the
+	// way browsers serialize Host and Origin: a spelling like :0443 or an
+	// explicit :443 on https would otherwise never match those headers.
+	if port := parsed.Port(); port != "" {
+		host = strings.TrimSuffix(host, ":"+port)
+		isDefault := (scheme == "http" && portNumber == 80) || (scheme == "https" && portNumber == 443)
+		if !isDefault {
+			host = host + ":" + strconv.Itoa(portNumber)
+		}
 	}
 
 	return (&url.URL{Scheme: scheme, Host: host, Path: path}).String(), nil

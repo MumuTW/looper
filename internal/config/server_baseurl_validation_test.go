@@ -22,6 +22,12 @@ func TestCanonicalizeServerBaseURL(t *testing.T) {
 		{value: "http://192.168.1.5:17310", want: "http://192.168.1.5:17310"},
 		// The IPv6 zone identifier keeps its case and its %25 escaping.
 		{value: "http://[FE80::1%25ETH0]:17310", want: "http://[fe80::1%25ETH0]:17310"},
+		// Ports canonicalize to the browser serialization: integer spelling,
+		// scheme defaults omitted.
+		{value: "https://daemon.example:0443", want: "https://daemon.example"},
+		{value: "http://daemon.example:080", want: "http://daemon.example"},
+		{value: "http://daemon.example:08080/base", want: "http://daemon.example:8080/base"},
+		{value: "https://daemon.example:80", want: "https://daemon.example:80"},
 	}
 	for _, tt := range valid {
 		got, err := CanonicalizeServerBaseURL(tt.value)
@@ -55,6 +61,8 @@ func TestCanonicalizeServerBaseURL(t *testing.T) {
 		{value: "https://daemon.example/a%2F%2Fb", wantMessage: "percent-encoded"},
 		{value: "https://daemon.example/a%20b", wantMessage: "percent-encoded"},
 		{value: "http://bücher.example", wantMessage: "IDNA/punycode"},
+		{value: "http://0.0.0.0:17310", wantMessage: "unspecified (wildcard) host"},
+		{value: "http://[::]:17310", wantMessage: "unspecified (wildcard) host"},
 	}
 	for _, tt := range invalid {
 		got, err := CanonicalizeServerBaseURL(tt.value)
