@@ -761,7 +761,8 @@ authMode = "local-token"
 localToken = "replace-me"
 # Optional; set when a reverse proxy, tunnel, or TLS terminator sits in front
 # of the daemon. Must be a canonical absolute http(s) URL with a host — no
-# credentials, query, or fragment — and any trailing slash is normalized away.
+# path prefix, credentials, query, or fragment — and any trailing slash is
+# normalized away.
 # baseUrl = "https://looper.example.com"
 
 [daemon]

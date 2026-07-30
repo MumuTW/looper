@@ -596,6 +596,12 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 	if ip := net.ParseIP(parsed.Hostname()); ip != nil && ip.IsUnspecified() {
 		return "", errors.New("must not use an unspecified (wildcard) host such as 0.0.0.0 or ::")
 	}
+	// Numeric spellings like 0, 00, 0x0, or 0.0.0 are IPv4 integers to a
+	// browser (which canonicalizes them, 0 included, to dotted-quad) but plain
+	// hostnames to Go, so the two sides would disagree about the authority.
+	if isNumericIPv4Spelling(parsed.Hostname()) && net.ParseIP(parsed.Hostname()) == nil {
+		return "", errors.New("must spell IPv4 hosts in canonical dotted-quad form")
+	}
 	portNumber := 0
 	if port := parsed.Port(); port != "" {
 		number, err := strconv.Atoi(port)
@@ -614,28 +620,11 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 		return "", errors.New("must not include a fragment")
 	}
 
-	path := parsed.EscapedPath()
-	// Percent-escapes would let encoded separators or dot segments slip past
-	// the segment checks below and decode differently behind a proxy.
-	if strings.Contains(path, "%") {
-		return "", errors.New("must not contain percent-encoded path segments")
-	}
-	if path == "/" {
-		path = ""
-	}
-	if path != "" {
-		if !strings.HasPrefix(path, "/") {
-			return "", errors.New("must use an absolute path")
-		}
-		path = strings.TrimSuffix(path, "/")
-		for _, segment := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
-			switch segment {
-			case "":
-				return "", errors.New("must not contain empty path segments")
-			case ".", "..":
-				return "", errors.New("must not contain . or .. path segments")
-			}
-		}
+	// The dashboard requests API routes and assets by absolute path, so a
+	// path-prefixed advertised URL would work for the CLI but break the
+	// browser surface. Reject the prefix until the dashboard is prefix-aware.
+	if path := parsed.EscapedPath(); path != "" && path != "/" {
+		return "", errors.New("must not include a path; serving the daemon under a path prefix is not supported")
 	}
 
 	// Lowercase the host but not an IPv6 zone identifier, which is
@@ -658,7 +647,36 @@ func CanonicalizeServerBaseURL(value string) (string, error) {
 		}
 	}
 
-	return (&url.URL{Scheme: scheme, Host: host, Path: path}).String(), nil
+	return (&url.URL{Scheme: scheme, Host: host}).String(), nil
+}
+
+// isNumericIPv4Spelling reports whether every dot-separated label of host is a
+// decimal or 0x-prefixed hexadecimal number — the shapes browsers parse as an
+// IPv4 integer rather than a DNS name.
+func isNumericIPv4Spelling(host string) bool {
+	if host == "" {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return false
+		}
+		digits := strings.ToLower(label)
+		isHex := strings.HasPrefix(digits, "0x")
+		if isHex {
+			digits = strings.TrimPrefix(digits, "0x")
+		}
+		for _, r := range digits {
+			if r >= '0' && r <= '9' {
+				continue
+			}
+			if isHex && r >= 'a' && r <= 'f' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func isAbsoluteHTTPURL(value string) bool {

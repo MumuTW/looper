@@ -16,8 +16,7 @@ func TestCanonicalizeServerBaseURL(t *testing.T) {
 		{value: "http://localhost:17310", want: "http://localhost:17310"},
 		{value: "  HTTP://LocalHost:17310/  ", want: "http://localhost:17310"},
 		{value: "https://daemon.example", want: "https://daemon.example"},
-		{value: "https://Daemon.Example:8443/looper/", want: "https://daemon.example:8443/looper"},
-		{value: "https://daemon.example/a/b", want: "https://daemon.example/a/b"},
+		{value: "https://Daemon.Example:8443/", want: "https://daemon.example:8443"},
 		{value: "http://[::1]:17310", want: "http://[::1]:17310"},
 		{value: "http://192.168.1.5:17310", want: "http://192.168.1.5:17310"},
 		// The IPv6 zone identifier keeps its case and its %25 escaping.
@@ -26,7 +25,7 @@ func TestCanonicalizeServerBaseURL(t *testing.T) {
 		// scheme defaults omitted.
 		{value: "https://daemon.example:0443", want: "https://daemon.example"},
 		{value: "http://daemon.example:080", want: "http://daemon.example"},
-		{value: "http://daemon.example:08080/base", want: "http://daemon.example:8080/base"},
+		{value: "http://daemon.example:08080", want: "http://daemon.example:8080"},
 		{value: "https://daemon.example:80", want: "https://daemon.example:80"},
 	}
 	for _, tt := range valid {
@@ -52,14 +51,20 @@ func TestCanonicalizeServerBaseURL(t *testing.T) {
 		{value: "http://user:pass@daemon.example", wantMessage: "userinfo"},
 		{value: "http://daemon.example/?admin=1", wantMessage: "query"},
 		{value: "http://daemon.example/#fragment", wantMessage: "fragment"},
-		{value: "http://daemon.example//double", wantMessage: "empty path segments"},
-		{value: "http://daemon.example/a/../b", wantMessage: ". or .. path segments"},
-		{value: "http://daemon.example/./a", wantMessage: ". or .. path segments"},
+		{value: "http://daemon.example//double", wantMessage: "must not include a path"},
+		{value: "http://daemon.example/a/../b", wantMessage: "must not include a path"},
+		{value: "http://daemon.example/./a", wantMessage: "must not include a path"},
+		{value: "https://daemon.example/looper", wantMessage: "must not include a path"},
+		{value: "http://0:17310", wantMessage: "canonical dotted-quad"},
+		{value: "http://00:17310", wantMessage: "canonical dotted-quad"},
+		{value: "http://0x0:17310", wantMessage: "canonical dotted-quad"},
+		{value: "http://0.0.0:17310", wantMessage: "canonical dotted-quad"},
+		{value: "http://0x7f.0x0.0x0.0x1:17310", wantMessage: "canonical dotted-quad"},
 		{value: "http://127.0.0.1:99999", wantMessage: "port between 1 and 65535"},
 		{value: "http://127.0.0.1:0", wantMessage: "port between 1 and 65535"},
-		{value: "https://daemon.example/%2e%2e/admin", wantMessage: "percent-encoded"},
-		{value: "https://daemon.example/a%2F%2Fb", wantMessage: "percent-encoded"},
-		{value: "https://daemon.example/a%20b", wantMessage: "percent-encoded"},
+		{value: "https://daemon.example/%2e%2e/admin", wantMessage: "must not include a path"},
+		{value: "https://daemon.example/a%2F%2Fb", wantMessage: "must not include a path"},
+		{value: "https://daemon.example/a%20b", wantMessage: "must not include a path"},
 		{value: "http://bücher.example", wantMessage: "IDNA/punycode"},
 		{value: "http://0.0.0.0:17310", wantMessage: "unspecified (wildcard) host"},
 		{value: "http://[::]:17310", wantMessage: "unspecified (wildcard) host"},
@@ -100,7 +105,7 @@ func TestValidateAcceptsCanonicalServerBaseURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	baseURL := "https://daemon.example/looper"
+	baseURL := "https://daemon.example"
 	token := "secret"
 	cfg.Server.BaseURL = &baseURL
 	cfg.Server.AuthMode = AuthModeLocalToken
@@ -132,7 +137,7 @@ func TestValidateRequiresTokenAuthForPublicBaseURL(t *testing.T) {
 
 	// Loopback advertised authority stays fine without a token, and a public
 	// one is accepted once token auth is on.
-	loopbackBase := "http://localhost:8080/looper"
+	loopbackBase := "http://localhost:8080"
 	cfg.Server.BaseURL = &loopbackBase
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("Validate() error = %v, want loopback baseUrl accepted with authMode none", err)
@@ -149,13 +154,13 @@ func TestValidateRequiresTokenAuthForPublicBaseURL(t *testing.T) {
 func TestNormalizeStoresCanonicalServerBaseURL(t *testing.T) {
 	t.Parallel()
 
-	value := "HTTP://Daemon.Example:8080/base/"
+	value := "HTTP://Daemon.Example:8080/"
 	cfg, err := Normalize(t.TempDir(), PartialConfig{Server: &PartialServerConfig{BaseURL: &value}})
 	if err != nil {
 		t.Fatalf("Normalize() error = %v", err)
 	}
-	if cfg.Server.BaseURL == nil || *cfg.Server.BaseURL != "http://daemon.example:8080/base" {
-		t.Fatalf("Normalize() Server.BaseURL = %v, want http://daemon.example:8080/base", cfg.Server.BaseURL)
+	if cfg.Server.BaseURL == nil || *cfg.Server.BaseURL != "http://daemon.example:8080" {
+		t.Fatalf("Normalize() Server.BaseURL = %v, want http://daemon.example:8080", cfg.Server.BaseURL)
 	}
 
 	invalid := "daemon.example"
