@@ -206,6 +206,7 @@ func stringExpressions(path string, authority map[string]string) []literal {
 		return nil
 	}
 	local := fileStringConstants(file)
+	qualifiers := authorityQualifiers(file)
 	out := []literal{}
 	ast.Inspect(file, func(node ast.Node) bool {
 		expr, ok := node.(ast.Expr)
@@ -219,7 +220,7 @@ func stringExpressions(path string, authority map[string]string) []literal {
 		default:
 			return true
 		}
-		value, ok := foldString(expr, local, authority)
+		value, ok := foldString(expr, local, authority, qualifiers)
 		if !ok {
 			return true
 		}
@@ -261,7 +262,35 @@ func fileStringConstants(file *ast.File) map[string]string {
 // references to label-authority constants (labels.Prefix,
 // protocol.TargetLabelPrefix) and local file constants. It returns the folded
 // value and true when expr is a constant string expression.
-func foldString(expr ast.Expr, local, authority map[string]string) (string, bool) {
+// authorityQualifiers maps the name a file actually uses for each authority
+// package to its canonical name. An import alias is ordinary Go, and resolving
+// it is what keeps `l.Prefix + "plan"` from folding to nothing and slipping
+// past a check whose whole purpose is to be unbypassable.
+func authorityQualifiers(file *ast.File) map[string]string {
+	canonical := map[string]string{
+		"github.com/nexu-io/looper/internal/labels":           "labels",
+		"github.com/nexu-io/looper/internal/network/protocol": "protocol",
+	}
+	out := map[string]string{}
+	for _, spec := range file.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			continue
+		}
+		name, known := canonical[path]
+		if !known {
+			continue
+		}
+		local := name
+		if spec.Name != nil {
+			local = spec.Name.Name
+		}
+		out[local] = name
+	}
+	return out
+}
+
+func foldString(expr ast.Expr, local, authority, qualifiers map[string]string) (string, bool) {
 	switch e := expr.(type) {
 	case *ast.BasicLit:
 		if e.Kind != token.STRING {
@@ -276,17 +305,17 @@ func foldString(expr ast.Expr, local, authority map[string]string) (string, bool
 		if e.Op != token.ADD {
 			return "", false
 		}
-		left, ok := foldString(e.X, local, authority)
+		left, ok := foldString(e.X, local, authority, qualifiers)
 		if !ok {
 			return "", false
 		}
-		right, ok := foldString(e.Y, local, authority)
+		right, ok := foldString(e.Y, local, authority, qualifiers)
 		if !ok {
 			return "", false
 		}
 		return left + right, true
 	case *ast.ParenExpr:
-		return foldString(e.X, local, authority)
+		return foldString(e.X, local, authority, qualifiers)
 	case *ast.Ident:
 		v, ok := local[e.Name]
 		return v, ok
@@ -295,7 +324,11 @@ func foldString(expr ast.Expr, local, authority map[string]string) (string, bool
 		if !ok {
 			return "", false
 		}
-		v, ok := authority[pkg.Name+"."+e.Sel.Name]
+		qualifier, aliased := qualifiers[pkg.Name]
+		if !aliased {
+			qualifier = pkg.Name
+		}
+		v, ok := authority[qualifier+"."+e.Sel.Name]
 		return v, ok
 	default:
 		return "", false
