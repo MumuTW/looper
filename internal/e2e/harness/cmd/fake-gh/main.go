@@ -197,6 +197,14 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 		return emitDefaultJSON(key, fields)
 	case "label list":
 		fields := requestedJSONFields(os.Args[1:])
+		// validateFields only inspects the fields that were asked for, so an
+		// omitted --json passes it by having nothing to check. Real gh prints
+		// its table format in that case and the caller's JSON decode fails
+		// against GitHub but not here, which is the drift this harness exists
+		// to remove.
+		if mode == "strict" && len(fields) == 0 {
+			return fmt.Errorf("%s requires --json; real gh emits its table format otherwise", key)
+		}
 		allowed := schemaDoc.JSONFieldAllowlist[key]
 		if len(allowed) == 0 && mode == "strict" {
 			return fmt.Errorf("missing fake-gh allowlist for %s", key)
