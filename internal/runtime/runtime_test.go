@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/labels"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
@@ -4072,7 +4074,7 @@ func TestShouldAutoRecoverFailedReviewerLoopRefusesUnsafeStates(t *testing.T) {
 		}(), run: baseRun, queue: baseQueue},
 		{name: "ready label checkpoint", loop: baseLoop, run: func() storage.RunRecord {
 			r := baseRun
-			r.CheckpointJSON = checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":["looper:spec-ready"]}`)
+			r.CheckpointJSON = checkpoint(fmt.Sprintf(`"detail":{"state":"OPEN","reviewDecision":"","labels":[%q]}`, labels.SpecReady))
 			return r
 		}(), queue: baseQueue},
 		{name: "missing checkpoint detail", loop: baseLoop, run: func() storage.RunRecord {
@@ -4517,7 +4519,7 @@ func TestShouldAutoRecoverFailedReviewerLoopHonorsRecoveryPolicy(t *testing.T) {
 	}{
 		{name: "draft checkpoint", run: storage.RunRecord{ID: "run_recover_draft", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","isDraft":true,"reviewDecision":"","labels":[]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}},
 		{name: "approved checkpoint", run: storage.RunRecord{ID: "run_recover_approved", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","reviewDecision":"APPROVED","labels":[]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}},
-		{name: "ready label checkpoint", run: storage.RunRecord{ID: "run_recover_ready", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(`"detail":{"state":"OPEN","reviewDecision":"","labels":["looper:spec-ready"]}`), Summary: &errorMessage, ErrorMessage: &errorMessage}},
+		{name: "ready label checkpoint", run: storage.RunRecord{ID: "run_recover_ready", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: checkpoint(fmt.Sprintf(`"detail":{"state":"OPEN","reviewDecision":"","labels":[%q]}`, labels.SpecReady)), Summary: &errorMessage, ErrorMessage: &errorMessage}},
 	}
 	for _, tt := range tests {
 		tt := tt

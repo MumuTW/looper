@@ -53,7 +53,7 @@ type reviewSubmitPullRequestViewer interface {
 
 type reviewSubmitGateway interface {
 	reviewSubmitPullRequestViewer
-	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	GetPullRequestDiff(context.Context, githubinfra.GetPullRequestDiffInput) (string, error)
 	SubmitReview(context.Context, githubinfra.SubmitReviewInput) error
 }
@@ -307,7 +307,7 @@ func effectiveReviewSubmitEvent(ctx context.Context, stderr io.Writer, gh review
 	if !strings.EqualFold(strings.TrimSpace(event), "APPROVE") || strings.TrimSpace(authorLogin) == "" {
 		return event, nil
 	}
-	currentLogin, err := gh.GetCurrentUserLogin(ctx, cwd)
+	currentLogin, err := gh.GetCurrentUserLoginForRepo(ctx, repo, cwd)
 	if err != nil {
 		return "", fmt.Errorf("determine authenticated GitHub user for self-approval check: %w", err)
 	}

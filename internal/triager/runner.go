@@ -23,11 +23,25 @@ import (
 )
 
 const (
-	EnrollmentEventType   = "triage.enrolled"
+	// EnrollmentEventType is the Triage enrollment: Triager's durable record
+	// that a specific new/reopened source event entered the workflow before
+	// any LLM call. It provides retry identity across agent outages and
+	// source-lookback expiry; it does not authorize Planner.
+	EnrollmentEventType = "triage.enrolled"
+	// ReportEventType is the Triage Report: Triager's durable structured
+	// record of classification, scope, risk, confidence, missing information,
+	// recommended next Role, rationale, the source Issue event, idempotency
+	// key, and policy outcome. It is the semantic Authority for automatic
+	// Planner routing; GitHub labels may project its outcome but cannot
+	// replace it.
 	ReportEventType       = "triage.report"
 	ConfirmationEventType = "triage.confirmed"
-	ProjectionEventType   = "triage.routed"
-	RetirementEventType   = "triage.retired"
+	// ProjectionEventType is the Triage routing acknowledgement: the
+	// projection of an accepted Triage Report into Planner's durable loop and
+	// queue without consulting Planner's label/assignee discovery filters —
+	// distinct from Coordinator Dispatch, which stays label-mediated.
+	ProjectionEventType = "triage.routed"
+	RetirementEventType = "triage.retired"
 
 	ActionRoutePlanner Action = "route_planner"
 	ActionAwaitHuman   Action = "await_human_confirmation"
@@ -167,6 +181,11 @@ type Options struct {
 	DecisionLimit  int
 }
 
+// Runner is the Triager: an internal proactive Role for the personal GitHub
+// workflow. It consumes new and reopened Issue events, persists a structured
+// Triage Report, and projects accepted low-risk reports directly into Planner
+// work. It has no configurable trigger labels and does not replace Fixer's
+// review-feedback source.
 type Runner struct {
 	repos          *storage.Repositories
 	github         GitHubGateway
@@ -248,6 +267,12 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	// Issues returned here are exactly those updated inside the lookback window, so
+	// this set is a free, exact answer to "could a confirmation have arrived?".
+	touched := make(map[int64]struct{}, len(issues))
+	for _, summary := range issues {
+		touched[summary.Number] = struct{}{}
+	}
 	for _, summary := range issues {
 		detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: summary.Number, CWD: project.RepoPath})
 		if err != nil {
@@ -287,7 +312,24 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 
 	pending := pendingSourceStates(states)
+	// A source parked on a human cannot change unless someone touches its issue, but
+	// re-verifying it costs a ViewIssue and a ListIssueTimeline every tick. Left
+	// uncapped that grows without bound, because nothing ever removes an awaiting
+	// entry: the oldest here had been re-verified every tick for over seven hours.
+	awaitingRechecks := selectAwaitingRechecks(pending, touched, awaitingRecheckBudget)
 	for _, state := range pending {
+		if awaitingExpired(state, r.now()) {
+			// Bound the set. A retired source re-enrolls if its issue sees new activity,
+			// so this drops the backlog rather than the work.
+			if err := r.retireSource(ctx, state, RetirementReasonConfirmationTimeout, &result); err != nil {
+				return result, err
+			}
+			continue
+		}
+		if awaitsHumanConfirmation(state) && !shouldProcessAwaiting(state, touched, awaitingRechecks) {
+			result.Skipped++
+			continue
+		}
 		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, &result); err != nil {
 			return result, err
 		}

@@ -25,7 +25,7 @@ func TestStopAllLoopsReleasesStopGateWhenPauseFails(t *testing.T) {
 
 	registry := looperdruntime.NewActiveExecutionRegistry()
 	active := &fakeActiveExecution{}
-	unregister := registry.Register("loop_failed_pause", "run_failed_pause", "exec_failed_pause", active)
+	unregister := bindTestActiveExecution(t, registry, "loop_failed_pause", "run_failed_pause", "exec_failed_pause", active)
 	defer unregister()
 	services.ActiveExecutions = registry
 
@@ -77,7 +77,7 @@ func TestStopAllLoopsKeepsStopGateStickyAfterDurablePause(t *testing.T) {
 
 	registry := looperdruntime.NewActiveExecutionRegistry()
 	active := &fakeActiveExecution{}
-	unregister := registry.Register("loop_sticky", "run_sticky", "exec_sticky", active)
+	unregister := bindTestActiveExecution(t, registry, "loop_sticky", "run_sticky", "exec_sticky", active)
 	defer unregister()
 	services.ActiveExecutions = registry
 

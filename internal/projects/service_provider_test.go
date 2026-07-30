@@ -2,6 +2,7 @@ package projects
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -133,5 +134,45 @@ func TestServiceAddProjectRejectsDetectedRepoFromMismatchedProvider(t *testing.T
 				t.Fatalf("stored = %#v, published = %v; want rejection before persistence", stored, published)
 			}
 		})
+	}
+}
+
+// A checkout whose origin is not github.com used to register with no repository
+// and no warning: the scheduler skipped it on every tick, so registration looked
+// successful while nothing ever ran. Both halves of that gap are now reported.
+func TestServiceAddProjectWarnsWhenNoRepositoryCouldBeDetermined(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	service := &Service{
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		Config: cfg,
+		Now:    func() time.Time { return now },
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{}, fmt.Errorf(`origin host "code.example.com" is not github.com; looper drives GitHub only, so the repository cannot be detected — pass the repository explicitly as owner/name`)
+		},
+		PublishProjects: func([]config.ProjectRefConfig) {},
+	}
+
+	added, err := service.AddProject(context.Background(), AddInput{
+		ID: "demo", Name: "Demo", RepoPath: "/tmp/demo",
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v, want registration to succeed with warnings", err)
+	}
+
+	joined := strings.Join(added.Warnings, "\n")
+	if !strings.Contains(joined, "is not github.com") {
+		t.Fatalf("warnings = %#v, want the unrecognized origin host reported", added.Warnings)
+	}
+	if !strings.Contains(joined, "no automation will run") {
+		t.Fatalf("warnings = %#v, want the inert-project consequence reported", added.Warnings)
 	}
 }

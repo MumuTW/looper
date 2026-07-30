@@ -131,10 +131,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("provider kind %q is no longer supported: %s", provider.Kind, reason)})
 		} else if !isValidProviderKind(provider.Kind) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be: %s", ProviderKindGitHub)})
-		} else if strings.TrimSpace(provider.BaseURL) != "" && !isAbsoluteHTTPURL(provider.BaseURL) {
-			// baseUrl is optional and is only a repository-identity discriminator
-			// (it never routes gh); when set it must be an absolute http(s) URL.
-			issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL"})
+		} else if message, ok := unsupportedProviderBaseURL(provider.BaseURL); !ok {
+			issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: message})
 		}
 	}
 
@@ -643,6 +641,32 @@ func isNumericIPv4Spelling(host string) bool {
 		}
 	}
 	return true
+}
+
+// unsupportedProviderBaseURL accepts only github.com hosts. baseUrl reaches
+// repository identity and nothing else: the gh gateway resolves its own host,
+// so a GitHub Enterprise Server URL here configures a target looper cannot
+// drive. Accepting it lets looperd start and then fail at publish time — the
+// review-submit REST path and webhook tunnel routing both mishandle a non
+// github.com target — so it is rejected at startup instead. See #238.
+func unsupportedProviderBaseURL(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", true
+	}
+	if !isAbsoluteHTTPURL(value) {
+		return "must be an absolute http(s) URL", false
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "must be an absolute http(s) URL", false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	switch host {
+	case "github.com", "www.github.com", "api.github.com":
+		return "", true
+	}
+	return "must be a github.com URL or omitted; GitHub Enterprise Server is not supported", false
 }
 
 func isAbsoluteHTTPURL(value string) bool {

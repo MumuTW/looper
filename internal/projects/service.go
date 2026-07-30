@@ -364,6 +364,13 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 	if provider != nil && (repo == nil || strings.TrimSpace(*repo) == "") {
 		return AddResult{}, nil, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
 	}
+	if repo == nil || strings.TrimSpace(*repo) == "" {
+		// Registering without a repository is allowed, but it produces a project
+		// no role can act on: every discovery lane skips a project whose repo
+		// metadata is empty. Say so at registration instead of leaving the
+		// operator to infer it from a daemon log line on every tick.
+		warnings = append(warnings, "No repository is set for this project, so no automation will run for it. Re-register with an explicit owner/name repository, or set one through the dashboard or PATCH /api/v1/projects/{id}.")
+	}
 
 	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
 		return AddResult{}, nil, err

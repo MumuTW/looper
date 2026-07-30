@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
@@ -285,10 +287,10 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 		t.Fatalf("agent timeout defaults = %#v", got)
 	}
 
-	if got := cfg.Roles.Planner; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:plan"}) {
+	if got := cfg.Roles.Planner; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{labels.DefaultPlanTrigger}) {
 		t.Fatalf("planner role defaults = %#v", got)
 	}
-	if got := cfg.Roles.Reviewer; !got.Discovery.AutoDiscovery || got.Discovery.Triggers.IncludeDrafts || !got.Discovery.Triggers.RequireReviewRequest || got.Discovery.Triggers.LabelMode != LabelModeAll || len(got.Discovery.Triggers.Labels) != 0 || !got.Discovery.SpecReview.IncludeReviewingLabel || got.Discovery.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
+	if got := cfg.Roles.Reviewer; !got.Discovery.AutoDiscovery || got.Discovery.Triggers.IncludeDrafts || !got.Discovery.Triggers.RequireReviewRequest || got.Discovery.Triggers.LabelMode != LabelModeAll || len(got.Discovery.Triggers.Labels) != 0 || !got.Discovery.SpecReview.IncludeReviewingLabel || got.Discovery.SpecReview.ReviewingLabel != labels.SpecReviewing {
 		t.Fatalf("reviewer role defaults = %#v", got)
 	}
 	if got := cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
@@ -306,34 +308,11 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Fixer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || got.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 {
 		t.Fatalf("fixer role defaults = %#v", got)
 	}
-	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:worker-ready"}) {
+	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{labels.DefaultWorkerReadyTrigger}) {
 		t.Fatalf("worker role defaults = %#v", got)
 	}
 	if got := cfg.Roles.Reviewer.Behavior.Loop.MaxWallClockSeconds; got != 0 {
 		t.Fatalf("reviewer loop max wall clock default = %d, want 0", got)
-	}
-}
-
-func TestValidateAllowsSameRepoAcrossForgeProviders(t *testing.T) {
-	t.Parallel()
-
-	tokenEnv := "FORGE_TOKEN"
-	cfg, err := Normalize(t.TempDir(), PartialConfig{
-		Providers: &[]PartialProviderConfig{
-			{ID: "ghes-one", Kind: providerKindPtr(ProviderKindGitHub), BaseURL: stringPtr("https://one.example.test/"), TokenEnv: &tokenEnv},
-			{ID: "ghes-two", Kind: providerKindPtr(ProviderKindGitHub), BaseURL: stringPtr("https://two.example.test"), TokenEnv: &tokenEnv},
-		},
-		Projects: &[]PartialProjectRefConfig{
-			{ID: "github", Name: "GitHub", Repo: stringPtr("Acme/App"), RepoPath: "/tmp/github"},
-			{ID: "one", Name: "One", Provider: stringPtr("ghes-one"), Repo: stringPtr("acme/app"), RepoPath: "/tmp/one"},
-			{ID: "two", Name: "Two", Provider: stringPtr("ghes-two"), Repo: stringPtr("ACME/APP"), RepoPath: "/tmp/two"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Normalize() error = %v", err)
-	}
-	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
-		t.Fatalf("ValidateWithOptions() error = %v, want provider-qualified repositories to coexist", err)
 	}
 }
 
@@ -4075,4 +4054,75 @@ func TestProjectOverrideCannotSelectRemovedSummaryCommentPublishMode(t *testing.
 		t.Fatalf("ValidateWithOptions() error = %v, want the project override rejected", err)
 	}
 	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.publishMode", "must be single_review")
+}
+
+// Every provider now resolves to github.com, so two projects carrying the same
+// owner/name slug are the same physical repository regardless of how many
+// provider ids they are split across. This replaces the case that used
+// different provider base URLs to make the slug coexist, which is no longer a
+// configurable shape.
+func TestValidateRejectsSameRepoAcrossGitHubProviders(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{
+			{ID: "one", Kind: providerKindPtr(ProviderKindGitHub)},
+			{ID: "two", Kind: providerKindPtr(ProviderKindGitHub)},
+		},
+		Projects: &[]PartialProjectRefConfig{
+			{ID: "first", Name: "First", Provider: stringPtr("one"), Repo: stringPtr("acme/app"), RepoPath: "/tmp/first"},
+			{ID: "second", Name: "Second", Provider: stringPtr("two"), Repo: stringPtr("ACME/APP"), RepoPath: "/tmp/second"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("ValidateWithOptions() error = %v, want the same slug rejected across provider ids", err)
+	}
+}
+
+func TestProviderBaseURLRejectsNonGitHubHosts(t *testing.T) {
+	t.Parallel()
+
+	for _, baseURL := range []string{"https://code.example.com", "https://ghe.corp.internal", "http://github.example.com"} {
+		baseURL := baseURL
+		t.Run(baseURL, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := Normalize(t.TempDir(), PartialConfig{
+				Providers: &[]PartialProviderConfig{{ID: "p", Kind: providerKindPtr(ProviderKindGitHub), BaseURL: stringPtr(baseURL)}},
+				Projects:  &[]PartialProjectRefConfig{{ID: "demo", Name: "Demo", Provider: stringPtr("p"), Repo: stringPtr("acme/app"), RepoPath: "/tmp/demo"}},
+			})
+			if err != nil {
+				t.Fatalf("Normalize() error = %v", err)
+			}
+			err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+			var validationErr *ConfigValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("ValidateWithOptions() error = %v, want *ConfigValidationError", err)
+			}
+			assertValidationIssue(t, validationErr, "providers[0].baseUrl", "must be a github.com URL or omitted; GitHub Enterprise Server is not supported")
+		})
+	}
+}
+
+func TestProviderBaseURLAcceptsGitHubHosts(t *testing.T) {
+	t.Parallel()
+
+	for _, baseURL := range []string{"", "https://github.com", "https://api.github.com", "https://GitHub.com/"} {
+		baseURL := baseURL
+		t.Run("base="+baseURL, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := Normalize(t.TempDir(), PartialConfig{
+				Providers: &[]PartialProviderConfig{{ID: "p", Kind: providerKindPtr(ProviderKindGitHub), BaseURL: stringPtr(baseURL)}},
+				Projects:  &[]PartialProjectRefConfig{{ID: "demo", Name: "Demo", Provider: stringPtr("p"), Repo: stringPtr("acme/app"), RepoPath: "/tmp/demo"}},
+			})
+			if err != nil {
+				t.Fatalf("Normalize() error = %v", err)
+			}
+			if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+				t.Fatalf("ValidateWithOptions() error = %v, want a github.com base URL accepted", err)
+			}
+		})
+	}
 }

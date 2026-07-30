@@ -413,11 +413,8 @@ func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewI
 	return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels}, nil
 }
 
-func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if a.gateway == nil {
-		return "", fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, repo, cwd string) (string, error) {
+	return roleCurrentUserLogin(ctx, a.config, a.gateway, repo, cwd)
 }
 
 func (a plannerGitHubAdapter) AddIssueAssignees(ctx context.Context, input planner.IssueAssigneesInput) error {
@@ -592,11 +589,8 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 	return result, nil
 }
 
-func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if a.gateway == nil {
-		return "", fmt.Errorf("github gateway is not configured")
-	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, repo, cwd string) (string, error) {
+	return roleCurrentUserLogin(ctx, a.config, a.gateway, repo, cwd)
 }
 
 func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
@@ -1146,8 +1140,8 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 	return result, nil
 }
 
-func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, repo, cwd string) (string, error) {
+	return roleCurrentUserLogin(ctx, a.config, a.gateway, repo, cwd)
 }
 
 func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {
@@ -1388,11 +1382,41 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 	return result, nil
 }
 
-func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if a.gateway == nil {
+func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, repo, cwd string) (string, error) {
+	return roleCurrentUserLogin(ctx, a.config, a.gateway, repo, cwd)
+}
+
+// roleCurrentUserLogin binds the lookup to the configured project identity.
+// CWD selects the project snapshot; its provider base URL, not ambient gh
+// state or an agent response, supplies the hostname.
+func roleCurrentUserLogin(ctx context.Context, cfg *config.Config, gateway *githubinfra.Gateway, repo, cwd string) (string, error) {
+	if gateway == nil {
 		return "", fmt.Errorf("github gateway is not configured")
 	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+	if cfg != nil {
+		for _, project := range cfg.Projects {
+			if filepath.Clean(project.RepoPath) != filepath.Clean(cwd) {
+				continue
+			}
+			if strings.TrimSpace(project.Repo) == "" {
+				// The catalog can briefly lag repository detection. The configured
+				// provider remains host authority; the runtime-selected repo only
+				// supplies the missing owner/slug.
+				project.Repo = repo
+			}
+			identity, ok := config.ProjectRepositoryIdentity(*cfg, project)
+			if !ok {
+				return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
+			}
+			baseURL, err := url.Parse(identity.BaseURL)
+			if err != nil || strings.TrimSpace(baseURL.Hostname()) == "" {
+				return "", fmt.Errorf("github provider hostname is not configured for project %s", project.ID)
+			}
+			repo = baseURL.Hostname() + "/" + identity.Repo
+			break
+		}
+	}
+	return gateway.GetCurrentUserLoginForRepo(ctx, repo, cwd)
 }
 
 func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker.IssueAssigneesInput) error {
@@ -3440,6 +3464,12 @@ func ensureClaimFinalized(ctx context.Context, item storage.QueueItemRecord, run
 	}
 	if got == nil || got.Status != "running" {
 		return nil
+	}
+	// Worker has durably completed every execution step but its atomic
+	// run/queue/loop terminal transaction failed. Requeueing here would repeat
+	// already-published work; retain the operation lease and degrade instead.
+	if errors.Is(runErr, worker.ErrSuccessfulClaimFinalization) {
+		return errors.Join(ErrOperationFinalizeFailed, runErr)
 	}
 	// Still running after processor return: typed durable finalization.
 	if now == nil {

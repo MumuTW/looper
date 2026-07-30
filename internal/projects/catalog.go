@@ -18,12 +18,16 @@ type ConfigSource interface {
 	View() OperationView
 }
 
-// Catalog owns the immutable runtime configuration view. Publish and
-// PublishGlobals update disjoint portions of that view with compare-and-swap
-// loops so concurrent database materialization and config reloads cannot undo
-// one another.
+// Catalog is the Project Catalog: the startup-built, immutable view of
+// active Projects materialized from SQLite records after configuration
+// import. Runtime modules consume it through the normalized project
+// configuration interface; they do not consult the original [[projects]]
+// input.
 //
-// Catalog keeps no caller-owned slices, maps, or pointers. Snapshot likewise
+// Catalog owns the runtime configuration view. Publish and PublishGlobals
+// update disjoint portions of that view with compare-and-swap loops so
+// concurrent database materialization and config reloads cannot undo one
+// another. Catalog keeps no caller-owned slices, maps, or pointers; Snapshot
 // returns a detached copy so a consumer cannot mutate the published view.
 type Catalog struct {
 	current atomic.Pointer[config.Config]
