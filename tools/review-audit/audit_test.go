@@ -216,6 +216,9 @@ func TestAuditLargeGateRejectsSelfReviewAndMissingChangedLineCounts(t *testing.T
 		{[]byte(`[{"number": 17, "title": "missing additions", "deletions": 1000}]`), "missing additions"},
 		{[]byte(`[{"number": 18, "title": "missing deletions", "additions": 1000}]`), "missing deletions"},
 		{[]byte(`[{"number": 19, "title": "missing both"}]`), "missing additions and deletions"},
+		{[]byte(`[{"number": 21, "title": "negative additions", "additions": -1, "deletions": 0}]`), "negative additions"},
+		{[]byte(`[{"number": 22, "title": "negative deletions", "additions": 0, "deletions": -1}]`), "negative deletions"},
+		{[]byte(`[{"number": 23, "title": "overflowed counts", "additions": 9223372036854775807, "deletions": 1}]`), "overflow int64"},
 	} {
 		if _, _, err := Audit(test.input, 300); err == nil || !strings.Contains(err.Error(), test.want) {
 			t.Fatalf("Audit(missing changed-line count) error = %v, want fail-closed validation", err)

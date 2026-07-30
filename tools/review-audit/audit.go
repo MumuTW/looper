@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 )
@@ -197,6 +198,12 @@ func validateChangedLineCounts(pr PullRequest) error {
 		return fmt.Errorf("PR #%d is missing additions; request both changed-line counts before applying the audit", pr.Number)
 	case pr.Deletions == nil:
 		return fmt.Errorf("PR #%d is missing deletions; request both changed-line counts before applying the audit", pr.Number)
+	case *pr.Additions < 0:
+		return fmt.Errorf("PR #%d has negative additions %d; changed-line counts must be non-negative", pr.Number, *pr.Additions)
+	case *pr.Deletions < 0:
+		return fmt.Errorf("PR #%d has negative deletions %d; changed-line counts must be non-negative", pr.Number, *pr.Deletions)
+	case *pr.Additions > math.MaxInt64-*pr.Deletions:
+		return fmt.Errorf("PR #%d changed-line counts overflow int64; additions %d plus deletions %d exceeds the supported range", pr.Number, *pr.Additions, *pr.Deletions)
 	default:
 		return nil
 	}
