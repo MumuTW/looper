@@ -29,6 +29,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
@@ -130,8 +131,13 @@ func (s *fixerDiscoveryLockSet) With(key string, fn func() error) error {
 }
 
 type FixItem struct {
-	Type                string   `json:"type"`
-	Source              string   `json:"source,omitempty"`
+	Type   string `json:"type"`
+	Source string `json:"source,omitempty"`
+	// ID identifies the item within its Source and is a union across sources:
+	// for "forgejo-reviewer-summary" it carries a forge.ReviewItemID, and for
+	// the native review-comment sources it carries a provider comment ID.
+	// Crossings in either direction are explicit conversions, because only
+	// Source tells you which identity space an ID belongs to.
 	ID                  string   `json:"id,omitempty"`
 	ThreadID            string   `json:"threadId,omitempty"`
 	ThreadFingerprint   string   `json:"threadFingerprint,omitempty"`
@@ -489,6 +495,7 @@ type AgentResult struct {
 	Stdout                       string
 	Stderr                       string
 	ParseStatus                  string
+	CompletionPayload            string
 	Lifecycle                    *lifecycle.State
 	TimeoutType                  string
 	ConfiguredIdleTimeoutSeconds int64
@@ -980,16 +987,39 @@ const (
 
 func (e *loopError) Error() string { return e.message }
 
-func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
+func validateCompletedRepairCheckpoint(repair *checkpointRepair, worktree *checkpointWorktree) error {
 	if repair == nil {
 		return nil
 	}
 	if repair.ParseStatus == "parsed" {
 		return nil
 	}
+	message := fmt.Sprintf(
+		"Fixer agent completed without a valid structured result (parse status: %s); automatic retry paused for manual recovery",
+		firstNonEmpty(repair.ParseStatus, "missing"),
+	)
+	if worktree != nil && worktree.Path != "" && worktree.CleanedAt == "" {
+		// Path != "" and an empty CleanedAt only prove Looper did not record
+		// cleanup; they do not prove the worktree still exists on disk (external
+		// deletion, daemon restart with an old checkpoint, or an agent removing
+		// its working directory can all leave a stale path). os.Stat succeeds for
+		// an empty directory or an unrelated file recreated at the recorded path,
+		// so claim preservation only when the path is still a usable fixer git
+		// checkout (the same local checkout-usability probe prepare uses); otherwise
+		// describe the recorded path so the operator is not told recovery evidence
+		// was preserved at a nonexistent or unrelated location.
+		if localFixerWorktreeCheckoutUsable(worktree.Path) {
+			message += "; worktree preserved at " + worktree.Path
+		} else {
+			message += "; recorded worktree path " + worktree.Path
+		}
+	}
+	if summary := strings.TrimSpace(repair.Summary); summary != "" {
+		message += ". Agent summary: " + summary
+	}
 	return &loopError{
-		message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent completed without valid structured result (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
-		kind:    FailureRetryableTransient,
+		message: message,
+		kind:    FailureManualIntervention,
 	}
 }
 
@@ -1219,10 +1249,96 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []reply
 	return out
 }
 
+// fixerRepairTaskOutcome reads the agent's declared outcome from its structured
+// completion payload. The declared outcome is the authority for whether the repair
+// completed or was blocked; commits, pushes, and heartbeats are progress evidence
+// only and never synthesize success here.
+//
+// Reports (blocked, message, failureKind, err). A nil err with blocked=false means
+// the agent declared completion. err is returned when the payload is absent,
+// unparseable, or declares no recognized outcome — the fixer must not advance to
+// validate/push/resolve on an unauthorized completion.
+func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind, *loopError) {
+	payload := strings.TrimSpace(result.CompletionPayload)
+	if payload == "" {
+		// Older adapters and the checkpoint fallback path do not carry the parsed
+		// payload; recover it from the transcript.
+		payload = extractCompletionMarkerPayload(result.Stdout + "\n" + result.Stderr)
+	}
+	if payload == "" {
+		return false, "", "", &loopError{message: "Fixer agent completed without required structured outcome", kind: FailureRetryableTransient}
+	}
+	var parsed struct {
+		Outcome     string `json:"outcome"`
+		Summary     string `json:"summary"`
+		FailureKind string `json:"failure_kind"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return false, "", "", &loopError{message: "Fixer agent completed with invalid structured outcome", kind: FailureRetryableTransient}
+	}
+	switch strings.ToLower(strings.TrimSpace(parsed.Outcome)) {
+	case "completed":
+		return false, "", "", nil
+	case "blocked":
+		kind, ok := parseFixerBlockedFailureKind(parsed.FailureKind)
+		if !ok {
+			return false, "", "", &loopError{message: "Fixer blocked outcome requires a valid failure_kind", kind: FailureRetryableTransient}
+		}
+		message := firstNonEmpty(strings.TrimSpace(parsed.Summary), result.Summary, "fixer repair task was blocked")
+		return true, message, kind, nil
+	default:
+		return false, "", "", &loopError{message: "Fixer agent completed with missing or unrecognized structured outcome", kind: FailureRetryableTransient}
+	}
+}
+
+// parseFixerBlockedFailureKind bounds a blocked repair to the classifications
+// Looper actually acts on, so it cannot smuggle in an arbitrary one.
+//
+// The prompt advertises only retryable_transient and manual_intervention.
+// retryable_after_resume stays accepted rather than rejected: it is a valid kind
+// elsewhere in the runner, and an agent that reports it should not have its block
+// downgraded to a contract failure. It is not advertised because a repair-step
+// block resumes identically to retryable_transient — NormalizeResumePolicy only
+// applies a kind-derived policy when none is set, and a resumed checkpoint always
+// carries advance_from_checkpoint — so offering it would promise a re-prepared
+// environment that this path does not deliver.
+func parseFixerBlockedFailureKind(raw string) (QueueFailureKind, bool) {
+	switch QueueFailureKind(strings.ToLower(strings.TrimSpace(raw))) {
+	case FailureManualIntervention:
+		return FailureManualIntervention, true
+	case FailureRetryableAfterResume:
+		return FailureRetryableAfterResume, true
+	case FailureRetryableTransient:
+		return FailureRetryableTransient, true
+	default:
+		return "", false
+	}
+}
+
 // extractCompletionMarkerPayload mirrors the agent core's last-line scan but
 // without coupling fixer code to internal/agent's parser. It returns the JSON
 // payload after the final __LOOPER_RESULT__= line, or "" if absent.
 func extractCompletionMarkerPayload(combined string) string {
+	raw := scanCompletionMarkerPayloads(combined)
+	if json.Valid([]byte(raw)) {
+		return raw
+	}
+	// Codex --json embeds the marker inside a JSON event (an agent_message or a
+	// command output) rather than printing it on a stdout line. Scanning the raw
+	// stream then yields the marker's JSON-escaped tail, which is not valid JSON --
+	// so translate the JSONL stream into the text the agent actually produced and
+	// scan that instead.
+	if translated := agent.CombinedTextFromJSONL(combined); translated != "" {
+		if payload := scanCompletionMarkerPayloads(translated); json.Valid([]byte(payload)) {
+			return payload
+		}
+	}
+	// Nothing parseable anywhere. Return the raw find so an unparseable marker is
+	// reported as invalid rather than as no marker at all.
+	return raw
+}
+
+func scanCompletionMarkerPayloads(combined string) string {
 	for _, payload := range agent.CompletionMarkerPayloads(combined) {
 		if isTemplateCompletionPayload(payload) {
 			continue
@@ -1237,15 +1353,13 @@ func isTemplateCompletionPayload(payload string) bool {
 	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
 		return false
 	}
+	// "<one-sentence summary>" is the literal placeholder every completion
+	// template emits, and a real agent never leaves the summary as that exact
+	// token. Keying on it alone also covers the fixer template, which carries
+	// outcome/failure_kind placeholders alongside the summary and so would slip
+	// past a single-key shape check.
 	summary, _ := parsed["summary"].(string)
-	if strings.TrimSpace(summary) != "<one-sentence summary>" {
-		return false
-	}
-	if len(parsed) != 1 {
-		return false
-	}
-	_, ok := parsed["summary"]
-	return ok
+	return strings.TrimSpace(summary) == "<one-sentence summary>"
 }
 
 func sanitizeReplyExplanation(raw string) string {
@@ -2131,7 +2245,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := validateFixerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
 		failure := r.classifyFailure(err)
 		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-		latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
+		// createRunContext sets a resumed checkpoint's policy to
+		// advance_from_checkpoint, so NormalizeResumePolicy would preserve that
+		// nonempty advance policy and leave the failed run ineligible for
+		// MarkInvalidCompletionRunRestartFromDiscover. A manual-intervention
+		// resume-validation failure (missing/invalid repair result on a legacy or
+		// interrupted downstream checkpoint) must durably park the checkpoint so
+		// operator retry can escape via restart_from_discover instead of resuming
+		// the same downstream step and re-parking forever.
+		if failure.kind == FailureManualIntervention {
+			latest.ResumePolicy = loops.ResumePolicyManualIntervention
+		} else {
+			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
+		}
 		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 			return ProcessResult{}, err
 		}
@@ -3055,7 +3181,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, nil
 	}
 	if checkpoint.Repair != nil {
-		if err := validateCompletedRepairCheckpoint(checkpoint.Repair); err != nil {
+		if err := validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree); err != nil {
 			return checkpoint, err
 		}
 		return checkpoint, nil
@@ -3181,8 +3307,54 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// same evidence, including the transcript scan that only the live result
 	// carries.
 	repair := checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
-	if err := validateCompletedRepairCheckpoint(repair); err != nil {
+	if err := validateCompletedRepairCheckpoint(repair, checkpoint.Worktree); err != nil {
+		checkpoint.Repair = repair
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		// The agent already ran and may have changed or pushed code, so the repair
+		// record is the only evidence of that work. Returning it in memory alone
+		// leaves the caller's completeRun as the single write that can persist it;
+		// a transient failure there loses the evidence and lets a later run repeat
+		// the repair. Checkpoint it here for the same reason the non-completed
+		// branch above does.
+		//
+		// A persist failure is reported as a secondary issue only: the validation
+		// error is the primary causal failure and must survive to classify the run
+		// as manual intervention.
+		if persistErr := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); persistErr != nil {
+			r.logError("fixer manual-intervention checkpoint persist failed", map[string]any{
+				"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID,
+				"message": persistErr.Error(),
+			})
+		}
 		return checkpoint, err
+	}
+	// The parse gate above only proves a structured result arrived. The declared
+	// outcome is what authorizes Looper advancing to reconcile/validate/push, so
+	// read it before any downstream step can act on this run.
+	//
+	// Scope: this governs Looper's publish steps, not the agent's own. When
+	// allowAutoPush is set and no validation commands are configured, the repair
+	// prompt still asks the agent to push its commits directly, so partial work can
+	// reach the PR before this outcome exists. That is a pre-existing property of
+	// that configuration -- configuring validation commands makes the repair
+	// local-only via RestrictToolNetwork -- and closing it means changing the
+	// fixer's push model, tracked separately rather than folded into this gate.
+	//
+	// Neither rejection path records checkpoint.Repair. A stored repair record with
+	// ParseStatus "parsed" is what the replay guard at the top of this function
+	// treats as a finished repair, so recording one here would let the next
+	// automatic retry of a retryable block skip the agent entirely and publish
+	// whatever the blocked attempt left behind. The agent's own reason survives as
+	// the run's failure summary and in the event log; leaving the repair unrecorded
+	// keeps the step replayable, which is what a retryable classification means.
+	blocked, blockedMessage, blockedKind, outcomeErr := fixerRepairTaskOutcome(result)
+	if outcomeErr != nil {
+		return checkpoint, outcomeErr
+	}
+	if blocked {
+		// A declared block is the agent reporting it could not do the work, not a
+		// Looper failure, so it fails with the kind the agent declared.
+		return checkpoint, &loopError{message: blockedMessage, kind: blockedKind}
 	}
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
 		return checkpoint, err
@@ -4020,7 +4192,7 @@ func buildForgejoFixerSummary(checkpoint fixerCheckpoint, reviewerSummary forge.
 		if reviewItem.Status != forge.ReviewItemStatusOpen {
 			continue
 		}
-		fixItem, ok := fixItemsByID[reviewItem.ReviewItemID]
+		fixItem, ok := fixItemsByID[string(reviewItem.ReviewItemID)]
 		if !ok {
 			return forge.FixerSummary{}, fmt.Errorf("forgejo fixer missing fix item for open review_item_id %q", reviewItem.ReviewItemID)
 		}
@@ -4847,15 +5019,15 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specpr.ReviewingLabel)
-	if (specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) || checkpointHadSpecReviewing) && isSpecReviewClean(detail) {
-		if specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) {
-			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+	checkpointHadSpecReviewing := labels.Has(detailLabels(checkpoint.Detail), labels.SpecReviewing)
+	if (labels.Has(detail.Labels, labels.SpecReviewing) || checkpointHadSpecReviewing) && isSpecReviewClean(detail) {
+		if labels.Has(detail.Labels, labels.SpecReviewing) {
+			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.SpecReviewing}, CWD: input.Project.RepoPath}); err != nil {
 				return checkpoint, err
 			}
 		}
-		if !specpr.HasLabel(detail.Labels, specpr.ReadyLabel) {
-			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+		if !labels.Has(detail.Labels, labels.SpecReady) {
+			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath}); err != nil {
 				return checkpoint, err
 			}
 		}
@@ -5419,6 +5591,74 @@ func restartLatestRunFromDiscover(ctx context.Context, repos *storage.Repositori
 	return repos.Runs.Upsert(ctx, updated)
 }
 
+// fixerRunParkedOnInvalidCompletion reports whether a manual-intervention park was
+// caused by the repair completion contract rather than by a condition an operator
+// must clear outside Looper.
+func fixerRunParkedOnInvalidCompletion(run storage.RunRecord, checkpoint fixerCheckpoint) bool {
+	// A skipped repair never had a contract to satisfy.
+	if checkpoint.SkipReason != "" {
+		return false
+	}
+	// Every other manual-intervention park records a pause reason naming its own
+	// cause (risky_conflict, dirty_worktree, auto_commit_disabled). The
+	// completion-contract park records none.
+	if checkpoint.Pause != nil && strings.TrimSpace(checkpoint.Pause.Reason) != "" {
+		return false
+	}
+	if checkpoint.Repair == nil {
+		// A wholly absent record only proves a missing contract when the run parked
+		// at a step that requires the structured result; before repair, a nil record
+		// is simply work that had not started.
+		return validateFixerResumeCheckpoint(asFixerStep(derefString(run.CurrentStep)), checkpoint) != nil
+	}
+	return validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree) != nil
+}
+
+// MarkInvalidCompletionRunRestartFromDiscover rewrites a fixer run parked for
+// manual intervention to restart_from_discover, but only when the park was caused
+// by a missing or invalid repair completion contract.
+//
+// manual_intervention is also the policy for risky conflicts, dirty worktrees, and
+// auto-commit-disabled parks. Those name a condition an operator must resolve on
+// disk or in configuration; rewriting them to restart_from_discover would discard
+// the park and rerun discovery while the blocking condition still holds. Only the
+// completion-contract park is safe to escape this way, because discovery rebuilds
+// the fix items the missing result would have authorized.
+//
+// Interrupted runs are included because the retry API exposes them as retryable and
+// createRunContext resumes interrupted predecessors at the same downstream step.
+// Runs that are not failed/interrupted, not parked for manual recovery, or parked
+// for another cause are left untouched so createRunContext's natural resume logic
+// still applies. The boolean reports whether a checkpoint was rewritten.
+func MarkInvalidCompletionRunRestartFromDiscover(ctx context.Context, repos *storage.Repositories, loopID, updatedAt string) (bool, error) {
+	if repos == nil || repos.Runs == nil {
+		return false, nil
+	}
+	latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loopID)
+	if err != nil {
+		return false, err
+	}
+	if latestRun == nil || (latestRun.Status != "failed" && latestRun.Status != "interrupted") {
+		return false, nil
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		return false, nil
+	}
+	if !fixerRunParkedOnInvalidCompletion(*latestRun, checkpoint) {
+		return false, nil
+	}
+	checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+	updated := *latestRun
+	encoded := mustMarshalJSON(checkpoint)
+	updated.CheckpointJSON = &encoded
+	updated.UpdatedAt = updatedAt
+	if err := repos.Runs.Upsert(ctx, updated); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (r *Runner) resumePausedNoopResolveLoop(ctx context.Context, loop storage.LoopRecord, headSHA, fixItemsStateHash string, unresolvedThreadIDs []string) (bool, storage.LoopRecord, error) {
 	if loop.Status != "paused" || r.repos == nil || r.repos.Runs == nil {
 		return false, loop, nil
@@ -5881,6 +6121,15 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 }
 
 func (r *Runner) failQueueItemWithBreaker(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint fixerCheckpoint, step FixerStep, failure *loopError) (*storage.QueueItemRecord, int, error) {
+	// Manual-intervention failures are already terminal and park the loop for
+	// human recovery. They must not count toward the consecutive-failure
+	// breaker: tripping it would clean the preserved worktree and enqueue a
+	// rediscovery handoff that rewrites the checkpoint back to discover,
+	// destroying the very recovery evidence this state is meant to retain.
+	if failure.kind == FailureManualIntervention {
+		failedQueue, err := r.failQueueItemTerminal(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts+1)
+		return failedQueue, 0, err
+	}
 	streak, streakLoop, err := r.recordFixerFailureStreak(ctx, loop, queueItem, runID, checkpoint, step)
 	if err != nil {
 		return nil, 0, err
@@ -6926,7 +7175,28 @@ func previousFixerStep(step FixerStep) FixerStep {
 func validateFixerResumeCheckpoint(startStep FixerStep, checkpoint fixerCheckpoint) error {
 	switch startStep {
 	case stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck:
-		return validateCompletedRepairCheckpoint(checkpoint.Repair)
+		// A skipped repair (ineligible PR, no remaining fix items) intentionally
+		// succeeds without creating a repair record, and every downstream step
+		// short-circuits on SkipReason before it would need the structured result.
+		// Demanding the contract here would park an interrupted skip for manual
+		// recovery even though no repair was ever authorized to run.
+		if checkpoint.SkipReason != "" {
+			return nil
+		}
+		// Resuming at any step after repair requires the structured completion
+		// result as the authority for reconcile/validate/push/resolve decisions.
+		// A legacy or interrupted run may record LastCompletedStep as repair or
+		// later while its checkpoint has no repair object; a wholly absent
+		// repair record is the strongest form of the missing contract parked
+		// here, so reject it before downstream steps can commit, push, or mutate
+		// review threads without the declared-authoritative result.
+		if checkpoint.Repair == nil {
+			return &loopError{
+				message: "Fixer resume checkpoint is missing the completed repair record; automatic retry paused for manual recovery",
+				kind:    FailureManualIntervention,
+			}
+		}
+		return validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree)
 	default:
 		return nil
 	}
@@ -7221,12 +7491,13 @@ func forgejoReviewerSummaryFixItems(summary forge.ReviewerSummary) []FixItem {
 		if item.Status != forge.ReviewItemStatusOpen {
 			continue
 		}
+		reviewItemID := string(item.ReviewItemID.Normalized())
 		items = append(items, FixItem{
 			Type:              "comment",
 			Source:            "forgejo-reviewer-summary",
-			ID:                strings.TrimSpace(item.ReviewItemID),
-			ThreadID:          strings.TrimSpace(item.ReviewItemID),
-			ThreadFingerprint: normalizeThreadFingerprint("forgejo-reviewer-summary", strings.TrimSpace(item.ReviewItemID), strings.TrimSpace(item.ReviewItemID)),
+			ID:                reviewItemID,
+			ThreadID:          reviewItemID,
+			ThreadFingerprint: normalizeThreadFingerprint("forgejo-reviewer-summary", reviewItemID, reviewItemID),
 			Summary:           strings.TrimSpace(item.Title + "\n\n" + item.Body),
 			Files:             cloneStrings(item.Files),
 			Path:              firstNonEmptyFromSlice(item.Files),
@@ -7595,7 +7866,7 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 		parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentRuntime, agentModel))
 	}
 	parts = append(parts, "For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round. Do not mechanically reuse the PR title or a previous fixer subject when this round's edits are narrower or different.")
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
+	return agent.AppendFixerCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 }
 
 func customInstructionConfig(value *config.Config) config.Config {
@@ -7724,8 +7995,6 @@ func shouldResumeFromPrepare(status string, failedStep FixerStep, checkpoint fix
 	switch failedStep {
 	case stepRepair, stepReconcileCommits, stepValidate, stepPush:
 		return true
-	case stepResolveComments, stepRecheck:
-		return validateCompletedRepairCheckpoint(checkpoint.Repair) != nil
 	default:
 		return false
 	}
@@ -8184,20 +8453,20 @@ func prQueryLabels(labels []string) []string {
 	return result
 }
 
-func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+func labelsMatch(itemLabels []string, required []string, mode config.LabelMode) bool {
 	if len(required) == 0 {
 		return true
 	}
 	if mode == config.LabelModeAny {
 		for _, label := range required {
-			if specpr.HasLabel(labels, label) {
+			if labels.Has(itemLabels, label) {
 				return true
 			}
 		}
 		return false
 	}
 	for _, label := range required {
-		if !specpr.HasLabel(labels, label) {
+		if !labels.Has(itemLabels, label) {
 			return false
 		}
 	}

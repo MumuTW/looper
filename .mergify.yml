@@ -1,0 +1,46 @@
+# Mergify: merge queue for `main`, with opt-in auto-merge.
+#
+# Authority. The `main` branch protection on GitHub decides what may merge.
+# Mergify injects those required checks into the queue itself
+# (branch_protection_injection_mode defaults to `queue`), so no check name is
+# repeated here and this file cannot drift from GitHub's requirements. Adding or
+# removing a required check is done in one place: branch protection.
+#
+# What the queue adds on top of branch protection: the pull request is retested
+# against the current tip of `main` before it merges, so two PRs that are green
+# in isolation cannot land a broken `main` together.
+#
+# Auto-merge is opt-in per pull request via the `auto-merge` label. Without the
+# label Mergify does nothing on its own; `@mergifyio queue` still queues a pull
+# request manually.
+
+merge_queue:
+  # One pull request checked at a time. This repository's CI fans out into
+  # race-detector and several E2E jobs, so speculative checks would multiply
+  # runner cost for a backlog that is currently small.
+  max_parallel_checks: 1
+
+queue_rules:
+  - name: default
+    # Matches the existing history on `main`, which is merge commits.
+    merge_method: merge
+    queue_conditions:
+      - base = main
+      - -draft
+      - -conflict
+
+# auto_merge_conditions only takes effect when at least one merge protection
+# rule exists. This rule deliberately asserts only what branch protection cannot
+# express; the CI gate stays in branch protection and is enforced by the queue.
+merge_protections:
+  - name: mergeable shape
+    description: The pull request is ready to be considered for merging.
+    if:
+      - base = main
+    success_conditions:
+      - -draft
+      - -conflict
+
+merge_protections_settings:
+  auto_merge_conditions:
+    - label = auto-merge

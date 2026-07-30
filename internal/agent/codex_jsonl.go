@@ -180,6 +180,17 @@ func (t *codexJSONLTranslator) ingestAll(blob string) {
 	}
 }
 
+// CombinedTextFromJSONL translates a codex `--json` JSONL stdout blob into the
+// human-readable text the agent produced (command outputs plus the final
+// message), so callers can locate the completion marker wherever the agent
+// emitted it. Returns "" when stdout is not JSONL (no translatable events),
+// letting callers fall back to scanning the raw stdout.
+func CombinedTextFromJSONL(stdout string) string {
+	tr := newCodexJSONLTranslator()
+	tr.ingestAll(stdout)
+	return tr.combinedText()
+}
+
 // FinalMessage returns the final assistant message from Codex JSONL output.
 // Plain-text vendors (and Codex without --json) fall back to stdout unchanged.
 func FinalMessage(stdout string) string {

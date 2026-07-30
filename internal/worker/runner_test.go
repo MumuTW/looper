@@ -12,7 +12,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/network/protocol"
@@ -117,7 +117,7 @@ func TestDiscoverIssuesEnqueuesWorkerReadyAssignedIssue(t *testing.T) {
 func TestDiscoverIssuesSkipsWorkerHoldLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready", domain.HoldLabelWorker}}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready", labels.HoldWorker}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -147,7 +147,7 @@ func TestProcessClaimedItemSkipsHeldAutoDiscoveredWorkerIssue(t *testing.T) {
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_hold", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: loopTarget, Repo: &repo, DedupeKey: "worker:hold", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, PayloadJSON: &payloadJSON, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issueNumber, Labels: []string{domain.HoldLabelWorker}}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issueNumber, Labels: []string{labels.HoldWorker}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_worker_hold", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: loopTarget, Repo: &repo, Status: "running", PayloadJSON: &payloadJSON})
@@ -174,7 +174,7 @@ func TestWorkerHoldSummaryChecksRetargetedPullRequestLabels(t *testing.T) {
 		issueDetail: IssueDetail{Number: issueNumber},
 		prDetailResponses: []PullRequestDetail{
 			{Number: prNumber, Title: "Worker PR", BaseRefName: "main", HeadRefName: "worker/46"},
-			{Number: prNumber, Labels: []string{domain.HoldLabelWorker}, BaseRefName: "main", HeadRefName: "worker/46"},
+			{Number: prNumber, Labels: []string{labels.HoldWorker}, BaseRefName: "main", HeadRefName: "worker/46"},
 		},
 	}
 	runner := New(Options{GitHub: github, Logger: fixture.logger, Now: fixture.now})
@@ -198,7 +198,7 @@ func TestWorkerHoldSummaryDoesNotInheritIssueHoldAfterPullRequestRetarget(t *tes
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{
-		issueDetail: IssueDetail{Number: 46, Labels: []string{domain.HoldLabelWorker}},
+		issueDetail: IssueDetail{Number: 46, Labels: []string{labels.HoldWorker}},
 		prDetail:    PullRequestDetail{Number: 101, Labels: []string{}},
 	}
 	runner := New(Options{GitHub: github, Logger: fixture.logger, Now: fixture.now})
@@ -224,7 +224,7 @@ func TestRunPrepareWorkStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *te
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 	nowISO := fixture.nowISO()
 	github := &fakeGitHubGateway{
-		issueDetail:          IssueDetail{Number: issueNumber, Labels: []string{domain.HoldLabelWorker}},
+		issueDetail:          IssueDetail{Number: issueNumber, Labels: []string{labels.HoldWorker}},
 		issueDetailResponses: []IssueDetail{{Number: issueNumber}},
 		prDetail:             PullRequestDetail{Number: prNumber, Labels: []string{}, BaseRefName: "main", HeadRefName: "worker/46"},
 	}
@@ -252,7 +252,7 @@ func TestRunPrepareWorkStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *te
 func TestRunOpenPRStepSkipsWhenHoldAddedBeforePush(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 46, Labels: []string{domain.HoldLabelWorker}}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 46, Labels: []string{labels.HoldWorker}}}
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
 	checkpoint, err := runner.runOpenPRStep(context.Background(), stepInput{
@@ -284,7 +284,7 @@ func TestRunOpenPRStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing
 	prNumber := int64(101)
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 	github := &fakeGitHubGateway{
-		issueDetail: IssueDetail{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		issueDetail: IssueDetail{Number: issueNumber, State: "open", Labels: []string{labels.HoldWorker}},
 		prDetail:    PullRequestDetail{Number: prNumber, State: "open", Labels: []string{}},
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
@@ -1325,7 +1325,7 @@ func TestRunExecuteStepRecoversStaleWorktreePathBeforeAgentStart(t *testing.T) {
 func TestRunExecuteStepSkipsWhenWorkerHoldAppliedBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, Labels: []string{domain.HoldLabelWorker}}}
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, Labels: []string{labels.HoldWorker}}}
 	agent := &fakeAgentExecutor{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
 	run := storage.RunRecord{ID: "run_execute_hold", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
@@ -1363,7 +1363,7 @@ func TestRunExecuteStepSkipsWhenWorkerHoldAppliedBeforeAgentStart(t *testing.T) 
 func TestRunExecuteStepRechecksWorkerHoldAfterAgentCompletion(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{prDetailResponses: []PullRequestDetail{{Number: 42}, {Number: 42, Labels: []string{domain.HoldLabelWorker}}}}
+	github := &fakeGitHubGateway{prDetailResponses: []PullRequestDetail{{Number: 42}, {Number: 42, Labels: []string{labels.HoldWorker}}}}
 	git := &fakeGitGateway{inspectResult: InspectHeadResult{HasUncommittedChanges: true}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
 	run := storage.RunRecord{ID: "run_execute_hold_after_agent", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
@@ -3908,7 +3908,7 @@ func TestRunOpenPRStepStopsCreatePRSideEffectsWhenHeldAfterFallbackPush(t *testi
 		{Number: issueNumber, State: "open"},
 		{Number: issueNumber, State: "open"},
 		{Number: issueNumber, State: "open"},
-		{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		{Number: issueNumber, State: "open", Labels: []string{labels.HoldWorker}},
 	}}
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
@@ -3958,7 +3958,7 @@ func TestRunOpenPRStepStopsPushExistingSideEffectsWhenHeldAfterPush(t *testing.T
 	github := &fakeGitHubGateway{issueDetailResponses: []IssueDetail{
 		{Number: issueNumber, State: "open"},
 		{Number: issueNumber, State: "open"},
-		{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		{Number: issueNumber, State: "open", Labels: []string{labels.HoldWorker}},
 	}}
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
@@ -4007,7 +4007,7 @@ func TestRunOpenPRStepStopsNormalCreatePRSideEffectsWhenHeldAfterPush(t *testing
 		{Number: issueNumber, State: "open"},
 		{Number: issueNumber, State: "open"},
 		{Number: issueNumber, State: "open"},
-		{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		{Number: issueNumber, State: "open", Labels: []string{labels.HoldWorker}},
 	}}
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
@@ -4059,7 +4059,7 @@ func TestRunOpenPRStepStopsReviewerAssignmentWhenCreatedPRHeld(t *testing.T) {
 			{Number: issueNumber, State: "open"},
 			{Number: issueNumber, State: "open"},
 		},
-		prDetail:       PullRequestDetail{Number: 565, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		prDetail:       PullRequestDetail{Number: 565, State: "open", Labels: []string{labels.HoldWorker}},
 		createPRResult: CreatePullRequestResult{Number: 565, URL: "https://example/pr/565"},
 	}
 	git := &fakeGitGateway{}
@@ -4120,7 +4120,7 @@ func TestRunOpenPRStepStopsExistingPRSideEffectsWhenHeldAfterPush(t *testing.T) 
 			{Number: issueNumber, State: "open"},
 			{Number: issueNumber, State: "open"},
 		},
-		prDetail: PullRequestDetail{Number: 563, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		prDetail: PullRequestDetail{Number: 563, State: "open", Labels: []string{labels.HoldWorker}},
 		openPRs:  []PullRequestSummary{{Number: 563, URL: "https://example/pr/563", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}},
 	}
 	git := &fakeGitGateway{}
@@ -4181,7 +4181,7 @@ func TestRunOpenPRStepStopsAdoptedPRSideEffectsWhenExistingPRHeldAfterNormalPush
 			{Number: issueNumber, State: "open"},
 			{Number: issueNumber, State: "open"},
 		},
-		prDetail:        PullRequestDetail{Number: 564, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		prDetail:        PullRequestDetail{Number: 564, State: "open", Labels: []string{labels.HoldWorker}},
 		openPRResponses: [][]PullRequestSummary{{}, {{Number: 564, URL: "https://example/pr/564", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}},
 	}
 	git := &fakeGitGateway{}

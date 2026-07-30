@@ -25,8 +25,9 @@ func TestFakeAgentWritesEvidenceAndCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run fake agent: %v", err)
 	}
-	if !strings.Contains(string(output), `__LOOPER_RESULT__={"changedFiles":["nested/output.txt"],"summary":"fake agent wrote file"}`) &&
-		!strings.Contains(string(output), `__LOOPER_RESULT__={"summary":"fake agent wrote file","changedFiles":["nested/output.txt"]}`) {
+	if !strings.Contains(string(output), `"outcome":"completed"`) ||
+		!strings.Contains(string(output), `"summary":"fake agent wrote file"`) ||
+		!strings.Contains(string(output), `"changedFiles":["nested/output.txt"]`) {
 		t.Fatalf("fake agent output = %q, want completion marker", string(output))
 	}
 	evidence := LoadCWDEvidence(t, agent.EvidencePath())

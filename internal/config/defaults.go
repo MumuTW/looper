@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 const DefaultServerPort = 17310
@@ -199,7 +201,7 @@ func DefaultConfig(cwd string) (Config, error) {
 					},
 					Autonomous: CoordinatorDispatchAutonomousConfig{
 						DelayMinutes: 30,
-						HoldLabel:    "looper:hold",
+						HoldLabel:    labels.HoldGlobal,
 					},
 					AssignTo: "",
 				},
@@ -216,7 +218,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,
 				Triggers: IssueRoleTriggersConfig{
-					Labels:                     []string{"looper:plan"},
+					Labels:                     []string{labels.DefaultPlanTrigger},
 					LabelMode:                  LabelModeAll,
 					RequireAssigneeCurrentUser: true,
 				},
@@ -233,7 +235,7 @@ func DefaultConfig(cwd string) (Config, error) {
 					},
 					SpecReview: ReviewerSpecReviewConfig{
 						IncludeReviewingLabel: true,
-						ReviewingLabel:        "looper:spec-reviewing",
+						ReviewingLabel:        labels.SpecReviewing,
 					},
 				},
 				Behavior: ReviewerConfig{
@@ -287,7 +289,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			Worker: WorkerRoleConfig{
 				AutoDiscovery: true,
 				Triggers: IssueRoleTriggersConfig{
-					Labels:                     []string{"looper:worker-ready"},
+					Labels:                     []string{labels.DefaultWorkerReadyTrigger},
 					LabelMode:                  LabelModeAll,
 					RequireAssigneeCurrentUser: true,
 				},

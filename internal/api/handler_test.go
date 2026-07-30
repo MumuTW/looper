@@ -23,6 +23,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
@@ -197,6 +198,50 @@ func TestHandlerLoopRetryResetsFixerFailureStreak(t *testing.T) {
 	}
 	if got["unrelated"] != "preserved" {
 		t.Fatalf("unrelated metadata = %#v, want preserved", got["unrelated"])
+	}
+}
+
+func TestHandlerLoopRetryEscapesManualInterventionFixerCheckpoint(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_escape_manual"
+	loopID := "loop_retry_escape_manual"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 47, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpoint := `{"resumePolicy":"manual_intervention","worktree":{"path":"/tmp/wt-42","branch":"feature/fix-42","preparedAt":"2026-04-11T12:00:00.000Z"},"repair":{"summary":"upstream server_error","parseStatus":"","completedAt":"2026-04-11T12:00:00.000Z"}}`
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_parked", LoopID: loopID, Status: "failed", CurrentStep: stringPtr("resolve_comments"), LastCompletedStep: stringPtr("push"), CheckpointJSON: &checkpoint, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	lastErrorKind := "manual_intervention"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_escape_manual", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:escape_manual", Priority: storage.QueuePriorityFixer, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/47/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	run, err := services.Repositories.Runs.GetByID(context.Background(), "run_parked")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
+	}
+	if !strings.Contains(*run.CheckpointJSON, `"restart_from_discover"`) {
+		t.Fatalf("checkpoint = %s, want resumePolicy restart_from_discover after operator retry", *run.CheckpointJSON)
+	}
+	if strings.Contains(*run.CheckpointJSON, `"manual_intervention"`) {
+		t.Fatalf("checkpoint = %s, want manual_intervention resumePolicy replaced", *run.CheckpointJSON)
 	}
 }
 
@@ -4078,7 +4123,7 @@ func TestHandlerCreateManualLoopsRejectHeldTargetsWithoutForce(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), project); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 	h := NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), Now: func() time.Time { return fixture.now.Add(time.Minute) }})
 	for _, tc := range []struct{ name, path, body string }{
 		{name: "planner", path: "/api/v1/planners", body: `{"projectId":"project_1","issueNumber":77}`},
@@ -4113,7 +4158,7 @@ func TestHandlerPlannerCreateForceBypassesHold(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"project_1","issueNumber":77,"force":true}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
@@ -4134,7 +4179,7 @@ func TestHandlerWorkerCreateRejectsHeldRequestedIssueEvenWhenPlannerPRExists(t *
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelWorker}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldWorker}))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
@@ -4158,7 +4203,7 @@ func TestHandlerCreateManualLoopForceBypassesHoldButStillConflicts(t *testing.T)
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_existing_conflict", Seq: 100, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"), Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -4184,7 +4229,7 @@ func TestHandlerCreateReviewerLoopForcePersistsManualMetadata(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42,"force":true}`)))
 	req.Header.Set("content-type", "application/json")
@@ -8268,4 +8313,60 @@ type requestArtifactRoute struct {
 	Request struct {
 		Body any `json:"body"`
 	} `json:"request"`
+}
+
+func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testing.T) {
+	fixture := newTestFixture(t)
+	ctx := context.Background()
+	repos := fixture.runtime.Services().Repositories
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{
+		ID:         "prs_tied_runs",
+		ProjectID:  "project_1",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "abc123",
+		CapturedAt: nowISO,
+		CreatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_pr_42", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// Three attempts inside one millisecond; IDs descend lexically so an
+	// ID-based tie-break would report the first insert instead of the newest.
+	for _, run := range []storage.RunRecord{
+		{ID: "z_attempt_1", LoopID: "loop_pr_42", Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "m_attempt_2", LoopID: "loop_pr_42", Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "a_attempt_3", LoopID: "loop_pr_42", Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Runs.Upsert(ctx, run); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		}
+	}
+	// Touching an older attempt later must not make it the latest run.
+	laterISO := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+	if err := repos.Runs.Upsert(ctx, storage.RunRecord{ID: "z_attempt_1", LoopID: "loop_pr_42", Status: "interrupted", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: laterISO}); err != nil {
+		t.Fatalf("Runs.Upsert(z_attempt_1 update) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Flooper/42/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	loopStatus := data["loopStatus"].(map[string]any)
+	assertEqual(t, loopStatus["latestRunStatus"], "running")
 }

@@ -900,7 +900,7 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	if result.Status != "completed" {
 		t.Fatalf("result.Status = %q, want completed", result.Status)
 	}
-	if result.ParseStatus != "parsed" || result.CompletionSignal != CompletionMarkerPrefix || result.Summary != "done" {
+	if result.ParseStatus != "parsed" || result.CompletionSignal != CompletionMarkerPrefix || result.CompletionPayload == "" || result.Summary != "done" {
 		t.Fatalf("result = %#v, want parsed completion marker result", result)
 	}
 	if len(result.Artifacts) != 1 || result.Artifacts[0] != "spec.md" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "main.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {
@@ -1041,6 +1041,27 @@ func TestParseCompletionIgnoresTemplatePlaceholder(t *testing.T) {
 	parsed := parseCompletion(CompletionMarkerPrefix+`{"summary":"<one-sentence summary>"}`+"\nreal work\n", "")
 	if parsed.ParseStatus != "missing" || parsed.Summary != "" {
 		t.Fatalf("parseCompletion() = %#v, want template placeholder ignored", parsed)
+	}
+}
+
+// TestParseCompletionIgnoresFixerTemplatePlaceholders guards the fixer-specific
+// completion templates: an agent that echoes either offered example and exits
+// without emitting a real result must not authorize downstream actions. The
+// core detector keys on the "<one-sentence summary>" placeholder alone, so the
+// outcome/failure_kind keys alongside it do not slip past as a real completion.
+func TestParseCompletionIgnoresFixerTemplatePlaceholders(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		`{"outcome":"completed","summary":"<one-sentence summary>"}`,
+		`{"outcome":"blocked","failure_kind":"manual_intervention","summary":"<one-sentence summary>"}`,
+	}
+	for _, payload := range cases {
+		stdout := CompletionMarkerPrefix + payload + "\nreal work\n"
+		parsed := parseCompletion(stdout, "")
+		if parsed.ParseStatus != "missing" || parsed.Summary != "" || parsed.CompletionPayload != "" {
+			t.Fatalf("parseCompletion(%s) = %#v, want echoed fixer template ignored", payload, parsed)
+		}
 	}
 }
 
@@ -1525,18 +1546,20 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if err := coordinator.Close(); err != nil {
 		t.Fatalf("coordinator.Close() error = %v", err)
 	}
-	workDir := t.TempDir()
-	pidPath := filepath.Join(workDir, "agent.pid")
+	// Assert reaping through the containment handle bound during Start, not
+	// through a pid marker the child writes. A marker-based check cannot tell
+	// "reaped before it published its pid" from "containment never confirmed
+	// death" — Start joins that reap failure with ErrExecutionPersistence, so
+	// the earlier assertions still pass and the missing marker would be read as
+	// success. That is precisely the leak this test exists to catch.
+	owner := &trackingOwner{}
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
-		// Publish the pid with a rename so the reader never observes a created
-		// but not-yet-written file; a plain redirect makes the empty window
-		// visible and the pid unparseable.
-		"command": "/bin/sh", "args": []any{"-c", `echo $$ > "$PID_FILE.tmp"; mv "$PID_FILE.tmp" "$PID_FILE"; trap '' TERM; while true; do sleep 1; done`},
-	}}, Repos: repos, ParamsOwnerVendor: customOwner()})
+		"command": "/bin/sh", "args": []any{"-c", `trap '' TERM; while true; do sleep 1; done`},
+	}}, Repos: repos, ParamsOwnerVendor: customOwner(), Owner: owner})
 
 	handle, err := executor.Start(context.Background(), RunInput{
-		ExecutionID: "agent_initial_persist_failure", WorkingDirectory: workDir, Prompt: "ignored",
-		Timeout: time.Second, Env: map[string]string{"PID_FILE": pidPath},
+		ExecutionID: "agent_initial_persist_failure", WorkingDirectory: t.TempDir(), Prompt: "ignored",
+		Timeout: time.Second,
 	})
 	if err == nil {
 		t.Fatal("Start() error = nil, want initial persistence failure")
@@ -1547,30 +1570,12 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if handle != nil {
 		t.Fatalf("Start() handle = %#v, want nil", handle)
 	}
-	// Wait for the pid rather than reading once: a single read that lands
-	// before the child recorded its pid used to skip the reap assertion
-	// entirely, so the test passed without checking anything.
-	pid := 0
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
-		if data, readErr := os.ReadFile(pidPath); readErr == nil {
-			if parsed, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil {
-				pid = parsed
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
+	if owner.lease == nil || owner.lease.handle == nil {
+		t.Fatal("owner did not receive a containment handle; cannot verify the child was reaped")
 	}
-	if pid == 0 {
-		// Reaped before it could record a pid; there is no process to leak.
-		return
+	if !owner.lease.handle.ConfirmedDead() {
+		t.Fatalf("containment handle for pid %d is not ConfirmedDead after failed Start", owner.lease.handle.PID())
 	}
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
-		if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("spawned process %d survived failed Start", pid)
 }
 
 func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {

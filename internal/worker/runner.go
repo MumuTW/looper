@@ -26,6 +26,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
@@ -61,7 +62,6 @@ const (
 	workerBranchSlugMaxWords         = 5
 	workerBranchHashLength           = 16
 	workerPRDedupeLookupLimit        = 1000
-	issueDiscoveryLabel              = "looper:worker-ready"
 	maxPublicIssueClaimSummaryLength = 240
 )
 
@@ -814,7 +814,7 @@ func New(options Options) *Runner {
 	}
 	policy := options.DiscoveryPolicy
 	if policy.LabelMode == "" {
-		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{issueDiscoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
+		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultWorkerReadyTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
 	return &Runner{
 		db:                      options.DB,
@@ -1477,7 +1477,7 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		}
 	}
 	if input.Loop.TargetType == "pull_request" && work.Repo != "" && work.PRNumber > 0 && r.github != nil {
-		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath})
+		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath})
 	}
 	checkpoint.Work = &work
 	checkpoint.ClaimedLockKey = lockKey
