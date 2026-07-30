@@ -435,6 +435,15 @@ type ReviewerLoopConfig struct {
 	StopOnApproved            bool `json:"stopOnApproved"`
 	StopOnReadyLabel          bool `json:"stopOnReadyLabel"`
 	StopOnIdenticalOutput     bool `json:"stopOnIdenticalOutput"`
+
+	// ConvergenceBounds configures the reviewer↔fixer loop escalation by
+	// semantic progress instead of round count. A round is productive when it
+	// introduces new review items or transitions previously open items to a
+	// terminal state; unproductive rounds accumulate toward escalation.
+	ConvergenceUnproductiveRounds int    `json:"convergenceUnproductiveRounds"`
+	StuckItemAttempts             int    `json:"stuckItemAttempts"`
+	SeverityFloor                 string `json:"severityFloor"`
+	AbsoluteRoundCeiling          int    `json:"absoluteRoundCeiling"`
 }
 
 type ReviewerConfig struct {
@@ -941,9 +950,13 @@ type PartialReviewerLoopConfig struct {
 	MaxWallClockSeconds       *int  `json:"maxWallClockSeconds,omitempty"`
 	MaxConsecutiveFailures    *int  `json:"maxConsecutiveFailures,omitempty"`
 	MaxAgentExecutionsPerPR   *int  `json:"maxAgentExecutionsPerPR,omitempty"`
-	StopOnApproved            *bool `json:"stopOnApproved,omitempty"`
-	StopOnReadyLabel          *bool `json:"stopOnReadyLabel,omitempty"`
-	StopOnIdenticalOutput     *bool `json:"stopOnIdenticalOutput,omitempty"`
+	StopOnApproved            *bool   `json:"stopOnApproved,omitempty"`
+	StopOnReadyLabel          *bool   `json:"stopOnReadyLabel,omitempty"`
+	StopOnIdenticalOutput     *bool   `json:"stopOnIdenticalOutput,omitempty"`
+	ConvergenceUnproductiveRounds *int `json:"convergenceUnproductiveRounds,omitempty"`
+	StuckItemAttempts             *int `json:"stuckItemAttempts,omitempty"`
+	SeverityFloor                 *string `json:"severityFloor,omitempty"`
+	AbsoluteRoundCeiling          *int `json:"absoluteRoundCeiling,omitempty"`
 }
 
 type PartialReviewerConfig struct {
