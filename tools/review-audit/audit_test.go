@@ -8,6 +8,7 @@ import (
 func TestClassify(t *testing.T) {
 	reviewed := Classify(PullRequest{
 		Number:     1,
+		Author:     Author{Login: "maintainer"},
 		HeadRefOID: "head1",
 		Reviews: []Review{
 			{Author: Author{Login: "codex"}, State: "COMMENTED", Commit: Commit{OID: "head1"}},
@@ -41,6 +42,7 @@ func TestClassify(t *testing.T) {
 	// merged head and must fail closed.
 	missingCommit := Classify(PullRequest{
 		Number:     4,
+		Author:     Author{Login: "maintainer"},
 		HeadRefOID: "head1",
 		Reviews:    []Review{{Author: Author{Login: "codex"}, State: "APPROVED"}},
 	})
@@ -51,6 +53,7 @@ func TestClassify(t *testing.T) {
 	// The same is true if the input lacks the merged head provenance.
 	missingHead := Classify(PullRequest{
 		Number:  5,
+		Author:  Author{Login: "maintainer"},
 		Reviews: []Review{{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}}},
 	})
 	if missingHead.Verdict != VerdictUnreviewed {
@@ -61,6 +64,7 @@ func TestClassify(t *testing.T) {
 	// that merged.
 	stale := Classify(PullRequest{
 		Number:     6,
+		Author:     Author{Login: "maintainer"},
 		HeadRefOID: "head2",
 		Reviews:    []Review{{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}}},
 	})
@@ -69,6 +73,7 @@ func TestClassify(t *testing.T) {
 	}
 	current := Classify(PullRequest{
 		Number:     7,
+		Author:     Author{Login: "maintainer"},
 		HeadRefOID: "head2",
 		Reviews: []Review{
 			{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}},
@@ -99,6 +104,7 @@ func TestClassify(t *testing.T) {
 	// A refusal notice does not downgrade a PR that also got a real review.
 	both := Classify(PullRequest{
 		Number:     10,
+		Author:     Author{Login: "maintainer"},
 		HeadRefOID: "head1",
 		Reviews:    []Review{{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}}},
 		Comments:   []Comment{{Author: Author{Login: "coderabbitai"}, Body: "Review limit reached"}},
@@ -107,7 +113,30 @@ func TestClassify(t *testing.T) {
 		t.Fatalf("Classify(review+refusal) = %+v, want reviewed", both)
 	}
 
-	bare := Classify(PullRequest{Number: 11, Comments: []Comment{{Author: Author{Login: "somedev"}, Body: "ordinary discussion"}}})
+	// A review submitted by the PR author does not establish independent
+	// coverage, even when it is bound to the merged head.
+	selfReviewed := Classify(PullRequest{
+		Number:     11,
+		Author:     Author{Login: "maintainer"},
+		HeadRefOID: "head1",
+		Reviews:    []Review{{Author: Author{Login: "Maintainer"}, State: "COMMENTED", Commit: Commit{OID: "head1"}}},
+	})
+	if selfReviewed.Verdict != VerdictUnreviewed {
+		t.Fatalf("Classify(self-reviewed) = %+v, want unreviewed", selfReviewed)
+	}
+
+	// Missing PR-author provenance cannot prove that a submitted review was
+	// independent, so coverage also fails closed.
+	missingAuthor := Classify(PullRequest{
+		Number:     12,
+		HeadRefOID: "head1",
+		Reviews:    []Review{{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}}},
+	})
+	if missingAuthor.Verdict != VerdictUnreviewed {
+		t.Fatalf("Classify(missing PR author) = %+v, want unreviewed", missingAuthor)
+	}
+
+	bare := Classify(PullRequest{Number: 13, Comments: []Comment{{Author: Author{Login: "somedev"}, Body: "ordinary discussion"}}})
 	if bare.Verdict != VerdictUnreviewed {
 		t.Fatalf("Classify(bare) = %+v, want unreviewed", bare)
 	}
@@ -115,12 +144,12 @@ func TestClassify(t *testing.T) {
 
 func TestAuditReportAndThreshold(t *testing.T) {
 	input := []byte(`[
-		{"number": 10, "title": "reviewed change", "additions": 500, "deletions": 100,
+		{"number": 10, "title": "reviewed change", "author": {"login": "maintainer"}, "additions": 500, "deletions": 100,
 		 "headRefOid": "h1", "reviews": [{"author": {"login": "codex"}, "state": "APPROVED", "commit": {"oid": "h1"}}]},
 		{"number": 11, "title": "big silent change", "additions": 900, "deletions": 141,
 		 "comments": [{"author": {"login": "coderabbitai"}, "body": "Review limit reached"}]},
 		{"number": 12, "title": "small silent change", "additions": 3, "deletions": 1},
-		{"number": 13, "title": "big stale-reviewed rewrite", "additions": 800, "deletions": 10,
+		{"number": 13, "title": "big stale-reviewed rewrite", "author": {"login": "maintainer"}, "additions": 800, "deletions": 10,
 		 "headRefOid": "h2",
 		 "reviews": [{"author": {"login": "codex"}, "state": "APPROVED", "commit": {"oid": "h1"}}]},
 		{"number": 14, "title": "big review without provenance", "additions": 700, "deletions": 1,
@@ -164,5 +193,37 @@ func TestAuditReportAndThreshold(t *testing.T) {
 	}
 	if _, _, err := Audit(input, -1); err == nil {
 		t.Fatal("Audit(negative threshold) must error instead of silently disabling the gate")
+	}
+}
+
+func TestAuditLargeGateRejectsSelfReviewAndMissingChangedLineCounts(t *testing.T) {
+	selfReview := []byte(`[
+		{"number": 16, "title": "large author-only review", "author": {"login": "maintainer"}, "additions": 1000, "deletions": 1,
+		 "headRefOid": "h1", "reviews": [{"author": {"login": "maintainer"}, "state": "COMMENTED", "commit": {"oid": "h1"}}]}
+	]`)
+	report, flagged, err := Audit(selfReview, 300)
+	if err != nil {
+		t.Fatalf("Audit(self review) error = %v", err)
+	}
+	if !flagged || !strings.Contains(report, "#16\tunreviewed\t+1000/-1\tLARGE-UNREVIEWED") {
+		t.Fatalf("Audit(self review) = flagged %t report:\n%s\nwant large self-review to fail", flagged, report)
+	}
+
+	for _, test := range []struct {
+		input []byte
+		want  string
+	}{
+		{[]byte(`[{"number": 17, "title": "missing additions", "deletions": 1000}]`), "missing additions"},
+		{[]byte(`[{"number": 18, "title": "missing deletions", "additions": 1000}]`), "missing deletions"},
+		{[]byte(`[{"number": 19, "title": "missing both"}]`), "missing additions and deletions"},
+	} {
+		if _, _, err := Audit(test.input, 300); err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Fatalf("Audit(missing changed-line count) error = %v, want fail-closed validation", err)
+		}
+	}
+
+	// Explicit zero is valid data, not an omitted count.
+	if _, _, err := Audit([]byte(`[{"number": 20, "title": "zero-sized", "additions": 0, "deletions": 0}]`), 300); err != nil {
+		t.Fatalf("Audit(explicit zero counts) error = %v, want accepted", err)
 	}
 }

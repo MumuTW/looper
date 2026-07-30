@@ -7,13 +7,16 @@
 // pure classifier over recorded state:
 //
 //	gh pr list --state merged --limit 100 \
-//	  --json number,title,additions,deletions,mergedAt,headRefOid,reviews,comments \
+//	  --json number,title,author,additions,deletions,mergedAt,headRefOid,reviews,comments \
 //	  | go run ./tools/review-audit -large 300
 //
 // Authority: every verdict derives from GitHub's own records — submitted
 // review objects (PENDING drafts and DISMISSED reviews do not count) bound
-// to the reviewed commit; missing commit provenance does not count, and the
-// refusal notice posted by the trusted reviewer account.
+// to the reviewed commit and submitted by an account other than the PR
+// author; missing author or commit provenance does not count. The gate also
+// rejects records that omit either changed-line count, rather than allowing
+// JSON's zero value to undercount a merge. Refusals require the notice posted
+// by the trusted reviewer account.
 // The tool never infers review quality from discussion content; it only
 // distinguishes recorded scrutiny from recorded refusal from silence.
 //
