@@ -215,7 +215,7 @@ func canonicalRoundTripFixtureConfig() Config {
 		Notifications: NotificationConfig{InApp: false, Osascript: OsascriptNotificationConfig{Enabled: true, SoundForLevels: []NotificationSoundLevel{NotificationSoundLevelFailure}, ThrottleWindowSeconds: 120}},
 		Disclosure:    DisclosureConfig{Enabled: true, IncludeAgent: false, IncludeOS: true, Channels: DisclosureChannelsConfig{GitCommit: true, PullRequest: false, IssueComment: true, ReviewComment: false, InlineCommentVisible: true}},
 		Tools:         ToolPathsConfig{GitPath: &gitPath, GHPath: &ghPath, LooperPath: &looperPath, OsascriptPath: &osascriptPath},
-		Package: PackageConfig{Distribution: "github-release", AutoMigrateOnStartup: true, RequireBackupBeforeMigrate: true},
+		Package:       PackageConfig{Distribution: "github-release", AutoMigrateOnStartup: true, RequireBackupBeforeMigrate: true},
 		Defaults:      DefaultsConfig{BaseBranch: baseBranch, AllowAutoCommit: false, AllowAutoPush: true, AllowAutoApprove: true, AllowAutoMerge: false, AllowRiskyFixes: true, FixAllPullRequests: false, OpenPRStrategy: OpenPRStrategyFirstCommit, AddSnapshotMode: AddSnapshotModeFull},
 		Instructions:  InstructionsConfig{Enabled: true, MaxBytes: 12288},
 		Roles: RoleConfigs{
