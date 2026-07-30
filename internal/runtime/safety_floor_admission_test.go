@@ -61,6 +61,10 @@ func TestSafetyFloorMutationsAndClaimsGatedUntilReady(t *testing.T) {
 	if err := rt.CompleteStartup(context.Background()); err != nil {
 		t.Fatalf("CompleteStartup() error = %v", err)
 	}
+	// CompleteStartup wakes the scheduler claim pump. Stop and join it before
+	// the exact-count assertions below so an in-flight asynchronous pass cannot
+	// race the manual admission checks.
+	rt.stopSchedulerLoop()
 	if got := rt.AdmissionState(); got != AdmissionReady {
 		t.Fatalf("AdmissionState() after CompleteStartup = %q, want ready", got)
 	}
