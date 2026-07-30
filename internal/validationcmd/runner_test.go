@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/processsandbox"
 )
 
 func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
@@ -49,10 +51,7 @@ func TestIsolatedEnvironmentOmitsDaemonCredentials(t *testing.T) {
 }
 
 func TestRunAllowsGitStatusInLinkedWorktree(t *testing.T) {
-	codex, err := exec.LookPath("codex")
-	if err != nil {
-		t.Skip("codex sandbox is not installed")
-	}
+	requireSandboxRuntime(t)
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
 	worktree := filepath.Join(root, "linked")
@@ -76,21 +75,17 @@ func TestRunAllowsGitStatusInLinkedWorktree(t *testing.T) {
 	runGit("worktree", "add", "-b", "linked-test", worktree)
 
 	result, err := Run(context.Background(), Options{
-		CWD:          worktree,
-		Command:      `git status --porcelain >/dev/null`,
-		Timeout:      10 * time.Second,
-		CodexCommand: codex,
+		CWD:     worktree,
+		Command: `git status --porcelain >/dev/null`,
+		Timeout: 60 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("Run(git status) error = %v; stdout=%q stderr=%q", err, result.Stdout, result.Stderr)
 	}
 }
 
-func TestRunUsesNativeSandboxForCredentialFreeWorkspaceValidation(t *testing.T) {
-	codex, err := exec.LookPath("codex")
-	if err != nil {
-		t.Skip("codex sandbox is not installed")
-	}
+func TestRunUsesProcessSandboxForCredentialFreeWorkspaceValidation(t *testing.T) {
+	requireSandboxRuntime(t)
 	root := t.TempDir()
 	worktree := filepath.Join(root, "worktree")
 	if err := os.Mkdir(worktree, 0o755); err != nil {
@@ -104,10 +99,9 @@ func TestRunUsesNativeSandboxForCredentialFreeWorkspaceValidation(t *testing.T) 
 	t.Setenv("LOOPER_CONFIG", "/home/daemon/.looper/config.json")
 
 	result, err := Run(context.Background(), Options{
-		CWD:          worktree,
-		Command:      `test -z "$SSH_AUTH_SOCK" && test -z "$LOOPER_CONFIG" && test ! -r ../daemon-secret && touch validation-ok`,
-		Timeout:      10 * time.Second,
-		CodexCommand: codex,
+		CWD:     worktree,
+		Command: `test -z "$SSH_AUTH_SOCK" && test -z "$LOOPER_CONFIG" && test ! -r ../daemon-secret && touch validation-ok`,
+		Timeout: 60 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("Run() error = %v; stdout=%q stderr=%q", err, result.Stdout, result.Stderr)
@@ -118,22 +112,28 @@ func TestRunUsesNativeSandboxForCredentialFreeWorkspaceValidation(t *testing.T) 
 }
 
 func TestRunAllowsInstalledToolchainAndReadOnlyModuleCache(t *testing.T) {
-	codex, err := exec.LookPath("codex")
-	if err != nil {
-		t.Skip("codex sandbox is not installed")
-	}
+	requireSandboxRuntime(t)
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	result, err := Run(context.Background(), Options{
-		CWD:          repoRoot,
-		Command:      `go test ./internal/validationcmd -run '^TestBuildPermissionProfileDeniesNetworkAndLimitsWrites$' -count=1`,
-		Timeout:      30 * time.Second,
-		CodexCommand: codex,
+		CWD:     repoRoot,
+		Command: `go test ./internal/validationcmd -run '^TestBuildPermissionProfileDeniesNetworkAndLimitsWrites$' -count=1`,
+		Timeout: 180 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("Run(go test) error = %v; stdout=%q stderr=%q", err, result.Stdout, result.Stderr)
+	}
+}
+
+func requireSandboxRuntime(t *testing.T) {
+	t.Helper()
+	if err := processsandbox.Available(); err != nil {
+		if os.Getenv("LOOPER_REQUIRE_TRUSTED_SRT") == "1" {
+			t.Fatalf("trusted sandbox runtime required: %v", err)
+		}
+		t.Skipf("trusted sandbox runtime is unavailable: %v", err)
 	}
 }
