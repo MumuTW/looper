@@ -614,11 +614,6 @@ func (r *ActiveExecutionRegistry) cancelAndDrainLoop(loopID, reason string, t lo
 	for _, lease := range t.toCancel {
 		lease.cancel(cause)
 	}
-	// Confirmed-drain bound handles for this loop so stop does not return while
-	// a post-BindHandle process is only asynchronously killed via lease cancel
-	// after Start continues (BindHandle→persistStatus window). Propagate kill
-	// failures: this may be the only path that confirms the process is dead
-	// when no durable AgentExecutionRecord exists yet.
 	var drainErr error
 	for _, entry := range t.toKill {
 		killErr := r.killOwned(entry, reason)
@@ -627,7 +622,7 @@ func (r *ActiveExecutionRegistry) cancelAndDrainLoop(loopID, reason string, t lo
 		}
 		r.rememberStopDrain(entry, killErr)
 	}
-	budget := r.killBudget()
+	deadline := time.Now().Add(r.killBudget())
 	waitChans := make([]<-chan struct{}, 0, len(t.spawnWait)+len(t.rebindWait))
 	waitChans = append(waitChans, t.spawnWait...)
 	waitChans = append(waitChans, t.rebindWait...)
@@ -637,15 +632,10 @@ func (r *ActiveExecutionRegistry) cancelAndDrainLoop(loopID, reason string, t lo
 		}
 		select {
 		case <-done:
-		case <-time.After(budget):
-			// Surface timeout as drain failure: the confirmation channel that
-			// proves no just-started process outlives stop never completed.
+		case <-time.After(time.Until(deadline)):
 			drainErr = errors.Join(drainErr, errLoopStopWaitTimeout)
 		}
 	}
-	// Join refuse-path killUnowned failures published on waited leases. Those
-	// handles never enter r.executions, so the second drain pass cannot see
-	// them; treating a closed wait channel as success would hide live agents.
 	for _, lease := range t.toCancel {
 		if err := lease.takeUnownedDrainErr(); err != nil {
 			drainErr = errors.Join(drainErr, err)
@@ -953,7 +943,7 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 			drainErr = errors.Join(drainErr, err)
 		}
 	}
-	budget := r.killBudget()
+	deadline := time.Now().Add(r.killBudget())
 	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait)+len(opWait))
 	waitChans = append(waitChans, spawnWait...)
 	waitChans = append(waitChans, rebindWait...)
@@ -964,7 +954,7 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 		}
 		select {
 		case <-done:
-		case <-time.After(budget):
+		case <-time.After(time.Until(deadline)):
 			drainErr = errors.Join(drainErr, errShutdownDrainTimeout)
 		}
 	}
@@ -993,14 +983,14 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	// Non-agent Supervisor-owned handles: prefer owner cancel path (shell.Run /
 	// trusted-review Kill) so we do not race concurrent Kill. Wait for release,
 	// then force-kill stragglers and join reported drain failures.
-	if err := r.drainNonAgentHandles(budget); err != nil {
+	if err := r.drainNonAgentHandles(time.Until(deadline)); err != nil {
 		drainErr = errors.Join(drainErr, err)
 	}
 
 	// Finalizers: bound operation leases release only after durable queue
 	// finalize. Wait (do not force-release) so shutdown does not close storage
 	// under an unowned running claim while ownership is still live.
-	if err := r.waitBoundOperations(budget); err != nil {
+	if err := r.waitBoundOperations(time.Until(deadline)); err != nil {
 		drainErr = errors.Join(drainErr, err)
 	}
 
