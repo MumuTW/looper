@@ -1112,40 +1112,56 @@ func TestRunnerAutonomousDispatchRotatesPastBlockedBacklogPage(t *testing.T) {
 		cfg.Roles.Coordinator.PollInterval = "0s"
 		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
 		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
-		cfg.Roles.Coordinator.Dependencies.Enabled = true
+		cfg.Roles.Coordinator.Dispatch.Autonomous.DelayMinutes = 60
 		cfg.Scheduler.MaxConcurrentRuns = 1
 	})
+	for int(fixture.now.Unix()/int64((5*time.Minute).Seconds()))%4 != 2 {
+		fixture.now = fixture.now.Add(5 * time.Minute)
+	}
+	fixture.runner.now = func() time.Time { return fixture.now }
+
+	backlog := make([]githubinfra.IssueSummary, 0, 101)
 	for issueNumber := int64(1); issueNumber <= 101; issueNumber++ {
 		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
-		if issueNumber <= 100 {
-			fixture.github.blockedBy[issueNumber] = []githubinfra.DependencyIssue{{Number: 1000, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
-		}
+		backlog = append(backlog, githubinfra.IssueSummary{Number: issueNumber, Labels: []string{"triaged", "dispatch/implement"}})
 	}
-	fixture.github.details[1000] = githubinfra.IssueDetail{Number: 1000, State: "open"}
+	// The first oldest page cannot dispatch this hour; the 101st row is the
+	// first eligible one on the next page.
+	for issueNumber := int64(1); issueNumber <= 100; issueNumber++ {
+		fixture.github.details[issueNumber] = githubinfra.IssueDetail{Number: issueNumber, Title: "Blocked", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Labels: []string{"triaged", "dispatch/implement"}, State: "open"}
+		fixture.github.timeline[issueNumber] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	}
+	fixture.github.issues = nil
+	var backlogLimits []int
 	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
-		if len(input.Labels) == 0 {
+		if !containsAllLabels(input.Labels, "triaged", "dispatch/implement") || !strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`) {
 			return nil
 		}
-		if input.Limit != coordinatorBacklogSummaryLimit {
-			t.Fatalf("backlog summary limit = %d, want %d", input.Limit, coordinatorBacklogSummaryLimit)
-		}
-		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") {
-			return fixture.github.issues
-		}
-		return nil
+		backlogLimits = append(backlogLimits, input.Limit)
+		return append([]githubinfra.IssueSummary(nil), backlog[:min(input.Limit, len(backlog))]...)
 	}
 
-	for tick := 1; tick <= 101; tick++ {
-		readsBefore := fixture.github.viewIssueReads
-		if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
-			t.Fatalf("DiscoverIssues() tick %d error = %v", tick, err)
-		}
-		if got := fixture.github.viewIssueReads - readsBefore; got != 1 {
-			t.Fatalf("tick %d issue-detail reads = %d, want 1", tick, got)
-		}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() first tick error = %v", err)
+	}
+	if len(fixture.github.assigned) != 0 {
+		t.Fatalf("assigned on blocked first page = %v, want none", assignedIssueNumbers(fixture.github.assigned))
+	}
+	if got := fixture.github.viewIssueReads; got != 1 {
+		t.Fatalf("hydrated issues on first page = %d, want 1 available dispatch slot", got)
 	}
 
+	fixture.now = fixture.now.Add(5 * time.Minute)
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() second tick error = %v", err)
+	}
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{101})
+	if got := fixture.github.viewIssueReads; got != 2 {
+		t.Fatalf("hydrated issues after two ticks = %d, want only one candidate per tick", got)
+	}
+	if len(backlogLimits) != 2 || backlogLimits[0] != backlogPageSize || backlogLimits[1] != 2*backlogPageSize {
+		t.Fatalf("backlog query limits = %v, want [%d %d]", backlogLimits, backlogPageSize, 2*backlogPageSize)
+	}
 }
 
 func TestRunnerBacklogHydrationMatchesAvailableDispatchCapacity(t *testing.T) {

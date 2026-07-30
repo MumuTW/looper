@@ -33,8 +33,18 @@ const dispatchFailureCommentMarker = "<!-- looper:coordinator:dispatch-failure -
 const cycleCommentMarker = "<!-- looper:coordinator:cycle -->"
 const mergeWatchCommentMarkerPrefix = "<!-- looper:coordinator:merge-watch"
 const noEligibleNodeStatus = "no-eligible-node"
-const coordinatorBacklogSummaryLimit = 1000
-const coordinatorBacklogHydrationLimit = 20
+const backlogPageSize = 100
+const backlogPageCount = 2
+
+type backlogLane struct {
+	dispatchLabel string
+	triggerLabels []string
+}
+
+type backlogTarget struct {
+	lane         int
+	triggerLabel string
+}
 
 type DiscoveryInput struct {
 	ProjectID string
@@ -101,17 +111,15 @@ type Options struct {
 // RuntimeState contains coordinator lifecycle state that must outlive one
 // immutable configuration snapshot. Snapshot-specific policy remains on Runner.
 type RuntimeState struct {
-	mu                       sync.Mutex
-	lastTickByProject        map[string]time.Time
-	watchLocks               map[string]*sync.Mutex
-	backlogOffsetByProjectID map[string]int
+	mu                sync.Mutex
+	lastTickByProject map[string]time.Time
+	watchLocks        map[string]*sync.Mutex
 }
 
 func NewRuntimeState() *RuntimeState {
 	return &RuntimeState{
-		lastTickByProject:        map[string]time.Time{},
-		watchLocks:               map[string]*sync.Mutex{},
-		backlogOffsetByProjectID: map[string]int{},
+		lastTickByProject: map[string]time.Time{},
+		watchLocks:        map[string]*sync.Mutex{},
 	}
 }
 
@@ -242,16 +250,16 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		loaded = append(loaded, issue)
 	}
-	backlogBudget, err := r.backlogHydrationBudget(ctx)
+	backlogBudget, err := r.backlogHydrationBudget(ctx, triageCfg, dispatchCfg)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	if backlogBudget > 0 {
-		backlog, err := r.listCoordinatorBacklog(ctx, input.Repo, project.RepoPath, triageCfg, dispatchCfg, issues)
+		backlog, err := r.listCoordinatorBacklog(ctx, input.ProjectID, input.Repo, project.RepoPath, triageCfg, dispatchCfg, issues, backlogBudget)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		for _, summary := range r.selectCoordinatorBacklog(input.ProjectID, backlog, backlogBudget) {
+		for _, summary := range backlog {
 			issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
 			if err != nil {
 				return DiscoveryResult{}, err
@@ -312,78 +320,95 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	return DiscoveryResult{Ticked: true}, nil
 }
 
-func (r *Runner) listCoordinatorBacklog(ctx context.Context, repo, cwd string, triageCfg triage.Config, dispatchCfg dispatch.Config, recent []githubinfra.IssueSummary) ([]githubinfra.IssueSummary, error) {
+func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cwd string, triageCfg triage.Config, dispatchCfg dispatch.Config, recent []githubinfra.IssueSummary, limit int) ([]githubinfra.IssueSummary, error) {
 	seen := make(map[int64]struct{}, len(recent))
 	for _, issue := range recent {
 		seen[issue.Number] = struct{}{}
 	}
-	issues := make([]githubinfra.IssueSummary, 0)
-	backlogLanes := []struct {
-		dispatchLabel string
-		triggerLabels []string
-	}{
+	issues := make([]githubinfra.IssueSummary, 0, limit)
+	backlogLanes := []backlogLane{
 		{dispatchLabel: dispatch.DispatchPlan, triggerLabels: dispatchCfg.PlannerTriggerLabels},
 		{dispatchLabel: dispatch.DispatchImplement, triggerLabels: dispatchCfg.WorkerTriggerLabels},
 	}
-	for _, lane := range backlogLanes {
-		for _, triggerLabel := range lane.triggerLabels {
-			triggerLabel = strings.TrimSpace(triggerLabel)
-			if triggerLabel == "" {
+	targets := backlogScanTargets(backlogLanes)
+	if len(targets) == 0 {
+		return issues, nil
+	}
+	targetStart, page := r.backlogScanPosition(projectID, len(targets))
+	for offset := 0; offset < len(targets) && len(issues) < limit; offset++ {
+		target := targets[(targetStart+offset)%len(targets)]
+		lane := backlogLanes[target.lane]
+		search := fmt.Sprintf("-label:%q sort:created-asc", target.triggerLabel)
+		if dispatchCfg.Mode == dispatch.ModeAutonomous {
+			search = autonomousBacklogSearch(search, dispatchCfg.HoldLabel)
+		}
+		backlog, err := r.github.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{
+			Repo:   repo,
+			CWD:    cwd,
+			Limit:  (page + 1) * backlogPageSize,
+			Labels: []string{triageCfg.TriagedLabel, lane.dispatchLabel},
+			Search: search,
+		})
+		if err != nil {
+			return nil, err
+		}
+		pageStart := page * backlogPageSize
+		if pageStart >= len(backlog) {
+			// A short page is the only page for this lane, so visit it on
+			// every rotation rather than hiding a small backlog every other tick.
+			pageStart = 0
+		}
+		pageEnd := min(pageStart+backlogPageSize, len(backlog))
+		for _, issue := range backlog[pageStart:pageEnd] {
+			if _, ok := seen[issue.Number]; ok {
 				continue
 			}
-			search := fmt.Sprintf("-label:%q sort:created-asc", triggerLabel)
-			if dispatchCfg.Mode == dispatch.ModeAutonomous {
-				search = autonomousBacklogSearch(search, dispatchCfg.HoldLabel)
-			}
-			backlog, err := r.github.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{
-				Repo:   repo,
-				CWD:    cwd,
-				Limit:  coordinatorBacklogSummaryLimit,
-				Labels: []string{triageCfg.TriagedLabel, lane.dispatchLabel},
-				Search: search,
-			})
-			if err != nil {
-				return nil, err
-			}
-			for _, issue := range backlog {
-				if _, ok := seen[issue.Number]; ok {
-					continue
-				}
-				seen[issue.Number] = struct{}{}
-				issues = append(issues, issue)
+			seen[issue.Number] = struct{}{}
+			issues = append(issues, issue)
+			if len(issues) == limit {
+				break
 			}
 		}
 	}
-	sort.Slice(issues, func(i, j int) bool { return issues[i].Number < issues[j].Number })
 	return issues, nil
 }
 
-func (r *Runner) backlogHydrationBudget(ctx context.Context) (int, error) {
-	if r == nil || r.config == nil || r.config.Scheduler.MaxConcurrentRuns <= 0 {
-		return coordinatorBacklogHydrationLimit, nil
+func (r *Runner) backlogHydrationBudget(ctx context.Context, triageCfg triage.Config, dispatchCfg dispatch.Config) (int, error) {
+	limit := triageCfg.MaxPerTick
+	if limit <= 0 || dispatchCfg.Mode != dispatch.ModeAutonomous || r == nil || r.config == nil || r.config.Scheduler.MaxConcurrentRuns <= 0 {
+		return limit, nil
 	}
 	running, err := r.runningQueueItems(ctx)
 	if err != nil {
 		return 0, err
 	}
-	return min(max(r.config.Scheduler.MaxConcurrentRuns-running, 0), coordinatorBacklogHydrationLimit), nil
+	return min(limit, max(r.config.Scheduler.MaxConcurrentRuns-running, 0)), nil
 }
 
-func (r *Runner) selectCoordinatorBacklog(projectID string, issues []githubinfra.IssueSummary, limit int) []githubinfra.IssueSummary {
-	if len(issues) == 0 || limit <= 0 {
-		return nil
+func backlogScanTargets(lanes []backlogLane) []backlogTarget {
+	targets := make([]backlogTarget, 0)
+	for laneIndex, lane := range lanes {
+		for _, triggerLabel := range lane.triggerLabels {
+			if triggerLabel = strings.TrimSpace(triggerLabel); triggerLabel != "" {
+				targets = append(targets, backlogTarget{lane: laneIndex, triggerLabel: triggerLabel})
+			}
+		}
 	}
-	limit = min(limit, len(issues))
-	r.state.mu.Lock()
-	offset := r.state.backlogOffsetByProjectID[projectID] % len(issues)
-	r.state.backlogOffsetByProjectID[projectID] = (offset + limit) % len(issues)
-	r.state.mu.Unlock()
-	selected := make([]githubinfra.IssueSummary, 0, limit)
-	for index := 0; index < limit; index++ {
-		selected = append(selected, issues[(offset+index)%len(issues)])
+	return targets
+}
+
+func (r *Runner) backlogScanPosition(projectID string, targetCount int) (int, int) {
+	interval := r.pollInterval(projectID)
+	if interval <= 0 {
+		interval = 5 * time.Minute
 	}
-	sort.Slice(selected, func(i, j int) bool { return selected[i].Number < selected[j].Number })
-	return selected
+	intervalSeconds := int64(interval / time.Second)
+	if intervalSeconds <= 0 {
+		intervalSeconds = 1
+	}
+	phase := int(r.now().UTC().Unix() / intervalSeconds)
+	page := phase % backlogPageCount
+	return (phase / backlogPageCount) % targetCount, page
 }
 
 func autonomousBacklogSearch(search, legacyHoldLabel string) string {
