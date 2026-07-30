@@ -132,8 +132,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		} else if !isValidProviderKind(provider.Kind) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be: %s", ProviderKindGitHub)})
 		} else if strings.TrimSpace(provider.BaseURL) != "" && !isAbsoluteHTTPURL(provider.BaseURL) {
-			// baseUrl is optional (omitted means github.com); when set it names
-			// a GHES host and must be an absolute http(s) URL.
+			// baseUrl is optional and is only a repository-identity discriminator
+			// (it never routes gh); when set it must be an absolute http(s) URL.
 			issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL"})
 		}
 	}

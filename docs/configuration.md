@@ -189,7 +189,7 @@ Looper's frozen canonical top-level config roots are:
 | `defaults` | user-facing default policy that does not belong to a narrower domain |
 | `instructions` | global instruction-system settings that are not role-specific instruction content |
 | `roles` | role-specific config grouped by role name, for example `roles.<role>` |
-| `providers` | GitHub provider definitions: hosts (github.com or GHES) and credentials |
+| `providers` | Optional GitHub provider definitions used as repository-identity discriminators |
 | `projects` | per-project metadata and supported project-scoped overrides |
 
 ### Project authority and import
@@ -798,9 +798,8 @@ ghPath = "/opt/homebrew/bin/gh"
 osascriptPath = "/usr/bin/osascript"
 
 [[providers]]
-id = "ghes-main"
+id = "acme"
 kind = "github"
-baseUrl = "https://code.example.com"
 
 [package]
 distribution = "github-release"
@@ -923,8 +922,8 @@ worktreeRoot = "/Users/you/.looper/worktrees/looper"
 id = "second-example"
 name = "Second Example"
 repoPath = "/absolute/path/to/second-example"
-provider = "ghes-main"
-repo = "acme/ghes-example"
+provider = "acme"
+repo = "acme/second-example"
 
 [projects.roles.worker.discovery]
 autoDiscovery = false

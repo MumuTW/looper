@@ -146,15 +146,14 @@ Minimal project bound to an explicit provider:
 vendor = "opencode"
 
 [[providers]]
-id = "ghes-main"
+id = "acme"
 kind = "github"
-baseUrl = "https://code.example.com"
 
 [[projects]]
 id = "example"
 name = "Example"
 repoPath = "/absolute/path/to/example"
-provider = "ghes-main"
+provider = "acme"
 repo = "acme/example"
 ```
 
@@ -319,9 +318,8 @@ ghPath = "/opt/homebrew/bin/gh"
 osascriptPath = "/usr/bin/osascript"
 
 [[providers]]
-id = "ghes-main"
+id = "acme"
 kind = "github"
-baseUrl = "https://code.example.com"
 
 [defaults]
 baseBranch = "main"
@@ -375,11 +373,11 @@ name = "Looper"
 repoPath = "/absolute/path/to/looper"
 
 [[projects]]
-id = "ghes-example"
-name = "GHES Example"
-repoPath = "/absolute/path/to/ghes-example"
-provider = "ghes-main"
-repo = "acme/ghes-example"
+id = "second-example"
+name = "Second Example"
+repoPath = "/absolute/path/to/second-example"
+provider = "acme"
+repo = "acme/second-example"
 
 [projects.roles.reviewer.discovery.triggers]
 labels = ["needs-review"]
