@@ -35,7 +35,7 @@ Also make sure:
 - GitHub projects: `gh` is authenticated with the target GitHub account
 - each coding role you want to run can resolve a vendor: set global `agent.vendor` in the config (for example `vendor = "opencode"`), or supply vendor via `agent.profiles` / `roles.<role>.agent` as described in [Multi-role agent vendor and model](configuration.md#multi-role-agent-vendor-and-model). A single global vendor is the zero-diff default that covers planner, worker, reviewer, and fixer until you add per-role bindings. Coordinator triage always uses the global agent only and is skipped when global vendor is unset.
 
-Provider health is visible on the dashboard and via `GET /api/v1/status`. `looper status` reports the config file, daemon reachability, and the registered projects, but not per-provider health.
+`GET /api/v1/status` reports service, storage, scheduler, agent, webhook, loop, network, safety, notification, and tool state; there is no per-provider health surface. `looper status` reports the config file, daemon reachability, and the registered projects.
 
 ### Grok Build (xAI)
 

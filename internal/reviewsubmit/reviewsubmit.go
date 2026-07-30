@@ -244,18 +244,6 @@ func Run(ctx context.Context, opts Options) error {
 	return writeJSON(stdout, map[string]any{"submitted": true})
 }
 
-// trustedReviewRequestSubmitBypass reports whether Forgejo review-request /
-// label publish gates may be skipped. Authority is storage run/loop metadata,
-// never the argv --reviewer-manual flag alone.
-//
-// Bypass applies when:
-//   - the current trusted run is a manual reviewer loop (--reviewer-run-id), or
-//   - the current trusted reviewer loop is an enabled follow-up reviewing a head
-//     that differs from lastPublishedHeadSha (matching requireReviewRequestForLoop
-//     / reviewerFollowUpHasNewHead in the reviewer runner). Automatic follow-up
-//     runs do not pass --reviewer-run-id, so that path resolves the current
-//     running reviewer loop for the PR when the flag is absent.
-//
 // resolveReviewSubmitAnchors establishes complete base/head anchor authority.
 // For actionable inline comments it prefers path-targeted local diffs (GitHub
 // gateway) and never treats a truncated remote capture as authoritative.
