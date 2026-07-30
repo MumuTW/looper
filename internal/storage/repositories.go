@@ -881,6 +881,25 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 	return nil
 }
 
+// UpdateCheckpoint updates only the checkpoint projection for a durable run.
+// Callers that write after a run has already reached a terminal status use this
+// narrow write so they cannot overwrite concurrent status, step, heartbeat, or
+// completion transitions with a stale full row.
+func (r *RunsRepository) UpdateCheckpoint(ctx context.Context, id, checkpointJSON, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `UPDATE runs SET checkpoint_json = ?, updated_at = ? WHERE id = ?`, checkpointJSON, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("update run checkpoint: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read updated run checkpoint rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("update run checkpoint: run not found: %s", id)
+	}
+	return nil
+}
+
 func (r *RunsRepository) GetByID(ctx context.Context, id string) (*RunRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE id = ?`, id)
 	record, err := scanRun(row)

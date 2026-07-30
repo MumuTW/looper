@@ -2057,7 +2057,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 				if project != nil {
 					if breakerStreak > 0 && breakerPause != nil {
-						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, &runFailure.checkpoint)
+						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
 						if resumeErr != nil {
 							return nil, resumeErr
 						}
@@ -2065,7 +2065,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 							return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 						}
 					} else {
-						r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &runFailure.checkpoint)
+						r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
 					}
 				}
 			}
@@ -2275,7 +2275,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if breakerStreak > 0 {
 			r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-			if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, &latest); err != nil {
+			if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
 				return ProcessResult{}, err
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -2284,12 +2284,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 				return ProcessResult{}, err
 			} else if scheduled {
-				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 			}
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
@@ -2323,7 +2323,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 			return ProcessResult{}, err
 		} else if scheduled {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 		}
 		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -2333,7 +2333,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}); err != nil {
 			return ProcessResult{}, err
 		}
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
 	if resumedRun.Resumed && resumedRun.StartStep != stepDiscoverPR || (!resumedRun.Resumed && resumedRun.StartStep == stepDiscoverPR && len(prQueryLabels(r.discoveryPolicyForProject(project.ID).Labels)) > 0) {
@@ -2414,7 +2414,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			if breakerStreak > 0 {
 				r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-				if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, &latest); err != nil {
+				if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
 					return ProcessResult{}, err
 				}
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -2423,12 +2423,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 					return ProcessResult{}, err
 				} else if scheduled {
-					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 				}
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
-				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -2461,7 +2461,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": summary}})
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 		return ProcessResult{}, err
@@ -2474,7 +2474,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 			return ProcessResult{}, err
 		} else if scheduled {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 			status := statusForSkip(checkpoint.SkipReason)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 		}
@@ -2483,14 +2483,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		if paused {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 	}
 	if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if scheduled {
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 		status := statusForSkip(checkpoint.SkipReason)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 	}
@@ -2505,7 +2505,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 	}
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+	r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 	status := statusForSkip(checkpoint.SkipReason)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
@@ -2786,7 +2786,7 @@ func (r *Runner) finishLabelMismatchFixerQueueItem(ctx context.Context, project 
 	}); err != nil {
 		return ProcessResult{}, err
 	}
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, &checkpoint)
+	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, derefRunRecordID(run), &checkpoint)
 	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
 	if run != nil {
 		result.RunID = run.ID
@@ -6025,8 +6025,8 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 // and immediately hands off to feedback that discovery durably observed while
 // the failing run was active. The new queue state is exposed only after the
 // failed checkpoint is forced back to discover.
-func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint *fixerCheckpoint) (bool, error) {
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, checkpoint)
+func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint *fixerCheckpoint) (bool, error) {
+	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, runID, checkpoint)
 	if r.db == nil || r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
 		return false, nil
 	}
@@ -6959,10 +6959,23 @@ func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRe
 	return checkpoint, nil
 }
 
-func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *fixerCheckpoint) {
+// cleanupFixerWorktreeIfTerminal removes the run's worktree once the run has
+// reached a terminal state, and records the attempt durably.
+//
+// The cleanup timestamps it sets are the only record of what happened: a run with
+// CleanupAttemptedAt but no CleanedAt is one whose cleanup failed. Callers reach
+// this after completeRun has already written the run, so a full-row Upsert of the
+// in-memory record could revert a concurrent transition (discovery persisting
+// restart_from_discover while cleanup runs, say). The narrow UpdateCheckpoint
+// write touches the checkpoint projection only.
+//
+// runID may be empty when no durable run owns the cleanup; the timestamps then
+// stay in-memory for the returned ProcessResult, as before.
+func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, runID string, checkpoint *fixerCheckpoint) {
 	if checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
 		return
 	}
+	defer r.persistTerminalCleanupCheckpoint(ctx, runID, checkpoint)
 	// Unprepared rewind paths (PreparedAt cleared, path kept) may still hold
 	// interrupted-repair dirt that prepare never evaluated. Terminal queue
 	// parking / success cleanup must not force-remove that evidence.
@@ -6982,6 +6995,28 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleaned", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch}})
+}
+
+// derefRunRecordID returns the run's ID, or "" when no durable run exists.
+func derefRunRecordID(run *storage.RunRecord) string {
+	if run == nil {
+		return ""
+	}
+	return run.ID
+}
+
+// persistTerminalCleanupCheckpoint stores the cleanup timestamps without
+// disturbing the rest of the run row. A failure here is logged, not returned: the
+// run has already completed and its recorded status is the primary result.
+func (r *Runner) persistTerminalCleanupCheckpoint(ctx context.Context, runID string, checkpoint *fixerCheckpoint) {
+	if checkpoint == nil || r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
+		return
+	}
+	if err := r.repos.Runs.UpdateCheckpoint(ctx, runID, mustMarshalJSON(checkpoint), r.nowISO()); err != nil {
+		r.logError("fixer terminal cleanup checkpoint persist failed", map[string]any{
+			"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": err.Error(),
+		})
+	}
 }
 
 // isMissingOrUnusableFixerWorktree reports whether a checkpoint worktree path

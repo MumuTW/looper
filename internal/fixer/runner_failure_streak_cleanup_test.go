@@ -116,7 +116,7 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	if err != nil {
 		t.Fatalf("updateLoop(paused) error = %v", err)
 	}
-	resumed, err := runner.finishFailureStreakBreaker(context.Background(), *project, paused, queue, &checkpoint)
+	resumed, err := runner.finishFailureStreakBreaker(context.Background(), *project, paused, queue, "", &checkpoint)
 	if err != nil || !resumed {
 		t.Fatalf("finishFailureStreakBreaker() = (%v, %v), want immediate pending resume", resumed, err)
 	}
