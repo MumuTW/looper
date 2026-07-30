@@ -103,3 +103,87 @@ Feishu anchor:  💻 本地接管 → looper resume 153
    so the human and the daemon never drive the same session concurrently.
 4. **Vendor gating.** Only codex/claude offer takeover until opencode/cursor pass
    the same 3-turn resume check.
+
+## What the hold actually covers
+
+`human_takeover` is a status on one loop. "A human owns this target" is a claim
+about a shared filesystem resource — the detached worktree — enforced through
+that one loop's status, and the two are not the same thing. State the difference
+rather than letting the wording imply the stronger one.
+
+Three tiers, and the difference between them is mechanical rather than a matter
+of degree. **Absolute** means the guarantee is enforced inside the same statement
+that could break it, so there is no window: a claim is refused by the claim
+predicate itself, a hold is refused by the writing statement itself.
+**Best-effort** means the check and the thing it protects are two separate
+operations — a status read, then a filesystem mutation — so a takeover landing
+between them wins the read and loses the outcome. **Not covered** means there is
+no check at all.
+
+A reader can classify any future protection by asking that one question.
+
+### Absolute, from the moment takeover commits until `looper handback`
+
+- **No new claim** is granted on the held loop, or on any other loop sharing its
+  checkout — same project + repo + PR number for a PR target; same project +
+  target_id for an issue target, among planner loops only. Two target types are
+  *not* shared checkouts, and each fences only the held loop:
+  - A **project** target: project workers run concurrently by design, each on its
+    own branch.
+  - A **non-planner issue** loop: planner is the only role whose issue branch is
+    issue-derived (`looper/planner/<issue>-<slug>`), so a replacement planner loop
+    on the same issue does land on the held checkout. A worker's branch carries
+    its own loop hash (`looper/<issue>-<slug>-<loopHash>`), so a worker on the same
+    issue never shares the planner's checkout or another worker's.
+- **The selected loop's in-flight run is stopped**, and spawn admission for it
+  stays closed. A claim that reaches its run boundary after the hold commits
+  aborts there instead of preparing a worktree or launching an agent.
+- **No blind write may take or release the hold.** Only `looper takeover` creates
+  one and only `looper handback` (or an explicit stop/terminate) releases it;
+  every other write to a held loop is refused inside the writing statement,
+  including a `POST /loops` insert that names `human_takeover` directly.
+- **Startup recovery leaves held loops alone**, and a refused recovery write is
+  skipped rather than aborting the pass — one held loop must not fail daemon
+  startup for every other loop.
+- **Stale-run reconciliation cannot leave work queued against the hold.** Its
+  requeue re-reads the loop after writing and cancels its own replacement queue
+  item if a takeover landed mid-repair. This one is closable rather than
+  best-effort because both halves are durable writes on the same rows.
+
+### Best-effort only, pending #210
+
+- **Its worktree is kept out of cleanup — but the check is not held with the
+  delete.** `worktreecleanup.Plan` reads the hold (both from loop metadata and
+  from the run checkpoint, which is where ordinary fixer and reviewer loops
+  actually record their path), and `Run` deletes later; the fixer's and reviewer's
+  terminal-cleanup paths read the hold, then call `CleanupWorktree`. A takeover
+  committing after the read and before the filesystem mutation is reported as a
+  successful hold while the checkout is removed. Cleanup does not *target* held
+  loops — in practice the read is correct — but it is a check-then-act, so it
+  narrows the window rather than closing it, and no re-check anywhere in that span
+  would change that. #210 closes it by putting the filesystem operation and the
+  ownership check under one lock keyed on the worktree. Deliberately not patched
+  further here: a re-check would make the code look protected while the guarantee
+  stayed probabilistic.
+
+### Not covered at all
+
+- **A sibling loop already claimed and running on the same checkout keeps
+  running.** The claim boundary refuses new claims; it cannot revoke one already
+  granted, and takeover stops only the loop it was given.
+- **`looper retry --discard-worktree-changes` can still reset the checkout.** It
+  does not share takeover's target mutex, so it can reach the filesystem before
+  the guard refuses its status write — and a filesystem mutation cannot be
+  undone by refusing a database write afterwards.
+
+Everything below "Absolute" needs a target/worktree-level lease rather than a
+per-loop status, which is the redesign #210 exists to scope. Until then the
+takeover response names the gaps, because the incident that produced all of this
+was a control reporting more than it did.
+
+### If the stop fails after the hold commits
+
+Takeover commits the hold first and stops the run second, so a stop failure
+leaves the loop genuinely parked. The API reports that as a *partial* failure
+naming the parked loop, the cancelled queue item, and `looper handback <id>` —
+the residue is only safe because it is reported.

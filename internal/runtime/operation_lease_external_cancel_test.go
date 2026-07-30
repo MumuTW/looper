@@ -150,7 +150,7 @@ func TestDurableCompleteClaimReleasesWhenExternallyCancelled(t *testing.T) {
 		t.Fatalf("Projects.Upsert: %v", err)
 	}
 	// Parked loop status (human_takeover) matches schedulerLoopParked observation.
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 5, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "human_takeover", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Loops.UpsertChangingHumanHold(context.Background(), storage.LoopRecord{ID: loopID, Seq: 5, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "human_takeover", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert: %v", err)
 	}
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{

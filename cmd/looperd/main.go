@@ -465,6 +465,11 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	if _, err := services.Loops.Hold(ctx, loopID, &reasonCopy); err != nil {
 		return result, err
 	}
+	// From here the hold and the queue-item cancel are durable. Every later
+	// return — including the failure one — must carry that fact so the API can
+	// report a partial failure instead of a bare error: the loop is genuinely
+	// parked and only `looper handback` releases it.
+	result.HoldCommitted = true
 	if _, err := haltLoopWithPreflight(ctx, services, loopID, reason, now, signal, executionMatchesProcess, false, true, preflight); err != nil {
 		return result, err
 	}

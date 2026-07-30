@@ -148,7 +148,7 @@ func TestSafetyFloorQuarantinePreservesHumanTakeover(t *testing.T) {
 	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Takeover", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 99, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "human_takeover", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+	if err := seedRepos.Loops.UpsertChangingHumanHold(context.Background(), storage.LoopRecord{ID: loopID, Seq: 99, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "human_takeover", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("execute"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {

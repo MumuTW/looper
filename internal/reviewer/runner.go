@@ -1020,6 +1020,13 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 	if loopErr != nil {
 		return loopErr
 	}
+	// Held loops are skipped before anything is enqueued: the queue item is
+	// created below and the status write only afterwards, so discovering a held
+	// reviewer any later would leave dormant active work behind.
+	if loopResult.skipped {
+		result.Skipped++
+		return nil
+	}
 	if terminalReviewerLoopReason(loopResult.record) == "failed" {
 		recovered, recoverErr := r.recoverFailedReviewerLoop(ctx, loopResult.record, pr)
 		if recoverErr != nil {
@@ -1601,7 +1608,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err != nil {
 		return ProcessResult{}, err
 	}
-	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	updatedLoop, held, err := r.beginLoopRun(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
 		updated.NextRunAt = nil
@@ -1609,6 +1616,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	})
 	if err != nil {
 		return ProcessResult{}, err
+	}
+	if held {
+		return r.finishHeldReviewerQueueItem(ctx, updatedLoop, &run, queueItem, checkpoint, reviewerRunStartHeldSummary)
 	}
 	// The runner is the immutable claim snapshot. Carry the just-persisted
 	// policy into every step so stale loop metadata from an earlier queued run
@@ -1698,7 +1708,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				failedQueue.Status = "failed"
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
-				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, loop.ID, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: runStatus, Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -1752,7 +1762,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 	}
-	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, loop.ID, &checkpoint)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
 
@@ -1890,7 +1900,7 @@ func (r *Runner) skipMissingPullRequest(ctx context.Context, input stepInput, ch
 	checkpoint.SkipReason = fmt.Sprintf("Skipped missing pull request %s#%d: %s", input.Repo, input.PRNumber, githubinfra.ErrorMessage(err))
 	checkpoint.SkipKind = "pr_not_found"
 	checkpoint.ResumePolicy = ""
-	r.cleanupReviewerWorktreeIfTerminal(context.Background(), input.Project, &checkpoint)
+	r.cleanupReviewerWorktreeIfTerminal(context.Background(), input.Project, input.Loop.ID, &checkpoint)
 	if terminateErr := r.terminateLoop(ctx, input.Loop, "pr_not_found"); terminateErr != nil {
 		return checkpoint, true, terminateErr
 	}
@@ -4332,6 +4342,9 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 type loopUpsertResult struct {
 	record  storage.LoopRecord
 	created bool
+	// skipped means the loop is human-held: discovery must not enqueue for it
+	// and must not treat that as an error.
+	skipped bool
 }
 
 func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, existing *storage.LoopRecord) (loopUpsertResult, error) {
@@ -4349,6 +4362,14 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 	}
 	if existing != nil {
+		// A human holds this PR's worktree. Report it as skipped *here*, before the
+		// caller reaches the enqueue: preserving the status through the metadata
+		// refresh and only failing later at the queued write left an active queue
+		// item behind for a loop no lane may claim, and returned an error that
+		// aborted the whole discovery pass.
+		if domain.LoopIsHumanHeld(existing.Status) {
+			return loopUpsertResult{record: *existing, created: false, skipped: true}, nil
+		}
 		budgetTerminationReason := deprecatedReviewerLoopBudgetTerminationReason(*existing)
 		if terminalReviewerLoopReason(*existing) != "" && budgetTerminationReason == "" {
 			return loopUpsertResult{record: *existing, created: false}, nil
@@ -4382,6 +4403,12 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 		updated.UpdatedAt = nowISO
 		if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+			// Takeover (or handback) committed between the read above and this
+			// write. Same outcome as the pre-write check: skip this PR, do not fail
+			// the pass, and let the next tick see what persisted.
+			if storage.IsLoopHumanHeldError(err) {
+				return r.humanHeldLoopSkip(ctx, updated.ID)
+			}
 			return loopUpsertResult{}, err
 		}
 		return loopUpsertResult{record: updated, created: false}, nil
@@ -4823,6 +4850,14 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil && current.Status == "terminated" {
 		return *current, nil
 	}
+	// A human-held loop is left exactly as it is, for the same reason a
+	// terminated one is: this helper's mutations all move a loop's status or
+	// scheduling, and neither is the daemon's to decide while a human owns the
+	// worktree. Reporting the persisted record (not an error) keeps a takeover
+	// racing a reviewer turn from failing the turn.
+	if current != nil && domain.LoopIsHumanHeld(current.Status) {
+		return *current, nil
+	}
 	updated := loop
 	if current != nil {
 		updated = *current
@@ -4836,9 +4871,59 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	}
 	updated.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+		// Lost the race against takeover/handback; the persisted row wins.
+		if storage.IsLoopHumanHeldError(err) {
+			if persisted, readErr := r.repos.Loops.GetByID(ctx, loop.ID); readErr != nil {
+				return storage.LoopRecord{}, readErr
+			} else if persisted != nil {
+				return *persisted, nil
+			}
+		}
 		return storage.LoopRecord{}, err
 	}
 	return updated, nil
+}
+
+// reviewerRunStartHeldSummary is the run outcome recorded when takeover wins the
+// race against a claim: the run is completed without ever entering the workflow.
+const reviewerRunStartHeldSummary = "Reviewer stopped before starting because the loop is held by human takeover"
+
+// beginLoopRun applies the run-start loop transition and reports whether
+// `looper takeover` already owns the loop.
+//
+// This is the run-*boundary* counterpart to updateLoop's mid-turn behaviour, and
+// the two differ on purpose. updateLoop swallows a hold and returns the persisted
+// row: a takeover that lands in the middle of an in-flight turn must not fail that
+// turn, and the turn's remaining status/schedule writes are correctly no-ops
+// because the human now owns them. At a run boundary there is no in-flight turn to
+// protect. The side effects the caller is about to perform — worktree preparation,
+// agent launch — have not happened yet, and they are precisely what the hold
+// exists to prevent, so the boundary must abort instead of proceeding on a row
+// that says human_takeover.
+//
+// How a reader tells the two apart: exactly one updateLoop call per runner opens
+// the run by writing Status = "running", and that call goes through here. Every
+// other call site is mid-turn or terminal and keeps the swallow.
+func (r *Runner) beginLoopRun(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, bool, error) {
+	updated, err := r.updateLoop(ctx, loop, mutate)
+	if err != nil {
+		return storage.LoopRecord{}, false, err
+	}
+	return updated, domain.LoopIsHumanHeld(updated.Status), nil
+}
+
+// humanHeldLoopSkip reports a human-held loop from what is actually persisted,
+// so discovery skips instead of enqueueing against a stale record. A failed
+// re-read propagates: only losing the race is routine.
+func (r *Runner) humanHeldLoopSkip(ctx context.Context, loopID string) (loopUpsertResult, error) {
+	current, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	if current == nil {
+		return loopUpsertResult{skipped: true}, nil
+	}
+	return loopUpsertResult{record: *current, created: false, skipped: true}, nil
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {
@@ -6315,7 +6400,17 @@ func agentNativeLoopReviewMarker(loopID string, headSHA string) string {
 	return fmt.Sprintf("looper:review id_prefix=reviewer:%s: head=%s", loopID, headSHA)
 }
 
-func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *reviewerCheckpoint) {
+// cleanupReviewerWorktreeIfTerminal force-removes the reviewer checkout on a
+// terminal path. loopID names the loop that produced the checkpoint and its
+// *durable* status is re-read here, for the same reason the fixer's equivalent
+// does: takeover cancels the loop's queue item, the run fails at its next step,
+// and this is where every terminal reviewer path ends — so takeover succeeding is
+// what would delete the checkout it just handed to the human (#162). The reviewer
+// is also the loop most likely to be held alongside a fixer on the same PR.
+//
+// Best-effort by construction: the check and the removal are separate statements
+// (#210). See docs/DESIGN-human-takeover.md.
+func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, loopID string, checkpoint *reviewerCheckpoint) {
 	if r.git == nil || checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
 		return
 	}
@@ -6323,6 +6418,10 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 	// fixer dirt that prepare never evaluated (remote-head drift / fetch fail
 	// before status). Terminal success/failure cleanup must not force-remove it.
 	if strings.TrimSpace(checkpoint.Worktree.PreparedAt) == "" {
+		return
+	}
+	if r.reviewerWorktreeHumanHeld(ctx, loopID) {
+		r.logInfo("reviewer worktree cleanup skipped for human takeover", map[string]any{"projectId": project.ID, "loopId": loopID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch})
 		return
 	}
 	// An active fixer owner stamp means the path is still fixer-owned evidence;
@@ -6400,6 +6499,21 @@ func capturePriorFixerOwnerToken(checkpoint reviewerCheckpoint, worktreeRoot, pr
 
 // restoreFixerOwnerToken rewrites a prior fixer ownership stamp after CreateWorktree
 // revoked it and prepare could not complete a clean reclaim. Empty inputs are no-ops.
+// reviewerWorktreeHumanHeld reports whether the durable loop row is held by
+// `looper takeover`. A read error preserves the checkout: cleanup is
+// irreversible and the loop is unavailable to prove it is safe.
+func (r *Runner) reviewerWorktreeHumanHeld(ctx context.Context, loopID string) bool {
+	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.Loops == nil {
+		return false
+	}
+	loop, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		r.logError("reviewer worktree cleanup could not read loop hold; preserving worktree", map[string]any{"loopId": loopID, "message": err.Error()})
+		return true
+	}
+	return loop != nil && domain.LoopIsHumanHeld(loop.Status)
+}
+
 func restoreFixerOwnerToken(worktreePath, token string) error {
 	token = strings.TrimSpace(token)
 	worktreePath = strings.TrimSpace(worktreePath)

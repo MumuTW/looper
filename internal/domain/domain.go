@@ -109,12 +109,19 @@ var loopStatusTransitions = map[LoopStatus][]LoopStatus{
 	LoopStatusPaused:        {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
 	LoopStatusWaiting:       {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
 	LoopStatusAwaitingHuman: {LoopStatusRunning, LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
-	LoopStatusHumanTakeover: {LoopStatusQueued, LoopStatusRunning, LoopStatusStopped, LoopStatusTerminated},
+	// No direct edge to running: a run may start only after handback requeues
+	// the loop, so the domain itself says handback is the only way back to work
+	// rather than leaving that to each caller's discipline.
+	LoopStatusHumanTakeover: {LoopStatusQueued, LoopStatusStopped, LoopStatusTerminated},
 	LoopStatusStopped:       {},
 	LoopStatusTerminated:    {},
 	LoopStatusCompleted:     {},
 	LoopStatusFailed:        {},
-	LoopStatusInterrupted:   {LoopStatusQueued, LoopStatusFailed},
+	// interrupted reaches human_takeover like every other non-terminal status.
+	// A run that died mid-flight and left a dirty checkout is one of the most
+	// likely reasons to reach for `looper takeover` at all, and without this
+	// edge that command fails with an invalid-transition error.
+	LoopStatusInterrupted: {LoopStatusQueued, LoopStatusFailed, LoopStatusHumanTakeover},
 }
 
 var runStatusTransitions = map[RunStatus][]RunStatus{
@@ -190,6 +197,18 @@ func IsActiveLoopStatus(status LoopStatus) bool {
 func IsConflictingActiveLoopStatus(status LoopStatus) bool {
 	_, ok := conflictingActiveLoopStatuses[status]
 	return ok
+}
+
+// LoopIsHumanHeld reports whether a loop's persisted status means a human owns
+// its worktree and agent session, so the daemon must not claim it, revive it in
+// discovery, recover it, or clean its worktree up.
+//
+// The authority is the human's own `looper takeover` call, durably recorded as
+// the loop's status; nothing is inferred from infra state. Only `looper handback`
+// releases the hold. This is the read-side name for the same invariant
+// storage.ErrLoopHumanHeld enforces on the write side.
+func LoopIsHumanHeld(status string) bool {
+	return status == string(LoopStatusHumanTakeover)
 }
 
 func IsTerminalRunStatus(status RunStatus) bool {

@@ -79,7 +79,7 @@ func TestTerminalCleanupPersistsSuccessTimestamps(t *testing.T) {
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "run_cleanup_ok", &checkpoint)
+	}, "", "run_cleanup_ok", &checkpoint)
 
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("len(git.cleanupCalls) = %d, want 1", len(git.cleanupCalls))
@@ -111,7 +111,7 @@ func TestTerminalCleanupPersistsAttemptBeforeWorktreeMutation(t *testing.T) {
 	}
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "run_cleanup_attempt_boundary", &checkpoint)
+	}, "", "run_cleanup_attempt_boundary", &checkpoint)
 
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("len(git.cleanupCalls) = %d, want 1", len(git.cleanupCalls))
@@ -127,7 +127,7 @@ func TestTerminalCleanupRecordsRefusedRemovalAsUnverified(t *testing.T) {
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "run_cleanup_failed", &checkpoint)
+	}, "", "run_cleanup_failed", &checkpoint)
 
 	attempted, cleaned := storedCleanupTimestamps(t, fixture, "run_cleanup_failed")
 	if attempted == "" {
@@ -171,7 +171,7 @@ func TestTerminalCleanupPreservesConcurrentRunState(t *testing.T) {
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "run_cleanup_policy_race", &checkpoint)
+	}, "", "run_cleanup_policy_race", &checkpoint)
 
 	after, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_policy_race")
 	if err != nil || after == nil {
@@ -211,7 +211,7 @@ func TestTerminalCleanupWithoutRunIDStaysInMemory(t *testing.T) {
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "", &checkpoint)
+	}, "", "", &checkpoint)
 
 	if checkpoint.Worktree.CleanedAt == "" {
 		t.Fatal("in-memory CleanedAt is empty, want the cleanup still reflected for the caller")
@@ -239,7 +239,7 @@ func TestTerminalCleanupSurvivesLaterRetryPolicyWrite(t *testing.T) {
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "run_cleanup_then_retry", &checkpoint)
+	}, "", "run_cleanup_then_retry", &checkpoint)
 
 	// ...and writes its policy change afterwards, from that stale read.
 	if err := fixture.repos.Runs.MergeRunResumePolicy(context.Background(), before.ID, loops.ResumePolicyRestartFromDiscover, fixture.nowISO()); err != nil {
@@ -272,7 +272,7 @@ func TestTerminalCleanupRecordsRefusedRemovalAsSecondaryIssue(t *testing.T) {
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "run_cleanup_issue", &checkpoint)
+	}, "", "run_cleanup_issue", &checkpoint)
 
 	// In memory, for the returned ProcessResult.
 	if checkpoint.Outcome == nil || len(checkpoint.Outcome.SecondaryIssues) != 1 {
@@ -333,7 +333,7 @@ func TestTerminalCleanupAppendsToExistingSecondaryIssues(t *testing.T) {
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "run_cleanup_append", &checkpoint)
+	}, "", "run_cleanup_append", &checkpoint)
 
 	after, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_append")
 	if err != nil || after == nil {

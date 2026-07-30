@@ -625,6 +625,18 @@ func (r *LoopsRepository) UpsertChangingHumanHold(ctx context.Context, record Lo
 func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeHumanHold bool) error {
 	insertSource := `VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	args := []any{record.ID, record.Seq, record.ProjectID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.Status, record.ConfigJSON, record.MetadataJSON, record.LastRunAt, record.NextRunAt, record.CreatedAt, record.UpdatedAt}
+	// The DO UPDATE guard only sees rows that already exist, so on its own it
+	// leaves the insert branch open: `POST /loops` with status human_takeover
+	// would mint the target-wide fence with no `looper takeover`, no queue
+	// cancellation and no stop. An unsanctioned write that *names* the held
+	// status must therefore also prove a row is already there;
+	// UpsertChangingHumanHold is the only way to create a hold. The existence
+	// test is part of the writing statement for the same reason the update guard
+	// is: a read-then-write here would be a race, not a guard.
+	if !changeHumanHold && domain.LoopIsHumanHeld(record.Status) {
+		insertSource = `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM loops WHERE id = ?)`
+		args = append(args, record.ID)
+	}
 	guard := ""
 	if !changeHumanHold {
 		guard = ` WHERE (loops.status = ?) = (excluded.status = ?)`
@@ -657,7 +669,7 @@ func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeH
 			return fmt.Errorf("upsert loop: read rows affected: %w", err)
 		}
 		if affected == 0 {
-			return fmt.Errorf("%w: loop %s", ErrLoopHumanHeld, record.ID)
+			return r.humanHoldRejection(ctx, record)
 		}
 	}
 
@@ -672,6 +684,23 @@ func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeH
 	}
 
 	return nil
+}
+
+// humanHoldRejection names which side of the hold the refused write was on, so
+// the operator-facing conflict says what actually happened instead of always
+// claiming the loop is held. Only runs on the rejection path.
+func (r *LoopsRepository) humanHoldRejection(ctx context.Context, record LoopRecord) error {
+	if domain.LoopIsHumanHeld(record.Status) {
+		// Two different refusals name the same status. Distinguish them from the
+		// durable row rather than guessing: no row at all means the write tried to
+		// *create* a hold, an existing row means it tried to restore one handback
+		// already released.
+		if existing, err := r.GetByID(ctx, record.ID); err == nil && existing == nil {
+			return fmt.Errorf("%w: refusing to create loop %s directly in human_takeover; `looper takeover` is the only way to take a hold", ErrLoopHumanHeld, record.ID)
+		}
+		return fmt.Errorf("%w: loop %s is no longer held by human takeover; refusing to restore the hold from a stale write", ErrLoopHumanHeld, record.ID)
+	}
+	return fmt.Errorf("%w: loop %s (wanted status %q); run `looper handback` to release it", ErrLoopHumanHeld, record.ID, record.Status)
 }
 
 func (r *LoopsRepository) GetByID(ctx context.Context, id string) (*LoopRecord, error) {

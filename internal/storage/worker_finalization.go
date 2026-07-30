@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"github.com/nexu-io/looper/internal/domain"
 )
 
 // WorkerSuccessFinalizationInput is the complete durable outcome of a worker
@@ -73,7 +75,13 @@ func FinalizeWorkerSuccess(ctx context.Context, db *sql.DB, input WorkerSuccessF
 			loop.UpdatedAt = input.FinishedAt
 			return repos.Loops.Upsert(ctx, *loop)
 		}
-		if loop.Status != "terminated" {
+		// Same rule as terminated, and the same rule the runners' updateLoop
+		// applies: while `looper takeover` holds the loop, its status and schedule
+		// belong to the human. The run and the queue claim are this transaction's
+		// own outcome and still commit; only the loop status write is dropped.
+		// Attempting it instead would be refused by the human-hold guard on
+		// Loops.Upsert and would fail a finalization that otherwise succeeded.
+		if loop.Status != "terminated" && !domain.LoopIsHumanHeld(loop.Status) {
 			loop.Status = input.LoopStatus
 			loop.LastRunAt = &input.FinishedAt
 			loop.NextRunAt = nil

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -160,6 +161,25 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 			if run.Status == "running" {
 				states[index].block("referenced by running run")
 			}
+			// For fixer and reviewer loops the worktree path lives only in the run
+			// checkpoint, never in loop metadata, so the loop pass above cannot match
+			// the loop to this worktree and its status check never runs. Takeover
+			// cancels the queue item and drives the run terminal, which is exactly
+			// when the `running` guard above stops applying — so without this the
+			// checkout a human was just handed becomes eligible once it ages past
+			// retention, while the loop still says human_takeover.
+			//
+			// Only the human-held status is applied here, not the full
+			// protectsLoopStatus set. A run checkpoint is a record of a past run, not
+			// a durable attachment: fixer and reviewer loops sit in idle/queued/paused
+			// between runs, all of which are "protected", so applying the whole set
+			// would block every checkpoint-derived worktree forever and make retention
+			// cleanup a no-op for precisely the loops it exists to serve. A human hold
+			// is different in kind — an active claim on the checkout with no expiry
+			// but the human's own handback.
+			if ok && domain.LoopIsHumanHeld(loop.Status) {
+				states[index].block("referenced by protected loop status " + loop.Status)
+			}
 		}
 	}
 
@@ -268,7 +288,11 @@ func (s *candidateState) block(reason string) {
 
 func protectsLoopStatus(status string) bool {
 	switch status {
-	case "idle", "queued", "running", "waiting", "paused", "failed", "interrupted":
+	case "idle", "queued", "running", "waiting", "paused", "failed", "interrupted",
+		// awaiting_human and human_takeover were added to the status set later and
+		// never backfilled here, which let cleanup delete a worktree a human had
+		// been told they owned (#162).
+		string(domain.LoopStatusAwaitingHuman), string(domain.LoopStatusHumanTakeover):
 		return true
 	default:
 		return false

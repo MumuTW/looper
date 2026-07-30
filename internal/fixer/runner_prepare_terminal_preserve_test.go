@@ -24,7 +24,7 @@ func TestCleanupFixerWorktreeIfTerminalSkipsUnpreparedWorktree(t *testing.T) {
 	}
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "", checkpoint)
+	}, "", "", checkpoint)
 	if len(git.cleanupCalls) != 0 {
 		t.Fatalf("len(git.cleanupCalls) = %d, want 0 for unprepared worktree", len(git.cleanupCalls))
 	}
@@ -36,7 +36,7 @@ func TestCleanupFixerWorktreeIfTerminalSkipsUnpreparedWorktree(t *testing.T) {
 	checkpoint.Worktree.PreparedAt = "2026-04-11T12:00:00.000Z"
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
 		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
-	}, "", checkpoint)
+	}, "", "", checkpoint)
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("len(git.cleanupCalls) = %d, want 1 for prepared worktree", len(git.cleanupCalls))
 	}

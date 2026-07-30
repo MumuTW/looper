@@ -133,6 +133,28 @@ type TakeoverResult struct {
 	Vendor       string
 	SessionID    string
 	WorktreePath string
+	// HoldCommitted records that the human_takeover hold and the queue-item
+	// cancel are already durable. It is the field that matters on the *error*
+	// return: takeover holds before it stops, so a stop failure leaves the loop
+	// genuinely parked. Reporting only "takeover failed" would hide durable state
+	// the operator now has to undo with `looper handback` — the same class of
+	// defect (a control describing something other than what it did) this change
+	// exists to fix.
+	HoldCommitted bool
+}
+
+// takeoverPartialFailure is the error body for a takeover whose hold committed
+// and whose stop then failed. It names what is durable so the operator does not
+// have to infer it from a bare failure.
+type takeoverPartialFailure struct {
+	LoopID          string `json:"loopId"`
+	HoldCommitted   bool   `json:"holdCommitted"`
+	QueueCancelled  bool   `json:"queueCancelled"`
+	StopError       string `json:"stopError"`
+	RecoveryCommand string `json:"recoveryCommand"`
+	WorktreePath    string `json:"worktreePath,omitempty"`
+	SessionID       string `json:"sessionId,omitempty"`
+	Vendor          string `json:"vendor,omitempty"`
 }
 
 type Handler struct {
@@ -707,6 +729,14 @@ func (e apiError) Error() string {
 func asAPIError(err error, target *apiError) bool {
 	if err == nil || target == nil {
 		return false
+	}
+
+	// The storage write guard refuses to move a loop out of human_takeover. It is
+	// a precondition failure, not a server fault: surface it as a conflict with
+	// the release command, wherever a loop write bubbles up.
+	if storage.IsLoopHumanHeldError(err) {
+		*target = apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: err.Error()}
+		return true
 	}
 
 	typed, ok := err.(apiError)
@@ -5411,6 +5441,22 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 	}
 
 	services := h.context.Runtime.Services()
+	// Refuse a human-held loop before anything else: /start and /pause both
+	// rewrite the status through a blind upsert, and /start additionally clears
+	// the sticky stop gate below. Either one silently ends the hold the operator
+	// was promised, so both are refused here for every target status — only
+	// /handback releases it. Checked outside the TX so the gate is never touched.
+	if services.Repositories != nil && services.Repositories.Loops != nil {
+		heldLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if heldLoop != nil && heldLoop.Status != string(status) {
+			if err := rejectReactivationWhileHumanHeld(heldLoop.Status, loopID, loopStatusMutationVerb(status)); err != nil {
+				return loopResponse{}, err
+			}
+		}
+	}
 	if status == domain.LoopStatusRunning {
 		if services.Repositories == nil || services.Coordinator == nil {
 			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
@@ -5618,6 +5664,29 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	}
 	result, err := h.context.TakeoverLoop(ctx, loopID, "Taken over by a human via looper takeover")
 	if err != nil {
+		// Hold-before-stop means a stop failure is a *partial* failure, not a
+		// no-op: the loop is parked and its queue item is cancelled whatever
+		// happens next. Say so, and name the command that undoes it.
+		if result.HoldCommitted {
+			recovery := fmt.Sprintf("looper handback %s", loopID)
+			return takeoverLoopResponse{}, apiError{
+				code:   pkgapi.ErrorCodeInternalError,
+				status: http.StatusInternalServerError,
+				message: fmt.Sprintf(
+					"Takeover could not stop the loop's in-flight run: %v. The hold is already committed: loop %s is parked in human_takeover and its queue item was cancelled, so the daemon will not resume it. Run `%s` to release it.",
+					err, loopID, recovery),
+				details: takeoverPartialFailure{
+					LoopID:          loopID,
+					HoldCommitted:   true,
+					QueueCancelled:  true,
+					StopError:       err.Error(),
+					RecoveryCommand: recovery,
+					WorktreePath:    result.WorktreePath,
+					SessionID:       result.SessionID,
+					Vendor:          result.Vendor,
+				},
+			}
+		}
 		return takeoverLoopResponse{}, err
 	}
 	resp := takeoverLoopResponse{
@@ -5635,11 +5704,25 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	resp.Supported = ok
 	if ok {
 		resp.ResumeCommand = cmdLine
+		resp.Message = takeoverHoldClause
 	} else {
-		resp.Message = "Interactive takeover needs a captured session id and a supported agent (codex/claude); the loop is parked in human_takeover — hand it back with `looper handback` to resume the daemon."
+		resp.Message = "Interactive takeover needs a captured session id and a supported agent (codex/claude), so there is no resume command; " + takeoverHoldClause
 	}
 	return resp, nil
 }
+
+// takeoverHoldClause states what the hold actually fences, split by whether the
+// protection has a window in it. "Guaranteed" is what the claim predicate and the
+// write guard enforce inside the statement that would break them. "Best-effort"
+// is cleanup: it reads the hold, then mutates the filesystem, so a takeover
+// landing between the two wins the read and loses the checkout (#210). Saying the
+// worktree "is kept out of cleanup" would be true only modulo that race — and
+// this control exists because an earlier one misreported what it did. The tiers
+// are defined in docs/DESIGN-human-takeover.md.
+const takeoverHoldClause = "The loop is parked in human_takeover until you run `looper handback`. " +
+	"Guaranteed: no new claim is granted on its target, its in-flight run is stopped, and no daemon write can take it out of human_takeover. " +
+	"Best-effort only: cleanup reads the hold before it deletes, so a sweep already past that read can still remove the worktree (#210). " +
+	"Not covered: a loop already running on the same checkout is not stopped, and `looper retry --discard-worktree-changes` can still reset it."
 
 // handbackLoop re-arms a taken-over loop so the daemon resumes it. It stamps the
 // loop with the native session id the human drove (so the next worker run resumes
@@ -6052,6 +6135,14 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	if preflightLoop == nil {
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 	}
+	// Reject before the sticky stop gate is cleared below: clearing it for a
+	// held loop would reopen spawn admission for the human's worktree even if
+	// the requeue then failed.
+	if !fromHandback {
+		if err := rejectReactivationWhileHumanHeld(preflightLoop.Status, loopID, "retry"); err != nil {
+			return retryLoopResponse{}, err
+		}
+	}
 	target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
 	if targetErr != nil {
 		return retryLoopResponse{}, targetErr
@@ -6280,8 +6371,10 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		}
 
 		updated := queueLoop
+		// Handback is the one sanctioned release of a human takeover hold; a
+		// direct /retry is refused above and by the guarded write below.
 		writeLoop := repos.Loops.Upsert
-		if loop.Status == string(domain.LoopStatusHumanTakeover) {
+		if fromHandback && loop.Status == string(domain.LoopStatusHumanTakeover) {
 			writeLoop = repos.Loops.UpsertChangingHumanHold
 		}
 		if err := writeLoop(ctx, updated); err != nil {
@@ -6702,6 +6795,43 @@ func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	status, _ := loopMeta["status"].(string)
 	return status == "terminated" || status == "stopped" || status == "failed"
+}
+
+// loopStatusMutationVerb names the operator-facing route behind a
+// mutateLoopStatus call so a refusal reads as the command that was run.
+func loopStatusMutationVerb(status domain.LoopStatus) string {
+	switch status {
+	case domain.LoopStatusRunning:
+		return "start"
+	case domain.LoopStatusPaused:
+		return "pause"
+	default:
+		return fmt.Sprintf("set %s on", status)
+	}
+}
+
+// rejectReactivationWhileHumanHeld refuses an API reactivation of a loop a human
+// holds via `looper takeover`. /start, /pause and a direct /retry all rewrite the
+// loop status through a blind upsert; once the status is no longer
+// human_takeover the claim boundary stops applying and a lane can reach the
+// human's worktree before handback (#162). /pause is included because allowing it
+// would leave the hole one step longer — pause a held loop, then /start the
+// now-`paused` one — and the domain table has no human_takeover → paused edge
+// either.
+//
+// Only /handback releases the hold. The storage write guard
+// (storage.ErrLoopHumanHeld) is the backstop that closes the read-to-write race;
+// this exists so the operator gets the reason and the next command instead of a
+// generic conflict, and so the sticky stop gate is never cleared for a held loop.
+func rejectReactivationWhileHumanHeld(status, loopID, action string) error {
+	if !domain.LoopIsHumanHeld(status) {
+		return nil
+	}
+	return apiError{
+		code:    pkgapi.ErrorCodeValidationFailed,
+		status:  http.StatusConflict,
+		message: fmt.Sprintf("Cannot %s loop %s while it is parked in human_takeover; a human owns its worktree until `looper handback` releases it", action, loopID),
+	}
 }
 
 // rejectDiscardWhileParkedForHuman refuses discard+retry when the loop is

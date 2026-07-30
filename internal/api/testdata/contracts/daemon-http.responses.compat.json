@@ -992,7 +992,8 @@
           "sessionId": "session_fixture_1",
           "worktreePath": "/tmp/worktrees/loop_1",
           "supported": true,
-          "resumeCommand": "cd /tmp/worktrees/loop_1 && codex resume session_fixture_1"
+          "resumeCommand": "cd /tmp/worktrees/loop_1 && codex resume session_fixture_1",
+          "message": "The loop is parked in human_takeover until you run `looper handback`. Guaranteed: no new claim is granted on its target, its in-flight run is stopped, and no daemon write can take it out of human_takeover. Best-effort only: cleanup reads the hold before it deletes, so a sweep already past that read can still remove the worktree (#210). Not covered: a loop already running on the same checkout is not stopped, and `looper retry --discard-worktree-changes` can still reset it."
         },
         "requestId": "fixture-request-id"
       }
