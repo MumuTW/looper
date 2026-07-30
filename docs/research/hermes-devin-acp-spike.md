@@ -165,7 +165,26 @@ backend can do, and the denial was never a containment boundary to begin with
 (see the safety section). Any such patch should approve narrowly — a
 specific server, specific tool names — not switch on `allow_always`.
 
-Practical consequence for today: **treat repo memory as read-mostly.** Hermes recalls
+### End-to-end result (2026-07-31)
+
+With the carried patch applied and the MCP server registered, a plain
+`hermes -z` session on the Devin backend stored a note through Hermes's own
+memory tool, and a subsequent fresh session recalled it — the full loop the
+prompt-contract route could never close:
+
+```
+Stored to persistent memory (looper profile, via the hermes-memory MCP backend):
+"E2E-PROOF-77: memory writes reach the looper profile through the Devin ACP backend."
+Memory store now at 13% (302/2,200 chars), 3 entries.
+```
+
+The entry is in the profile's `MEMORY.md`, and a later session answering
+"from memory only" reproduced it verbatim. Writes are no longer read-mostly
+once both setup steps are done; without them, recall still works and writes
+silently no-op.
+
+Historical note, since the rest of this section describes the pre-patch
+state: **treat repo memory as read-mostly** on an unpatched install. Hermes recalls
 and reasons over `memories/MEMORY.md` normally; writes should be made by a
 non-ACP Hermes session or by editing the file directly. A `memory`-toolset
 session on this backend will claim success without persisting anything.
@@ -216,17 +235,18 @@ Go for interactive/experimental use of Hermes-on-Devin via the repo profile,
 with memory treated as read-mostly: recall and repo-scoped memory both work,
 which was the point of the exercise.
 
-No-go for treating it as a production provider until the per-turn process
-spawn, zero usage reporting, and the inability to drive Hermes-side tools are
-addressed.
+The tool blocker is resolved. Devin's ACP server does own the tool loop, so
+Hermes's prompt-level `<tool_call>` contract stays dead — but the MCP route
+reaches the same destination from the other side, and the carried patch in
+`tools/hermes-devin/` closes the loop end-to-end: a session stores through
+Hermes's memory tool and a later session recalls it.
 
-That last one is no longer believed to be structural. Devin's ACP server does
-own the tool loop, so Hermes's prompt-level `<tool_call>` contract stays dead
-— but the MCP route above reaches the same destination from the other side,
-and it was proven end-to-end with a stub server. The remaining work is a
-carried Hermes patch of modest size (an MCP server wrapping the Hermes tools
-worth exposing, plus a narrow, allow-listed replacement for the shim's
-blanket permission denial), not an upstream change.
+Remaining no-gos for production use are the per-turn process spawn and full
+transcript replay, zero usage reporting to Hermes, the free tier's rolling
+message rate limit, and the standing fact that this is an unsupported,
+version-pinned integration that any release on either side may break. The
+patch is carried, not upstream, so a Hermes upgrade will refuse to apply it
+until it is rebuilt against the new file.
 
 ## The carried patch (`tools/hermes-devin/`)
 
