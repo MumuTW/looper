@@ -3,9 +3,11 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -108,6 +110,169 @@ func TestWorkerDoesNotAttachOldVendorSessionsAfterVendorChange(t *testing.T) {
 		t.Fatalf("cross-vendor mailbox session = %q, want fresh session", got)
 	}
 }
+
+func TestWorkerInboxAcknowledgementPreservesConcurrentMessageForNextTurn(t *testing.T) {
+	for _, initialMessages := range []int{0, 20} {
+		t.Run("initial_inbox_"+strconv.Itoa(initialMessages), func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			ctx := context.Background()
+			loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+			if err != nil || loop == nil {
+				t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+			}
+			for i := 0; i < initialMessages; i++ {
+				meta, appendErr := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: "before", Text: fmt.Sprintf("before-%d", i)})
+				if appendErr != nil {
+					t.Fatalf("AppendHumanMessage() error = %v", appendErr)
+				}
+				loop.MetadataJSON = &meta
+			}
+			if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+
+			agent := &blockingAgentExecutor{started: make(chan struct{}), release: make(chan struct{})}
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now,
+				GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: t.TempDir(), Branch: "looper/inbox", BaseBranch: "main"}},
+				AgentExecutor: agent, HITLEnabled: true, AllowAutoCommit: true,
+			})
+			claim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "worker-1", "worker")
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
+			}
+			finished := make(chan error, 1)
+			go func() {
+				_, runErr := runner.ProcessClaimedItem(ctx, *claim)
+				finished <- runErr
+			}()
+			<-agent.started
+
+			appendHumanMessageForWorkerTest(t, ctx, fixture.repos, fixture.nowISO(), "loop_worker_1", "late instruction")
+			close(agent.release)
+			if err := <-finished; err != nil {
+				t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+			}
+
+			loop, err = fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+			if err != nil || loop == nil || loop.Status != "queued" {
+				t.Fatalf("loop after first turn = (%#v, %v), want queued", loop, err)
+			}
+			inbox := loops.ReadHumanInbox(loop.MetadataJSON)
+			if len(inbox) != 1 || inbox[0].Text != "late instruction" {
+				t.Fatalf("inbox after first turn = %#v, want only late instruction", inbox)
+			}
+			queue, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+			if err != nil || queue == nil || queue.Status != "queued" {
+				t.Fatalf("queue after first turn = (%#v, %v), want queued", queue, err)
+			}
+
+			next, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "worker-2", "worker")
+			if err != nil || next == nil {
+				t.Fatalf("ClaimNextOfType(next) = (%#v, %v)", next, err)
+			}
+			if _, err := runner.ProcessClaimedItem(ctx, *next); err != nil {
+				t.Fatalf("ProcessClaimedItem(next) error = %v", err)
+			}
+			if len(agent.starts) != 2 || !strings.Contains(agent.starts[1].Prompt, "late instruction") {
+				t.Fatalf("agent starts = %#v, want second prompt containing late instruction", agent.starts)
+			}
+		})
+	}
+}
+
+func TestSuspendForHumanAcknowledgesOnlyPromptInboxSnapshot(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: "before", Text: "prompt message"})
+	if err != nil {
+		t.Fatalf("AppendHumanMessage() error = %v", err)
+	}
+	loop.MetadataJSON = &meta
+	loop.Status = "running"
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	drained := loops.ReadHumanInbox(&meta)
+	appendHumanMessageForWorkerTest(t, ctx, fixture.repos, nowISO, loop.ID, "late message")
+
+	queue, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v)", queue, err)
+	}
+	queue.Status = "running"
+	if err := fixture.repos.Queue.Upsert(ctx, *queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_suspend_inbox", LoopID: loop.ID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(ctx, loop.ProjectID)
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true, HITLAnswerTransport: "feishu"})
+	if _, err := runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: *queue}, run, workerCheckpoint{}, &awaitingHumanError{question: "Continue?", drainedInbox: drained}); err != nil {
+		t.Fatalf("suspendForHuman() error = %v", err)
+	}
+	updated, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() after suspend = (%#v, %v)", updated, err)
+	}
+	inbox := loops.ReadHumanInbox(updated.MetadataJSON)
+	if len(inbox) != 1 || inbox[0].Text != "late message" {
+		t.Fatalf("inbox after suspend = %#v, want only late message", inbox)
+	}
+}
+
+func appendHumanMessageForWorkerTest(t *testing.T, ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) {
+	t.Helper()
+	unlock := loops.LockLoopRequeue(loopID)
+	defer unlock()
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
+	if err != nil {
+		t.Fatalf("AppendHumanMessage() error = %v", err)
+	}
+	loop.MetadataJSON = &meta
+	loop.UpdatedAt = nowISO
+	if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+}
+
+type blockingAgentExecutor struct {
+	started chan struct{}
+	release chan struct{}
+	starts  []AgentRunInput
+}
+
+func (a *blockingAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
+	a.starts = append(a.starts, input)
+	if len(a.starts) == 1 {
+		close(a.started)
+		return blockingAgentExecution{release: a.release}, nil
+	}
+	return fakeAgentExecution{result: AgentResult{Status: "completed", Summary: "done", ParseStatus: "parsed"}}, nil
+}
+
+type blockingAgentExecution struct{ release <-chan struct{} }
+
+func (a blockingAgentExecution) Wait(context.Context) (AgentResult, error) {
+	<-a.release
+	return AgentResult{Status: "completed", Summary: "done", ParseStatus: "parsed"}, nil
+}
+
+func (blockingAgentExecution) Kill(string) error { return nil }
 
 func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 	fixture := newRunnerFixture(t)
