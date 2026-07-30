@@ -64,11 +64,30 @@ func TestPollFeishuHITLInboxCursorBlocksOnFailedDelivery(t *testing.T) {
 	}
 
 	n, newCursor := pollFeishuHITLInboxOnce(context.Background(), events, deps, 0)
-	if n != 3 {
-		t.Fatalf("handled = %d, want 3", n)
+	if n != 1 {
+		t.Fatalf("handled = %d, want 1 before the failed event", n)
 	}
 	if newCursor != 9 {
 		t.Fatalf("newCursor = %d, want 9 (blocked on failed event 10)", newCursor)
+	}
+	if callCount != 2 {
+		t.Fatalf("delivery attempts = %d, want 2 (do not apply events after failure)", callCount)
+	}
+}
+
+func TestPollFeishuHITLInboxCursorAdvancesPastSkippedEvents(t *testing.T) {
+	events := []feishuInboxEvent{
+		{ID: 10, Kind: "message", RootID: "om_root", Text: "   "},
+		makeCardAction(11, "not-a-sequence", "yes"),
+		{ID: 12, Kind: "unsupported"},
+	}
+
+	n, newCursor := pollFeishuHITLInboxOnce(context.Background(), events, feishuHITLPollDeps{}, 9)
+	if n != 0 {
+		t.Fatalf("handled = %d, want 0", n)
+	}
+	if newCursor != 12 {
+		t.Fatalf("newCursor = %d, want 12 after skipped events", newCursor)
 	}
 }
 

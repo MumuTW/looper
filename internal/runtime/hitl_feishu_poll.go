@@ -39,12 +39,11 @@ type feishuHITLPollDeps struct {
 
 // pollFeishuHITLInboxOnce delivers answers among a batch of inbox events.
 // Returns the count of successfully delivered events and a safe cursor value.
-// The cursor advances to one before the first delivery-failed event ID so that
-// failed events are retried on the next poll. Events intentionally skipped
-// (wrong looper, empty text, unknown kind) do not block the cursor.
+// A delivery failure stops the batch before later events can be applied past
+// the retry cursor. Events intentionally skipped (wrong looper, empty text,
+// unknown kind) are consumed and do not block the cursor.
 func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps feishuHITLPollDeps, lastCursor int64) (delivered int, newCursor int64) {
 	newCursor = lastCursor
-	failedMin := int64(-1)
 
 	for _, e := range events {
 		loopID := ""
@@ -55,6 +54,7 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 			text := strings.TrimSpace(e.Text)
 			root := strings.TrimSpace(e.RootID)
 			if text == "" || root == "" || deps.loopByRoot == nil || deps.enqueueMessage == nil {
+				newCursor = maxFeishuInboxCursor(newCursor, e.ID)
 				continue
 			}
 			loopID = deps.loopByRoot(ctx, root)
@@ -64,40 +64,38 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 			ans := strings.TrimSpace(e.Value.Answer)
 			seq, err := strconv.ParseInt(strings.TrimSpace(e.Value.LoopSeq), 10, 64)
 			if ans == "" || err != nil || deps.loopBySeq == nil {
+				newCursor = maxFeishuInboxCursor(newCursor, e.ID)
 				continue
 			}
 			loopID = deps.loopBySeq(ctx, seq)
 			value = ans
 			deliver = deps.deliverAnswer
 		default:
+			newCursor = maxFeishuInboxCursor(newCursor, e.ID)
 			continue
 		}
 		if strings.TrimSpace(loopID) == "" {
 			// Belongs to another looper or already resumed — does not block cursor.
-			if e.ID > newCursor {
-				newCursor = e.ID
-			}
+			newCursor = maxFeishuInboxCursor(newCursor, e.ID)
 			continue
 		}
 		if err := deliver(ctx, loopID, value); err != nil {
 			if deps.logWarn != nil {
 				deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"eventId": e.ID, "loopId": loopID, "kind": e.Kind, "error": err.Error()})
 			}
-			if failedMin < 0 || e.ID < failedMin {
-				failedMin = e.ID
-			}
-			continue
+			return delivered, newCursor
 		}
 		delivered++
-		if e.ID > newCursor {
-			newCursor = e.ID
-		}
-	}
-
-	if failedMin >= 0 && failedMin <= newCursor {
-		newCursor = failedMin - 1
+		newCursor = maxFeishuInboxCursor(newCursor, e.ID)
 	}
 	return delivered, newCursor
+}
+
+func maxFeishuInboxCursor(current, eventID int64) int64 {
+	if eventID > current {
+		return eventID
+	}
+	return current
 }
 
 // feishuInboxCursor tracks the last inbox event id this daemon has consumed.
