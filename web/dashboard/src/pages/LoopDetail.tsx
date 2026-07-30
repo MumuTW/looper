@@ -254,10 +254,10 @@ export function LogsPane({ selector }: { selector: string }) {
                         formatLiveStderrChunk(gap, sectionHeaderPresent),
                       );
                       sectionHeaderPresent = true;
-                      setPhase("live");
                     } else if (secondary.agent?.stderr?.trim()) {
                       sectionHeaderPresent = true;
                     }
+                    setPhase("live");
                   } catch {
                     // Keep primary stream alive; soft-fail malformed stderr only.
                   }
@@ -330,7 +330,9 @@ export function LogsPane({ selector }: { selector: string }) {
                 try {
                   const snap = JSON.parse(rawData) as LoopLogsSnapshot;
                   replaceText(seedFromSnapshot(snap));
-                  setPhase("live");
+                  if (!needsSeparateStderrFollow(snap.agent)) {
+                    setPhase("live");
+                  }
                   startStderrFollow(snap);
                 } catch {
                   setError("Malformed snapshot event (invalid JSON)");
