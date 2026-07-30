@@ -389,6 +389,9 @@ export function LogsPane({ selector }: { selector: string }) {
               }
               if (event === "error") {
                 recordStreamError(decodeStreamError(rawData));
+                controller.abort();
+                scheduleReconnect();
+                return;
               }
             },
             controller.signal,
