@@ -255,6 +255,15 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateAgentConfig(config, issues)
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
+	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", issues)
+	for i, project := range config.Projects {
+		if project.Roles == nil || project.Roles.Gatekeeper == nil || project.Roles.Gatekeeper.Trust == nil {
+			continue
+		}
+		validateGatekeeperRoleConfig(
+			GatekeeperRoleConfig{Trust: *project.Roles.Gatekeeper.Trust},
+			fmt.Sprintf("projects[%d].roles.gatekeeper", i), issues)
+	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
 	validatePackageAndDefaultsConfig(config, issues)
@@ -432,6 +441,27 @@ func validateIntakeConfig(config Config, issues *[]ValidationIssue) {
 		}
 	}
 	*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: fmt.Sprintf("must name a configured project; %q is not in projects[]", defaultProject)})
+}
+
+// validateGatekeeperRoleConfig rejects a trust level Looper cannot honour.
+//
+// "auto" is rejected rather than accepted-and-ignored on purpose: a merge
+// authority that silently behaves one level below what the operator configured
+// is the worst possible failure for this setting.
+func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, issues *[]ValidationIssue) {
+	switch GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(gatekeeper.Trust)))) {
+	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise:
+	case GatekeeperTrustAuto:
+		*issues = append(*issues, ValidationIssue{
+			Path:    path + ".trust",
+			Message: fmt.Sprintf("%q is not implemented yet; Gatekeeper cannot merge. Use %q, and enable roles.reviewer.autoMerge if you want merges today", GatekeeperTrustAuto, GatekeeperTrustAdvise),
+		})
+	default:
+		*issues = append(*issues, ValidationIssue{
+			Path:    path + ".trust",
+			Message: fmt.Sprintf("must be one of: %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise),
+		})
+	}
 }
 
 func validateHITLConfig(hitl HITLConfig, issues *[]ValidationIssue) {

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/labels"
@@ -16,6 +17,10 @@ import (
 )
 
 const (
+	// Report.Mode carries the project's configured trust level, spelled exactly as
+	// it is in configuration. Reports written before the trust ladder existed carry
+	// the historical value "observe_only", which means the same as "observe".
+	//
 	// GateReportEventType is the Gate report: the durable event written by
 	// Merge Gatekeeper recording eligible or blocked, stable reasons and
 	// evidence, and the observed head SHA. It is audit evidence, not merge
@@ -23,7 +28,6 @@ const (
 	// before merging, because holds, reviews, threads, and Project policy can
 	// change without moving the head.
 	GateReportEventType = "pull_request.merge_gate.evaluated"
-	ModeObserveOnly     = "observe_only"
 	StatusEligible      = "eligible"
 	StatusBlocked       = "blocked"
 	reportVersion       = 1
@@ -144,6 +148,10 @@ type GitHubGateway interface {
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error)
 	GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error)
+	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
+	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
+	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
+	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 }
 
 type Options struct {
@@ -151,6 +159,10 @@ type Options struct {
 	GitHub              GitHubGateway
 	Now                 func() time.Time
 	PolicyPermitsTarget func(projectID, repo, baseRefName string) bool
+	// TrustForProject reports a project's merge-authority level. Nil means every
+	// project stays at observe, which is also the configured default.
+	TrustForProject func(projectID string) config.GatekeeperTrustLevel
+	LogWarn         func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -164,6 +176,8 @@ type Runner struct {
 	github              GitHubGateway
 	now                 func() time.Time
 	policyPermitsTarget func(projectID, repo, baseRefName string) bool
+	trustForProject     func(projectID string) config.GatekeeperTrustLevel
+	logWarn             func(msg string, fields map[string]any)
 }
 
 func New(options Options) *Runner {
@@ -175,7 +189,10 @@ func New(options Options) *Runner {
 	if policy == nil {
 		policy = func(string, string, string) bool { return true }
 	}
-	return &Runner{repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy}
+	return &Runner{
+		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
+		trustForProject: options.TrustForProject, logWarn: options.LogWarn,
+	}
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -248,7 +265,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 
 	report := Report{
-		Version: reportVersion, Mode: ModeObserveOnly, Status: StatusBlocked,
+		Version: reportVersion, Mode: string(r.trustFor(input.ProjectID)), Status: StatusBlocked,
 		ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber,
 		ExpectedHeadSHA: input.ExpectedHeadSHA, RequiresFreshRevalidation: true,
 		Reasons: []Reason{}, Evidence: Evidence{RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{}},
@@ -394,6 +411,21 @@ func (r *Runner) persistProviderBlock(ctx context.Context, report Report, code R
 	return r.persist(ctx, report)
 }
 
+// trustFor reports a project's configured merge-authority level, defaulting to
+// observe when nothing is configured.
+func (r *Runner) trustFor(projectID string) config.GatekeeperTrustLevel {
+	if r == nil || r.trustForProject == nil {
+		return config.GatekeeperTrustObserve
+	}
+	level := config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(r.trustForProject(projectID)))))
+	switch level {
+	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
+		return level
+	default:
+		return config.GatekeeperTrustObserve
+	}
+}
+
 func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	sortReasons(report.Reasons)
 	report.Eligible = len(report.Reasons) == 0
@@ -410,6 +442,16 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		Payload: report, CreatedAt: r.now(),
 	}); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	}
+	// Publishing is best-effort and happens after the durable report: the report
+	// is the record, the comment is a convenience for whoever is deciding. A forge
+	// that refuses the comment must not discard an evaluation already stored.
+	if r.trustFor(report.ProjectID) != config.GatekeeperTrustObserve {
+		if err := r.publishVerdict(ctx, report); err != nil && r.logWarn != nil {
+			r.logWarn("gatekeeper: could not publish the verdict comment", map[string]any{
+				"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
+			})
+		}
 	}
 	return report, nil
 }

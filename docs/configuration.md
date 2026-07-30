@@ -727,6 +727,49 @@ allowedUserIds = [123456789]
 defaultProjectId = "looper"
 ```
 
+## Merge Gatekeeper trust level (`roles.gatekeeper.trust`)
+
+Merge Gatekeeper evaluates every open pull request against merge policy —
+required checks, review state, **unresolved review threads**, hold labels,
+mergeability, project policy — and writes a durable Gate report. The trust level
+decides what it may do with that judgement.
+
+| Level | Behaviour |
+| --- | --- |
+| `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
+| `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
+| `auto` | Would let Gatekeeper merge. **Not implemented** — configuration rejects it. |
+
+`auto` is rejected rather than accepted and ignored on purpose: a merge authority
+that silently behaves one level below what was configured is the worst possible
+failure for this setting.
+
+```toml
+[roles.gatekeeper]
+trust = "advise"
+```
+
+Project overrides use `projects[].roles.gatekeeper.trust`.
+
+At `advise` the verdict is a single comment kept up to date in place, not a new
+comment per evaluation — this lane re-evaluates every tick. An unchanged verdict
+is left alone entirely.
+
+The verdict states the head it was evaluated at and says plainly that anything
+changing afterwards invalidates it. That is not decoration: holds, reviews,
+threads, and policy can all change without moving the head, which is why the Gate
+report is audit evidence rather than merge authority.
+
+### Relationship to `roles.reviewer.autoMerge`
+
+These are two different merge stories, and today they coexist: Reviewer's
+auto-merge opts a PR into GitHub's native auto-merge on its own approval, while
+Gatekeeper only observes or advises. Reviewer's path checks a narrower set of
+conditions — notably **not** unresolved review threads or requested changes.
+[#116](https://github.com/MumuTW/looper/issues/116) consolidates both behind this
+ladder and retires `roles.reviewer.autoMerge`; until `auto` exists, Reviewer's
+setting remains the only way Looper merges anything.
+
 ## Project override rules
 
 Project entries stay in `projects[]`, but any override-bearing config must mirror the same local shape it uses globally.

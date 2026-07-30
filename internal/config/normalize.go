@@ -1218,6 +1218,9 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Worker != nil {
 		mergeWorkerRoleConfig(&config.Worker, *partial.Worker)
 	}
+	if partial.Gatekeeper != nil && partial.Gatekeeper.Trust != nil {
+		config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
+	}
 }
 
 func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCoordinatorRoleConfig) {

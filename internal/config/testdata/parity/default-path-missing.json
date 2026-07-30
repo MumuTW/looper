@@ -192,6 +192,7 @@
             "assignTo": ""
           }
         },
+        "gatekeeper": {},
         "planner": {
           "autoDiscovery": true,
           "triggers": {
