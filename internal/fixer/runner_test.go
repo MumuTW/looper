@@ -436,6 +436,18 @@ func TestDiscoverPullRequestsSkipsOccupiedCandidateAndContinuesBatch(t *testing.
 	}
 }
 
+func TestEnsureLoopForPullRequestRequiresDatabaseForNewLoop(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{Repos: fixture.repos, Now: fixture.now})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if _, err := runner.ensureLoopForPullRequest(context.Background(), *project, "acme/looper", 42, "head", "items", "state", nil, nil); err == nil || !strings.Contains(err.Error(), "fixer runner database is not configured") {
+		t.Fatalf("ensureLoopForPullRequest() error = %v, want database configuration error", err)
+	}
+}
+
 func TestDiscoverPullRequestCreatesLoopAndQueue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

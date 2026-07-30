@@ -4209,8 +4209,8 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
-	if domain.LoopType(loopType) == domain.LoopTypeWorker && target.TargetType == domain.LoopTargetTypeIssue && derefBool(body.Force) {
-		metadataJSON, err = forcedIssueWorkerMetadataJSON(metadataJSON, target)
+	if domain.LoopType(loopType) == domain.LoopTypeWorker && target.TargetType == domain.LoopTargetTypeIssue {
+		metadataJSON, err = issueWorkerMetadataJSON(metadataJSON, target, derefBool(body.Force))
 		if err != nil {
 			return loopResponse{}, err
 		}
@@ -4817,6 +4817,9 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if err != nil {
 		return err
 	}
+	if target.TargetType != domain.LoopTargetTypeIssue && target.TargetType != domain.LoopTargetTypePullRequest {
+		return nil
+	}
 	// An injected refresher is already the caller's explicit freshness authority;
 	// unlike the default GitHub gateway, it does not require a local checkout or
 	// a configured gh binary.
@@ -5106,11 +5109,10 @@ func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
 	return &text
 }
 
-// forcedIssueWorkerMetadataJSON records the operator's explicit override in
-// the same durable worker shape consumed during PR adoption. The issue target
-// supplies the source identity even when a generic manual-loop request omitted
-// optional worker metadata.
-func forcedIssueWorkerMetadataJSON(metadataJSON *string, target domain.LoopTarget) (*string, error) {
+// issueWorkerMetadataJSON records the source identity used after a worker
+// retargets to a pull request. Only force=true may create the durable override:
+// callers control generic metadata, so an incoming override is not authority.
+func issueWorkerMetadataJSON(metadataJSON *string, target domain.LoopTarget, force bool) (*string, error) {
 	metadata := parseJSONObject(metadataJSON)
 	if metadata == nil {
 		metadata = map[string]any{}
@@ -5119,7 +5121,10 @@ func forcedIssueWorkerMetadataJSON(metadataJSON *string, target domain.LoopTarge
 	if worker == nil {
 		worker = map[string]any{}
 	}
-	worker["issueClaimOverride"] = true
+	delete(worker, "issueClaimOverride")
+	if force {
+		worker["issueClaimOverride"] = true
+	}
 	worker["repo"] = target.Repo
 	worker["issueNumber"] = target.IssueNumber
 	metadata["worker"] = worker

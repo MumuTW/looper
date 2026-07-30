@@ -4989,6 +4989,18 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		return loopUpsertResult{record: updatedLoop, created: false, availableAt: availableAt}, nil
 	}
 	targetID := buildPullRequestTargetID(repo, prNumber)
+	if r.db == nil {
+		return loopUpsertResult{}, fmt.Errorf("fixer runner database is not configured")
+	}
+	var metadataJSON *string
+	if sourceWorkerID := fixerSourceWorkerIDForPullRequest(existingLoops, project.ID, repo, prNumber); sourceWorkerID != "" {
+		metadata, err := json.Marshal(map[string]any{"sourceWorkerId": sourceWorkerID})
+		if err != nil {
+			return loopUpsertResult{}, err
+		}
+		text := string(metadata)
+		metadataJSON = &text
+	}
 	var loop storage.LoopRecord
 	if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
 		repos := storage.NewRepositories(tx)
@@ -4996,7 +5008,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		if err != nil {
 			return err
 		}
-		loop = storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+		loop = storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: metadataJSON}
 		if err := repos.Loops.AssertIssueClaimAdmission(ctx, loop, false); err != nil {
 			return err
 		}
@@ -5005,6 +5017,19 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		return loopUpsertResult{}, err
 	}
 	return loopUpsertResult{record: loop, created: true, availableAt: now}, nil
+}
+
+func fixerSourceWorkerIDForPullRequest(loops []storage.LoopRecord, projectID, repo string, prNumber int64) string {
+	for _, loop := range loops {
+		if loop.ProjectID != projectID || loop.Type != string(domain.LoopTypeWorker) || loop.TargetType != string(domain.LoopTargetTypePullRequest) || !strings.EqualFold(derefString(loop.Repo), repo) || derefInt64(loop.PRNumber) != prNumber {
+			continue
+		}
+		worker, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+		if worker != nil && int64FromAny(worker["issueNumber"]) > 0 {
+			return loop.ID
+		}
+	}
+	return ""
 }
 
 func (r *Runner) resumePausedZeroProgressLoopIfStateChanged(ctx context.Context, projectID, repo string, prNumber int64, headSHA, fixItemsStateHash string) error {

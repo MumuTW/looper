@@ -1092,6 +1092,16 @@ func (r *LoopsRepository) sourceWorkerForPullRequest(ctx context.Context, loop L
 	if loop.TargetType != string(domain.LoopTargetTypePullRequest) || repo == "" || prNumber <= 0 {
 		return nil, nil
 	}
+	if sourceWorkerID := sourceWorkerIDFromMetadata(loop.MetadataJSON); sourceWorkerID != "" {
+		worker, err := r.GetByID(ctx, sourceWorkerID)
+		if err != nil {
+			return nil, err
+		}
+		if worker == nil || worker.ProjectID != loop.ProjectID || worker.Type != string(domain.LoopTypeWorker) || worker.TargetType != string(domain.LoopTargetTypePullRequest) || !strings.EqualFold(loopString(worker.Repo), repo) || loopInt64(worker.PRNumber) != prNumber {
+			return nil, fmt.Errorf("source worker link %q no longer matches pull request %s#%d", sourceWorkerID, repo, prNumber)
+		}
+		return worker, nil
+	}
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops
 		WHERE project_id = ? AND type = ? AND target_type = ?
 		  AND repo = ? COLLATE NOCASE AND pr_number = ?
@@ -1115,17 +1125,31 @@ func (r *LoopsRepository) sourceWorkerForPullRequest(ctx context.Context, loop L
 	return nil, nil
 }
 
+func sourceWorkerIDFromMetadata(metadataJSON *string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	var metadata struct {
+		SourceWorkerID string `json:"sourceWorkerId"`
+	}
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(metadata.SourceWorkerID)
+}
+
 func parseIssueTargetID(targetID string) (string, int64, bool) {
-	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(targetID), "issue:"), ":")
-	if len(parts) < 2 || !strings.HasPrefix(targetID, "issue:") {
+	trimmed := strings.TrimSpace(targetID)
+	parts := strings.Split(strings.TrimPrefix(trimmed, "issue:"), ":")
+	if len(parts) < 2 || !strings.HasPrefix(trimmed, "issue:") {
 		return "", 0, false
 	}
 	var number int64
 	if _, err := fmt.Sscan(parts[len(parts)-1], &number); err != nil || number <= 0 {
 		return "", 0, false
 	}
-	repo := strings.Join(parts[:len(parts)-1], ":")
-	return repo, number, strings.TrimSpace(repo) != ""
+	repo := strings.TrimSpace(strings.Join(parts[:len(parts)-1], ":"))
+	return repo, number, repo != ""
 }
 
 func workerIssueFromMetadata(metadataJSON *string, fallbackRepo string) (string, int64, bool) {

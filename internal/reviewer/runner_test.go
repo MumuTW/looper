@@ -1820,7 +1820,7 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 		t.Fatalf("loopEnabled(empty metadata) = true, want false for legacy persisted loop")
 	}
 
-	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "", "acme/looper", 42)
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "", "acme/looper", 42, "")
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
 	}
@@ -1836,7 +1836,7 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 		t.Fatalf("reviewEvents = %#v, want snapshotted decision policy", reviewEvents)
 	}
 	current := `{"loop":{"enabled":true,"status":"terminated","terminationReason":"max_wall_clock","maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`
-	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42)
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42, "")
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON(legacy budget metadata) error = %v", err)
 	}
@@ -1853,12 +1853,12 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 		t.Fatalf("loop metadata status = %#v, want active after removing budget termination", loopMeta["status"])
 	}
 	current = `{"reviewEvents":{"clean":"BOGUS","blocking":"APPROVE"}}`
-	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42)
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42, "")
 	if err == nil || !strings.Contains(err.Error(), "reviewEvents.clean") {
 		t.Fatalf("ensureLoopMetadataJSON(invalid reviewEvents) error = %v, want validation error", err)
 	}
 	current = `{"reviewEvents":{"clean":123}}`
-	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42)
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42, "")
 	if err == nil || !strings.Contains(err.Error(), "reviewEvents.clean") {
 		t.Fatalf("ensureLoopMetadataJSON(malformed reviewEvents) error = %v, want validation error", err)
 	}
@@ -1887,7 +1887,7 @@ func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
 		CustomInstructions: &projectCfg,
 	})
 
-	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "ghes-native", "owner/second", 7)
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "ghes-native", "owner/second", 7, "")
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
 	}
@@ -2039,6 +2039,53 @@ func TestEnsureLoopForPullRequestRefusesOccupiedSourceIssueOnReactivation(t *tes
 	persisted, err := fixture.repos.Loops.GetByID(context.Background(), terminated.ID)
 	if err != nil || persisted == nil || persisted.Status != "terminated" {
 		t.Fatalf("reactivated loop = %#v, %v; want terminated record unchanged", persisted, err)
+	}
+}
+
+func TestEnsureLoopForPullRequestRequiresDatabaseForNewLoop(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{Repos: fixture.repos, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if _, err := runner.ensureLoopForPullRequest(context.Background(), *project, "acme/looper", 42, nil); err == nil || !strings.Contains(err.Error(), "reviewer runner database is not configured") {
+		t.Fatalf("ensureLoopForPullRequest() error = %v, want database configuration error", err)
+	}
+}
+
+func TestReviewerDiscoveryDoesNotEnqueueRejectedWaitingReactivation(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	prTarget := "pr:acme/looper:42"
+	issueTarget := "issue:acme/looper:77"
+	metadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	for _, loop := range []storage.LoopRecord{
+		{ID: "source_worker", Seq: 1, ProjectID: project.ID, Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()},
+		{ID: "waiting_reviewer", Seq: 2, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "waiting", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()},
+		{ID: "occupying_worker", Seq: 3, ProjectID: project.ID, Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()},
+	} {
+		if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("seed %s: %v", loop.ID, err)
+		}
+	}
+	_, err = runner.enqueueAndMarkLoopQueuedForReview(context.Background(), storage.LoopRecord{ID: "waiting_reviewer"}, enqueueInput{ProjectID: project.ID, LoopID: "waiting_reviewer", Repo: repo, PRNumber: prNumber, AvailableAt: fixture.now()})
+	if _, ok := storage.IsIssueClaimConflictError(err); !ok {
+		t.Fatalf("enqueueAndMarkLoopQueuedForReview() error = %v, want source-issue conflict", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "waiting_reviewer")
+	if err != nil || loop == nil || loop.Status != "waiting" {
+		t.Fatalf("waiting reviewer = %#v, %v; want waiting", loop, err)
+	}
+	queue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), "waiting_reviewer")
+	if err != nil || queue != nil {
+		t.Fatalf("queue = %#v, %v; want none after rejected admission", queue, err)
 	}
 }
 
@@ -7078,7 +7125,7 @@ func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *te
 	queueID := "queue_publish_pr_not_found"
 	nowISO := fixture.nowISO()
 	worktreePath := filepath.Join(t.TempDir(), "reviewer-worktree")
-	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "project_1", repo, prNumber)
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "project_1", repo, prNumber, "")
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
 	}

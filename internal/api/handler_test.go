@@ -4587,6 +4587,65 @@ func TestHandlerCreateLoopForcedIssueWorkerPersistsClaimOverride(t *testing.T) {
 	}
 }
 
+func TestHandlerCreateLoopIssueWorkerCanonicalizesSourceMetadataAndForceAuthority(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	repo := "acme/looper"
+	prNumber := int64(177)
+	prTarget := "pr:acme/looper:177"
+	claimMetadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_claim", Seq: 177, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &claimMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("seed conflicting fixer: %v", err)
+	}
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"worker","targetType":"issue","repo":"acme/looper","issueNumber":77,"metadata":{"worker":{"issueClaimOverride":true}}}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"worker","targetType":"issue","repo":"acme/looper","issueNumber":78,"metadata":{"worker":{"issueClaimOverride":true}}}`)))
+	req.Header.Set("content-type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	loopID := parseJSONMap(t, rec.Body.Bytes())["data"].(map[string]any)["id"].(string)
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want worker", loop, err)
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+	if metadata["repo"] != "acme/looper" || metadata["issueNumber"] != float64(78) || metadata["issueClaimOverride"] != nil {
+		t.Fatalf("worker metadata = %#v, want canonical source without override", metadata)
+	}
+}
+
+func TestHandlerCreateLoopSkipsInjectedLabelRefreshForProjectTarget(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+		RefreshTargetLabels: func(context.Context, domain.LoopTarget, string) ([]string, error) {
+			t.Fatal("project target must not invoke label refresh")
+			return nil, nil
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"worker","targetType":"project","targetId":"project:project_1","metadata":{"worker":{"title":"Implement","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandlerWorkerCreateRejectsRepoMismatchForExplicitProject(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)

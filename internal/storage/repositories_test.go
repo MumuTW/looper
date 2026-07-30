@@ -72,6 +72,49 @@ func TestIssueClaimAdmissionSerializesWorkerAndPRLoopPublication(t *testing.T) {
 	}
 }
 
+func TestParseIssueTargetIDNormalizesWhitespace(t *testing.T) {
+	repo, number, ok := parseIssueTargetID("  issue: acme/looper :19  ")
+	if !ok || repo != "acme/looper" || number != 19 {
+		t.Fatalf("parseIssueTargetID() = (%q, %d, %v), want (acme/looper, 19, true)", repo, number, ok)
+	}
+}
+
+func TestIssueClaimAdmissionKeepsPersistedPRSourceWorkerIdentity(t *testing.T) {
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	startedAt := "2026-04-11T12:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(77)
+	prTarget := "pr:acme/looper:77"
+	issueA := "issue:acme/looper:19"
+	issueB := "issue:acme/looper:20"
+	workerA := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+	workerB := `{"worker":{"repo":"acme/looper","issueNumber":20}}`
+	reviewerA := `{"sourceWorkerId":"worker_a"}`
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	for _, record := range []LoopRecord{
+		{ID: "worker_a", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &workerA, CreatedAt: startedAt, UpdatedAt: startedAt},
+		{ID: "reviewer_a", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &reviewerA, CreatedAt: startedAt, UpdatedAt: startedAt},
+		{ID: "worker_b", Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &workerB, CreatedAt: startedAt, UpdatedAt: "2026-04-11T12:01:00.000Z"},
+	} {
+		if err := repos.Loops.Upsert(ctx, record); err != nil {
+			t.Fatalf("seed %s: %v", record.ID, err)
+		}
+	}
+	candidate := LoopRecord{ID: "new_worker_a", Seq: 4, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueA, Repo: &repo, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt}
+	if err := repos.Loops.Upsert(ctx, candidate); err == nil {
+		t.Fatal("Upsert() error = nil, want source issue conflict")
+	} else if conflict, ok := IsIssueClaimConflictError(err); !ok || conflict.LoopID != "reviewer_a" {
+		t.Fatalf("Upsert() error = %v, want reviewer_a source issue conflict", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "new_worker_b", Seq: 5, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueB, Repo: &repo, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("Upsert(issue B) error = %v, want no conflict for distinct source issue", err)
+	}
+}
+
 func TestIssueClaimAdmissionConcurrentWritersPublishOnlyOne(t *testing.T) {
 	t.Parallel()
 

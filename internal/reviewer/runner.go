@@ -1011,7 +1011,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		return nil
 	}
 	availableAt := r.nextReviewAvailableAt(meta)
-	queueItem, queueErr := r.enqueue(ctx, enqueueInput{
+	queueItem, queueErr := r.enqueueAndMarkLoopQueuedForReview(ctx, loopResult.record, enqueueInput{
 		ProjectID:   project.ID,
 		LoopID:      loopResult.record.ID,
 		Repo:        repo,
@@ -1021,9 +1021,6 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 	})
 	if queueErr != nil {
 		return queueErr
-	}
-	if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
-		return err
 	}
 	result.QueueItems = append(result.QueueItems, queueItem)
 	return nil
@@ -4066,7 +4063,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			text := string(encoded)
 			metadataJSONSource = &text
 		}
-		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, project.ID, repo, prNumber)
+		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, project.ID, repo, prNumber, "")
 		if err != nil {
 			return loopUpsertResult{}, err
 		}
@@ -4082,7 +4079,14 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		return loopUpsertResult{record: updated, created: false}, nil
 	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
-	metadataJSON, err := r.ensureLoopMetadataJSON(nil, project.ID, repo, prNumber)
+	if r.db == nil {
+		return loopUpsertResult{}, fmt.Errorf("reviewer runner database is not configured")
+	}
+	sourceWorkerID, err := r.sourceWorkerIDForPullRequest(ctx, project.ID, repo, prNumber)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	metadataJSON, err := r.ensureLoopMetadataJSON(nil, project.ID, repo, prNumber, sourceWorkerID)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
@@ -4345,35 +4349,6 @@ func isReviewerRediscoveryRunStep(run *storage.RunRecord) bool {
 	return step == string(stepPublish) || step == string(stepReview) || step == string(stepThreadResolution)
 }
 
-func (r *Runner) markLoopQueuedForReview(ctx context.Context, loop storage.LoopRecord, availableAt string) error {
-	if terminalReviewerLoopReason(loop) != "" {
-		return nil
-	}
-	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		if active, activeErr := r.hasActiveRunningRun(ctx, updated.ID); activeErr == nil && active {
-			updated.Status = "running"
-			updated.NextRunAt = nil
-			return
-		}
-		updated.Status = "queued"
-		updated.NextRunAt = stringPtr(availableAt)
-	})
-	return err
-}
-
-func (r *Runner) hasActiveRunningRun(ctx context.Context, loopID string) (bool, error) {
-	runs, err := r.repos.Runs.ListByLoop(ctx, loopID)
-	if err != nil {
-		return false, err
-	}
-	for _, run := range runs {
-		if run.Status == "running" {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 func (r *Runner) listFollowUpLoops(ctx context.Context, projectID, repo string) ([]storage.LoopRecord, error) {
 	loops, err := r.repos.Loops.List(ctx)
 	if err != nil {
@@ -4441,10 +4416,24 @@ type enqueueInput struct {
 }
 
 func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
-	dedupeKey := buildReviewerDedupeKey(input.ProjectID, input.LoopID, input.Repo, input.PRNumber)
-	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+	queueItem, wake, err := r.enqueueWithQueue(ctx, r.repos.Queue, input)
 	if err != nil {
 		return storage.QueueItemRecord{}, err
+	}
+	if wake {
+		r.wakeSchedulerAfterEnqueue()
+	}
+	return queueItem, nil
+}
+
+// enqueueWithQueue keeps queue construction usable inside a caller-owned
+// transaction. The caller wakes the scheduler only after that transaction has
+// committed, so it can never observe a queue item without its loop transition.
+func (r *Runner) enqueueWithQueue(ctx context.Context, queue *storage.QueueRepository, input enqueueInput) (storage.QueueItemRecord, bool, error) {
+	dedupeKey := buildReviewerDedupeKey(input.ProjectID, input.LoopID, input.Repo, input.PRNumber)
+	existing, err := queue.FindActiveByDedupe(ctx, dedupeKey)
+	if err != nil {
+		return storage.QueueItemRecord{}, false, err
 	}
 	availableAt := r.nowISO()
 	if !input.AvailableAt.IsZero() {
@@ -4454,7 +4443,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if strings.TrimSpace(input.HeadSHA) != "" {
 		payload, err := json.Marshal(map[string]any{"headSha": input.HeadSHA})
 		if err != nil {
-			return storage.QueueItemRecord{}, err
+			return storage.QueueItemRecord{}, false, err
 		}
 		payloadJSON = string(payload)
 	}
@@ -4467,16 +4456,15 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				updated.AvailableAt = availableAt
 				updated.UpdatedAt = r.nowISO()
 				updated.PayloadJSON = &payloadJSON
-				persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
+				persisted, _, err := queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
 				if err != nil {
-					return storage.QueueItemRecord{}, err
+					return storage.QueueItemRecord{}, false, err
 				}
 				updated = persisted
-				r.wakeSchedulerAfterEnqueue()
-				return updated, nil
+				return updated, true, nil
 			}
 		}
-		return *existing, nil
+		return *existing, false, nil
 	}
 	nowISO := r.nowISO()
 	targetID := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
@@ -4487,14 +4475,75 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if payloadJSON != "" {
 		queueItem.PayloadJSON = &payloadJSON
 	}
-	persisted, created, err := r.repos.Queue.CreateOrGetActiveByDedupe(ctx, queueItem)
+	persisted, created, err := queue.CreateOrGetActiveByDedupe(ctx, queueItem)
+	if err != nil {
+		return storage.QueueItemRecord{}, false, err
+	}
+	return persisted, created, nil
+}
+
+// enqueueAndMarkLoopQueuedForReview makes reviewer rediscovery a single
+// publication: source-issue admission, queued loop state, and claimable queue
+// work all commit together. This prevents a rejected reactivation from leaving
+// a queue item runnable on behalf of a waiting reviewer.
+func (r *Runner) enqueueAndMarkLoopQueuedForReview(ctx context.Context, loop storage.LoopRecord, input enqueueInput) (storage.QueueItemRecord, error) {
+	if r.db == nil {
+		return storage.QueueItemRecord{}, fmt.Errorf("reviewer runner database is not configured")
+	}
+	shouldWake := false
+	queueItem, err := storage.WithTransactionValue(ctx, r.db, nil, func(tx *sql.Tx) (storage.QueueItemRecord, error) {
+		repos := storage.NewRepositories(tx)
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		if current == nil || terminalReviewerLoopReason(*current) != "" {
+			return storage.QueueItemRecord{}, fmt.Errorf("reviewer loop %s is no longer eligible for discovery", loop.ID)
+		}
+		updated := *current
+		runs, err := repos.Runs.ListByLoop(ctx, updated.ID)
+		if err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		activeRun := false
+		for _, run := range runs {
+			if run.Status == "running" {
+				activeRun = true
+				break
+			}
+		}
+		if activeRun {
+			updated.Status = "running"
+			updated.NextRunAt = nil
+		} else {
+			updated.Status = "queued"
+			availableAt := eventlog.FormatJavaScriptISOString(input.AvailableAt.UTC())
+			if input.AvailableAt.IsZero() {
+				availableAt = r.nowISO()
+			}
+			updated.NextRunAt = &availableAt
+		}
+		updated.UpdatedAt = r.nowISO()
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, updated, false); err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		queueItem, wake, err := r.enqueueWithQueue(ctx, repos.Queue, input)
+		if err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		shouldWake = wake
+		return queueItem, nil
+	})
 	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
-	if created {
+	if shouldWake {
 		r.wakeSchedulerAfterEnqueue()
 	}
-	return persisted, nil
+	return queueItem, nil
 }
 
 func (r *Runner) wakeSchedulerAfterEnqueue() {
@@ -5303,7 +5352,7 @@ func loopEnabledMetadataMissing(meta map[string]any) bool {
 	return true
 }
 
-func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string, prNumber int64) (string, error) {
+func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string, prNumber int64, sourceWorkerID string) (string, error) {
 	meta, err := loops.DecodeMetadataObjectForWrite(current)
 	if err != nil {
 		return "", err
@@ -5331,6 +5380,9 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string,
 	loopMeta["repo"] = repo
 	loopMeta["prNumber"] = prNumber
 	loopMeta["scope"] = string(r.scope)
+	if strings.TrimSpace(sourceWorkerID) != "" {
+		meta["sourceWorkerId"] = sourceWorkerID
+	}
 	loopMeta["quietPeriodSeconds"] = r.loopConfig.QuietPeriodSeconds
 	loopMeta["minPublishIntervalSeconds"] = r.loopConfig.MinPublishIntervalSeconds
 	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
@@ -5372,6 +5424,23 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string,
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
+}
+
+func (r *Runner) sourceWorkerIDForPullRequest(ctx context.Context, projectID, repo string, prNumber int64) (string, error) {
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, loop := range loops {
+		if loop.ProjectID != projectID || loop.Type != string(domain.LoopTypeWorker) || loop.TargetType != string(domain.LoopTargetTypePullRequest) || !strings.EqualFold(derefString(loop.Repo), repo) || derefInt64(loop.PRNumber) != prNumber {
+			continue
+		}
+		worker, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+		if worker != nil && intFromAny(worker["issueNumber"]) > 0 {
+			return loop.ID, nil
+		}
+	}
+	return "", nil
 }
 
 func (r *Runner) recordLoopRunStartMetadata(current *string, projectID string) (string, error) {
