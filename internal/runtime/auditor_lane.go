@@ -61,8 +61,8 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 	if err != nil {
 		return fmt.Errorf("auditor read default branch checks: %w", err)
 	}
-	failedChecks := failedAuditorChecks(checks)
-	if len(failedChecks) == 0 {
+	failureEvidence := failedAuditorCheckEvidence(checks)
+	if len(failureEvidence.Names) == 0 {
 		return nil
 	}
 	since := eventlog.FormatJavaScriptISOString(observedAt.Add(-time.Duration(role.WindowMinutes) * time.Minute))
@@ -101,7 +101,7 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 	projectID := project.ID
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType: auditor.ObservedFailureEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: auditor.FailureObservation{Version: 1, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failedChecks, CandidatePRs: candidatePRs, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
+		Payload: auditor.FailureObservation{Version: 2, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failureEvidence.Names, CheckSuiteIDs: failureEvidence.SuiteIDs, CandidatePRs: candidatePRs, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
 	})
 }
 
@@ -110,10 +110,23 @@ func auditorRoleForProject(cfg config.Config, projectID string) config.AuditorRo
 }
 
 func failedAuditorChecks(checks githubinfra.PullRequestCheckRuns) []string {
+	return failedAuditorCheckEvidence(checks).Names
+}
+
+type auditorCheckFailureEvidence struct {
+	Names    []string
+	SuiteIDs []int64
+}
+
+func failedAuditorCheckEvidence(checks githubinfra.PullRequestCheckRuns) auditorCheckFailureEvidence {
 	failed := make(map[string]struct{})
+	suites := make(map[int64]struct{})
 	for _, check := range checks.CheckRuns {
 		if isFailedCheckState(check.Status, check.Conclusion) {
 			failed[strings.TrimSpace(check.Name)] = struct{}{}
+			if check.CheckSuiteID > 0 {
+				suites[check.CheckSuiteID] = struct{}{}
+			}
 		}
 	}
 	for _, status := range checks.Statuses {
@@ -128,7 +141,12 @@ func failedAuditorChecks(checks githubinfra.PullRequestCheckRuns) []string {
 		}
 	}
 	sort.Strings(result)
-	return result
+	suiteIDs := make([]int64, 0, len(suites))
+	for suiteID := range suites {
+		suiteIDs = append(suiteIDs, suiteID)
+	}
+	sort.Slice(suiteIDs, func(i, j int) bool { return suiteIDs[i] < suiteIDs[j] })
+	return auditorCheckFailureEvidence{Names: result, SuiteIDs: suiteIDs}
 }
 
 func isFailedCheckState(status, conclusion string) bool {
