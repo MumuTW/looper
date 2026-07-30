@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMissingPIDExecution(t
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, nil)
+	rt, repos := newStaleExecutionLeaseRuntime(t, func() time.Time { return now }, nil)
 	loopID, runID, queueID := seedStaleExecutionLeaseRun(t, repos, now, "missing_pid")
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
@@ -83,7 +84,7 @@ func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMismatchedPID(t *test
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-			rt, repos := newStaleExecutionLeaseRuntime(t, now, func(context.Context, int) (string, error) {
+			rt, repos := newStaleExecutionLeaseRuntime(t, func() time.Time { return now }, func(context.Context, int) (string, error) {
 				return "python unrelated.py", nil
 			})
 			loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "mismatched_"+tc.name)
@@ -113,7 +114,7 @@ func TestRuntimeReconcileStaleRunningRunsNeverOverlapsMatchingLiveProcess(t *tes
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, func(context.Context, int) (string, error) {
+	rt, repos := newStaleExecutionLeaseRuntime(t, func() time.Time { return now }, func(context.Context, int) (string, error) {
 		return "codex exec", nil
 	})
 	loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "matching_live")
@@ -153,7 +154,7 @@ func TestRuntimeReconcileStaleRunningRunsParksFreshInvalidIdentityForConfirmatio
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, nil)
+	rt, repos := newStaleExecutionLeaseRuntime(t, func() time.Time { return now }, nil)
 	loopID, runID, queueID := seedStaleExecutionLeaseRun(t, repos, now, "fresh_missing_pid")
 	nowISO := formatJavaScriptISOString(now)
 	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
@@ -189,7 +190,9 @@ func TestRuntimeReconcileStaleRunningRunsPreservesQuarantineAfterExpiry(t *testi
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, nil)
+	var clock atomic.Pointer[time.Time]
+	clock.Store(&now)
+	rt, repos := newStaleExecutionLeaseRuntime(t, func() time.Time { return *clock.Load() }, nil)
 	loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "confirmation_then_expired")
 	nowISO := formatJavaScriptISOString(now)
 	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
@@ -215,9 +218,7 @@ func TestRuntimeReconcileStaleRunningRunsPreservesQuarantineAfterExpiry(t *testi
 	if _, err := repos.Queue.CancelByLoop(context.Background(), loopID, operatorPausedAt, &reason); err != nil {
 		t.Fatalf("CancelByLoop() error = %v", err)
 	}
-	rt.mu.Lock()
-	rt.now = func() time.Time { return later }
-	rt.mu.Unlock()
+	clock.Store(&later)
 	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
 		t.Fatalf("second reconcile error = %v", err)
@@ -236,7 +237,7 @@ func TestRuntimeReconcileStaleRunningRunsPreservesQuarantineAfterExpiry(t *testi
 	}
 }
 
-func newStaleExecutionLeaseRuntime(t *testing.T, now time.Time, readProcess ReadProcessCommandFunc) (*Runtime, *storage.Repositories) {
+func newStaleExecutionLeaseRuntime(t *testing.T, clock func() time.Time, readProcess ReadProcessCommandFunc) (*Runtime, *storage.Repositories) {
 	t.Helper()
 	root := t.TempDir()
 	cfg, err := config.DefaultConfig(root)
@@ -249,7 +250,7 @@ func newStaleExecutionLeaseRuntime(t *testing.T, now time.Time, readProcess Read
 	rt := New(Options{
 		Config:             cfg,
 		Logger:             &testLogger{},
-		Now:                func() time.Time { return now },
+		Now:                clock,
 		RunSchedulerTick:   func(context.Context, Services) error { return nil },
 		ReadProcessCommand: readProcess,
 		ReadProcessStart:   func(context.Context, int) (int64, error) { return 2202, nil },
