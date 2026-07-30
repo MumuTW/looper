@@ -65,7 +65,7 @@ func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
 	}
 }
 
-func TestHandlerHealthzRemainsLiveWhenAdmissionDegradedAndStatusReportsAdmissionState(t *testing.T) {
+func TestHandlerHealthzRemainsLiveWhenAdmissionDegradedAndStatusReportsNotReady(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	if err := rt.MarkDegraded("test readiness transition"); err != nil {
 		t.Fatalf("MarkDegraded() error = %v", err)
@@ -88,9 +88,7 @@ func TestHandlerHealthzRemainsLiveWhenAdmissionDegradedAndStatusReportsAdmission
 	statusData := parseJSONMap(t, statusRecorder.Body.Bytes())["data"].(map[string]any)
 	service := statusData["service"].(map[string]any)
 	assertEqual(t, service["admissionState"], "degraded")
-	// Admission closes mutation gates while the scheduler itself remains live;
-	// status exposes the former through service.admissionState.
-	assertEqual(t, statusData["scheduler"].(map[string]any)["healthy"], true)
+	assertEqual(t, statusData["scheduler"].(map[string]any)["healthy"], false)
 }
 
 func TestHandlerLoopRetryCreatesReplacementQueueItem(t *testing.T) {
