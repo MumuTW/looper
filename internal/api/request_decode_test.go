@@ -80,6 +80,26 @@ func TestDecodeJSONMutationBodyContract(t *testing.T) {
 		}
 	})
 
+	t.Run("case-variant duplicate aliases are rejected", func(t *testing.T) {
+		// encoding/json matches struct fields case-insensitively, so a
+		// case-variant alias would silently let the last spelling win.
+		var dst decodeProbe
+		aerr := decodeJSONMutationBody(newRequest(`{"force":true,"Force":false}`), &dst, true)
+		if aerr == nil || !strings.Contains(aerr.message, "duplicate field") {
+			t.Fatalf("decode error = %#v, want case-folded duplicate rejection", aerr)
+		}
+	})
+
+	t.Run("same name in sibling objects is legal", func(t *testing.T) {
+		var dst struct {
+			A map[string]any `json:"a"`
+			B map[string]any `json:"b"`
+		}
+		if aerr := decodeJSONMutationBody(newRequest(`{"a":{"name":"x"},"b":{"name":"y"}}`), &dst, true); aerr != nil {
+			t.Fatalf("decode error = %v, want same names in different objects accepted", aerr)
+		}
+	})
+
 	t.Run("empty body required", func(t *testing.T) {
 		var dst decodeProbe
 		aerr := decodeJSONMutationBody(newRequest(""), &dst, true)

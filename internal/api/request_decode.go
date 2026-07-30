@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
@@ -70,10 +69,63 @@ func decodeStrictJSONValue(raw []byte, dst any) *apiError {
 		return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must contain exactly one JSON value"}
 	}
 	// raw is valid single-value JSON at this point, so a failure here is a
-	// genuine duplicate: encoding/json silently keeps the last member,
-	// letting {"force":true,"force":false} change an operation's meaning.
-	if err := config.ValidateUniqueJSONNames(raw); err != nil {
-		return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Request body has a duplicate field: %v", err)}
+	// genuine duplicate. Comparison is case-folded because encoding/json
+	// matches struct fields case-insensitively even with
+	// DisallowUnknownFields: {"force":true,"Force":false} would silently let
+	// the last spelling win.
+	if dup := firstDuplicateJSONName(raw); dup != "" {
+		return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Request body has a duplicate field: %q", dup)}
 	}
 	return nil
+}
+
+// firstDuplicateJSONName walks every object in raw and returns the first
+// member name that repeats within one object under case-folding, or "".
+// raw must already be known-valid JSON.
+func firstDuplicateJSONName(raw []byte) string {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	type objectFrame struct {
+		seen      map[string]string
+		expectKey bool
+		isObject  bool
+	}
+	var stack []*objectFrame
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		switch t := token.(type) {
+		case json.Delim:
+			switch t {
+			case '{':
+				stack = append(stack, &objectFrame{seen: map[string]string{}, expectKey: true, isObject: true})
+			case '[':
+				stack = append(stack, &objectFrame{})
+			case '}', ']':
+				stack = stack[:len(stack)-1]
+				if len(stack) > 0 && stack[len(stack)-1].isObject {
+					stack[len(stack)-1].expectKey = true
+				}
+			}
+		case string:
+			if len(stack) > 0 && stack[len(stack)-1].isObject && stack[len(stack)-1].expectKey {
+				frame := stack[len(stack)-1]
+				folded := strings.ToLower(t)
+				if _, dup := frame.seen[folded]; dup {
+					return t
+				}
+				frame.seen[folded] = t
+				frame.expectKey = false
+				continue
+			}
+			if len(stack) > 0 && stack[len(stack)-1].isObject {
+				stack[len(stack)-1].expectKey = true
+			}
+		default:
+			if len(stack) > 0 && stack[len(stack)-1].isObject {
+				stack[len(stack)-1].expectKey = true
+			}
+		}
+	}
 }
