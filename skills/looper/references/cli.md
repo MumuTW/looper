@@ -51,6 +51,6 @@ Argument parsing, which decides whether a command reaches the daemon at all:
 | --- | --- |
 | `looper bootstrap` | `looper init`, edit the config, install and run `looperd`, `looper project add` |
 | `looper daemon start` | `looperd` (foreground) or user's process manager |
-| `looper project add --id/--repo/--base-branch …` | The CLI verb takes a path only; the other fields are dashboard / `POST /api/v1/projects` |
+| `looper project add --id/--repo/--base-branch …` | The CLI verb takes a path only; supported advanced fields belong to `POST /api/v1/projects` (the dashboard lists projects only) |
 | `looper ps` / `logs` / `jump` | Dashboard / API; worktree path from dirty-retry dialog |
 | `looper plan` / `review` / `work` | Label/assign on the forge; daemon discovery claims the work |
