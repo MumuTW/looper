@@ -179,7 +179,7 @@ func TestAnUnusableCannotReproduceRecordStillEscalatesWithAnExplanation(t *testi
 			t.Parallel()
 			fixture := newFixture(t)
 			fixture.seedTriageReport(triager.ClassificationBug)
-			fixture.writeWorktreeJSON(CannotReproduceRelPath, payload)
+			fixture.agent.onStart = func() { fixture.writeWorktreeJSON(CannotReproduceRelPath, payload) }
 
 			if result := fixture.discover(); result.Unreproducible != 1 {
 				t.Fatalf("DiscoverIssues() = %#v, want the decline still escalated", result)

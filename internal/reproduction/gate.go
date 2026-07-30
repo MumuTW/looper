@@ -75,6 +75,10 @@ type Input struct {
 	Timeout      time.Duration
 	CodexCommand string
 	Tracker      processcontainment.LiveTracker
+	// VerifyManifest binds downstream completion gates to the committed
+	// reviewer-facing projection. Authoring calls intentionally leave it false:
+	// the draft manifest has not been finalized yet.
+	VerifyManifest bool
 
 	// Run is an in-package test seam. Production callers leave it nil so
 	// repository-controlled commands stay sandboxed.
@@ -214,6 +218,17 @@ func proveSignature(input Input, output string) Result {
 // This is the mechanical half of tamper detection: a prompt telling Worker not
 // to weaken the reproduction is exactly the self-policing this Role removes.
 func checkIntegrity(input Input) (Result, bool) {
+	// The manifest is a committed, reviewer-facing projection of the event-log
+	// authority. Checking only its declared test files lets a later Role delete
+	// or replace that projection while retaining enough information to pass the
+	// command. Require the on-branch manifest to still agree with the persisted
+	// record before trusting either artifact.
+	if input.VerifyManifest {
+		manifest, present, err := ReadManifest(input.WorktreePath)
+		if err != nil || !present || !manifestMatchesRecord(manifest, input.Record) {
+			return Result{Reason: ReasonTestModified, Summary: "Reproduction manifest was deleted or no longer matches the recorded reproduction authority"}, false
+		}
+	}
 	for _, file := range input.Record.Files {
 		absolute, err := resolveInsideWorktree(input.WorktreePath, file.Path)
 		if err != nil {
@@ -245,6 +260,18 @@ func checkIntegrity(input Input) (Result, bool) {
 		}
 	}
 	return Result{}, true
+}
+
+func manifestMatchesRecord(manifest Manifest, record Record) bool {
+	if manifest.IdempotencyKey != record.IdempotencyKey || manifest.Command != record.Command || manifest.IssueNumber != record.IssueNumber || manifest.ExpectedFailure.Normalize() != record.ExpectedFailure.Normalize() || len(manifest.Files) != len(record.Files) {
+		return false
+	}
+	for i := range record.Files {
+		if manifest.Files[i] != record.Files[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func runCommand(ctx context.Context, input Input) (string, error) {

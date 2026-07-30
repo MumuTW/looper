@@ -117,6 +117,7 @@ func (r *Runner) recordUnreproducible(ctx context.Context, project storage.Proje
 			// instead — and declining to append a waiver on the next discovery
 			// pass cannot retract work that is already claimable.
 			NonResumingOptions: []string{AnswerReject},
+			ResumingOptions:    []string{AnswerProceed},
 			Recommendation:     "Reproducer could not make this bug fail on the current base, so planning would be against a description rather than a demonstrated failure.",
 			Consequences: map[string]string{
 				AnswerProceed: "Planner proceeds with no reproduction; completion falls back to the repository suite plus review judgement.",
@@ -195,7 +196,7 @@ func unreproducibleFrom(declined CannotReproduce) reproduction.Unreproducible {
 }
 
 func readDraft(worktreePath string) (reproduction.Draft, bool, error) {
-	raw, err := os.ReadFile(reproduction.ManifestPath(worktreePath))
+	raw, err := reproduction.ReadBoundedWorktreeFile(worktreePath, reproduction.ManifestRelPath)
 	if os.IsNotExist(err) {
 		return reproduction.Draft{}, false, nil
 	}
@@ -213,8 +214,7 @@ func readDraft(worktreePath string) (reproduction.Draft, bool, error) {
 }
 
 func readCannotReproduce(worktreePath string) (CannotReproduce, bool, error) {
-	path := filepath.Join(worktreePath, filepath.FromSlash(CannotReproduceRelPath))
-	raw, err := os.ReadFile(path)
+	raw, err := reproduction.ReadBoundedWorktreeFile(worktreePath, CannotReproduceRelPath)
 	if os.IsNotExist(err) {
 		return CannotReproduce{}, false, nil
 	}

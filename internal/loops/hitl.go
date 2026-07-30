@@ -45,6 +45,10 @@ type HITLAsk struct {
 	// Role that authored the question instead of teaching the respond path about
 	// individual Roles.
 	NonResumingOptions []string `json:"nonResumingOptions,omitempty"`
+	// ResumingOptions, when present, is the allow-list for answers that may
+	// restart the loop. This is used by constrained authority asks: free text
+	// must not accidentally start work that requires an explicit human choice.
+	ResumingOptions []string `json:"resumingOptions,omitempty"`
 }
 
 // AnswerResumes reports whether the given answer should resume the loop. An
@@ -52,6 +56,14 @@ type HITLAsk struct {
 // path every other ask relies on.
 func (a HITLAsk) AnswerResumes(answer string) bool {
 	answer = strings.TrimSpace(answer)
+	if len(a.ResumingOptions) > 0 {
+		for _, option := range a.ResumingOptions {
+			if strings.EqualFold(strings.TrimSpace(option), answer) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, option := range a.NonResumingOptions {
 		if strings.EqualFold(strings.TrimSpace(option), answer) {
 			return false

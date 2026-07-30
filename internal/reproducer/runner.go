@@ -320,6 +320,15 @@ func (r *Runner) reproduce(ctx context.Context, project storage.ProjectRecord, r
 		result.Reproduced++
 		return nil
 	}
+	// A previous incomplete turn may have left one of the structured decision
+	// files behind. They are turn output, not durable authority: retaining one
+	// lets it win over the next agent's fresh result. Clear both before a new
+	// turn so this attempt is settled only by output it actually produced.
+	for _, rel := range []string{reproduction.ManifestRelPath, CannotReproduceRelPath} {
+		if err := os.Remove(filepath.Join(worktree.Path, filepath.FromSlash(rel))); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
 
 	agentResult, err := r.runAgent(ctx, project, repo, detail, worktree)
 	if err != nil {

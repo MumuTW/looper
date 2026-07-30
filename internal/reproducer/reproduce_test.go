@@ -82,7 +82,7 @@ func TestReproducerAdoptsItsOwnCommittedWorkAfterACrash(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)
 	report := fixture.seedTriageReport(triager.ClassificationBug)
-	fixture.writeAgentDraft("go test ./pkg -run TestCrash", map[string]string{"pkg/crash_test.go": "func TestCrash(t *testing.T) { panic(1) }"})
+	fixture.writeAgentDraftNow("go test ./pkg -run TestCrash", map[string]string{"pkg/crash_test.go": "func TestCrash(t *testing.T) { panic(1) }"})
 
 	// Simulate the crashed run: the reproduction is committed and the manifest
 	// is finalized on the branch, but no record was ever acknowledged.

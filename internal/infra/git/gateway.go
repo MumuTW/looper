@@ -805,7 +805,20 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 		// Stage exactly the declared paths so exploratory or undeclared changes
 		// are not swept into a commit that is supposed to carry only the
 		// declared artifacts. `--` keeps paths literal (no pathspec options).
-		addArgs := append([]string{"add", "--"}, input.Paths...)
+		addArgs := []string{"add"}
+		// The reproduction manifest is a daemon-owned required artifact. Target
+		// repositories commonly ignore .looper/, so normal selected-path staging
+		// would fail even though the exact path is intentionally part of this
+		// commit. Keep force limited to that control file rather than broadening
+		// staging for arbitrary agent output.
+		for _, path := range input.Paths {
+			if filepath.ToSlash(path) == ".looper/reproduction.json" {
+				addArgs = append(addArgs, "-f")
+				break
+			}
+		}
+		addArgs = append(addArgs, "--")
+		addArgs = append(addArgs, input.Paths...)
 		if err := g.runGit(ctx, input.WorktreePath, nil, addArgs...); err != nil {
 			return CommitResult{}, err
 		}

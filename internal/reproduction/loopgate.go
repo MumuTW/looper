@@ -74,11 +74,12 @@ func GateForLoop(ctx context.Context, input LoopGateInput) (Result, bool, error)
 		verify = Verify
 	}
 	result, err := verify(ctx, Input{
-		WorktreePath: input.WorktreePath,
-		Record:       *status.Record,
-		Timeout:      input.Timeout,
-		CodexCommand: input.CodexCommand,
-		Tracker:      input.Tracker,
+		WorktreePath:   input.WorktreePath,
+		Record:         *status.Record,
+		Timeout:        input.Timeout,
+		CodexCommand:   input.CodexCommand,
+		Tracker:        input.Tracker,
+		VerifyManifest: true,
 	})
 	if err != nil {
 		return Result{}, true, err

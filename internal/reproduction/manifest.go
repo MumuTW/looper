@@ -98,7 +98,7 @@ func ManifestPath(worktreePath string) string {
 // is the normal case for every non-bug Issue and every project with the
 // Reproducer disabled.
 func ReadManifest(worktreePath string) (Manifest, bool, error) {
-	raw, err := os.ReadFile(ManifestPath(worktreePath))
+	raw, err := ReadBoundedWorktreeFile(worktreePath, ManifestRelPath)
 	if os.IsNotExist(err) {
 		return Manifest{}, false, nil
 	}
@@ -110,6 +110,23 @@ func ReadManifest(worktreePath string) (Manifest, bool, error) {
 		return Manifest{}, true, err
 	}
 	return manifest, true, nil
+}
+
+// ReadBoundedWorktreeFile reads an agent-authored control file only after its
+// resolved path has been contained in the worktree, and never buffers more
+// than the reproduction-file limit.  Decision files are untrusted just like
+// declared test files; using os.ReadFile here would let a symlink or device
+// consume the daemon before JSON validation gets a chance to reject it.
+func ReadBoundedWorktreeFile(worktreePath, rel string) ([]byte, error) {
+	absolute, err := resolveInsideWorktree(worktreePath, rel)
+	if err != nil {
+		return nil, err
+	}
+	contents, err := readBoundedFile(absolute)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(contents), nil
 }
 
 // DecodeManifest strictly decodes a manifest. Unknown fields are rejected so a
@@ -153,6 +170,11 @@ func DecodeDraft(raw []byte) (Draft, error) {
 		return Draft{}, fmt.Errorf("decode reproduction draft: command is required")
 	}
 	draft.Files = normalizePaths(draft.Files)
+	for _, path := range draft.Files {
+		if isControlPath(path) {
+			return Draft{}, fmt.Errorf("decode reproduction draft: control file %s cannot be a reproduction file", path)
+		}
+	}
 	if len(draft.Files) == 0 {
 		return Draft{}, fmt.Errorf("decode reproduction draft: at least one reproduction file is required")
 	}
@@ -164,6 +186,11 @@ func DecodeDraft(raw []byte) (Draft, error) {
 	}
 	draft.ExpectedFailure = draft.ExpectedFailure.Normalize()
 	return draft, nil
+}
+
+func isControlPath(path string) bool {
+	path = filepath.ToSlash(filepath.Clean(path))
+	return path == ManifestRelPath || strings.HasPrefix(path, ".looper/")
 }
 
 // WriteManifest writes the manifest into the worktree, creating .looper/.

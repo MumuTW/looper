@@ -164,6 +164,13 @@ func (f *fixture) status() reproduction.Status {
 
 func (f *fixture) writeAgentDraft(command string, files map[string]string) {
 	f.t.Helper()
+	f.agent.onStart = func() {
+		f.writeAgentDraftNow(command, files)
+	}
+}
+
+func (f *fixture) writeAgentDraftNow(command string, files map[string]string) {
+	f.t.Helper()
 	paths := make([]string, 0, len(files))
 	for rel, contents := range files {
 		path := filepath.Join(f.worktree, filepath.FromSlash(rel))
@@ -183,6 +190,13 @@ func (f *fixture) writeAgentDraft(command string, files map[string]string) {
 }
 
 func (f *fixture) writeCannotReproduce(record CannotReproduce) {
+	f.t.Helper()
+	f.agent.onStart = func() {
+		f.writeCannotReproduceNow(record)
+	}
+}
+
+func (f *fixture) writeCannotReproduceNow(record CannotReproduce) {
 	f.t.Helper()
 	record.Version = reproduction.ManifestVersion
 	f.writeWorktreeJSON(CannotReproduceRelPath, record)
@@ -259,11 +273,15 @@ type fakeAgent struct {
 	status  string
 	prompts []string
 	starts  int
+	onStart func()
 }
 
 func (f *fakeAgent) Start(_ context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
 	f.starts++
 	f.prompts = append(f.prompts, input.Prompt)
+	if f.onStart != nil {
+		f.onStart()
+	}
 	status := f.status
 	if status == "" {
 		status = "completed"
