@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/diffanchor"
-	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/diffanchor"
+	"github.com/MumuTW/looper/internal/infra/shell"
 )
 
 func TestBuildReviewAnchorIndexUsesLocalPathDiffWhenRemoteIsTruncated(t *testing.T) {

@@ -11,17 +11,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/fixer/publish"
-	"github.com/nexu-io/looper/internal/fixer/workflow"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/lifecycle"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/validation"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/fixer/publish"
+	"github.com/MumuTW/looper/internal/fixer/workflow"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/validation"
 )
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int, author string) ([]PullRequestSummary, error) {
@@ -396,6 +396,55 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 	if queue == nil || queue.Status != "queued" || !strings.HasPrefix(queue.DedupeKey, "fixer:project_1:"+result.CreatedLoopIDs[0]+":acme/looper:42:") {
 		t.Fatalf("queue = %#v, want queued fixer item for #42", queue)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsOccupiedCandidateAndContinuesBatch(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	pr42 := int64(42)
+	prTarget := "pr:acme/looper:42"
+	issueTarget := "issue:acme/looper:77"
+	metadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	for _, loop := range []storage.LoopRecord{
+		{ID: "source_worker", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &pr42, Status: "completed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()},
+		{ID: "occupying_worker", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()},
+	} {
+		if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("seed %s: %v", loop.ID, err)
+		}
+	}
+	github := &fakeGitHubGateway{
+		listOpen: []PullRequestSummary{
+			{Number: 42, State: "OPEN", HeadSHA: "head-42"},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43"},
+		},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c42", "threadId": "t42", "body": "occupied fix"}}},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43", Comments: []map[string]any{{"id": "c43", "threadId": "t43", "body": "admissible fix"}}},
+		},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if result.Skipped == 0 || len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 43 {
+		t.Fatalf("result = %#v, want occupied #42 skipped and #43 queued", result)
+	}
+}
+
+func TestEnsureLoopForPullRequestRequiresDatabaseForNewLoop(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{Repos: fixture.repos, Now: fixture.now})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	if _, err := runner.ensureLoopForPullRequest(context.Background(), *project, "acme/looper", 42, "head", "items", "state", nil, nil); err == nil || !strings.Contains(err.Error(), "fixer runner database is not configured") {
+		t.Fatalf("ensureLoopForPullRequest() error = %v, want database configuration error", err)
 	}
 }
 

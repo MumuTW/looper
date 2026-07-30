@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops"
 )
 
 // Cross-component contract: every runner's loop-metadata merge decodes through

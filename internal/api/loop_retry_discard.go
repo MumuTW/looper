@@ -9,14 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/worktreesafety"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/worktreesafety"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 type worktreeDiscardResult struct {

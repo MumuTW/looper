@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/dashboard"
+	"github.com/MumuTW/looper/internal/dashboard"
 )
 
 // NewRootHandler mounts the dashboard static handler under /dashboard and

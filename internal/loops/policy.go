@@ -1,6 +1,6 @@
 package loops
 
-import "github.com/nexu-io/looper/internal/loops/policy"
+import "github.com/MumuTW/looper/internal/loops/policy"
 
 // The failure-kind and resume-policy vocabulary lives in the leaf package
 // internal/loops/policy so that decision-only packages can depend on it

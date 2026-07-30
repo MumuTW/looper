@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/config"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 // rewriteHTTPtestDefaultHost is enabled only by TestMain during `go test`.

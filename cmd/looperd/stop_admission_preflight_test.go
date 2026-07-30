@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/loops"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/loops"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // Every repository read that establishes stop ownership must happen before

@@ -1,4 +1,4 @@
-module github.com/nexu-io/looper
+module github.com/MumuTW/looper
 
 go 1.22
 

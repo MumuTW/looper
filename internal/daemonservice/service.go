@@ -44,7 +44,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // Label identifies the service to the platform supervisor. It is also the

@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 type PullRequestPhase string

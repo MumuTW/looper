@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/infra/shell"
 )
 
 type TransientError struct {

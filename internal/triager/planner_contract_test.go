@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/planner"
+	"github.com/MumuTW/looper/internal/planner"
 )
 
 func TestTriagerReportRoutesThroughProcessedPlannerWithoutLabelsOrAssignee(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // daemon.worktreeCleanup.enabled is hot-editable, so the loop runs regardless of

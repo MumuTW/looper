@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // hitlSentinelRelPath is where an agent writes a mid-run question, relative to

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 type Server struct {

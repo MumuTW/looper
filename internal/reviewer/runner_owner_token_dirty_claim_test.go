@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/worktreesafety"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
 // Fresh reviewer (no checkpoint worktree) still hits an interrupted fixer's dirty

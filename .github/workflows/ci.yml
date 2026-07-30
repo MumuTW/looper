@@ -50,6 +50,9 @@ jobs:
           test -f ../../internal/dashboard/assets/.production
           test -f ../../internal/dashboard/assets/index.html
 
+      - name: Test Hermes/Devin helpers
+        run: python3 -m unittest discover -s tools/hermes-devin -p 'test_*.py'
+
       - name: Check formatting
         run: |
           unformatted="$(gofmt -l .)"
@@ -67,6 +70,35 @@ jobs:
       - name: Reject committed binaries
         run: go run ./tools/check-binaries
 
+      # The srt trust probe rejects the runtime when any path in or above
+      # the installation is writable by the daemon user. Hosted-runner
+      # images vary: some ship /usr/local and /usr/local/lib writable by
+      # the runner account, via ownership or ACLs, and a default ACL on
+      # /usr/local/lib would propagate runner-writable entries into
+      # anything installed under it. Rather than hope for a clean image,
+      # every run first RECREATES the hostile conditions (runner
+      # ownership plus a default ACL granting the runner write), so the
+      # hardening below is exercised deterministically on every image and
+      # a regression fails this step on every run instead of only on
+      # whichever image the pool happens to serve.
+      - name: Simulate hostile runner image
+        run: |
+          sudo chown "$(id -u):$(id -g)" /usr/local/lib
+          sudo setfacl -m "d:u:$(id -un):rwx" -m "u:$(id -un):rwx" /usr/local/lib
+
+      # Harden BEFORE installing so nothing installed can inherit a
+      # default ACL: pin the ancestor chain root-owned, 0755, and strip
+      # both access and default ACL entries (-b alone leaves default
+      # entries in place on some acl builds; -k removes them explicitly).
+      # The chain runs all the way to / because the probe walks every
+      # ancestor and image variance has been observed as high as /usr
+      # (PR #318's verify run failed on "/usr is writable").
+      - name: Harden sandbox runtime ancestors
+        run: |
+          sudo chown root:root / /usr /usr/local /usr/local/lib
+          sudo chmod 0755 / /usr /usr/local /usr/local/lib
+          sudo setfacl -b -k / /usr /usr/local /usr/local/lib
+
       - name: Install process sandbox runtime
         run: |
           sudo apt-get update
@@ -78,18 +110,21 @@ jobs:
           sudo ln -s ../looper-srt-runtime/bin/srt /usr/local/lib/looper-srt-tools/srt
           echo /usr/local/lib/looper-srt-tools >> "$GITHUB_PATH"
 
-      # The srt trust probe rejects the runtime when any ancestor of the
-      # installation is writable by the daemon user. Some hosted-runner
-      # images ship /usr/local and /usr/local/lib writable by the runner
-      # account (ownership or ACLs vary by image build), which fails the
-      # probe for every PR that lands on such a runner. Pin the ancestor
-      # chain to root-owned, non-group-writable, ACL-free so verify does
-      # not depend on which image the runner pool serves.
-      - name: Harden sandbox runtime ancestors
+      # Belt-and-braces sweep of the installed trees, then assert the
+      # probe's own criterion — access(W_OK) as the runner user — over
+      # the full chain. find -writable uses the same access(2) check the
+      # Go probe uses, so this fails the job at setup time with the
+      # offending paths listed, instead of surfacing later as
+      # intermittent test failures.
+      - name: Verify sandbox runtime is unwritable by the daemon user
         run: |
-          sudo chown root:root /usr/local /usr/local/lib
-          sudo chmod 0755 /usr/local /usr/local/lib
-          sudo setfacl -b /usr/local /usr/local/lib
+          sudo chmod -R go-w /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools
+          sudo setfacl -R -b -k /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools
+          writable="$(find / /usr /usr/local /usr/local/lib -maxdepth 0 -writable; find /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools -writable)"
+          if [ -n "$writable" ]; then
+            printf 'srt paths still writable by the daemon user:\n%s\n' "$writable"
+            exit 1
+          fi
 
       - name: Test
         env:

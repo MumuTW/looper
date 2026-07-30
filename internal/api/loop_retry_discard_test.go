@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/domain"
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/domain"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestHandlerLoopWorktreeStatusDirtyAndClean(t *testing.T) {

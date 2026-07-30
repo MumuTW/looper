@@ -1,0 +1,197 @@
+--- a/agent/copilot_acp_client.py
++++ b/agent/copilot_acp_client.py
+@@ -14,6 +14,7 @@
+ import re
+ import shlex
+ import subprocess
++import sys
+ import threading
+ import time
+ from collections import deque
+@@ -134,6 +135,150 @@
+     }
+ 
+ 
++# --- carried patch: selective MCP tool-call permission approval -------------
++# Stock Hermes denies every session/request_permission, which makes any MCP
++# tool it is offered unreachable. This opts specific tools into approval and
++# nothing else: deny stays the default, the allow-list is empty unless the
++# operator sets HERMES_ACP_ALLOWED_MCP_TOOLS, and only a single-call grant is
++# ever selected.
++#
++# WHAT THIS GATE IS AND IS NOT. The tool name it matches on is supplied by the
++# same ACP backend whose request it then approves, so this is NOT a defence
++# against a malicious or compromised backend: such a backend could announce an
++# allow-listed name and request permission for something else. It does not
++# need to. The shim already services fs/write_text_file inside the session cwd
++# with no permission round-trip at all, and in the default agent type the
++# backend runs its own native tools in its own loop, unmediated. Containment
++# against a hostile backend is the disposable workspace, not this gate.
++#
++# What the gate does buy, against a backend behaving honestly: the *model*
++# cannot reach a Hermes-side tool the operator did not name. Model tool choice
++# is the thing that actually varies run to run, and it is what stock Hermes's
++# blanket denial was protecting against — at the cost of allowing nothing.
++_ACP_ALLOWED_TOOLS_ENV = "HERMES_ACP_ALLOWED_MCP_TOOLS"
++
++# Single-call only, and no fallback. Every other offered option outlives the
++# call: allow_session and allow_server_session stop the backend asking again
++# for the rest of the session, the allow_*_always variants persist beyond it,
++# switch_bypass drops the gate entirely, and both allow_server_* forms cover
++# every tool on that server including ones never allow-listed. A wire shape
++# that stops offering allow_once means the pinned protocol has drifted, which
++# is when to deny rather than reach for the next-broadest grant.
++_ACP_APPROVAL_OPTION_ID = "allow_once"
++
++# A session/request_permission carries only a toolCallId — no tool name. The
++# name arrives earlier, on the session/update that announced the tool call, in
++# vendor _meta. Correlating the two is what makes an allow-list possible at
++# all; matching the human-readable option labels instead would mean gating on
++# UI copy, and several options with very different scopes share kind
++# "allow_always" so only the prose distinguishes them.
++_ACP_TOOL_NAME_META_KEYS = (
++    "cognition.ai/toolName",
++    "cognition.ai/inferenceToolName",
++)
++
++
++def _acp_allowed_tools() -> set[str]:
++    raw = os.environ.get(_ACP_ALLOWED_TOOLS_ENV) or ""
++    return {name.strip() for name in raw.split(",") if name.strip()}
++
++
++def _acp_tool_call_identity(update: Any) -> tuple[str, str] | None:
++    """Return ``(toolCallId, toolName)`` from a tool_call session update."""
++    if not isinstance(update, dict):
++        return None
++    call_id = update.get("toolCallId")
++    if not isinstance(call_id, str) or not call_id.strip():
++        return None
++    meta = update.get("_meta")
++    if not isinstance(meta, dict):
++        return None
++    for key in _ACP_TOOL_NAME_META_KEYS:
++        name = meta.get(key)
++        if isinstance(name, str) and name.strip():
++            return call_id.strip(), name.strip()
++    return None
++
++
++def _acp_offered_option_ids(params: Any) -> list[str]:
++    if not isinstance(params, dict):
++        return []
++    options = params.get("options")
++    if not isinstance(options, list):
++        return []
++    offered: list[str] = []
++    for option in options:
++        if isinstance(option, dict):
++            option_id = option.get("optionId") or option.get("id")
++            if isinstance(option_id, str) and option_id.strip():
++                offered.append(option_id.strip())
++    return offered
++
++
++def _acp_permission_response(
++    message_id: Any,
++    params: Any,
++    tool_names: dict[str, str] | None,
++) -> dict[str, Any]:
++    allowed = _acp_allowed_tools()
++    if not allowed:
++        return _permission_denied(message_id)
++
++    call_id = None
++    if isinstance(params, dict):
++        block = params.get("toolCall")
++        if isinstance(block, dict):
++            raw_id = block.get("toolCallId")
++            if isinstance(raw_id, str) and raw_id.strip():
++                call_id = raw_id.strip()
++
++    matched = (tool_names or {}).get(call_id) if call_id else None
++    if matched is None:
++        # No correlated name means we cannot tell what is being approved.
++        print(
++            "[acp-permission] denied: no tool name was announced for "
++            f"toolCallId {call_id!r}",
++            file=sys.stderr,
++            flush=True,
++        )
++        return _permission_denied(message_id)
++
++    if matched not in allowed:
++        print(
++            f"[acp-permission] denied: tool {matched!r} is not in ${_ACP_ALLOWED_TOOLS_ENV}",
++            file=sys.stderr,
++            flush=True,
++        )
++        return _permission_denied(message_id)
++
++    offered = _acp_offered_option_ids(params)
++    if _ACP_APPROVAL_OPTION_ID not in offered:
++        print(
++            f"[acp-permission] denied: tool {matched!r} is allow-listed but "
++            f"{_ACP_APPROVAL_OPTION_ID!r} was not offered; every other option "
++            f"outlives this call (offered: {', '.join(offered) or 'none'})",
++            file=sys.stderr,
++            flush=True,
++        )
++        return _permission_denied(message_id)
++
++    print(
++        f"[acp-permission] approved: tool {matched!r} via {_ACP_APPROVAL_OPTION_ID}",
++        file=sys.stderr,
++        flush=True,
++    )
++    return {
++        "jsonrpc": "2.0",
++        "id": message_id,
++        "result": {
++            "outcome": {
++                "outcome": "selected",
++                "optionId": _ACP_APPROVAL_OPTION_ID,
++            }
++        },
++    }
++
++
+ def _format_messages_as_prompt(
+     messages: list[dict[str, Any]],
+     model: str | None = None,
+@@ -419,6 +564,8 @@
+         self.is_closed = False
+         self._active_process: subprocess.Popen[str] | None = None
+         self._active_process_lock = threading.Lock()
++        # toolCallId -> tool name, populated from session/update (carried patch).
++        self._acp_tool_names: dict[str, str] = {}
+ 
+     def close(self) -> None:
+         proc: subprocess.Popen[str] | None
+@@ -531,6 +678,7 @@
+         self.is_closed = False
+         with self._active_process_lock:
+             self._active_process = proc
++        self._acp_tool_names = {}
+ 
+         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
+         stderr_tail: deque[str] = deque(maxlen=40)
+@@ -683,6 +831,9 @@
+             params = msg.get("params") or {}
+             update = params.get("update") or {}
+             kind = str(update.get("sessionUpdate") or "").strip()
++            identity = _acp_tool_call_identity(update)
++            if identity is not None:
++                self._acp_tool_names[identity[0]] = identity[1]
+             content = update.get("content") or {}
+             chunk_text = ""
+             if isinstance(content, dict):
+@@ -700,7 +851,7 @@
+         params = msg.get("params") or {}
+ 
+         if method == "session/request_permission":
+-            response = _permission_denied(message_id)
++            response = _acp_permission_response(message_id, params, self._acp_tool_names)
+         elif method == "fs/read_text_file":
+             try:
+                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)

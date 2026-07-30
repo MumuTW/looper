@@ -17,14 +17,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/labels"
-	networkclient "github.com/nexu-io/looper/internal/network/client"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/webhookforward"
+	"github.com/MumuTW/looper/internal/config"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/labels"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/webhookforward"
 )
 
 func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
@@ -2028,9 +2028,9 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 
 	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
 	seedRepos := storage.NewRepositories(seedCoordinator.DB())
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(186)
-	targetID := "pr:nexu-io/looper:186"
+	targetID := "pr:MumuTW/looper:186"
 	loopID := "loop_mismatched_agent_running"
 	runID := "run_mismatched_agent_running"
 	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -2139,9 +2139,9 @@ func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
 
 	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
 	seedRepos := storage.NewRepositories(seedCoordinator.DB())
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(186)
-	targetID := "pr:nexu-io/looper:186"
+	targetID := "pr:MumuTW/looper:186"
 	loopID := "loop_active_agent_running"
 	runID := "run_active_agent_running"
 	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -2248,9 +2248,9 @@ func TestRuntimeReconcileLiveStaleRunningRunsInterruptsAgentBackedRunWithoutExec
 	}
 	defer rt.Stop("test cleanup")
 	repos := rt.Services().Repositories
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(186)
-	targetID := "pr:nexu-io/looper:186"
+	targetID := "pr:MumuTW/looper:186"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -2395,9 +2395,9 @@ func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T
 			}
 			defer rt.Stop("test cleanup")
 			repos := rt.Services().Repositories
-			repo := "nexu-io/looper"
+			repo := "MumuTW/looper"
 			prNumber := int64(188)
-			targetID := "pr:nexu-io/looper:188"
+			targetID := "pr:MumuTW/looper:188"
 			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 				t.Fatalf("Projects.Upsert() error = %v", err)
 			}
@@ -2471,9 +2471,9 @@ func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *test
 			}
 			defer rt.Stop("test cleanup")
 			repos := rt.Services().Repositories
-			repo := "nexu-io/looper"
+			repo := "MumuTW/looper"
 			prNumber := int64(575)
-			targetID := "pr:nexu-io/looper:575"
+			targetID := "pr:MumuTW/looper:575"
 			loopID := "loop_dead_exec_quarantine"
 			runID := "run_dead_exec_quarantine"
 			queueID := "queue_dead_exec_quarantine"
@@ -2590,9 +2590,9 @@ func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecu
 			}
 			defer rt.Stop("test cleanup")
 			repos := rt.Services().Repositories
-			repo := "nexu-io/looper"
+			repo := "MumuTW/looper"
 			prNumber := int64(189)
-			targetID := "pr:nexu-io/looper:189"
+			targetID := "pr:MumuTW/looper:189"
 			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 				t.Fatalf("Projects.Upsert() error = %v", err)
 			}
@@ -2645,9 +2645,9 @@ func TestRepairStaleRunQueueStateDoesNotRequeueLoopWhileNewerRunIsLive(t *testin
 	}
 	defer rt.Stop("test cleanup")
 	repos := rt.Services().Repositories
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(195)
-	targetID := "pr:nexu-io/looper:195"
+	targetID := "pr:MumuTW/looper:195"
 	loopID := "loop_superseded_latest_live"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
@@ -2656,7 +2656,7 @@ func TestRepairStaleRunQueueStateDoesNotRequeueLoopWhileNewerRunIsLive(t *testin
 	if err := repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	runningQueue := storage.QueueItemRecord{ID: "queue_superseded_running", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_superseded_latest_live:nexu-io/looper:195", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: oldISO, StartedAt: stringPtr(oldISO), MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}
+	runningQueue := storage.QueueItemRecord{ID: "queue_superseded_running", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_superseded_latest_live:MumuTW/looper:195", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: oldISO, StartedAt: stringPtr(oldISO), MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := repos.Queue.Upsert(context.Background(), runningQueue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -2718,9 +2718,9 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 		}
 		defer rt.Stop("test cleanup")
 		repos := rt.Services().Repositories
-		repo := "nexu-io/looper"
+		repo := "MumuTW/looper"
 		prNumber := int64(190)
-		targetID := "pr:nexu-io/looper:190"
+		targetID := "pr:MumuTW/looper:190"
 		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 			t.Fatalf("Projects.Upsert() error = %v", err)
 		}
@@ -2775,9 +2775,9 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 		}
 		defer rt.Stop("test cleanup")
 		repos := rt.Services().Repositories
-		repo := "nexu-io/looper"
+		repo := "MumuTW/looper"
 		prNumber := int64(191)
-		targetID := "pr:nexu-io/looper:191"
+		targetID := "pr:MumuTW/looper:191"
 		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 			t.Fatalf("Projects.Upsert() error = %v", err)
 		}
@@ -2824,9 +2824,9 @@ func TestRuntimeReconcileStaleRunningRunsCancelsDuplicateActiveQueueItems(t *tes
 	}
 	defer rt.Stop("test cleanup")
 	repos := rt.Services().Repositories
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(192)
-	targetID := "pr:nexu-io/looper:192"
+	targetID := "pr:MumuTW/looper:192"
 	loopID := "loop_duplicate_active_queue"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
@@ -2837,7 +2837,7 @@ func TestRuntimeReconcileStaleRunningRunsCancelsDuplicateActiveQueueItems(t *tes
 	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_duplicate_active_queue", LoopID: loopID, Status: "running", CurrentStep: stringPtr("repair"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	for _, item := range []storage.QueueItemRecord{{ID: "queue_duplicate_1", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_duplicate_active_queue:nexu-io/looper:192:a", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: oldISO, StartedAt: stringPtr(oldISO), MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}, {ID: "queue_duplicate_2", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_duplicate_active_queue:nexu-io/looper:192:b", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: oldISO, MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}} {
+	for _, item := range []storage.QueueItemRecord{{ID: "queue_duplicate_1", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_duplicate_active_queue:MumuTW/looper:192:a", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: oldISO, StartedAt: stringPtr(oldISO), MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}, {ID: "queue_duplicate_2", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_duplicate_active_queue:MumuTW/looper:192:b", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: oldISO, MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}} {
 		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
 			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
 		}
@@ -2889,9 +2889,9 @@ func TestRuntimeReconcileStaleRunningRunsIsIdempotent(t *testing.T) {
 			}
 			defer rt.Stop("test cleanup")
 			repos := rt.Services().Repositories
-			repo := "nexu-io/looper"
+			repo := "MumuTW/looper"
 			prNumber := int64(193)
-			targetID := "pr:nexu-io/looper:193"
+			targetID := "pr:MumuTW/looper:193"
 			loopID := "loop_idempotent_reconcile"
 			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 				t.Fatalf("Projects.Upsert() error = %v", err)
@@ -2943,9 +2943,9 @@ func TestRuntimeReconcileStaleRunningRunsDedupesUncertainIdentityEvents(t *testi
 	}
 	defer rt.Stop("test cleanup")
 	repos := rt.Services().Repositories
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(196)
-	targetID := "pr:nexu-io/looper:196"
+	targetID := "pr:MumuTW/looper:196"
 	loopID := "loop_uncertain_event_dedupe"
 	runID := "run_uncertain_event_dedupe"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -3019,9 +3019,9 @@ func TestRuntimeReconcileStaleRunningRunsRepairsInterruptedLoopQueueOnLaterPass(
 	}
 	defer rt.Stop("test cleanup")
 	repos := rt.Services().Repositories
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(194)
-	targetID := "pr:nexu-io/looper:194"
+	targetID := "pr:MumuTW/looper:194"
 	loopID := "loop_interrupted_queue_repair"
 	queueID := "queue_interrupted_queue_repair"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -3033,7 +3033,7 @@ func TestRuntimeReconcileStaleRunningRunsRepairsInterruptedLoopQueueOnLaterPass(
 	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_interrupted_queue_repair", LoopID: loopID, Status: "interrupted", CurrentStep: stringPtr("repair"), StartedAt: oldISO, EndedAt: stringPtr(nowISO), CreatedAt: oldISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_interrupted_queue_repair:nexu-io/looper:194", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: oldISO, StartedAt: stringPtr(oldISO), MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_interrupted_queue_repair:MumuTW/looper:194", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: oldISO, StartedAt: stringPtr(oldISO), MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
@@ -3075,9 +3075,9 @@ func TestRuntimeReconcileStaleRunningRunsRecreatesQueuedItemForInterruptedQueued
 	}
 	defer rt.Stop("test cleanup")
 	repos := rt.Services().Repositories
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(195)
-	targetID := "pr:nexu-io/looper:195"
+	targetID := "pr:MumuTW/looper:195"
 	loopID := "loop_interrupted_needs_queue_recreate"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
@@ -3149,6 +3149,40 @@ func TestRuntimeStartBeginsSchedulerPolling(t *testing.T) {
 	})
 	if got := atomic.LoadInt32(&tickCount); got < 2 {
 		t.Fatalf("scheduler tick count = %d, want immediate tick plus polling tick", got)
+	}
+}
+
+// Contract: the claim pump remains on its default catalog path when a caller
+// replaces only the full scheduler tick; both construction seams are independent.
+func TestRuntimeCustomSchedulerTickKeepsDefaultClaimPass(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+
+	rt := New(Options{
+		Config:        cfg,
+		Logger:        &testLogger{},
+		DeferRecovery: true,
+		RunSchedulerTick: func(context.Context, Services) error {
+			return nil
+		},
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+	if rt.defaultSchedulerClaim == nil {
+		t.Fatal("defaultSchedulerClaim = nil with custom tick and nil claim, want catalog claim pass")
+	}
+	if err := rt.CompleteStartup(context.Background()); err != nil {
+		t.Fatalf("CompleteStartup() error = %v", err)
 	}
 }
 
@@ -3346,7 +3380,7 @@ func TestRuntimeWebhookStatusMergesForwarderStats(t *testing.T) {
 			Queued:              6,
 			RecentOutcomes: []webhookforward.Outcome{{
 				At:         "2026-05-16T12:01:00.000Z",
-				Repo:       "nexu-io/looper",
+				Repo:       "MumuTW/looper",
 				ObjectType: "pull_request",
 				Number:     379,
 				EventType:  "pull_request",
@@ -3365,7 +3399,7 @@ func TestRuntimeWebhookStatusMergesForwarderStats(t *testing.T) {
 	if len(status.RecentOutcomes) != 1 {
 		t.Fatalf("len(Status().RecentOutcomes) = %d, want 1", len(status.RecentOutcomes))
 	}
-	if status.RecentOutcomes[0].Outcome != "completed" || status.RecentOutcomes[0].Message != "nexu-io/looper · pull_request #379 · pull_request" {
+	if status.RecentOutcomes[0].Outcome != "completed" || status.RecentOutcomes[0].Message != "MumuTW/looper · pull_request #379 · pull_request" {
 		t.Fatalf("Status().RecentOutcomes[0] = %#v, want merged forwarder outcome", status.RecentOutcomes[0])
 	}
 }
@@ -3697,7 +3731,7 @@ func TestDefaultSyncConfiguredProjectsPreservesRepoMetadataWhenRepoPathIsUnchang
 
 	repositories := storage.NewRepositories(coordinator.DB())
 	repoPath := workingDir + "/repo"
-	existingMetadata := `{"repo":"nexu-io/looper","worktreeRoot":"/tmp/old","source":"config"}`
+	existingMetadata := `{"repo":"MumuTW/looper","worktreeRoot":"/tmp/old","source":"config"}`
 	baseBranch := "main"
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
 		ID:           "project_1",
@@ -3731,7 +3765,7 @@ func TestDefaultSyncConfiguredProjectsPreservesRepoMetadataWhenRepoPathIsUnchang
 	if project == nil || project.MetadataJSON == nil {
 		t.Fatal("project metadata missing after sync")
 	}
-	const want = `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"config"}`
+	const want = `{"repo":"MumuTW/looper","worktreeRoot":null,"source":"config"}`
 	if *project.MetadataJSON != want {
 		t.Fatalf("project.MetadataJSON = %q, want %q", *project.MetadataJSON, want)
 	}
@@ -3902,9 +3936,9 @@ func TestRecoveryInterruptsOlderRunningRunWhenLatestCompleted(t *testing.T) {
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(184)
-	targetID := "pr:nexu-io/looper:184"
+	targetID := "pr:MumuTW/looper:184"
 	loopID := "loop_recovery_old_running"
 	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 184, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "completed", CreatedAt: oldISO, UpdatedAt: completedISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -3969,9 +4003,9 @@ func TestRecoveryInterruptsStaleLatestRunningRunWithoutActivity(t *testing.T) {
 			if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 				t.Fatalf("Projects.Upsert() error = %v", err)
 			}
-			repo := "nexu-io/looper"
+			repo := "MumuTW/looper"
 			prNumber := int64(184)
-			targetID := "pr:nexu-io/looper:184"
+			targetID := "pr:MumuTW/looper:184"
 			loopID := "loop_recovery_stale_latest"
 			if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 185, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: tt.loopStatus, CreatedAt: oldISO, UpdatedAt: heartbeatISO}); err != nil {
 				t.Fatalf("Loops.Upsert() error = %v", err)
@@ -3980,7 +4014,7 @@ func TestRecoveryInterruptsStaleLatestRunningRunWithoutActivity(t *testing.T) {
 				t.Fatalf("Runs.Upsert() error = %v", err)
 			}
 			if tt.hasActiveQueue {
-				if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_stale_latest", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_recovery_stale_latest:nexu-io/looper:184", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_stale_latest", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:project_1:loop_recovery_stale_latest:MumuTW/looper:184", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 					t.Fatalf("Queue.Upsert() error = %v", err)
 				}
 			}
@@ -4530,7 +4564,7 @@ func TestDefaultSyncConfiguredProjectsPreservesUnknownMetadataFields(t *testing.
 	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
 	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
-	existingMetadata := `{"extra":"value","repo":"nexu-io/looper","worktreeRoot":"/tmp/old","source":"config"}`
+	existingMetadata := `{"extra":"value","repo":"MumuTW/looper","worktreeRoot":"/tmp/old","source":"config"}`
 	repoPath := "/tmp/repo"
 	project := config.ProjectRefConfig{ID: "project_1", Name: "Looper", RepoPath: repoPath}
 	createdAt := "2026-04-16T12:00:00.000Z"
@@ -4556,7 +4590,7 @@ func TestDefaultSyncConfiguredProjectsPreservesUnknownMetadataFields(t *testing.
 		t.Fatalf("Projects.GetByID() = %#v, want metadata", stored)
 	}
 
-	const want = `{"extra":"value","repo":"nexu-io/looper","worktreeRoot":null,"source":"config"}`
+	const want = `{"extra":"value","repo":"MumuTW/looper","worktreeRoot":null,"source":"config"}`
 	if *stored.MetadataJSON != want {
 		t.Fatalf("project.MetadataJSON = %q, want %q", *stored.MetadataJSON, want)
 	}

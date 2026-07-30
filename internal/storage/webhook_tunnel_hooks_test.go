@@ -19,7 +19,7 @@ func TestWebhookTunnelHooksRepositoryCRUD(t *testing.T) {
 
 	repo := NewRepositories(coordinator.DB()).WebhookTunnelHooks
 	lastDisableAt := int64(15)
-	record := WebhookTunnelHookRecord{Repo: "nexu-io/looper", HookID: 42, ManagedURL: "https://example.test/hook", SecretRef: "secret://hook", ConsecutiveDisables: 2, LastDisableAt: &lastDisableAt, Orphaned: false, CreatedAt: 10, UpdatedAt: 10}
+	record := WebhookTunnelHookRecord{Repo: "MumuTW/looper", HookID: 42, ManagedURL: "https://example.test/hook", SecretRef: "secret://hook", ConsecutiveDisables: 2, LastDisableAt: &lastDisableAt, Orphaned: false, CreatedAt: 10, UpdatedAt: 10}
 	if err := repo.Upsert(context.Background(), record); err != nil {
 		t.Fatalf("Upsert() error = %v", err)
 	}

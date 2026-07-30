@@ -2,7 +2,7 @@
 # Local mirror of CI's blocking gates — run this before you push and CI won't
 # surprise you. Covers .github/workflows/ci.yml's `verify` and `race` jobs:
 #   optional gofmt -w → dashboard (pnpm install/test/build + artifact checks)
-#   → gofmt -l  →  go vet  →  production-only staticcheck  →  go test
+#   → Hermes/Devin helper tests → gofmt -l → go vet → production-only staticcheck → go test
 #   → go test -race (focused)
 #   → go build (with release ldflags)
 #
@@ -42,7 +42,7 @@ if [ "$FIX" -eq 1 ]; then
   echo "  gofmt -w applied"
 fi
 
-for tool in node pnpm; do
+for tool in node pnpm python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "missing required dashboard tool: $tool (see CONTRIBUTING.md prerequisites)" >&2
     exit 1
@@ -61,6 +61,9 @@ step "dashboard (pnpm install/test/build + artifact checks)"
   test -f ../../internal/dashboard/assets/index.html
 )
 echo "  clean"
+
+step "Hermes/Devin helper tests"
+python3 -m unittest discover -s tools/hermes-devin -p 'test_*.py'
 
 step "gofmt"
 unformatted="$(gofmt -l .)"

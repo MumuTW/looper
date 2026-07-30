@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/deployer"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/deployer"
 )
 
 // This test runs a real /bin/sh on purpose.

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/forge"
 )
 
 // The daemon decides whether to tell a reviewer agent to publish through this

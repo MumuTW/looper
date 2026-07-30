@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/coordinator/depgraph"
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/coordinator/depgraph"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func TestAutonomousGraceNotElapsedDoesNothing(t *testing.T) {

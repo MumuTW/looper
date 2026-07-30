@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 const DefaultServerPort = 17310

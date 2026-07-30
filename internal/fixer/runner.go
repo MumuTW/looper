@@ -18,27 +18,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/fixer/discovery"
-	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
-	"github.com/nexu-io/looper/internal/fixer/publish"
-	"github.com/nexu-io/looper/internal/fixer/reconcile"
-	"github.com/nexu-io/looper/internal/fixer/workflow"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/specpr"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/lifecycle"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/loops/failureclass"
-	"github.com/nexu-io/looper/internal/processcontainment"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/validation"
-	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/fixer/adopt"
+	"github.com/MumuTW/looper/internal/fixer/discovery"
+	"github.com/MumuTW/looper/internal/fixer/failurepolicy"
+	"github.com/MumuTW/looper/internal/fixer/publish"
+	"github.com/MumuTW/looper/internal/fixer/reconcile"
+	"github.com/MumuTW/looper/internal/fixer/workflow"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/specpr"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/validation"
+	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
 // FixerStep aliases the extracted workflow authority's step type; the
@@ -1981,6 +1982,13 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	}
 	loopResult, err := r.ensureLoopForPullRequest(ctx, project, repo, detail.Number, detail.HeadSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs)
 	if err != nil {
+		// An occupied source issue is specific to this candidate. Preserve the
+		// rest of the discovery batch rather than aborting it as an infrastructure
+		// failure.
+		if _, occupied := storage.IsIssueClaimConflictError(err); occupied {
+			result.Skipped++
+			return nil
+		}
 		return err
 	}
 	if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.skipped {
@@ -3016,7 +3024,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 // prepared while later dirty adopt can never satisfy hasFixerWorktreeProvenance.
 func (r *Runner) finishPreparedWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot, worktreePath, headSHA string) (fixerCheckpoint, error) {
 	preparedAt := r.nowISO()
-	ownerToken := newFixerWorktreeOwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
+	ownerToken := adopt.OwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
 	if err := worktreesafety.WriteFixerOwnerToken(worktreePath, ownerToken); err != nil {
 		return checkpoint, fmt.Errorf("stamp fixer ownership for %s: %w", worktreePath, err)
 	}
@@ -3046,19 +3054,16 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 	if !hasFixerWorktreeProvenance(checkpoint, created.WorktreePath) {
 		return false, checkpoint, nil
 	}
-	switch input.Loop.Status {
-	case string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusAwaitingHuman):
-		return false, checkpoint, nil
-	}
-	if _, ok := loops.ReadTakeoverResume(input.Loop.MetadataJSON); ok {
-		return false, checkpoint, nil
-	}
+	_, hasTakeoverResume := loops.ReadTakeoverResume(input.Loop.MetadataJSON)
+	loopParked := input.Loop.Status == string(domain.LoopStatusHumanTakeover) || input.Loop.Status == string(domain.LoopStatusAwaitingHuman)
 	expectedHead := strings.TrimSpace(detailHeadSHA(checkpoint.Detail))
-	if expectedHead == "" {
-		return false, checkpoint, nil
-	}
-	// prepared.HeadSHA is remote when dirty; require it still matches expected.
-	if remoteHead := strings.TrimSpace(prepared.HeadSHA); remoteHead != "" && remoteHead != expectedHead {
+	if !adopt.EligiblePreflight(adopt.Preflight{
+		LoopParked:     loopParked,
+		TakeoverResume: hasTakeoverResume,
+		ExpectedHead:   expectedHead,
+		// prepared.HeadSHA is remote when dirty.
+		RemoteHead: prepared.HeadSHA,
+	}) {
 		return false, checkpoint, nil
 	}
 	local, err := r.git.InspectHead(ctx, InspectHeadInput{
@@ -3069,7 +3074,7 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 	if err != nil {
 		return false, checkpoint, err
 	}
-	if strings.TrimSpace(local.HeadSHA) != expectedHead {
+	if !adopt.ConfirmLocalHead(local.HeadSHA, expectedHead) {
 		return false, checkpoint, nil
 	}
 	preparedAt := r.nowISO()
@@ -3125,22 +3130,6 @@ func hasFixerWorktreeProvenance(checkpoint fixerCheckpoint, worktreePath string)
 		return false
 	}
 	return diskToken == token
-}
-
-func newFixerWorktreeOwnerToken(loopID, runID, preparedAt string) string {
-	loopID = strings.TrimSpace(loopID)
-	runID = strings.TrimSpace(runID)
-	preparedAt = strings.TrimSpace(preparedAt)
-	if loopID == "" {
-		loopID = "unknown-loop"
-	}
-	if runID == "" {
-		runID = "unknown-run"
-	}
-	if preparedAt == "" {
-		preparedAt = "unknown-time"
-	}
-	return "fixer:" + loopID + ":" + runID + ":" + preparedAt
 }
 
 func sameManagedWorktreePath(a, b string) bool {
@@ -4999,16 +4988,48 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 		return loopUpsertResult{record: updatedLoop, created: false, availableAt: availableAt}, nil
 	}
-	seq, err := r.repos.Loops.AllocateSeq(ctx)
-	if err != nil {
-		return loopUpsertResult{}, err
-	}
 	targetID := buildPullRequestTargetID(repo, prNumber)
-	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
+	if r.db == nil {
+		return loopUpsertResult{}, fmt.Errorf("fixer runner database is not configured")
+	}
+	var metadataJSON *string
+	if sourceWorkerID := fixerSourceWorkerIDForPullRequest(existingLoops, project.ID, repo, prNumber); sourceWorkerID != "" {
+		metadata, err := json.Marshal(map[string]any{"sourceWorkerId": sourceWorkerID})
+		if err != nil {
+			return loopUpsertResult{}, err
+		}
+		text := string(metadata)
+		metadataJSON = &text
+	}
+	var loop storage.LoopRecord
+	if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+		repos := storage.NewRepositories(tx)
+		seq, err := repos.Loops.AllocateSeq(ctx)
+		if err != nil {
+			return err
+		}
+		loop = storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: metadataJSON}
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, loop, false); err != nil {
+			return err
+		}
+		return repos.Loops.Upsert(ctx, loop)
+	}); err != nil {
 		return loopUpsertResult{}, err
 	}
 	return loopUpsertResult{record: loop, created: true, availableAt: now}, nil
+}
+
+func fixerSourceWorkerIDForPullRequest(loops []storage.LoopRecord, projectID, repo string, prNumber int64) string {
+	for _, loop := range loops {
+		if loop.ProjectID != projectID || loop.Type != string(domain.LoopTypeWorker) || loop.TargetType != string(domain.LoopTargetTypePullRequest) || !strings.EqualFold(derefString(loop.Repo), repo) || derefInt64(loop.PRNumber) != prNumber {
+			continue
+		}
+		worker, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+		if worker != nil && int64FromAny(worker["issueNumber"]) > 0 {
+			return loop.ID
+		}
+	}
+	return ""
 }
 
 func (r *Runner) resumePausedZeroProgressLoopIfStateChanged(ctx context.Context, projectID, repo string, prNumber int64, headSHA, fixItemsStateHash string) error {

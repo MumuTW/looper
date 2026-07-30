@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 // Applying a label used to create it with `gh label create --force`, which

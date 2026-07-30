@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 )
 
 // setupRealRepoWithPRHead creates a bare remote + clone with main, a feature branch,

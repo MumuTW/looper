@@ -1,8 +1,8 @@
 package clean
 
 import (
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 // Referencing a constant is the intended usage and must not be reported.

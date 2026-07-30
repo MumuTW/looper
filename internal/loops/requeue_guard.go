@@ -5,8 +5,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // guardRegistry hands out per-key mutexes and reclaims entries when the last
