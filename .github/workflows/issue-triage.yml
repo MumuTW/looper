@@ -1,22 +1,36 @@
 name: Issue Intake
 
-# Marks every new issue as awaiting triage. The label is a visibility
-# projection only: the durable authority for triage state is the Triager's
-# Triage Report (CONTEXT.md), and removing needs-triage belongs to the
-# Triager's projection step, not to any workflow.
+# Projects "awaiting triage" visibility onto issues. Both transitions key on
+# durable GitHub events only — never on model output:
+#   add:    issue opened/reopened
+#   remove: issue closed, or looper takes authority (a looper:* or dispatch/*
+#           label lands, e.g. looper:worker-ready on dispatch)
+# The durable authority for triage state remains the Triager's Triage Report
+# (CONTEXT.md); semantic projection beyond this belongs to the Triager (#122).
+# No workflow may write looper:* or dispatch/* labels.
 on:
   issues:
-    types: [opened, reopened]
+    types: [opened, reopened, closed, labeled]
 
 permissions:
   issues: write
 
 jobs:
-  mark-needs-triage:
+  project-triage-state:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      NUMBER: ${{ github.event.issue.number }}
     steps:
-      - run: gh issue edit "$NUMBER" --add-label "needs-triage"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          NUMBER: ${{ github.event.issue.number }}
+      - name: Mark awaiting triage
+        if: github.event.action == 'opened' || github.event.action == 'reopened'
+        run: gh issue edit "$NUMBER" --add-label "needs-triage"
+
+      - name: Clear when looper takes authority or the issue closes
+        if: >-
+          github.event.action == 'closed' ||
+          (github.event.action == 'labeled' &&
+            (startsWith(github.event.label.name, 'looper:') ||
+             startsWith(github.event.label.name, 'dispatch/')))
+        run: gh issue edit "$NUMBER" --remove-label "needs-triage"
