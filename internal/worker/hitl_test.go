@@ -517,3 +517,99 @@ func TestDetectHumanAskParksOnSentinelFailure(t *testing.T) {
 		t.Fatalf("detectHumanAsk error = %#v, want loopError with manual_intervention: a retryable kind auto-requeues and the retry, finding the sentinel quarantined, would publish the gated work", awaitErr)
 	}
 }
+
+func TestSuspendForHumanAbortsOnMalformedMetadataInsteadOfStranding(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID error = %v", err)
+	}
+	malformed := `{"worktreeId":"wt-1","hitl":{`
+	loop.Status = "running"
+	loop.MetadataJSON = &malformed
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID error = %v", err)
+	}
+	queueItem.Status = "running"
+	if err := fixture.repos.Queue.Upsert(ctx, *queueItem); err != nil {
+		t.Fatalf("Queue.Upsert error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID error = %v", err)
+	}
+
+	runner := New(Options{
+		DB:                  fixture.coordinator.DB(),
+		Repos:               fixture.repos,
+		Logger:              fixture.logger,
+		Now:                 fixture.now,
+		HITLEnabled:         true,
+		HITLAnswerTransport: "feishu",
+		HITLNotify: func(_ context.Context, n HITLAskNotification) error {
+			return nil
+		},
+	})
+
+	awaiting := &awaitingHumanError{question: "Which datastore?", sessionID: "sess-xyz", executionID: "agent-1", vendor: "codex"}
+	_, err = runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: *queueItem}, run, workerCheckpoint{}, awaiting)
+	if err == nil {
+		t.Fatal("suspendForHuman error = nil, want persist-ask failure: parking without a stored ask strands the loop")
+	}
+	if !errors.Is(err, loops.ErrMalformedLoopMetadata) {
+		t.Fatalf("suspendForHuman error = %v, want ErrMalformedLoopMetadata", err)
+	}
+
+	// The loop must not have transitioned to awaiting_human, its malformed
+	// metadata must be intact for diagnosis, and the queue item untouched.
+	got, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || got == nil {
+		t.Fatalf("Loops.GetByID error = %v", err)
+	}
+	if got.Status == "awaiting_human" {
+		t.Fatal("loop status = awaiting_human, want suspension aborted")
+	}
+	if got.MetadataJSON == nil || *got.MetadataJSON != malformed {
+		t.Fatalf("loop metadata = %v, want the malformed value preserved verbatim", got.MetadataJSON)
+	}
+	q, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+	if err != nil || q == nil {
+		t.Fatalf("Queue.GetByID error = %v", err)
+	}
+	if q.Status != "running" {
+		t.Fatalf("queue item status = %q, want running (not cancelled)", q.Status)
+	}
+}
+
+func TestMergeLoopMetadataJSONRejectsMalformedCurrentValue(t *testing.T) {
+	t.Parallel()
+
+	malformed := `{"prUrl":`
+	got, err := mergeLoopMetadataJSON(&malformed, map[string]any{"prUrl": "https://example.com/pr/1"})
+	if err == nil {
+		t.Fatalf("mergeLoopMetadataJSON(malformed) = %q, want error: merging over a corrupt value erases durable state", got)
+	}
+	if !errors.Is(err, loops.ErrMalformedLoopMetadata) {
+		t.Fatalf("mergeLoopMetadataJSON(malformed) error = %v, want ErrMalformedLoopMetadata", err)
+	}
+
+	valid := `{"worker":{"lastRun":"r1"}}`
+	out, err := mergeLoopMetadataJSON(&valid, map[string]any{"prUrl": "https://example.com/pr/1"})
+	if err != nil {
+		t.Fatalf("mergeLoopMetadataJSON(valid) error = %v", err)
+	}
+	if !strings.Contains(out, `"worker"`) || !strings.Contains(out, `"prUrl"`) {
+		t.Fatalf("mergeLoopMetadataJSON(valid) = %q, want existing keys preserved and update applied", out)
+	}
+}

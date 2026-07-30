@@ -392,10 +392,16 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			})
 		}
 	}
+	var askWriteErr error
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
-			updated.MetadataJSON = &meta
+		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask)
+		if werr != nil {
+			// Without a stored ask the response paths can never resume this
+			// loop; abort the whole suspension instead of parking it stranded.
+			askWriteErr = werr
+			return
 		}
+		updated.MetadataJSON = &meta
 		// The agent re-asked after reading the queued human messages, so they're
 		// consumed — clear the inbox so they aren't re-injected on the next resume.
 		if meta, werr := loops.ClearHumanInbox(updated.MetadataJSON); werr == nil {
@@ -406,6 +412,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
+	}
+	if askWriteErr != nil {
+		return ProcessResult{}, fmt.Errorf("persist HITL ask before suspension: %w", askWriteErr)
 	}
 	reason := "worker suspended awaiting human decision"
 	if _, err := r.repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {

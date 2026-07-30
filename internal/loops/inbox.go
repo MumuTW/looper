@@ -53,7 +53,7 @@ func ClearHumanInbox(metadataJSON *string) (string, error) {
 }
 
 func marshalWithHumanInbox(metadataJSON *string, msgs []HumanMessage) (string, error) {
-	meta, err := parseMetadataObjectForWrite(metadataJSON)
+	meta, err := DecodeMetadataObjectForWrite(metadataJSON)
 	if err != nil {
 		return "", err
 	}

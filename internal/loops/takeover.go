@@ -34,7 +34,7 @@ func ReadTakeoverResume(metadataJSON *string) (TakeoverResume, bool) {
 // WriteTakeoverResume merges the takeover-resume marker into a loop's metadata,
 // preserving all other keys.
 func WriteTakeoverResume(metadataJSON *string, tr TakeoverResume) (string, error) {
-	meta, err := parseMetadataObjectForWrite(metadataJSON)
+	meta, err := DecodeMetadataObjectForWrite(metadataJSON)
 	if err != nil {
 		return "", err
 	}
@@ -56,7 +56,7 @@ func WriteTakeoverResume(metadataJSON *string, tr TakeoverResume) (string, error
 
 // ClearTakeoverResume removes the takeover-resume marker from a loop's metadata.
 func ClearTakeoverResume(metadataJSON *string) (string, error) {
-	meta, err := parseMetadataObjectForWrite(metadataJSON)
+	meta, err := DecodeMetadataObjectForWrite(metadataJSON)
 	if err != nil {
 		return "", err
 	}

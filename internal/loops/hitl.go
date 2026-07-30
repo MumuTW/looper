@@ -62,7 +62,7 @@ func ReadHITLAsk(metadataJSON *string) (HITLAsk, bool) {
 // WriteHITLAsk merges the HITL ask state into a loop's metadata JSON, preserving
 // all other keys, and returns the updated JSON string.
 func WriteHITLAsk(metadataJSON *string, ask HITLAsk) (string, error) {
-	meta, err := parseMetadataObjectForWrite(metadataJSON)
+	meta, err := DecodeMetadataObjectForWrite(metadataJSON)
 	if err != nil {
 		return "", err
 	}
@@ -84,7 +84,7 @@ func WriteHITLAsk(metadataJSON *string, ask HITLAsk) (string, error) {
 
 // ClearHITLAsk removes the HITL ask state from a loop's metadata JSON.
 func ClearHITLAsk(metadataJSON *string) (string, error) {
-	meta, err := parseMetadataObjectForWrite(metadataJSON)
+	meta, err := DecodeMetadataObjectForWrite(metadataJSON)
 	if err != nil {
 		return "", err
 	}
@@ -117,12 +117,14 @@ func parseMetadataObject(metadataJSON *string) map[string]any {
 	return meta
 }
 
-// parseMetadataObjectForWrite decodes the current metadata ahead of a
+// DecodeMetadataObjectForWrite decodes the current metadata ahead of a
 // mutation. Existing persisted metadata is part of the loop's durable workflow
 // state: a writer must successfully decode the current version before it may
 // replace it, so malformed metadata fails the mutation loudly instead of being
-// overwritten with an empty object.
-func parseMetadataObjectForWrite(metadataJSON *string) (map[string]any, error) {
+// overwritten with an empty object. Every loop-metadata writer — inside this
+// package and out (e.g. the worker's PR/worktree merges) — must decode through
+// this function.
+func DecodeMetadataObjectForWrite(metadataJSON *string) (map[string]any, error) {
 	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
 		return map[string]any{}, nil
 	}

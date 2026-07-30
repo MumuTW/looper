@@ -5621,12 +5621,16 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 		}
 		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
 			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
-			if werr == nil {
-				loop.MetadataJSON = &meta
-				loop.UpdatedAt = nowISO
-				if err := repos.Loops.Upsert(ctx, *loop); err != nil {
-					return struct{}{}, err
-				}
+			if werr != nil {
+				// Without the resume marker the next worker run cannot attach
+				// to the human-driven session; leave the loop parked instead of
+				// pretending the handback succeeded.
+				return struct{}{}, fmt.Errorf("persist takeover resume marker: %w", werr)
+			}
+			loop.MetadataJSON = &meta
+			loop.UpdatedAt = nowISO
+			if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+				return struct{}{}, err
 			}
 		}
 		reason := "Cleared for takeover handback"

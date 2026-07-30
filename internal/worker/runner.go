@@ -4221,7 +4221,12 @@ func labelsMatch(labels []string, required []string, mode config.LabelMode) bool
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
-	metadata := parseJSONObject(current)
+	// Loop metadata mutations share the strict decoder: a malformed stored
+	// value blocks the merge instead of being replaced with only the updates.
+	metadata, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	for key, value := range updates {
 		metadata[key] = value
 	}
