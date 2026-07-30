@@ -93,6 +93,35 @@ func TestTerminalCleanupPersistsSuccessTimestamps(t *testing.T) {
 	}
 }
 
+func TestTerminalCleanupRefusesReplacedTargetLeaseCapability(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_replaced_lease", filepath.Join(t.TempDir(), "wt-42"))
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_run_cleanup_replaced_lease")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	key := storage.TargetLeaseKeyFromLoop(*loop)
+	acquired, err := fixture.repos.TargetLeases.Acquire(context.Background(), storage.TargetLeaseRecord{
+		TargetKey: key, OwnerToken: "current-token", OwnerKind: "automation", OwnerID: "queue_1", Purpose: "claim", AcquiredAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	})
+	if err != nil || !acquired {
+		t.Fatalf("TargetLeases.Acquire() = (%v, %v), want (true, nil)", acquired, err)
+	}
+	ctx := loops.WithTargetLeaseCapability(context.Background(), loops.TargetLeaseCapability{Key: key, OwnerToken: "stale-token"})
+	runner.cleanupFixerWorktreeIfTerminal(ctx, storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main")}, "run_cleanup_replaced_lease", &checkpoint)
+
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0 when capability token changed", len(git.cleanupCalls))
+	}
+	attempted, cleaned := storedCleanupTimestamps(t, fixture, "run_cleanup_replaced_lease")
+	if attempted != "" || cleaned != "" {
+		t.Fatalf("stored cleanup timestamps = (%q, %q), want neither written without lease authority", attempted, cleaned)
+	}
+}
+
 func TestTerminalCleanupPersistsAttemptBeforeWorktreeMutation(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -1642,7 +1642,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				failedQueue.Status = "failed"
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
-				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupReviewerWorktreeIfTerminal(ctx, *project, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: runStatus, Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -1696,7 +1696,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 	}
-	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+	r.cleanupReviewerWorktreeIfTerminal(ctx, *project, &checkpoint)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
 
@@ -1834,7 +1834,7 @@ func (r *Runner) skipMissingPullRequest(ctx context.Context, input stepInput, ch
 	checkpoint.SkipReason = fmt.Sprintf("Skipped missing pull request %s#%d: %s", input.Repo, input.PRNumber, githubinfra.ErrorMessage(err))
 	checkpoint.SkipKind = "pr_not_found"
 	checkpoint.ResumePolicy = ""
-	r.cleanupReviewerWorktreeIfTerminal(context.Background(), input.Project, &checkpoint)
+	r.cleanupReviewerWorktreeIfTerminal(ctx, input.Project, &checkpoint)
 	if terminateErr := r.terminateLoop(ctx, input.Loop, "pr_not_found"); terminateErr != nil {
 		return checkpoint, true, terminateErr
 	}
@@ -6231,6 +6231,12 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 	// before status). Terminal success/failure cleanup must not force-remove it.
 	if strings.TrimSpace(checkpoint.Worktree.PreparedAt) == "" {
 		return
+	}
+	if capability, ok := loops.TargetLeaseCapabilityFromContext(ctx); ok {
+		lease, err := r.repos.TargetLeases.Get(ctx, capability.Key)
+		if err != nil || lease == nil || lease.OwnerToken != capability.OwnerToken {
+			return
+		}
 	}
 	// An active fixer owner stamp means the path is still fixer-owned evidence;
 	// force-remove would destroy partial edits the reviewer never successfully
