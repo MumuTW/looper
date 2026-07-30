@@ -13,11 +13,20 @@ A configured forge integration that owns remote Issues, Pull Requests, labels, c
 _Avoid_: forge, host, remote.
 
 **Project**:
-A durable local registration that binds one repository to one Provider and supplies the project-level policy consumed by Roles. The SQLite project record is the runtime Authority for whether a Project exists and for its repository/Provider binding; `[[projects]]` is a startup import, not a parallel runtime Authority.
+Defined at `storage.ProjectRecord` in `internal/storage`, whose doc comment
+carries the semantics: a durable local registration that binds one repository
+to one Provider and supplies the project-level policy consumed by Roles. The
+SQLite project record is the runtime Authority for whether a Project exists and
+for its repository/Provider binding; `[[projects]]` is a startup import, not a
+parallel runtime Authority.
 _Avoid_: config project, runtime binding.
 
 **Project Catalog**:
-The startup-built, immutable view of active Projects materialized from SQLite records after configuration import. Runtime modules consume the Project Catalog through the existing normalized project configuration interface; they do not consult the original `[[projects]]` input.
+Defined at `projects.Catalog` in `internal/projects`, whose doc comment carries
+the semantics: the startup-built, immutable view of active Projects materialized
+from SQLite records after configuration import. Runtime modules consume it
+through the existing normalized project configuration interface; they do not
+consult the original `[[projects]]` input.
 _Avoid_: registry, live config projects.
 
 **Planner**:

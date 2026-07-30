@@ -18,6 +18,11 @@ type ConfigSource interface {
 	View() OperationView
 }
 
+// Catalog is the Project Catalog: the startup-built, immutable view of active
+// Projects materialized from SQLite records after configuration import. Runtime
+// modules consume it through the existing normalized project configuration
+// interface; they do not consult the original [[projects]] input.
+//
 // Catalog owns the immutable runtime configuration view. Publish and
 // PublishGlobals update disjoint portions of that view with compare-and-swap
 // loops so concurrent database materialization and config reloads cannot undo

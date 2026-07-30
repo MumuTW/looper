@@ -82,6 +82,11 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 	}
 }
 
+// ProjectRecord is the Project: a durable local registration that binds one
+// repository to one Provider and supplies the project-level policy consumed by
+// Roles. It is the runtime Authority for whether a Project exists and for its
+// repository/Provider binding; [[projects]] is a startup import, not a parallel
+// runtime Authority.
 type ProjectRecord struct {
 	ID           string
 	Name         string
