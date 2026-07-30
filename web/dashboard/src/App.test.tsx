@@ -108,6 +108,28 @@ describe("bootstrap code exchange", () => {
     expect(screen.queryByRole("navigation")).toBeNull();
   });
 
+  it("clears a rejected restored token and points back to the login flow", async () => {
+    window.history.replaceState({}, "", "/dashboard/");
+    sessionStorage.setItem("looper.dashboard.token", "stale-token");
+    stubDaemon(
+      () => response({ token: "unused" }),
+      () =>
+        response(
+          { code: "UNAUTHORIZED", message: "Authorization token is required" },
+          401,
+        ),
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard login required" }),
+    ).toBeTruthy();
+    expect(sessionStorage.getItem("looper.dashboard.token")).toBeNull();
+    expect(screen.getByText("looper dashboard")).toBeTruthy();
+    expect(screen.queryByRole("navigation")).toBeNull();
+  });
+
   it("stores the session token when the exchange succeeds", async () => {
     window.history.replaceState({}, "", "/dashboard/?code=fresh");
     stubDaemon(() => response({ token: "tok_local" }));

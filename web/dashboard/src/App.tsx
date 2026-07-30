@@ -3,9 +3,9 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { Shell } from "@/components/layout/Shell";
 import {
   ApiError,
+  clearDashboardToken,
   exchangeBootstrapCodeIfPresent,
   fetchHealthz,
-  getDashboardToken,
 } from "@/lib/api";
 import { DashboardDataProvider } from "@/lib/DashboardDataContext";
 import { ProjectFilterProvider } from "@/lib/ProjectFilterContext";
@@ -61,14 +61,14 @@ export default function App() {
     void (async () => {
       try {
         await exchangeBootstrapCodeIfPresent();
-        // With no code or prior session, one read distinguishes authMode "none"
-        // from a local-token daemon. The latter returns 401 here, letting the
-        // shell show the supported login command instead of rendering several
-        // unrelated panels that all say Authorization token is required.
-        if (!getDashboardToken()) {
-          await fetchHealthz();
-        }
+        // One read verifies both a fresh browser and a restored session token.
+        // A rotated/expired session must reach the same recovery UI as a browser
+        // with no token instead of rendering several unrelated panel-level 401s.
+        await fetchHealthz();
       } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          clearDashboardToken();
+        }
         if (!cancelled && !isBootstrapRouteAbsent(err)) {
           const message = err instanceof Error ? err.message : String(err);
           setBootstrapError(message);

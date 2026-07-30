@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	looperapi "github.com/nexu-io/looper/internal/api"
@@ -38,7 +39,17 @@ func TestDashboardCommandCompletesUnauthenticatedBrowserLogin(t *testing.T) {
 			LocalToken: &acceptedToken,
 		},
 	}})
-	server.Config.Handler = looperapi.NewRootHandler(apiHandler, dashboard.Handler())
+	root := looperapi.NewRootHandler(apiHandler, dashboard.Handler())
+	var dashboardAuthorization string
+	var dashboardAuthorizationMu sync.Mutex
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/dashboard/" {
+			dashboardAuthorizationMu.Lock()
+			dashboardAuthorization = r.Header.Get("Authorization")
+			dashboardAuthorizationMu.Unlock()
+		}
+		root.ServeHTTP(w, r)
+	})
 	server.Start()
 	t.Cleanup(server.Close)
 
@@ -75,6 +86,12 @@ func TestDashboardCommandCompletesUnauthenticatedBrowserLogin(t *testing.T) {
 	if page.StatusCode != http.StatusOK {
 		t.Fatalf("dashboard status = %d, want 200", page.StatusCode)
 	}
+	dashboardAuthorizationMu.Lock()
+	gotDashboardAuthorization := dashboardAuthorization
+	dashboardAuthorizationMu.Unlock()
+	if gotDashboardAuthorization != "" {
+		t.Fatalf("unauthenticated dashboard Authorization = %q, want empty", gotDashboardAuthorization)
+	}
 
 	requestBody, err := json.Marshal(map[string]string{"code": parsed.Query().Get("code")})
 	if err != nil {
@@ -106,6 +123,35 @@ func TestDashboardCommandCompletesUnauthenticatedBrowserLogin(t *testing.T) {
 	if envelope.Data.Token != acceptedToken {
 		t.Fatalf("exchanged token = %q, want daemon token", envelope.Data.Token)
 	}
+
+	replay := exchangeBootstrapCodeRequest(t, server.URL, parsed.Query().Get("code"))
+	defer replay.Body.Close()
+	if replay.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(replay.Body)
+		t.Fatalf("replayed exchange status = %d, want 401; body=%s", replay.StatusCode, body)
+	}
+	if body, _ := io.ReadAll(replay.Body); bytes.Contains(body, []byte(acceptedToken)) {
+		t.Fatalf("replayed exchange leaked daemon token: %s", body)
+	}
+}
+
+func exchangeBootstrapCodeRequest(t *testing.T, serverURL, code string) *http.Response {
+	t.Helper()
+	requestBody, err := json.Marshal(map[string]string{"code": code})
+	if err != nil {
+		t.Fatalf("encode exchange: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, serverURL+"/api/v1/dashboard/bootstrap/exchange", bytes.NewReader(requestBody))
+	if err != nil {
+		t.Fatalf("create exchange request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", serverURL)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("exchange bootstrap code: %v", err)
+	}
+	return response
 }
 
 func TestDashboardCommandWithoutAuthPrintsDirectURL(t *testing.T) {

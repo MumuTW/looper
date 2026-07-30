@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,6 +28,25 @@ func TestLoadFileAcceptsLocalTokenFromEnvironment(t *testing.T) {
 	if got := loaded.Metadata.FieldSources["server.localToken"]; got != ValueSourceEnv {
 		t.Fatalf("server.localToken source = %q, want %q", got, ValueSourceEnv)
 	}
+}
+
+func TestEmptyLocalTokenEnvironmentDoesNotFallBackToFileSecret(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[server]\nauthMode = \"local-token\"\nlocalToken = \"file-token\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv:  mapEnvLookup(map[string]string{"LOOPER_TOKEN": ""}),
+	})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %T %v, want validation error", err, err)
+	}
+	assertValidationIssue(t, validationErr, "server.localToken", "is required when authMode is local-token")
 }
 
 func TestLocalTokenEnvironmentOverridesFile(t *testing.T) {
