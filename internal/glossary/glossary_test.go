@@ -38,8 +38,11 @@ var exactlyFourDigits = regexp.MustCompile(`^[0-9]{4}$`)
 var codePointer = regexp.MustCompile("`([a-z][a-z0-9_]*)\\.([A-Z][A-Za-z0-9_]*)`")
 
 // packagePath matches a backticked repository path, such as `internal/labels`
-// or `internal/disclosure/disclosure.go`.
-var packagePath = regexp.MustCompile("`((?:internal|cmd|pkg)/[A-Za-z0-9_./-]+)`")
+// or `internal/disclosure/disclosure.go`. The capture runs to the closing
+// backtick rather than stopping at the characters a path usually contains, so
+// that a reference carrying a suffix — an anchor, a stray bracket — is checked
+// and fails, instead of not matching at all and being silently skipped.
+var packagePath = regexp.MustCompile("`((?:internal|cmd|pkg)/[^`]+)`")
 
 func contextDoc(t *testing.T) string {
 	t.Helper()

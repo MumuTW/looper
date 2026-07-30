@@ -15,11 +15,19 @@ import (
 
 const repoRoot = "../.."
 
-// ownerDirs are the packages allowed to write a protected label literal: the
-// package that declares each value.
-var ownerDirs = []string{
-	filepath.Join(repoRoot, "internal", "labels"),
-	filepath.Join(repoRoot, "internal", "network", "protocol"),
+// ownerDirs are the packages that declare protected label values. Exemption is
+// per value, not per directory: labels may not restate a value protocol owns
+// and protocol may not restate one labels owns, because labels.go assigns the
+// target-label family to protocol precisely so there is one place to look.
+var ownerDirs = map[string]string{
+	"labels":   filepath.Join(repoRoot, "internal", "labels"),
+	"protocol": filepath.Join(repoRoot, "internal", "network", "protocol"),
+}
+
+// protectedValue is a label value and the one directory allowed to write it.
+type protectedValue struct {
+	qualifier string
+	ownerDir  string
 }
 
 // Having a constant is not enough. Before this package existed, infra/github
@@ -47,13 +55,10 @@ func TestLabelLiteralsAreConfinedToTheirOwningPackage(t *testing.T) {
 		t.Fatalf("target-label prefix %q is not protected; the coordinator regression this test cites would go unenforced", protocol.TargetLabelPrefix)
 	}
 
-	owners := map[string]struct{}{}
-	for _, dir := range ownerDirs {
-		abs, err := filepath.Abs(dir)
-		if err != nil {
-			t.Fatalf("resolve owner dir %s: %v", dir, err)
-		}
-		owners[abs] = struct{}{}
+	targetPrefix := Normalize(protocol.TargetLabelPrefix)
+	protocolDir, err := filepath.Abs(ownerDirs["protocol"])
+	if err != nil {
+		t.Fatalf("resolve protocol dir: %v", err)
 	}
 
 	for _, root := range []string{"internal", "cmd", "pkg"} {
@@ -69,18 +74,27 @@ func TestLabelLiteralsAreConfinedToTheirOwningPackage(t *testing.T) {
 			if strings.HasSuffix(path, "_test.go") {
 				return nil
 			}
-			if dir, absErr := filepath.Abs(filepath.Dir(path)); absErr == nil {
-				if _, owned := owners[dir]; owned {
-					return nil
-				}
+			dir, absErr := filepath.Abs(filepath.Dir(path))
+			if absErr != nil {
+				return absErr
 			}
 			for _, found := range stringExpressions(path, authority) {
 				// Compare normalized: forge labels are case-insensitive and
 				// this package's own comparisons fold case, so "LOOPER:PLAN"
 				// is the same protocol label and the same bypass.
-				if name, banned := forbidden[Normalize(found.value)]; banned {
-					rel, _ := filepath.Rel(repoRoot, path)
-					t.Errorf("%s:%d writes the label literal %q; use %s instead", rel, found.line, found.value, name)
+				normalized := Normalize(found.value)
+				rel, _ := filepath.Rel(repoRoot, path)
+				if value, banned := forbidden[normalized]; banned {
+					if dir != value.ownerDir {
+						t.Errorf("%s:%d writes the label literal %q; use %s instead", rel, found.line, found.value, value.qualifier)
+					}
+					continue
+				}
+				// A concrete target label is as much a bypass as the prefix:
+				// labels.go assigns the whole family to protocol, so nothing
+				// else may spell one out.
+				if normalized != targetPrefix && strings.HasPrefix(normalized, targetPrefix) && dir != protocolDir {
+					t.Errorf("%s:%d writes the target label %q; build it with protocol.TargetLabelForNode", rel, found.line, found.value)
 				}
 			}
 			return nil
@@ -107,12 +121,16 @@ func TestLabelLiteralsAreConfinedToTheirOwningPackage(t *testing.T) {
 // fmt.Sprintf are not folded; the confinement rule targets the copy-paste and
 // constant-reassembly that has actually happened, not every conceivable
 // construction.
-func protectedLabelValues(t *testing.T) (map[string]string, map[string]string) {
+func protectedLabelValues(t *testing.T) (map[string]protectedValue, map[string]string) {
 	t.Helper()
 
-	forbidden := map[string]string{}
+	forbidden := map[string]protectedValue{}
 	authority := map[string]string{}
 	collect := func(dir, qualifier string) {
+		ownerDir, absErr := filepath.Abs(dir)
+		if absErr != nil {
+			t.Fatalf("resolve owner dir %s: %v", dir, absErr)
+		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			t.Fatalf("read %s: %v", dir, err)
@@ -126,14 +144,14 @@ func protectedLabelValues(t *testing.T) (map[string]string, map[string]string) {
 				if name == "Prefix" || !strings.HasPrefix(strings.ToLower(value), Prefix) {
 					continue
 				}
-				forbidden[Normalize(value)] = qualifier + "." + name
+				forbidden[Normalize(value)] = protectedValue{qualifier: qualifier + "." + name, ownerDir: ownerDir}
 			}
 		}
 	}
 	// Every file of this package, so a constant added in a future file is
 	// protected without anyone remembering to extend a list.
-	collect(filepath.Join(repoRoot, "internal", "labels"), "labels")
-	collect(filepath.Join(repoRoot, "internal", "network", "protocol"), "protocol")
+	collect(ownerDirs["labels"], "labels")
+	collect(ownerDirs["protocol"], "protocol")
 	return forbidden, authority
 }
 
