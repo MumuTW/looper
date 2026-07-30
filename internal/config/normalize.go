@@ -1225,6 +1225,13 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	}
 }
 
+// MergeDeployerRoleConfig applies a project's deployer overrides onto a copy of
+// the global role. Exported so a caller that needs only this role can resolve it
+// without cloning every other role's configuration.
+func MergeDeployerRoleConfig(config *DeployerRoleConfig, partial PartialDeployerRoleConfig) {
+	mergeDeployerRoleConfig(config, partial)
+}
+
 func mergeDeployerRoleConfig(config *DeployerRoleConfig, partial PartialDeployerRoleConfig) {
 	if partial.Enabled != nil {
 		config.Enabled = *partial.Enabled
