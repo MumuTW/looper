@@ -5913,6 +5913,80 @@ func TestHandlerWorkersCreateReusesIssueWorkerBeforePlannerPRTarget(t *testing.T
 	assertEqual(t, data["reused"], true)
 }
 
+func TestHandlerWorkersCreateRejectsPlannerPRTargetHeldBySeparateLifecycle(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	issueTargetID := "issue:acme/looper:77"
+	prTargetID := "pr:acme/looper:42"
+	prNumber := int64(42)
+	plannerMetadata := `{"prNumber":42,"specPath":"specs/planner.md"}`
+	workerMetadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           "loop_planner_pr_target",
+		Seq:          1,
+		ProjectID:    "project_1",
+		Type:         "planner",
+		TargetType:   "issue",
+		TargetID:     &issueTargetID,
+		Repo:         stringPtr("acme/looper"),
+		PRNumber:     &prNumber,
+		Status:       "running",
+		MetadataJSON: &plannerMetadata,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_planner_pr_target) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           "loop_source_worker_for_pr",
+		Seq:          2,
+		ProjectID:    "project_1",
+		Type:         "worker",
+		TargetType:   "pull_request",
+		TargetID:     &prTargetID,
+		Repo:         stringPtr("acme/looper"),
+		PRNumber:     &prNumber,
+		Status:       "completed",
+		MetadataJSON: &workerMetadata,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_source_worker_for_pr) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_fixer_for_pr",
+		Seq:        3,
+		ProjectID:  "project_1",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		TargetID:   &prTargetID,
+		Repo:       stringPtr("acme/looper"),
+		PRNumber:   &prNumber,
+		Status:     "running",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_fixer_for_pr) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	apiErr := parseJSONMap(t, recorder.Body.Bytes())["error"].(map[string]any)
+	assertEqual(t, apiErr["code"], string(pkgapi.ErrorCodeLoopConflict))
+	occupiedBy := apiErr["details"].(map[string]any)["occupiedBy"].(map[string]any)
+	assertEqual(t, occupiedBy["loopId"], "loop_fixer_for_pr")
+}
+
 func TestHandlerWorkersCreateTriggersSchedulerTickHook(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)

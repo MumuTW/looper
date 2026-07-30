@@ -4427,19 +4427,6 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if issueNumber != nil {
 		requestedIssueTarget = &domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
 	}
-	// Preserve the early 409 before any PR target refresh, but use the same
-	// storage authority as publication. The transaction below remains the
-	// atomic decision; this is only an eager, user-facing check.
-	if requestedIssueTarget != nil && !derefBool(body.Force) {
-		issueTargetID := fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
-		candidate := storage.LoopRecord{ProjectID: projectID, Type: string(domain.LoopTypeWorker), TargetType: string(domain.LoopTargetTypeIssue), TargetID: &issueTargetID, Repo: repo, Status: string(domain.LoopStatusQueued)}
-		if preflightErr := storage.WithTransaction(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) error {
-			return assertIssueClaimAdmission(r.Context(), storage.NewRepositories(tx), candidate, false)
-		}); preflightErr != nil {
-			return workerCreateResponse{}, preflightErr
-		}
-	}
-
 	effectivePRNumber := (*int64)(nil)
 	if prNumber != nil {
 		resolved, resolveErr := h.requirePullRequestTarget(r.Context(), requirePullRequestTargetInput{ProjectID: projectID, Repo: *repo, PRNumber: *prNumber})
@@ -4540,6 +4527,42 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 	metadataJSON := string(payloadJSONBytes)
 	reusedWorkerLoop := false
+	issueClaimCandidate := func(reusedLoopID string) storage.LoopRecord {
+		return storage.LoopRecord{
+			ID:           reusedLoopID,
+			ProjectID:    projectID,
+			Type:         string(domain.LoopTypeWorker),
+			TargetType:   targetType,
+			TargetID:     &targetID,
+			Repo:         repo,
+			PRNumber:     effectivePRNumber,
+			Status:       string(domain.LoopStatusQueued),
+			MetadataJSON: &metadataJSON,
+		}
+	}
+
+	// Keep the eager 409 before publication, but model a reusable worker as its
+	// existing lifecycle. A planner may retarget a new worker to a PR, while an
+	// earlier issue worker is still the one that this request will resume.
+	// Admission skips only that loop ID; independent source-issue lifecycles
+	// remain conflicts. The transaction below is the authoritative recheck.
+	if requestedIssueTarget != nil && !derefBool(body.Force) {
+		existing, listErr := services.Repositories.Loops.List(r.Context())
+		if listErr != nil {
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: listErr.Error()}
+		}
+		reusedLoopID := ""
+		if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
+			return workerCreateResponse{}, reuseErr
+		} else if ok {
+			reusedLoopID = existingLoop.ID
+		}
+		if preflightErr := storage.WithTransaction(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) error {
+			return assertIssueClaimAdmission(r.Context(), storage.NewRepositories(tx), issueClaimCandidate(reusedLoopID), false)
+		}); preflightErr != nil {
+			return workerCreateResponse{}, preflightErr
+		}
+	}
 
 	// Issue-worker reuse enqueues the existing loop (same as start requeue).
 	// Take the shared per-loop retry lock before the TX so discard+retry cannot
@@ -4594,41 +4617,53 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
-		if requestedIssueTarget != nil {
-			candidate := storage.LoopRecord{ProjectID: projectID, Type: string(domain.LoopTypeWorker), TargetType: targetType, TargetID: &targetID, Repo: repo, PRNumber: effectivePRNumber, Status: string(domain.LoopStatusQueued), MetadataJSON: &metadataJSON}
-			if admissionErr := assertIssueClaimAdmission(r.Context(), repos, candidate, derefBool(body.Force)); admissionErr != nil {
-				return storage.LoopRecord{}, admissionErr
-			}
-		}
-
 		existing, listErr := repos.Loops.List(r.Context())
 		if listErr != nil {
 			return storage.LoopRecord{}, listErr
 		}
+		var reusableLoop *storage.LoopRecord
 		if issueNumber != nil {
-			if existingLoop, existingTarget, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
+			if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
 				return storage.LoopRecord{}, reuseErr
 			} else if ok {
-				reusedWorkerLoop = true
-				// Ensure gate is open even when the pre-TX scan missed this loop;
-				// still before commit so the queue item is not yet claimable.
-				if services.ActiveExecutions != nil {
-					if reuseStopGateLoopID == "" {
-						reuseStopGateLoopID = existingLoop.ID
-					}
-					// Clear+report under one lock: looper stop may establish the gate
-					// after the pre-TX clear saw it inactive. Without this return
-					// value, TX abort restore would skip (flag still false).
-					if services.ActiveExecutions.ClearLoopStop(existingLoop.ID) {
-						reuseGateWasActive = true
-					}
-				}
-				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
-				if resumeErr != nil {
-					return storage.LoopRecord{}, resumeErr
-				}
-				return resumed, nil
+				loop := existingLoop
+				reusableLoop = &loop
 			}
+		}
+		if requestedIssueTarget != nil {
+			reusedLoopID := ""
+			if reusableLoop != nil {
+				reusedLoopID = reusableLoop.ID
+			}
+			if admissionErr := assertIssueClaimAdmission(r.Context(), repos, issueClaimCandidate(reusedLoopID), derefBool(body.Force)); admissionErr != nil {
+				return storage.LoopRecord{}, admissionErr
+			}
+		}
+		if reusableLoop != nil {
+			reusedWorkerLoop = true
+			existingLoop := *reusableLoop
+			existingTarget, targetErr := loopTargetFromRecordCompat(existingLoop)
+			if targetErr != nil {
+				return storage.LoopRecord{}, targetErr
+			}
+			// Ensure gate is open even when the pre-TX scan missed this loop;
+			// still before commit so the queue item is not yet claimable.
+			if services.ActiveExecutions != nil {
+				if reuseStopGateLoopID == "" {
+					reuseStopGateLoopID = existingLoop.ID
+				}
+				// Clear+report under one lock: looper stop may establish the gate
+				// after the pre-TX clear saw it inactive. Without this return
+				// value, TX abort restore would skip (flag still false).
+				if services.ActiveExecutions.ClearLoopStop(existingLoop.ID) {
+					reuseGateWasActive = true
+				}
+			}
+			resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
+			if resumeErr != nil {
+				return storage.LoopRecord{}, resumeErr
+			}
+			return resumed, nil
 		}
 		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued); uniqueErr != nil {
 			return storage.LoopRecord{}, uniqueErr
