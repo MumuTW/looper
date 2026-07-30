@@ -55,10 +55,17 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		Transport:      "respond",
 	}
 
-	r.appendEvent(ctx, eventInput{
+	// The planner.escalation record is the authority for this suspension: it is
+	// what the dashboard, the audit trail and any replay read to learn why the
+	// loop is parked and what decision was requested. Parking without it would
+	// leave awaiting_human with no explanation, so the write is checked and the
+	// suspension is abandoned if it fails.
+	if err := r.appendEventChecked(ctx, eventInput{
 		eventType: EscalationEventType, projectID: input.Loop.ProjectID, loopID: input.Loop.ID, runID: run.ID,
 		entityType: "loop", entityID: input.Loop.ID, payload: record,
-	})
+	}); err != nil {
+		return ProcessResult{}, err
+	}
 
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {

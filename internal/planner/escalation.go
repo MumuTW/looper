@@ -123,18 +123,58 @@ const (
 	EscalationOptionStop    = "stop: settle this Issue without a spec"
 )
 
-// decodeScopeAssessment parses the agent's strict-JSON assessment. Unknown
-// fields and trailing content are rejected so a drifting prompt fails loudly
-// rather than silently assessing zero blast radius.
+// scopeAssessmentSchemaKeys is every key the prompt's schema requires. An absent
+// key is not a zero value, it is a broken contract: `{"rationale":"read the
+// repo"}` would otherwise decode to zero files, zero packages and all-false
+// booleans, so no criterion fires and an enabled gate is bypassed in silence.
+var scopeAssessmentSchemaKeys = []string{
+	"estimatedFilesTouched",
+	"estimatedPackagesTouched",
+	"filesEvidence",
+	"packagesEvidence",
+	"publicSurfaceChange",
+	"publicSurfaces",
+	"publicSurfaceEvidence",
+	"adrConflict",
+	"conflictingAdr",
+	"adrConflictEvidence",
+	"unauthorizedDecision",
+	"decisionRequired",
+	"rationale",
+}
+
+// decodeScopeAssessment parses the agent's strict-JSON assessment. The schema is
+// enforced as one whole: every key must be supplied, no key may be unknown, no
+// trailing content is tolerated, and each boolean must agree with the fields
+// that evidence it. An assessment that is partial or self-contradicting cannot
+// be judged by the policy, so it is rejected rather than read as "nothing fires".
 func decodeScopeAssessment(raw string) (ScopeAssessment, error) {
+	trimmed := strings.TrimSpace(raw)
+	var supplied map[string]json.RawMessage
+	presence := json.NewDecoder(bytes.NewBufferString(trimmed))
+	if err := presence.Decode(&supplied); err != nil {
+		return ScopeAssessment{}, fmt.Errorf("decode planner scope assessment: %w", err)
+	}
+	if err := presence.Decode(&struct{}{}); err != io.EOF {
+		return ScopeAssessment{}, fmt.Errorf("decode planner scope assessment: trailing content")
+	}
+	if supplied == nil {
+		return ScopeAssessment{}, fmt.Errorf("decode planner scope assessment: expected a JSON object")
+	}
+	missing := make([]string, 0, len(scopeAssessmentSchemaKeys))
+	for _, key := range scopeAssessmentSchemaKeys {
+		if _, ok := supplied[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return ScopeAssessment{}, fmt.Errorf("decode planner scope assessment: schema keys not supplied: %s", strings.Join(missing, ", "))
+	}
 	var assessment ScopeAssessment
-	decoder := json.NewDecoder(bytes.NewBufferString(strings.TrimSpace(raw)))
+	decoder := json.NewDecoder(bytes.NewBufferString(trimmed))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&assessment); err != nil {
 		return ScopeAssessment{}, fmt.Errorf("decode planner scope assessment: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return ScopeAssessment{}, fmt.Errorf("decode planner scope assessment: trailing content")
 	}
 	assessment.FilesEvidence = compactStrings(assessment.FilesEvidence)
 	assessment.PackagesEvidence = compactStrings(assessment.PackagesEvidence)
@@ -148,6 +188,29 @@ func decodeScopeAssessment(raw string) (ScopeAssessment, error) {
 		return ScopeAssessment{}, err
 	}
 	return assessment, nil
+}
+
+// suppliedField names one detail/evidence field and whether the agent filled it.
+type suppliedField struct {
+	name     string
+	supplied bool
+}
+
+// checkFlagAgreement enforces that an escalation boolean and the fields that
+// evidence it tell the same story. `publicSurfaceChange:false` alongside
+// `publicSurfaces:["public_api"]` is not a harmless inconsistency: the policy
+// reads only the boolean, so the contradiction would bypass an enabled gate
+// while the evidence for firing it sits right there in the same object.
+func checkFlagAgreement(flagName string, flag bool, required string, fields []suppliedField) error {
+	for _, field := range fields {
+		if !flag && field.supplied {
+			return fmt.Errorf("decode planner scope assessment: %s is false but %s was supplied", flagName, field.name)
+		}
+		if flag && field.name == required && !field.supplied {
+			return fmt.Errorf("decode planner scope assessment: %s is true but %s is empty", flagName, required)
+		}
+	}
+	return nil
 }
 
 func validateScopeAssessment(assessment ScopeAssessment) error {
@@ -164,7 +227,21 @@ func validateScopeAssessment(assessment ScopeAssessment) error {
 			return fmt.Errorf("decode planner scope assessment: unsupported public surface %q", surface)
 		}
 	}
-	return nil
+	if err := checkFlagAgreement("publicSurfaceChange", assessment.PublicSurfaceChange, "publicSurfaces", []suppliedField{
+		{name: "publicSurfaces", supplied: len(assessment.PublicSurfaces) > 0},
+		{name: "publicSurfaceEvidence", supplied: assessment.PublicSurfaceEvidence != ""},
+	}); err != nil {
+		return err
+	}
+	if err := checkFlagAgreement("adrConflict", assessment.ADRConflict, "conflictingAdr", []suppliedField{
+		{name: "conflictingAdr", supplied: assessment.ConflictingADR != ""},
+		{name: "adrConflictEvidence", supplied: assessment.ADRConflictEvidence != ""},
+	}); err != nil {
+		return err
+	}
+	return checkFlagAgreement("unauthorizedDecision", assessment.UnauthorizedDecision, "decisionRequired", []suppliedField{
+		{name: "decisionRequired", supplied: assessment.DecisionRequired != ""},
+	})
 }
 
 // evaluateEscalationPolicy is the authority boundary: the model reported facts,
@@ -288,6 +365,8 @@ Schema:
 {"estimatedFilesTouched":0,"estimatedPackagesTouched":0,"filesEvidence":["string"],"packagesEvidence":["string"],"publicSurfaceChange":false,"publicSurfaces":["public_api|config_schema|cli_surface|storage_schema|wire_format"],"publicSurfaceEvidence":"string","adrConflict":false,"conflictingAdr":"string","adrConflictEvidence":"string","unauthorizedDecision":false,"decisionRequired":"string","rationale":"string"}
 
 Rules:
+- Every key in the schema is REQUIRED. Emit all of them, even when the value is 0, false, "" or []. An output missing any key is rejected.
+- A boolean and its detail fields must agree. When a boolean is false its detail/evidence fields must be empty; when it is true the field naming what changed must be filled. A contradiction is rejected.
 - estimatedFilesTouched / estimatedPackagesTouched are your best estimate of the implementation's blast radius, based on what you actually read. filesEvidence / packagesEvidence list the concrete paths behind those numbers.
 - publicSurfaceChange is true only when implementing this Issue alters a public API, a config schema, a CLI surface, a storage schema, or a wire format. publicSurfaces names which; leave it empty when false.
 - adrConflict is true only when the change contradicts or supersedes a decision recorded under docs/adr/. conflictingAdr must name that file path.

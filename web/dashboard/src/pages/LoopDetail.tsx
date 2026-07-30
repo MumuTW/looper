@@ -450,6 +450,7 @@ export function LoopDetailPage() {
         <HumanDecisionCard
           selector={String(data.seq)}
           loopId={data.id}
+          loopStatus={data.status}
           metadataJson={data.metadataJson}
           onResponded={onMutated}
         />

@@ -1,5 +1,11 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { CopyButton } from "@/components/CopyButton";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -7,6 +13,7 @@ import { fetchLoopEvents, respondToLoop } from "@/lib/api";
 import { formatAge } from "@/lib/format";
 import {
   isAwaitingHuman,
+  isResumeStalled,
   latestEscalationCriteria,
   parseHITLAsk,
   questionWithoutRenderedCriteria,
@@ -19,6 +26,8 @@ export type HumanDecisionCardProps = {
   selector: string;
   /** Loop id — the entity key the event log is indexed by. */
   loopId: string;
+  /** Current loop status: an answered ask still parked here is a stalled resume. */
+  loopStatus?: string | null;
   /** Raw loop metadata JSON carrying the `hitl` ask. */
   metadataJson?: string | null;
   /** Called after a delivered answer so the page can refetch (use forceRefresh). */
@@ -35,12 +44,33 @@ type DetailState =
   | { status: "ready"; criteria: FiredCriterion[] }
   | { status: "error"; message: string };
 
-function SectionLabel({ children }: { children: ReactNode }) {
-  return (
-    <div className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-      {children}
-    </div>
-  );
+/**
+ * The one answer in flight. Every control on the card disables while it is set,
+ * and the control that started it says so.
+ */
+type Pending =
+  | { kind: "option"; index: number }
+  | { kind: "answer" }
+  | { kind: "resume" };
+
+const SECTION_LABEL_CLASS =
+  "text-[10px] uppercase tracking-wide text-[var(--text-muted)]";
+
+function SectionLabel({
+  children,
+  htmlFor,
+}: {
+  children: ReactNode;
+  htmlFor?: string;
+}) {
+  if (htmlFor) {
+    return (
+      <label htmlFor={htmlFor} className={SECTION_LABEL_CLASS}>
+        {children}
+      </label>
+    );
+  }
+  return <div className={SECTION_LABEL_CLASS}>{children}</div>;
 }
 
 function Criteria({ criteria }: { criteria: FiredCriterion[] }) {
@@ -85,24 +115,96 @@ function Criteria({ criteria }: { criteria: FiredCriterion[] }) {
 }
 
 /**
+ * Free-text answer, for the asks no button can answer: one that arrived with no
+ * options at all, and a stalled resume whose recorded answer text is gone. Same
+ * POST as the option buttons — the daemon rejects an empty answer, so an empty
+ * box cannot be submitted.
+ */
+function AnswerComposer({
+  hint,
+  submitLabel,
+  pendingLabel,
+  busy,
+  pending,
+  onSubmit,
+}: {
+  hint: string;
+  submitLabel: string;
+  pendingLabel: string;
+  /** Some answer is in flight — not necessarily this one. */
+  busy: boolean;
+  pending: boolean;
+  onSubmit: (answer: string) => void;
+}) {
+  const inputId = useId();
+  const [text, setText] = useState("");
+  const answer = text.trim();
+
+  // Left as typed on failure: the toast explains, the answer stays retryable.
+  const submit = () => {
+    if (!answer || busy) return;
+    onSubmit(answer);
+  };
+
+  return (
+    <section className="flex flex-col gap-1">
+      <SectionLabel htmlFor={inputId}>Your answer</SectionLabel>
+      <textarea
+        id={inputId}
+        className="min-h-14 w-full resize-y rounded border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-[12px] leading-snug text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-60"
+        value={text}
+        disabled={busy}
+        placeholder="Answer in your own words…"
+        title="⌘/Ctrl + Enter sends"
+        onChange={(event) => setText(event.currentTarget.value)}
+        onKeyDown={(event) => {
+          // Enter has to stay a newline in a textarea, so the modifier sends.
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            submit();
+          }
+        }}
+      />
+      <div className="flex flex-wrap items-center justify-between gap-1.5">
+        <span className="text-[11px] leading-snug text-[var(--text-muted)]">
+          {hint}
+        </span>
+        <Button
+          size="sm"
+          disabled={!answer || busy}
+          aria-keyshortcuts="Meta+Enter Control+Enter"
+          onClick={submit}
+        >
+          {pending ? pendingLabel : submitLabel}
+        </Button>
+      </div>
+    </section>
+  );
+}
+
+/**
  * The blocking ask on a loop parked as awaiting_human: what is being decided,
  * why the loop stopped, what the agent recommends, and one button per answer.
  *
  * Renders nothing unless the loop metadata carries an ask still awaiting an
- * answer, so the page can mount it unconditionally.
+ * answer — or one whose answer was recorded without the loop ever resuming, the
+ * one state where the operator needs this card most — so the page can mount it
+ * unconditionally.
  */
 export function HumanDecisionCard({
   selector,
   loopId,
+  loopStatus,
   metadataJson,
   onResponded,
 }: HumanDecisionCardProps) {
   const toast = useToast();
   const ask = useMemo(() => parseHITLAsk(metadataJson), [metadataJson]);
   const awaiting = isAwaitingHuman(ask);
+  const stalled = isResumeStalled(ask, loopStatus);
 
   const [detail, setDetail] = useState<DetailState>({ status: "loading" });
-  const [pendingIndex, setPendingIndex] = useState<number | null>(null);
+  const [pending, setPending] = useState<Pending | null>(null);
 
   useEffect(() => {
     if (!awaiting || !loopId) return;
@@ -132,30 +234,106 @@ export function HumanDecisionCard({
   }, [awaiting, loopId]);
 
   const respond = useCallback(
-    async (answer: string, index: number) => {
-      setPendingIndex(index);
+    async (answer: string, marker: Pending, delivered: string) => {
+      setPending(marker);
       try {
         await respondToLoop(selector, answer);
-        toast.success("Answer delivered");
+        toast.success(delivered);
         // The loop leaves awaiting_human on the refresh and this card unmounts.
         await onResponded?.();
       } catch (err) {
         toast.error(err instanceof Error ? err.message : String(err));
       } finally {
-        setPendingIndex(null);
+        setPending(null);
       }
     },
     [selector, toast, onResponded],
   );
 
-  const respondRequest = useMemo(
-    () =>
-      `POST /api/v1/loops/${encodeURIComponent(selector)}/respond {"answer": "…"}`,
-    [selector],
-  );
-
-  if (!ask || !awaiting) {
+  if (!ask || (!awaiting && !stalled)) {
     return null;
+  }
+
+  const busy = pending !== null;
+
+  if (stalled) {
+    // Re-POSTing the recorded answer replays both halves of /respond: the
+    // handler only guards on the loop still being awaiting_human, so the write
+    // lands again and the requeue it never reached is retried.
+    const resume = () =>
+      void respond(ask.answer, { kind: "resume" }, "Loop resumed");
+
+    return (
+      <Card
+        title="Answer recorded — loop not resumed"
+        // The wait is over and the requeue is not: a fault to clear, not a wait.
+        style={{ borderColor: "var(--danger)" }}
+        actions={
+          <div className="flex items-center gap-2">
+            {ask.answeredAt ? (
+              <span className="text-[11px] text-[var(--text-muted)]">
+                answered {formatAge(ask.answeredAt)} ago
+              </span>
+            ) : null}
+            <StatusChip status="awaiting_human" />
+          </div>
+        }
+      >
+        <div className="flex flex-col gap-2.5">
+          {/* The decision is settled, so the question is context now: two lines,
+              the rest on hover. */}
+          {ask.question ? (
+            <p
+              className="m-0 line-clamp-2 whitespace-pre-wrap break-words text-[12px] leading-snug text-[var(--text-muted)]"
+              title={ask.question}
+            >
+              {ask.question}
+            </p>
+          ) : null}
+
+          {ask.answer ? (
+            <section className="flex flex-col gap-1">
+              <SectionLabel>Your answer</SectionLabel>
+              <p className="m-0 whitespace-pre-wrap break-words rounded border border-[var(--border)] bg-[var(--bg)] p-2 mono text-[12px] text-[var(--text)]">
+                {ask.answer}
+              </p>
+            </section>
+          ) : null}
+
+          <p className="m-0 text-[11px] leading-snug text-[var(--text-muted)]">
+            The answer was saved, but the loop never left{" "}
+            <span className="mono">awaiting_human</span> — the resume did not go
+            through, and nothing will pick the loop up until it does.
+          </p>
+
+          {ask.answer ? (
+            <div className="flex flex-wrap items-center gap-1">
+              <Button
+                size="sm"
+                disabled={busy}
+                title="Re-sends the recorded answer and retries the requeue"
+                onClick={resume}
+              >
+                {pending?.kind === "resume" ? "Resuming …" : "Resume loop"}
+              </Button>
+            </div>
+          ) : (
+            // No answer text survived, so there is nothing to re-send: the loop
+            // stays answerable rather than becoming a dead end.
+            <AnswerComposer
+              hint="The recorded answer is missing — send it again to resume the loop."
+              submitLabel="Resume loop"
+              pendingLabel="Resuming …"
+              busy={busy}
+              pending={pending?.kind === "answer"}
+              onSubmit={(answer) =>
+                void respond(answer, { kind: "answer" }, "Loop resumed")
+              }
+            />
+          )}
+        </div>
+      </Card>
+    );
   }
 
   const criteria = detail.status === "ready" ? detail.criteria : [];
@@ -163,7 +341,6 @@ export function HumanDecisionCard({
     Boolean(ask.recommendation) ||
     Boolean(ask.recommendedOption) ||
     Boolean(ask.confidence);
-  const busy = pendingIndex !== null;
 
   return (
     <Card
@@ -258,25 +435,31 @@ export function HumanDecisionCard({
                 size="sm"
                 disabled={busy}
                 title={option}
-                onClick={() => void respond(option, index)}
+                onClick={() =>
+                  void respond(
+                    option,
+                    { kind: "option", index },
+                    "Answer delivered",
+                  )
+                }
               >
-                {pendingIndex === index ? `${option} …` : option}
+                {pending?.kind === "option" && pending.index === index
+                  ? `${option} …`
+                  : option}
               </Button>
             ))}
           </div>
         ) : (
-          <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
-            <div className="mb-1 flex items-center justify-between gap-2">
-              <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-                Answer request
-              </span>
-              <CopyButton text={respondRequest} />
-            </div>
-            <p className="m-0 break-all mono text-[11px]">{respondRequest}</p>
-            <p className="m-0 mt-1 text-[11px] text-[var(--text-muted)]">
-              This ask carries no preset options — answer it with any text.
-            </p>
-          </div>
+          <AnswerComposer
+            hint="This ask carries no preset options — your text is the answer."
+            submitLabel="Send answer"
+            pendingLabel="Sending …"
+            busy={busy}
+            pending={pending?.kind === "answer"}
+            onSubmit={(answer) =>
+              void respond(answer, { kind: "answer" }, "Answer delivered")
+            }
+          />
         )}
       </div>
     </Card>

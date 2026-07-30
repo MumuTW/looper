@@ -84,6 +84,7 @@ function renderCard(
       <HumanDecisionCard
         selector="3491"
         loopId="loop_1"
+        loopStatus="awaiting_human"
         metadataJson={metadata()}
         onResponded={onResponded}
         {...props}
@@ -274,14 +275,192 @@ describe("HumanDecisionCard", () => {
     expect(onResponded).not.toHaveBeenCalled();
   });
 
-  // A free-form ask (no preset options) must still say how to answer.
-  it("shows the respond request when the ask carries no options", async () => {
-    renderCard({ metadataJson: metadata({ options: [] }) });
+  // A free-form ask (no preset options) is answerable in principle, so it must
+  // be answerable here: the card is the only place the operator has.
+  describe("an ask with no options", () => {
+    const freeForm = () => metadata({ options: [], consequences: {} });
 
-    expect(
-      await screen.findByText(
-        'POST /api/v1/loops/3491/respond {"answer": "…"}',
-      ),
-    ).toBeTruthy();
+    function answerBox() {
+      return screen.getByLabelText("Your answer") as HTMLTextAreaElement;
+    }
+
+    function sendButton() {
+      return screen.getByRole("button", {
+        name: "Send answer",
+      }) as HTMLButtonElement;
+    }
+
+    it("offers a free-text answer instead of a dead end", () => {
+      renderCard({ metadataJson: freeForm() });
+
+      expect(answerBox()).toBeTruthy();
+      expect(
+        screen.getByText(/This ask carries no preset options/),
+      ).toBeTruthy();
+      // The copyable request template it replaced left nothing to fill in.
+      expect(screen.queryByText(/POST \/api\/v1\/loops/)).toBeNull();
+    });
+
+    it("cannot submit an empty or whitespace-only answer", () => {
+      renderCard({ metadataJson: freeForm() });
+
+      expect(sendButton().disabled).toBe(true);
+
+      fireEvent.change(answerBox(), { target: { value: "   " } });
+      expect(sendButton().disabled).toBe(true);
+      fireEvent.click(sendButton());
+      expect(respondToLoop).not.toHaveBeenCalled();
+    });
+
+    it("sends the typed answer trimmed and refreshes the loop", async () => {
+      const { onResponded } = renderCard({ metadataJson: freeForm() });
+
+      fireEvent.change(answerBox(), {
+        target: { value: "  spec design B, it keeps the wire format  " },
+      });
+      fireEvent.click(sendButton());
+
+      await waitFor(() => {
+        expect(respondToLoop).toHaveBeenCalledWith(
+          "3491",
+          "spec design B, it keeps the wire format",
+        );
+      });
+      expect(onResponded).toHaveBeenCalled();
+    });
+
+    it("sends on ⌘/Ctrl+Enter but leaves a bare Enter as a newline", async () => {
+      renderCard({ metadataJson: freeForm() });
+
+      fireEvent.change(answerBox(), { target: { value: "design B" } });
+      fireEvent.keyDown(answerBox(), { key: "Enter" });
+      expect(respondToLoop).not.toHaveBeenCalled();
+
+      fireEvent.keyDown(answerBox(), { key: "Enter", metaKey: true });
+      await waitFor(() => {
+        expect(respondToLoop).toHaveBeenCalledWith("3491", "design B");
+      });
+    });
+
+    it("locks the box and the button while the answer is in flight", async () => {
+      let release: (() => void) | null = null;
+      respondToLoop.mockReturnValue(
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      );
+      renderCard({ metadataJson: freeForm() });
+
+      fireEvent.change(answerBox(), { target: { value: "design B" } });
+      fireEvent.click(sendButton());
+
+      await waitFor(() => {
+        expect(answerBox().disabled).toBe(true);
+      });
+      const pressed = screen.getByRole("button", {
+        name: "Sending …",
+      }) as HTMLButtonElement;
+      expect(pressed.disabled).toBe(true);
+
+      release?.();
+    });
+
+    it("keeps the typed answer when the send fails", async () => {
+      respondToLoop.mockRejectedValue(new Error("daemon unreachable"));
+      renderCard({ metadataJson: freeForm() });
+
+      fireEvent.change(answerBox(), { target: { value: "design B" } });
+      fireEvent.click(sendButton());
+
+      expect(await screen.findByText("daemon unreachable")).toBeTruthy();
+      expect(answerBox().value).toBe("design B");
+      expect(sendButton().disabled).toBe(false);
+    });
+  });
+
+  // POST /respond stores the answer and flips the loop to running in two steps.
+  // When the flip fails the loop is stuck with nothing left to claim it, so the
+  // card has to stay up and offer the retry.
+  describe("an answer that never resumed the loop", () => {
+    const stalled = (overrides: Record<string, unknown> = {}) =>
+      metadata({
+        status: "answered",
+        answer: PROCEED,
+        answeredAt: "2026-07-30T10:04:00.000Z",
+        ...overrides,
+      });
+
+    function resumeButton() {
+      return screen.getByRole("button", {
+        name: "Resume loop",
+      }) as HTMLButtonElement;
+    }
+
+    it("stays visible with the recorded answer and a resume action", () => {
+      renderCard({ metadataJson: stalled() });
+
+      expect(screen.getByText("Answer recorded — loop not resumed")).toBeTruthy();
+      expect(screen.getByText(PROCEED)).toBeTruthy();
+      expect(screen.getByText(/the resume did not go through/)).toBeTruthy();
+      expect(resumeButton()).toBeTruthy();
+    });
+
+    // The decision is made: re-offering the options would invite a second one.
+    it("does not re-offer the options or the escalation detail", () => {
+      renderCard({ metadataJson: stalled() });
+
+      expect(screen.queryByRole("button", { name: PROCEED })).toBeNull();
+      expect(screen.queryByRole("button", { name: STOP })).toBeNull();
+      expect(screen.queryByText("Why it stopped")).toBeNull();
+      expect(screen.queryByText("Agent recommendation")).toBeNull();
+      expect(fetchLoopEvents).not.toHaveBeenCalled();
+    });
+
+    it("re-sends the recorded answer to retry the requeue", async () => {
+      const { onResponded } = renderCard({ metadataJson: stalled() });
+
+      fireEvent.click(resumeButton());
+
+      await waitFor(() => {
+        expect(respondToLoop).toHaveBeenCalledWith("3491", PROCEED);
+      });
+      expect(onResponded).toHaveBeenCalled();
+    });
+
+    it("marks the retry in flight, then re-enables it on failure", async () => {
+      respondToLoop.mockRejectedValue(new Error("scheduler is not running"));
+      renderCard({ metadataJson: stalled() });
+
+      fireEvent.click(resumeButton());
+
+      expect(await screen.findByText("scheduler is not running")).toBeTruthy();
+      expect(resumeButton().disabled).toBe(false);
+    });
+
+    // Nothing to re-send, so the operator supplies it — still never a dead end.
+    it("falls back to a free-text answer when no answer text survived", async () => {
+      renderCard({ metadataJson: stalled({ answer: "" }) });
+
+      const box = screen.getByLabelText("Your answer") as HTMLTextAreaElement;
+      expect(screen.getByText(/The recorded answer is missing/)).toBeTruthy();
+      expect(resumeButton().disabled).toBe(true);
+
+      fireEvent.change(box, { target: { value: PROCEED } });
+      fireEvent.click(resumeButton());
+
+      await waitFor(() => {
+        expect(respondToLoop).toHaveBeenCalledWith("3491", PROCEED);
+      });
+    });
+
+    // The successful answered window (loop already running) is not a failure.
+    it("renders nothing once the loop actually resumed", () => {
+      const { view } = renderCard({
+        metadataJson: stalled(),
+        loopStatus: "running",
+      });
+
+      expect(view.container.textContent).toBe("");
+    });
   });
 });

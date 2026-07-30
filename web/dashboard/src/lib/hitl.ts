@@ -16,11 +16,14 @@ export type HITLAsk = {
   options: string[];
   /** "awaiting" | "answered" | "consumed" (lowercased; "" when absent). */
   status: string;
+  /** The delivered answer, recorded from "answered" on. */
+  answer: string;
   recommendation: string;
   recommendedOption: string;
   confidence: string;
   consequences: ConsequenceEntry[];
   askedAt: string;
+  answeredAt: string;
 };
 
 /** One entry of the ask's label→text consequences map, in JSON order. */
@@ -99,17 +102,41 @@ export function parseHITLAsk(
     question: asString(ask.question),
     options: asStringArray(ask.options),
     status: asString(ask.status).toLowerCase(),
+    answer: asString(ask.answer),
     recommendation: asString(ask.recommendation),
     recommendedOption: asString(ask.recommendedOption),
     confidence: asString(ask.confidence),
     consequences: asConsequences(ask.consequences),
     askedAt: asString(ask.askedAt),
+    answeredAt: asString(ask.answeredAt),
   };
 }
+
+/** internal/domain.LoopStatusAwaitingHuman — the status a blocking ask parks a loop in. */
+const AWAITING_HUMAN_LOOP_STATUS = "awaiting_human";
 
 /** True only while the loop is blocked on this ask. */
 export function isAwaitingHuman(ask: HITLAsk | null): boolean {
   return ask?.status === "awaiting";
+}
+
+/**
+ * True when the answer was stored but the loop never left awaiting_human.
+ *
+ * api.deliverHumanAnswer persists the answer and flips the loop to running in
+ * two steps, so a failure between them strands the loop: the ask reads
+ * "answered" and nothing will ever claim the loop again. On the successful path
+ * the flip lands and the loop reads "running", so this stays false for the whole
+ * normal answered window — only the stuck one matches.
+ */
+export function isResumeStalled(
+  ask: HITLAsk | null,
+  loopStatus: string | null | undefined,
+): boolean {
+  return (
+    ask?.status === "answered" &&
+    asString(loopStatus).toLowerCase() === AWAITING_HUMAN_LOOP_STATUS
+  );
 }
 
 /**

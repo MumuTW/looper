@@ -1713,6 +1713,7 @@ type fakeGitHubGateway struct {
 	issueDetail        IssueDetail
 	issueDetails       []IssueDetail
 	issueDetailIndex   int
+	viewIssueCalls     int
 	openPullRequests   []PullRequestSummary
 	prDetail           PullRequestDetail
 	viewPRErr          error
@@ -1737,6 +1738,7 @@ func (f *fakeGitHubGateway) ListOpenIssues(_ context.Context, input ListOpenIssu
 }
 
 func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (IssueDetail, error) {
+	f.viewIssueCalls++
 	detail := f.issueDetail
 	if f.issueDetailIndex < len(f.issueDetails) {
 		detail = f.issueDetails[f.issueDetailIndex]
@@ -1868,10 +1870,16 @@ type fakeAgentExecutor struct {
 	starts  []AgentRunInput
 	waitErr error
 	wait    func(context.Context) error
+	// onStart observes daemon state at the instant a turn begins, so tests can
+	// assert what was already durable before the turn was allowed to run.
+	onStart func(AgentRunInput)
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
 	f.starts = append(f.starts, input)
+	if f.onStart != nil {
+		f.onStart(input)
+	}
 	if len(f.results) == 0 {
 		return nil, fmt.Errorf("no queued agent result")
 	}

@@ -1074,14 +1074,29 @@ func (r *Runner) runAssessScopeStep(ctx context.Context, input stepInput) (plann
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
-	if ask, ok := r.pendingEscalationAnswer(ctx, input.Loop); ok {
-		return r.applyEscalationAnswer(ctx, input, checkpoint, ask)
-	}
 	policy := r.escalationPolicyForProject(input.Project.ID)
+	if ask, ok := r.pendingEscalationAnswer(ctx, input.Loop); ok {
+		updated, applied, err := r.applyEscalationAnswer(ctx, input, checkpoint, ask)
+		if err != nil || applied {
+			return updated, err
+		}
+		// The Issue changed under the human's feet, so the answer was retired
+		// rather than applied. Fall through to a fresh assessment of the Issue
+		// as it reads now.
+		checkpoint = updated
+	}
 	if !policy.Enabled {
 		return checkpoint, nil
 	}
 	if checkpoint.Scope != nil && checkpoint.Scope.Assessed {
+		// An escalated scope carrying no recorded human decision must never
+		// advance to spec authoring. That state means the decision was lost
+		// between the answer being consumed and the checkpoint being persisted,
+		// and advancing here would silently convert a human `stop` into a
+		// proceed. Park on the same record instead.
+		if checkpoint.Scope.Escalated && strings.TrimSpace(checkpoint.Scope.HumanDecision) == "" {
+			return checkpoint, r.escalationErrorFromCheckpoint(input, policy, checkpoint)
+		}
 		return checkpoint, nil
 	}
 	issue, err := requireIssue(checkpoint)
@@ -1096,13 +1111,30 @@ func (r *Runner) runAssessScopeStep(ctx context.Context, input stepInput) (plann
 	if err != nil {
 		return checkpoint, err
 	}
+	if err := r.verifyAssessmentLeftWorktreeClean(ctx, input, worktree); err != nil {
+		return checkpoint, err
+	}
 	criteria := evaluateEscalationPolicy(policy, assessment)
 	checkpoint.Scope = &checkpointScope{Assessed: true, Assessment: &assessment, Criteria: criteria, Escalated: len(criteria) > 0}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	if len(criteria) == 0 {
 		return checkpoint, nil
 	}
-	record := EscalationRecord{
+	// A hold applied while the assessment turn was running must not be turned
+	// into a decision request nobody should have to answer. write-spec rechecks
+	// the hold after its agent turn for exactly this reason.
+	if !plannerQueueItemIsManual(input.QueueItem) {
+		if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+			return checkpoint, err
+		} else if held {
+			return checkpoint, &holdSkipError{summary: summary}
+		}
+	}
+	return checkpoint, &escalationError{record: r.buildEscalationRecord(input, policy, issue, assessment, criteria)}
+}
+
+func (r *Runner) buildEscalationRecord(input stepInput, policy EscalationPolicy, issue *checkpointIssue, assessment ScopeAssessment, criteria []FiredCriterion) EscalationRecord {
+	return EscalationRecord{
 		Version:           escalationRecordVersion,
 		ProjectID:         input.Project.ID,
 		Repo:              issue.Repo,
@@ -1115,11 +1147,82 @@ func (r *Runner) runAssessScopeStep(ctx context.Context, input stepInput) (plann
 		DecisionRequested: buildEscalationQuestion(issue.Repo, issue.IssueNumber, criteria),
 		Options:           []string{EscalationOptionProceed, EscalationOptionStop},
 	}
-	return checkpoint, &escalationError{record: record}
 }
 
-// applyEscalationAnswer resumes an escalated loop with the human's decision.
-func (r *Runner) applyEscalationAnswer(ctx context.Context, input stepInput, checkpoint plannerCheckpoint, ask loops.HITLAsk) (plannerCheckpoint, error) {
+// escalationErrorFromCheckpoint re-parks a run on the escalation already
+// recorded in its checkpoint, without re-running the assessment turn.
+func (r *Runner) escalationErrorFromCheckpoint(input stepInput, policy EscalationPolicy, checkpoint plannerCheckpoint) error {
+	issue, err := requireIssue(checkpoint)
+	if err != nil {
+		return err
+	}
+	assessment := ScopeAssessment{}
+	if checkpoint.Scope.Assessment != nil {
+		assessment = *checkpoint.Scope.Assessment
+	}
+	return &escalationError{record: r.buildEscalationRecord(input, policy, issue, assessment, checkpoint.Scope.Criteria)}
+}
+
+// verifyAssessmentLeftWorktreeClean is the mechanical proof that the read-only
+// scope assessment stayed read-only. The Issue body is untrusted input: an
+// instruction-injection payload that gets the assessor to write files would have
+// those files committed wholesale by runWriteSpecStep and pushed by
+// runPublishStep, landing attacker-chosen source in the spec PR. Rather than a
+// second isolated checkout, the InspectHead the write-spec step already relies
+// on proves both the working tree and the branch head are untouched — the exact
+// two inputs that step consumes — and a mismatch fails loudly with its own
+// reason instead of being silently adopted.
+func (r *Runner) verifyAssessmentLeftWorktreeClean(ctx context.Context, input stepInput, worktree *checkpointWorktree) error {
+	if r.git == nil {
+		return nil
+	}
+	worktreeRoot, err := plannerWorktreeRoot(input.Project)
+	if err != nil {
+		return err
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: worktree.BaseBranch})
+	if err != nil {
+		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if !inspect.HasUncommittedChanges && len(inspect.NewCommitSHAs) == 0 {
+		return nil
+	}
+	return &loopError{
+		message: fmt.Sprintf("Planner scope assessment modified its worktree (uncommittedChanges=%t, newCommits=%d, changedFiles=%s); refusing to carry those changes into the spec PR", inspect.HasUncommittedChanges, len(inspect.NewCommitSHAs), strings.Join(inspect.ChangedFiles, ", ")),
+		kind:    FailureManualIntervention,
+	}
+}
+
+// applyEscalationAnswer resumes an escalated loop with the human's decision. The
+// second return is false when the answer was retired instead of applied because
+// the Issue changed while it was waiting; the caller then reassesses.
+func (r *Runner) applyEscalationAnswer(ctx context.Context, input stepInput, checkpoint plannerCheckpoint, ask loops.HITLAsk) (plannerCheckpoint, bool, error) {
+	repo, issueNumber := "", int64(0)
+	if checkpoint.Issue != nil {
+		repo, issueNumber = checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber
+	}
+	// A human may answer days later. Honouring the answer against the
+	// checkpointed Issue would author a spec from a title/body nobody has read
+	// since the escalation was raised.
+	refreshed, changed, err := r.refreshCheckpointIssue(ctx, input, checkpoint)
+	if err != nil {
+		return checkpoint, false, err
+	}
+	checkpoint = refreshed
+	if changed {
+		r.markEscalationAnswerConsumed(ctx, input.Loop)
+		if err := r.appendEventChecked(ctx, eventInput{
+			eventType: EscalationResolutionEventType, projectID: input.Loop.ProjectID, loopID: input.Loop.ID, runID: input.Run.ID,
+			entityType: "loop", entityID: input.Loop.ID,
+			payload: map[string]any{"repo": repo, "issueNumber": issueNumber, "authorized": false, "answer": strings.TrimSpace(ask.Answer), "answeredAt": ask.AnsweredAt, "superseded": true, "supersededReason": "issue content changed while awaiting the human decision"},
+		}); err != nil {
+			return checkpoint, false, err
+		}
+		checkpoint.Scope = nil
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, false, nil
+	}
+
 	authorized := classifyEscalationAnswer(ask.Answer)
 	if checkpoint.Scope == nil {
 		checkpoint.Scope = &checkpointScope{}
@@ -1129,22 +1232,51 @@ func (r *Runner) applyEscalationAnswer(ctx context.Context, input stepInput, che
 	checkpoint.Scope.HumanDecidedAt = ask.AnsweredAt
 	checkpoint.Scope.Assessed = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	r.markEscalationAnswerConsumed(ctx, input.Loop)
-	repo, issueNumber := "", int64(0)
-	if checkpoint.Issue != nil {
-		repo, issueNumber = checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber
+	if authorized {
+		checkpoint.Scope.AuthorizedGuidance = checkpoint.Scope.HumanDecision
+	} else {
+		checkpoint.SkipReason = fmt.Sprintf("Planner escalation settled by human for %s#%d: %s", repo, issueNumber, checkpoint.Scope.HumanDecision)
 	}
-	r.appendEvent(ctx, eventInput{
+	// Durability before consumption. If the daemon exits between these two
+	// writes the ask is still "answered", so the resumed run re-applies the same
+	// decision. In the reverse order the ask reads "consumed" while the
+	// checkpoint still holds only the escalated scope, and a `stop` is lost.
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepAssessScope, checkpoint); err != nil {
+		return checkpoint, false, wrapRetryableAfterResume(err)
+	}
+	r.markEscalationAnswerConsumed(ctx, input.Loop)
+	if err := r.appendEventChecked(ctx, eventInput{
 		eventType: EscalationResolutionEventType, projectID: input.Loop.ProjectID, loopID: input.Loop.ID, runID: input.Run.ID,
 		entityType: "loop", entityID: input.Loop.ID,
 		payload: map[string]any{"repo": repo, "issueNumber": issueNumber, "authorized": authorized, "answer": checkpoint.Scope.HumanDecision, "answeredAt": ask.AnsweredAt},
-	})
-	if !authorized {
-		checkpoint.SkipReason = fmt.Sprintf("Planner escalation settled by human for %s#%d: %s", repo, issueNumber, checkpoint.Scope.HumanDecision)
-		return checkpoint, nil
+	}); err != nil {
+		return checkpoint, false, err
 	}
-	checkpoint.Scope.AuthorizedGuidance = checkpoint.Scope.HumanDecision
-	return checkpoint, nil
+	return checkpoint, true, nil
+}
+
+// refreshCheckpointIssue re-reads the Issue a checkpoint was built from. The
+// second return reports whether the content the spec prompt is built from —
+// title and body — changed.
+func (r *Runner) refreshCheckpointIssue(ctx context.Context, input stepInput, checkpoint plannerCheckpoint) (plannerCheckpoint, bool, error) {
+	if r.github == nil || checkpoint.Issue == nil {
+		return checkpoint, false, nil
+	}
+	detail, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: checkpoint.Issue.Repo, IssueNumber: checkpoint.Issue.IssueNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return checkpoint, false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	issue := *checkpoint.Issue
+	changed := strings.TrimSpace(detail.Title) != strings.TrimSpace(issue.Title) || strings.TrimSpace(detail.Body) != strings.TrimSpace(issue.Body)
+	issue.Title = detail.Title
+	issue.Body = detail.Body
+	if strings.TrimSpace(detail.URL) != "" {
+		issue.URL = detail.URL
+	}
+	issue.Assignees = cloneStrings(detail.Assignees)
+	issue.Labels = cloneStrings(detail.Labels)
+	checkpoint.Issue = &issue
+	return checkpoint, changed, nil
 }
 
 // assessScope runs one read-only agent turn in the prepared worktree and decodes
@@ -1863,11 +1995,29 @@ type eventInput struct {
 	payload    any
 }
 
+// appendEvent is best-effort telemetry: step/run progress events whose loss
+// costs observability but no authority.
 func (r *Runner) appendEvent(ctx context.Context, input eventInput) {
 	if r.repos == nil || r.repos.Events == nil {
 		return
 	}
-	_ = eventlog.Append(ctx, r.repos, eventlog.AppendInput{EventType: input.eventType, ProjectID: optionalString(input.projectID), LoopID: optionalString(input.loopID), RunID: optionalString(input.runID), EntityType: optionalString(input.entityType), EntityID: optionalString(input.entityID), ActorType: optionalString("system"), ActorID: optionalString("planner-loop"), ActorDisplayName: optionalString("planner-loop"), Payload: input.payload, CreatedAt: r.now()})
+	_ = r.appendEventChecked(ctx, input)
+}
+
+// appendEventChecked writes an event whose record IS the authority for what
+// happened, and surfaces the failure. This matches triager, which persists its
+// triage.report through a checked path (persistReport returns the Events.Append
+// error and its caller propagates it). A planner.escalation that failed to
+// persist means there is no durable record of why the loop is parked, so the
+// caller must fail rather than park on a record nobody can replay.
+func (r *Runner) appendEventChecked(ctx context.Context, input eventInput) error {
+	if r.repos == nil || r.repos.Events == nil {
+		return fmt.Errorf("append %s: event log is unavailable", input.eventType)
+	}
+	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{EventType: input.eventType, ProjectID: optionalString(input.projectID), LoopID: optionalString(input.loopID), RunID: optionalString(input.runID), EntityType: optionalString(input.entityType), EntityID: optionalString(input.entityID), ActorType: optionalString("system"), ActorID: optionalString("planner-loop"), ActorDisplayName: optionalString("planner-loop"), Payload: input.payload, CreatedAt: r.now()}); err != nil {
+		return fmt.Errorf("append %s: %w", input.eventType, err)
+	}
+	return nil
 }
 
 type loopUpsertResult struct {

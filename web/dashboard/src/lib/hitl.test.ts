@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { LoopEvent } from "@/lib/api";
 import {
   isAwaitingHuman,
+  isResumeStalled,
   latestEscalationCriteria,
   parseHITLAsk,
   questionWithoutRenderedCriteria,
@@ -59,12 +60,28 @@ describe("parseHITLAsk", () => {
     expect(parseHITLAsk(metadata("awaiting"))).toBeNull();
   });
 
+  it("reads the delivered answer once the ask has one", () => {
+    const ask = parseHITLAsk(
+      metadata({
+        question: "Authorize Planner to write a spec?",
+        status: "answered",
+        answer: "proceed: yes",
+        answeredAt: "2026-07-30T10:04:00.000Z",
+      }),
+    );
+
+    expect(ask?.answer).toBe("proceed: yes");
+    expect(ask?.answeredAt).toBe("2026-07-30T10:04:00.000Z");
+  });
+
   it("coerces wrong-typed fields instead of trusting them", () => {
     const ask = parseHITLAsk(
       metadata({
         question: 42,
         options: ["ok", 7, "  ", null],
         status: "AWAITING",
+        answer: { text: "proceed" },
+        answeredAt: 1754000000,
         consequences: { ok: 5, "": "dropped", keep: "kept" },
       }),
     );
@@ -72,6 +89,8 @@ describe("parseHITLAsk", () => {
     expect(ask?.question).toBe("");
     expect(ask?.options).toEqual(["ok"]);
     expect(ask?.status).toBe("awaiting");
+    expect(ask?.answer).toBe("");
+    expect(ask?.answeredAt).toBe("");
     expect(ask?.consequences).toEqual([{ label: "keep", text: "kept" }]);
   });
 
@@ -83,6 +102,38 @@ describe("parseHITLAsk", () => {
       false,
     );
     expect(isAwaitingHuman(null)).toBe(false);
+  });
+});
+
+describe("isResumeStalled", () => {
+  const answered = parseHITLAsk(
+    metadata({ status: "answered", answer: "proceed: yes" }),
+  );
+
+  // /respond writes the answer and flips the status in two steps: an answered
+  // ask under a loop still parked as awaiting_human is the failure in between.
+  it("is true only for an answered ask still parked as awaiting_human", () => {
+    expect(isResumeStalled(answered, "awaiting_human")).toBe(true);
+    expect(isResumeStalled(answered, "AWAITING_HUMAN")).toBe(true);
+  });
+
+  // The whole successful window — answered, then consumed by the resumed run —
+  // must not read as stalled, or every answer would flash the failure card.
+  it("is false once the loop left awaiting_human", () => {
+    expect(isResumeStalled(answered, "running")).toBe(false);
+    expect(isResumeStalled(answered, "completed")).toBe(false);
+    expect(isResumeStalled(answered, null)).toBe(false);
+    expect(isResumeStalled(answered, undefined)).toBe(false);
+  });
+
+  it("is false for asks that are not answered", () => {
+    expect(
+      isResumeStalled(parseHITLAsk(metadata({ status: "awaiting" })), "awaiting_human"),
+    ).toBe(false);
+    expect(
+      isResumeStalled(parseHITLAsk(metadata({ status: "consumed" })), "awaiting_human"),
+    ).toBe(false);
+    expect(isResumeStalled(null, "awaiting_human")).toBe(false);
   });
 });
 
