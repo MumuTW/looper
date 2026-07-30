@@ -2880,7 +2880,7 @@ func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bo
 		return true, nil
 	}
 	var commandErr *shell.CommandExecutionError
-	if errors.As(err, &commandErr) {
+	if errors.As(err, &commandErr) && commandErr.Category == shell.FailureNonZeroExit {
 		return false, nil
 	}
 	return false, err
