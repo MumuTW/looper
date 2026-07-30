@@ -121,6 +121,10 @@ type Context struct {
 	// Optional: when nil, dispatch keeps the local-only occupancy check from
 	// #319 and does not call the forge.
 	LookupIssueOccupancy func(ctx context.Context, repo string, issueNumber int64, cwd string) (IssueOccupancy, error)
+	// RefreshTargetLabels reads the live labels used by manual-loop hold
+	// preflight. Production leaves it nil and uses the configured GitHub gateway;
+	// embeddings and tests can inject the same freshness authority explicitly.
+	RefreshTargetLabels func(ctx context.Context, target domain.LoopTarget, cwd string) ([]string, error)
 }
 
 // PullRequestTarget is the minimum a caller needs to decide whether a pull
@@ -4299,7 +4303,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			record.NextRunAt = &nowISO
 		}
 
-		if err := transactionRepos.Loops.Upsert(r.Context(), record); err != nil {
+		if err := upsertLoopAfterIssueClaimAdmission(r.Context(), transactionRepos.Loops, record, derefBool(body.Force)); err != nil {
 			return storage.LoopRecord{}, err
 		}
 
@@ -4349,6 +4353,13 @@ func assertIssueClaimAdmission(ctx context.Context, repos *storage.Repositories,
 		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
 	}
 	return err
+}
+
+func upsertLoopAfterIssueClaimAdmission(ctx context.Context, loops *storage.LoopsRepository, record storage.LoopRecord, force bool) error {
+	if force {
+		return loops.UpsertForcingIssueClaimAdmission(ctx, record)
+	}
+	return loops.Upsert(ctx, record)
 }
 
 func issueCollisionError(issueNumber int64, loopID, loopType string) apiError {
@@ -4689,7 +4700,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
-		if upsertErr := repos.Loops.Upsert(r.Context(), record); upsertErr != nil {
+		if upsertErr := upsertLoopAfterIssueClaimAdmission(r.Context(), repos.Loops, record, derefBool(body.Force)); upsertErr != nil {
 			return storage.LoopRecord{}, upsertErr
 		}
 
@@ -4800,30 +4811,30 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if ghPath == "" {
 		return nil
 	}
-	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, Env: config.DaemonGitHubCredentialEnv(h.context.Config), GHRun: shell.Run})
-	labels := []string(nil)
-	switch target.TargetType {
-	case domain.LoopTargetTypeIssue:
-		// Labels-only: ViewIssue would additionally page through every comment
-		// on the issue, and this preflight reads nothing but the labels.
-		issueLabels, err := gh.GetIssueLabels(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
-		}
-		labels = issueLabels
-	case domain.LoopTargetTypePullRequest:
-		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
-		}
-		labels = detail.Labels
-	default:
-		return nil
+	labels, refreshErr := h.refreshTargetLabels(ctx, target, project.RepoPath, ghPath)
+	if refreshErr != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
 	}
 	if !domain.IsAutoLaneHeld(loopType, labels) {
 		return nil
 	}
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+}
+
+func (h *Handler) refreshTargetLabels(ctx context.Context, target domain.LoopTarget, cwd, ghPath string) ([]string, error) {
+	if h.context.RefreshTargetLabels != nil {
+		return h.context.RefreshTargetLabels(ctx, target, cwd)
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: cwd, Env: config.DaemonGitHubCredentialEnv(h.context.Config), GHRun: shell.Run})
+	switch target.TargetType {
+	case domain.LoopTargetTypeIssue:
+		return gh.GetIssueLabels(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: cwd})
+	case domain.LoopTargetTypePullRequest:
+		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: cwd})
+		return detail.Labels, err
+	default:
+		return nil, nil
+	}
 }
 
 // refuseOccupiedIssueTarget asks the forge whether the issue is still open and

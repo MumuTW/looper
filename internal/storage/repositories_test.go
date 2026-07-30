@@ -131,6 +131,76 @@ func TestIssueClaimAdmissionConcurrentWritersPublishOnlyOne(t *testing.T) {
 	}
 }
 
+func TestLoopUpsertGuardsReactivationAndRetargetedWorkerIssueClaims(t *testing.T) {
+	t.Parallel()
+
+	t.Run("reactivation", func(t *testing.T) {
+		coordinator := openMigratedCoordinatorForRepositories(t)
+		repos := NewRepositories(coordinator.DB())
+		ctx := context.Background()
+		startedAt := "2026-07-31T00:00:00.000Z"
+		repo := "acme/looper"
+		prNumber := int64(77)
+		prTarget := "pr:acme/looper:77"
+		issueTarget := "issue:acme/looper:19"
+		metadata := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+			t.Fatalf("seed project: %v", err)
+		}
+
+		for _, record := range []LoopRecord{
+			{ID: "source_worker", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: startedAt, UpdatedAt: startedAt},
+			{ID: "inactive_reviewer", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", CreatedAt: startedAt, UpdatedAt: startedAt},
+			{ID: "active_worker", Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt},
+		} {
+			if err := repos.Loops.Upsert(ctx, record); err != nil {
+				t.Fatalf("seed %s: %v", record.ID, err)
+			}
+		}
+
+		reviewer, err := repos.Loops.GetByID(ctx, "inactive_reviewer")
+		if err != nil || reviewer == nil {
+			t.Fatalf("load inactive reviewer: %v, %#v", err, reviewer)
+		}
+		reviewer.Status = "queued"
+		reviewer.UpdatedAt = "2026-07-31T00:01:00.000Z"
+		if err := repos.Loops.Upsert(ctx, *reviewer); err == nil {
+			t.Fatal("reactivating reviewer error = nil, want source-issue conflict")
+		} else if conflict, ok := IsIssueClaimConflictError(err); !ok || conflict.LoopID != "active_worker" {
+			t.Fatalf("reactivating reviewer error = %v, want active worker conflict", err)
+		}
+		persisted, err := repos.Loops.GetByID(ctx, "inactive_reviewer")
+		if err != nil || persisted == nil || persisted.Status != "failed" {
+			t.Fatalf("reactivated reviewer = %#v, %v; want failed record unchanged", persisted, err)
+		}
+	})
+
+	t.Run("retargeted worker", func(t *testing.T) {
+		coordinator := openMigratedCoordinatorForRepositories(t)
+		repos := NewRepositories(coordinator.DB())
+		ctx := context.Background()
+		startedAt := "2026-07-31T00:00:00.000Z"
+		repo := "acme/looper"
+		prNumber := int64(77)
+		prTarget := "pr:acme/looper:77"
+		issueTarget := "issue:acme/looper:19"
+		metadata := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+			t.Fatalf("seed project: %v", err)
+		}
+		retargeted := LoopRecord{ID: "retargeted_worker", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: startedAt, UpdatedAt: startedAt}
+		if err := repos.Loops.Upsert(ctx, retargeted); err != nil {
+			t.Fatalf("seed retargeted worker: %v", err)
+		}
+		candidate := LoopRecord{ID: "new_worker", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt}
+		if err := repos.Loops.Upsert(ctx, candidate); err == nil {
+			t.Fatal("new issue worker error = nil, want retargeted worker conflict")
+		} else if conflict, ok := IsIssueClaimConflictError(err); !ok || conflict.LoopID != retargeted.ID {
+			t.Fatalf("new issue worker error = %v, want retargeted worker conflict", err)
+		}
+	})
+}
+
 func TestAgentExecutionTerminalObservationCannotRegressToActive(t *testing.T) {
 	t.Parallel()
 

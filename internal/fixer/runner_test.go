@@ -399,6 +399,43 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsSkipsOccupiedCandidateAndContinuesBatch(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	pr42 := int64(42)
+	prTarget := "pr:acme/looper:42"
+	issueTarget := "issue:acme/looper:77"
+	metadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	for _, loop := range []storage.LoopRecord{
+		{ID: "source_worker", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &pr42, Status: "completed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()},
+		{ID: "occupying_worker", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()},
+	} {
+		if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("seed %s: %v", loop.ID, err)
+		}
+	}
+	github := &fakeGitHubGateway{
+		listOpen: []PullRequestSummary{
+			{Number: 42, State: "OPEN", HeadSHA: "head-42"},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43"},
+		},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c42", "threadId": "t42", "body": "occupied fix"}}},
+			{Number: 43, State: "OPEN", HeadSHA: "head-43", Comments: []map[string]any{{"id": "c43", "threadId": "t43", "body": "admissible fix"}}},
+		},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if result.Skipped == 0 || len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 43 {
+		t.Fatalf("result = %#v, want occupied #42 skipped and #43 queued", result)
+	}
+}
+
 func TestDiscoverPullRequestCreatesLoopAndQueue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

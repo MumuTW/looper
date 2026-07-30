@@ -1982,6 +1982,13 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	}
 	loopResult, err := r.ensureLoopForPullRequest(ctx, project, repo, detail.Number, detail.HeadSHA, fixItemsHash, fixItemsStateHash, fixItems, unresolvedThreadIDs)
 	if err != nil {
+		// An occupied source issue is specific to this candidate. Preserve the
+		// rest of the discovery batch rather than aborting it as an infrastructure
+		// failure.
+		if _, occupied := storage.IsIssueClaimConflictError(err); occupied {
+			result.Skipped++
+			return nil
+		}
 		return err
 	}
 	if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.skipped {

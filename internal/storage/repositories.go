@@ -663,13 +663,47 @@ func (r *ProjectsRepository) Archive(ctx context.Context, id string, updatedAt s
 type LoopsRepository struct{ q sqliteQuerier }
 
 func (r *LoopsRepository) Upsert(ctx context.Context, record LoopRecord) error {
-	return r.upsert(ctx, record, false)
+	return r.upsertWithIssueClaimAdmission(ctx, record, false, false)
 }
 
 // UpsertChangingHumanHold is reserved for lifecycle operations that have
 // already established authority through domain transition validation.
 func (r *LoopsRepository) UpsertChangingHumanHold(ctx context.Context, record LoopRecord) error {
-	return r.upsert(ctx, record, true)
+	return r.upsertWithIssueClaimAdmission(ctx, record, true, false)
+}
+
+// UpsertForcingIssueClaimAdmission is the explicit operator override for a
+// manual loop create with force=true. It bypasses only source-issue admission;
+// the human-takeover write guard still applies.
+func (r *LoopsRepository) UpsertForcingIssueClaimAdmission(ctx context.Context, record LoopRecord) error {
+	return r.upsertWithIssueClaimAdmission(ctx, record, false, true)
+}
+
+// upsertWithIssueClaimAdmission makes source-issue admission part of loop
+// publication itself. Any inactive-to-conflicting-active transition is checked
+// in the same SQLite transaction as its write, covering create, rediscovery,
+// recovery, and resume without relying on individual callers to remember it.
+func (r *LoopsRepository) upsertWithIssueClaimAdmission(ctx context.Context, record LoopRecord, changeHumanHold, forceIssueClaim bool) error {
+	if db, ok := r.q.(txBeginner); ok {
+		return WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+			return NewRepositories(tx).Loops.upsertWithIssueClaimAdmission(ctx, record, changeHumanHold, forceIssueClaim)
+		})
+	}
+	current, err := r.GetByID(ctx, record.ID)
+	if err != nil {
+		return err
+	}
+	if !forceIssueClaim && issueClaimAdmissionRequired(current, record) {
+		if err := r.AssertIssueClaimAdmission(ctx, record, false); err != nil {
+			return err
+		}
+	}
+	return r.upsert(ctx, record, changeHumanHold)
+}
+
+func issueClaimAdmissionRequired(current *LoopRecord, candidate LoopRecord) bool {
+	return domain.IsConflictingActiveLoopStatus(domain.LoopStatus(candidate.Status)) &&
+		(current == nil || !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(current.Status)))
 }
 
 func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeHumanHold bool) error {
@@ -931,9 +965,6 @@ func (r *LoopsRepository) AssertIssueClaimAdmission(ctx context.Context, candida
 		// source) are competing source-issue publications.
 		if claim.sourceWorker != "" && existingClaim.sourceWorker == claim.sourceWorker {
 			continue
-		}
-		if candidate.Type == string(domain.LoopTypeWorker) && candidate.TargetType == string(domain.LoopTargetTypeIssue) && loop.Type == string(domain.LoopTypeWorker) {
-			continue // normal worker reuse owns this case.
 		}
 		return &IssueClaimConflictError{IssueNumber: claim.issueNumber, LoopID: loop.ID, LoopType: loop.Type}
 	}

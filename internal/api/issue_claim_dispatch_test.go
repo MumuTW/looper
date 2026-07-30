@@ -17,6 +17,17 @@ import (
 
 func strPtr(s string) *string { return &s }
 
+func newIssueClaimHandler(fixture testFixture) *Handler {
+	return NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		Now:     func() time.Time { return fixture.now },
+		RefreshTargetLabels: func(context.Context, domain.LoopTarget, string) ([]string, error) {
+			return nil, nil
+		},
+	})
+}
+
 func assertQueuedIssueWorker(t *testing.T, fixture testFixture) {
 	t.Helper()
 	queue, err := fixture.runtime.Services().Repositories.Queue.FindActiveByDedupe(context.Background(), "worker:project_1:acme/looper:77")
@@ -83,7 +94,7 @@ func TestHandlerWorkerCreateRefusesCollisionWithActiveFixerLoop(t *testing.T) {
 	req.Header.Set("content-type", "application/json")
 	recorder := httptest.NewRecorder()
 
-	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }}).ServeHTTP(recorder, req)
+	newIssueClaimHandler(fixture).ServeHTTP(recorder, req)
 
 	if recorder.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
@@ -133,7 +144,7 @@ func TestHandlerWorkerCreateRefusesCollisionWithActiveReviewerLoop(t *testing.T)
 	req.Header.Set("content-type", "application/json")
 	recorder := httptest.NewRecorder()
 
-	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }}).ServeHTTP(recorder, req)
+	newIssueClaimHandler(fixture).ServeHTTP(recorder, req)
 
 	if recorder.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())

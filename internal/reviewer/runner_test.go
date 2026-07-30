@@ -79,6 +79,39 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsSkipsOccupiedCandidateAndContinuesBatch(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	pr42 := int64(42)
+	prTarget := "pr:acme/looper:42"
+	issueTarget := "issue:acme/looper:77"
+	metadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	for _, loop := range []storage.LoopRecord{
+		{ID: "source_worker", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &pr42, Status: "completed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()},
+		{ID: "occupying_worker", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()},
+	} {
+		if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("seed %s: %v", loop.ID, err)
+		}
+	}
+	github := &fakeGitHubGateway{currentLogin: "octocat", listOpenByLabel: map[string][]PullRequestSummary{
+		"": {
+			{Number: 42, Title: "Occupied", State: "OPEN", HeadSHA: "head-42", Author: "alice", ReviewRequests: []string{"octocat"}},
+			{Number: 43, Title: "Admissible", State: "OPEN", HeadSHA: "head-43", Author: "alice", ReviewRequests: []string{"octocat"}},
+		},
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if result.Skipped == 0 || len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 43 {
+		t.Fatalf("result = %#v, want occupied #42 skipped and #43 queued", result)
+	}
+}
+
 func TestDiscoverPullRequestsSkipsReviewerHoldLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1932,6 +1965,39 @@ func TestEnsureLoopForPullRequestReactivatesLegacyBudgetTerminatedLoop(t *testin
 	}
 	if loopMeta["status"] != "active" {
 		t.Fatalf("loop metadata status = %#v, want active", loopMeta["status"])
+	}
+}
+
+func TestEnsureLoopForPullRequestRefusesOccupiedSourceIssueOnReactivation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig()})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	prTarget := "pr:acme/looper:42"
+	issueTarget := "issue:acme/looper:77"
+	workerMetadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	terminatedMetadata := `{"followUpdates":true,"loop":{"enabled":true,"status":"terminated","terminationReason":"max_wall_clock"}}`
+	sourceWorker := storage.LoopRecord{ID: "loop_source_worker", Seq: 1, ProjectID: project.ID, Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &workerMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	terminated := storage.LoopRecord{ID: "loop_budget_terminated", Seq: 2, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "terminated", MetadataJSON: &terminatedMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	occupyingWorker := storage.LoopRecord{ID: "loop_other_worker", Seq: 3, ProjectID: project.ID, Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	for _, loop := range []storage.LoopRecord{sourceWorker, terminated, occupyingWorker} {
+		if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("seed %s: %v", loop.ID, err)
+		}
+	}
+
+	_, err = runner.ensureLoopForPullRequest(context.Background(), *project, repo, prNumber, &terminated)
+	if conflict, ok := storage.IsIssueClaimConflictError(err); !ok || conflict.LoopID != occupyingWorker.ID {
+		t.Fatalf("ensureLoopForPullRequest() error = %v, want source-issue conflict", err)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), terminated.ID)
+	if err != nil || persisted == nil || persisted.Status != "terminated" {
+		t.Fatalf("reactivated loop = %#v, %v; want terminated record unchanged", persisted, err)
 	}
 }
 

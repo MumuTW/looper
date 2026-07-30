@@ -965,6 +965,12 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 
 	loopResult, loopErr := r.ensureLoopForPullRequest(ctx, project, repo, pr.Number, existing)
 	if loopErr != nil {
+		// Source-issue occupation is a typed candidate skip, not a failed
+		// discovery pass. Other pull requests in this batch remain admissible.
+		if _, occupied := storage.IsIssueClaimConflictError(loopErr); occupied {
+			result.Skipped++
+			return nil
+		}
 		return loopErr
 	}
 	if terminalReviewerLoopReason(loopResult.record) == "failed" {
