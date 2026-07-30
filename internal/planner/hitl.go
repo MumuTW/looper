@@ -119,24 +119,27 @@ func (r *Runner) pendingEscalationAnswer(ctx context.Context, loop storage.LoopR
 // markEscalationAnswerConsumed flips a delivered answer from "answered" to
 // "consumed" so a later run of the same loop cannot re-apply it. Persisted
 // against the freshest record so it does not clobber concurrent metadata writes.
-func (r *Runner) markEscalationAnswerConsumed(ctx context.Context, loop storage.LoopRecord) {
+func (r *Runner) markEscalationAnswerConsumed(ctx context.Context, loop storage.LoopRecord) error {
 	if r.repos == nil || r.repos.Loops == nil {
-		return
+		return fmt.Errorf("consume planner escalation answer: loop repository is unavailable")
 	}
 	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil || fresh == nil {
-		return
+	if err != nil {
+		return err
+	}
+	if fresh == nil {
+		return fmt.Errorf("consume planner escalation answer: loop %s not found", loop.ID)
 	}
 	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
 	if !ok || ask.Status != "answered" {
-		return
+		return nil
 	}
 	ask.Status = "consumed"
 	meta, werr := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
 	if werr != nil {
-		return
+		return werr
 	}
 	fresh.MetadataJSON = &meta
 	fresh.UpdatedAt = r.nowISO()
-	_ = r.repos.Loops.Upsert(ctx, *fresh)
+	return r.repos.Loops.Upsert(ctx, *fresh)
 }

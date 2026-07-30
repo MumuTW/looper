@@ -431,6 +431,20 @@ type checkpointScope struct {
 	HumanAuthorized    bool             `json:"humanAuthorized,omitempty"`
 	HumanDecidedAt     string           `json:"humanDecidedAt,omitempty"`
 	AuthorizedGuidance string           `json:"authorizedGuidance,omitempty"`
+	// Resolution is a durable outbox for the audit event that settles an
+	// escalation. It prevents a successful checkpoint write from advancing
+	// without ever recording the decision when the event store is transiently
+	// unavailable.
+	Resolution *checkpointEscalationResolution `json:"resolution,omitempty"`
+}
+
+type checkpointEscalationResolution struct {
+	Authorized bool   `json:"authorized"`
+	Answer     string `json:"answer"`
+	AnsweredAt string `json:"answeredAt,omitempty"`
+	Superseded bool   `json:"superseded,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	Recorded   bool   `json:"recorded,omitempty"`
 }
 
 type checkpointWriteSpec struct {
@@ -1075,6 +1089,13 @@ func (r *Runner) runAssessScopeStep(ctx context.Context, input stepInput) (plann
 		return checkpoint, nil
 	}
 	policy := r.escalationPolicyForProject(input.Project.ID)
+	if checkpoint.Scope != nil && checkpoint.Scope.Resolution != nil {
+		updated, err := r.flushEscalationResolution(ctx, input, checkpoint)
+		if err != nil {
+			return updated, err
+		}
+		checkpoint = updated
+	}
 	if ask, ok := r.pendingEscalationAnswer(ctx, input.Loop); ok {
 		updated, applied, err := r.applyEscalationAnswer(ctx, input, checkpoint, ask)
 		if err != nil || applied {
@@ -1209,18 +1230,40 @@ func (r *Runner) applyEscalationAnswer(ctx context.Context, input stepInput, che
 		return checkpoint, false, err
 	}
 	checkpoint = refreshed
-	if changed {
-		r.markEscalationAnswerConsumed(ctx, input.Loop)
-		if err := r.appendEventChecked(ctx, eventInput{
-			eventType: EscalationResolutionEventType, projectID: input.Loop.ProjectID, loopID: input.Loop.ID, runID: input.Run.ID,
-			entityType: "loop", entityID: input.Loop.ID,
-			payload: map[string]any{"repo": repo, "issueNumber": issueNumber, "authorized": false, "answer": strings.TrimSpace(ask.Answer), "answeredAt": ask.AnsweredAt, "superseded": true, "supersededReason": "issue content changed while awaiting the human decision"},
-		}); err != nil {
-			return checkpoint, false, err
+	// An automatic discovery authorization is conditional on the current Issue
+	// still matching the discovery policy. A human answer cannot revive an
+	// Issue whose routing label or assignment was removed while it waited.
+	queuePayload := parseJSONObject(input.QueueItem.PayloadJSON)
+	if !plannerQueueItemIsManual(input.QueueItem) && plannerQueueRoutingAuthority(queuePayload) == "" {
+		policy := r.discoveryPolicyForProject(input.Project.ID)
+		current := checkpoint.Issue
+		if current != nil && !shouldClaimIssue(IssueSummary{Assignees: current.Assignees, Labels: current.Labels}, current.CurrentUserLogin, policy) {
+			checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer qualifies for automatic Planner discovery", current.Repo, current.IssueNumber)
+			checkpoint.Scope = &checkpointScope{Resolution: &checkpointEscalationResolution{
+				Answer: strings.TrimSpace(ask.Answer), AnsweredAt: ask.AnsweredAt, Superseded: true,
+				Reason: "issue eligibility changed while awaiting the human decision",
+			}}
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepAssessScope, checkpoint); err != nil {
+				return checkpoint, false, wrapRetryableAfterResume(err)
+			}
+			updated, err := r.flushEscalationResolution(ctx, input, checkpoint)
+			return updated, true, err
 		}
-		checkpoint.Scope = nil
+	}
+	if changed {
+		checkpoint.Scope = &checkpointScope{Resolution: &checkpointEscalationResolution{
+			Answer: strings.TrimSpace(ask.Answer), AnsweredAt: ask.AnsweredAt,
+			Superseded: true, Reason: "issue content changed while awaiting the human decision",
+		}}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
-		return checkpoint, false, nil
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepAssessScope, checkpoint); err != nil {
+			return checkpoint, false, wrapRetryableAfterResume(err)
+		}
+		updated, err := r.flushEscalationResolution(ctx, input, checkpoint)
+		if err != nil {
+			return updated, false, err
+		}
+		return updated, false, nil
 	}
 
 	authorized := classifyEscalationAnswer(ask.Answer)
@@ -1237,22 +1280,59 @@ func (r *Runner) applyEscalationAnswer(ctx context.Context, input stepInput, che
 	} else {
 		checkpoint.SkipReason = fmt.Sprintf("Planner escalation settled by human for %s#%d: %s", repo, issueNumber, checkpoint.Scope.HumanDecision)
 	}
-	// Durability before consumption. If the daemon exits between these two
-	// writes the ask is still "answered", so the resumed run re-applies the same
-	// decision. In the reverse order the ask reads "consumed" while the
-	// checkpoint still holds only the escalated scope, and a `stop` is lost.
+	// Durability before consumption. The resolution audit event is represented
+	// in the same checkpoint as the decision, then drained by the next pass; a
+	// transient event-store failure therefore cannot make an authorized run
+	// advance with a missing resolution record.
+	checkpoint.Scope.Resolution = &checkpointEscalationResolution{
+		Authorized: authorized, Answer: checkpoint.Scope.HumanDecision, AnsweredAt: ask.AnsweredAt,
+	}
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepAssessScope, checkpoint); err != nil {
 		return checkpoint, false, wrapRetryableAfterResume(err)
 	}
-	r.markEscalationAnswerConsumed(ctx, input.Loop)
-	if err := r.appendEventChecked(ctx, eventInput{
-		eventType: EscalationResolutionEventType, projectID: input.Loop.ProjectID, loopID: input.Loop.ID, runID: input.Run.ID,
-		entityType: "loop", entityID: input.Loop.ID,
-		payload: map[string]any{"repo": repo, "issueNumber": issueNumber, "authorized": authorized, "answer": checkpoint.Scope.HumanDecision, "answeredAt": ask.AnsweredAt},
-	}); err != nil {
-		return checkpoint, false, err
+	updated, err := r.flushEscalationResolution(ctx, input, checkpoint)
+	if err != nil {
+		return updated, false, err
 	}
-	return checkpoint, true, nil
+	return updated, true, nil
+}
+
+// flushEscalationResolution drains the checkpointed resolution outbox before
+// an assessment can advance. The checkpoint is intentionally retained until
+// the audit write succeeds; retries may append a duplicate after a crash in the
+// tiny write-then-checkpoint window, but they never lose the required record or
+// silently proceed without it.
+func (r *Runner) flushEscalationResolution(ctx context.Context, input stepInput, checkpoint plannerCheckpoint) (plannerCheckpoint, error) {
+	resolution := checkpoint.Scope.Resolution
+	if !resolution.Recorded {
+		issue, err := requireIssue(checkpoint)
+		if err != nil {
+			return checkpoint, err
+		}
+		payload := map[string]any{"repo": issue.Repo, "issueNumber": issue.IssueNumber, "authorized": resolution.Authorized, "answer": resolution.Answer, "answeredAt": resolution.AnsweredAt}
+		if resolution.Superseded {
+			payload["superseded"] = true
+			payload["supersededReason"] = resolution.Reason
+		}
+		if err := r.appendEventChecked(ctx, eventInput{eventType: EscalationResolutionEventType, projectID: input.Loop.ProjectID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "loop", entityID: input.Loop.ID, payload: payload}); err != nil {
+			return checkpoint, err
+		}
+		resolution.Recorded = true
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepAssessScope, checkpoint); err != nil {
+			return checkpoint, wrapRetryableAfterResume(err)
+		}
+	}
+	if err := r.markEscalationAnswerConsumed(ctx, input.Loop); err != nil {
+		return checkpoint, wrapRetryableAfterResume(err)
+	}
+	if resolution.Superseded {
+		checkpoint.Scope = nil
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepAssessScope, checkpoint); err != nil {
+			return checkpoint, wrapRetryableAfterResume(err)
+		}
+	}
+	return checkpoint, nil
 }
 
 // refreshCheckpointIssue re-reads the Issue a checkpoint was built from. The
