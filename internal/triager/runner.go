@@ -254,6 +254,12 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	// Issues returned here are exactly those updated inside the lookback window, so
+	// this set is a free, exact answer to "could a confirmation have arrived?".
+	touched := make(map[int64]struct{}, len(issues))
+	for _, summary := range issues {
+		touched[summary.Number] = struct{}{}
+	}
 	for _, summary := range issues {
 		detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: input.Repo, IssueNumber: summary.Number, CWD: project.RepoPath})
 		if err != nil {
@@ -293,7 +299,24 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 
 	pending := pendingSourceStates(states)
+	// A source parked on a human cannot change unless someone touches its issue, but
+	// re-verifying it costs a ViewIssue and a ListIssueTimeline every tick. Left
+	// uncapped that grows without bound, because nothing ever removes an awaiting
+	// entry: the oldest here had been re-verified every tick for over seven hours.
+	awaitingRechecks := selectAwaitingRechecks(pending, touched, awaitingRecheckBudget)
 	for _, state := range pending {
+		if awaitingExpired(state, r.now()) {
+			// Bound the set. A retired source re-enrolls if its issue sees new activity,
+			// so this drops the backlog rather than the work.
+			if err := r.retireSource(ctx, state, RetirementReasonConfirmationTimeout, &result); err != nil {
+				return result, err
+			}
+			continue
+		}
+		if awaitsHumanConfirmation(state) && !shouldProcessAwaiting(state, touched, awaitingRechecks) {
+			result.Skipped++
+			continue
+		}
 		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, &result); err != nil {
 			return result, err
 		}
