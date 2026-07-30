@@ -110,6 +110,41 @@ func TestAwaitingConfirmationStatusExcludesRemovedProject(t *testing.T) {
 func statusAwaitingReport(key string, issueNumber int64, createdAt time.Time) Report {
 	return Report{
 		Version: 2, IdempotencyKey: key, ProjectID: "project_1", Repo: "acme/looper", IssueNumber: issueNumber,
-		Policy: PolicyDecision{Action: ActionAwaitHuman}, CreatedAt: createdAt.Format(time.RFC3339Nano),
+		Policy: PolicyDecision{Action: ActionAwaitHuman}, ConfirmationToken: "triage-confirm-" + key,
+		CreatedAt: createdAt.Format(time.RFC3339Nano),
+	}
+}
+
+// Contract: the projection carries the comment that resolves the ask. The
+// confirmation token is minted per report and appears in no other operator
+// surface, so a roster without it reports a wait nobody can end (#255).
+func TestAwaitingConfirmationStatusCarriesTheConfirmationCommand(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	runner := fixture.runner()
+
+	tokenless := statusAwaitingReport("tokenless", 51, fixture.now.Add(-time.Hour))
+	tokenless.ConfirmationToken = ""
+	for _, report := range []Report{statusAwaitingReport("tokened", 50, fixture.now.Add(-2*time.Hour)), tokenless} {
+		if err := runner.persistReport(ctx, report); err != nil {
+			t.Fatalf("persist report %q: %v", report.IdempotencyKey, err)
+		}
+	}
+
+	summary, err := AwaitingConfirmationStatus(ctx, fixture.repos, fixture.now)
+	if err != nil {
+		t.Fatalf("AwaitingConfirmationStatus() error = %v", err)
+	}
+	if summary.Count != 2 {
+		t.Fatalf("summary = %#v, want both awaiting sources", summary)
+	}
+	if got, want := summary.Sources[0].Command, "/plan triage-confirm-tokened"; got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+	// A report persisted without a token cannot be confirmed by anyone, so the
+	// roster reports no command rather than one that would never be accepted.
+	if got := summary.Sources[1].Command; got != "" {
+		t.Fatalf("command = %q, want empty for a tokenless report", got)
 	}
 }

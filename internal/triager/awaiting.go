@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/nexu-io/looper/internal/storage"
@@ -99,6 +100,15 @@ type AwaitingConfirmationSource struct {
 	IssueNumber int64  `json:"issueNumber"`
 	CreatedAt   string `json:"createdAt"`
 	AgeSeconds  int64  `json:"ageSeconds"`
+	// Command is the exact comment that confirms this source, carrying the
+	// report's confirmation token. Reporting that a source is waiting is only
+	// half the ask: the token is minted per report and lives nowhere an operator
+	// reads, so without it the verdict stays unreachable — which is the defect
+	// in #255, not the missing counter.
+	//
+	// It is empty only for a report persisted without a token, which no
+	// operator could confirm anyway.
+	Command string `json:"command,omitempty"`
 }
 
 // AwaitingConfirmationSummary is the operator-facing live projection of
@@ -207,10 +217,14 @@ func AwaitingConfirmationStatus(ctx context.Context, repositories *storage.Repos
 		if age < 0 {
 			age = 0
 		}
-		summary.Sources = append(summary.Sources, AwaitingConfirmationSource{
+		source := AwaitingConfirmationSource{
 			ProjectID: state.report.ProjectID, Repo: state.report.Repo, IssueNumber: state.report.IssueNumber,
 			CreatedAt: state.report.CreatedAt, AgeSeconds: int64(age / time.Second),
-		})
+		}
+		if token := strings.TrimSpace(state.report.ConfirmationToken); token != "" {
+			source.Command = confirmationCommand(token)
+		}
+		summary.Sources = append(summary.Sources, source)
 	}
 	sort.Slice(summary.Sources, func(i, j int) bool {
 		if summary.Sources[i].CreatedAt != summary.Sources[j].CreatedAt {

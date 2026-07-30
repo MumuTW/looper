@@ -920,6 +920,8 @@ type statusAwaitingConfirmationSourceView struct {
 	Repo        string `json:"repo"`
 	IssueNumber int64  `json:"issueNumber"`
 	AgeSeconds  int64  `json:"ageSeconds"`
+	// Command is the comment that confirms this source, token included.
+	Command string `json:"command"`
 }
 
 type statusBinaryView struct {
@@ -1025,12 +1027,25 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 	if awaiting.Count > 0 {
 		_, _ = fmt.Fprintf(stdout, "triage:  awaitingHumanConfirmation=%d\n", awaiting.Count)
 		for _, source := range awaiting.Sources {
-			_, _ = fmt.Fprintf(stdout, "  - %s#%d  waiting %s\n", source.Repo, source.IssueNumber, statusAge(source.AgeSeconds))
+			_, _ = fmt.Fprintf(stdout, "  - %s\n", awaitingConfirmationLine(source))
 		}
 	}
 	if len(status.Service.DegradedReasons) > 0 {
 		_, _ = fmt.Fprintf(stdout, "degraded: %s\n", strings.Join(status.Service.DegradedReasons, ", "))
 	}
+}
+
+// awaitingConfirmationLine renders one parked triage source and the single
+// comment that releases it. The command carries a per-report token that exists
+// nowhere else an operator reads, so a line without it names a problem the
+// reader still cannot act on (#255). A source the daemon reported without one
+// is printed without the trailing clause rather than with an unusable command.
+func awaitingConfirmationLine(source statusAwaitingConfirmationSourceView) string {
+	line := fmt.Sprintf("%s#%d  waiting %s", source.Repo, source.IssueNumber, statusAge(source.AgeSeconds))
+	if command := strings.TrimSpace(source.Command); command != "" {
+		line += fmt.Sprintf("  ->  comment %q on the issue", command)
+	}
+	return line
 }
 
 func statusAge(seconds int64) string {
