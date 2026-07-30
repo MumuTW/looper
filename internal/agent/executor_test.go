@@ -1044,6 +1044,27 @@ func TestParseCompletionIgnoresTemplatePlaceholder(t *testing.T) {
 	}
 }
 
+// TestParseCompletionIgnoresFixerTemplatePlaceholders guards the fixer-specific
+// completion templates: an agent that echoes either offered example and exits
+// without emitting a real result must not authorize downstream actions. The
+// core detector keys on the "<one-sentence summary>" placeholder alone, so the
+// outcome/failure_kind keys alongside it do not slip past as a real completion.
+func TestParseCompletionIgnoresFixerTemplatePlaceholders(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		`{"outcome":"completed","summary":"<one-sentence summary>"}`,
+		`{"outcome":"blocked","failure_kind":"manual_intervention","summary":"<one-sentence summary>"}`,
+	}
+	for _, payload := range cases {
+		stdout := CompletionMarkerPrefix + payload + "\nreal work\n"
+		parsed := parseCompletion(stdout, "")
+		if parsed.ParseStatus != "missing" || parsed.Summary != "" || parsed.CompletionPayload != "" {
+			t.Fatalf("parseCompletion(%s) = %#v, want echoed fixer template ignored", payload, parsed)
+		}
+	}
+}
+
 func TestParseCompletionAcceptsMarkerGluedToProse(t *testing.T) {
 	t.Parallel()
 
