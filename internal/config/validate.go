@@ -52,193 +52,7 @@ func Validate(config Config) error {
 func ValidateWithOptions(config Config, options ValidateOptions) error {
 	issues := make([]ValidationIssue, 0)
 
-	if config.Server.Host == "" {
-		issues = append(issues, ValidationIssue{Path: "server.host", Message: "must be a non-empty string"})
-	}
-
-	if config.Server.Port < 1 || config.Server.Port > 65535 {
-		issues = append(issues, ValidationIssue{Path: "server.port", Message: "must be an integer between 1 and 65535"})
-	}
-
-	if !isValidAuthMode(config.Server.AuthMode) {
-		issues = append(issues, ValidationIssue{Path: "server.authMode", Message: fmt.Sprintf("must be one of: %s, %s", AuthModeNone, AuthModeLocalToken)})
-	}
-	// A peer-address check cannot distinguish a direct local client from a
-	// remote client hidden behind a loopback reverse proxy. It also makes a
-	// concrete LAN-only bind unusable because every accepted peer is non-loopback.
-	// Fail closed at startup instead: token-less mode is intentionally limited
-	// to literal loopback binds. The cost is that wildcard/LAN binds and custom
-	// hostnames require local-token auth, including trusted reverse proxies; this
-	// explicit credential boundary is preferable to guessing request provenance.
-	if config.Server.AuthMode == AuthModeNone && config.Server.Host != "" && !isLoopbackBindHost(config.Server.Host) {
-		issues = append(issues, ValidationIssue{Path: "server.authMode", Message: "none is allowed only when server.host is localhost or a loopback IP; use local-token for wildcard, LAN, public, proxy, or custom-hostname binds"})
-	}
-
-	if config.Server.AuthMode == AuthModeLocalToken && isNilOrEmptyString(config.Server.LocalToken) {
-		issues = append(issues, ValidationIssue{Path: "server.localToken", Message: "is required when authMode is local-token"})
-	}
-
-	if config.Storage.Mode != "sqlite" {
-		issues = append(issues, ValidationIssue{Path: "storage.mode", Message: "must be sqlite"})
-	}
-
-	if config.Storage.DBPath == "" {
-		issues = append(issues, ValidationIssue{Path: "storage.dbPath", Message: "must be a non-empty path"})
-	}
-
-	if config.Scheduler.PollIntervalSeconds < 10 {
-		issues = append(issues, ValidationIssue{Path: "scheduler.pollIntervalSeconds", Message: "must be an integer >= 10"})
-	}
-
-	if config.Scheduler.MaxConcurrentRuns < 1 {
-		issues = append(issues, ValidationIssue{Path: "scheduler.maxConcurrentRuns", Message: "must be a positive integer"})
-	}
-
-	if config.Scheduler.RetryMaxAttempts == 0 || config.Scheduler.RetryMaxAttempts < -1 {
-		issues = append(issues, ValidationIssue{Path: "scheduler.retryMaxAttempts", Message: "must be -1 or a positive integer"})
-	}
-
-	if config.Scheduler.ConsecutiveFailureThreshold < 1 {
-		issues = append(issues, ValidationIssue{Path: "scheduler.consecutiveFailureThreshold", Message: "must be a positive integer"})
-	}
-
-	if config.Scheduler.RetryBaseDelayMS < 1 {
-		issues = append(issues, ValidationIssue{Path: "scheduler.retryBaseDelayMs", Message: "must be a positive integer"})
-	}
-
-	if config.Scheduler.SlowLaneWarnThresholdMS < 1 {
-		issues = append(issues, ValidationIssue{Path: "scheduler.slowLaneWarnThresholdMs", Message: "must be a positive integer"})
-	}
-
-	if config.Scheduler.DiscoveryCacheTTLSeconds < 0 {
-		issues = append(issues, ValidationIssue{Path: "scheduler.discoveryCacheTtlSeconds", Message: "must be an integer >= 0"})
-	}
-
-	if config.Webhook.FallbackPollIntervalSeconds < 60 {
-		issues = append(issues, ValidationIssue{Path: "webhook.fallbackPollIntervalSeconds", Message: "must be an integer >= 60"})
-	}
-	if !isValidWebhookMode(config.Webhook.Mode) {
-		issues = append(issues, ValidationIssue{Path: "webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
-	}
-	if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, nil) {
-		validateWebhookTunnelConfig(config.Webhook, "webhook", &issues)
-	}
-
-	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
-		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: agentVendorValidationMessage()})
-	}
-	validateAgentProfiles(config.Agent.Profiles, &issues)
-	validateEnvironmentNames(config.Agent.Env, "agent.env", &issues)
-	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", &issues)
-
-	if !isValidLogLevel(config.Logging.Level) {
-		issues = append(issues, ValidationIssue{Path: "logging.level", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError)})
-	}
-
-	if config.Logging.MaxSizeMB < 1 {
-		issues = append(issues, ValidationIssue{Path: "logging.maxSizeMB", Message: "must be a positive integer"})
-	}
-
-	if config.Logging.MaxFiles < 1 {
-		issues = append(issues, ValidationIssue{Path: "logging.maxFiles", Message: "must be a positive integer"})
-	}
-
-	if config.Notifications.Osascript.ThrottleWindowSeconds < 1 {
-		issues = append(issues, ValidationIssue{Path: "notifications.osascript.throttleWindowSeconds", Message: "must be a positive integer"})
-	}
-
-	for _, level := range config.Notifications.Osascript.SoundForLevels {
-		if !isValidNotificationSoundLevel(level) {
-			issues = append(issues, ValidationIssue{Path: "notifications.osascript.soundForLevels", Message: fmt.Sprintf("contains unsupported value: %s", level)})
-		}
-	}
-
-	switch strings.TrimSpace(config.Notifications.Webhook.Mode) {
-	case "", "webhook":
-	case "app":
-		if config.Notifications.Webhook.Enabled {
-			if strings.TrimSpace(config.Notifications.Webhook.AppIDEnv) == "" {
-				issues = append(issues, ValidationIssue{Path: "notifications.webhook.appIdEnv", Message: "is required when notifications.webhook.mode is app"})
-			}
-			if strings.TrimSpace(config.Notifications.Webhook.AppSecretEnv) == "" {
-				issues = append(issues, ValidationIssue{Path: "notifications.webhook.appSecretEnv", Message: "is required when notifications.webhook.mode is app"})
-			}
-			if strings.TrimSpace(config.Notifications.Webhook.ChatID) == "" {
-				issues = append(issues, ValidationIssue{Path: "notifications.webhook.chatId", Message: "is required when notifications.webhook.mode is app"})
-			}
-		}
-	default:
-		issues = append(issues, ValidationIssue{Path: "notifications.webhook.mode", Message: "must be one of: webhook, app"})
-	}
-
-	transport := strings.ToLower(strings.TrimSpace(config.HITL.AnswerTransport))
-	switch transport {
-	case "", "github", "respond":
-	case "feishu":
-		if config.HITL.Feishu == nil {
-			issues = append(issues, ValidationIssue{Path: "hitl.feishu", Message: "is required when hitl.answerTransport is feishu"})
-		} else {
-			if !strings.EqualFold(strings.TrimSpace(config.HITL.Feishu.Inbound), "cf-inbox") {
-				issues = append(issues, ValidationIssue{Path: "hitl.feishu.inbound", Message: "must be cf-inbox when hitl.answerTransport is feishu"})
-			}
-			if strings.TrimSpace(config.HITL.Feishu.EventInboxURLEnv) == "" {
-				issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxUrlEnv", Message: "is required when hitl.answerTransport is feishu"})
-			}
-			if strings.TrimSpace(config.HITL.Feishu.EventInboxTokenEnv) == "" {
-				issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxTokenEnv", Message: "is required when hitl.answerTransport is feishu"})
-			}
-		}
-	default:
-		issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be one of: github, feishu, respond"})
-	}
-
-	if !isValidDaemonMode(config.Daemon.Mode) {
-		issues = append(issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
-	}
-	validateEnvironmentNames(config.Daemon.Environment, "daemon.environment", &issues)
-
-	if !isValidDaemonRestartPolicy(config.Daemon.RestartPolicy) {
-		issues = append(issues, ValidationIssue{Path: "daemon.restartPolicy", Message: fmt.Sprintf("must be one of: %s, %s, %s", DaemonRestartNever, DaemonRestartOnFailure, DaemonRestartAlways)})
-	}
-
-	if config.Daemon.RestartThrottleSeconds < 1 {
-		issues = append(issues, ValidationIssue{Path: "daemon.restartThrottleSeconds", Message: "must be a positive integer"})
-	}
-
-	if config.Daemon.LogDir == "" {
-		issues = append(issues, ValidationIssue{Path: "daemon.logDir", Message: "must be a non-empty path"})
-	}
-
-	if config.Daemon.ShutdownTimeoutMS < 1 {
-		issues = append(issues, ValidationIssue{Path: "daemon.shutdownTimeoutMs", Message: "must be a positive integer"})
-	}
-
-	if config.Daemon.WorkingDirectory == "" {
-		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
-	}
-	validateWorktreeCleanupConfig(config.Daemon.WorktreeCleanup, "daemon.worktreeCleanup", &issues)
-
-	if strings.TrimSpace(config.Package.Distribution) == "" {
-		issues = append(issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})
-	}
-
-	if config.Defaults.BaseBranch == "" {
-		issues = append(issues, ValidationIssue{Path: "defaults.baseBranch", Message: "must be a non-empty string"})
-	}
-
-	if !isValidOpenPRStrategy(config.Defaults.OpenPRStrategy) {
-		issues = append(issues, ValidationIssue{Path: "defaults.openPrStrategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", OpenPRStrategyAllDone, OpenPRStrategyFirstCommit, OpenPRStrategyManual)})
-	}
-
-	if !isValidAddSnapshotMode(config.Defaults.AddSnapshotMode) {
-		issues = append(issues, ValidationIssue{Path: "defaults.addSnapshotMode", Message: fmt.Sprintf("must be one of: %s, %s, %s", AddSnapshotModeAsync, AddSnapshotModeFull, AddSnapshotModeOff)})
-	}
-
-	for index, command := range config.Defaults.ValidationCommands {
-		if strings.TrimSpace(command) == "" {
-			issues = append(issues, ValidationIssue{Path: fmt.Sprintf("defaults.validationCommands[%d]", index), Message: "must be a non-empty string"})
-		}
-	}
+	validateCoreConfig(config, &issues)
 
 	if config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
@@ -496,6 +310,196 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	return nil
+}
+
+// validateCoreConfig preserves the validation and issue ordering for settings
+// that apply before role, provider, and project validation.
+func validateCoreConfig(config Config, issues *[]ValidationIssue) {
+	validateServerConfig(config.Server, issues)
+	validateStorageConfig(config.Storage, issues)
+	validateSchedulerConfig(config.Scheduler, issues)
+	validateWebhookConfig(config, issues)
+	validateAgentConfig(config, issues)
+	validateLoggingAndNotificationConfig(config, issues)
+	validateHITLConfig(config.HITL, issues)
+	validateDaemonConfig(config.Daemon, issues)
+	validatePackageAndDefaultsConfig(config, issues)
+}
+
+func validateServerConfig(server ServerConfig, issues *[]ValidationIssue) {
+	if server.Host == "" {
+		*issues = append(*issues, ValidationIssue{Path: "server.host", Message: "must be a non-empty string"})
+	}
+	if server.Port < 1 || server.Port > 65535 {
+		*issues = append(*issues, ValidationIssue{Path: "server.port", Message: "must be an integer between 1 and 65535"})
+	}
+	if !isValidAuthMode(server.AuthMode) {
+		*issues = append(*issues, ValidationIssue{Path: "server.authMode", Message: fmt.Sprintf("must be one of: %s, %s", AuthModeNone, AuthModeLocalToken)})
+	}
+	// Token-less mode is limited to literal loopback binds; remote clients behind
+	// a loopback proxy cannot be distinguished safely from direct local clients.
+	if server.AuthMode == AuthModeNone && server.Host != "" && !isLoopbackBindHost(server.Host) {
+		*issues = append(*issues, ValidationIssue{Path: "server.authMode", Message: "none is allowed only when server.host is localhost or a loopback IP; use local-token for wildcard, LAN, public, proxy, or custom-hostname binds"})
+	}
+	if server.AuthMode == AuthModeLocalToken && isNilOrEmptyString(server.LocalToken) {
+		*issues = append(*issues, ValidationIssue{Path: "server.localToken", Message: "is required when authMode is local-token"})
+	}
+}
+
+func validateStorageConfig(storage StorageConfig, issues *[]ValidationIssue) {
+	if storage.Mode != "sqlite" {
+		*issues = append(*issues, ValidationIssue{Path: "storage.mode", Message: "must be sqlite"})
+	}
+	if storage.DBPath == "" {
+		*issues = append(*issues, ValidationIssue{Path: "storage.dbPath", Message: "must be a non-empty path"})
+	}
+}
+
+func validateSchedulerConfig(scheduler SchedulerConfig, issues *[]ValidationIssue) {
+	if scheduler.PollIntervalSeconds < 10 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.pollIntervalSeconds", Message: "must be an integer >= 10"})
+	}
+	if scheduler.MaxConcurrentRuns < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.maxConcurrentRuns", Message: "must be a positive integer"})
+	}
+	if scheduler.RetryMaxAttempts == 0 || scheduler.RetryMaxAttempts < -1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.retryMaxAttempts", Message: "must be -1 or a positive integer"})
+	}
+	if scheduler.ConsecutiveFailureThreshold < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.consecutiveFailureThreshold", Message: "must be a positive integer"})
+	}
+	if scheduler.RetryBaseDelayMS < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.retryBaseDelayMs", Message: "must be a positive integer"})
+	}
+	if scheduler.SlowLaneWarnThresholdMS < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.slowLaneWarnThresholdMs", Message: "must be a positive integer"})
+	}
+	if scheduler.DiscoveryCacheTTLSeconds < 0 {
+		*issues = append(*issues, ValidationIssue{Path: "scheduler.discoveryCacheTtlSeconds", Message: "must be an integer >= 0"})
+	}
+}
+
+func validateWebhookConfig(config Config, issues *[]ValidationIssue) {
+	if config.Webhook.FallbackPollIntervalSeconds < 60 {
+		*issues = append(*issues, ValidationIssue{Path: "webhook.fallbackPollIntervalSeconds", Message: "must be an integer >= 60"})
+	}
+	if !isValidWebhookMode(config.Webhook.Mode) {
+		*issues = append(*issues, ValidationIssue{Path: "webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
+	}
+	if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, nil) {
+		validateWebhookTunnelConfig(config.Webhook, "webhook", issues)
+	}
+}
+
+func validateAgentConfig(config Config, issues *[]ValidationIssue) {
+	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
+		*issues = append(*issues, ValidationIssue{Path: "agent.vendor", Message: agentVendorValidationMessage()})
+	}
+	validateAgentProfiles(config.Agent.Profiles, issues)
+	validateEnvironmentNames(config.Agent.Env, "agent.env", issues)
+	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", issues)
+}
+
+func validateLoggingAndNotificationConfig(config Config, issues *[]ValidationIssue) {
+	if !isValidLogLevel(config.Logging.Level) {
+		*issues = append(*issues, ValidationIssue{Path: "logging.level", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError)})
+	}
+	if config.Logging.MaxSizeMB < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "logging.maxSizeMB", Message: "must be a positive integer"})
+	}
+	if config.Logging.MaxFiles < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "logging.maxFiles", Message: "must be a positive integer"})
+	}
+	if config.Notifications.Osascript.ThrottleWindowSeconds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "notifications.osascript.throttleWindowSeconds", Message: "must be a positive integer"})
+	}
+	for _, level := range config.Notifications.Osascript.SoundForLevels {
+		if !isValidNotificationSoundLevel(level) {
+			*issues = append(*issues, ValidationIssue{Path: "notifications.osascript.soundForLevels", Message: fmt.Sprintf("contains unsupported value: %s", level)})
+		}
+	}
+	switch strings.TrimSpace(config.Notifications.Webhook.Mode) {
+	case "", "webhook":
+	case "app":
+		if config.Notifications.Webhook.Enabled {
+			if strings.TrimSpace(config.Notifications.Webhook.AppIDEnv) == "" {
+				*issues = append(*issues, ValidationIssue{Path: "notifications.webhook.appIdEnv", Message: "is required when notifications.webhook.mode is app"})
+			}
+			if strings.TrimSpace(config.Notifications.Webhook.AppSecretEnv) == "" {
+				*issues = append(*issues, ValidationIssue{Path: "notifications.webhook.appSecretEnv", Message: "is required when notifications.webhook.mode is app"})
+			}
+			if strings.TrimSpace(config.Notifications.Webhook.ChatID) == "" {
+				*issues = append(*issues, ValidationIssue{Path: "notifications.webhook.chatId", Message: "is required when notifications.webhook.mode is app"})
+			}
+		}
+	default:
+		*issues = append(*issues, ValidationIssue{Path: "notifications.webhook.mode", Message: "must be one of: webhook, app"})
+	}
+}
+
+func validateHITLConfig(hitl HITLConfig, issues *[]ValidationIssue) {
+	switch strings.ToLower(strings.TrimSpace(hitl.AnswerTransport)) {
+	case "", "github", "respond":
+	case "feishu":
+		if hitl.Feishu == nil {
+			*issues = append(*issues, ValidationIssue{Path: "hitl.feishu", Message: "is required when hitl.answerTransport is feishu"})
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(hitl.Feishu.Inbound), "cf-inbox") {
+			*issues = append(*issues, ValidationIssue{Path: "hitl.feishu.inbound", Message: "must be cf-inbox when hitl.answerTransport is feishu"})
+		}
+		if strings.TrimSpace(hitl.Feishu.EventInboxURLEnv) == "" {
+			*issues = append(*issues, ValidationIssue{Path: "hitl.feishu.eventInboxUrlEnv", Message: "is required when hitl.answerTransport is feishu"})
+		}
+		if strings.TrimSpace(hitl.Feishu.EventInboxTokenEnv) == "" {
+			*issues = append(*issues, ValidationIssue{Path: "hitl.feishu.eventInboxTokenEnv", Message: "is required when hitl.answerTransport is feishu"})
+		}
+	default:
+		*issues = append(*issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be one of: github, feishu, respond"})
+	}
+}
+
+func validateDaemonConfig(daemon DaemonConfig, issues *[]ValidationIssue) {
+	if !isValidDaemonMode(daemon.Mode) {
+		*issues = append(*issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
+	}
+	validateEnvironmentNames(daemon.Environment, "daemon.environment", issues)
+	if !isValidDaemonRestartPolicy(daemon.RestartPolicy) {
+		*issues = append(*issues, ValidationIssue{Path: "daemon.restartPolicy", Message: fmt.Sprintf("must be one of: %s, %s, %s", DaemonRestartNever, DaemonRestartOnFailure, DaemonRestartAlways)})
+	}
+	if daemon.RestartThrottleSeconds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "daemon.restartThrottleSeconds", Message: "must be a positive integer"})
+	}
+	if daemon.LogDir == "" {
+		*issues = append(*issues, ValidationIssue{Path: "daemon.logDir", Message: "must be a non-empty path"})
+	}
+	if daemon.ShutdownTimeoutMS < 1 {
+		*issues = append(*issues, ValidationIssue{Path: "daemon.shutdownTimeoutMs", Message: "must be a positive integer"})
+	}
+	if daemon.WorkingDirectory == "" {
+		*issues = append(*issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
+	}
+	validateWorktreeCleanupConfig(daemon.WorktreeCleanup, "daemon.worktreeCleanup", issues)
+}
+
+func validatePackageAndDefaultsConfig(config Config, issues *[]ValidationIssue) {
+	if strings.TrimSpace(config.Package.Distribution) == "" {
+		*issues = append(*issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})
+	}
+	if config.Defaults.BaseBranch == "" {
+		*issues = append(*issues, ValidationIssue{Path: "defaults.baseBranch", Message: "must be a non-empty string"})
+	}
+	if !isValidOpenPRStrategy(config.Defaults.OpenPRStrategy) {
+		*issues = append(*issues, ValidationIssue{Path: "defaults.openPrStrategy", Message: fmt.Sprintf("must be one of: %s, %s, %s", OpenPRStrategyAllDone, OpenPRStrategyFirstCommit, OpenPRStrategyManual)})
+	}
+	if !isValidAddSnapshotMode(config.Defaults.AddSnapshotMode) {
+		*issues = append(*issues, ValidationIssue{Path: "defaults.addSnapshotMode", Message: fmt.Sprintf("must be one of: %s, %s, %s", AddSnapshotModeAsync, AddSnapshotModeFull, AddSnapshotModeOff)})
+	}
+	for index, command := range config.Defaults.ValidationCommands {
+		if strings.TrimSpace(command) == "" {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("defaults.validationCommands[%d]", index), Message: "must be a non-empty string"})
+		}
+	}
 }
 
 func isLoopbackBindHost(host string) bool {
