@@ -1218,6 +1218,9 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Worker != nil {
 		mergeWorkerRoleConfig(&config.Worker, *partial.Worker)
 	}
+	if partial.Gatekeeper != nil && partial.Gatekeeper.Trust != nil {
+		config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
+	}
 }
 
 func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCoordinatorRoleConfig) {
@@ -1887,6 +1890,14 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		}
 		worker.Agent = cloneRoleAgentConfig(configs.Worker.Agent)
 		cloned.Worker = &worker
+	}
+	if configs.Gatekeeper != nil {
+		gatekeeper := *configs.Gatekeeper
+		if configs.Gatekeeper.Trust != nil {
+			trust := *configs.Gatekeeper.Trust
+			gatekeeper.Trust = &trust
+		}
+		cloned.Gatekeeper = &gatekeeper
 	}
 	if configs.Coordinator != nil {
 		coordinator := *configs.Coordinator

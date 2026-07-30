@@ -1690,6 +1690,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Repos:  repos,
 			GitHub: githubGateway,
 			Now:    now,
+			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
+				return gatekeeperTrustForProject(cfg, projectID)
+			},
+			LogWarn: func(msg string, fields map[string]any) {
+				if logger != nil {
+					logger.Warn(msg, fields)
+				}
+			},
 			PolicyPermitsTarget: func(projectID, repo, baseRefName string) bool {
 				project, ok := runtimeProjectBinding(cfg, projectID)
 				if !ok {
