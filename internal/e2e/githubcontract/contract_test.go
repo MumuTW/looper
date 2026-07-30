@@ -365,19 +365,20 @@ func TestRealGHReadOnlySmoke(t *testing.T) {
 // TestRealGHLabelCreateModelsDuplicateSemantics pins the fake-gh label model
 // against real `gh` behavior. Issue #223: nothing validates the fake-gh label
 // model against real `gh`. This test runs only with LOOPER_E2E_REAL_GH=1 against
-// a sandbox repo (LOOPER_E2E_SANDBOX_REPO) and asserts:
+// a sandbox repo (LOOPER_E2E_GITHUB_SANDBOX_REPO, or its legacy alias) and asserts:
 //   - creating a label succeeds
 //   - creating it again without --force fails with "already exists"
 //   - creating it again with --force updates the label
+//
 // If real `gh` behavior drifts from the fake-gh model, this test fails and
 // signals that handleLabelCreate must be updated to match.
 func TestRealGHLabelCreateModelsDuplicateSemantics(t *testing.T) {
-	if os.Getenv("LOOPER_E2E_REAL_GH") == "" {
+	if strings.TrimSpace(os.Getenv("LOOPER_E2E_REAL_GH")) != "1" {
 		t.Skip("set LOOPER_E2E_REAL_GH=1 to run real-gh label contract")
 	}
-	sandboxRepo := os.Getenv("LOOPER_E2E_SANDBOX_REPO")
+	sandboxRepo := realGHSandboxRepo(t)
 	if sandboxRepo == "" {
-		t.Skip("set LOOPER_E2E_SANDBOX_REPO (e.g. user/looper-sandbox) to run real-gh label contract")
+		t.Skip("set LOOPER_E2E_GITHUB_SANDBOX_REPO (e.g. user/looper-sandbox) to run real-gh label contract")
 	}
 	ghPath, err := exec.LookPath("gh")
 	if err != nil {
@@ -391,7 +392,10 @@ func TestRealGHLabelCreateModelsDuplicateSemantics(t *testing.T) {
 		t.Fatalf("real-gh label create failed: %v\n%s", err, string(out))
 	}
 	t.Cleanup(func() {
-		exec.Command(ghPath, "label", "delete", uniqueLabel, "--repo", sandboxRepo, "--yes").CombinedOutput()
+		out, err := exec.Command(ghPath, "label", "delete", uniqueLabel, "--repo", sandboxRepo, "--yes").CombinedOutput()
+		if err != nil {
+			t.Errorf("real-gh label cleanup failed: %v\n%s", err, string(out))
+		}
 	})
 
 	dupCmd := exec.Command(ghPath, "label", "create", uniqueLabel, "--repo", sandboxRepo, "--color", "5319e7", "--description", "rewritten wording")
@@ -405,6 +409,43 @@ func TestRealGHLabelCreateModelsDuplicateSemantics(t *testing.T) {
 	if out, err := forceCmd.CombinedOutput(); err != nil {
 		t.Fatalf("real-gh label create --force failed: %v\n%s", err, string(out))
 	}
+
+	listCmd := exec.Command(ghPath, "label", "list", "--repo", sandboxRepo, "--search", uniqueLabel, "--json", "name,color,description", "--limit", "100")
+	out, err := listCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("real-gh label readback failed: %v\n%s", err, string(out))
+	}
+	var listed []struct {
+		Name        string `json:"name"`
+		Color       string `json:"color"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(out, &listed); err != nil {
+		t.Fatalf("decode real-gh label readback: %v\n%s", err, string(out))
+	}
+	for _, label := range listed {
+		if label.Name != uniqueLabel {
+			continue
+		}
+		if label.Color != "000000" || label.Description != "rewritten wording" {
+			t.Fatalf("real-gh label after --force = %+v, want color 000000 and rewritten wording", label)
+		}
+		return
+	}
+	t.Fatalf("real-gh label %q missing after --force; labels = %+v", uniqueLabel, listed)
+}
+
+func realGHSandboxRepo(t *testing.T) string {
+	t.Helper()
+	preferred := strings.TrimSpace(os.Getenv("LOOPER_E2E_GITHUB_SANDBOX_REPO"))
+	legacy := strings.TrimSpace(os.Getenv("LOOPER_E2E_SANDBOX_REPO"))
+	if preferred != "" && legacy != "" && preferred != legacy {
+		t.Fatalf("LOOPER_E2E_GITHUB_SANDBOX_REPO and LOOPER_E2E_SANDBOX_REPO select different repositories (%q != %q)", preferred, legacy)
+	}
+	if preferred != "" {
+		return preferred
+	}
+	return legacy
 }
 
 func loadFixtureSchema(tb testing.TB) harness.GHSchema {
