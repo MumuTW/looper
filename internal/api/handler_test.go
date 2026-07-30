@@ -23,7 +23,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
-	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/projects"
@@ -68,36 +68,6 @@ func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
 	assertEqual(t, storageInfo["mode"], "sqlite")
 	if _, ok := storageInfo["dbPath"].(string); !ok {
 		t.Fatalf("data.storage.dbPath missing/invalid: %#v", storageInfo["dbPath"])
-	}
-}
-
-func TestHandlerPostMergeDigestReadsDurableLocalProjection(t *testing.T) {
-	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
-	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
-		options.Now = func() time.Time { return now }
-		options.Config.Roles.Coordinator.PostMergeDigest = &config.CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 10}
-	})
-	rt := fixture.runtime
-	cfg := rt.Config()
-	h := NewHandler(Context{Config: cfg, Runtime: rt, Now: func() time.Time { return now }})
-	services := rt.Services()
-	projectID := "project_digest"
-	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Digest", RepoPath: t.TempDir(), CreatedAt: "2026-07-31T00:00:00.000Z", UpdatedAt: "2026-07-31T00:00:00.000Z"}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-	entityType, entityID := "pull_request", "acme/looper#12"
-	if err := eventlog.Append(context.Background(), services.Repositories, eventlog.AppendInput{EventType: eventlog.CoordinatorPullRequestMergedEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: map[string]any{"repo": "acme/looper", "prNumber": 12}, CreatedAt: now.Add(-time.Hour)}); err != nil {
-		t.Fatalf("eventlog.Append() error = %v", err)
-	}
-	recorder := httptest.NewRecorder()
-	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/post-merge-digest", nil))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
-	}
-	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
-	digest := data["digest"].(map[string]any)
-	if got := len(digest["merged"].([]any)); got != 1 {
-		t.Fatalf("merged count = %d, want 1", got)
 	}
 }
 
@@ -2270,6 +2240,59 @@ func TestHandlerEventAndPullRequestRoutesMatchFrozenSuccessArtifacts(t *testing.
 				t.Fatalf("normalized body mismatch\nactual=%s\nwant=%s", actualJSON, wantJSON)
 			}
 		})
+	}
+}
+
+// TestUnreviewedGateReportsRouteEnumeratesMergedPullRequestsWithoutReview is the
+// operator-facing half: before this route the durable answer existed in the Gate
+// reports but could only be read one pull request at a time, by a caller who
+// already knew which one to ask about.
+func TestUnreviewedGateReportsRouteEnumeratesMergedPullRequestsWithoutReview(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedEventAndPullRequestRouteData(t, fixture.runtime)
+	appendGateReportEvent(t, fixture.runtime, "gate_1", 280, `{"status":"refused","completedReviews":0,"reviewers":[],"refusals":[{"login":"coderabbitai[bot]","detector":"coderabbit_review_limit","commentId":1}]}`)
+	appendGateReportEvent(t, fixture.runtime, "gate_2", 281, `{"status":"reviewed","completedReviews":1,"reviewers":[{"login":"octocat","isBot":false,"state":"APPROVED"}],"refusals":[]}`)
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/gate-reports/unreviewed?state=merged", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Data struct {
+			Items []gatekeeper.UnreviewedPullRequest `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(response.Data.Items) != 1 || response.Data.Items[0].PRNumber != 280 {
+		t.Fatalf("items = %#v, want only the merged pull request with no completed review", response.Data.Items)
+	}
+	if response.Data.Items[0].ReviewProvenance.Status != gatekeeper.ReviewProvenanceRefused {
+		t.Fatalf("provenance = %#v, want the recorded refusal", response.Data.Items[0].ReviewProvenance)
+	}
+}
+
+func appendGateReportEvent(t *testing.T, rt *looperdruntime.Runtime, eventID string, prNumber int64, provenanceJSON string) {
+	t.Helper()
+	payload := fmt.Sprintf(
+		`{"version":2,"projectId":"project_1","repo":"acme/looper","prNumber":%d,"evaluatedAt":"2026-04-11T12:00:00.000Z","evidence":{"pullRequestState":"MERGED","reviewProvenance":%s}}`,
+		prNumber, provenanceJSON)
+	entityID := fmt.Sprintf("acme/looper#%d", prNumber)
+	if err := rt.Services().Repositories.Events.Append(context.Background(), storage.EventLogRecord{
+		ID:          eventID,
+		EventType:   gatekeeper.GateReportEventType,
+		ProjectID:   stringPtr("project_1"),
+		EntityType:  stringPtr("pull_request"),
+		EntityID:    &entityID,
+		PayloadJSON: payload,
+		CreatedAt:   "2026-04-11T12:00:00.000Z",
+	}); err != nil {
+		t.Fatalf("Events.Append(%s) error = %v", eventID, err)
 	}
 }
 

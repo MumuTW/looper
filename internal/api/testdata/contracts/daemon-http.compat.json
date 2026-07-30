@@ -107,9 +107,9 @@
       "routeSpecificStatuses": [400]
     },
     {
-      "id": "postMergeDigest.get",
+      "id": "gateReports.unreviewed",
       "method": "GET",
-      "path": "/api/v1/post-merge-digest",
+      "path": "/api/v1/gate-reports/unreviewed?state=merged",
       "fixture": "default",
       "expectedStatus": 200,
       "routeSpecificStatuses": []

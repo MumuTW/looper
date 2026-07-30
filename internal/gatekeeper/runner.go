@@ -184,6 +184,7 @@ type GitHubGateway interface {
 	GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error)
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error)
+	ListPullRequestReviews(context.Context, githubinfra.ViewPullRequestInput) ([]githubinfra.ReviewSummary, error)
 	// GetPullRequestHeadAndBaseSHA is the final revalidation read. It returns
 	// both the head and base ref OIDs so a gate whose verdict depends on the
 	// merge base (the diff budget) can detect a base advance that the head
@@ -355,7 +356,10 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		Version: reportVersion, Status: StatusBlocked,
 		ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber,
 		ExpectedHeadSHA: input.ExpectedHeadSHA, RequiresFreshRevalidation: true,
-		Reasons: []Reason{}, Evidence: Evidence{RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{}},
+		Reasons: []Reason{}, Evidence: Evidence{
+			RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{},
+			ReviewProvenance: ReviewProvenance{Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}},
+		},
 		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
 		SourceFingerprint: input.SourceFingerprint,
 	}
@@ -392,6 +396,16 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if !codexReview.CurrentHeadValid {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
 	}
+
+	// Recorded here, before every gate branch and every early return below,
+	// because provenance is an observation about the pull request rather than a
+	// step in the eligibility decision — and because the reports that matter most
+	// never reach the review branch at all. A merged pull request answers the
+	// mergeability read ambiguously, and that returns long before the review
+	// branch — yet the closed-webhook evaluation that follows a merge is exactly
+	// the report an operator later reads to ask whether the merged change was
+	// ever reviewed.
+	report.Evidence.ReviewProvenance = r.observeReviewProvenance(ctx, input)
 
 	if report.Evidence.PullRequestState != "OPEN" {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonPullRequestNotOpen})
@@ -572,6 +586,48 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		}
 	}
 	return persisted, nil
+}
+
+// observeReviewProvenance reads who reviewed this pull request and who refused
+// to.
+//
+// It never returns an error, and that is deliberate rather than lax: Gatekeeper
+// is observe-only, so an observation must not be able to move a pull request
+// from eligible to blocked. A forge that will not answer yields
+// ReviewProvenanceUnknown, which the enumeration excludes — the record says it
+// does not know instead of saying nobody reviewed.
+//
+// It costs two forge reads per full evaluation. The review list is REST because
+// only REST classifies the reviewer's account, and the comment list is where a
+// refusal lives, because a refusal is not a review and the forge files it
+// nowhere else. Both are skipped entirely for a pull request whose fingerprint
+// is unchanged.
+func (r *Runner) observeReviewProvenance(ctx context.Context, input EvaluationInput) ReviewProvenance {
+	unknown := ReviewProvenance{Status: ReviewProvenanceUnknown, Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}}
+	reviews, err := r.github.ListPullRequestReviews(ctx, githubinfra.ViewPullRequestInput{
+		Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD,
+	})
+	if err != nil {
+		r.warnReviewProvenance(input, "reviews", err)
+		return unknown
+	}
+	comments, err := r.github.ListIssueComments(ctx, githubinfra.ViewIssueInput{
+		Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD,
+	})
+	if err != nil {
+		r.warnReviewProvenance(input, "comments", err)
+		return unknown
+	}
+	return reviewProvenanceFrom(reviews, comments)
+}
+
+func (r *Runner) warnReviewProvenance(input EvaluationInput, subject string, err error) {
+	if r.logWarn == nil {
+		return
+	}
+	r.logWarn("gatekeeper: could not observe review provenance", map[string]any{
+		"repo": input.Repo, "pr": input.PRNumber, "subject": subject, "error": err.Error(),
+	})
 }
 
 func (r *Runner) projectCWD(ctx context.Context, projectID string) string {

@@ -3141,7 +3141,14 @@ type ReviewSummary struct {
 	ID     int64
 	State  string // "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "DISMISSED"
 	Author string
-	Body   string
+	// IsBot is GitHub's own classification of the reviewer's account, taken from
+	// the REST `user.type` this endpoint returns. It is read here rather than
+	// derived from the login because the login alone cannot answer it: REST
+	// spells a bot `coderabbitai[bot]` while the GraphQL projection `gh pr view`
+	// returns spells the same account `coderabbitai`, so a `[bot]` suffix test
+	// reports app reviewers as humans wherever the GraphQL shape is in play.
+	IsBot bool
+	Body  string
 }
 
 // ListPullRequestReviews returns a PR's submitted reviews (REST), with the numeric
@@ -3162,11 +3169,13 @@ func (g *Gateway) ListPullRequestReviews(ctx context.Context, input ViewPullRequ
 	}
 	reviews := make([]ReviewSummary, 0, len(rows))
 	for _, row := range rows {
+		author := firstNonNil(row["user"], row["author"])
 		reviews = append(reviews, ReviewSummary{
 			ID:     asInt64(firstNonNil(row["id"], row["databaseId"])),
 			State:  asString(row["state"]),
 			Body:   asString(row["body"]),
-			Author: extractAuthor(firstNonNil(row["user"], row["author"])),
+			Author: extractAuthor(author),
+			IsBot:  extractAuthorIsBot(author),
 		})
 	}
 	return reviews, nil
@@ -4388,6 +4397,19 @@ func extractAuthor(value any) string {
 		return login
 	}
 	return asString(row["name"])
+}
+
+// extractAuthorIsBot reads GitHub's own classification of an account: REST spells
+// it `type: "Bot"`, and gh's GraphQL projections spell it `is_bot: true`.
+func extractAuthorIsBot(value any) bool {
+	row, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(asString(row["type"])), "Bot") {
+		return true
+	}
+	return asBool(row["is_bot"])
 }
 
 func extractOID(value any) string {
