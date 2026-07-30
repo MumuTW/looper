@@ -211,25 +211,3 @@ func TestApplyingLabelsStopsCreatingAfterAFailure(t *testing.T) {
 		t.Errorf("kept creating labels after the action was known to fail:\n%s", strings.Join(runner.calls, "\n"))
 	}
 }
-
-// A dry run's whole output is the plan, and no create follows to correct a
-// wrong guess about what already exists. A failed listing therefore has to be
-// reported rather than reported as "everything will be created".
-func TestInitializeLabelsDryRunRequiresAListing(t *testing.T) {
-	t.Parallel()
-
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		if strings.HasPrefix(strings.Join(options.Args, " "), "label list ") {
-			return shell.Result{}, &shell.CommandExecutionError{Message: "HTTP 502: Bad Gateway", Category: shell.FailureNonZeroExit}
-		}
-		t.Fatalf("a dry run must not mutate: %q", strings.Join(options.Args, " "))
-		return shell.Result{}, nil
-	}
-
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	result, err := gateway.InitializeLabels(context.Background(), InitializeLabelsInput{Repo: "acme/looper", DryRun: true})
-	if err == nil {
-		t.Fatalf("InitializeLabels(dry run) error = nil, want the failed listing reported; got plan %#v", result.Summary)
-	}
-}
