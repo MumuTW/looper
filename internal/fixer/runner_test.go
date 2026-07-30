@@ -6413,7 +6413,7 @@ func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 	return result, nil
 }
 
-func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string, string) (string, error) {
 	if f.currentUserErr != nil {
 		return "", f.currentUserErr
 	}

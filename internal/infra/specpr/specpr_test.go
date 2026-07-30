@@ -1,10 +1,14 @@
 package specpr
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/nexu-io/looper/internal/labels"
+)
 
 func TestResolvePullRequestPhase(t *testing.T) {
 	t.Parallel()
-	if got := ResolvePullRequestPhase([]string{"looper:spec-reviewing"}); got != PhaseSpec {
+	if got := ResolvePullRequestPhase([]string{labels.SpecReviewing}); got != PhaseSpec {
 		t.Fatalf("ResolvePullRequestPhase(spec) = %q, want %q", got, PhaseSpec)
 	}
 	if got := ResolvePullRequestPhase([]string{"looper:ready"}); got != PhaseImplementation {

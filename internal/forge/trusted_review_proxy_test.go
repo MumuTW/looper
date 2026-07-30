@@ -352,24 +352,19 @@ func TestTrustedReviewSockConfigured(t *testing.T) {
 	}
 }
 
-func TestTrustedReviewProxyChildEnvOmitsSocketAndFile(t *testing.T) {
+func TestTrustedReviewProxyChildEnvOmitsSocketAndConfigSelectors(t *testing.T) {
 	t.Setenv(TrustedReviewSockEnv, "/tmp/should-not-propagate")
-	t.Setenv(TrustedEnvFileEnv, "/tmp/secret-file")
 	t.Setenv(trustedReviewProxySkipEnv, "")
 	t.Setenv("LOOPER_CONFIG", "/tmp/ambient.json")
 	env := trustedReviewProxyChildEnv(map[string]string{
 		"PROVIDER_TOKEN":          "secret",
 		TrustedReviewSockEnv:      "/tmp/agent-controlled-sock",
-		TrustedEnvFileEnv:         "/tmp/agent-controlled-secret-file",
 		trustedReviewProxySkipEnv: "",
 		"LOOPER_CONFIG":           "/tmp/agent-controlled-config.json",
 	}, TrustedReviewConfigChildFD)
 	joined := strings.Join(env, "\n")
 	if strings.Contains(joined, TrustedReviewSockEnv+"=") {
 		t.Fatalf("child env still has %s", TrustedReviewSockEnv)
-	}
-	if strings.Contains(joined, TrustedEnvFileEnv+"=") {
-		t.Fatalf("child env still has %s", TrustedEnvFileEnv)
 	}
 	if !strings.Contains(joined, "PROVIDER_TOKEN=secret") {
 		t.Fatalf("child env missing provider token: %s", joined)

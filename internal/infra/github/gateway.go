@@ -660,33 +660,6 @@ type CapturePullRequestSnapshotInput struct {
 	CapturedAt string
 }
 
-type InitializeLabelsInput struct {
-	Repo   string
-	CWD    string
-	DryRun bool
-}
-
-type LabelInitResult struct {
-	Repo    string           `json:"repo"`
-	DryRun  bool             `json:"dryRun"`
-	Labels  []LabelInitItem  `json:"labels"`
-	Summary LabelInitSummary `json:"summary"`
-}
-
-type LabelInitItem struct {
-	Name        string `json:"name"`
-	Status      string `json:"status"`
-	Color       string `json:"color"`
-	Description string `json:"description"`
-	Error       string `json:"error,omitempty"`
-}
-
-type LabelInitSummary struct {
-	Created int `json:"created"`
-	Skipped int `json:"skipped"`
-	Failed  int `json:"failed"`
-}
-
 type ReviewThreadNotFoundError struct {
 	ThreadID string
 }
@@ -1957,7 +1930,12 @@ func (g *Gateway) CompareCommits(ctx context.Context, input CompareCommitsInput)
 	if input.Repo == "" || input.Base == "" || input.Head == "" {
 		return CompareCommitsResult{}, fmt.Errorf("compare commits requires repo, base, and head")
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/compare/%s...%s", input.Repo, input.Base, input.Head))
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/compare/%s...%s", repo, input.Base, input.Head)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return CompareCommitsResult{}, err
 	}
@@ -2048,7 +2026,8 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 		"comments":         processing.Comments,
 	}
 	if len(input.Comments) > 0 || strings.TrimSpace(input.CommitID) != "" {
-		endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber)
+		hostname, repo := splitRepoHostname(input.Repo)
+		endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, input.PRNumber)
 		payload := map[string]any{
 			"event":     input.Event,
 			"body":      emptyToNil(input.Body),
@@ -2084,7 +2063,11 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 		request["method"] = "POST"
 		request["endpoint"] = endpoint
 		g.emitReviewSubmitDiagnostic("github_review_submit_prepared", map[string]any{"request": request})
-		result, err := g.runGh(ctx, input.CWD, string(body), "api", endpoint, "--method", "POST", "--input", "-", "--include")
+		args := []string{"api", endpoint, "--method", "POST", "--input", "-", "--include"}
+		if hostname != "" {
+			args = append(args, "--hostname", hostname)
+		}
+		result, err := g.runGh(ctx, input.CWD, string(body), args...)
 		if err != nil {
 			fields := map[string]any{"request": request, "gh_stdout": reviewSubmitRawStdout(result.Stdout), "gh_stderr": result.Stderr, "gh_error": sanitizeReviewSubmitCommandError(err.Error())}
 			if response, ok := parseReviewSubmitHTTPResponse(result.Stdout); ok {
@@ -2139,7 +2122,8 @@ func validateReviewOutboundContent(body string, comments []ReviewComment) error 
 }
 
 func (g *Gateway) reviewSubmitRequest(input SubmitReviewInput) map[string]any {
-	endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber)
+	_, repo := splitRepoHostname(input.Repo)
+	endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, input.PRNumber)
 	request := map[string]any{
 		"repo":      input.Repo,
 		"pr_number": input.PRNumber,
@@ -2426,7 +2410,12 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 	if strings.TrimSpace(input.Marker) == "" {
 		return ReviewMarkerResult{}, nil
 	}
-	reviewsResult, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber))
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, input.PRNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	reviewsResult, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return ReviewMarkerResult{}, err
 	}
@@ -2442,7 +2431,12 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 }
 
 func (g *Gateway) fetchReviewCommentBodies(ctx context.Context, repo string, prNumber int64, reviewID string, cwd string) ([]string, error) {
-	result, err := g.runGh(ctx, cwd, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews/%s/comments", repo, prNumber, reviewID))
+	hostname, repoSlug := splitRepoHostname(repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews/%s/comments", repoSlug, prNumber, reviewID)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2667,19 +2661,29 @@ func reviewEventFromState(state string) string {
 }
 
 func (g *Gateway) AddPullRequestReaction(ctx context.Context, input PullRequestReactionInput) error {
-	_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.PRNumber), "--method", "POST", "-H", "Accept: application/vnd.github+json", "-f", "content="+input.Content)
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/reactions", repo, input.PRNumber), "--method", "POST", "-H", "Accept: application/vnd.github+json", "-f", "content=" + input.Content}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
 }
 
 func (g *Gateway) RemovePullRequestReaction(ctx context.Context, input PullRequestReactionInput) error {
-	currentLogin, err := g.GetCurrentUserLogin(ctx, input.CWD)
+	currentLogin, err := g.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
 	if err != nil {
 		return err
 	}
 	if currentLogin == "" {
 		return nil
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.PRNumber), "-H", "Accept: application/vnd.github+json")
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/reactions", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return err
 	}
@@ -2695,7 +2699,11 @@ func (g *Gateway) RemovePullRequestReaction(ctx context.Context, input PullReque
 		if reaction.Content != input.Content || !strings.EqualFold(reaction.UserLogin, currentLogin) {
 			continue
 		}
-		if _, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/reactions/%d", input.Repo, input.PRNumber, reaction.ID), "--method", "DELETE", "-H", "Accept: application/vnd.github+json"); err != nil {
+		deleteArgs := []string{"api", fmt.Sprintf("repos/%s/issues/%d/reactions/%d", repo, input.PRNumber, reaction.ID), "--method", "DELETE", "-H", "Accept: application/vnd.github+json"}
+		if hostname != "" {
+			deleteArgs = append(deleteArgs, "--hostname", hostname)
+		}
+		if _, err := g.runGh(ctx, input.CWD, "", deleteArgs...); err != nil {
 			return err
 		}
 	}
@@ -2709,9 +2717,13 @@ func (g *Gateway) AddPullRequestLabels(ctx context.Context, input PullRequestLab
 	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
 		return err
 	}
-	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", input.Repo, input.PRNumber), "--method", "POST"}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels", repo, input.PRNumber), "--method", "POST"}
 	for _, label := range input.Labels {
 		args = append(args, "-f", "labels[]="+label)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
@@ -2721,8 +2733,13 @@ func (g *Gateway) RemovePullRequestLabels(ctx context.Context, input PullRequest
 	if len(input.Labels) == 0 {
 		return nil
 	}
+	hostname, repo := splitRepoHostname(input.Repo)
 	for _, label := range input.Labels {
-		_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", input.Repo, input.PRNumber, encodeURIComponent(label)), "--method", "DELETE")
+		args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", repo, input.PRNumber, encodeURIComponent(label)), "--method", "DELETE"}
+		if hostname != "" {
+			args = append(args, "--hostname", hostname)
+		}
+		_, err := g.runGh(ctx, input.CWD, "", args...)
 		if err == nil {
 			continue
 		}
@@ -2738,9 +2755,13 @@ func (g *Gateway) AddPullRequestReviewers(ctx context.Context, input PullRequest
 	if len(input.Reviewers) == 0 {
 		return nil
 	}
-	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/requested_reviewers", input.Repo, input.PRNumber), "--method", "POST"}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/requested_reviewers", repo, input.PRNumber), "--method", "POST"}
 	for _, reviewer := range input.Reviewers {
 		args = append(args, "-f", "reviewers[]="+reviewer)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
 	_, err := g.runGh(ctx, input.CWD, "", args...)
 	return err
@@ -2957,6 +2978,13 @@ func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (strin
 }
 
 func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo string, cwd string) (string, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.getCurrentUserLoginForRepo(ctx, repo, cwd)
+	}
+	return g.getCurrentUserLoginForRepoRaw(ctx, repo, cwd)
+}
+
+func (g *Gateway) getCurrentUserLoginForRepoRaw(ctx context.Context, repo string, cwd string) (string, error) {
 	hostname, _ := splitRepoHostname(repo)
 	args := []string{"api", "user", "--jq", ".login"}
 	if hostname != "" {
@@ -3015,26 +3043,7 @@ func (g *Gateway) DetectCurrentRepository(ctx context.Context, cwd string) (stri
 	return repo, nil
 }
 
-func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsInput) (LabelInitResult, error) {
-	repo := strings.TrimSpace(input.Repo)
-	if err := validateGitHubRepoSlug(repo); err != nil {
-		return LabelInitResult{}, err
-	}
-	return g.ensureLabels(ctx, repo, input.CWD, labels.Standard(), ensureLabelsOptions{
-		dryRun: input.DryRun,
-		// Provisioning reports a per-label plan, so it keeps going and records
-		// every outcome rather than stopping at the first failure.
-		requireListing: input.DryRun,
-	})
-}
-
-// ensureLabels creates every definition the repository does not already have,
-// and reports what it did.
-//
-// This is the single label-creating path. There used to be two — bulk
-// provisioning and the per-apply check — and each grew the same overwrite
-// defect independently, which is why the same fix had to be written twice.
-// One implementation cannot diverge from itself.
+// ensureLabels creates every definition the repository does not already have.
 //
 // Create-only, always. Looper needs a label to exist; it has no claim on how a
 // maintainer has worded one that already does.
@@ -3043,70 +3052,27 @@ func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsIn
 // it exists only to skip creates that would fail anyway — so a failed list
 // must not block the caller: nothing is then known to exist, every create is
 // attempted, and one that loses to an existing label is tolerated exactly as a
-// lost race is.
-type ensureLabelsOptions struct {
-	dryRun bool
-	// requireListing makes a failed listing fatal. Tolerating one is only safe
-	// when creates follow: an attempted create corrects a wrong guess about
-	// what exists. A dry run performs none, so its entire output would be that
-	// guess presented as a plan.
-	requireListing bool
-	// stopOnFirstFailure abandons the remaining definitions once the caller's
-	// action is already known to fail. The apply paths want this: continuing
-	// to create labels that will never be applied leaves the repository
-	// changed for an action that did not happen.
-	stopOnFirstFailure bool
-}
-
-func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definitions []labels.Definition, opts ensureLabelsOptions) (LabelInitResult, error) {
-	result := LabelInitResult{Repo: repo, DryRun: opts.dryRun, Labels: make([]LabelInitItem, 0, len(definitions))}
+// lost race is. Any other create failure stops immediately because the caller's
+// label application will not happen.
+func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definitions []labels.Definition) error {
 	if len(definitions) == 0 {
-		return result, nil
+		return nil
 	}
 
 	existing, listErr := g.listRepositoryLabels(ctx, repo, cwd)
 	if listErr != nil {
-		if opts.requireListing {
-			return LabelInitResult{}, listErr
-		}
 		existing = nil
 	}
 
-	var firstFailure error
 	for _, definition := range definitions {
-		item := LabelInitItem{Name: definition.Name, Color: definition.Color, Description: definition.Description}
 		if _, exists := existing[labels.Normalize(definition.Name)]; exists {
-			item.Status = "skipped"
-		} else {
-			item.Status = "created"
-			if !opts.dryRun {
-				if _, createErr := g.runGh(ctx, cwd, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description); createErr != nil {
-					if isLabelAlreadyExistsError(createErr) {
-						item.Status = "skipped"
-					} else {
-						item.Status = "failed"
-						item.Error = createErr.Error()
-						if firstFailure == nil {
-							firstFailure = fmt.Errorf("create label %s: %w", definition.Name, createErr)
-						}
-					}
-				}
-			}
+			continue
 		}
-		result.Labels = append(result.Labels, item)
-		incrementLabelSummary(&result.Summary, item.Status)
-		if firstFailure != nil && opts.stopOnFirstFailure {
-			break
+		if _, err := g.runGh(ctx, cwd, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description); err != nil && !isLabelAlreadyExistsError(err) {
+			return fmt.Errorf("create label %s: %w", definition.Name, err)
 		}
 	}
-
-	// Return the underlying failure rather than a count. A caller applying a
-	// label needs to know it hit a 403, not that one mutation failed; the
-	// per-item errors on the result still carry the rest.
-	if firstFailure != nil {
-		return result, firstFailure
-	}
-	return result, nil
+	return nil
 }
 
 func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
@@ -3447,8 +3413,7 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []s
 		seen[normalized] = struct{}{}
 		definitions = append(definitions, labelPresentation(label))
 	}
-	_, err := g.ensureLabels(ctx, repo, cwd, definitions, ensureLabelsOptions{stopOnFirstFailure: true})
-	return err
+	return g.ensureLabels(ctx, repo, cwd, definitions)
 }
 
 // isLabelAlreadyExistsError reports whether a `gh label create` failure is the
@@ -3745,7 +3710,12 @@ func validateCloseIssueStateReason(value string) (string, error) {
 }
 
 func (g *Gateway) viewIssueState(ctx context.Context, repo string, issueNumber int64, cwd string) (string, error) {
-	result, err := g.runGh(ctx, cwd, "", "api", fmt.Sprintf("repos/%s/issues/%d", repo, issueNumber), "--jq", ".state")
+	hostname, repoSlug := splitRepoHostname(repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d", repoSlug, issueNumber), "--jq", ".state"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
 	if err != nil {
 		return "", err
 	}
@@ -3846,17 +3816,6 @@ func extractIssueRepository(value any) IssueRepository {
 
 func normalizeLabelColor(value string) string {
 	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(value)), "#")
-}
-
-func incrementLabelSummary(summary *LabelInitSummary, status string) {
-	switch status {
-	case "created":
-		summary.Created++
-	case "skipped":
-		summary.Skipped++
-	case "failed":
-		summary.Failed++
-	}
 }
 
 func decodeJSONObject(value string) (map[string]any, error) {

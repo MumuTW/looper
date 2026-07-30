@@ -97,6 +97,9 @@ type HeartbeatResponse struct {
 	Warnings   []string  `json:"warnings,omitempty"`
 }
 
+// CoordinatorLease is the Lease: the durable Authority for Network
+// Coordinator control-plane leadership — a row in the loopernet database with
+// a fencing token, validated at every GitHub side-effect boundary.
 type CoordinatorLease struct {
 	Name         string     `json:"name"`
 	HolderNodeID string     `json:"holderNodeId,omitempty"`
@@ -239,6 +242,10 @@ func containsExact(values []string, want string) bool {
 	return false
 }
 
+// ValidateNodeName validates a Node's human-readable Name (a short,
+// label-safe string; convention is a color such as red or cyan). A Node is a
+// single looperd instance enrolled in a Network, identified by an opaque
+// cloud-issued ID plus this Name.
 func ValidateNodeName(value string) error {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {

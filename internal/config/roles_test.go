@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 func TestCodingRolesFromLegacyProjectsSourceAndFields(t *testing.T) {
@@ -11,7 +13,7 @@ func TestCodingRolesFromLegacyProjectsSourceAndFields(t *testing.T) {
 			AutoDiscovery: true,
 			Instructions:  "plan carefully",
 			Triggers: IssueRoleTriggersConfig{
-				Labels:                     []string{"looper:plan"},
+				Labels:                     []string{labels.DefaultPlanTrigger},
 				LabelMode:                  LabelModeAll,
 				RequireAssigneeCurrentUser: true,
 			},
@@ -122,7 +124,7 @@ func TestValidateRoleDiscoveryRejectsCrossSourceFields(t *testing.T) {
 			discovery: RoleDiscoveryConfig{
 				Source:                     WorkSourceIssue,
 				RequireAssigneeCurrentUser: true,
-				Labels:                     []string{"looper:plan"},
+				Labels:                     []string{labels.DefaultPlanTrigger},
 			},
 			wantCount: 0,
 		},

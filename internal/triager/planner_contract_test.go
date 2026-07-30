@@ -53,7 +53,7 @@ func (g *contractPlannerGitHub) ViewIssue(context.Context, planner.ViewIssueInpu
 	return g.detail, nil
 }
 
-func (g *contractPlannerGitHub) GetCurrentUserLogin(context.Context, string) (string, error) {
+func (g *contractPlannerGitHub) GetCurrentUserLogin(context.Context, string, string) (string, error) {
 	return "octocat", nil
 }
 

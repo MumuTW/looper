@@ -7,6 +7,9 @@ import (
 	"github.com/nexu-io/looper/internal/diffanchor"
 )
 
+// AcceptanceCriterion is one checkbox item under an Issue's "## Acceptance
+// criteria" section. Reviewer's auto-merge gate verifies each criterion has a
+// satisfying-evidence pointer in the diff before submitting APPROVE.
 type AcceptanceCriterion string
 
 type Verdict string

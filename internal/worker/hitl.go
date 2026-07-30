@@ -144,7 +144,6 @@ type awaitingHumanError struct {
 	recommendedOption string
 	consequences      map[string]string
 	confidence        string
-	drainedInbox      []loops.HumanMessage
 }
 
 func (e *awaitingHumanError) Error() string { return "worker paused awaiting human decision" }
@@ -213,62 +212,95 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor 
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
-// acknowledgeHumanInbox records a completed turn's answer and removes exactly
-// the inbox snapshot it received. It shares the enqueue lock so neither update
-// can overwrite a concurrent message append.
-func (r *Runner) acknowledgeHumanInbox(ctx context.Context, loop *storage.LoopRecord, drained []loops.HumanMessage) {
+// finalizeCompletedHumanInboxTurn completes the loop or re-arms the completed
+// queue item for a survivor. It runs after Queue.Complete: requeueing while the
+// old item is still running cannot create an eligible follow-up claim.
+func (r *Runner) finalizeCompletedHumanInboxTurn(ctx context.Context, loopID, queueID string) (bool, error) {
+	if r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil {
+		return false, nil
+	}
+	unlock := loops.LockLoopRequeue(loopID)
+	defer unlock()
+
+	fresh, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || fresh == nil {
+		return false, err
+	}
+	// A terminal operator action wins over the agent result. It must not be
+	// reopened merely because a late human message exists.
+	if fresh.Status != "running" {
+		return false, nil
+	}
+	unlockTarget := loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*fresh))
+	defer unlockTarget()
+
+	nowISO := r.nowISO()
+	if r.hitlEnabled && len(loops.ReadHumanInbox(fresh.MetadataJSON)) > 0 {
+		requeued, err := r.repos.Queue.RequeueCompletedByID(ctx, loopID, queueID, nowISO)
+		if err != nil {
+			return false, err
+		}
+		if requeued == 0 {
+			return false, fmt.Errorf("requeue completed queue item %s for loop %s: no eligible completed item", queueID, loopID)
+		}
+		fresh.Status = "queued"
+		fresh.NextRunAt = &nowISO
+		fresh.UpdatedAt = nowISO
+		if err := r.repos.Loops.Upsert(ctx, *fresh); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	fresh.Status = "completed"
+	fresh.NextRunAt = nil
+	fresh.LastRunAt = stringPtr(nowISO)
+	fresh.UpdatedAt = nowISO
+	return false, r.repos.Loops.Upsert(ctx, *fresh)
+}
+
+// acknowledgePostTurnMetadata serializes every post-turn metadata mutation
+// with free-text enqueue. A single fresh read and upsert avoids one mutation
+// restoring metadata that an earlier mutation had just preserved.
+func (r *Runner) acknowledgePostTurnMetadata(ctx context.Context, loop *storage.LoopRecord, consumed []loops.HumanMessage) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
 	unlock := loops.LockLoopRequeue(loop.ID)
 	defer unlock()
-	r.markHumanAnswerConsumed(ctx, loop)
-	r.clearHumanInbox(ctx, loop, drained)
-}
-
-// clearHumanInbox drops only the loop's drained human-message snapshot after a
-// successful turn, leaving any later appends for the next turn. Caller holds
-// loops.LockLoopRequeue(loop.ID).
-func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord, drained []loops.HumanMessage) {
-	if r.repos == nil || r.repos.Loops == nil {
-		return
-	}
 	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil || fresh == nil {
 		return
 	}
-	if len(drained) == 0 || len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
+	meta := fresh.MetadataJSON
+	changed := false
+	if r.hitlEnabled {
+		if ask, ok := loops.ReadHITLAsk(meta); ok && ask.Status == "answered" {
+			ask.Status = "consumed"
+			if updated, werr := loops.WriteHITLAsk(meta, ask); werr == nil {
+				meta = &updated
+				changed = true
+			}
+		}
+		if len(consumed) > 0 {
+			if updated, werr := loops.AcknowledgeHumanMessages(meta, consumed); werr == nil {
+				meta = &updated
+				changed = true
+			}
+		}
+	}
+	if _, ok := loops.ReadTakeoverResume(meta); ok {
+		if updated, werr := loops.ClearTakeoverResume(meta); werr == nil {
+			meta = &updated
+			changed = true
+		}
+	}
+	if !changed {
 		return
 	}
-	meta, werr := loops.ClearHumanInboxMessages(fresh.MetadataJSON, drained)
-	if werr != nil {
-		return
-	}
-	fresh.MetadataJSON = &meta
+	fresh.MetadataJSON = meta
 	fresh.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
-		loop.MetadataJSON = &meta
-	}
-}
-
-// markTakeoverResumeConsumed clears the takeover-resume marker after a successful
-// resumed turn so it is not re-applied on later runs. No-op when absent.
-func (r *Runner) markTakeoverResumeConsumed(ctx context.Context, loop *storage.LoopRecord) {
-	if r.repos == nil || r.repos.Loops == nil {
-		return
-	}
-	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil || fresh == nil {
-		return
-	}
-	if _, ok := loops.ReadTakeoverResume(fresh.MetadataJSON); !ok {
-		return
-	}
-	meta, werr := loops.ClearTakeoverResume(fresh.MetadataJSON)
-	if werr != nil {
-		return
-	}
-	fresh.MetadataJSON = &meta
-	fresh.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
-		loop.MetadataJSON = &meta
+		loop.MetadataJSON = meta
 	}
 }
 
@@ -285,35 +317,6 @@ func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecor
 		return resumePrompt + "\nThe configured agent vendor changed after the question was asked, so continue in a fresh session rather than trying to attach to the prior vendor's session.", ""
 	}
 	return resumePrompt, strings.TrimSpace(ask.SessionID)
-}
-
-// markHumanAnswerConsumed flips a delivered human answer from "answered" to
-// "consumed" so it is not re-injected on any later run of the same loop. It is
-// called only after the resumed agent turn completes successfully. No-op when
-// there is no answered ask. Persists against the freshest loop record so it does
-// not clobber concurrent metadata writes. Only called when hitl.enabled is true.
-func (r *Runner) markHumanAnswerConsumed(ctx context.Context, loop *storage.LoopRecord) {
-	if r.repos == nil || r.repos.Loops == nil {
-		return
-	}
-	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil || fresh == nil {
-		return
-	}
-	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
-	if !ok || ask.Status != "answered" {
-		return
-	}
-	ask.Status = "consumed"
-	meta, werr := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
-	if werr != nil {
-		return
-	}
-	fresh.MetadataJSON = &meta
-	fresh.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
-		loop.MetadataJSON = &meta
-	}
 }
 
 // readFreshHITLAsk reads the loop's HITL ask from the freshest persisted record,
@@ -424,9 +427,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		}
 	}
 	var askWriteErr error
-	unlock := loops.LockLoopRequeue(input.Loop.ID)
-	defer unlock()
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+	// Hold the per-loop requeue mutex across the suspension's read-modify-write
+	// for the same reason as post-turn acknowledgement: a message appended
+	// concurrently by the enqueue path must not be overwritten by this upsert.
+	unlockRequeue := loops.LockLoopRequeue(input.Loop.ID)
+	_, updateErr := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask)
 		if werr != nil {
 			// Without a stored ask the response paths can never resume this
@@ -434,17 +439,20 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			askWriteErr = werr
 			return
 		}
-		updated.MetadataJSON = &meta
-		// The agent re-asked after reading this snapshot. A message delivered while
-		// the ask was published did not reach that turn and must stay queued.
-		if meta, werr := loops.ClearHumanInboxMessages(updated.MetadataJSON, awaiting.drainedInbox); werr == nil {
+		// The agent re-asked after reading the queued human messages, so the
+		// ones it actually saw are consumed — but a message that arrived while
+		// it was running was never observed and stays queued for the resumed
+		// turn.
+		if meta, werr := loops.AcknowledgeHumanMessages(&meta, loops.ReadHumanInbox(input.Loop.MetadataJSON)); werr == nil {
 			updated.MetadataJSON = &meta
 		}
 		updated.Status = "awaiting_human"
 		updated.LastRunAt = stringPtr(nowISO)
 		updated.NextRunAt = nil
-	}); err != nil {
-		return ProcessResult{}, err
+	})
+	unlockRequeue()
+	if updateErr != nil {
+		return ProcessResult{}, updateErr
 	}
 	if askWriteErr != nil {
 		return r.abortSuspension(ctx, run, checkpoint, askWriteErr)

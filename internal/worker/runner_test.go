@@ -85,9 +85,9 @@ func TestDiscoverIssuesEnqueuesWorkerReadyAssignedIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{
-		{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}},
+		{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}},
 		{Number: 47, Title: "No label", Assignees: []string{"octocat"}},
-		{Number: 48, Title: "Wrong assignee", Assignees: []string{"someone"}, Labels: []string{"looper:worker-ready"}},
+		{Number: 48, Title: "Wrong assignee", Assignees: []string{"someone"}, Labels: []string{labels.DefaultWorkerReadyTrigger}},
 	}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
@@ -117,7 +117,7 @@ func TestDiscoverIssuesEnqueuesWorkerReadyAssignedIssue(t *testing.T) {
 func TestDiscoverIssuesSkipsWorkerHoldLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready", labels.HoldWorker}}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger, labels.HoldWorker}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -334,8 +334,8 @@ func TestDiscoverIssuesRoutedProjectRequiresCurrentNodeTargetLabel(t *testing.T)
 	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}
 	fixture.cfg.Network = config.NetworkConfig{NodeName: "worker-1", GitHubLogin: "octocat"}
 	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{
-		{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}},
-		{Number: 47, Title: "Targeted", URL: "https://github.com/acme/looper/issues/47", Assignees: []string{"octocat"}, AssigneeUsers: []networkpolicy.GitHubUser{{Login: "octocat"}}, Labels: []string{"looper:worker-ready", protocol.TargetLabelForNode("worker-1")}},
+		{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}},
+		{Number: 47, Title: "Targeted", URL: "https://github.com/acme/looper/issues/47", Assignees: []string{"octocat"}, AssigneeUsers: []networkpolicy.GitHubUser{{Login: "octocat"}}, Labels: []string{labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("worker-1")}},
 	}}
 	network := &stubWorkerNetwork{status: protocol.NodeStatusResponse{Membership: protocol.Membership{NodeName: "worker-1"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg, Network: network})
@@ -353,7 +353,7 @@ func TestDiscoverIssuesRoutedProjectFailsWhenNetworkStatusMissing(t *testing.T) 
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}
-	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready", protocol.TargetLabelForNode("worker-1")}}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("worker-1")}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
 
 	_, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -371,7 +371,7 @@ func (s *stubWorkerNetwork) Status(context.Context) (protocol.NodeStatusResponse
 func TestDiscoverIssuesRoutedModeRequiresMatchingTargetLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"worker"}, AssigneeUsers: []networkpolicy.GitHubUser{{Login: "worker", ID: 42}}, Labels: []string{"looper:worker-ready", "looper:target:blue"}}}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"worker"}, AssigneeUsers: []networkpolicy.GitHubUser{{Login: "worker", ID: 42}}, Labels: []string{labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("blue")}}}}
 	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "worker", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
 
@@ -387,7 +387,7 @@ func TestDiscoverIssuesRoutedModeRequiresMatchingTargetLabel(t *testing.T) {
 func TestDiscoverIssuesRoutedModeRefreshesLoginFallbackFromGitHub(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "new-worker", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", AssigneeUsers: []networkpolicy.GitHubUser{{Login: "new-worker"}}, Labels: []string{"looper:worker-ready", "looper:target:red"}}}}
+	github := &fakeGitHubGateway{currentLogin: "new-worker", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", AssigneeUsers: []networkpolicy.GitHubUser{{Login: "new-worker"}}, Labels: []string{labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("red")}}}}
 	cfg, err := config.DefaultConfig(t.TempDir())
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
@@ -411,7 +411,7 @@ func TestDiscoverIssuesRoutedModeRefreshesLoginFallbackFromGitHub(t *testing.T) 
 func TestDiscoverIssuesDedupesWorkerReadyIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	first, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -433,7 +433,7 @@ func TestDiscoverIssuesDedupesWorkerReadyIssue(t *testing.T) {
 func TestDiscoverIssuesSkipsIssueWhenExistingWorkerLoopAlreadyLinkedPR(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}}}
 	nowISO := fixture.nowISO()
 	metadataJSON := `{"worker":{"title":"Implement worker-ready","repo":"acme/looper","baseBranch":"main","executionMode":"create-pr","issueNumber":46,"issueUrl":"https://github.com/acme/looper/issues/46","autoDiscovered":true}}`
 	prTargetID := "pr:acme/looper:101"
@@ -512,7 +512,7 @@ func TestDiscoverIssuesRoutedProjectCombinesTargetLabelWithAnyTriggerQueries(t *
 		issues: []IssueSummary{{
 			Number:        47,
 			Title:         "Targeted",
-			Labels:        []string{"team:beta", "looper:worker-ready", protocol.TargetLabelForNode("worker-1")},
+			Labels:        []string{"team:beta", labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("worker-1")},
 			AssigneeUsers: []networkpolicy.GitHubUser{{Login: "octocat"}},
 		}},
 	}
@@ -549,7 +549,7 @@ func TestDiscoverIssuesPreservesExistingWorkerMetadataOnRediscovery(t *testing.T
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 27, Title: "Updated worker-ready title", URL: "https://github.com/acme/looper/issues/27", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 27, Title: "Updated worker-ready title", URL: "https://github.com/acme/looper/issues/27", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -583,7 +583,7 @@ func TestDiscoverIssuesSkipsFailedWorkerLoopWhenFingerprintUnchanged(t *testing.
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
-	issue := IssueSummary{Number: 91, Title: "Implement worker-ready", Body: "same body", URL: "https://github.com/acme/looper/issues/91", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}
+	issue := IssueSummary{Number: 91, Title: "Implement worker-ready", Body: "same body", URL: "https://github.com/acme/looper/issues/91", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}
 	fingerprint := buildWorkerDiscoveryFingerprint(repo, "main", issue)
 	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
 	targetID := buildIssueTargetID(repo, issue.Number)
@@ -614,8 +614,8 @@ func TestDiscoverIssuesRequeuesFailedWorkerLoopWhenFingerprintChanges(t *testing
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
-	oldIssue := IssueSummary{Number: 92, Title: "Implement worker-ready", Body: "old body", URL: "https://github.com/acme/looper/issues/92", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}
-	newIssue := IssueSummary{Number: 92, Title: "Implement worker-ready", Body: "new body", URL: "https://github.com/acme/looper/issues/92", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}
+	oldIssue := IssueSummary{Number: 92, Title: "Implement worker-ready", Body: "old body", URL: "https://github.com/acme/looper/issues/92", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}
+	newIssue := IssueSummary{Number: 92, Title: "Implement worker-ready", Body: "new body", URL: "https://github.com/acme/looper/issues/92", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}
 	fingerprint := buildWorkerDiscoveryFingerprint(repo, "main", oldIssue)
 	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
 	targetID := buildIssueTargetID(repo, newIssue.Number)
@@ -2810,7 +2810,7 @@ func TestProcessClaimedItemRestartsFromDiscoverAfterStaleValidationFailure(t *te
 func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "worker-login", issues: []IssueSummary{{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}}, issueDetail: IssueDetail{Number: 52, Title: "Implement worker loop", State: "open"}}
+	github := &fakeGitHubGateway{currentLogin: "worker-login", issues: []IssueSummary{{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{labels.DefaultWorkerReadyTrigger}}}, issueDetail: IssueDetail{Number: 52, Title: "Implement worker loop", State: "open"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
@@ -2832,14 +2832,14 @@ func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyDisabled(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "worker-login", issues: []IssueSummary{{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}}, issueDetail: IssueDetail{Number: 52, Title: "Implement worker loop", State: "open"}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{"looper:worker-ready"}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: false}})
+	github := &fakeGitHubGateway{currentLogin: "worker-login", issues: []IssueSummary{{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{labels.DefaultWorkerReadyTrigger}}}, issueDetail: IssueDetail{Number: 52, Title: "Implement worker loop", State: "open"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultWorkerReadyTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: false}})
 
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
 	if err != nil || project == nil {
 		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
 	}
-	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{labels.DefaultWorkerReadyTrigger}}
 	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
 	loopResult, err := runner.ensureLoopForDiscoveredIssue(context.Background(), *project, "acme/looper", issue, fingerprint)
 	if err != nil {
@@ -4630,7 +4630,7 @@ type fakeGitHubGateway struct {
 	createPRIndex           int
 }
 
-func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string, string) (string, error) {
 	f.currentLoginCalls++
 	if f.currentLogin == "" {
 		return "octocat", nil

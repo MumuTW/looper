@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path/filepath"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/storage"
@@ -40,11 +42,25 @@ func TestRepoFromWebhookTunnelPath(t *testing.T) {
 	if got, ok := repoFromWebhookTunnelPath("/webhook/acme/looper"); !ok || got != "acme/looper" {
 		t.Fatalf("repoFromWebhookTunnelPath() = (%q, %v), want (%q, true)", got, ok, "acme/looper")
 	}
+	if got, ok := repoFromWebhookTunnelPath("/webhook/host/github/acme/looper"); !ok || got != "github/acme/looper" {
+		t.Fatalf("repoFromWebhookTunnelPath() = (%q, %v), want (%q, true)", got, ok, "github/acme/looper")
+	}
 
-	for _, path := range []string{"", "/webhook", "/webhook/acme", "/hook/acme/looper", "/webhook//looper", "/webhook/acme/", "/webhook/acme/looper/extra"} {
+	for _, path := range []string{"", "/webhook", "/webhook/acme", "/hook/acme/looper", "/webhook//looper", "/webhook/acme/", "/webhook/acme/looper/extra", "/webhook/github/acme/looper", "/webhook/host//acme/looper"} {
 		if got, ok := repoFromWebhookTunnelPath(path); ok || got != "" {
 			t.Fatalf("repoFromWebhookTunnelPath(%q) = (%q, %v), want (\"\", false)", path, got, ok)
 		}
+	}
+}
+
+func TestWebhookTunnelPayloadRepo(t *testing.T) {
+	t.Parallel()
+
+	if got := webhookTunnelPayloadRepo("code.example.test/acme/looper"); got != "acme/looper" {
+		t.Fatalf("webhookTunnelPayloadRepo() = %q, want acme/looper", got)
+	}
+	if got := webhookTunnelPayloadRepo("acme/looper"); got != "acme/looper" {
+		t.Fatalf("webhookTunnelPayloadRepo() = %q, want acme/looper", got)
 	}
 }
 
@@ -56,6 +72,52 @@ func TestWebhookTunnelManagedURLTrimsTrailingSlash(t *testing.T) {
 
 	if got := webhookTunnelManagedURL(cfg, "acme/looper"); got != "https://example.com/base/webhook/acme/looper" {
 		t.Fatalf("webhookTunnelManagedURL() = %q, want %q", got, "https://example.com/base/webhook/acme/looper")
+	}
+	if got := webhookTunnelManagedURL(cfg, "github/acme/looper"); got != "https://example.com/base/webhook/host/github/acme/looper" {
+		t.Fatalf("webhookTunnelManagedURL() = %q, want host-qualified route", got)
+	}
+}
+
+func TestConfiguredWebhookTunnelReposUseProviderHostname(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Providers = []config.ProviderConfig{{ID: "ghe", Kind: config.ProviderKindGitHub, BaseURL: "https://github/api/v3"}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", Provider: "ghe", Repo: "acme/looper", RepoPath: t.TempDir(), Webhook: config.ProjectWebhookConfig{Mode: config.WebhookModeTunnel}}}
+
+	if got := configuredWebhookReposForMode(cfg, config.WebhookModeTunnel); !slices.Equal(got, []string{"github/acme/looper"}) {
+		t.Fatalf("configuredWebhookReposForMode() = %#v, want provider-qualified tunnel repo", got)
+	}
+	if got := configuredWebhookReposForMode(cfg, config.WebhookModeGHForward); len(got) != 0 {
+		t.Fatalf("configuredWebhookReposForMode(gh-forward) = %#v, want no tunnel project", got)
+	}
+}
+
+func TestWebhookRuntimeReconcileUsesProviderQualifiedTunnelRepo(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	cfg.Providers = []config.ProviderConfig{{ID: "ghe", Kind: config.ProviderKindGitHub, BaseURL: "https://github/api/v3"}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", Provider: "ghe", Repo: "acme/looper", RepoPath: t.TempDir()}}
+	client := &fakeWebhookTunnelGitHubClient{}
+	runtime := newWebhookRuntime(cfg, &testLogger{}, time.Now)
+	runtime.bootstrapDone = true
+	runtime.tunnelClient = client
+	defer runtime.stopTunnelServer()
+
+	if err := runtime.Reconcile(repos); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if client.createCalls != 1 || client.lastCreate.repo != "github/acme/looper" || client.lastCreate.url != "/webhook/host/github/acme/looper" {
+		t.Fatalf("CreateHook = %#v calls=%d, want provider-qualified tunnel hook", client.lastCreate, client.createCalls)
+	}
+	if _, ok, err := repos.WebhookTunnelHooks.Get(ctx, "github/acme/looper"); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	} else if !ok {
+		t.Fatal("WebhookTunnelHooks.Get() found = false, want provider-qualified record")
 	}
 }
 
@@ -115,6 +177,7 @@ type fakeWebhookTunnelGitHubClient struct {
 	updateCalls    int
 	deleteCalls    int
 	lastUpdate     fakeWebhookTunnelUpdateCall
+	lastCreate     fakeWebhookTunnelCreateCall
 	deletedHooks   []int64
 }
 
@@ -126,14 +189,20 @@ type fakeWebhookTunnelUpdateCall struct {
 	active bool
 }
 
+type fakeWebhookTunnelCreateCall struct {
+	repo string
+	url  string
+}
+
 func (f *fakeWebhookTunnelGitHubClient) GetHook(ctx context.Context, _ string, _ int64) (webhookTunnelGitHubHook, bool, error) {
 	f.getCalls++
 	_, f.getDeadline = ctx.Deadline()
 	return f.getHook, f.getFound, nil
 }
 
-func (f *fakeWebhookTunnelGitHubClient) CreateHook(ctx context.Context, _ string, _ string, _ string, _ []string) (webhookTunnelGitHubHook, error) {
+func (f *fakeWebhookTunnelGitHubClient) CreateHook(ctx context.Context, repo string, url string, _ string, _ []string) (webhookTunnelGitHubHook, error) {
 	f.createCalls++
+	f.lastCreate = fakeWebhookTunnelCreateCall{repo: repo, url: url}
 	_, f.createDeadline = ctx.Deadline()
 	if f.createHook.ID == 0 {
 		f.createHook.ID = 999

@@ -525,22 +525,34 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: input.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}); err != nil {
 		return err
 	}
+
+	// Provenance check: refuse to remove a worktree that looper did not create.
+	// This prevents destructive cleanup of external (non-looper) worktrees that
+	// happen to share the same repo (#128).
+	if g.repos == nil {
+		return fmt.Errorf("refusing to remove worktree %q branch %q: looper provenance repository is unavailable", input.WorktreePath, input.Branch)
+	}
+	existing, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+	if err != nil {
+		return fmt.Errorf("provenance check (get worktree by branch): %w", err)
+	}
+	if existing == nil {
+		return fmt.Errorf("refusing to remove worktree %q branch %q: no looper worktree record found for this project — worktree was not created by looper", input.WorktreePath, input.Branch)
+	}
+	if existing.Status != "active" {
+		return fmt.Errorf("refusing to remove worktree %q branch %q: looper worktree record is %q, not active", input.WorktreePath, input.Branch, existing.Status)
+	}
+	if normalizeComparablePath(existing.RepoPath) != normalizeComparablePath(input.RepoPath) {
+		return fmt.Errorf("refusing to remove worktree %q branch %q: looper record belongs to a different repository", input.WorktreePath, input.Branch)
+	}
+	if normalizeComparablePath(existing.WorktreePath) != normalizeComparablePath(input.WorktreePath) {
+		return fmt.Errorf("refusing to remove worktree %q branch %q: looper record has a different path %q — refusing to remove a path that may belong to a different checkout", input.WorktreePath, input.Branch, existing.WorktreePath)
+	}
+
 	if err := g.runGitWithStartGate(ctx, input.RepoPath, nil, input.AdmitStart, "worktree", "remove", "--force", input.WorktreePath); err != nil {
 		if !missingWorktreeErrorPattern.MatchString(err.Error()) {
 			return err
 		}
-	}
-
-	if g.repos == nil {
-		return nil
-	}
-
-	existing, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
-	if err != nil {
-		return fmt.Errorf("get worktree before cleanup update: %w", err)
-	}
-	if existing == nil {
-		return nil
 	}
 
 	nowISO := g.now().UTC().Format(javaScriptISOStringLayout)

@@ -30,6 +30,7 @@ import (
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
+	"github.com/nexu-io/looper/internal/worker"
 )
 
 type OpenSQLiteCoordinatorFunc func(context.Context, string, storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error)
@@ -1284,7 +1285,11 @@ func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, view p
 	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
 		return projects.DetectedRepo{Repo: remote.Repo}, nil
 	}
-	return projects.DetectedRepo{}, nil
+	// An unrecognized host is reported rather than returned as an empty
+	// detection. Returning nothing here used to register the project with no
+	// repository and no warning: the scheduler then skipped it on every tick,
+	// so registration looked successful while nothing ever ran.
+	return projects.DetectedRepo{}, fmt.Errorf("origin host %q is not github.com; looper drives GitHub only, so the repository cannot be detected — pass the repository explicitly as owner/name", strings.TrimSpace(remote.Host))
 }
 
 func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repositories) error {
@@ -2438,6 +2443,13 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		if !decision.Interrupt {
 			continue
 		}
+		finalized, err := r.finalizeSuccessfulWorkerRunIfNeeded(ctx, repositories, *loop, &run, nowISO)
+		if err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		if finalized {
+			continue
+		}
 		if err := interruptRecoveryRun(ctx, repositories, run, *loop, nowISO, decision.Message); err != nil {
 			return StaleRunReconcileSummary{}, err
 		}
@@ -2821,8 +2833,14 @@ func (r *Runtime) repairInterruptedLoopQueueIfNeeded(ctx context.Context, reposi
 		return staleRunQueueRepairSummary{}, nil
 	}
 	latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
-	if err != nil || latestRun == nil || latestRun.Status != string(domain.RunStatusInterrupted) {
+	if err != nil || latestRun == nil {
 		return staleRunQueueRepairSummary{}, err
+	}
+	if finalized, err := r.finalizeSuccessfulWorkerRunIfNeeded(ctx, repositories, loop, latestRun, nowISO); err != nil || finalized {
+		return staleRunQueueRepairSummary{}, err
+	}
+	if latestRun.Status != string(domain.RunStatusInterrupted) {
+		return staleRunQueueRepairSummary{}, nil
 	}
 	activeCount, err := repositories.Queue.CountActiveByLoopID(ctx, loop.ID)
 	if err != nil {
@@ -2839,6 +2857,36 @@ func (r *Runtime) repairInterruptedLoopQueueIfNeeded(ctx context.Context, reposi
 		return staleRunQueueRepairSummary{}, nil
 	}
 	return r.repairStaleRunQueueState(ctx, repositories, loop, latestRun, false, nowISO)
+}
+
+func (r *Runtime) finalizeSuccessfulWorkerRunIfNeeded(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, run *storage.RunRecord, nowISO string) (bool, error) {
+	if loop.Type != string(domain.LoopTypeWorker) || run == nil || !worker.IsSuccessfulClaimFinalizationCandidate(*run) || repositories == nil || repositories.Queue == nil {
+		return false, nil
+	}
+	queueItem, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil || queueItem == nil || !worker.CanFinalizeSuccessfulClaim(*queueItem, *run, loop.Status) {
+		return false, err
+	}
+	r.mu.RLock()
+	coordinator := r.services.Coordinator
+	r.mu.RUnlock()
+	if coordinator == nil {
+		return false, fmt.Errorf("recover worker success finalization: sqlite coordinator is not configured")
+	}
+	completed := *run
+	completed.Status = string(domain.RunStatusSuccess)
+	completed.CurrentStep = nil
+	completed.ErrorMessage = nil
+	if completed.Summary == nil {
+		completed.Summary = stringPtr("Recovered completed worker " + loop.ID)
+	}
+	completed.EndedAt = stringPtr(nowISO)
+	completed.LastHeartbeatAt = stringPtr(nowISO)
+	completed.UpdatedAt = nowISO
+	if err := storage.FinalizeWorkerSuccess(ctx, coordinator.DB(), storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: nowISO}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func isAgentBackedRunStep(loop storage.LoopRecord, run storage.RunRecord) bool {
@@ -3750,7 +3798,12 @@ func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositor
 	}
 	loginCtx, cancel := context.WithTimeout(ctx, reviewerRecoveryLoginTimeout)
 	defer cancel()
-	login, err := githubGateway.GetCurrentUserLogin(loginCtx, project.RepoPath)
+	repo := ""
+	if loop.Repo != nil {
+		repo = *loop.Repo
+	}
+	cfg := r.Config()
+	login, err := roleCurrentUserLogin(loginCtx, &cfg, githubGateway, repo, project.RepoPath)
 	if err != nil {
 		if r.logger != nil {
 			r.logger.Warn("failed to refresh reviewer login during recovery", map[string]any{"loopId": loop.ID, "projectId": loop.ProjectID, "error": err.Error()})

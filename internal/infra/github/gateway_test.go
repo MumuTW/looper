@@ -1001,6 +1001,22 @@ func TestSubmitReviewUsesAPIForTopLevelReviewWithCommitID(t *testing.T) {
 	}
 }
 
+func TestSubmitReviewUsesQualifiedHostnameForTopLevelReview(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include --hostname code.example.test" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: "{}"}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "code.example.test/acme/looper", PRNumber: 42, Event: "COMMENT", Body: "app.go: Looks good", CommitID: "abc123"}); err != nil {
+		t.Fatalf("SubmitReview() error = %v", err)
+	}
+}
+
 func TestSubmitReviewNormalizesAnchorsBeforePublishing(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -1681,6 +1697,148 @@ func TestGatewayRemovePullRequestReactionReadsSlurpedPaginatedReactions(t *testi
 	}
 }
 
+func TestGatewayUsesQualifiedHostnameForRepoScopedAPICommands(t *testing.T) {
+	t.Parallel()
+	const repo = "code.example.test/acme/looper"
+
+	tests := []struct {
+		name string
+		run  func(*Gateway) error
+		want []string
+	}{
+		{
+			name: "compare commits",
+			run: func(gateway *Gateway) error {
+				_, err := gateway.CompareCommits(context.Background(), CompareCommitsInput{Repo: repo, Base: "base", Head: "head"})
+				return err
+			},
+			want: []string{"api repos/acme/looper/compare/base...head --hostname code.example.test"},
+		},
+		{
+			name: "add pull request reaction",
+			run: func(gateway *Gateway) error {
+				return gateway.AddPullRequestReaction(context.Background(), PullRequestReactionInput{Repo: repo, PRNumber: 42, Content: "eyes"})
+			},
+			want: []string{"api repos/acme/looper/issues/42/reactions --method POST -H Accept: application/vnd.github+json -f content=eyes --hostname code.example.test"},
+		},
+		{
+			name: "remove pull request reaction",
+			run: func(gateway *Gateway) error {
+				return gateway.RemovePullRequestReaction(context.Background(), PullRequestReactionInput{Repo: repo, PRNumber: 42, Content: "eyes"})
+			},
+			want: []string{
+				"api user --jq .login --hostname code.example.test",
+				"api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname code.example.test",
+				"api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json --hostname code.example.test",
+			},
+		},
+		{
+			name: "add pull request labels",
+			run: func(gateway *Gateway) error {
+				return gateway.AddPullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: repo, PRNumber: 42, Labels: []string{"ready"}})
+			},
+			want: []string{
+				"label list --repo code.example.test/acme/looper --limit 1000 --json name,color,description",
+				"api repos/acme/looper/issues/42/labels --method POST -f labels[]=ready --hostname code.example.test",
+			},
+		},
+		{
+			name: "remove pull request labels",
+			run: func(gateway *Gateway) error {
+				return gateway.RemovePullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: repo, PRNumber: 42, Labels: []string{"needs-work"}})
+			},
+			want: []string{"api repos/acme/looper/issues/42/labels/needs-work --method DELETE --hostname code.example.test"},
+		},
+		{
+			name: "add pull request reviewers",
+			run: func(gateway *Gateway) error {
+				return gateway.AddPullRequestReviewers(context.Background(), PullRequestReviewersInput{Repo: repo, PRNumber: 42, Reviewers: []string{"reviewer"}})
+			},
+			want: []string{"api repos/acme/looper/pulls/42/requested_reviewers --method POST -f reviewers[]=reviewer --hostname code.example.test"},
+		},
+		{
+			name: "view issue state",
+			run: func(gateway *Gateway) error {
+				_, err := gateway.viewIssueState(context.Background(), repo, 42, "")
+				return err
+			},
+			want: []string{"api repos/acme/looper/issues/42 --jq .state --hostname code.example.test"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &fakeGHRunner{t: t}
+			runner.respond = func(options shell.Options) (shell.Result, error) {
+				switch strings.Join(options.Args, " ") {
+				case "api user --jq .login --hostname code.example.test":
+					return shell.Result{Stdout: "ghes-reviewer\n"}, nil
+				case "api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname code.example.test":
+					return shell.Result{Stdout: `[{"id":7,"content":"eyes","user":{"login":"ghes-reviewer"}}]`}, nil
+				case "label list --repo code.example.test/acme/looper --limit 1000 --json name,color,description":
+					return shell.Result{Stdout: `[{"name":"ready","color":"ededed","description":""}]`}, nil
+				case "api repos/acme/looper/compare/base...head --hostname code.example.test":
+					return shell.Result{Stdout: `{"status":"identical"}`}, nil
+				case "api repos/acme/looper/issues/42 --jq .state --hostname code.example.test":
+					return shell.Result{Stdout: "open\n"}, nil
+				default:
+					return shell.Result{Stdout: "{}"}, nil
+				}
+			}
+
+			gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+			if err := test.run(gateway); err != nil {
+				t.Fatalf("operation error = %v", err)
+			}
+			if !slices.Equal(runner.calls, test.want) {
+				t.Fatalf("gh calls = %#v, want %#v", runner.calls, test.want)
+			}
+		})
+	}
+}
+
+func TestGatewayRemovePullRequestReactionUsesRepoHostIdentity(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api user --jq .login":
+			return shell.Result{Stdout: "public-user\n"}, nil
+		case "api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json":
+			return shell.Result{Stdout: `[{"id":6,"content":"eyes","user":{"login":"public-user"}}]`}, nil
+		case "api repos/acme/looper/issues/42/reactions/6 --method DELETE -H Accept: application/vnd.github+json":
+			return shell.Result{Stdout: "{}"}, nil
+		case "api user --jq .login --hostname ghes":
+			return shell.Result{Stdout: "enterprise-user\n"}, nil
+		case "api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname ghes":
+			return shell.Result{Stdout: `[{"id":7,"content":"eyes","user":{"login":"enterprise-user"}},{"id":8,"content":"eyes","user":{"login":"public-user"}}]`}, nil
+		case "api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json --hostname ghes":
+			return shell.Result{Stdout: "{}"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.RemovePullRequestReaction(context.Background(), PullRequestReactionInput{Repo: "acme/looper", PRNumber: 42, Content: "eyes"}); err != nil {
+		t.Fatalf("RemovePullRequestReaction(github.com) error = %v", err)
+	}
+	if err := gateway.RemovePullRequestReaction(context.Background(), PullRequestReactionInput{Repo: "ghes/acme/looper", PRNumber: 42, Content: "eyes"}); err != nil {
+		t.Fatalf("RemovePullRequestReaction(GHES) error = %v", err)
+	}
+	if want := []string{
+		"api user --jq .login",
+		"api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json",
+		"api repos/acme/looper/issues/42/reactions/6 --method DELETE -H Accept: application/vnd.github+json",
+		"api user --jq .login --hostname ghes",
+		"api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname ghes",
+		"api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json --hostname ghes",
+	}; !slices.Equal(runner.calls, want) {
+		t.Fatalf("gh calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
 func TestGatewayIsAuthenticatedTracksGHAuthStatus(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -1833,15 +1991,15 @@ func TestGatewayGetIssueLabelsSkipsCommentFetch(t *testing.T) {
 		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues/8" {
 			t.Fatalf("unexpected gh args: %q", got)
 		}
-		return shell.Result{Stdout: `{"number":8,"labels":[{"name":"looper:hold"},{"name":"bug"}]}`}, nil
+		return shell.Result{Stdout: fmt.Sprintf(`{"number":8,"labels":[{"name":%q},{"name":"bug"}]}`, labels.HoldGlobal)}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	labels, err := gateway.GetIssueLabels(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 8})
+	gotLabels, err := gateway.GetIssueLabels(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 8})
 	if err != nil {
 		t.Fatalf("GetIssueLabels() error = %v", err)
 	}
-	if len(labels) != 2 || labels[0] != "looper:hold" || labels[1] != "bug" {
-		t.Fatalf("GetIssueLabels() = %#v, want [looper:hold bug]", labels)
+	if len(gotLabels) != 2 || gotLabels[0] != labels.HoldGlobal || gotLabels[1] != "bug" {
+		t.Fatalf("GetIssueLabels() = %#v, want [looper:hold bug]", gotLabels)
 	}
 	if len(runner.calls) != 1 {
 		t.Fatalf("gh calls = %#v, want exactly one (no comment pagination)", runner.calls)
@@ -2146,7 +2304,7 @@ func TestGatewayIgnoresMissingLabelDeleteErrors(t *testing.T) {
 		return shell.Result{Stdout: "{}"}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	if err := gateway.RemovePullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{"looper:spec-ready"}}); err != nil {
+	if err := gateway.RemovePullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{labels.SpecReady}}); err != nil {
 		t.Fatalf("RemovePullRequestLabels() error = %v, want nil", err)
 	}
 }
@@ -2276,182 +2434,6 @@ func TestGatewayRunGhPassesTimeouts(t *testing.T) {
 	_, _ = gateway.GetPullRequestDiff(context.Background(), GetPullRequestDiffInput{Repo: "acme/looper", PRNumber: 42})
 	if len(timeouts) != 2 || timeouts[0] != prListGhCommandTimeout || timeouts[1] != prDiffGhCommandTimeout {
 		t.Fatalf("timeouts = %#v, want list/diff timeouts", timeouts)
-	}
-}
-
-func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
-	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		switch args {
-		case "label list --repo acme/looper --limit 1000 --json name,color,description":
-			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"},{"name":"looper:spec-reviewing","color":"000000","description":"Old description"}]`}, nil
-		case "label create looper:worker-ready --repo acme/looper --color 0e8a16 --description Ready for Looper worker implementation":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:awaiting-human --repo acme/looper --color fbca04 --description Waiting on a human response before Looper continues":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold --repo acme/looper --color b60205 --description Pause all automatic Looper work":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold:worker --repo acme/looper --color b60205 --description Pause automatic worker work":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold:fixer --repo acme/looper --color b60205 --description Pause automatic fixer work":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold:reviewer --repo acme/looper --color b60205 --description Pause automatic reviewer work":
-			return shell.Result{Stdout: "{}"}, nil
-		default:
-			t.Fatalf("unexpected gh args: %q", args)
-			return shell.Result{}, nil
-		}
-	}
-
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	result, err := gateway.InitializeLabels(context.Background(), InitializeLabelsInput{Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("InitializeLabels() error = %v", err)
-	}
-	// Create-only: looper:plan and looper:spec-reviewing already exist, so both
-	// are skipped and neither is edited even though spec-reviewing's live
-	// description differs from the standard one.
-	if result.Summary.Created != 8 || result.Summary.Skipped != 2 || result.Summary.Failed != 0 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=8 skipped=2 failed=0", result.Summary)
-	}
-
-	log := strings.Join(runner.calls, "\n")
-	for _, needle := range []string{
-		"label list --repo acme/looper --limit 1000 --json name,color,description",
-		"label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation",
-		"label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention",
-		"label create looper:hold --repo acme/looper --color b60205 --description Pause all automatic Looper work",
-		"label create looper:hold:worker --repo acme/looper --color b60205 --description Pause automatic worker work",
-		"label create looper:hold:fixer --repo acme/looper --color b60205 --description Pause automatic fixer work",
-		"label create looper:hold:reviewer --repo acme/looper --color b60205 --description Pause automatic reviewer work",
-	} {
-		if !strings.Contains(log, needle) {
-			t.Fatalf("gh log missing %q\n%s", needle, log)
-		}
-	}
-}
-
-func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
-	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		switch args {
-		case "label list --repo github.example.com/acme/looper --limit 1000 --json name,color,description":
-			return shell.Result{Stdout: `[]`}, nil
-		case "label create looper:plan --repo github.example.com/acme/looper --color 5319e7 --description Picked up automatically by planner":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:spec-reviewing --repo github.example.com/acme/looper --color 1d76db --description Spec PR is under review":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:worker-ready --repo github.example.com/acme/looper --color 0e8a16 --description Ready for Looper worker implementation":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:awaiting-human --repo github.example.com/acme/looper --color fbca04 --description Waiting on a human response before Looper continues":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:spec-ready --repo github.example.com/acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:needs-human --repo github.example.com/acme/looper --color d93f0b --description Looper requires manual intervention":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold --repo github.example.com/acme/looper --color b60205 --description Pause all automatic Looper work":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold:worker --repo github.example.com/acme/looper --color b60205 --description Pause automatic worker work":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold:fixer --repo github.example.com/acme/looper --color b60205 --description Pause automatic fixer work":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold:reviewer --repo github.example.com/acme/looper --color b60205 --description Pause automatic reviewer work":
-			return shell.Result{Stdout: "{}"}, nil
-		default:
-			t.Fatalf("unexpected gh args: %q", args)
-			return shell.Result{}, nil
-		}
-	}
-
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	result, err := gateway.InitializeLabels(context.Background(), InitializeLabelsInput{Repo: "github.example.com/acme/looper"})
-	if err != nil {
-		t.Fatalf("InitializeLabels() error = %v", err)
-	}
-	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 10 {
-		t.Fatalf("InitializeLabels() result = %#v, want host-qualified repo and created=8", result)
-	}
-}
-
-func TestGatewayDryRunInitializesLooperLabelsWithoutMutating(t *testing.T) {
-	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		if args == "label list --repo acme/looper --limit 1000 --json name,color,description" {
-			return shell.Result{Stdout: `[]`}, nil
-		}
-		t.Fatalf("unexpected gh args: %q", args)
-		return shell.Result{}, nil
-	}
-
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	result, err := gateway.InitializeLabels(context.Background(), InitializeLabelsInput{Repo: "acme/looper", DryRun: true})
-	if err != nil {
-		t.Fatalf("InitializeLabels(dry run) error = %v", err)
-	}
-	if result.Summary.Created != 10 || len(runner.calls) != 1 {
-		t.Fatalf("dry run result = %#v, calls = %#v; want ten planned creates and only label list", result.Summary, runner.calls)
-	}
-}
-
-func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
-	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		switch args {
-		case "label list --repo acme/looper --limit 1000 --json name,color,description":
-			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
-		case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:worker-ready --repo acme/looper --color 0e8a16 --description Ready for Looper worker implementation":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:awaiting-human --repo acme/looper --color fbca04 --description Waiting on a human response before Looper continues":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold --repo acme/looper --color b60205 --description Pause all automatic Looper work":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold:worker --repo acme/looper --color b60205 --description Pause automatic worker work":
-			result := shell.Result{ExitCode: 1, Stderr: "permission denied"}
-			return result, &shell.CommandExecutionError{Message: "gh exited with code 1: permission denied", Result: result}
-		case "label create looper:hold:fixer --repo acme/looper --color b60205 --description Pause automatic fixer work":
-			return shell.Result{Stdout: "{}"}, nil
-		case "label create looper:hold:reviewer --repo acme/looper --color b60205 --description Pause automatic reviewer work":
-			return shell.Result{Stdout: "{}"}, nil
-		default:
-			t.Fatalf("unexpected gh args: %q", args)
-			return shell.Result{}, nil
-		}
-	}
-
-	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	result, err := gateway.InitializeLabels(context.Background(), InitializeLabelsInput{Repo: "acme/looper"})
-	if err == nil {
-		t.Fatalf("InitializeLabels() error = nil, want failure")
-	}
-	if result.Summary.Failed != 1 || result.Summary.Created != 8 || result.Summary.Skipped != 1 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=8 skipped=1 failed=1", result.Summary)
-	}
-	got := ""
-	for _, label := range result.Labels {
-		if label.Name == labels.HoldWorker {
-			got = label.Error
-		}
-	}
-	if !strings.Contains(got, "permission denied") {
-		t.Fatalf("failed label error = %q, want stderr details", got)
 	}
 }
 

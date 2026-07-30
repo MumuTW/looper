@@ -131,10 +131,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("provider kind %q is no longer supported: %s", provider.Kind, reason)})
 		} else if !isValidProviderKind(provider.Kind) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be: %s", ProviderKindGitHub)})
-		} else if strings.TrimSpace(provider.BaseURL) != "" && !isAbsoluteHTTPURL(provider.BaseURL) {
-			// baseUrl is optional and is only a repository-identity discriminator
-			// (it never routes gh); when set it must be an absolute http(s) URL.
-			issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL"})
+		} else if message, ok := unsupportedProviderBaseURL(provider.BaseURL); !ok {
+			issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: message})
 		}
 	}
 
@@ -645,6 +643,23 @@ func isNumericIPv4Spelling(host string) bool {
 	return true
 }
 
+// unsupportedProviderBaseURL accepts a concrete GitHub or GitHub Enterprise
+// endpoint. Its host is part of a project's provider-bound repository identity.
+func unsupportedProviderBaseURL(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", true
+	}
+	if !isAbsoluteHTTPURL(value) {
+		return "must be an absolute http(s) URL", false
+	}
+	_, err := url.Parse(value)
+	if err != nil {
+		return "must be an absolute http(s) URL", false
+	}
+	return "", true
+}
+
 func isAbsoluteHTTPURL(value string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil {
@@ -914,7 +929,7 @@ func isValidInstructionRole(role string) bool {
 
 func protectedInstructionPhrase(text string) string {
 	normalized := strings.ToLower(strings.Join(strings.Fields(text), " "))
-	protected := []string{"systemprompt", "system prompt", "__looper_result__", "completion marker", "git_pr_lifecycle", "summary field", "commits field", "result json", "allowautopush", "allowautoapprove", "allow auto push", "allow auto approve", "auto approve", "auto push", "pr creation policy", "review submission policy", "looper review submit", "review submit wrapper", "gh pr review", "disclosure stamping", "auth requirement", "permission boundary", "state transition", "state machine", "ignore lifecycle", "override lifecycle", "custom completion"}
+	protected := []string{"systemprompt", "system prompt", "__looper_result__", "completion marker", "git_pr_lifecycle", "summary field", "commits field", "result json", "allowautopush", "allowautoapprove", "allow auto push", "allow auto approve", "auto approve", "auto push", "pr creation policy", "review submission policy", "looper review submit", "review submit capability", "gh pr review", "disclosure stamping", "auth requirement", "permission boundary", "state transition", "state machine", "ignore lifecycle", "override lifecycle", "custom completion"}
 	for _, phrase := range protected {
 		if strings.Contains(normalized, phrase) {
 			return phrase

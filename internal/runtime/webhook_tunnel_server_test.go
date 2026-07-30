@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -255,4 +256,54 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 			t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
 		}
 	})
+}
+
+func TestWebhookTunnelServerForwardsProviderQualifiedRoutingKey(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	const (
+		repo      = "github/acme/looper"
+		secret    = "top-secret"
+		secretRef = "webhook_github_acme_looper.key"
+	)
+	if err := repos.WebhookTunnelHooks.Upsert(ctx, storage.WebhookTunnelHookRecord{Repo: repo, HookID: 42, ManagedURL: webhookTunnelManagedURL(cfg, repo), SecretRef: secretRef, CreatedAt: time.Now().UnixNano(), UpdatedAt: time.Now().UnixNano()}); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Upsert() error = %v", err)
+	}
+	secretPath := webhookTunnelSecretPath(cfg.Storage.DBPath, secretRef)
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o700); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	forwarder := &testTunnelForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	rt := newWebhookRuntime(cfg, &testLogger{}, time.Now)
+	rt.tunnelStore = repos.WebhookTunnelHooks
+	rt.setAllowedTunnelRepos(map[string]struct{}{repo: {}})
+	rt.forwarder = func() WebhookForwarder { return forwarder }
+
+	body := []byte(`{"repository":{"full_name":"acme/looper"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/host/github/acme/looper", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", "delivery-qualified")
+	req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, body))
+	resp := httptest.NewRecorder()
+
+	(&webhookTunnelServer{runtime: rt}).ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("ServeHTTP() status = %d body=%s, want %d", resp.Code, resp.Body.String(), http.StatusAccepted)
+	}
+	var payload struct {
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
+	}
+	if err := json.Unmarshal(forwarder.lastRequest.Payload, &payload); err != nil {
+		t.Fatalf("decode forwarded payload: %v", err)
+	}
+	if payload.Repository.FullName != repo {
+		t.Fatalf("forwarded repository.full_name = %q, want %q", payload.Repository.FullName, repo)
+	}
 }

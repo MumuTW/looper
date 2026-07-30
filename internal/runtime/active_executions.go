@@ -15,17 +15,15 @@ import (
 // live stop/kill must not reconstruct ownership from SQLite PID.
 var ErrAgentLiveHandleMissing = errors.New("agent live containment handle is missing")
 
-type activeExecution interface {
-	Kill(string) error
-}
-
 type ownedExecution struct {
 	loopID      string
 	runID       string
 	executionID string
 	// softKill notifies the agent execution status path (async killCh).
 	softKill agent.SoftKillFunc
-	// handle is the process containment Authority for confirmed drain.
+	// handle is the process-containment authority for confirmed drain. Every
+	// execution entry is published by BindHandle, so handle is non-nil; pending
+	// spawn windows stay in pending until they have a containment handle.
 	handle *processcontainment.Handle
 }
 
@@ -474,7 +472,7 @@ func (l *spawnLease) Release() {
 		l.mu.Lock()
 		handle := l.handle
 		l.mu.Unlock()
-		if entry.handle == handle || (entry.handle == nil && handle == nil) {
+		if entry.handle == handle {
 			delete(r.executions, key)
 		}
 	}
@@ -552,6 +550,8 @@ type loopStopTargets struct {
 }
 
 // collectLoopStopTargetsLocked snapshots leases and bound handles for loopID.
+// The bound containment handle is authoritative for live process ownership;
+// durable execution status may lag it and must not make a live entry skippable.
 // Caller must hold r.mu.
 func (r *ActiveExecutionRegistry) collectLoopStopTargetsLocked(loopID string) loopStopTargets {
 	var t loopStopTargets
@@ -576,11 +576,8 @@ func (r *ActiveExecutionRegistry) collectLoopStopTargetsLocked(loopID string) lo
 			}
 		}
 	}
-	// Only drain entries with a containment handle. SoftKill-only Register
-	// stubs (tests / transitional) stay for haltLoop Kill-by-id, which still
-	// consults durable execution status and must not half-kill stale rows.
 	for _, entry := range r.executions {
-		if entry != nil && entry.loopID == loopID && entry.handle != nil {
+		if entry != nil && entry.loopID == loopID {
 			t.toKill = append(t.toKill, entry)
 		}
 	}
@@ -645,7 +642,7 @@ func (r *ActiveExecutionRegistry) cancelAndDrainLoop(loopID, reason string, t lo
 		r.mu.Lock()
 		second := make([]*ownedExecution, 0)
 		for _, entry := range r.executions {
-			if entry != nil && entry.loopID == loopID && entry.handle != nil {
+			if entry != nil && entry.loopID == loopID {
 				second = append(second, entry)
 			}
 		}
@@ -968,7 +965,7 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 		r.mu.Lock()
 		second := make([]*ownedExecution, 0, len(r.executions))
 		for _, entry := range r.executions {
-			if entry != nil && entry.handle != nil {
+			if entry != nil {
 				second = append(second, entry)
 			}
 		}
@@ -1062,52 +1059,9 @@ func (r *ActiveExecutionRegistry) drainNonAgentHandles(budget time.Duration) err
 	return drainErr
 }
 
-// Register is retained for tests and transitional paths that hold an
-// activeExecution without a containment handle. Production agent spawns must
-// use AdmitSpawn + BindHandle at the common executor boundary (#576).
-// A contract test fails if only the worker role registers post-spawn.
-func (r *ActiveExecutionRegistry) Register(loopID, runID, executionID string, execution activeExecution) func() {
-	if r == nil || execution == nil {
-		return func() {}
-	}
-	key := activeExecutionKey(loopID, runID, executionID)
-	r.mu.Lock()
-	if r.admissionClosed || (loopID != "" && r.stoppingLoops[loopID] != nil) {
-		reason := r.shutdownReason
-		if reason == "" {
-			reason = "execution admission is closed"
-		}
-		if loopID != "" && r.stoppingLoops[loopID] != nil {
-			reason = "loop is stopping"
-		}
-		r.mu.Unlock()
-		_ = execution.Kill(reason)
-		return func() {}
-	}
-	soft := agent.SoftKillFunc(execution.Kill)
-	r.executions[key] = &ownedExecution{
-		loopID:      loopID,
-		runID:       runID,
-		executionID: executionID,
-		softKill:    soft,
-	}
-	r.mu.Unlock()
-	return func() {
-		r.mu.Lock()
-		if entry, ok := r.executions[key]; ok && entry.softKill != nil {
-			// Compare via pointer identity is unavailable for funcs; drop by key
-			// only when still the soft-kill-only registration (no handle).
-			if entry.handle == nil {
-				delete(r.executions, key)
-			}
-		}
-		r.mu.Unlock()
-	}
-}
-
 // Kill stops a live owned agent by containment handle (confirmed drain) when
-// bound, otherwise via softKill. Returns (false, nil) when no live ownership
-// entry exists — callers must not fall back to SQLite PID after #576.
+// bound. Returns (false, nil) when no live ownership entry exists — callers
+// must not fall back to SQLite PID after #576.
 //
 // When BeginLoopStop already confirmed-drained this key and releaseLease removed
 // the entry during handle.Kill, returns (true, nil) so haltLoop does not treat
@@ -1142,7 +1096,7 @@ func (r *ActiveExecutionRegistry) rememberStopDrain(entry *ownedExecution, killE
 	}
 	// Record only when kill succeeded, or the containment handle is already dead
 	// (soft-kill error after confirmed handle drain must still count).
-	if killErr != nil && (entry.handle == nil || !entry.handle.ConfirmedDead()) {
+	if killErr != nil && !entry.handle.ConfirmedDead() {
 		return
 	}
 	key := activeExecutionKey(entry.loopID, entry.runID, entry.executionID)
@@ -1208,13 +1162,10 @@ func (r *ActiveExecutionRegistry) killOwned(entry *ownedExecution, reason string
 	if entry.softKill != nil {
 		softErr = entry.softKill(reason)
 	}
-	if entry.handle != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), r.killBudget())
-		defer cancel()
-		if err := entry.handle.Kill(ctx); err != nil {
-			return errors.Join(softErr, err)
-		}
-		return softErr
+	ctx, cancel := context.WithTimeout(context.Background(), r.killBudget())
+	defer cancel()
+	if err := entry.handle.Kill(ctx); err != nil {
+		return errors.Join(softErr, err)
 	}
 	return softErr
 }

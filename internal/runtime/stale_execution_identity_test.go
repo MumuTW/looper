@@ -2,9 +2,12 @@ package runtime
 
 import (
 	"context"
+	"os/exec"
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -88,7 +91,7 @@ func TestRuntimeReconcileNeverOverridesCurrentSupervisorOwner(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
-	release := rt.Services().ActiveExecutions.Register(loopID, runID, executionID, stubAgentExecution{})
+	release := bindStaleExecutionTestOwner(t, rt.Services().ActiveExecutions, loopID, runID, executionID)
 	defer release()
 
 	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
@@ -97,5 +100,34 @@ func TestRuntimeReconcileNeverOverridesCurrentSupervisorOwner(t *testing.T) {
 	}
 	if summary.InterruptedRuns != 0 || summary.CleanedExecutions != 0 || summary.LoopsRequeued != 0 {
 		t.Fatalf("summary = %#v, want current Supervisor owner preserved", summary)
+	}
+}
+
+func bindStaleExecutionTestOwner(t *testing.T, registry *ActiveExecutionRegistry, loopID, runID, executionID string) func() {
+	t.Helper()
+	lease, err := registry.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: loopID, RunID: runID, ExecutionID: executionID})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		lease.Release()
+		t.Fatalf("start test process: %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{GracePeriod: 10 * time.Millisecond, DrainTimeout: time.Second})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		lease.Release()
+		t.Fatalf("bind test process: %v", err)
+	}
+	if err := lease.BindHandle(handle, nil); err != nil {
+		_ = handle.Kill(context.Background())
+		lease.Release()
+		t.Fatalf("BindHandle: %v", err)
+	}
+	return func() {
+		_ = handle.Kill(context.Background())
+		lease.Release()
 	}
 }

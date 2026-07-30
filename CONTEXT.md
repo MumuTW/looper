@@ -9,51 +9,67 @@ Looper is a daemon (`looperd`) plus CLI (`looper`) that runs autonomous agent **
 A **Role** is a configured agent that performs one specific job in the issue/PR lifecycle.
 
 **Provider**:
-A configured forge integration that owns remote Issues, Pull Requests, labels, comments, reviews, webhooks, and identity for a Project. Git remains separate and owns local repositories, refs, and worktrees.
+Defined at `config.ProviderConfig` in `internal/config`, whose doc comment
+carries the semantics: the configured forge integration owning a Project's
+remote state, with Git separately owning local repositories.
 _Avoid_: forge, host, remote.
 
 **Project**:
-A durable local registration that binds one repository to one Provider and supplies the project-level policy consumed by Roles. The SQLite project record is the runtime Authority for whether a Project exists and for its repository/Provider binding; `[[projects]]` is a startup import, not a parallel runtime Authority.
+Defined at `storage.ProjectRecord` in `internal/storage`, whose doc comment
+carries the semantics: the durable registration that is the runtime Authority
+for a Project's existence and repository/Provider binding.
 _Avoid_: config project, runtime binding.
 
 **Project Catalog**:
-The startup-built, immutable view of active Projects materialized from SQLite records after configuration import. Runtime modules consume the Project Catalog through the existing normalized project configuration interface; they do not consult the original `[[projects]]` input.
+Defined at `internal/projects.Catalog`, whose doc comment carries the
+semantics: the startup-built, immutable view of active Projects materialized
+from SQLite records.
 _Avoid_: registry, live config projects.
 
 **Planner**:
-A reactive Role that produces a Spec from an Issue.
+Defined at `planner.Runner` in `internal/planner`, whose doc comment carries
+the semantics: a reactive Role producing a Spec from an Issue.
 _Avoid_: designer, architect.
 
 **Triager**:
-An internal proactive Role for the personal GitHub workflow. It consumes new
-and reopened Issue events, persists a structured Triage Report, and projects
-accepted low-risk reports directly into Planner work. It has no configurable
-trigger labels and does not replace Fixer's review-feedback source.
+Defined at `triager.Runner` in `internal/triager`, whose doc comment carries
+the semantics: the internal proactive Role that persists Triage Reports and
+projects accepted low-risk reports into Planner work.
 _Avoid_: coordinator (a separate label/network control-plane role).
 
 **Worker**:
-A reactive Role that implements a Spec or an Issue, producing a Pull Request.
+Defined at `worker.Runner` in `internal/worker`, whose doc comment carries the
+semantics: a reactive Role implementing a Spec or an Issue into a Pull Request.
 _Avoid_: implementer, builder, coder.
 
 **Reviewer**:
-A reactive Role that reviews a Pull Request and posts review comments.
+Defined at `reviewer.Runner` in `internal/reviewer`, whose doc comment carries
+the semantics: a reactive Role reviewing a Pull Request.
 _Avoid_: critic, checker.
 
 **Fixer**:
-A reactive Role that addresses review feedback on a Pull Request.
+Defined at `fixer.Runner` in `internal/fixer`, whose doc comment carries the
+semantics: a reactive Role addressing review feedback on a Pull Request.
 _Avoid_: patcher, responder.
 
 **Merge Gatekeeper**:
-A reactive, agent-free policy Role that re-fetches current Pull Request state and writes an observe-only **Gate report**. It never reviews code, repairs a Pull Request, resolves comments, or merges.
+Defined at `gatekeeper.Runner` in `internal/gatekeeper`, whose doc comment
+carries the semantics: the agent-free policy Role writing observe-only **Gate
+report**s, never reviewing, repairing, resolving, or merging.
 _Avoid_: merger, reviewer, fixer.
 
 **Coordinator**:
-A proactive, LLM-driven Role for the legacy label-mediated intake path that performs Triage on fresh Issues and executes Dispatch. In Network mode, Coordinator is also the control plane for Issue admission, PR review assignment, and exact Node targeting, gated by the Network Lease. The internal Triager stands down while Coordinator is enabled for a Project so the two intake authorities cannot race.
+Defined at `coordinator.Runner` in `internal/coordinator`, whose doc comment
+carries the semantics: the proactive intake Role performing Triage and
+Dispatch, and in Network mode the Lease-gated control plane; the internal
+Triager stands down while it is enabled for a Project.
 _Avoid_: manager, commander, maintainer.
 
 ### Issue lifecycle
 
 **Triage**:
+(Prose-only: an act spanning two paths; its durable artifacts — Triage Report
+and Disposition — are anchored above.)
 The act of forming an opinion about a fresh Issue. In the personal GitHub path,
 Triager persists the opinion as a Triage Report. In the legacy
 Coordinator path, Coordinator applies classification labels, posts a triage
@@ -62,19 +78,18 @@ authority, and they do not run concurrently for one Project.
 _Avoid_: assessment.
 
 **Triage Report**:
-Triager's durable structured record containing classification, scope, risk,
-confidence, missing information, recommended next Role, rationale, the source
-Issue event, idempotency key, and policy outcome. It is stored as a
-`triage.report` event and is the semantic Authority for automatic Planner
-routing. GitHub labels may project its outcome but cannot replace it.
+Defined at `triager.ReportEventType` in `internal/triager`, whose doc comment
+carries the semantics: Triager's durable structured record, stored as a
+`triage.report` event, and the semantic Authority for automatic Planner
+routing.
 _Avoid_: routing label, inferred issue state.
 
 **Triage enrollment**:
-Triager's durable record that a specific new/reopened source event entered the
-workflow before any LLM call. `triage.enrolled` provides retry identity across
-agent outages and source-lookback expiry; it does not authorize Planner.
-`triage.routed` acknowledges an accepted projection, while `triage.retired`
-settles a source that closed or was superseded.
+Defined at `triager.EnrollmentEventType` in `internal/triager`, whose doc
+comment carries the semantics: the durable pre-LLM record giving a source
+event retry identity. `triage.routed` acknowledges an accepted projection and
+`triage.retired` settles a closed or superseded source (constants in the same
+block).
 _Avoid_: routing authority, report.
 
 **Triage routing**:
@@ -82,15 +97,36 @@ The projection of an accepted Triage Report into Planner's durable loop and
 queue without consulting Planner's label/assignee discovery filters. This is
 distinct from Coordinator Dispatch, which remains the label-mediated action
 defined below. A report held by policy may instead be authorized by a later
-`triage.confirmed` record derived from an exact `/plan` comment by a repository
-collaborator with write access.
+`triage.confirmed` record derived from a `/plan <confirmation token>` comment by
+a repository collaborator with write access. The command must be the entire
+first line of the comment; text after it is a Clarification.
 _Avoid_: Dispatch (reserved for Coordinator).
 
+**Triage Ask**:
+Triager's durable record that it has asked a human to release a held report,
+stored as a `triage.asked` event. It is the idempotency authority for the
+question — a report carrying an Ask is never asked again — and the delivery
+channel for the report's Confirmation token, which exists nowhere else outside
+the local event log. The question is posted as an Issue comment listing the
+missing information and the exact command to reply with.
+_Avoid_: reminder, nag.
+
+**Clarification**:
+The answer a human supplies after the confirmation command, recorded on the
+`triage.confirmed` event and handed to Planner alongside the Issue. Planner is
+told it supersedes the Issue body where the two conflict, because Planner reads
+only the Issue title and body and would otherwise never see it.
+_Avoid_: reply, follow-up.
+
 **Disposition**:
-Coordinator's high-level conclusion about an Issue. One of `valid`, `out-of-scope`, `unclear`. Distinct from `kind`/`area`/`complexity`, which are classification labels applied only when the Disposition is `valid`.
+Defined at `internal/coordinator/triage.Disposition`, whose doc comment carries
+the semantics: the high-level conclusion (`valid` / `out-of-scope` / `unclear`),
+distinct from the classification labels applied only when `valid`.
 _Avoid_: verdict, outcome, status.
 
 **Dispatch**:
+(Prose-only: the act's durable Authority is the GitHub `dispatch/*` label; no
+single Go type defines the act itself.)
 The act of putting an Issue into a state where Planner or Worker will discover it: applying the role's trigger label and assigning the configured user. Performed by Coordinator either on human slash-command (human-gated mode) or autonomously after a grace window (autonomous mode).
 _Avoid_: handoff (overloaded — see below), route, promote, enqueue.
 
@@ -99,35 +135,50 @@ The label a reactive Role watches for to claim an Issue or Pull Request. Configu
 _Avoid_: queue label, pickup label, routed label, dispatched label, target label.
 
 **Veto signal**:
-A human-applied state on an Issue that blocks Coordinator's autonomous Dispatch. Examples: removing the `dispatch/*` label, applying `looper:hold`, or applying the trigger label manually.
+A human-applied state on an Issue that blocks Coordinator's autonomous Dispatch. Examples: removing the `dispatch/*` label, applying `looper:hold`, or applying the trigger label manually. (Prose-only: the signal is human GitHub state, not a Looper type.)
 
 **Blocker**:
-An Issue listed in another Issue's GitHub-native `blocked_by` set. The Blocker's `state` and `state_reason`, together with `blocked_by` itself, are the named **Authority** for the dependency gate.
+Defined at `internal/coordinator/depgraph.Blocker`, whose doc comment carries
+the semantics: an Issue in another Issue's GitHub-native `blocked_by` set, the
+named **Authority** for the dependency gate.
 
 **Dependency gate**:
-The **Dispatch** precondition that all **Blockers** be `state==closed AND state_reason==completed`. The gate is blocked when any Blocker is open or closed-not-completed, and released when every Blocker satisfies the condition.
+Defined at `internal/coordinator/depgraph.DependencyGraph`, whose doc comment
+carries the semantics: the **Dispatch** precondition over **Blockers**.
 
 **Ready set**:
-The subset of tracked Issues whose **Dependency gate** is currently released — the Issues that may be **Dispatched** this tick, subject to the existing PRD #334 conditions.
+Defined at `internal/coordinator/depgraph.DependencyGraph` (the `ReadySet`
+method), whose doc comment carries the semantics: the tracked Issues whose
+**Dependency gate** is currently released.
 
 **Acceptance criterion**:
-A checkbox item under an Issue's `## Acceptance criteria` section. Reviewer's auto-merge gate verifies each criterion has a satisfying-evidence pointer in the diff before submitting APPROVE.
+Defined at `internal/reviewer/criteria.AcceptanceCriterion`, whose doc comment
+carries the semantics: one checkbox item Reviewer's auto-merge gate verifies
+against diff evidence before APPROVE.
 
 **Auto-merge scope**:
-The Looper-only constraint identifying which PRs Looper may opt into auto-merge: `looper:` label AND tracked-Issue link, both required. Encoded in `roles.reviewer.autoMerge.scope = "looper-only"`.
+Defined at `config.ReviewerAutoMergeScopeLooperOnly` in `internal/config`,
+whose doc comment carries the semantics: the Looper-only constraint
+(`looper:` label AND tracked-Issue link) encoded by
+`roles.reviewer.autoMerge.scope`.
 
 **Merge-pending state**:
-The GitHub-native state of a Pull Request after `gh pr merge --auto` has been called and before GitHub merges or a **Veto signal** arrives. The PR's `auto_merge` field is non-null in this state. Coordinator's merge-watch classifies merge-pending PRs into WatchActions.
+The GitHub-native state of a Pull Request after `gh pr merge --auto` has been called and before GitHub merges or a **Veto signal** arrives. The PR's `auto_merge` field is non-null in this state. Coordinator's merge-watch classifies merge-pending PRs into WatchActions. (Prose-only: a GitHub-native state; the classifier over it is `internal/coordinator/mergewatch.WatchAction`.)
 
 **Watch marker**:
-The `<!-- looper:coordinator:merge-watch retries=N -->` HTML-comment marker Coordinator places on the linked Issue rather than the PR, keeping Coordinator's state rooted on the Issue, to carry merge-watch retry-counter state across ticks. Public, durable, idempotent — preserves ADR-0001's stateless property.
+Defined at `internal/coordinator/mergewatch.PriorWatchMarker`, whose doc
+comment carries the semantics: the Issue-rooted HTML-comment marker that
+carries merge-watch retry-counter state across ticks.
 
 **Gate report**:
-The durable `pull_request.merge_gate.evaluated` event written by Merge Gatekeeper. It records `eligible` or `blocked`, stable reasons and evidence, and the observed head SHA. It is audit evidence, not merge authority: a future merge path must rerun every gate immediately before merging because holds, reviews, threads, and Project policy can change without moving the head.
+Defined at `gatekeeper.GateReportEventType` in `internal/gatekeeper`, whose doc
+comment carries the semantics: Merge Gatekeeper's durable evaluation event —
+audit evidence, not merge authority.
 
 ### Authority and statelessness
 
 **Authority**:
+(Prose-only: a design principle defined in `AGENTS.md`, not a Go type.)
 For any side-effecting action, the named, durable, structured signal that justifies the action. Per `AGENTS.md`: "What is the authority for this action, and why is it not the agent's own structured output?" Coordinator's authority for Dispatch is the durable `dispatch/*` label on the Issue, which is the agent's structured output committed to GitHub.
 Triager's authority for Triage routing is the persisted Triage Report; the
 policy outcome is stored before Planner projection and replayed after partial
@@ -135,42 +186,62 @@ failures. When policy requires a human, the report plus its persisted
 write-authorized confirmation is the Authority.
 
 **Stateless Role**:
+(Prose-only: a property of Roles, not a type; each Role's statefulness is
+stated on its Runner doc.)
 A Role whose memory lives entirely in GitHub (labels, comments with markers, event timeline). It owns no private database tables. Coordinator is stateless. Worker, Planner, Reviewer, and Fixer are not — they persist runs in the local SQLite database.
 
 ### Comment markers
 
 **Stamp**:
-The standard `<!-- looper:stamp v=1 -->` HTML comment plus visible footer applied by every agent-authored comment, identifying the comment as Looper-generated. Defined in `internal/disclosure/disclosure.go`.
+Defined at `disclosure.Stamper` in `internal/disclosure`, whose doc comment
+carries the semantics: the standard `<!-- looper:stamp v=1 -->` HTML comment
+plus visible footer on every agent-authored comment.
 
 **Self-dedup marker**:
+(Prose-only: each Role defines its own marker string next to the code that
+posts it; there is deliberately no shared type.)
 A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) used by a stateless Role to recognise its own prior comments and avoid duplicate posts.
 
 ### Network
 
 **Network**:
+(Prose-only: a system-of-instances concept; its code-defined parts — Node,
+Lease, Target label — are anchored in this section.)
 A coordinated set of `looperd` instances that share Coordinator admission/assignment decisions for a configured set of repositories. A Node joins exactly one Network at a time. Hosted by a `loopernet` instance (one Network per `loopernet`).
 
 **Node**:
-A single `looperd` instance enrolled in a Network. Identified by an opaque cloud-issued ID and a human-readable Name (short label-safe string; convention is to use a color, e.g. `red`, `blue`, `cyan`).
+Defined at `internal/network/protocol.ValidateNodeName`, whose doc comment
+carries the semantics: a single `looperd` instance enrolled in a Network,
+identified by an opaque cloud-issued ID plus a validated human-readable Name.
 _Avoid_: peer, member, instance, agent.
 
 **Coordinator control plane**:
+(Prose-only: a responsibility of `coordinator.Runner` in Network mode, spanning
+admission, assignment, and the protocol package's target labels.)
 The Network-aware Coordinator responsibility that decides Issue admission and PR review assignment, then applies the GitHub state that Worker/Reviewer consume. In Routed projects it also applies an exact target label (`looper:target:<node_name>`) so a specific Node can claim the work.
 _Avoid_: router, dispatcher, scheduler, balancer.
 
 **Routed project**:
-A project whose `network.mode` is `routed`. Coordinator admission/assignment is performed by the current Network Lease holder. Worker/Reviewer claim only when the exact target label matches the local Node and the role-specific GitHub-native coarse target is present. The complement is a *local-only project*, whose Roles keep existing single-machine behaviour and ignore `looper:target:*` labels.
+Defined at `networkpolicy.IsRouted` in `internal/networkpolicy`, whose doc
+comment carries the semantics: `network.mode` `routed`, Lease-held
+admission/assignment, exact-target claiming; the complement is a local-only
+project.
 
 **Target label**:
 Constructed and parsed by `protocol.TargetLabelForNode` and `protocol.ParseTargetLabel` in `internal/network/protocol`, which is where they live because forming one requires validating a Node name. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim; target labels are ignored in local-only projects.
 _Avoid_: trigger label, routed label, worker-ready suffix.
 
 **Lease**:
-The durable Authority for Network Coordinator control-plane leadership. A row in the `loopernet` database with a fencing token, validated at every GitHub side-effect boundary.
+Defined at `internal/network/protocol.CoordinatorLease`, whose doc comment
+carries the semantics: the durable Authority for Network Coordinator
+control-plane leadership, fencing-token validated at every GitHub side-effect
+boundary.
 
 ### Testing
 
 **Live sandbox**:
+(Prose-only: test infrastructure convention; see `e2e/` and the sandbox CI
+workflows.)
 A dedicated remote repository on a real Provider used for live end-to-end tests. It is isolated from product and developer repositories, but still performs real provider mutations.
 _Avoid_: local sandbox, mock sandbox.
 
@@ -191,6 +262,7 @@ _Avoid_: local sandbox, mock sandbox.
 
 ## Flagged ambiguities
 
+- **Disposition (name collision)** — `criteria.AggregateDisposition` (pass/fail/unverifiable) and `depgraph`'s blocker disposition reuse the word for unrelated concepts; only `internal/coordinator/triage.Disposition` is the glossary's Disposition. Qualify on first use anywhere the packages meet.
 - **classification** — used by humans to mean both Disposition and the kind/area labels. Resolved: Disposition is the high-level conclusion (`valid` / `out-of-scope` / `unclear`); kind/area/complexity are classification *labels* applied during a `valid` Triage. The unqualified word "classification" is avoided in favor of "Disposition" or "label".
 - **handoff** — already used in code (`authoritative handoff fields`) for the PR-seed contract between Reviewer and Fixer. Not used for Coordinator's Dispatch action, which is a different concept. Use "Dispatch" exclusively for the Coordinator action.
 - **manager / commander / maintainer** — early names considered for the Coordinator Role. Rejected: "manager" implies it directs other Roles (it doesn't, it sets labels), "commander" overpromises authority, "maintainer" is a human role.

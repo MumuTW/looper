@@ -304,7 +304,7 @@ type PullRequestLabelsInput struct {
 
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
-	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	GetPullRequestAuthor(context.Context, ViewPullRequestInput) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error)
@@ -546,6 +546,8 @@ type DiscoveryPolicy struct {
 	LabelMode     config.LabelMode
 }
 
+// Runner is the Fixer: a reactive Role that addresses review feedback on a
+// Pull Request.
 type Runner struct {
 	db                          *sql.DB
 	repos                       *storage.Repositories
@@ -629,6 +631,7 @@ type replyAction string
 const (
 	replyActionFixed    replyAction = "fixed"
 	replyActionDeclined replyAction = "declined"
+	replyActionDeferred replyAction = "deferred"
 )
 
 type fixerFollowupReason string
@@ -714,6 +717,10 @@ type FixerRunOutcome struct {
 	PrimaryFailure  *FixerOutcomeFailure  `json:"primaryFailure,omitempty"`
 	SecondaryIssues []FixerOutcomeFailure `json:"secondaryIssues,omitempty"`
 	Progress        FixerDurableProgress  `json:"progress"`
+	// FollowUpThreadIDs records review threads that were not part of this
+	// repair's snapshot or that the agent explicitly deferred. They remain work
+	// for the next round but do not invalidate this round's decisions.
+	FollowUpThreadIDs []string `json:"followUpThreadIds,omitempty"`
 	// PartialSuccess marks a failed run that nonetheless left durable effects, so an
 	// operator can tell "nothing happened, retry freely" from "some of this shipped".
 	PartialSuccess bool `json:"partialSuccess,omitempty"`
@@ -1130,6 +1137,8 @@ func normalizeReplyAction(raw string) string {
 		return string(replyActionFixed)
 	case replyActionDeclined:
 		return string(replyActionDeclined)
+	case replyActionDeferred:
+		return string(replyActionDeferred)
 	default:
 		return ""
 	}
@@ -1228,6 +1237,48 @@ func looksLikeFixerCheckpoint(run storage.RunRecord, checkpoint fixerCheckpoint)
 	for _, step := range []string{derefString(run.CurrentStep), derefString(run.LastCompletedStep)} {
 		switch asFixerStep(step) {
 		case stepDiscoverPR, stepClaimPR, stepCollectFixes, stepRepair, stepResolveComments, stepRecheck:
+			return true
+		}
+	}
+	return false
+}
+
+func newFollowupThreadIDs(snapshot, live []FixItem) []string {
+	known := make(map[string]struct{}, len(snapshot))
+	for _, item := range snapshot {
+		if threadID := strings.TrimSpace(item.ThreadID); threadID != "" {
+			known[threadID] = struct{}{}
+		}
+	}
+	ids := make([]string, 0)
+	for _, item := range live {
+		if threadID := strings.TrimSpace(item.ThreadID); threadID != "" {
+			if _, exists := known[threadID]; !exists {
+				ids = append(ids, threadID)
+			}
+		}
+	}
+	return canonicalizeStringSlice(ids)
+}
+
+func hasNewFollowupFixItems(snapshot, live []FixItem) bool {
+	for _, item := range live {
+		// #189 follows review threads. A changed CI/check item already has its
+		// own discovery lifecycle and must not turn a completed repair round
+		// into an unsolicited follow-up.
+		if strings.TrimSpace(item.ThreadID) != "" && !fixItemPresentInLiveReview(item, snapshot) {
+			return true
+		}
+	}
+	return false
+}
+
+func fixItemPresentInLiveReview(item FixItem, live []FixItem) bool {
+	for _, candidate := range live {
+		if item.ID != "" && item.ID == candidate.ID {
+			return true
+		}
+		if item.ThreadID != "" && item.ThreadID == candidate.ThreadID {
 			return true
 		}
 	}
@@ -1595,7 +1646,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	policy := r.discoveryPolicyForProject(project.ID)
 	currentUser := ""
 	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
-		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -1702,7 +1753,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	}
 	currentUser := ""
 	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
-		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -1755,7 +1806,7 @@ func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, in
 	policy := r.discoveryPolicyForProject(project.ID)
 	currentUser := ""
 	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
-		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -2732,7 +2783,7 @@ func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, loop storag
 	if r.discoveryPolicyForProject(projectID).AuthorFilter == config.FixerAuthorFilterAny {
 		return "", nil
 	}
-	currentUser, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, repo, cwd)
 	if err != nil {
 		return "", err
 	}
@@ -3735,9 +3786,29 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
-	fixItems := collectFixItems(liveDetail)
-	checkpoint.FixItems = fixItems
-	checkpoint.FixItemsHash = hashFixItems(fixItems)
+	liveFixItems := collectFixItems(liveDetail)
+	// The repair snapshot is the authority for this resolve pass. Replacing it
+	// with live feedback would ask the agent to account for a thread it never
+	// saw, then incorrectly classify that absence as a contract violation.
+	useRepairSnapshot := checkpoint.Repair != nil && strings.TrimSpace(checkpoint.Repair.CompletedAt) != ""
+	fixItems := liveFixItems
+	if useRepairSnapshot {
+		fixItems = append([]FixItem(nil), checkpoint.FixItems...)
+		if checkpoint.Outcome == nil {
+			checkpoint.Outcome = &FixerRunOutcome{}
+		}
+		checkpoint.Outcome.FollowUpThreadIDs = canonicalizeStringSlice(append(checkpoint.Outcome.FollowUpThreadIDs, newFollowupThreadIDs(fixItems, liveFixItems)...))
+		if hasNewFollowupFixItems(fixItems, liveFixItems) {
+			if _, err := r.recordPendingFixerRediscovery(ctx, input.Loop, liveDetail.HeadSHA, hashFixItemsState(liveFixItems), unresolvedThreadIDs(liveFixItems)); err != nil {
+				return checkpoint, err
+			}
+		} else if _, err := r.clearPendingFixerRediscovery(ctx, input.Loop); err != nil {
+			return checkpoint, err
+		}
+	} else {
+		checkpoint.FixItems = liveFixItems
+		checkpoint.FixItemsHash = hashFixItems(liveFixItems)
+	}
 	if checkpoint.ResolvedComments == nil {
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
 	}
@@ -3758,6 +3829,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	driftCount := 0
 	mutationFailureCount := 0
+	deferredThreadIDs := make([]string, 0)
 	// Drift detection must be anchored to when the agent recorded the
 	// reply explanations, not when the current (possibly retried) run
 	// started. Otherwise a reviewer comment posted between the original
@@ -3780,6 +3852,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	// unbreakable drift loop.
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
+			continue
+		}
+		if useRepairSnapshot && !fixItemPresentInLiveReview(item, liveFixItems) {
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "stale_missing_from_review", UpdatedAt: r.nowISO()})
 			continue
 		}
 		decision, ok := repliesByItemID[item.ID]
@@ -3814,6 +3890,15 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if decisionIssueStatus != "" {
 			contractViolationCount++
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: decisionIssueStatus, Message: decisionIssueMessage, UpdatedAt: r.nowISO()})
+			continue
+		}
+		if normalizeReplyAction(decision.Action) == string(replyActionDeferred) {
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeferred), Status: "deferred", Message: decision.Explanation, UpdatedAt: r.nowISO()})
+			deferredThreadIDs = append(deferredThreadIDs, item.ThreadID)
+			if checkpoint.Outcome == nil {
+				checkpoint.Outcome = &FixerRunOutcome{}
+			}
+			checkpoint.Outcome.FollowUpThreadIDs = canonicalizeStringSlice(append(checkpoint.Outcome.FollowUpThreadIDs, item.ThreadID))
 			continue
 		}
 		if fixedDecisionMissingThreadSnapshot(decision) || threadCommentsObservedDrifted(decision, thread) {
@@ -3885,6 +3970,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, commitSHA, lookupReplyExplanations(checkpoint))
 	}
 	if driftCount > 0 {
+		// A changed thread is not a new follow-up: its prior decision is stale,
+		// so the retry must restart from the current review snapshot.
+		checkpoint.FixItems = liveFixItems
+		checkpoint.FixItemsHash = hashFixItems(liveFixItems)
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because review thread content changed during the fixer run", driftCount), kind: FailureRetryableAfterResume}
 	}
@@ -3896,7 +3985,12 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
 		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s); will retry on next run", mutationFailureCount), kind: FailureRetryableAfterResume}
 	}
-	if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
+	deferredThreadIDs = canonicalizeStringSlice(deferredThreadIDs)
+	if len(deferredThreadIDs) > 0 {
+		if _, err := r.recordFixerFollowupState(ctx, input.Loop, fixerFollowupReasonMissingEvidence, liveDetail.HeadSHA, hashFixItemsState(liveFixItems), deferredThreadIDs, r.now()); err != nil {
+			return checkpoint, err
+		}
+	} else if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
 		return checkpoint, err
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -4133,7 +4227,7 @@ func threadCommentsObservedDrifted(decision replyExplanationEntry, thread Review
 
 func fixedDecisionMissingThreadSnapshot(decision replyExplanationEntry) bool {
 	action := normalizeReplyAction(decision.Action)
-	if action == string(replyActionDeclined) {
+	if action == string(replyActionDeclined) || action == string(replyActionDeferred) {
 		return false
 	}
 	return normalizeThreadCommentsObserved(decision.ThreadCommentsObserved) == ""
@@ -4376,7 +4470,7 @@ func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput
 		return
 	}
 	trustedLogin := ""
-	if login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath); err == nil {
+	if login, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath); err == nil {
 		trustedLogin = login
 	}
 	if existingID, existingURL := findExistingFixerSummaryCommentID(checkpoint.Detail, headSHA, trustedLogin); existingID != 0 {
@@ -4678,15 +4772,65 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 		}
 	}
 	checkpoint.Recheck = &checkpointRecheck{RemainingFixItems: collectFixItems(detail)}
+	blockingFixItems := excludeDeferredFixItems(checkpoint.Recheck.RemainingFixItems, checkpoint.ResolvedComments)
+	if checkpoint.Outcome != nil {
+		blockingFixItems = excludeFollowupThreads(blockingFixItems, checkpoint.Outcome.FollowUpThreadIDs)
+	}
 	verifiedNoPushHead := resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, input.Loop.MetadataJSON, checkpoint.FixItemsHash)
 	hasVerifiedNoPushHead := verifiedNoPushHead != "" && strings.TrimSpace(detail.HeadSHA) == verifiedNoPushHead
-	if shouldBlockResolveWithoutFix(checkpoint, checkpoint.Recheck.RemainingFixItems, hasVerifiedNoPushHead) {
+	if shouldBlockResolveWithoutFix(checkpoint, blockingFixItems, hasVerifiedNoPushHead) {
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonNoopResolveNoNewCommits, true, strings.TrimSpace(detail.HeadSHA), currentRecheckFixItemsStateHash(checkpoint), unresolvedThreadIDs(suppressDeclinedFixItems(input.Loop.MetadataJSON, strings.TrimSpace(detail.HeadSHA), checkpoint.Recheck.RemainingFixItems)))
 		return checkpoint, &loopError{message: "resolve-comments left review threads unresolved because fixer produced no new commits to push", kind: FailureManualIntervention}
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func excludeDeferredFixItems(fixItems []FixItem, resolved *checkpointResolvedComments) []FixItem {
+	if resolved == nil || len(resolved.Items) == 0 {
+		return fixItems
+	}
+	deferred := make(map[string]struct{})
+	for _, item := range resolved.Items {
+		if item.Status != "deferred" {
+			continue
+		}
+		if item.FixItemID != "" {
+			deferred["id:"+item.FixItemID] = struct{}{}
+		}
+		if item.ThreadID != "" {
+			deferred["thread:"+item.ThreadID] = struct{}{}
+		}
+	}
+	out := make([]FixItem, 0, len(fixItems))
+	for _, item := range fixItems {
+		_, byID := deferred["id:"+item.ID]
+		_, byThread := deferred["thread:"+item.ThreadID]
+		if !byID && !byThread {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func excludeFollowupThreads(fixItems []FixItem, threadIDs []string) []FixItem {
+	if len(threadIDs) == 0 {
+		return fixItems
+	}
+	followup := make(map[string]struct{}, len(threadIDs))
+	for _, threadID := range threadIDs {
+		if threadID = strings.TrimSpace(threadID); threadID != "" {
+			followup[threadID] = struct{}{}
+		}
+	}
+	out := make([]FixItem, 0, len(fixItems))
+	for _, item := range fixItems {
+		if _, ok := followup[item.ThreadID]; !ok {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) (resumedRunContext, error) {
@@ -9255,7 +9399,7 @@ func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput
 	if err != nil {
 		return
 	}
-	self, _ := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	self, _ := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 	seen := map[string]bool{}
 	reviewers := make([]string, 0, len(reviews))
 	for _, rv := range reviews {

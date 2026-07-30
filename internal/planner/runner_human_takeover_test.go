@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -26,8 +27,8 @@ func newHeldPlannerLoopFixture(t *testing.T) (*runnerFixture, *Runner) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{
-		issues:      []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}}},
-		issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{"looper:plan"}},
+		issues:      []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}},
+		issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}},
 	}
 	runner := New(Options{DB: base.coordinator.DB(), Repos: base.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: base.logger, Now: base.now})
 	return base, runner

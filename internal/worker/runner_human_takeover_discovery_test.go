@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -29,7 +30,7 @@ func TestDiscoverIssuesSkipsHumanHeldWorkerLoop(t *testing.T) {
 	if err := fixture.repos.Loops.UpsertChangingHumanHold(ctx, held); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.DiscoverIssues(ctx, DiscoveryInput{ProjectID: "project_1", Repo: repo})
@@ -70,8 +71,8 @@ func TestDiscoverIssuesHeldLoopDoesNotAbortBatch(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{
-		{Number: 46, Title: "Held by a human", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}},
-		{Number: 47, Title: "Ordinary work", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}},
+		{Number: 46, Title: "Held by a human", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}},
+		{Number: 47, Title: "Ordinary work", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}},
 	}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
@@ -107,7 +108,7 @@ func TestDiscoverIssuesHandbackDirection(t *testing.T) {
 	if err := fixture.repos.Loops.UpsertChangingHumanHold(ctx, seeded); err != nil {
 		t.Fatalf("Loops.UpsertChangingHumanHold() error = %v", err)
 	}
-	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Fresh title from GitHub", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Fresh title from GitHub", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	// A pass over the held loop must not touch the row at all — not even the

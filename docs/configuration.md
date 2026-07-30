@@ -431,19 +431,23 @@ Provider rules:
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`. A configured `forgejo` or `plane` kind is rejected with an explicit unsupported-provider error — both were removed and are never reinterpreted as a supported provider.
 - **Upgrading from a config that used a removed provider:** delete the `[[providers]]` entry and any `[[projects]]` bound to it before starting the new daemon. A project registered through the dashboard or `POST /api/v1/projects` (`source = "api"`) survives in SQLite independently of the config file, and startup fails while it references a provider the config no longer declares. Because the daemon is down, its own DELETE endpoint cannot repair it; the startup error names the `sqlite3` statement that removes the stored row.
-- `providers[].baseUrl` is optional; when set it must be an absolute `http(s)` URL. **It does not point Looper at that host.** Its only consumer is repository identity, which is what lets two projects carry the same `owner/name` slug without colliding. Every GitHub call still goes to whatever host `gh` resolves.
+- `providers[].baseUrl` is optional and, when set, must be a `github.com` URL (`github.com`, `www.github.com`, or `api.github.com`). It does not point Looper at a host — the `gh` gateway resolves its own — so a non-github.com value would configure a target Looper cannot drive and is rejected at startup rather than failing later at publish time.
 - `providers[].tokenEnv` names an environment variable, **not the credential the GitHub gateway uses.** Planner, worker, reviewer, fixer, webhook, and discovery calls all authenticate through ambient `gh` auth (`gh auth login`). The named variable is copied unchanged from the daemon environment into trusted `looper review submit` child processes and nowhere else.
 - A project bound to a provider requires both `provider` and a repo (`owner/name`); a binding without a repo is rejected. The project HTTP API can register a local `repoPath` against a running daemon, but provider bindings themselves are file-managed. Already-started work retains its previous catalog snapshot.
-- Config validation rejects two projects whose repository *identities* collide, matched case-insensitively. Identity is provider-qualified (kind + normalized `baseUrl` + repo), so the same `owner/name` under two provider ids with different `baseUrl` values is allowed, while two ids that normalize to the same endpoint are a duplicate.
+- Config validation rejects two projects whose repository *identities* collide, matched case-insensitively. Every provider resolves to github.com, so the same `owner/name` slug is a duplicate no matter how many provider ids it is split across.
 
 ### GitHub Enterprise Server
 
-GHES is **not supported**. Some read paths would follow a host-qualified `projects[].repo` (`host/owner/name`) because the gateway derives `gh --hostname` from it, but that shape breaks other paths in ways that fail at publish time rather than at startup:
+GHES is **not supported, and configuring it is now rejected at startup** rather than accepted and failed later:
 
-- trusted `looper review submit` takes a REST branch that embeds the repo verbatim into `repos/{repo}/pulls/{n}/reviews`, producing `repos/host/owner/name/pulls/...` against the ambient host
-- webhook tunnel routing accepts only `/webhook/{owner}/{repo}`, so a host-qualified repo 404s every delivery, and the payload's `repository.full_name` would not match the configured key anyway
+```
+providers[0].baseUrl: must be a github.com URL or omitted; GitHub Enterprise Server is not supported
+```
 
-Do not configure it. Wiring the host through the gateway, review-submit, and tunnel routing consistently is the work that would make GHES real.
+The reason it cannot simply be pointed at a host: `providers[].baseUrl` reaches repository identity and nothing else, and the two mechanisms that could route are inconsistent. The gateway derives `gh --hostname` from a three-segment `projects[].repo` (`host/owner/name`), but the review-submit REST branch — which `looper review submit` always takes, because it supplies `commit_id` — interpolates the repo verbatim into `repos/{repo}/pulls/{n}/reviews`, and webhook tunnel routing accepts only `/webhook/{owner}/{repo}`. Both fail after startup, at publish and delivery time.
+
+Threading one host authority through the gateway, review-submit, and the tunnel router is the work that would make GHES real. Until then, failing at startup is the honest outcome.
+
 
 GitHub live sandbox tests now prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`. The older `LOOPER_E2E_SANDBOX_REPO` name remains a compatibility alias, but setting both names to different repos fails fast.
 
@@ -752,7 +756,7 @@ OPENAI_API_KEY = "replace-me"
 
 # Agent subprocesses inherit only execution-safe host variables (for example,
 # PATH, HOME, locale, temporary/configuration directories, certificate paths,
-# SSH_AUTH_SOCK, and LOOPER_CONFIG so trusted wrappers resolve the same config).
+# SSH_AUTH_SOCK, and LOOPER_CONFIG so agent-invoked looper commands resolve the same config).
 # Add required credentials or tool-specific variables here.
 
 [agent.nativeResume]

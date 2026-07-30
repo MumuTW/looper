@@ -6,12 +6,13 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/coordinator/depgraph"
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 func TestHumanGatedPlanByAllowedUserAppliesPlannerTrigger(t *testing.T) {
 	t.Parallel()
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, Comments: []Comment{{ID: 41, Author: "octo", HasWriteAccess: true, Body: "/plan"}}}, testConfig(), time.Now(), nil)
-	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" || action.AssignTo != "octocat" || action.ReactionCommentID != 41 || action.ReactionContent != ReactionSuccess {
+	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != labels.DefaultPlanTrigger || action.AssignTo != "octocat" || action.ReactionCommentID != 41 || action.ReactionContent != ReactionSuccess {
 		t.Fatalf("action = %#v, want planner dispatch with success reaction", action)
 	}
 }
@@ -19,7 +20,7 @@ func TestHumanGatedPlanByAllowedUserAppliesPlannerTrigger(t *testing.T) {
 func TestHumanGatedImplementAppliesWorkerTrigger(t *testing.T) {
 	t.Parallel()
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchImplement}, Comments: []Comment{{ID: 42, Author: "octo", HasWriteAccess: true, Body: "/implement"}}}, testConfig(), time.Now(), nil)
-	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:worker-ready" || action.ReactionContent != ReactionSuccess {
+	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != labels.DefaultWorkerReadyTrigger || action.ReactionContent != ReactionSuccess {
 		t.Fatalf("action = %#v, want worker dispatch with success reaction", action)
 	}
 }
@@ -46,14 +47,14 @@ func TestHumanGatedSkipsNewerUnauthorizedCommandAttempt(t *testing.T) {
 		{ID: 44, Author: "octo", HasWriteAccess: true, Body: "/plan"},
 		{ID: 45, Author: "outsider", Body: "/implement"},
 	}}, testConfig(), time.Now(), nil)
-	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" || action.AssignTo != "octocat" || action.ReactionCommentID != 44 || action.ReactionContent != ReactionSuccess {
+	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != labels.DefaultPlanTrigger || action.AssignTo != "octocat" || action.ReactionCommentID != 44 || action.ReactionContent != ReactionSuccess {
 		t.Fatalf("action = %#v, want latest authorized command to dispatch", action)
 	}
 }
 
 func TestHumanGatedTriggerAlreadyPresentIsIdempotent(t *testing.T) {
 	t.Parallel()
-	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "looper:plan"}, Comments: []Comment{{ID: 45, Author: "octo", HasWriteAccess: true, Body: "/plan"}}}, testConfig(), time.Now(), nil)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, labels.DefaultPlanTrigger}, Comments: []Comment{{ID: 45, Author: "octo", HasWriteAccess: true, Body: "/plan"}}}, testConfig(), time.Now(), nil)
 	if !action.NoOp || len(action.TriggerLabels) != 0 || action.ReactionContent != ReactionSuccess || action.ReactionCommentID != 45 {
 		t.Fatalf("action = %#v, want idempotent success ack", action)
 	}
@@ -70,9 +71,9 @@ func TestHumanGatedMissingTriagedFails(t *testing.T) {
 func TestHumanGatedPlanAppliesAllPlannerTriggersWhenConfigured(t *testing.T) {
 	t.Parallel()
 	cfg := testConfig()
-	cfg.PlannerTriggerLabels = []string{"looper:plan", "team:planner"}
+	cfg.PlannerTriggerLabels = []string{labels.DefaultPlanTrigger, "team:planner"}
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, Comments: []Comment{{ID: 48, Author: "octo", HasWriteAccess: true, Body: "/plan"}}}, cfg, time.Now(), nil)
-	if len(action.TriggerLabels) != 2 || action.TriggerLabels[0] != "looper:plan" || action.TriggerLabels[1] != "team:planner" {
+	if len(action.TriggerLabels) != 2 || action.TriggerLabels[0] != labels.DefaultPlanTrigger || action.TriggerLabels[1] != "team:planner" {
 		t.Fatalf("action = %#v, want all planner triggers", action)
 	}
 }
@@ -98,7 +99,7 @@ func TestHumanGatedBlockedBySatisfiedStillDispatches(t *testing.T) {
 	t.Parallel()
 	graph := dependencyGraph("acme/looper", 1, depgraph.IssueRef{Repo: "acme/looper", Number: 9}, depgraph.IssueState{State: "closed", StateReason: "completed"})
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan}, Comments: []Comment{{ID: 50, Author: "octo", HasWriteAccess: true, Body: "/plan"}}}, testConfig(), time.Now(), graph)
-	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" || action.ReactionContent != ReactionSuccess {
+	if len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != labels.DefaultPlanTrigger || action.ReactionContent != ReactionSuccess {
 		t.Fatalf("action = %#v, want successful dispatch", action)
 	}
 }
@@ -116,11 +117,11 @@ func testConfig() Config {
 	return Config{
 		Mode:                 ModeHumanGated,
 		TriagedLabel:         "triaged",
-		HoldLabel:            "looper:hold",
+		HoldLabel:            labels.HoldGlobal,
 		AutonomousDelay:      30 * time.Minute,
 		SlashCommands:        []string{"/plan", "/implement"},
 		AssignTo:             "octocat",
-		PlannerTriggerLabels: []string{"looper:plan"},
-		WorkerTriggerLabels:  []string{"looper:worker-ready"},
+		PlannerTriggerLabels: []string{labels.DefaultPlanTrigger},
+		WorkerTriggerLabels:  []string{labels.DefaultWorkerReadyTrigger},
 	}
 }

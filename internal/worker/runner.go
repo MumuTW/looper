@@ -67,6 +67,9 @@ const (
 var (
 	workerANSIEscapePattern              = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 	workerStructuredResultMessagePattern = regexp.MustCompile(`^Worker completed without a valid structured result \(parse status: ([a-z_]+)\)\. See Looper logs for details\.$`)
+	// ErrSuccessfulClaimFinalization prevents generic failure recovery from
+	// requeueing externally completed work when the atomic terminal write fails.
+	ErrSuccessfulClaimFinalization = errors.New("worker successful claim finalization failed")
 )
 
 var workerStepSequence = []WorkerStep{
@@ -250,7 +253,7 @@ type GitHubGateway interface {
 	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
-	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
@@ -545,6 +548,8 @@ type DiscoveryPolicy struct {
 	RoutedClaimPolicy          networkpolicy.ProjectPolicy
 }
 
+// Runner is the Worker: a reactive Role that implements a Spec or an Issue,
+// producing a Pull Request.
 type Runner struct {
 	db                      *sql.DB
 	repos                   *storage.Repositories
@@ -869,7 +874,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	login := ""
 	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		login, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -879,7 +884,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	} else if policy.RequireAssigneeCurrentUser {
 		var err error
-		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		login, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -993,6 +998,9 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
+		if errors.Is(err, ErrSuccessfulClaimFinalization) {
+			return nil, err
+		}
 		return r.recoverClaimedItem(ctx, queueItem, err)
 	}
 	return &result, nil
@@ -1060,6 +1068,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	if result, finalized, err := r.finalizePriorSuccessfulClaim(ctx, *loop, queueItem); err != nil || finalized {
+		return result, err
 	}
 	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
 		return ProcessResult{}, err
@@ -1219,67 +1230,20 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 
 	summary := r.buildSuccessSummary(*loop, checkpoint)
-	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
-		return ProcessResult{}, err
-	}
 	status := "success"
 	if checkpoint.SkipReason != "" {
 		status = "skipped"
 	}
-	// A message can arrive after the execute step acknowledged its prompt
-	// snapshot but before this queue item completes. Serialize finalization with
-	// enqueue so a message linearized while the loop is running gets another turn
-	// instead of being stranded on a completed loop.
-	continueWithInbox := false
-	if r.hitlEnabled {
-		unlock := loops.LockLoopRequeue(loop.ID)
-		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-		if err != nil {
-			unlock()
-			return ProcessResult{}, err
-		}
-		continueWithInbox = fresh != nil && len(loops.ReadHumanInbox(fresh.MetadataJSON)) > 0
-		if continueWithInbox {
-			nowISO := r.nowISO()
-			if _, err := r.repos.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO); err != nil {
-				unlock()
-				return ProcessResult{}, err
-			}
-			if _, err := r.updateLoop(ctx, *fresh, func(updated *storage.LoopRecord) {
-				updated.Status = "queued"
-				updated.LastRunAt = stringPtr(nowISO)
-				updated.NextRunAt = stringPtr(nowISO)
-			}); err != nil {
-				unlock()
-				return ProcessResult{}, err
-			}
-		}
-		unlock()
-	}
-	if continueWithInbox {
-		r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &checkpoint, issueClaimStatusRunning, summary)
-		r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
-		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
-	}
-	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
-		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
-		}
-		return ProcessResult{}, err
-	}
-	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		updated.Status = "completed"
-		updated.LastRunAt = stringPtr(r.nowISO())
-		updated.NextRunAt = nil
-	}); err != nil {
+	completedRun, err := r.finalizeSuccessfulClaim(ctx, run, queueItem, *loop, checkpoint, summary)
+	if err != nil {
 		return ProcessResult{}, err
 	}
 	finalIssueClaimStatus := issueClaimStatusSuccess
 	if checkpoint.SkipReason != "" {
 		finalIssueClaimStatus = issueClaimStatusPaused
 	}
-	r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &checkpoint, finalIssueClaimStatus, summary)
-	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
+	r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: completedRun, QueueItem: queueItem}, &checkpoint, finalIssueClaimStatus, summary)
+	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, completedRun, checkpoint, statusForCheckpoint(checkpoint), "", summary))
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
 }
 
@@ -1375,21 +1339,8 @@ func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storag
 		checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is no longer an open issue", formatIssueReference(issueLookupRepo(*checkpoint.Work), checkpoint.Work.IssueNumber))
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		summary := r.buildSuccessSummary(loop, *checkpoint)
-		completedRun, err := r.completeRun(ctx, run, "success", summary, "", *checkpoint)
+		completedRun, err := r.finalizeSuccessfulClaim(ctx, run, queueItem, loop, *checkpoint, summary)
 		if err != nil {
-			return ProcessResult{}, true, err
-		}
-		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
-			if errors.Is(err, storage.ErrQueueItemNotActive) {
-				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, true, nil
-			}
-			return ProcessResult{}, true, err
-		}
-		if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-			updated.Status = "completed"
-			updated.LastRunAt = stringPtr(r.nowISO())
-			updated.NextRunAt = nil
-		}); err != nil {
 			return ProcessResult{}, true, err
 		}
 		r.syncIssueClaim(ctx, stepInput{Project: project, Loop: loop, Run: completedRun, QueueItem: queueItem}, checkpoint, issueClaimStatusPaused, summary)
@@ -1508,7 +1459,7 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 	if repo == "" {
 		return nil
 	}
-	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	login, err := r.github.GetCurrentUserLogin(ctx, repo, cwd)
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
 	}
@@ -1730,7 +1681,6 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err != nil {
 		return checkpoint, err
 	}
-	var inboxDrained []loops.HumanMessage
 	if !executionCompleted {
 		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
@@ -1746,6 +1696,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// HITL (gated): let the agent pause to ask a human, and on resume feed the
 		// human's answer back into the same agent session.
 		nativeResumePrompt := ""
+		// Snapshot the inbox actually included in this prompt: acknowledgement
+		// after the turn must remove exactly these messages, not ones that
+		// arrive while the agent is running.
+		includedHumanInbox := loops.ReadHumanInbox(input.Loop.MetadataJSON)
 		nativeSessionID := ""
 		if r.hitlEnabled {
 			prompt += hitlPromptInstruction
@@ -1769,7 +1723,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// conversation. Conversational: the agent may answer + ask again rather than
 		// treat them as a final decision.
 		if r.hitlEnabled {
-			if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
+			if inbox := includedHumanInbox; len(inbox) > 0 {
 				var msgs strings.Builder
 				msgs.WriteString("While you were working, the human sent these messages in the task thread:")
 				for _, m := range inbox {
@@ -1783,7 +1737,6 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				if nativeSessionID == "" {
 					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID, agentVendor)
 				}
-				inboxDrained = append([]loops.HumanMessage(nil), inbox...)
 			}
 		}
 		executionID := eventlog.NewEventID("agent")
@@ -1823,7 +1776,6 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			if awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, executionID); awaitErr != nil {
 				return checkpoint, awaitErr
 			} else if awaiting != nil {
-				awaiting.drainedInbox = inboxDrained
 				return checkpoint, awaiting
 			}
 		}
@@ -1849,10 +1801,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// answer that seeded it has been acted on. Flip it to "consumed" now — after
 		// the turn, never before — so a failed/timed-out turn re-reads the answer on
 		// retry, while a successful one never re-injects it on a later run.
-		if r.hitlEnabled {
-			r.acknowledgeHumanInbox(ctx, &input.Loop, inboxDrained)
-		}
-		r.markTakeoverResumeConsumed(ctx, &input.Loop)
+		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 			return checkpoint, err
 		}
@@ -2415,19 +2364,22 @@ func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.
 	checkpoint.SkipReason = summary
 	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 	if run != nil {
-		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+		finishedAt := r.nowISO()
+		completed := completedRunRecord(*run, "success", summary, "", checkpoint, finishedAt)
+		if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "queued", FinishedAt: finishedAt}); err != nil {
 			return ProcessResult{}, err
 		}
-	}
-	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
-		return ProcessResult{}, err
-	}
-	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		updated.Status = "queued"
-		updated.LastRunAt = stringPtr(r.nowISO())
-		updated.NextRunAt = nil
-	}); err != nil {
-		return ProcessResult{}, err
+	} else {
+		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+			return ProcessResult{}, err
+		}
+		if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+			updated.Status = "queued"
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+		}); err != nil {
+			return ProcessResult{}, err
+		}
 	}
 	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
 	if run != nil {
@@ -2561,14 +2513,12 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	startStep := stepPrepareWork
 	resumedCheckpoint := checkpoint
-	// A completed run normally begins a fresh worker lifecycle. The one exception
-	// is a free-text message accepted while it was running: retain the durable
-	// worktree/session context, but rerun the agent and validation steps so that
-	// message is actually delivered to the agent.
-	if latestRun != nil && latestRun.Status == "success" && len(loops.ReadHumanInbox(loop.MetadataJSON)) > 0 {
+	// A successful worker normally has no follow-up turn. A survivor in the
+	// human inbox is the exception: keep its work/session context but clear the
+	// completed execution so the next queued claim actually starts the agent.
+	if latestRun != nil && latestRun.Status == "success" && r.hitlEnabled && len(loops.ReadHumanInbox(loop.MetadataJSON)) > 0 {
 		resumedCheckpoint.Execution = nil
 		resumedCheckpoint.Validation = nil
-		resumedCheckpoint.SkipReason = ""
 	}
 	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
 		if restartFromDiscover {
@@ -2671,8 +2621,16 @@ func (r *Runner) persistCheckpoint(ctx context.Context, runID string, checkpoint
 }
 
 func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status, summary, errorMessage string, checkpoint workerCheckpoint) (storage.RunRecord, error) {
-	updated := run
 	endedAt := r.nowISO()
+	updated := completedRunRecord(run, status, summary, errorMessage, checkpoint, endedAt)
+	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
+		return storage.RunRecord{}, err
+	}
+	return updated, nil
+}
+
+func completedRunRecord(run storage.RunRecord, status, summary, errorMessage string, checkpoint workerCheckpoint, endedAt string) storage.RunRecord {
+	updated := run
 	updated.Status = status
 	if summary != "" {
 		updated.Summary = stringPtr(summary)
@@ -2685,10 +2643,80 @@ func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status,
 	updated.EndedAt = &endedAt
 	updated.LastHeartbeatAt = &endedAt
 	updated.UpdatedAt = endedAt
-	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
-		return storage.RunRecord{}, err
+	return updated
+}
+
+// IsSuccessfulClaimFinalizationCandidate reports durable evidence that worker
+// execution is already complete and only terminal storage finalization remains.
+func IsSuccessfulClaimFinalizationCandidate(run storage.RunRecord) bool {
+	if run.Status == "success" {
+		return derefString(run.LastCompletedStep) == string(stepOpenPR)
 	}
-	return updated, nil
+	return (run.Status == "running" || run.Status == "interrupted") && derefString(run.LastCompletedStep) == string(stepOpenPR)
+}
+
+func (r *Runner) finalizeSuccessfulClaim(ctx context.Context, run storage.RunRecord, queueItem storage.QueueItemRecord, loop storage.LoopRecord, checkpoint workerCheckpoint, summary string) (storage.RunRecord, error) {
+	unlock := loops.LockLoopRequeue(loop.ID)
+	defer unlock()
+	requeueForHumanInbox := false
+	if r.hitlEnabled && r.repos != nil && r.repos.Loops != nil {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return storage.RunRecord{}, err
+		}
+		requeueForHumanInbox = fresh != nil && fresh.Status == "running" && len(loops.ReadHumanInbox(fresh.MetadataJSON)) > 0
+	}
+	finishedAt := r.nowISO()
+	completed := completedRunRecord(run, "success", summary, "", checkpoint, finishedAt)
+	if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt, RequeueForHumanInbox: requeueForHumanInbox}); err != nil {
+		return storage.RunRecord{}, errors.Join(ErrSuccessfulClaimFinalization, err)
+	}
+	return completed, nil
+}
+
+func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (ProcessResult, bool, error) {
+	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil || latestRun == nil || !IsSuccessfulClaimFinalizationCandidate(*latestRun) || !CanFinalizeSuccessfulClaim(queueItem, *latestRun, loop.Status) {
+		return ProcessResult{}, false, err
+	}
+	checkpoint, err := parseCheckpoint(latestRun.CheckpointJSON)
+	if err != nil {
+		return ProcessResult{}, false, err
+	}
+	summary := derefString(latestRun.Summary)
+	if summary == "" {
+		summary = r.buildSuccessSummary(loop, checkpoint)
+	}
+	completed, err := r.finalizeSuccessfulClaim(ctx, *latestRun, queueItem, loop, checkpoint, summary)
+	if err != nil {
+		return ProcessResult{}, true, err
+	}
+	status := statusForCheckpoint(checkpoint)
+	return ProcessResult{LoopID: loop.ID, RunID: completed.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, true, nil
+}
+
+// CanFinalizeSuccessfulClaim prevents a later queue generation from being
+// consumed as recovery for an older completed run.
+func CanFinalizeSuccessfulClaim(queueItem storage.QueueItemRecord, run storage.RunRecord, loopStatus string) bool {
+	queueCreatedAt, queueErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(queueItem.CreatedAt))
+	runStartedAt, runErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(run.StartedAt))
+	if queueErr != nil || runErr != nil || queueCreatedAt.After(runStartedAt) {
+		return false
+	}
+	if run.Status != "success" {
+		return true
+	}
+	if run.EndedAt == nil {
+		return false
+	}
+	runEndedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*run.EndedAt))
+	if err != nil || queueCreatedAt.After(runEndedAt) {
+		return false
+	}
+	if queueItem.Status == "running" {
+		return loopStatus == "running"
+	}
+	return queueItem.Status == "queued" && queueItem.LastError != nil && strings.TrimSpace(*queueItem.LastError) != ""
 }
 
 func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord, fallback workerCheckpoint) workerCheckpoint {

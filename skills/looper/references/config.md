@@ -160,11 +160,11 @@ repo = "acme/example"
 Provider validation notes:
 
 - `providers[].kind` must be `github`. `forgejo` and `plane` were removed and are rejected with an explicit unsupported-provider error; they are never reinterpreted as a supported provider.
-- `baseUrl`, when set, must be an absolute `http(s)` URL. It feeds repository identity only and does not point Looper at that host. GHES is not supported: review-submit and webhook tunnel routing both mishandle a host-qualified repo.
+- `baseUrl`, when set, must be a `github.com` URL. It feeds repository identity only and does not point Looper at a host, so a GHES URL is rejected at startup rather than accepted and failed at publish time.
 - `tokenEnv` names an env var copied into trusted `looper review submit` children only. Normal GitHub calls use ambient `gh` auth.
 - A project with an explicit `provider` must also set `repo`; a binding without one is rejected.
 - A project bound to a provider requires a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add`, the dashboard, or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup.
-- Two projects whose provider-qualified repository identities collide are rejected case-insensitively. The same `owner/name` on two different hosts is fine; two provider ids normalizing to one endpoint are not.
+- Two projects whose repository identities collide are rejected case-insensitively. Every provider resolves to github.com, so the same `owner/name` is a duplicate however many provider ids it is split across.
 
 ## Role model guidance
 

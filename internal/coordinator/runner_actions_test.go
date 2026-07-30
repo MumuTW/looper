@@ -16,6 +16,7 @@ import (
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -470,7 +471,7 @@ func TestRunnerLocalOnlyImplementAdmissionAddsWorkerReadyWithoutTargetLabel(t *t
 
 	assertOrderedOps(t, fixture.github.ops, []string{"assign:octocat", "add:looper:worker-ready"})
 	for _, op := range fixture.github.ops {
-		if strings.Contains(op, "looper:target:") {
+		if strings.Contains(op, protocol.TargetLabelPrefix) {
 			t.Fatalf("ops = %v, want no target label in local-only mode", fixture.github.ops)
 		}
 	}
@@ -484,13 +485,13 @@ func TestRunnerPlanDispatchIgnoresStaleWorkerReadyLabel(t *testing.T) {
 		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
 		cfg.Roles.Planner.Triggers.Labels = []string{"my-custom-plan"}
 	})
-	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan", "looper:worker-ready"}}}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan", labels.DefaultWorkerReadyTrigger}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number:    1,
 		Title:     "Bug",
 		Author:    "octo",
 		CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339),
-		Labels:    []string{"triaged", "dispatch/plan", "looper:worker-ready"},
+		Labels:    []string{"triaged", "dispatch/plan", labels.DefaultWorkerReadyTrigger},
 		Comments:  []githubinfra.CommentInfo{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}},
 	}
 	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 11, Author: "octo", AuthorAssociation: "MEMBER", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
@@ -504,7 +505,7 @@ func TestRunnerPlanDispatchIgnoresStaleWorkerReadyLabel(t *testing.T) {
 	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, "my-custom-plan"); got != 1 {
 		t.Fatalf("planner trigger add count = %d, want 1", got)
 	}
-	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, "looper:worker-ready"); got != 0 {
+	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, labels.DefaultWorkerReadyTrigger); got != 0 {
 		t.Fatalf("worker-ready add count = %d, want 0", got)
 	}
 }
@@ -559,8 +560,8 @@ func TestRunnerRoutedImplementAdmissionRepairsHumanWorkerReadyIntent(t *testing.
 		},
 		Lease: protocol.CoordinatorLease{HolderNodeID: "coord-1", FencingToken: 7, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
 	}
-	fixture.github.issues = []githubinfra.IssueSummary{{Number: 2, Labels: []string{"looper:worker-ready"}}}
-	fixture.github.details[2] = githubinfra.IssueDetail{Number: 2, Title: "Human admitted", Author: "octo", URL: "https://github.com/acme/looper/issues/2", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"looper:worker-ready"}}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 2, Labels: []string{labels.DefaultWorkerReadyTrigger}}}
+	fixture.github.details[2] = githubinfra.IssueDetail{Number: 2, Title: "Human admitted", Author: "octo", URL: "https://github.com/acme/looper/issues/2", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{labels.DefaultWorkerReadyTrigger}}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -585,8 +586,8 @@ func TestRunnerRoutedImplementAdmissionRetargetsIssueToSingleWorker(t *testing.T
 		},
 		Lease: protocol.CoordinatorLease{HolderNodeID: "coord-1", FencingToken: 8, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
 	}
-	fixture.github.issues = []githubinfra.IssueSummary{{Number: 5, Labels: []string{"looper:worker-ready", protocol.TargetLabelForNode("worker-2")}}}
-	fixture.github.details[5] = githubinfra.IssueDetail{Number: 5, Title: "Retarget me", Author: "octo", URL: "https://github.com/acme/looper/issues/5", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"looper:worker-ready", protocol.TargetLabelForNode("worker-2")}}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 5, Labels: []string{labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("worker-2")}}}
+	fixture.github.details[5] = githubinfra.IssueDetail{Number: 5, Title: "Retarget me", Author: "octo", URL: "https://github.com/acme/looper/issues/5", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("worker-2")}}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -614,15 +615,15 @@ func TestRunnerRoutedImplementAdmissionRemovesMixedCaseStaleTargetLabel(t *testi
 		},
 		Lease: protocol.CoordinatorLease{HolderNodeID: "coord-1", FencingToken: 8, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
 	}
-	fixture.github.issues = []githubinfra.IssueSummary{{Number: 5, Labels: []string{"looper:worker-ready", "Looper:target:worker-2"}}}
-	fixture.github.details[5] = githubinfra.IssueDetail{Number: 5, Title: "Retarget me", Author: "octo", URL: "https://github.com/acme/looper/issues/5", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"looper:worker-ready", "Looper:target:worker-2"}}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 5, Labels: []string{labels.DefaultWorkerReadyTrigger, strings.Replace(protocol.TargetLabelForNode("worker-2"), "looper", "Looper", 1)}}}
+	fixture.github.details[5] = githubinfra.IssueDetail{Number: 5, Title: "Retarget me", Author: "octo", URL: "https://github.com/acme/looper/issues/5", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{labels.DefaultWorkerReadyTrigger, strings.Replace(protocol.TargetLabelForNode("worker-2"), "looper", "Looper", 1)}}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
 
 	assertOrderedOps(t, fixture.github.ops, []string{"assign:worker-bot", "remove:Looper:target:worker-2", "add:looper:target:worker-1"})
-	if got := countRemovedIssueOperations(fixture.github.removedLabels, 5, "Looper:target:worker-2"); got != 1 {
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 5, strings.Replace(protocol.TargetLabelForNode("worker-2"), "looper", "Looper", 1)); got != 1 {
 		t.Fatalf("removed mixed-case target label count = %d, want 1", got)
 	}
 }
@@ -685,7 +686,7 @@ func TestRunnerRoutedImplementAdmissionStopsBeforeTargetLabelWhenLeaseLostMidSeq
 
 	assertOrderedOps(t, fixture.github.ops, []string{"assign:worker-bot", "add:looper:worker-ready"})
 	for _, op := range fixture.github.ops {
-		if strings.Contains(op, "looper:target:worker-1") {
+		if strings.Contains(op, protocol.TargetLabelForNode("worker-1")) {
 			t.Fatalf("ops = %v, want no target label after lease loss", fixture.github.ops)
 		}
 	}
@@ -1150,10 +1151,10 @@ func TestRunnerAutonomousDispatchNoOpWorkerAdmissionDoesNotConsumeBudget(t *test
 		cfg.Scheduler.MaxConcurrentRuns = 1
 	})
 	fixture.github.issues = []githubinfra.IssueSummary{
-		{Number: 1, Labels: []string{"looper:worker-ready"}},
+		{Number: 1, Labels: []string{labels.DefaultWorkerReadyTrigger}},
 		{Number: 2, Labels: []string{"triaged", "dispatch/implement"}},
 	}
-	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Already admitted", Author: "octo", URL: "https://github.com/acme/looper/issues/1", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"looper:worker-ready"}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Already admitted", Author: "octo", URL: "https://github.com/acme/looper/issues/1", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{labels.DefaultWorkerReadyTrigger}}
 	fixture.github.details[2] = githubinfra.IssueDetail{Number: 2, Title: "Needs admission", Author: "octo", URL: "https://github.com/acme/looper/issues/2", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/implement"}}
 	fixture.github.timeline[2] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
 
@@ -1165,10 +1166,10 @@ func TestRunnerAutonomousDispatchNoOpWorkerAdmissionDoesNotConsumeBudget(t *test
 	if hasAssignedIssue(fixture.github.assigned, 1) {
 		t.Fatalf("assigned issue 1 unexpectedly; assigned = %v", assignedIssueNumbers(fixture.github.assigned))
 	}
-	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, "looper:worker-ready"); got != 0 {
+	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, labels.DefaultWorkerReadyTrigger); got != 0 {
 		t.Fatalf("issue 1 worker-ready add count = %d, want 0", got)
 	}
-	if got := countAddedIssueOperations(fixture.github.addedLabels, 2, "looper:worker-ready"); got != 1 {
+	if got := countAddedIssueOperations(fixture.github.addedLabels, 2, labels.DefaultWorkerReadyTrigger); got != 1 {
 		t.Fatalf("issue 2 worker-ready add count = %d, want 1", got)
 	}
 }
@@ -1201,7 +1202,7 @@ func TestRunnerReopenedBlockerDoesNothingForInFlightIssue(t *testing.T) {
 		cfg.Roles.Coordinator.Enabled = true
 		cfg.Roles.Coordinator.Dependencies.Enabled = true
 	})
-	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/plan", "looper:plan"})
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/plan", labels.DefaultPlanTrigger})
 	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/plan"})
 	fixture.github.blockedBy[2] = []githubinfra.DependencyIssue{{Number: 1, Repository: githubinfra.IssueRepository{FullName: "acme/looper"}, State: "open"}}
 
@@ -1611,7 +1612,7 @@ func TestRunnerMergeWatchConflictRoutesToFixerAndUpdatesMarker(t *testing.T) {
 		State:          "open",
 		HeadSHA:        "abc123",
 		BaseRefName:    "main",
-		Labels:         []string{"looper:plan"},
+		Labels:         []string{labels.DefaultPlanTrigger},
 		Mergeable:      boolPtr(false),
 		MergeableState: "dirty",
 		AutoMerge:      &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
@@ -1659,7 +1660,7 @@ func TestRunnerMergeWatchHumanDisabledRemovesMarkerOnly(t *testing.T) {
 		State:          "open",
 		HeadSHA:        "def456",
 		BaseRefName:    "main",
-		Labels:         []string{"looper:plan"},
+		Labels:         []string{labels.DefaultPlanTrigger},
 		Mergeable:      boolPtr(true),
 		MergeableState: "clean",
 	}
@@ -1703,7 +1704,7 @@ func TestRunnerMergeWatchTransientErrorKeepsMarkerAndSchedulesRetry(t *testing.T
 		State:          "open",
 		HeadSHA:        "abc123",
 		BaseRefName:    "main",
-		Labels:         []string{"looper:plan"},
+		Labels:         []string{labels.DefaultPlanTrigger},
 		Mergeable:      boolPtr(true),
 		MergeableState: "blocked",
 		AutoMerge:      &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
@@ -1754,7 +1755,7 @@ func TestRunnerMergeWatchPRDetailTransientErrorConsumesRetryBudget(t *testing.T)
 		State:          "open",
 		HeadSHA:        "abc123",
 		BaseRefName:    "main",
-		Labels:         []string{"looper:plan"},
+		Labels:         []string{labels.DefaultPlanTrigger},
 		Mergeable:      boolPtr(true),
 		MergeableState: "blocked",
 		AutoMerge:      &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
@@ -1802,7 +1803,7 @@ func TestRunnerMergeWatchBranchProtectionTransientErrorConsumesRetryBudget(t *te
 		State:          "open",
 		HeadSHA:        "abc123",
 		BaseRefName:    "main",
-		Labels:         []string{"looper:plan"},
+		Labels:         []string{labels.DefaultPlanTrigger},
 		Mergeable:      boolPtr(true),
 		MergeableState: "blocked",
 		AutoMerge:      &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
@@ -1949,7 +1950,7 @@ func TestRunnerAssignsDeterministicTargetForDuplicateReviewerIdentity(t *testing
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
-	if len(fixture.github.addedPRLabels) != 1 || fixture.github.addedPRLabels[0].Labels[0] != "looper:target:blue" {
+	if len(fixture.github.addedPRLabels) != 1 || fixture.github.addedPRLabels[0].Labels[0] != protocol.TargetLabelForNode("blue") {
 		t.Fatalf("addedPRLabels = %#v, want deterministic blue target", fixture.github.addedPRLabels)
 	}
 }
@@ -2137,7 +2138,7 @@ func TestRunnerMergeWatchStatusContextsPreventMissingRequiredCheck(t *testing.T)
 		State:          "open",
 		HeadSHA:        "ghi789",
 		BaseRefName:    "main",
-		Labels:         []string{"looper:plan"},
+		Labels:         []string{labels.DefaultPlanTrigger},
 		Mergeable:      boolPtr(true),
 		MergeableState: "blocked",
 		AutoMerge:      &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},
@@ -2187,7 +2188,7 @@ func TestRunnerMergeWatchRetriggerSkipsSameTickDispatch(t *testing.T) {
 		State:          "open",
 		HeadSHA:        "abc123",
 		BaseRefName:    "main",
-		Labels:         []string{"looper:plan"},
+		Labels:         []string{labels.DefaultPlanTrigger},
 		Mergeable:      boolPtr(false),
 		MergeableState: "unknown",
 		AutoMerge:      &githubinfra.PullRequestAutoMerge{EnabledBy: "looper"},

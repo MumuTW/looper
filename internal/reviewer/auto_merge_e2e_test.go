@@ -13,6 +13,7 @@ import (
 	coordtriage "github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/e2e/harness"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -50,7 +51,7 @@ func TestReviewerAutoMergeWaitsForMergeBeforeUnblockingDependentDispatchWithFake
 		},
 		CurrentUserLogin: "reviewer",
 		PullRequests: map[string]harness.GHPullRequest{
-			"acme/looper#42": {Number: 42, Repo: "acme/looper", Title: "Worker PR", Body: "Implements feature.\n\nCloses #1", State: "OPEN", Labels: []string{"looper:worker-ready"}, HeadRefName: "feature/worker-pr", BaseRefName: "main", HeadSHA: "abc123", BaseSHA: "base123", Author: "octocat", ReviewRequests: []string{"reviewer"}},
+			"acme/looper#42": {Number: 42, Repo: "acme/looper", Title: "Worker PR", Body: "Implements feature.\n\nCloses #1", State: "OPEN", Labels: []string{labels.DefaultWorkerReadyTrigger}, HeadRefName: "feature/worker-pr", BaseRefName: "main", HeadSHA: "abc123", BaseSHA: "base123", Author: "octocat", ReviewRequests: []string{"reviewer"}},
 		},
 	})
 
