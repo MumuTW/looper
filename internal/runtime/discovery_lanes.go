@@ -95,7 +95,8 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 				if input.Logger != nil {
 					input.Logger.Info("fixer discovery examined pull requests", map[string]any{
 						"projectId": projectID, "repo": repo,
-						"examined": result.Examined, "skipped": result.Skipped, "enqueued": len(result.QueueItems),
+						"examined": result.Examined, "skipped": result.Skipped,
+						"skippedClean": result.SkippedClean, "enqueued": len(result.QueueItems),
 					})
 				}
 				return result.QueueItems, err
