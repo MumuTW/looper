@@ -255,6 +255,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateAgentConfig(config, issues)
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
+	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
 	validatePackageAndDefaultsConfig(config, issues)
 }
@@ -394,6 +395,43 @@ func validateLoggingAndNotificationConfig(config Config, issues *[]ValidationIss
 	default:
 		*issues = append(*issues, ValidationIssue{Path: "notifications.webhook.mode", Message: "must be one of: webhook, app"})
 	}
+}
+
+// validateIntakeConfig fails startup rather than runtime. An intake bot whose
+// default project does not exist accepts every message and then rejects it, so
+// the mistake is only visible after someone has typed a request and lost it.
+func validateIntakeConfig(config Config, issues *[]ValidationIssue) {
+	tg := config.Intake.Telegram
+	if tg == nil || !tg.Enabled {
+		return
+	}
+	if strings.TrimSpace(tg.BotTokenEnv) == "" {
+		*issues = append(*issues, ValidationIssue{Path: "intake.telegram.botTokenEnv", Message: "is required when intake.telegram.enabled is true"})
+	} else if !environmentNamePattern.MatchString(strings.TrimSpace(tg.BotTokenEnv)) {
+		*issues = append(*issues, ValidationIssue{Path: "intake.telegram.botTokenEnv", Message: "must be a valid environment-variable name, not a token value"})
+	}
+	if len(tg.AllowedUserIDs) == 0 {
+		*issues = append(*issues, ValidationIssue{Path: "intake.telegram.allowedUserIds", Message: "must list at least one Telegram user id when intake.telegram.enabled is true"})
+	}
+	for i, id := range tg.AllowedUserIDs {
+		// Telegram user ids are positive. Negative values are group/channel chat
+		// ids, which people routinely collect during setup and paste here; such a
+		// value would silently reject every real sender.
+		if id <= 0 {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("intake.telegram.allowedUserIds[%d]", i), Message: "must be a positive Telegram user id (a negative value is a chat id, not a user id)"})
+		}
+	}
+	defaultProject := strings.TrimSpace(tg.DefaultProjectID)
+	if defaultProject == "" {
+		*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: "is required when intake.telegram.enabled is true"})
+		return
+	}
+	for _, project := range config.Projects {
+		if strings.EqualFold(strings.TrimSpace(project.ID), defaultProject) {
+			return
+		}
+	}
+	*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: fmt.Sprintf("must name a configured project; %q is not in projects[]", defaultProject)})
 }
 
 func validateHITLConfig(hitl HITLConfig, issues *[]ValidationIssue) {

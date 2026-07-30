@@ -26,7 +26,6 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/triager"
@@ -958,45 +957,6 @@ func TestActiveRunsAllSurfacesClosedLoopWithoutManualInterventionDisplayOverride
 	assertEqual(t, item["lastFailureReason"], "needs close")
 }
 
-func TestHandlerReviewerRepairInvokesContextAndTriggersScheduler(t *testing.T) {
-	t.Parallel()
-
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	var gotInput reviewer.RepairInput
-	triggered := 0
-	h := NewHandler(Context{
-		Config: cfg,
-		RepairReviewer: func(_ context.Context, input reviewer.RepairInput) (reviewer.RepairResult, error) {
-			gotInput = input
-			return reviewer.RepairResult{Repo: input.Repo, PRNumber: input.PRNumber, ProjectID: input.ProjectID, Apply: input.Apply, Applied: true, AppliedChanges: 1}, nil
-		},
-		TriggerSchedulerTick: func() { triggered++ },
-	})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/reviewer/repair", strings.NewReader(`{"projectId":"project_1","repo":"acme/looper","prNumber":42,"apply":true}`))
-	req.Header.Set("x-request-id", "repair-request-id")
-	recorder := httptest.NewRecorder()
-
-	h.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
-	}
-	if gotInput.Repo != "acme/looper" || gotInput.PRNumber != 42 || gotInput.ProjectID != "project_1" || !gotInput.Apply {
-		t.Fatalf("RepairReviewer input = %#v, want requested repo/pr/project/apply", gotInput)
-	}
-	if triggered != 1 {
-		t.Fatalf("scheduler trigger count = %d, want 1", triggered)
-	}
-	body := parseJSONMap(t, recorder.Body.Bytes())
-	assertEqual(t, body["ok"], true)
-	data := body["data"].(map[string]any)
-	assertEqual(t, data["repo"], "acme/looper")
-	assertEqual(t, data["applied"], true)
-}
-
 func TestIsTerminalReviewerLoopRecordTreatsFailedAsTerminal(t *testing.T) {
 	t.Parallel()
 	metadata := `{"loop":{"status":"failed"}}`
@@ -1344,7 +1304,7 @@ func TestHandlerStatusReportsUnknownBinaryIdentityWithoutReporter(t *testing.T) 
 	}
 }
 
-func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
+func TestHandlerStatusReportsDebtFromDurableQuarantineEvidence(t *testing.T) {
 	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
 		options.ReadProcessCommand = func(context.Context, int) (string, error) { return "", nil }
 	})
@@ -1357,7 +1317,7 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Reconcile", RepoPath: fixture.rootDir, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "paused", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("work"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
@@ -1370,13 +1330,14 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "execution_reconcile_status", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(fixture.rootDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
-
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
-	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
-	}
-	if summary.QuarantinedExecutions != 1 {
-		t.Fatalf("summary = %#v, want one quarantined execution", summary)
+	entityType := "agent_execution"
+	executionID := "execution_reconcile_status"
+	if err := repos.Events.Append(context.Background(), storage.EventLogRecord{
+		ID: "event_reconcile_status", EventType: "looperd.recovery.execution_quarantined",
+		ProjectID: &projectID, LoopID: &loopID, RunID: &runID,
+		EntityType: &entityType, EntityID: &executionID, PayloadJSON: `{}`, CreatedAt: oldISO,
+	}); err != nil {
+		t.Fatalf("Events.Append() error = %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
@@ -1409,7 +1370,7 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
 	}
 	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "running" {
-		t.Fatalf("run after reconcile = %#v, %v; want running quarantine evidence", run, err)
+		t.Fatalf("run = %#v, %v; want running quarantine evidence", run, err)
 	}
 }
 
@@ -1803,58 +1764,17 @@ func TestHandlerRouteAndMethodErrors(t *testing.T) {
 	if got := routeBody["requestId"].(string); got == "" {
 		t.Fatal("generated requestId is empty")
 	}
-}
 
-func TestHandlerReconcileStaleRunsRoute(t *testing.T) {
-	fixture := newTestFixture(t)
-	triggered := 0
-	h := NewHandler(Context{
-		Config:  fixture.config,
-		Runtime: fixture.runtime,
-		ReconcileStaleRuns: func(context.Context) (looperdruntime.StaleRunReconcileSummary, error) {
-			return looperdruntime.StaleRunReconcileSummary{Mode: "manual", CandidateRuns: 2, InterruptedRuns: 1, LoopsRequeued: 1, RunIDs: []string{"run_1"}, LoopIDs: []string{"loop_1"}}, nil
-		},
-		TriggerSchedulerTick: func() { triggered++ },
-	})
-
-	t.Run("success", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/reconcile-stale", nil)
+	for _, path := range []string{"/api/v1/reviewer/repair", "/api/v1/runs/reconcile-stale"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
 		recorder := httptest.NewRecorder()
 		h.ServeHTTP(recorder, req)
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("POST %s status = %d, want 404; body=%s", path, recorder.Code, recorder.Body.String())
 		}
 		body := parseJSONMap(t, recorder.Body.Bytes())
-		data := body["data"].(map[string]any)
-		assertEqual(t, data["mode"], "manual")
-		assertEqual(t, data["candidateRuns"], float64(2))
-		assertEqual(t, data["interruptedRuns"], float64(1))
-		assertEqual(t, data["loopsRequeued"], float64(1))
-		assertEqual(t, triggered, 1)
-	})
-
-	t.Run("method not allowed", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/reconcile-stale", nil)
-		recorder := httptest.NewRecorder()
-		h.ServeHTTP(recorder, req)
-		if recorder.Code != http.StatusMethodNotAllowed {
-			t.Fatalf("status = %d, want 405", recorder.Code)
-		}
-		body := parseJSONMap(t, recorder.Body.Bytes())
-		assertEqual(t, body["error"].(map[string]any)["code"], "METHOD_NOT_ALLOWED")
-	})
-
-	t.Run("runtime control unavailable", func(t *testing.T) {
-		unavailable := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/reconcile-stale", nil)
-		recorder := httptest.NewRecorder()
-		unavailable.ServeHTTP(recorder, req)
-		if recorder.Code != http.StatusNotImplemented {
-			t.Fatalf("status = %d, want 501", recorder.Code)
-		}
-		body := parseJSONMap(t, recorder.Body.Bytes())
-		assertEqual(t, body["error"].(map[string]any)["code"], "RUNTIME_CONTROL_UNAVAILABLE")
-	})
+		assertEqual(t, body["error"].(map[string]any)["code"], "ROUTE_NOT_FOUND")
+	}
 }
 
 func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testing.T) {
@@ -3122,6 +3042,48 @@ func TestTakeoverLoopFiltersCrossVendorResumeParams(t *testing.T) {
 	wantSame := "cd /tmp/wt-codex && /opt/codex-wrapper resume session_codex"
 	if !resp.Supported || resp.ResumeCommand != wantSame {
 		t.Fatalf("same-vendor resume = %q (supported=%v), want %q", resp.ResumeCommand, resp.Supported, wantSame)
+	}
+}
+
+func TestHandlerHandbackPersistsResumeMetadataWhileHumanTakeoverIsHeld(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	seedLoopRouteData(t, rt)
+	prepareLoopRouteForRetry(t, rt, "human_takeover")
+
+	nowISO := "2026-04-11T12:01:00.000Z"
+	sessionID := "session-handback-held"
+	if err := rt.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:              "agent_exec_handback_held",
+		ProjectID:       stringPtr("project_1"),
+		LoopID:          stringPtr("loop_1"),
+		Vendor:          "codex",
+		Status:          "completed",
+		NativeSessionID: &sessionID,
+		StartedAt:       nowISO,
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: cfg, Runtime: rt, Now: func() time.Time {
+		return time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC)
+	}})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_1/handback", strings.NewReader(`{"mode":"auto"}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	loop, err := rt.Services().Repositories.Loops.GetByID(context.Background(), "loop_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID(loop_1) = %#v, %v", loop, err)
+	}
+	if loop.Status != string(domain.LoopStatusQueued) {
+		t.Fatalf("loop status = %q, want queued", loop.Status)
+	}
+	if loop.MetadataJSON == nil || !strings.Contains(*loop.MetadataJSON, sessionID) {
+		t.Fatalf("loop metadata = %#v, want persisted takeover resume session", loop.MetadataJSON)
 	}
 }
 
@@ -7952,10 +7914,13 @@ func prepareLoopRouteForRetry(t *testing.T, rt *looperdruntime.Runtime, loopStat
 	}
 	loop.Status = loopStatus
 	loop.UpdatedAt = nowISO
-	if err := services.Repositories.Loops.Upsert(ctx, *loop); err != nil {
+	writeLoop := services.Repositories.Loops.Upsert
+	if loopStatus == "human_takeover" {
+		writeLoop = services.Repositories.Loops.UpsertChangingHumanHold
+	}
+	if err := writeLoop(ctx, *loop); err != nil {
 		t.Fatalf("Loops.Upsert(loop_1) error = %v", err)
 	}
-
 	run, err := services.Repositories.Runs.GetByID(ctx, "run_1")
 	if err != nil || run == nil {
 		t.Fatalf("Runs.GetByID(run_1) = %#v, %v", run, err)

@@ -141,6 +141,25 @@ func TestBootstrapRequiresExistingWritableWorkingDirectory(t *testing.T) {
 	assertDirectoryExists(t, filepath.Dir(dbPath))
 }
 
+func TestBootstrapRequiresTrustedSandboxWhenValidationIsEnabled(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Config{
+		Storage:  config.StorageConfig{DBPath: filepath.Join(root, "looper.sqlite")},
+		Logging:  config.LoggingConfig{Level: config.LogLevelInfo, MaxSizeMB: 10, MaxFiles: 5},
+		Daemon:   config.DaemonConfig{LogDir: filepath.Join(root, "logs"), WorkingDirectory: root},
+		Defaults: config.DefaultsConfig{ValidationCommands: []string{"go test ./..."}},
+	}
+	_, err := Bootstrap(context.Background(), Options{
+		LoadConfig: func(config.LoadFileOptions) (config.LoadedFileConfig, error) {
+			return config.LoadedFileConfig{Config: cfg}, nil
+		},
+		CheckSandboxRuntime: func() error { return errors.New("untrusted srt installation") },
+	})
+	if err == nil || !strings.Contains(err.Error(), "defaults.validationCommands") || !strings.Contains(err.Error(), "untrusted srt installation") {
+		t.Fatalf("Bootstrap() error = %v, want sandbox readiness validation", err)
+	}
+}
+
 func TestBootstrapPropagatesLoadConfigError(t *testing.T) {
 	wantErr := errors.New("boom")
 
