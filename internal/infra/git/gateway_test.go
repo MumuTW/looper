@@ -240,16 +240,17 @@ func TestGatewayWorktreeExcludesBuildArtifactsFromCommits(t *testing.T) {
 		t.Fatalf("CreateWorktree() error = %v", err)
 	}
 
-	// The worktree's info/exclude must carry looper's artifact patterns.
-	excludeRelPath := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "--git-path", "info/exclude"))
-	excludePath := excludeRelPath
+	// The worktree's local exclude file (in the private git dir) must carry
+	// looper's artifact patterns.
+	excludeRelPath := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "--git-dir"))
+	excludePath := filepath.Join(excludeRelPath, "looper-exclude")
 	if !filepath.IsAbs(excludePath) {
-		excludePath = filepath.Join(worktree.WorktreePath, excludeRelPath)
+		excludePath = filepath.Join(worktree.WorktreePath, excludePath)
 	}
 	excludeContent := readFile(t, excludePath)
 	for _, pattern := range []string{".pnpm-store/", "node_modules/", ".turbo/", "dist/", ".next/", ".cache/", "*.log"} {
 		if !strings.Contains(excludeContent, "\n"+pattern) && !strings.HasPrefix(excludeContent, pattern) {
-			t.Fatalf("info/exclude missing pattern %q; content = %q", pattern, excludeContent)
+			t.Fatalf("looper-exclude missing pattern %q; content = %q", pattern, excludeContent)
 		}
 	}
 
@@ -282,7 +283,7 @@ func TestGatewayWorktreeExcludesBuildArtifactsFromCommits(t *testing.T) {
 		t.Fatalf("CreateWorktree() second call error = %v", err)
 	}
 	if got := strings.Count(readFile(t, excludePath), ".pnpm-store/"); got != 1 {
-		t.Fatalf(".pnpm-store/ appears %d times in info/exclude, want 1 (idempotent)", got)
+		t.Fatalf(".pnpm-store/ appears %d times in looper-exclude, want 1 (idempotent)", got)
 	}
 }
 
@@ -1543,4 +1544,72 @@ func writeFakeGit(t *testing.T, script string) string {
 
 func stringsTrimSpace(value string) string {
 	return string(bytes.TrimSpace([]byte(value)))
+}
+
+// TestApplyWorktreeArtifactExcludesDoesNotPolluteSharedExclude verifies that
+// the worktree-local exclude file does not leak into the main checkout's
+// shared .git/info/exclude when called on a linked worktree.
+func TestApplyWorktreeArtifactExcludesDoesNotPolluteSharedExclude(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	// Create a real linked worktree.
+	linkedPath := filepath.Join(fixture.rootDir, "linked-worktree")
+	runGit(t, fixture.repoPath, "worktree", "add", "-b", "feature/linked-test", linkedPath)
+
+	// Record the shared info/exclude content before (it may have default git boilerplate).
+	sharedExclude := filepath.Join(fixture.repoPath, ".git", "info", "exclude")
+	before := ""
+	if data, err := os.ReadFile(sharedExclude); err == nil {
+		before = string(data)
+	}
+
+	gateway.applyWorktreeArtifactExcludes(ctx, linkedPath)
+
+	// After: the shared info/exclude must not contain any of looper's patterns
+	// (regardless of its initial state).
+	after := ""
+	if data, err := os.ReadFile(sharedExclude); err == nil {
+		after = string(data)
+	}
+	for _, pattern := range worktreeArtifactExcludePatterns {
+		if strings.Contains(after, pattern) {
+			t.Fatalf("shared info/exclude contains looper pattern %q: %q", pattern, after)
+		}
+	}
+
+	// The exclude file must live in the worktree's private git dir (worktree-local).
+	gitDir := stringsTrimSpace(runGit(t, linkedPath, "rev-parse", "--git-dir"))
+	localExclude := filepath.Join(gitDir, "looper-exclude")
+	if !filepath.IsAbs(localExclude) {
+		localExclude = filepath.Join(linkedPath, localExclude)
+	}
+	contents := readFile(t, localExclude)
+	for _, pattern := range worktreeArtifactExcludePatterns {
+		if !strings.Contains(contents, pattern) {
+			t.Fatalf("local exclude file missing pattern %q: %q", pattern, contents)
+		}
+	}
+
+	// And the worktree's local config must point core.excludesfile at it.
+	coreExcludes := runGit(t, linkedPath, "config", "--local", "core.excludesfile")
+	absExpected, _ := filepath.Abs(localExclude)
+	if !strings.Contains(coreExcludes, absExpected) {
+		t.Fatalf("worktree core.excludesfile = %q, want containing %q", coreExcludes, absExpected)
+	}
+
+	// Idempotent: calling again does not pollute the shared file.
+	gateway.applyWorktreeArtifactExcludes(ctx, linkedPath)
+	after2 := ""
+	if data, err := os.ReadFile(sharedExclude); err == nil {
+		after2 = string(data)
+	}
+	if after2 != after {
+		t.Fatalf("shared info/exclude changed on second call: before=%q after=%q", after, after2)
+	}
+
+	_ = before
 }

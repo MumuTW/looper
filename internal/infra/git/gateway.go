@@ -1118,26 +1118,39 @@ var worktreeArtifactExcludePatterns = []string{
 
 const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed; safe to remove)"
 
-// applyWorktreeArtifactExcludes appends looper's build-artifact ignore patterns
-// to the worktree's git exclude file (info/exclude). That file is local to this
-// clone and is never committed, so it cannot alter the repo's tracked files or
-// its .gitignore. The write is idempotent (patterns already present are skipped)
-// and best-effort: any failure is swallowed so it never blocks a loop worktree.
+// applyWorktreeArtifactExcludes writes looper's build-artifact ignore patterns
+// to a worktree-local file and points the worktree's core.excludesfile at it.
+//
+// Earlier versions wrote to the path returned by `git rev-parse --git-path
+// info/exclude`, but in a linked worktree that resolves to the common
+// .git/info/exclude shared by the main checkout and every sibling worktree.
+// Looper's patterns (.pnpm-store/, node_modules/, dist/, .next/, *.log, …)
+// would therefore leak onto the main checkout and every other worktree, and
+// could silently hide legitimate new artifacts from `git status` / `git add -A`.
+//
+// The exclude file lives in the worktree's private git directory (resolved via
+// `git rev-parse --git-dir`), so it is scoped to this worktree, never appears
+// in `git status`, and cannot collide with the shared info/exclude. The write
+// is idempotent (patterns already present are skipped) and best-effort: any
+// failure is swallowed so it never blocks a loop worktree.
 func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePath string) {
 	if strings.TrimSpace(worktreePath) == "" {
 		return
 	}
-	result, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--git-path", "info/exclude")
+
+	gitDir, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--git-dir")
 	if err != nil {
 		return
 	}
-	excludePath := strings.TrimSpace(result.Stdout)
-	if excludePath == "" {
+	gitDirPath := strings.TrimSpace(gitDir.Stdout)
+	if gitDirPath == "" {
 		return
 	}
-	if !filepath.IsAbs(excludePath) {
-		excludePath = filepath.Join(worktreePath, excludePath)
+	if !filepath.IsAbs(gitDirPath) {
+		gitDirPath = filepath.Join(worktreePath, gitDirPath)
 	}
+
+	excludePath := filepath.Join(gitDirPath, "looper-exclude")
 
 	existing, err := os.ReadFile(excludePath)
 	if err != nil && !os.IsNotExist(err) {
@@ -1151,27 +1164,38 @@ func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePat
 			missing = append(missing, pattern)
 		}
 	}
-	if len(missing) == 0 {
-		return
+
+	if len(missing) > 0 {
+		var builder strings.Builder
+		builder.WriteString(existingText)
+		if existingText != "" && !strings.HasSuffix(existingText, "\n") {
+			builder.WriteByte('\n')
+		}
+		if !strings.Contains(existingText, worktreeExcludeManagedHeader) {
+			builder.WriteString(worktreeExcludeManagedHeader)
+			builder.WriteByte('\n')
+		}
+		for _, pattern := range missing {
+			builder.WriteString(pattern)
+			builder.WriteByte('\n')
+		}
+		if err := os.WriteFile(excludePath, []byte(builder.String()), 0o644); err != nil {
+			return
+		}
 	}
 
-	if err := os.MkdirAll(filepath.Dir(excludePath), 0o755); err != nil {
-		return
+	g.setWorktreeExcludesFile(ctx, worktreePath, excludePath)
+}
+
+// setWorktreeExcludesFile points the worktree's core.excludesfile at the
+// given worktree-local path so git honors the patterns without touching the
+// shared info/exclude. Best-effort.
+func (g *Gateway) setWorktreeExcludesFile(ctx context.Context, worktreePath, excludePath string) {
+	absPath, err := filepath.Abs(excludePath)
+	if err != nil {
+		absPath = excludePath
 	}
-	var builder strings.Builder
-	builder.WriteString(existingText)
-	if existingText != "" && !strings.HasSuffix(existingText, "\n") {
-		builder.WriteByte('\n')
-	}
-	if !strings.Contains(existingText, worktreeExcludeManagedHeader) {
-		builder.WriteString(worktreeExcludeManagedHeader)
-		builder.WriteByte('\n')
-	}
-	for _, pattern := range missing {
-		builder.WriteString(pattern)
-		builder.WriteByte('\n')
-	}
-	_ = os.WriteFile(excludePath, []byte(builder.String()), 0o644)
+	g.runGit(ctx, worktreePath, nil, "config", "--local", "core.excludesfile", absPath)
 }
 
 // worktreeExcludeContainsPattern reports whether pattern already appears as its
