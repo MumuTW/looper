@@ -66,13 +66,19 @@ func TestRuntimeFailedStartupDoesNotResumeIncompleteDiscovery(t *testing.T) {
 func TestRuntimeDiscoveryResumeFailureStopsStartedResources(t *testing.T) {
 	t.Parallel()
 
-	rt, _ := startRuntimeWithPendingDiscovery(t, "rollback")
 	network := &startupRollbackNetworkManager{started: make(chan struct{}), stopped: make(chan struct{})}
 	forwarder := &startupRollbackWebhookForwarder{canceled: make(chan struct{}), closed: make(chan struct{})}
+	rt, _ := startRuntimeWithPendingDiscovery(t, "rollback", func(options *Options) {
+		options.WebhookForwarder = forwarder
+	})
+	// Kept white-box under #121: networkManager is wired inside start() from
+	// runtime internals and typed as an unexported interface — exporting a
+	// construction seam for one rollback-observation test would be a prop.
+	// The swap installs the observable fake and stops the real manager the
+	// boot started, so the rollback assertion below sees only the fake.
 	rt.mu.Lock()
 	previousNetwork := rt.networkManager
 	rt.networkManager = network
-	rt.webhookForwarder = forwarder
 	rt.mu.Unlock()
 	previousNetwork.Stop()
 
@@ -208,7 +214,7 @@ func TestRuntimeShutdownCanceledDiscoveryResumesAfterRestart(t *testing.T) {
 	}
 }
 
-func startRuntimeWithPendingDiscovery(t *testing.T, projectID string) (*Runtime, *projects.Service) {
+func startRuntimeWithPendingDiscovery(t *testing.T, projectID string, customize ...func(*Options)) (*Runtime, *projects.Service) {
 	t.Helper()
 
 	workingDir := t.TempDir()
@@ -217,12 +223,16 @@ func startRuntimeWithPendingDiscovery(t *testing.T, projectID string) (*Runtime,
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
-	rt := New(Options{
+	options := Options{
 		Config:           cfg,
 		Logger:           &testLogger{},
 		DeferRecovery:    true,
 		RunSchedulerTick: func(context.Context, Services) error { return nil },
-	})
+	}
+	for _, apply := range customize {
+		apply(&options)
+	}
+	rt := New(options)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
