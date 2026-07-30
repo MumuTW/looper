@@ -42,6 +42,7 @@ type IssueOccupancy struct {
 type IssueOccupantPullRequest struct {
 	Number int64
 	State  string
+	Repo   string
 	URL    string
 }
 
@@ -67,7 +68,11 @@ func NewGatewayIssueOccupancyLookup(cfg config.Config, now func() time.Time) fun
 	if cfg.Tools.GHPath != nil {
 		ghPath = strings.TrimSpace(*cfg.Tools.GHPath)
 	}
-	gateway := github.New(github.Options{GHPath: ghPath, Now: now})
+	gateway := github.New(github.Options{GHPath: ghPath, Env: config.DaemonGitHubCredentialEnv(cfg), Now: now})
+	return newGatewayIssueOccupancyLookup(gateway)
+}
+
+func newGatewayIssueOccupancyLookup(gateway *github.Gateway) func(context.Context, string, int64, string) (IssueOccupancy, error) {
 	return func(ctx context.Context, repo string, issueNumber int64, cwd string) (IssueOccupancy, error) {
 		// ViewIssue is the same call the worker's prepare-work step makes, so the
 		// dispatch check reuses the established authority rather than introducing a
@@ -88,14 +93,14 @@ func NewGatewayIssueOccupancyLookup(cfg config.Config, now func() time.Time) fun
 			// Linked-PR read failing is not fatal: the issue-state check alone still
 			// catches closed issues. An open-PR occupant could be missed, but a
 			// transient forge error must not block dispatch with a 500.
-			if github.IsTransientError(linkErr) {
+			if occupancy.Occupied() || github.IsTransientError(linkErr) {
 				return occupancy, nil
 			}
 			return IssueOccupancy{}, classifyIssueLookupError(linkErr)
 		}
 		for _, pr := range linked {
 			if strings.EqualFold(strings.TrimSpace(pr.State), "OPEN") {
-				occupancy.OpenPullRequests = append(occupancy.OpenPullRequests, IssueOccupantPullRequest{Number: pr.Number, State: pr.State})
+				occupancy.OpenPullRequests = append(occupancy.OpenPullRequests, IssueOccupantPullRequest{Number: pr.Number, State: pr.State, Repo: pr.Repo, URL: pr.URL})
 			}
 		}
 		return occupancy, nil

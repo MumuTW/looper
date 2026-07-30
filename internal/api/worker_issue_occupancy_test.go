@@ -87,6 +87,21 @@ func TestHandlerWorkerCreateRefusesOpenReferencingPullRequest(t *testing.T) {
 	}
 }
 
+func TestHandlerWorkerCreateNamesCrossRepositoryOccupantPullRequest(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	lookup := func(_ context.Context, repo string, issueNumber int64, _ string) (IssueOccupancy, error) {
+		return IssueOccupancy{Repo: repo, IssueNumber: issueNumber, State: "OPEN", OpenPullRequests: []IssueOccupantPullRequest{{Number: 181, State: "OPEN", Repo: "other/worker", URL: "https://github.com/other/worker/pull/181"}}}, nil
+	}
+	recorder := postWorkerIssue(t, newWorkerIssueOccupancyHandler(fixture, lookup), `{"projectId":"project_1","repo":"acme/looper","issueNumber":93,"baseBranch":"main"}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !bytes.Contains(recorder.Body.Bytes(), []byte("other/worker#181")) || !bytes.Contains(recorder.Body.Bytes(), []byte("https://github.com/other/worker/pull/181")) {
+		t.Fatalf("body = %s, want cross-repository PR identity", recorder.Body.String())
+	}
+}
+
 // TestHandlerWorkerCreateForceOverridesOccupiedIssue dispatches anyway when
 // force is true, even though the forge reports the issue closed and an open PR.
 func TestHandlerWorkerCreateForceOverridesOccupiedIssue(t *testing.T) {

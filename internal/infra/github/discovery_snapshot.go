@@ -151,6 +151,27 @@ func (s *DiscoverySnapshot) EnsureOpenIssues(ctx context.Context, input ListOpen
 	return s.ensureOpenIssues(ctx, input)
 }
 
+// EnsureFreshOpenIssues refreshes the open-issue authority without consulting
+// the discovery cache. Callers that destructively infer closure from absence
+// must use this rather than a cached discovery page.
+func (s *DiscoverySnapshot) EnsureFreshOpenIssues(ctx context.Context, input ListOpenIssuesInput) error {
+	if s == nil || s.gateway == nil {
+		return fmt.Errorf("discovery snapshot gateway is not configured")
+	}
+	issues, err := s.gateway.listOpenIssuesRaw(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: s.issueLimit})
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.openIssues = cloneIssueSummaries(issues)
+	s.openIssuesFetched = true
+	s.openIssuesFetchRepo = input.Repo
+	s.openIssuesFetchCWD = input.CWD
+	s.openIssuesLimit = s.issueLimit
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *DiscoverySnapshot) ensureOpenIssues(ctx context.Context, input ListOpenIssuesInput) error {
 	s.mu.Lock()
 	ready := s.openIssuesFetched && s.openIssuesFetchRepo == input.Repo && s.openIssuesFetchCWD == input.CWD

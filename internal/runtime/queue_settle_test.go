@@ -77,7 +77,9 @@ func TestSettleQueuedWorkerIssueTargetsRetiresClosedIssue(t *testing.T) {
 		t.Fatalf("snapshot listOpenIssues() error = %v", err)
 	}
 
-	settleQueuedWorkerIssueTargets(context.Background(), repos, snapshot, projectID, repo, nowISO, nil)
+	if err := settleQueuedWorkerIssueTargets(context.Background(), repos, snapshot, nil, projectID, repo, nowISO, nil); err != nil {
+		t.Fatalf("settleQueuedWorkerIssueTargets() error = %v", err)
+	}
 
 	item, err := repos.Queue.GetByID(context.Background(), "queue_"+loopID)
 	if err != nil {
@@ -95,6 +97,37 @@ func TestSettleQueuedWorkerIssueTargetsRetiresClosedIssue(t *testing.T) {
 	}
 	if loop.Status != "paused" {
 		t.Fatalf("loop status = %q, want paused (not left queued)", loop.Status)
+	}
+}
+
+// TestRunDefaultSchedulerTickSettlesClosedIssueBeforePreDiscoveryClaim covers
+// the scheduler lifecycle ordering: a queued worker for a now-closed issue
+// must be retired before the first claim phase can dispatch its processor.
+func TestRunDefaultSchedulerTickSettlesClosedIssueBeforePreDiscoveryClaim(t *testing.T) {
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "queue-settle-scheduler.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 8, 0, 0, 0, time.UTC)
+	projectID := "looper"
+	repo := "nexu-io/looper"
+	loopID := seedQueuedIssueWorker(t, repos, now, projectID, repo, 77)
+	workerRunner := &stubWorkerScheduler{}
+
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:             repos,
+		GitHubGateway:     newQueueSettleGateway(t, []int64{78}),
+		Now:               func() time.Time { return now },
+		MaxConcurrentRuns: 1,
+		Worker:            workerRunner,
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if workerRunner.processItemCount() != 0 {
+		t.Fatalf("worker processed %d items, want none for the closed target", workerRunner.processItemCount())
+	}
+	item, err := repos.Queue.GetByID(context.Background(), "queue_"+loopID)
+	if err != nil || item == nil || item.Status != "cancelled" {
+		t.Fatalf("queue item = %#v, %v; want cancelled before claim", item, err)
 	}
 }
 
@@ -118,7 +151,9 @@ func TestSettleQueuedWorkerIssueTargetsKeepsOpenIssue(t *testing.T) {
 		t.Fatalf("snapshot listOpenIssues() error = %v", err)
 	}
 
-	settleQueuedWorkerIssueTargets(context.Background(), repos, snapshot, projectID, repo, nowISO, nil)
+	if err := settleQueuedWorkerIssueTargets(context.Background(), repos, snapshot, nil, projectID, repo, nowISO, nil); err != nil {
+		t.Fatalf("settleQueuedWorkerIssueTargets() error = %v", err)
+	}
 
 	item, err := repos.Queue.GetByID(context.Background(), "queue_"+loopID)
 	if err != nil {
@@ -157,7 +192,9 @@ func TestSettleQueuedWorkerIssueTargetsNoopsWhenSnapshotIncomplete(t *testing.T)
 		t.Fatalf("snapshot EnsureOpenIssues() error = %v", err)
 	}
 
-	settleQueuedWorkerIssueTargets(context.Background(), repos, snapshot, projectID, repo, nowISO, nil)
+	if err := settleQueuedWorkerIssueTargets(context.Background(), repos, snapshot, nil, projectID, repo, nowISO, nil); err != nil {
+		t.Fatalf("settleQueuedWorkerIssueTargets() error = %v", err)
+	}
 
 	item, err := repos.Queue.GetByID(context.Background(), "queue_"+loopID)
 	if err != nil {
@@ -168,9 +205,10 @@ func TestSettleQueuedWorkerIssueTargetsNoopsWhenSnapshotIncomplete(t *testing.T)
 	}
 }
 
-// TestSettleQueuedWorkerIssueTargetsNoopsWhenSnapshotNotFetched does not retire
-// anything when discovery never read open issues for the project (ok=false).
-func TestSettleQueuedWorkerIssueTargetsNoopsWhenSnapshotNotFetched(t *testing.T) {
+// TestSettleQueuedWorkerIssueTargetsRefreshesUnfetchedSnapshot confirms that
+// retirement obtains its own fresh authority rather than relying on whether a
+// discovery lane happened to fetch issues first.
+func TestSettleQueuedWorkerIssueTargetsRefreshesUnfetchedSnapshot(t *testing.T) {
 	workingDir := t.TempDir()
 	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "queue-settle-unfetched.sqlite"), t.TempDir())
 	repos := storage.NewRepositories(coordinator.DB())
@@ -181,18 +219,20 @@ func TestSettleQueuedWorkerIssueTargetsNoopsWhenSnapshotNotFetched(t *testing.T)
 	repo := "nexu-io/looper"
 	loopID := seedQueuedIssueWorker(t, repos, now, projectID, repo, 77)
 
-	// Snapshot built but listOpenIssues never called — OpenIssueNumbers returns
-	// ok=false, so the pass must no-op.
+	// Snapshot built but listOpenIssues never called. Settlement performs its
+	// own fresh read and can safely retire the absent issue.
 	gateway := newQueueSettleGateway(t, nil)
 	snapshot := githubinfra.NewDiscoverySnapshot(gateway, githubinfra.NewDiscoveryTickState(), githubinfra.DiscoverySnapshotOptions{IssueLimit: 30})
 
-	settleQueuedWorkerIssueTargets(context.Background(), repos, snapshot, projectID, repo, nowISO, nil)
+	if err := settleQueuedWorkerIssueTargets(context.Background(), repos, snapshot, nil, projectID, repo, nowISO, nil); err != nil {
+		t.Fatalf("settleQueuedWorkerIssueTargets() error = %v", err)
+	}
 
 	item, err := repos.Queue.GetByID(context.Background(), "queue_"+loopID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if item.Status != "queued" {
-		t.Fatalf("queue status = %q, want queued (unfetched snapshot must not retire)", item.Status)
+	if item.Status != "cancelled" {
+		t.Fatalf("queue status = %q, want cancelled after fresh authority read", item.Status)
 	}
 }

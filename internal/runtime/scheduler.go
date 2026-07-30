@@ -2401,8 +2401,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		return nil
 	}
 
-	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
-	recordClaim(claimedCount, availableSlots, err)
 	tickDiscoveryState := githubinfra.NewDiscoveryTickState()
 	projectSnapshots := map[string]*githubinfra.DiscoverySnapshot{}
 	projectSnapshot := func(projectID string) *githubinfra.DiscoverySnapshot {
@@ -2416,6 +2414,31 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		projectSnapshots[projectID] = snapshot
 		return snapshot
 	}
+	// A queued worker can otherwise be claimed by the independent claim pump
+	// before discovery observes that its issue closed. Settle against a fresh
+	// issue page first; the helper holds the claim boundary through its authority
+	// read and atomic retirement.
+	for _, project := range projectsList {
+		if project.Archived {
+			continue
+		}
+		repo, inCatalog := schedulerProjectRepo(input, project)
+		if !inCatalog || repo == "" {
+			continue
+		}
+		if err := admissionRefuseWork(input); err != nil {
+			return nil
+		}
+		settleErr := settleQueuedWorkerIssueTargets(ctx, input.Repos, projectSnapshot(project.ID), input.ClaimBoundary, project.ID, repo, formatJavaScriptISOString(now()), func(msg string, fields map[string]any) {
+			if input.Logger != nil {
+				input.Logger.Debug(msg, fields)
+			}
+		})
+		appendErr(settleErr)
+	}
+
+	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
+	recordClaim(claimedCount, availableSlots, err)
 	lanes := discoveryLanes(input)
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {

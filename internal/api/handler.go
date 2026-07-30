@@ -4738,7 +4738,14 @@ func (h *Handler) refuseOccupiedIssueTarget(ctx context.Context, project storage
 	}
 	if len(occupancy.OpenPullRequests) > 0 {
 		pr := occupancy.OpenPullRequests[0]
-		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s already has an open pull request #%d; rerun with --force to bypass", reference, pr.Number)}
+		prReference := fmt.Sprintf("#%d", pr.Number)
+		if strings.TrimSpace(pr.Repo) != "" {
+			prReference = fmt.Sprintf("%s#%d", pr.Repo, pr.Number)
+		}
+		if strings.TrimSpace(pr.URL) != "" {
+			prReference += " (" + pr.URL + ")"
+		}
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s already has an open pull request %s; rerun with --force to bypass", reference, prReference)}
 	}
 	return nil
 }

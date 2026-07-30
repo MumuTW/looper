@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/github"
@@ -23,20 +24,29 @@ import (
 // deliberately bounded half of the issue: a merged pull request that closes the
 // issue is caught here (the issue leaves the open set); a merged PR that does
 // not close the issue is not — see the PR description for what it still misses.
-func settleQueuedWorkerIssueTargets(ctx context.Context, repos *storage.Repositories, snapshot *github.DiscoverySnapshot, projectID, repo string, nowISO string, logger func(string, map[string]any)) {
+func settleQueuedWorkerIssueTargets(ctx context.Context, repos *storage.Repositories, snapshot *github.DiscoverySnapshot, claimBoundary *sync.RWMutex, projectID, repo string, nowISO string, logger func(string, map[string]any)) error {
 	if repos == nil || repos.Queue == nil || repos.Loops == nil || snapshot == nil {
-		return
+		return nil
+	}
+	// The same boundary that guards ClaimNext* protects the fresh read and the
+	// retirement it authorizes, so a claim cannot slip between them.
+	if claimBoundary != nil {
+		claimBoundary.Lock()
+		defer claimBoundary.Unlock()
+	}
+	if err := snapshot.EnsureFreshOpenIssues(ctx, github.ListOpenIssuesInput{Repo: repo}); err != nil {
+		return fmt.Errorf("refresh open issues before queue settlement: %w", err)
 	}
 	openIssues, complete, ok := snapshot.OpenIssueNumbers()
 	if !ok || !complete {
-		return
+		return nil
 	}
 	queued, err := repos.Queue.ListByStatuses(ctx, []string{"queued"})
 	if err != nil {
 		if logger != nil {
 			logger("queue settle skipped", map[string]any{"projectId": projectID, "error": err.Error()})
 		}
-		return
+		return err
 	}
 	for _, item := range queued {
 		if item.Type != string(domain.LoopTypeWorker) || item.TargetType != string(domain.LoopTargetTypeIssue) {
@@ -63,28 +73,38 @@ func settleQueuedWorkerIssueTargets(ctx context.Context, repos *storage.Reposito
 		if _, stillOpen := openIssues[issueNumber]; stillOpen {
 			continue
 		}
+		unlockLoop := LockLoopRequeue(*item.LoopID)
+		loop, loopErr := repos.Loops.GetByID(ctx, *item.LoopID)
+		if loopErr != nil || loop == nil {
+			unlockLoop()
+			continue
+		}
+		unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
+		// Re-check under both existing requeue guards: an API retry/requeue may
+		// have changed either record while this scan waited for the locks.
+		current, currentErr := repos.Queue.GetByID(ctx, item.ID)
+		if currentErr != nil || current == nil || current.Status != "queued" || loop.Status != "queued" {
+			unlockTarget()
+			unlockLoop()
+			continue
+		}
 		reference := fmt.Sprintf("%s#%d", itemRepo, issueNumber)
 		reason := fmt.Sprintf("Worker retired from queue: %s is no longer an open issue", reference)
-		if _, cancelErr := repos.Queue.CancelByLoop(ctx, *item.LoopID, nowISO, &reason); cancelErr != nil {
+		retired, retireErr := repos.RetireQueuedLoop(ctx, *item.LoopID, item.ID, nowISO, &reason)
+		unlockTarget()
+		unlockLoop()
+		if retireErr != nil {
 			if logger != nil {
-				logger("queue settle cancel failed", map[string]any{"projectId": projectID, "loopId": *item.LoopID, "error": cancelErr.Error()})
+				logger("queue settle retirement failed", map[string]any{"projectId": projectID, "loopId": *item.LoopID, "error": retireErr.Error()})
 			}
 			continue
 		}
-		// Move the loop out of queued so the dashboard does not show stale
-		// queued work for a target that is gone. Paused (not failed) because the
-		// worker never ran — there is no run to mark failed, and reusing pause
-		// keeps it eligible for a human-driven requeue if the closure was wrong.
-		if loop, loopErr := repos.Loops.GetByID(ctx, *item.LoopID); loopErr == nil && loop != nil {
-			if domain.LoopStatus(loop.Status) == domain.LoopStatusQueued {
-				loop.Status = string(domain.LoopStatusPaused)
-				loop.NextRunAt = nil
-				loop.UpdatedAt = nowISO
-				_ = repos.Loops.Upsert(ctx, *loop)
-			}
+		if !retired {
+			continue
 		}
 		if logger != nil {
 			logger("queue settled retired stale worker", map[string]any{"projectId": projectID, "loopId": *item.LoopID, "issue": reference})
 		}
 	}
+	return nil
 }
