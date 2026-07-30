@@ -14,6 +14,11 @@ const jsISOStringLayout = "2006-01-02T15:04:05.000Z"
 
 var tokenPattern = regexp.MustCompile(`[A-Za-z][A-Za-z0-9_./-]{2,}`)
 
+// Disposition is Coordinator's high-level conclusion about an Issue: valid,
+// out-of-scope, or unclear. Distinct from kind/area/complexity, which are
+// classification labels applied only when the Disposition is valid. (The
+// similarly named criteria.AggregateDisposition and depgraph's blocker
+// disposition are unrelated concepts.)
 type Disposition string
 
 const (

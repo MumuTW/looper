@@ -15,6 +15,12 @@ const (
 	ActionTransientError          WatchActionKind = "TransientError"
 )
 
+// PriorWatchMarker is the Watch marker: the
+// <!-- looper:coordinator:merge-watch retries=N --> HTML-comment marker
+// Coordinator places on the linked Issue rather than the PR — keeping
+// Coordinator state rooted on the Issue — to carry merge-watch retry-counter
+// state across ticks. Public, durable, idempotent; preserves ADR-0001's
+// stateless property.
 type PriorWatchMarker struct {
 	PRNumber       int64
 	HeadSHA        string
